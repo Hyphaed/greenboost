@@ -1,0 +1,47 @@
+# Kernel module build artifacts
+*.ko
+*.o
+*.mod
+*.mod.c
+*.symvers
+*.order
+.*.cmd
+.tmp_versions/
+Module.symvers
+modules.order
+
+# Compiled shared library
+libgreenboost_cuda.so
+
+# Editor temp files
+nano.*.save
+*.swp
+*.swo
+*~
+
+# AI tool residual files
+*plan.md
+plan*.md
+apply_fixes.sh
+
+# AI assistant local context (never commit)
+.claude/
+.mcp-cache/
+CLAUDE.md
+MEMORY.md
+memory/
+*.claude.md
+.claude_*
+
+# Continue AI assistant (local config, never commit)
+.continue/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Python venv (managed by greenboost_setup.sh)
+venv/
+.venv/

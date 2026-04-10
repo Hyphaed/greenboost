@@ -1,0 +1,140 @@
+# GreenBoost DRA LLM Pod Example
+#
+# This pod demonstrates claiming both GPU and GreenBoost extended VRAM
+# through Dynamic Resource Allocation (DRA).
+#
+# For: V100 Cluster Node with 8× V100 (256 GB HBM2 + 307 GB T2 = 563 GB virtual VRAM)
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: greenboost-llm
+---
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClaimTemplate
+metadata:
+  namespace: greenboost-llm
+  name: single-gpu
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        deviceClassName: gpu.nvidia.com
+---
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClaimTemplate
+metadata:
+  namespace: greenboost-llm
+  name: extended-vram
+spec:
+  spec:
+    devices:
+      requests:
+      - name: vram
+        deviceClassName: greenboost.nvidia.com
+        allocationModeStrategy:
+          mode: All 						 # Allocate all available T2
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: greenboost-llm
+  name: llm-inference
+  labels:
+    app: llm-inference
+spec:
+  containers:
+  - name: ollama
+    image: ollama/ollama:latest
+    command: ["bash", "-c"]
+    args: [
+      """
+      # Export GreenBoost environment variables
+      export GREENBOOST_ACTIVE=1
+      export GREENBOOST_VRAM_HEADROOM_MB=2048
+      export OLLAMA_FLASH_ATTENTION=1
+      export OLLAMA_KV_CACHE_TYPE=q8_0
+      
+      # Run a large LLM that benefits from GreenBoost's 563 GB virtual VRAM
+      ollama run glm-4.7-flash:q8_0
+      
+      # Monitor memory tiers
+      watch -n1 'cat /sys/class/greenboost/greenboost/pool_info'
+      """
+    ]
+    resources:
+      requests:
+        memory: "16Gi"
+      limits:
+        memory: "32Gi"
+    claims:
+    - name: gpu-request
+    - name: vram-request
+    volumeMounts:
+    - name: greenboost-sysfs
+      mountPath: /sys/class/greenboost
+      readOnly: true
+    - name: models
+      mountPath: /models
+  - name: monitoring
+    image: ubuntu:22.04
+    command: ["bash", "-c"]
+    args: [
+      """
+      # Install monitoring tools
+      apt-get update && apt-get install -y curl jq
+      
+      # Watch GreenBoost metrics
+      while true; do
+        echo '=== GreenBoost Pool Info ==='
+        cat /sys/class/greenboost/greenboost/pool_info
+        echo ''
+        echo '=== GreenBoost DRA Status ==='
+        cat /sys/class/greenboost/greenboost/compute_domain_active
+        echo ''
+        sleep 10
+      done
+      """
+    ]
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+    volumeMounts:
+    - name: greenboost-sysfs
+      mountPath: /sys/class/greenboost
+      readOnly: true
+  resourceClaims:
+  - name: gpu-request
+    resourceClaimTemplateName: single-gpu
+  - name: vram-request
+    resourceClaimTemplateName: extended-vram
+  volumes:
+  - name: greenboost-sysfs
+    hostPath:
+      path: /sys/class/greenboost
+      type: Directory
+  - name: models
+    persistentVolumeClaim:
+      claimName: llm-models-pvc
+  tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+  nodeSelector:
+    accelerator: nvidia-tesla-v100
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  namespace: greenboost-llm
+  name: llm-models-pvc
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: lustre

@@ -1,0 +1,41 @@
+{{- if and .Values.greenboost.enable .Values.rbac.create }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "greenboost-dra-driver.fullname" . }}-plugin
+  labels:
+    {{- include "greenboost-dra-driver.labels" . | nindent 4 }}
+rules:
+# DRA: manage ResourceSlices (publish device inventory)
+- apiGroups: ["resource.k8s.io"]
+  resources: ["resourceslices"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# DRA: read ResourceClaims to handle prepare/unprepare
+- apiGroups: ["resource.k8s.io"]
+  resources: ["resourceclaims", "resourceclaims/status"]
+  verbs: ["get", "list", "watch"]
+# Node info (advertise capacity per node)
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+# Pod info (detect active workloads for KV orchestration)
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "greenboost-dra-driver.fullname" . }}-plugin
+  labels:
+    {{- include "greenboost-dra-driver.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "greenboost-dra-driver.fullname" . }}-plugin
+subjects:
+- kind: ServiceAccount
+  name: {{ include "greenboost-dra-driver.serviceAccountName" . }}
+  namespace: {{ include "greenboost-dra-driver.namespace" . }}
+{{- end }}

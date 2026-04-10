@@ -1,0 +1,44 @@
+# GreenBoost v2.8; AppArmor abstraction for LD_AUDIT injection
+#
+# Grants confined processes read access to libgreenboost_audit.so
+# (placed in /etc/ld.so.preload) and the full CUDA shim it may dlopen.
+#
+# The audit library is tiny (< 5 KB) and contains no CUDA code.  The full
+# shim (libgreenboost_cuda.so) is dlopen()'d only in processes that load
+# libcuda.so or libcudart.so, so non-CUDA profiles pay only the cost of
+# a single read-open of the audit stub.
+#
+# INSTALLATION (managed by greenboost_setup.sh install-sys-configs):
+#
+#   Layer A — abstractions/base injection (automatic, global):
+#     The installer adds this include to /etc/apparmor.d/abstractions/base,
+#     so every profile that pulls in <abstractions/base> inherits these
+#     permissions automatically.  New packages installed by apt or snap are
+#     covered without re-running setup.
+#
+#   Layer B — dynamic profile scan (catches profiles not using base):
+#     The installer also scans all profiles in /etc/apparmor.d/ and adds
+#     the include to any that don't already have it, excluding:
+#       - abstractions/, tunables/, disable/, force-complain/, local/, abi/
+#       - usr.lib.snapd.snap-confine.real  (snapd overwrites on upgrade)
+#
+#   Both layers are reversed cleanly by:  greenboost_setup.sh uninstall
+#
+# Manual usage in a single profile (without running setup):
+#   #include <abstractions/greenboost-audit>
+
+  # Allow the linker to open/mmap the audit stub (every preload process).
+  # /etc/ld.so.preload uses $LIB token — glibc expands it per ELF class:
+  #   64-bit → /usr/local/lib/x86_64-linux-gnu/libgreenboost_audit.so
+  #   32-bit → /usr/local/lib/i386-linux-gnu/libgreenboost_audit.so
+  # The bare /usr/local/lib/ path is kept for legacy install-sys-configs installs.
+  r  /usr/local/lib/libgreenboost_audit.so,
+  mr /usr/local/lib/libgreenboost_audit.so,
+  r  /usr/local/lib/x86_64-linux-gnu/libgreenboost_audit.so,
+  mr /usr/local/lib/x86_64-linux-gnu/libgreenboost_audit.so,
+  r  /usr/local/lib/i386-linux-gnu/libgreenboost_audit.so,
+  mr /usr/local/lib/i386-linux-gnu/libgreenboost_audit.so,
+
+  # Allow the full CUDA shim — only reached in CUDA processes
+  mr /usr/local/lib/libgreenboost_cuda.so,
+  mr /usr/local/lib/x86_64-linux-gnu/libgreenboost_cuda.so,

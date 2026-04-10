@@ -1,0 +1,16 @@
+# GreenBoost DeviceClass — standalone manifest (no Helm required).
+# Apply with: kubectl apply -f deviceclass.yaml
+# Requires Kubernetes 1.33+ with DRA feature gate enabled.
+#
+# This DeviceClass advertises GreenBoost's extended virtual VRAM pool via DRA.
+# The CEL selector matches any device published by the greenboost.nvidia.com driver.
+# Pods reference this by adding a ResourceClaimTemplate to their spec.
+
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: greenboost.nvidia.com
+spec:
+  selectors:
+  - cel:
+      expression: "device.driver == 'greenboost.nvidia.com'"

@@ -1,0 +1,224 @@
+{{- if .Values.greenboost.enable }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: greenboost-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "greenboost-dra-driver.name" . }}-plugin
+  namespace: {{ include "greenboost-dra-driver.namespace" . }}
+---
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "greenboost-dra-driver.name" . }}-plugin
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["resource.k8s.io"]
+  resources: ["resourceclaims", "resourceclaims/status", "devices"]
+  verbs: ["get", "list", "watch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "greenboost-dra-driver.name" . }}-plugin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "greenboost-dra-driver.name" . }}-plugin
+subjects:
+- kind: ServiceAccount
+  name: {{ include "greenboost-dra-driver.name" . }}-plugin
+  namespace: {{ include "greenboost-dra-driver.namespace" . }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "greenboost-dra-driver.name" . }}-plugin
+  namespace: {{ include "greenboost-dra-driver.namespace" . }}
+  labels:
+    {{- include "greenboost-dra-driver.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "greenboost-dra-driver.selectorLabels" (dict "context" . "componentName" "plugin") | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.kubeletPlugin.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "greenboost-dra-driver.templateLabels" . | nindent 8 }}
+        {{- include "greenboost-dra-driver.selectorLabels" (dict "context" . "componentName" "plugin") | nindent 8 }}
+    spec:
+      {{- if .Values.kubeletPlugin.priorityClassName }}
+      priorityClassName: {{ .Values.kubeletPlugin.priorityClassName }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "greenboost-dra-driver.name" . }}-plugin
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      initContainers:
+      - name: init-greenboost-module
+        image: {{ include "greenboost-dra-driver.fullimage" . }}
+        securityContext:
+          privileged: true
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          # Load GreenBoost kernel module
+          if ! lsmod | grep -q greenboost; then
+            insmod /lib/modules/$(uname -r)/kernel/drivers/gpu/greenboost.ko \
+              physical_vram_gb={{ .Values.greenboost.physicalVramGb }} \
+              virtual_vram_gb={{ .Values.greenboost.virtualVramGb }} \
+              safety_reserve_gb={{ .Values.greenboost.safetyReserveGb }} \
+              nvme_swap_gb={{ .Values.greenboost.nvmeSwapGb }} \
+              nvlink_pool_enable={{ .Values.greenboost.nvlinkPool | ternary "1" "0" }} \
+              use_hugepages={{ .Values.greenboost.useHugepages | ternary "1" "0" }} \
+              pcores_only={{ .Values.greenboost.pcoresOnly | ternary "1" "0" }} \
+              active_profile_name={{ .Values.greenboost.profileName }} \
+              debug_mode=0
+            echo "GreenBoost module loaded"
+          else
+            echo "GreenBoost module already loaded"
+          fi
+        volumeMounts:
+        - name: host-modules
+          mountPath: /lib/modules
+          readOnly: true
+      containers:
+      - name: greenboost-plugin
+        securityContext:
+          privileged: true
+        image: {{ include "greenboost-dra-driver.fullimage" . }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        command: ["/greenboost-kubelet-plugin"]
+        resources:
+          {{- toYaml .Values.kubeletPlugin.resources | nindent 12 }}
+        env:
+        - name: KUBELET_PLUGINS_DIRECTORY_PATH
+          value: {{ .Values.kubeletPlugin.kubeletPluginsDirectoryPath | quote }}
+        - name: KUBELET_REGISTRAR_DIRECTORY_PATH
+          value: {{ .Values.kubeletPlugin.kubeletRegistrarDirectoryPath | quote }}
+        - name: GREENBOOST_SYSFS_PATH
+          value: "/sys/class/greenboost"
+        - name: GREENBOOST_NVLINK_POOL
+          value: {{ .Values.greenboost.nvlinkPool | quote }}
+        - name: GREENBOOST_PROFILE_NAME
+          value: {{ .Values.greenboost.profileName | quote }}
+        {{- if .Values.featureGates }}
+        - name: FEATURE_GATES
+          value: "{{ range $key, $value := .Values.featureGates }}{{ $key }}={{ $value }},{{ end }}"
+        {{- end }}
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        volumeMounts:
+        - name: plugins
+          mountPath: {{ .Values.kubeletPlugin.kubeletPluginsDirectoryPath | quote }}
+          mountPropagation: Bidirectional
+        - name: plugins-registry
+          mountPath: {{ .Values.kubeletPlugin.kubeletRegistrarDirectoryPath | quote }}
+        - name: greenboost-sysfs
+          mountPath: /sys/class/greenboost
+          readOnly: true
+        - name: host-modules
+          mountPath: /lib/modules
+          readOnly: true
+      {{- if .Values.metricsExporter.enabled }}
+      - name: metrics-exporter
+        securityContext:
+          {{- toYaml .Values.securityContext | nindent 12 }}
+        image: {{ include "greenboost-dra-driver.fullimage" . }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        command: ["/greenboost-metrics-exporter"]
+        ports:
+        - containerPort: {{ .Values.metricsExporter.port }}
+          name: metrics
+          protocol: TCP
+        resources:
+          {{- toYaml .Values.metricsExporter.resources | nindent 12 }}
+        env:
+        - name: METRICS_PORT
+          value: {{ .Values.metricsExporter.port | quote }}
+        - name: METRICS_PATH
+          value: {{ .Values.metricsExporter.path | quote }}
+        - name: GREENBOOST_SYSFS_PATH
+          value: "/sys/class/greenboost"
+        volumeMounts:
+        - name: greenboost-sysfs
+          mountPath: /sys/class/greenboost
+          readOnly: true
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: metrics
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: metrics
+          initialDelaySeconds: 5
+          periodSeconds: 10
+      {{- end }}
+      volumes:
+      - name: plugins
+        hostPath:
+          path: {{ .Values.kubeletPlugin.kubeletPluginsDirectoryPath | quote }}
+      - name: plugins-registry
+        hostPath:
+          path: {{ .Values.kubeletPlugin.kubeletRegistrarDirectoryPath | quote }}
+      - name: greenboost-sysfs
+        hostPath:
+          path: /sys/class/greenboost
+          type: Directory
+      - name: host-modules
+        hostPath:
+          path: /lib/modules
+          type: Directory
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+
+---
+{{- if .Values.deviceClass.enabled }}
+apiVersion: resource.k8s.io/v1beta1
+kind: DeviceClass
+metadata:
+  name: greenboost.nvidia.com
+  namespace: greenboost-system
+spec:
+  nodeSelector:
+    matchLabels:
+      accelerator: nvidia-tesla-v100
+  suitableNodes:
+    matchLabels:
+      accelerator: nvidia-tesla-v100
+{{- end }}

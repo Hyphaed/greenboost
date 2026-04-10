@@ -1,0 +1,63 @@
+/* greenboost_cuda.map — GNU ld version script
+ *
+ * Ollama (libggml-cuda.so, ollama binary) uses ELF symbol versioning:
+ *
+ *   cudaMalloc@libcudart.so.13   — CUDA runtime allocation
+ *   cudaFree@libcudart.so.13     — CUDA runtime free
+ *   cudaMemGetInfo@libcudart.so.13
+ *   cudaMallocManaged@libcudart.so.13
+ *   cudaMallocAsync@libcudart.so.13
+ *   dlopen@GLIBC_2.2.5           — used to load libggml-cuda.so (with RTLD_DEEPBIND!)
+ *   dlsym@GLIBC_2.2.5            — used for CUDA/NVML GPU discovery
+ *
+ * Unversioned exports from LD_PRELOAD do NOT satisfy versioned requirements.
+ * We must export our hooks under the exact version strings callers require.
+ *
+ * Exporting dlopen@@GLIBC_2.2.5 lets us strip RTLD_DEEPBIND before Ollama
+ * loads libggml-cuda.so — RTLD_DEEPBIND causes libggml-cuda.so to resolve
+ * cudaMalloc from its bundled libcudart (local scope), bypassing our hooks.
+ *
+ * Exporting dlsym@@GLIBC_2.2.5 lets us intercept Ollama's GPU memory
+ * discovery calls (cuDeviceTotalMem_v2, nvmlDeviceGetMemoryInfo, etc.)
+ * to report the inflated virtual VRAM size.
+ */
+
+libcudart.so.13 {
+    global:
+        cudaMalloc;
+        cudaMallocAsync;
+        cudaFree;
+        cudaMemGetInfo;
+};
+
+GLIBC_2.2.5 {
+    global:
+        dlopen;
+        dlsym;
+        sysinfo;
+};
+
+/* GB_HOOKS — unversioned exports for ELF interposition via LD_PRELOAD.
+ * Ensures NVML + CUDA memory hooks resolve even when the caller does NOT
+ * go through our dlsym hook (e.g. PLT-linked or purego-style function
+ * pointers resolved directly from a dlopen handle).
+ * This is the critical path for Ollama's Go NVML bindings.
+ * local: * hides every symbol not explicitly listed as global. */
+GB_HOOKS {
+    global:
+        nvmlDeviceGetMemoryInfo;
+        nvmlDeviceGetMemoryInfo_v2;
+        nvmlDeviceGetMemoryInfo_v3;
+        cuDeviceTotalMem;
+        cuDeviceTotalMem_v2;
+        cuMemGetInfo;
+        cuMemGetInfo_v2;
+        cuMemAlloc_v2;
+        cuMemAllocAsync;
+        cuMemFree_v2;
+        cuMemFreeAsync;
+        cuMemPrefetchAsync;
+        cuMemCreate;
+    local:
+        *;
+};

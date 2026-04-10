@@ -1,0 +1,17 @@
+apiVersion: v2
+name: greenboost-dra-driver
+description: GreenBoost DRA Driver for GPU Memory Tiering in Kubernetes
+type: application
+version: "1.0.0"
+appVersion: "3.0.0"
+kubeVersion: ">=1.32.0-0"
+keywords:
+  - gpu
+  - memory
+  - greenboost
+  - dra
+  - dynamic-resource-allocation
+maintainers:
+  - name: Ferran Duarri
+    email: ferran@greenboost.dev
+home: https://gitlab.com/IsolatedOctopi/greenboost

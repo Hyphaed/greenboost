@@ -1,0 +1,28 @@
+{{- if and .Values.greenboost.enable .Values.metricsExporter.enabled }}
+---
+# Service exposing Prometheus metrics and health endpoints for the metrics sidecar.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "greenboost-dra-driver.fullname" . }}-metrics
+  namespace: {{ include "greenboost-dra-driver.namespace" . }}
+  labels:
+    {{- include "greenboost-dra-driver.labels" . | nindent 4 }}
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "{{ .Values.metricsExporter.port }}"
+    prometheus.io/path: "{{ .Values.metricsExporter.path }}"
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "greenboost-dra-driver.selectorLabels" . | nindent 4 }}
+  ports:
+  - name: metrics
+    port: {{ .Values.metricsExporter.port }}
+    targetPort: {{ .Values.metricsExporter.port }}
+    protocol: TCP
+  - name: health
+    port: 8081
+    targetPort: 8081
+    protocol: TCP
+{{- end }}

@@ -1,0 +1,72 @@
+GreenBoost Dual License
+=======================
+
+Copyright (C) 2026 Ferran Duarri. All rights reserved.
+
+This software is released under a DUAL LICENSE model:
+
+──────────────────────────────────────────────────────────────────────────────
+OPTION A — GNU General Public License v2 (open-source use)
+──────────────────────────────────────────────────────────────────────────────
+
+For open-source projects, personal use, research, and non-commercial use,
+this software is licensed under the GNU General Public License v2 (GPL v2),
+as published by the Free Software Foundation.
+
+You may redistribute and/or modify this software under the terms of the
+GPL v2. See the full GPL v2 text below.
+
+MANDATORY ATTRIBUTION — regardless of which license option applies:
+  All copies, forks, derivative works, documentation, publications, or
+  distributions must clearly credit:
+
+      GreenBoost — created by Ferran Duarri
+      https://gitlab.com/IsolatedOctopi/greenboost
+
+  This credit must appear in:
+    • Source file headers
+    • Documentation (README, man pages, articles)
+    • User-facing UI or terminal output where authorship is displayed
+    • Any academic or technical paper citing this work
+
+──────────────────────────────────────────────────────────────────────────────
+OPTION B — Commercial License
+──────────────────────────────────────────────────────────────────────────────
+
+For commercial use, proprietary integration, SaaS products, embedded
+products, or any use that cannot comply with GPL v2, a separate commercial
+license is required from the copyright holder.
+
+Commercial licenses may include royalty terms, support agreements, and
+custom modifications. Contact: ferran.duarri@me.com
+
+The author (Ferran Duarri) expressly reserves the right to:
+  • Re-license this software under any terms at any time
+  • Offer paid commercial licenses, including royalty-bearing licenses
+  • Grant exceptions to any of the above terms on a per-licensee basis
+
+──────────────────────────────────────────────────────────────────────────────
+GNU GENERAL PUBLIC LICENSE Version 2, June 1991
+──────────────────────────────────────────────────────────────────────────────
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along
+with this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+──────────────────────────────────────────────────────────────────────────────
+DISCLAIMER
+──────────────────────────────────────────────────────────────────────────────
+
+NVIDIA, GeForce, RTX, CUDA, and NVML are trademarks of NVIDIA Corporation.
+This project is not affiliated with, endorsed by, or sponsored by NVIDIA
+Corporation or any other third party.

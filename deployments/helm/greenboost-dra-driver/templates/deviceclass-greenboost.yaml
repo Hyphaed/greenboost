@@ -1,0 +1,16 @@
+{{- if .Values.deviceClass.enabled }}
+---
+# GreenBoost DeviceClass — advertises greenboost.nvidia.com extended VRAM via DRA.
+# CEL selector matches devices whose driver is greenboost.nvidia.com.
+# Resource API version is auto-detected: v1 (k8s 1.33+) > v1beta2 > v1beta1.
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: greenboost.nvidia.com
+  labels:
+    {{- include "greenboost-dra-driver.labels" . | nindent 4 }}
+spec:
+  selectors:
+  - cel:
+      expression: "device.driver == 'greenboost.nvidia.com'"
+{{- end }}

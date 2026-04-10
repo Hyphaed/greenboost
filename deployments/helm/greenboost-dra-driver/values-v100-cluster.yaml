@@ -1,0 +1,65 @@
+# GreenBoost Helm Values — 200-node V100 NVLink Cluster
+# 8× V100 SXM2 32 GB per node, 384 GB DDR4 ECC, Lustre T3, InfiniBand 200 Gb/s
+# Apply with: helm upgrade --install greenboost-dra ./deployments/helm/greenboost-dra-driver \
+#               -f values-v100-cluster.yaml
+
+greenboost:
+  enable: true
+  # 8× V100 SXM2 32 GB HBM2 = 256 GB T1 (NVLink 2.0 all-to-all P2P)
+  physicalVramGb: 256
+  # T2: 384 GB DDR4 - 20 GB safety reserve - 57 GB OS ≈ 307 GB
+  virtualVramGb: 307
+  safetyReserveGb: 20
+  # T3: Lustre parallel filesystem (set nvme swap to 0)
+  nvmeSwapGb: 0
+  nvmePoolGb: 0
+  # NVLink pool: V100 8-GPU node, all-to-all NVLink 2.0 (no NVSwitch)
+  nvlinkPool: true
+  nvlinkGpuCount: 8
+  # ECC DDR4 — avoid THP which can be unreliable with ECC
+  useHugepages: false
+  # V100 cc 7.0 — cuMemAllocAsync requires cc >= 8.0, disabled
+  cuMemAllocAsync: false
+  pcoresOnly: false
+  profileName: v100_cluster_node
+
+featureGates:
+  NVLinkFabricMonitor: true
+  ComputeDomainAwareTiering: true
+  PrometheusMetrics: true
+
+metricsExporter:
+  enabled: true
+  port: 8080
+  path: /metrics
+
+deviceClass:
+  enabled: true
+
+rbac:
+  create: true
+
+serviceAccount:
+  create: true
+  name: greenboost-plugin
+
+# Target V100 nodes only
+nodeSelector:
+  accelerator: nvidia-tesla-v100
+
+tolerations:
+- key: nvidia.com/gpu
+  operator: Exists
+  effect: NoSchedule
+
+# Init container loads greenboost.ko with V100 NVLink pool parameters
+kubeletPlugin:
+  kubeletPluginsDirectoryPath: /var/lib/kubelet/plugins
+  kubeletRegistrarDirectoryPath: /var/lib/kubelet/plugins_registry
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi

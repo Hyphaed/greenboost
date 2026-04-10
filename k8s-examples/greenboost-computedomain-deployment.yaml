@@ -1,0 +1,154 @@
+# GreenBoost Multi-Node ComputeDomain LLM Deployment Example
+#
+# Demonstrates a 4-node inference job on a V100 NVLink cluster using:
+#   - ComputeDomain resource claim (k8s-dra-driver-gpu) for MNNVL topology
+#   - GreenBoost extended VRAM claim (greenboost.nvidia.com)
+#   - GPU claim (gpu.nvidia.com)
+#   - InfiniBand scheduling topology annotations
+#
+# V100 note: IMEX channels are NOT supported (V100 has no NVSwitch).
+#   ComputeDomain passive mode is used — GreenBoost optimises per-node T2
+#   allocation; cross-node communication uses NCCL over InfiniBand.
+#
+# Per-node virtual VRAM: 256 GB T1 (NVLink) + 307 GB T2 DDR4 = 563 GB
+# 4-node cluster: 2.25 TB total virtual VRAM for model sharding.
+
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: greenboost-vram-4node
+  namespace: llm-inference
+spec:
+  spec:
+    devices:
+      requests:
+      - name: vram
+        deviceClassName: greenboost.nvidia.com
+        allocationMode: ExactCount
+        count: 1
+
+---
+# 4-replica StatefulSet — one pod per node, spread across InfiniBand topology
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: llm-inference-v100
+  namespace: llm-inference
+  labels:
+    app: llm-inference
+    greenboost.nvidia.com/compute-domain: "4node-llama-cluster"
+spec:
+  replicas: 4
+  serviceName: llm-inference
+  selector:
+    matchLabels:
+      app: llm-inference
+  template:
+    metadata:
+      labels:
+        app: llm-inference
+      annotations:
+        # InfiniBand topology hint — place pods on nodes with direct IB links
+        network.alpha.kubernetes.io/infiniband-topology: "required"
+        greenboost.nvidia.com/kv-tier: "T1"
+        greenboost.nvidia.com/compute-domain-mode: "passive"
+    spec:
+      # Spread across nodes (one pod per node)
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: llm-inference
+            topologyKey: kubernetes.io/hostname
+
+      nodeSelector:
+        accelerator: nvidia-tesla-v100
+
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+
+      # Request GreenBoost extended VRAM via DRA
+      resourceClaims:
+      - name: vram
+        resourceClaimTemplateName: greenboost-vram-4node
+
+      containers:
+      - name: llm-worker
+        image: ferrand/llm-inference:latest
+        imagePullPolicy: IfNotPresent
+
+        # CDI injection: request /dev/greenboost + /sys/class/greenboost
+        resources:
+          claims:
+          - name: vram
+          requests:
+            nvidia.com/gpu: "8"
+            cpu: "16"
+            memory: "32Gi"
+          limits:
+            nvidia.com/gpu: "8"
+
+        env:
+        # GreenBoost KV cache orchestration — all overflow treated as KV for LLM
+        - name: GREENBOOST_ACTIVE
+          value: "1"
+        - name: GREENBOOST_DAEMON
+          value: "1"
+        - name: GREENBOOST_KV_OVERFLOW
+          value: "1"
+        - name: GREENBOOST_PHASE_DETECT
+          value: "0"
+        # NCCL over InfiniBand for cross-node communication (V100 has no IMEX)
+        - name: NCCL_IB_DISABLE
+          value: "0"
+        - name: NCCL_NET_GDR_LEVEL
+          value: "2"
+        # StatefulSet pod index for rank assignment
+        - name: MY_POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+
+        volumeMounts:
+        - name: greenboost-dev
+          mountPath: /dev/greenboost
+        - name: greenboost-sysfs
+          mountPath: /sys/class/greenboost
+          readOnly: true
+        - name: shm
+          mountPath: /dev/shm
+
+      volumes:
+      - name: greenboost-dev
+        hostPath:
+          path: /dev/greenboost
+          type: CharDevice
+      - name: greenboost-sysfs
+        hostPath:
+          path: /sys/class/greenboost
+          type: Directory
+      # Large shared memory for NCCL collectives
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+
+---
+# Headless service for stable DNS names within the StatefulSet
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-inference
+  namespace: llm-inference
+spec:
+  clusterIP: None
+  selector:
+    app: llm-inference
+  ports:
+  - name: nccl
+    port: 29500
+    protocol: TCP

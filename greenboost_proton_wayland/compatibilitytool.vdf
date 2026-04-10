@@ -1,0 +1,13 @@
+"compatibilitytools"
+{
+  "compat_tools"
+  {
+    "greenboost-proton"
+    {
+      "install_path" "."
+      "display_name" "GreenBoost Proton"
+      "from_oslist"  "windows"
+      "to_oslist"    "linux"
+    }
+  }
+}

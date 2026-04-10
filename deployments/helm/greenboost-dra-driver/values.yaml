@@ -1,0 +1,113 @@
+# GreenBoost DRA Driver Values
+#
+# This configures the GreenBoost kubelet plugin and DRA feature for dynamic resource allocation
+
+image:
+  repository: ferrand/greenboost-dra-driver
+  tag: "3.0.0"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Kubelet plugin configuration
+kubeletPlugin:
+  # Directory where kubelet plugin socket is registered
+  kubeletRegistrarDirectoryPath: "/var/lib/kubelet/plugins_registry"
+  # Directory where kubelet plugin serves DRA requests
+  kubeletPluginsDirectoryPath: "/var/lib/kubelet/plugins"
+
+# GreenBoost kernel module parameters
+greenboost:
+  enable: true
+  
+  # Memory tier configuration
+  physicalVramGb: 256        # 8× V100 32GB aggregated via NVLink
+  virtualVramGb: 307        # T2 DDR pool (~307 GB)
+  safetyReserveGb: 20
+  nvmeSwapGb: 0             # Rely on Lustre for T3
+  useHugepages: false      # ECC DDR4 may limit THP
+  pcoresOnly: false
+  
+  # NVLink pooling
+  nvlinkPool: true
+  
+  # Tier 3 backend: lustre, nvme, gpfs
+  tier3Backend: "lustre"
+  
+  # CUDA 13 async alloc (disabled for V100 cc 7.0)
+  cuMemAllocAsync: false
+  
+  # Profile name
+  profileName: "v100_cluster_node"
+
+# DRA device class configuration
+deviceClass:
+  # Expose greenboost.nvidia.com device class
+  enabled: true
+  
+# Resource class configuration
+resources:
+  gpus:
+    enabled: true
+    # Enable GPU resource allocation alongside nvidia-dra-driver-gpu
+  
+# Metrics exporter configuration
+metricsExporter:
+  enabled: true
+  port: 8080
+  path: "/metrics"
+  
+  # Prometheus scraping interval
+  interval: "15s"
+  
+  # Resources for metrics exporter
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "100m"
+      memory: "128Mi"
+
+# Feature gates
+featureGates:
+  # Enable compute domain aware tiering
+  ComputeDomainAwareTiering: true
+  
+  # Enable NVLink fabric monitoring
+  NVLinkFabricMonitor: true
+  
+  # Enable Prometheus metrics
+  PrometheusMetrics: true
+
+# Security context
+securityContext:
+  runAsUser: 0
+  runAsGroup: 0
+  fsGroup: 0
+
+# Pod security context
+podSecurityContext:
+  runAsNonRoot: false
+  
+# Node selector
+nodeSelector:
+  accelerator: nvidia-tesla-v100
+
+# Tolerations
+tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+
+# Affinity (optional)
+affinity: {}
+
+# Service account
+serviceAccount:
+  create: true
+  name: greenboost-dra-driver
+
+# RBAC
+rbac:
+  create: true
