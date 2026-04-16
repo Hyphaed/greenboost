@@ -2,10 +2,12 @@
 
 **Author:** Ferran Duarri  
 **License:** GPL v2 (open-source)  
-**Version:** 2.8.1
+**Version:** 2.8.2
 
 <div align="center">
+
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/greenboost)
+
 </div>
 
 ---

@@ -1,4 +1,4 @@
-# GreenBoost v2.8.1 — Kernel module + CUDA shim build system
+# GreenBoost v2.8.2 — Kernel module + CUDA shim build system
 # Author: Ferran Duarri
 #
 # Kbuild file handles kernel-internal rules (obj-m, ccflags-y).
@@ -13,7 +13,7 @@ AUDIT   := libgreenboost_audit.so
 AUDIT32 := libgreenboost_audit32.so
 VULKAN  := libVkLayer_greenboost.so
 MODULE  := greenboost.ko
-GB_VERSION := 2.8.1
+GB_VERSION := 2.8.2
 
 PHYS_GB    ?= 0
 VIRT_GB    ?= 0
@@ -235,5 +235,5 @@ status:
 	@sudo dmesg 2>/dev/null | grep greenboost | tail -10 | sed 's/^/  /' || echo "  (requires sudo to read dmesg)"
 
 help:
-	@echo "GreenBoost v2.8.1 — make [module|shim|audit|vulkan|clean|install|load|unload|reload|status]"
+	@echo "GreenBoost v2.8.2 — make [module|shim|audit|vulkan|clean|install|load|unload|reload|status]"
 	@echo "  T1=$(PHYS_GB)GB VRAM  T2=$(VIRT_GB)GB DDR  T3=$(NVME_GB)GB NVMe"
