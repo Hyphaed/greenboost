@@ -37,6 +37,9 @@
 #define GB_ALLOC_KV_COMPRESSED (1u << 6)  /* TurboQuant-compressed KV cache buffer;
 					 * compressed representation — allows
 					 * 3-7× more KV history in T2/T3       */
+#define GB_ALLOC_SESSION_PROTECTED (1u << 7) /* session-protected: skipped by
+					 * auto-eviction until all unprotected
+					 * candidates are exhausted             */
 
 /* Allocate a pinned system RAM buffer; returns a DMA-BUF fd the GPU can import */
 struct gb_alloc_req {
@@ -102,6 +105,9 @@ struct gb_madvise_req {
 #define GB_MADVISE_T1_PREFER 3   /* mark as T1-priority (KV-like); moves to
 				  * LRU head, sets t1_priority — weight bufs
 				  * are evicted before T1-priority bufs          */
+#define GB_MADVISE_SESSION_PROTECT 4 /* protect this buffer from auto-eviction
+				  * until all unprotected candidates are gone    */
+#define GB_MADVISE_SESSION_DEMOTE  5 /* remove session-protection from buffer */
 
 /* Evict request — push a T2 buffer to T3 (NVMe swap) immediately */
 struct gb_evict_req {
@@ -152,7 +158,10 @@ struct gb_turboquant_req {
 };
 
 /* Dynamic T2 pool cap — set this at startup to cap the T2 DDR RAM pool based
- * on currently available system RAM (80% of free RAM minus safety_reserve_gb).
+ * on currently available system RAM:
+ *   systems with < 64 GB RAM: 70% of total RAM
+ *   systems with >= 64 GB RAM: 80% of total RAM
+ * minus safety_reserve_gb, enforced dynamically by the watchdog.
  * This allows T2 to shrink automatically when other workloads consume RAM,
  * preventing OOM.
  *
@@ -233,6 +242,25 @@ struct gb_t3_cap_req {
 	gb_u64 prev_mb;  /* previous cap in MB                  (out) */
 };
 #define GB_IOCTL_SET_T3_CAP       _IOWR(GB_IOCTL_MAGIC, 17, struct gb_t3_cap_req)
+
+/* Session priority management — inspired by dmem cgroup foreground-booster.
+ *
+ * GB_IOCTL_SESSION_IDLE:   move all T2 buffers owned by caller's PID to LRU
+ *   tail so they become preferred eviction candidates under pressure.  Call
+ *   this when the inference session transitions to idle (no new requests).
+ *
+ * GB_IOCTL_SESSION_ACTIVE: move all T2 buffers owned by caller's PID to LRU
+ *   head so they are evicted last.  Call this when a new inference request
+ *   arrives and the session transitions back to active.
+ *
+ * pid == 0 means the calling process's own PID.  pid != 0 requires CAP_SYS_ADMIN.
+ */
+struct gb_session_req {
+	gb_u32 pid;      /* 0 = caller's own PID */
+	gb_u32 reserved; /* must be zero         */
+};
+#define GB_IOCTL_SESSION_IDLE   _IOW(GB_IOCTL_MAGIC, 18, struct gb_session_req)
+#define GB_IOCTL_SESSION_ACTIVE _IOW(GB_IOCTL_MAGIC, 19, struct gb_session_req)
 
 /* Swap pressure thresholds (T3 NVMe) */
 #define GB_SWAP_PRESSURE_OK       0

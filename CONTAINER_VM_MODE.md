@@ -123,7 +123,7 @@ It provides the best possible bandwidth and the most robust integration:
   — something a pure-userspace path cannot do.
 
 - **T3 NVMe tier.** The kernel module manages the Tier 3 NVMe overflow pool
-  (`/swap_nvme.img`), which can extend the effective memory to hundreds of
+  (`/var/lib/greenboost/t3_store`), which can extend the effective memory to hundreds of
   gigabytes.  Path B has no T3 equivalent — when System DDR is exhausted it falls
   back to Path C (UVM paging to swap), which is slower and less controlled.
 

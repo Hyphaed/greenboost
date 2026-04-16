@@ -2,6 +2,21 @@
 
 ---
 
+## v2.8.2 : 2026-04-16
+
+⚠️🔥 Crtitical stability fixes
+Critical fixes to bring back greenboost stability.
+Greenboost v2.8 was a rushed version, was a must to make changes to follow NVidia trademark compliance, hence a developer version was released.
+
+🧩  Smarter Installation Process
+Refactored installation process and cleaned code. Old versions included extra tools that are now part of an unreleased developer/test suite. Both the Full Install and new Light Install options are now lighter.
+Enhanced missing software detection for Debian, Ubuntu, Fedora, and Arch.
+Fixed code that pointed to Intel dependencies when users had AMD CPUs.
+Backported lightweight installation option from older version. If you only want the core memory management update without system-wide performance tuning, you can now choose "Light Install."
+Added guards for old kernels.
+
+---
+
 ## v2.8 : 2026-04-10
 
 On Friday, April 3rd, I had a bicycle accident while jumping some hills.

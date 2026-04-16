@@ -256,15 +256,25 @@ static uint64_t gbvk_now_ms(void)
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* Called after each successful T2/T3 alloc. Updates burst state. */
+/* Called after each successful T2/T3 alloc. Updates burst state.
+ * On the first alloc of a new burst, promote this session to SESSION_ACTIVE
+ * so the kernel kernel evicts its buffers last under AI-inference pressure. */
 static void gbvk_burst_record(void)
 {
     uint64_t now = gbvk_now_ms();
     uint64_t prev = atomic_load(&g_gbvk_last_alloc_ms);
     atomic_store(&g_gbvk_last_alloc_ms, now);
 
-    if (!atomic_load(&g_gbvk_burst_active) || (now - prev < GBVK_BURST_QUIET_MS)) {
+    int was_active = atomic_load(&g_gbvk_burst_active);
+    if (!was_active || (now - prev >= GBVK_BURST_QUIET_MS)) {
+        /* New burst starting — promote session to LRU head */
         atomic_store(&g_gbvk_burst_active, 1);
+        int fd = gbvk_dev_fd();
+        if (fd >= 0) {
+            struct gb_session_req sr = { .pid = 0, .reserved = 0 };
+            ioctl(fd, GB_IOCTL_SESSION_ACTIVE, &sr);
+            gbvk_dbg("burst start: SESSION_ACTIVE sent");
+        }
     }
 }
 
@@ -300,6 +310,14 @@ static void gbvk_burst_check(void)
     atomic_store(&g_gbvk_burst_active, 0);
     if (marked)
         gbvk_log("burst ended: marked %u allocs HOT (game working set)", marked);
+
+    /* Keep session active during gameplay — the working set is in T2 and
+     * must not be evicted by a concurrent AI inference session. */
+    if (fd >= 0 && marked > 0) {
+        struct gb_session_req sr = { .pid = 0, .reserved = 0 };
+        ioctl(fd, GB_IOCTL_SESSION_ACTIVE, &sr);
+        gbvk_dbg("burst ended: SESSION_ACTIVE maintained for gameplay working set");
+    }
 }
 
 /* ── Runtime init ─────────────────────────────────────────────────────── */
@@ -413,6 +431,10 @@ static void gbvk_fini(void)
 
     int fd = g_gbvk_dev_fd;
     if (fd >= 0) {
+        /* Demote session priority before releasing — signals to any concurrent
+         * session that we are no longer competing for T2 space. */
+        struct gb_session_req sr = { .pid = 0, .reserved = 0 };
+        ioctl(fd, GB_IOCTL_SESSION_IDLE, &sr);
         /* Release all buffers owned by this process. */
         struct gb_release_pid_req r = { .pid = 0 };
         ioctl(fd, GB_IOCTL_RELEASE_PID, &r);
@@ -673,10 +695,13 @@ gbvk_AllocateMemory(VkDevice                       device,
                    pAllocInfo->allocationSize >= 256ULL * 1024ULL * 1024ULL);
 
     if (!skip_t2) {
+        /* Gaming T2 allocs are marked SESSION_PROTECTED so an AI inference
+         * session running concurrently (e.g. background Ollama) cannot evict
+         * the game's texture working set from T2 DDR. */
         VkResult t2_res = gbvk_try_dmabuf_alloc(
             device, pAllocInfo, pAllocator, pMemory,
             fn_alloc, fn_fd_props, &mem_props,
-            GB_ALLOC_WEIGHTS, 2);
+            GB_ALLOC_WEIGHTS | GB_ALLOC_SESSION_PROTECTED, 2);
         if (t2_res == VK_SUCCESS) return VK_SUCCESS;
     } else {
         gbvk_dbg("AllocateMemory: T2 skipped (CRITICAL pressure), %llu MB → T3 direct",

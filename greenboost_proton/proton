@@ -151,6 +151,53 @@ def _detect_cpu():
     return total_threads, total_threads, cpu_model, p_core_cpus
 
 
+def _purge_foz_pipeline_cache(gameid):
+    """Delete steamapprun fossilize pipeline cache entries for a game.
+
+    Called after a DXR state transition so stale pipelines (compiled without
+    DXR, or with DXR when it is now disabled) are not replayed at startup.
+    A marker file prevents repeated deletions on every launch.
+    """
+    import shutil
+    shadercache = os.path.expanduser(
+        f"~/.local/share/Steam/steamapps/shadercache/{gameid}"
+    )
+    marker = os.path.join(shadercache, ".greenboost_dxr_cache_purged")
+    if os.path.exists(marker):
+        return
+    foz_root = os.path.join(shadercache, "fozpipelinesv6")
+    if not os.path.isdir(foz_root):
+        try:
+            os.makedirs(shadercache, exist_ok=True)
+            open(marker, "w").close()
+        except Exception:
+            pass
+        return
+    cleaned = 0
+    for entry in os.listdir(foz_root):
+        if entry.startswith("steamapprun_pipeline_cache."):
+            target = os.path.join(foz_root, entry)
+            try:
+                if os.path.isdir(target):
+                    shutil.rmtree(target)
+                else:
+                    os.remove(target)
+                cleaned += 1
+            except Exception as e:
+                sys.stderr.write(
+                    f"[greenboost-proton] WARNING: could not remove {target}: {e}\n"
+                )
+    try:
+        open(marker, "w").close()
+    except Exception:
+        pass
+    if cleaned:
+        sys.stderr.write(
+            f"[greenboost-proton] Cleared {cleaned} stale DXR pipeline cache(s)"
+            f" for AppID {gameid}\n"
+        )
+
+
 def _restore_ue5_rt(gameid):
     """Remove GreenBoost-written RT disable keys from Engine.ini.
 
@@ -173,6 +220,12 @@ def _restore_ue5_rt(gameid):
     )
     config_dir = os.path.join(compat_root, app_name, "Saved", "Config", config_subdir)
     engine_ini = os.path.join(config_dir, "Engine.ini")
+
+    # Purge stale fossilize pipeline cache whenever DXR is being re-enabled.
+    # Runs once (idempotent via its own marker), independently of the Engine.ini
+    # restoration below — covers the case where a previous launch crashed after
+    # writing .greenboost_rt_restored but before the cache was cleaned.
+    _purge_foz_pipeline_cache(gameid)
 
     if not os.path.isfile(engine_ini):
         return

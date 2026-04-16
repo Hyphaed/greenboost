@@ -827,6 +827,23 @@ static inline size_t gb_effective_t2_cap(void)
     return gb_t2_pool_bytes;
 }
 
+/* T2 DDR headroom to advertise as free "virtual VRAM" in cuMemGetInfo / NVML hooks.
+ * = T2 pool cap − already committed (Path A/B + UVM estimate) − safety reserve.
+ * T3 (NVMe) is intentionally excluded: it is capacity for model loading, not
+ * fast memory suitable for KV cache; including it inflates context-length
+ * calculations and causes the KV cache to exceed available system RAM (OOM). */
+static size_t gb_t2_free_to_report(void)
+{
+    if (gb_t2_pool_bytes == 0)
+        return gb_virtual_vram_bytes;   /* no T2 info — keep legacy behaviour */
+    size_t t2_used  = atomic_load_explicit(&gb_t2_overflow_bytes,       memory_order_relaxed);
+    size_t uvm_used = atomic_load_explicit(&gb_uvm_estimated_ram_bytes, memory_order_relaxed);
+    size_t committed = t2_used + uvm_used;
+    size_t cap = (gb_t2_pool_bytes > gb_safety_reserve_bytes)
+                  ? (gb_t2_pool_bytes - gb_safety_reserve_bytes) : 0;
+    return (cap > committed) ? (cap - committed) : 0;
+}
+
 /* Idle timeout: if no overflow alloc occurs for this many ms while in STEADY
  * phase, transition to GB_PHASE_IDLE.  Override with GREENBOOST_IDLE_TIMEOUT_MS
  * env var; 0 = disabled. */
@@ -968,12 +985,22 @@ static void gb_check_idle_phase(void)
                 gb_log("Phase → DEEP_IDLE (GPU fully idle for %llu ms — skipping IDLE dwell) — signalling reclaim daemon",
                        (unsigned long long)(now - last));
                 gb_write_phase_file((int)GB_PHASE_DEEP_IDLE, now - last);
+                /* Demote all our T2 buffers to LRU tail — idle session yields
+                 * to any concurrent active session under memory pressure. */
+                if (gb_dev_fd >= 0) {
+                    struct gb_session_req sr = { .pid = 0, .reserved = 0 };
+                    ioctl(gb_dev_fd, GB_IOCTL_SESSION_IDLE, &sr);
+                }
             } else {
                 atomic_store_explicit(&g_idle_entered_ms, now,                memory_order_relaxed);
                 atomic_store_explicit(&g_alloc_phase,     (int)GB_PHASE_IDLE, memory_order_relaxed);
                 gb_log("Phase → IDLE (no overflow for %llu ms, native allocs still active)",
                        (unsigned long long)ito);
                 gb_write_phase_file((int)GB_PHASE_IDLE, now - last);
+                if (gb_dev_fd >= 0) {
+                    struct gb_session_req sr = { .pid = 0, .reserved = 0 };
+                    ioctl(gb_dev_fd, GB_IOCTL_SESSION_IDLE, &sr);
+                }
             }
         }
         return;
@@ -986,6 +1013,7 @@ static void gb_check_idle_phase(void)
             gb_log("Phase → DEEP_IDLE (idle for %llu ms) — signalling reclaim daemon",
                    (unsigned long long)(now - entered));
             gb_write_phase_file((int)GB_PHASE_DEEP_IDLE, now - entered);
+            /* Already in IDLE — SESSION_IDLE was sent then; no repeat needed. */
         }
     }
 }
@@ -1101,6 +1129,12 @@ static uint32_t gb_phase_classify(size_t bytesize)
                phase == (int)GB_PHASE_DEEP_IDLE ? "DEEP_IDLE" : "IDLE",
                bytesize >> 20);
         gb_write_phase_file((int)GB_PHASE_MODEL_LOAD, 0);
+        /* Session is active again — promote our T2 buffers back to LRU head
+         * so they are evicted last if another session competes for T2 space. */
+        if (gb_dev_fd >= 0) {
+            struct gb_session_req sr = { .pid = 0, .reserved = 0 };
+            ioctl(gb_dev_fd, GB_IOCTL_SESSION_ACTIVE, &sr);
+        }
         return GB_ALLOC_WEIGHTS;
 
     /* All six enum values are covered above. */
@@ -2684,14 +2718,20 @@ path_c_uvm:
      * safety_reserve_gb and will happily fault pages until the system OOM-kills everything.
      *
      * Estimate the portion of this UVM alloc that will demand-fault into system RAM:
-     *   ram_demand = bytesize − (physical_vram × 85%)
-     * We discount VRAM to 85% because ~15% is used for KV cache, compute scratch,
-     * and driver overhead.  The estimate is conservative (overestimates RAM demand),
-     * which is the safe direction.  Also account for prior UVM allocs already in flight. */
+     *   usable_vram = actual free VRAM (from cuMemGetInfo cache) minus headroom.
+     *   Fallback: physical_vram × 85% when the cache is not yet populated.
+     * Using cached free VRAM instead of total physical VRAM is critical: when VRAM
+     * is already full of model weights, cached_free ≈ 0, so ram_demand ≈ bytesize
+     * and the safety guard fires correctly.  The old physical×85% estimate made
+     * ram_demand ≈ 0 for 10 GB allocs on a 12 GB GPU that was already full, letting
+     * UVM proceed and exhaust system RAM (OOM kill). */
     {
         size_t mem_avail = gb_get_mem_available();
         if (mem_avail > 0) {
-            size_t usable_vram = (size_t)(gb_physical_vram_bytes * 85ULL / 100ULL);
+            size_t _cf = atomic_load_explicit(&g_cached_free_vram, memory_order_relaxed);
+            size_t usable_vram = (_cf > 0)
+                ? ((_cf > vram_headroom_bytes) ? _cf - vram_headroom_bytes : 0)
+                : (size_t)(gb_physical_vram_bytes * 85ULL / 100ULL);
             size_t ram_demand  = (bytesize > usable_vram) ? (bytesize - usable_vram) : 0;
             size_t uvm_cumul   = atomic_load_explicit(&gb_uvm_estimated_ram_bytes, memory_order_relaxed);
             size_t total_needed = ram_demand + uvm_cumul;
@@ -2748,9 +2788,13 @@ path_c_uvm:
             ht_insert(*dptr, bytesize, 1 /* UVM */, -1, NULL, -1, NULL);
             ht_set_flags(*dptr, alloc_flags);
             /* Track estimated system RAM demand — mirrors the MemAvailable guard above.
-             * Decremented on cuMemFree_v2 / cuMemFreeAsync when managed == 1. */
+             * Decremented on cuMemFree_v2 / cuMemFreeAsync when managed == 1.
+             * Use same cached-free-VRAM estimate for consistency with the guard. */
             {
-                size_t usable_vram = (size_t)(gb_physical_vram_bytes * 85ULL / 100ULL);
+                size_t _cf2 = atomic_load_explicit(&g_cached_free_vram, memory_order_relaxed);
+                size_t usable_vram = (_cf2 > 0)
+                    ? ((_cf2 > vram_headroom_bytes) ? _cf2 - vram_headroom_bytes : 0)
+                    : (size_t)(gb_physical_vram_bytes * 85ULL / 100ULL);
                 size_t est_ram = (bytesize > usable_vram) ? (bytesize - usable_vram) : 0;
                 atomic_fetch_add_explicit(&gb_uvm_estimated_ram_bytes, est_ram, memory_order_relaxed);
                 gb_log("Path C (UVM): %zu MB at 0x%llx (est_ram=%zu MB, uvm_cumul=%zu MB)",
@@ -2844,6 +2888,18 @@ CUresult cuMemCreate(CUmemGenericAllocationHandle *handle, size_t size,
                 return CUDA_ERROR_OUT_OF_MEMORY;
             }
         }
+        /* T2 inference cap — same 88% threshold as Paths A/B (gb_effective_t2_cap).
+         * Prevents VMM host-pinned KV cache from consuming DDR past the safe margin
+         * before the 4 GB safety reserve kicks in. */
+        {
+            size_t t2_used = atomic_load_explicit(&gb_t2_overflow_bytes, memory_order_relaxed);
+            size_t eff_cap = gb_effective_t2_cap();
+            if (eff_cap > 0 && (t2_used >= eff_cap || size > eff_cap - t2_used)) {
+                gb_log("cuMemCreate VMM skip: T2 inference cap %zu/%zu MB, req %zu MB",
+                       t2_used >> 20, eff_cap >> 20, size >> 20);
+                return CUDA_ERROR_OUT_OF_MEMORY;
+            }
+        }
 
         CUmemAllocationProp host_prop = *prop;
         host_prop.location.type = CU_MEM_LOCATION_TYPE_HOST;
@@ -2916,9 +2972,13 @@ CUresult cuMemFree_v2(CUdeviceptr dptr)
          * calling cuMemFree on it is invalid and causes a CUDA driver error.
          * Only call the real free for UVM / regular device allocations. */
         if (!mapped_ptr) {
-            /* Decrement UVM estimated RAM tracker for Path C allocs. */
+            /* Decrement UVM estimated RAM tracker for Path C allocs.
+             * Use same formula as alloc-time tracking for symmetry. */
             if (managed) {
-                size_t usable_vram = (size_t)(gb_physical_vram_bytes * 85ULL / 100ULL);
+                size_t _cf3 = atomic_load_explicit(&g_cached_free_vram, memory_order_relaxed);
+                size_t usable_vram = (_cf3 > 0)
+                    ? ((_cf3 > vram_headroom_bytes) ? _cf3 - vram_headroom_bytes : 0)
+                    : (size_t)(gb_physical_vram_bytes * 85ULL / 100ULL);
                 size_t est_ram = (sz > usable_vram) ? (sz - usable_vram) : 0;
                 atomic_fetch_sub_explicit(&gb_uvm_estimated_ram_bytes, est_ram, memory_order_relaxed);
             }
@@ -3185,11 +3245,18 @@ CUresult cuMemGetInfo_v2(size_t *free_out, size_t *total_out)
     if (ret != CUDA_SUCCESS)
         return ret;
 
-    if (free_out)  *free_out  = real_free  + gb_virtual_vram_bytes;
+    /* total = real VRAM + full virtual pool (T2+T3) — keeps all model layers on GPU.
+     * free  = real VRAM free + T2 DDR available only (excludes T3 NVMe):
+     *   T3 is capacity for model loading, not fast memory for KV cache.
+     *   Reporting T3 as "free" causes callers (ollama) to set a context length
+     *   whose KV cache exceeds available system RAM and triggers an OOM kill. */
+    if (free_out)  *free_out  = real_free  + gb_t2_free_to_report();
     if (total_out) *total_out = real_total + gb_virtual_vram_bytes;
 
-    gb_log("cuMemGetInfo_v2: real_free=%zuMB → virtual_free=%zuMB",
-           real_free >> 20, (real_free + gb_virtual_vram_bytes) >> 20);
+    gb_log("cuMemGetInfo_v2: real_free=%zuMB t2_free=%zuMB → virtual_free=%zuMB total=%zuMB",
+           real_free >> 20, gb_t2_free_to_report() >> 20,
+           (real_free + gb_t2_free_to_report()) >> 20,
+           (real_total + gb_virtual_vram_bytes) >> 20);
     return CUDA_SUCCESS;
 }
 
@@ -3212,11 +3279,14 @@ cudaError_t cudaMemGetInfo(size_t *free_out, size_t *total_out)
     if (ret != CUDA_SUCCESS)
         return (cudaError_t)ret;
 
-    if (free_out)  *free_out  = real_free  + gb_virtual_vram_bytes;
+    /* Same split as cuMemGetInfo_v2: free = T2 available only; total = T2+T3 capacity. */
+    if (free_out)  *free_out  = real_free  + gb_t2_free_to_report();
     if (total_out) *total_out = real_total + gb_virtual_vram_bytes;
 
-    gb_log("cudaMemGetInfo: real_free=%zuMB → virtual_free=%zuMB",
-           real_free >> 20, (real_free + gb_virtual_vram_bytes) >> 20);
+    gb_log("cudaMemGetInfo: real_free=%zuMB t2_free=%zuMB → virtual_free=%zuMB total=%zuMB",
+           real_free >> 20, gb_t2_free_to_report() >> 20,
+           (real_free + gb_t2_free_to_report()) >> 20,
+           (real_total + gb_virtual_vram_bytes) >> 20);
     return CUDA_SUCCESS;
 }
 
@@ -3278,11 +3348,12 @@ nvmlReturn_t nvmlDeviceGetMemoryInfo(nvmlDevice_t device, nvmlMemory_t *memory)
 
     ret = real_nvmlDeviceGetMemoryInfo(device, memory);
     if (ret == NVML_SUCCESS && memory) {
-        gb_log("nvmlDeviceGetMemoryInfo: real_total=%lluMB → virtual_total=%lluMB",
+        gb_log("nvmlDeviceGetMemoryInfo: real_total=%lluMB → virtual_total=%lluMB t2_free=%zuMB",
                memory->total >> 20,
-               (memory->total + gb_virtual_vram_bytes) >> 20);
+               (memory->total + gb_virtual_vram_bytes) >> 20,
+               gb_t2_free_to_report() >> 20);
         memory->total += gb_virtual_vram_bytes;
-        memory->free  += gb_virtual_vram_bytes;
+        memory->free  += gb_t2_free_to_report();
     }
     return ret;
 }
@@ -3296,11 +3367,12 @@ nvmlReturn_t nvmlDeviceGetMemoryInfo_v2(nvmlDevice_t device, nvmlMemory_v2_t *me
 
     ret = real_nvmlDeviceGetMemoryInfo_v2(device, memory);
     if (ret == NVML_SUCCESS && memory) {
-        gb_log("nvmlDeviceGetMemoryInfo_v2: real_total=%lluMB → virtual_total=%lluMB",
+        gb_log("nvmlDeviceGetMemoryInfo_v2: real_total=%lluMB → virtual_total=%lluMB t2_free=%zuMB",
                memory->total >> 20,
-               (memory->total + gb_virtual_vram_bytes) >> 20);
+               (memory->total + gb_virtual_vram_bytes) >> 20,
+               gb_t2_free_to_report() >> 20);
         memory->total += gb_virtual_vram_bytes;
-        memory->free  += gb_virtual_vram_bytes;
+        memory->free  += gb_t2_free_to_report();
     }
     return ret;
 }
@@ -3322,11 +3394,12 @@ nvmlReturn_t nvmlDeviceGetMemoryInfo_v3(nvmlDevice_t device, nvmlMemory_v3_t *me
 
     ret = real_nvmlDeviceGetMemoryInfo_v3(device, memory);
     if (ret == NVML_SUCCESS && memory) {
-        gb_log("nvmlDeviceGetMemoryInfo_v3: real_total=%lluMB → virtual_total=%lluMB",
+        gb_log("nvmlDeviceGetMemoryInfo_v3: real_total=%lluMB → virtual_total=%lluMB t2_free=%zuMB",
                memory->total >> 20,
-               (memory->total + gb_virtual_vram_bytes) >> 20);
+               (memory->total + gb_virtual_vram_bytes) >> 20,
+               gb_t2_free_to_report() >> 20);
         memory->total += gb_virtual_vram_bytes;
-        memory->free  += gb_virtual_vram_bytes;
+        memory->free  += gb_t2_free_to_report();
     }
     return ret;
 }
@@ -3381,9 +3454,13 @@ CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream hStream)
             /* DMA-BUF / HostReg allocs: dptr came from cuMemHostGetDevicePointer,
              * not cuMemAlloc — must not pass to cuMemFreeAsync. */
             if (!mapped_ptr && real_cuMemFreeAsync) {
-                /* Decrement UVM estimated RAM tracker for Path C allocs. */
+                /* Decrement UVM estimated RAM tracker for Path C allocs.
+                 * Use same formula as alloc-time tracking for symmetry. */
                 if (managed) {
-                    size_t usable_vram = (size_t)(gb_physical_vram_bytes * 85ULL / 100ULL);
+                    size_t _cf4 = atomic_load_explicit(&g_cached_free_vram, memory_order_relaxed);
+                    size_t usable_vram = (_cf4 > 0)
+                        ? ((_cf4 > vram_headroom_bytes) ? _cf4 - vram_headroom_bytes : 0)
+                        : (size_t)(gb_physical_vram_bytes * 85ULL / 100ULL);
                     size_t est_ram = (sz > usable_vram) ? (sz - usable_vram) : 0;
                     atomic_fetch_sub_explicit(&gb_uvm_estimated_ram_bytes, est_ram, memory_order_relaxed);
                 }

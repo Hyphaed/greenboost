@@ -1,13 +1,11 @@
 # GreenBoost — integration guide for inference tools
 
-Check [greenboost_commands.md](greenboost_commands.md) for all the available commands
-Check [architecture.md](architecture.md) to know about greenboost architecture
+Check [GREENBOOST_COMMANDS.md](GREENBOOST_COMMANDS.md) for all the available commands
+Check [ARCHITECTURE.md](ARCHITECTURE.md) to know about greenboost architecture
 
 ## How GreenBoost hooks in
 
-GreenBoost works by intercepting `cudaMalloc` and related CUDA symbols via `LD_PRELOAD`,
-plus intercepting `dlsym` so that virtual VRAM figures (65 GB) are returned to any app
-that queries VRAM size at runtime through `dlopen`+`dlsym`.
+GreenBoost works by intercepting `cudaMalloc` and related CUDA symbols via `LD_PRELOAD`, plus intercepting `dlsym` so that the virtual VRAM total (T1 VRAM + T2 DDR pool, computed from detected hardware) is returned to any app that queries VRAM size at runtime through `dlopen`+`dlsym`.
 
 The shim loads system-wide via `/etc/ld.so.preload` but stays **inert** until
 `GREENBOOST_ACTIVE=1` is set. In **interactive login shells** (terminal, SSH),
@@ -132,8 +130,8 @@ greenboost run python your_transformers_script.py
 ```
 
 With `device_map="auto"`, Transformers queries available VRAM before placing layers.
-GreenBoost reports 63 GB, so the full model is placed on the "GPU" (T1+T2) instead of
-being split to CPU:
+GreenBoost reports the detected T1+T2 total, so the full model is placed on the "GPU"
+(T1+T2) instead of being split to CPU:
 
 ```python
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -142,7 +140,7 @@ import torch
 model = AutoModelForCausalLM.from_pretrained(
     "/opt/models/glm-4.7-flash-hf",
     torch_dtype=torch.bfloat16,
-    device_map="auto",          # sees 65 GB — loads entire model onto T1+T2
+    device_map="auto",          # sees T1+T2 total — loads entire model onto T1+T2
 )
 tokenizer = AutoTokenizer.from_pretrained("/opt/models/glm-4.7-flash-hf")
 
@@ -236,42 +234,34 @@ For custom inference loops where you know exactly which tensors are KV cache, us
 freezes them in T2's LRU and refuses T3 spill:
 
 ```python
-import ctypes, fcntl, struct, os
+import fcntl, struct, os
 from pathlib import Path
 
-# GB_IOCTL_MADVISE = _IOWR('G', 8, struct gb_madvise_req)
-_IOC_MADVISE = (3 << 30) | (ord('G') << 8) | 8 | (16 << 16)
-GB_ALLOC_KV_CACHE    = 1 << 1
-GB_ALLOC_T1_PRIORITY = 1 << 5
+# GB_IOCTL_MADVISE = _IOW('G', 4, struct gb_madvise_req)  — 8 bytes
+_IOC_MADVISE     = (1 << 30) | (ord('G') << 8) | 4 | (8 << 16)
+GB_MADVISE_T1_PREFER = 3   # mark as T1-priority: freeze in T2 LRU, refuse T3 spill
 
-def gb_mark_kv(cuda_ptr: int, size: int) -> None:
+def gb_mark_kv(buf_fd: int) -> None:
     """
-    Tell GreenBoost that `cuda_ptr` is a KV cache buffer.
-    Must be called after cudaMalloc returns the pointer.
+    Tell GreenBoost that buf_fd (DMA-BUF fd from GB_IOCTL_ALLOC) is a KV cache buffer.
     Kernel will: freeze in T2 LRU, refuse T3 spill, set t1_priority.
+    buf_fd is the fd returned by GB_IOCTL_ALLOC (stored in gb_alloc_req.fd).
     """
     dev = Path("/dev/greenboost")
     if not dev.exists():
         return
-    # struct gb_madvise_req { u64 dev_ptr; u64 size; u32 flags; u32 _pad; }
-    buf = struct.pack("QQII", cuda_ptr, size, GB_ALLOC_KV_CACHE | GB_ALLOC_T1_PRIORITY, 0)
+    # struct gb_madvise_req { s32 buf_id; u32 advise; }
+    buf = struct.pack("iI", buf_fd, GB_MADVISE_T1_PREFER)
     fd  = os.open(str(dev), os.O_RDWR)
     try:
         fcntl.ioctl(fd, _IOC_MADVISE, buf)
     finally:
         os.close(fd)
 
-# Usage with PyTorch
-import torch
-
-# Allocate KV tensors after model weights are loaded
-kv_keys   = torch.zeros(n_layers, seq_len, n_heads, head_dim,
-                        dtype=torch.float16, device="cuda")
-kv_values = torch.zeros_like(kv_keys)
-
-# Mark them so GreenBoost treats them as T1-priority, never evicts to T3
-gb_mark_kv(kv_keys.data_ptr(),   kv_keys.nbytes)
-gb_mark_kv(kv_values.data_ptr(), kv_values.nbytes)
+# Usage with PyTorch (via ExLlamaV3 native IOCTL path)
+# buf_fd is obtained from GB_IOCTL_ALLOC, not from cudaMalloc.
+# For pure-PyTorch workflows, use GREENBOOST_KV_OVERFLOW=1 or the
+# phase detector (automatic) instead of calling this directly.
 ```
 
 ### Optimal loading order
@@ -303,8 +293,8 @@ If your script loads KV cache before or interleaved with weights, set
 ## Hugging Face Transformers — direct KV cache control
 
 Transformers uses PyTorch's CUDA allocator; GreenBoost intercepts all `cudaMalloc`
-calls. `device_map="auto"` queries VRAM size — GreenBoost reports 65 GB, so the full
-model is placed on T1+T2 instead of being split to CPU.
+calls. `device_map="auto"` queries VRAM size — GreenBoost reports the detected T1+T2
+total, so the full model is placed on T1+T2 instead of being split to CPU.
 
 ```bash
 GREENBOOST_ACTIVE=1 LD_PRELOAD=/usr/local/lib/libgreenboost_cuda.so \
@@ -328,7 +318,7 @@ import torch
 model = AutoModelForCausalLM.from_pretrained(
     "/opt/models/glm-4.7-flash-hf",
     torch_dtype=torch.bfloat16,
-    device_map="auto",          # sees 65 GB — all layers on GPU
+    device_map="auto",          # sees T1+T2 total — all layers on GPU
     attn_implementation="flash_attention_2",   # requires OLLAMA_FLASH_ATTENTION=1 equivalent
 )
 tokenizer = AutoTokenizer.from_pretrained("/opt/models/glm-4.7-flash-hf")
@@ -434,6 +424,17 @@ ExecStart=python -m vllm.entrypoints.openai.api_server --model ...
 
 ---
 
+## Ollama 0.18+ and the CUDA VMM path
+
+Ollama 0.18+ switched its ggml CUDA backend from `cudaMalloc` to the CUDA Virtual Memory
+Management API (`cuMemCreate` → `cuMemMap` → `cuMemSetAccess`). GreenBoost intercepts
+`cuMemCreate` transparently — no configuration change is needed. When a `cuMemCreate`
+call fails due to T1 being full, the shim retries with `CU_MEM_LOCATION_TYPE_HOST`, which
+creates a pinned host-memory (system DDR) allocation the GPU accesses over PCIe — the
+same effective result as Path B, but initiated from within the VMM code path.
+
+---
+
 ## TensorFlow / Keras
 
 TensorFlow loads `libcuda.so` via `ctypes` when `tf.config.list_physical_devices("GPU")`
@@ -447,7 +448,7 @@ GREENBOOST_ACTIVE=1 LD_PRELOAD=/usr/local/lib/libgreenboost_cuda.so \
 ### Memory growth vs pre-allocation
 
 TensorFlow defaults to pre-allocating all GPU memory on startup. GreenBoost reports
-65 GB, which TF would try to allocate entirely — set memory growth instead:
+the detected T1+T2 total, which TF would try to allocate entirely — set memory growth instead:
 
 ```python
 import os
@@ -456,7 +457,7 @@ os.environ["GREENBOOST_ACTIVE"] = "1"
 
 import tensorflow as tf
 
-# Prevent TF from trying to allocate all 65 GB at once
+# Prevent TF from trying to allocate the entire T1+T2 virtual pool at once
 gpus = tf.config.list_physical_devices("GPU")
 for gpu in gpus:
     tf.config.experimental.set_memory_growth(gpu, True)
@@ -640,13 +641,58 @@ print('✓ KV fully in T1' if kv_t2 == 0 else f'⚠ KV spilling to T2 — increa
 
 ---
 
+## Session Priority Management
+
+For multi-model deployments where several inference processes share T2 DDR, GreenBoost
+provides two IOCTLs to control which process's buffers get evicted first when T2 runs low:
+
+| IOCTL | Cmd | Effect |
+|-------|-----|--------|
+| `GB_IOCTL_SESSION_IDLE` | 18 | Move all caller-PID T2 buffers to LRU tail — first to be evicted under pressure |
+| `GB_IOCTL_SESSION_ACTIVE` | 19 | Move all caller-PID T2 buffers to LRU head — last to be evicted |
+
+Call `SESSION_IDLE` when a model goes idle (no pending requests) and `SESSION_ACTIVE` when
+a new request arrives. This lets the active model keep its weights in T2 while the idle
+model's weights become eviction candidates.
+
+```python
+import fcntl, struct, os
+
+# GB_IOCTL_SESSION_IDLE   = _IOW('G', 18, struct gb_session_req)  — 8 bytes
+# GB_IOCTL_SESSION_ACTIVE = _IOW('G', 19, struct gb_session_req)  — 8 bytes
+_IOC_SESSION_IDLE   = (1 << 30) | (ord('G') << 8) | 18 | (8 << 16)
+_IOC_SESSION_ACTIVE = (1 << 30) | (ord('G') << 8) | 19 | (8 << 16)
+
+def gb_session_idle() -> None:
+    """Mark this process's T2 buffers as low priority (idle model)."""
+    _gb_session_ioctl(_IOC_SESSION_IDLE)
+
+def gb_session_active() -> None:
+    """Mark this process's T2 buffers as high priority (active model)."""
+    _gb_session_ioctl(_IOC_SESSION_ACTIVE)
+
+def _gb_session_ioctl(cmd: int) -> None:
+    dev = "/dev/greenboost"
+    if not os.path.exists(dev):
+        return
+    # struct gb_session_req { u32 pid; u32 reserved; }  — pid=0 means caller's PID
+    buf = struct.pack("II", 0, 0)
+    fd  = os.open(dev, os.O_RDWR)
+    try:
+        fcntl.ioctl(fd, cmd, buf)
+    finally:
+        os.close(fd)
+```
+
+---
+
 ## Verify GreenBoost is active
 
 ```bash
 # Should show T2 pool in use (non-zero) after loading a model larger than 12 GB:
 cat /sys/class/greenboost/greenboost/status
 
-# Confirm virtual VRAM is visible (should report ~65 GB, not 12 GB):
+# Confirm virtual VRAM is visible (should report T1+T2 total, not just physical VRAM):
 # From an interactive terminal — GREENBOOST_ACTIVE=1 is already set by profile.d
 python -c "
 import torch

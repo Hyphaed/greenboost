@@ -1,4 +1,4 @@
-# GreenBoost v2.8 — Kernel module + CUDA shim build system
+# GreenBoost v2.8.1 — Kernel module + CUDA shim build system
 # Author: Ferran Duarri
 #
 # Kbuild file handles kernel-internal rules (obj-m, ccflags-y).
@@ -13,7 +13,7 @@ AUDIT   := libgreenboost_audit.so
 AUDIT32 := libgreenboost_audit32.so
 VULKAN  := libVkLayer_greenboost.so
 MODULE  := greenboost.ko
-GB_VERSION := 2.8
+GB_VERSION := 2.8.1
 
 PHYS_GB    ?= 0
 VIRT_GB    ?= 0
@@ -35,13 +35,14 @@ ifeq ($(HAS_AVX2),1)
 COMMON_CFLAGS += -mavx2
 endif
 
-# 32-bit header probe — needed for audit32 on modern Ubuntu (libc6-dev-i386 / gcc-multilib)
-HAS_32BIT_HEADERS := $(shell test -f /usr/include/i386-linux-gnu/bits/wordsize.h && echo 1 || echo 0)
+# 32-bit capability probe — tests actual -m32 compiler+linker support rather than a
+# specific header path (which moved in glibc 2.42 / Ubuntu 25.04 and later releases).
+HAS_32BIT_HEADERS := $(shell echo 'int x;' | $(CC) -m32 -x c - -shared -fPIC -o /dev/null 2>/dev/null && echo 1 || echo 0)
 # AUDIT32_CFLAGS: i686 build — no -march=native/-mtune=native (incompatible with -m32),
 # no -mavx2 (64-bit era), adds i386 multilib include path.
 AUDIT32_CFLAGS := -march=i686 -O3 -funroll-loops -std=gnu11
 AUDIT32_CFLAGS += -flto -fvisibility=hidden -ffunction-sections -fdata-sections
-AUDIT32_CFLAGS += -I/usr/include/i386-linux-gnu
+AUDIT32_CFLAGS += $(shell test -d /usr/include/i386-linux-gnu && echo -I/usr/include/i386-linux-gnu)
 # Shim uses the version script (local: *) for symbol hiding instead of
 # -fvisibility=hidden, so that version-script global: declarations actually
 # export the hook functions into the dynamic symbol table.
@@ -111,8 +112,9 @@ ifeq ($(HAS_32BIT_HEADERS),1)
 	@echo "[GreenBoost] Built $(AUDIT32) (i386, SHIM_PATH=$(SHIM_INSTALL_PATH))"
 else
 	@echo "[GreenBoost] NOTICE: 32-bit headers not found — skipping $(AUDIT32)"
-	@echo "[GreenBoost]   Install with: sudo apt install gcc-multilib libc6-dev-i386"
-	@echo "[GreenBoost]   Then re-run: make audit32"
+	@echo "[GreenBoost]   Install gcc-multilib + 32-bit glibc headers for your distro,"
+	@echo "[GreenBoost]   then re-run: make audit32"
+	@echo "[GreenBoost]   (Run the appropriate greenboost_setup*.sh to install dependencies)"
 endif
 
 vulkan: greenboost_vulkan_layer.c greenboost_ioctl.h
@@ -171,6 +173,11 @@ install-libs:
 	ldconfig
 
 dkms-install:
+	@echo "[GreenBoost] Cleaning previous installation residues..."
+	rmmod greenboost 2>/dev/null || true
+	find /lib/modules -name "greenboost.ko*" -delete 2>/dev/null || true
+	rm -rf /usr/src/greenboost-* 2>/dev/null || true
+	rm -rf /var/lib/dkms/greenboost 2>/dev/null || true
 	@echo "[GreenBoost] Installing DKMS source tree to $(DKMS_ROOT)..."
 	mkdir -p $(DKMS_ROOT)
 	cp greenboost.c greenboost_ioctl.h Kbuild Makefile dkms.conf $(DKMS_ROOT)/
@@ -178,7 +185,6 @@ dkms-install:
 	@if [ -f "$(TQ_LIB)" ]; then \
 		cp $(TQ_LIB) /usr/local/lib/ && echo "[GreenBoost] Installed libgreenboost_tq.so (dkms-install)"; \
 	fi
-	dkms remove greenboost/$(GB_VERSION) --all 2>/dev/null || true
 	dkms add greenboost/$(GB_VERSION)
 	dkms build greenboost/$(GB_VERSION)
 	dkms install greenboost/$(GB_VERSION)
@@ -191,8 +197,9 @@ dkms-uninstall:
 uninstall:
 	rmmod greenboost 2>/dev/null || true
 	dkms remove greenboost/$(GB_VERSION) --all 2>/dev/null || true
-	rm -rf $(DKMS_ROOT) 2>/dev/null || true
-	rm -f /lib/modules/$(shell uname -r)/extra/greenboost.ko
+	rm -rf /var/lib/dkms/greenboost 2>/dev/null || true
+	rm -rf /usr/src/greenboost-* 2>/dev/null || true
+	find /lib/modules -name "greenboost.ko*" -delete 2>/dev/null || true
 	rm -f /usr/local/lib/$(SHIM) /usr/local/lib/$(AUDIT) /usr/local/lib/$(VULKAN)
 	rm -f /usr/local/lib/i386-linux-gnu/$(AUDIT)
 	rm -f /etc/vulkan/implicit_layer.d/VkLayer_greenboost.json
@@ -228,5 +235,5 @@ status:
 	@sudo dmesg 2>/dev/null | grep greenboost | tail -10 | sed 's/^/  /' || echo "  (requires sudo to read dmesg)"
 
 help:
-	@echo "GreenBoost v2.8 — make [module|shim|audit|vulkan|clean|install|load|unload|reload|status]"
+	@echo "GreenBoost v2.8.1 — make [module|shim|audit|vulkan|clean|install|load|unload|reload|status]"
 	@echo "  T1=$(PHYS_GB)GB VRAM  T2=$(VIRT_GB)GB DDR  T3=$(NVME_GB)GB NVMe"

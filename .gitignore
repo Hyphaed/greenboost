@@ -45,3 +45,6 @@ __pycache__/
 # Python venv (managed by greenboost_setup.sh)
 venv/
 .venv/
+
+# GitLab push helper (local-only, never commit credentials or remote config)
+push_to_gitlab.sh

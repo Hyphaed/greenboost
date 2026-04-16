@@ -36,7 +36,7 @@
 │  ├── sysfs: status / hw_info / active_buffers / active_profile  │
 │  └── features/nvlink_pool  (V100 cluster T1 aggregation)        │
 │                                                                 │
-│  T3: kernel swap subsystem → /swap_nvme.img                     │
+│  T3: GreenBoost backing file → /var/lib/greenboost/t3_store     │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -48,7 +48,7 @@
 |------|----------------|------|
 | T1 | GPU VRAM | Hot computation — full GPU bandwidth, native CUDA execution |
 | T2 | System DDR (pinned, DMA-BUF) | Cold weights — transferred over PCIe on demand |
-| T3 | NVMe swap | Frozen pages — evicted by kernel swap subsystem |
+| T3 | NVMe (backing file) | Frozen pages — evicted directly to `/var/lib/greenboost/t3_store` by the kernel module |
 
 All three tiers are invisible to the application. CUDA apps see a single virtual VRAM device whose size is `physical_vram_gb + virtual_vram_gb` (T1 + T2). The IOCTL `GB_IOCTL_GET_INFO` field `total_combined_mb` covers all three.
 
@@ -63,7 +63,7 @@ All three tiers are invisible to the application. CUDA apps see a single virtual
 **Responsibilities:**
 - Registers the `/dev/greenboost` character device with an IOCTL interface.
 - **Tier 2 allocator:** allocates pinned physical pages (2 MB hugepages by default, 4 K optional) and exports them as DMA-BUF file descriptors (`GB_IOCTL_ALLOC`). The GPU imports these via `cudaImportExternalMemory` without a CPU round-trip.
-- **Tier 3 monitor:** allocates swappable 4 K pages; the kernel swap subsystem handles eviction to `/swap_nvme.img`. Disabled by default (`nvme_pool_gb=0`); enabled on systems with NVMe.
+- **Tier 3 monitor:** reads and writes cold buffers directly to the backing file at `/var/lib/greenboost/t3_store` (configurable via `t3_file_path` module parameter or `GB_IOCTL_SET_T3_CAP`). Disabled by default (`nvme_pool_gb=0`); enabled on systems with NVMe.
 - **Watchdog kthread:** monitors free RAM against `safety_reserve_gb` and NVMe swap pressure. Signals userspace via eventfd (`GB_IOCTL_POLL_FD`) when pressure levels change.
 - **IDR tracker:** uses Linux's integer ID allocator to track all live `gb_buf` objects. A mutex + spinlock pair protects the pool.
 - **sysfs interface** under `/sys/class/greenboost/greenboost/`:
@@ -86,6 +86,10 @@ All three tiers are invisible to the application. CUDA apps see a single virtual
 | `use_hugepages` | 2 MB compound pages for T2 |
 | `kv_reserve_mb` | T1 VRAM reserved for KV cache |
 | `pcores_max_cpu` | Last P-core logical CPU (watchdog affinity) |
+| `golden_cpu_min` | First high-frequency golden-core CPU (-1 = disabled; Intel hybrid CPUs) |
+| `golden_cpu_max` | Last high-frequency golden-core CPU (-1 = disabled) |
+| `t3_file_path` | Path to GreenBoost T3 backing file (default: `/var/lib/greenboost/t3_store`) |
+| `idle_cleanup_sec` | Seconds between watchdog dead-PID buffer reap (0 = disabled, default: 30) |
 | `debug_mode` | Verbose `dmesg` output |
 | `active_profile_name` | Set by installer at `insmod` time |
 
@@ -104,6 +108,7 @@ Loaded system-wide via `/etc/ld.so.preload`. A two-stage constructor (`RTLD_NOLO
 | `cudaFree` / `cuMemFree_v2` / `cuMemFreeAsync` | Release T2/T3 buffers |
 | `cuDeviceTotalMem_v2` | Return virtual VRAM size |
 | `nvmlDeviceGetMemoryInfo` / `_v3` | Return virtual VRAM stats |
+| `cuMemCreate` | Intercept CUDA VMM allocations (Ollama 0.18+ ggml backend); retries with host-pinned VMM on T1 OOM |
 | `dlsym` | Intercept Ollama's runtime GPU API lookups |
 | `dlopen` | Strip `RTLD_DEEPBIND` so hooks stay active inside bundled CUDA libs |
 
@@ -215,6 +220,9 @@ Single header usable from both kernel and userspace. Magic byte: `'G'`.
 | `GB_IOCTL_GET_POOL_INFO_V3` | 14 | IOR | Machine-readable pool info for k8s DRA / Prometheus |
 | `GB_IOCTL_RESET_PHASE` | 15 | IO | Increment phase_reset_seq (Synapse CLI uses before model swap) |
 | `GB_IOCTL_RELEASE_PID` | 16 | IOW | Release all T2/T3 buffers owned by a PID |
+| `GB_IOCTL_SET_T3_CAP` | 17 | IOWR | Live T3 backing file resize; 0 = disk-limited; requires CAP_SYS_ADMIN |
+| `GB_IOCTL_SESSION_IDLE` | 18 | IOW | Move all PID's T2 buffers to LRU tail (preferred eviction candidates) |
+| `GB_IOCTL_SESSION_ACTIVE` | 19 | IOW | Move all PID's T2 buffers to LRU head (evicted last under pressure) |
 
 **Allocation flags** (`gb_alloc_req.flags`):
 
@@ -227,6 +235,7 @@ Single header usable from both kernel and userspace. Magic byte: `'G'`.
 | `GB_ALLOC_NO_HUGEPAGE` | Force 4 K pages |
 | `GB_ALLOC_T1_PRIORITY` | KV-like; moved to LRU head — weight bufs evicted first |
 | `GB_ALLOC_KV_COMPRESSED` | TurboQuant-compressed KV buffer |
+| `GB_ALLOC_SESSION_PROTECTED` | Skipped by auto-eviction until all unprotected candidates are exhausted |
 
 ---
 
@@ -364,6 +373,6 @@ For multi-node V100 clusters, GreenBoost integrates with the NVIDIA k8s-dra-driv
 
 - **DRA kubelet plugin** — calls `GB_IOCTL_GET_POOL_INFO_V3` (struct `gb_pool_info_v3`) for machine-readable tier stats consumed by the Prometheus exporter.
 - **NVLink pool** — `gb_nvlink_set_ready()` is called by the kubelet plugin after NVML P2P verification; the kernel module updates `total_vram_gb` and exposes it via sysfs.
-- **T3 on Lustre** — on cluster nodes, the NVMe swap (`/swap_nvme.img`) is replaced by a Lustre parallel filesystem mount for aggregate petabyte-scale T3 capacity.
+- **T3 on Lustre** — on cluster nodes, the T3 backing file (`/var/lib/greenboost/t3_store`) is replaced by a Lustre parallel filesystem mount for aggregate petabyte-scale T3 capacity.
 
 See `k8s-deployment/INSTALL_CLUSTER.md` for full cluster installation steps.

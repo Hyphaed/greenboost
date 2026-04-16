@@ -6,11 +6,12 @@
 # Any change to greenboost_setup.sh must be propagated here manually.
 #
 # USAGE:
+#   sudo ./greenboost_setup_arch.sh full-install     — full install (prompts for mode)
+#   sudo ./greenboost_setup_arch.sh module-only      — kernel module only (safe on any machine)
 #   sudo ./greenboost_setup_arch.sh install          — build + install system-wide
 #   sudo ./greenboost_setup_arch.sh uninstall        — remove module + all config
 #   sudo ./greenboost_setup_arch.sh load             — insmod with detected params
 #   sudo ./greenboost_setup_arch.sh unload           — rmmod
-#   sudo ./greenboost_setup_arch.sh full-install     — complete first-time setup
 #        ./greenboost_setup_arch.sh status           — show pool info + system state
 #        ./greenboost_setup_arch.sh                  — open interactive wizard
 
@@ -23,7 +24,7 @@ VULKAN_IMPLICIT_LAYER_DIR="/etc/vulkan/implicit_layer.d"
 SHIM_DEST="/usr/local/lib"
 MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-GB_VERSION="2.8"
+GB_VERSION="2.8.2"
 GB_PROFILES_DIR="/etc/greenboost/profiles"
 GB_ACTIVE_PROFILE_LINK="/etc/greenboost/active_profile.md"
 GB_STOPPED_SERVICES=""
@@ -132,6 +133,59 @@ gb_press_enter() {
     read -r
 }
 
+# gb_confirm "Question" — amber ❯ Y/n; returns 0 if yes
+gb_confirm() {
+    printf "  ${C_AMBER}${C_BOLD}❯${C_RESET}  ${C_GRAY}$1${C_RESET} ${C_DIM}[Y/n]${C_RESET}: "
+    read -r _confirm_reply
+    [[ "${_confirm_reply:-Y}" =~ ^[Yy]$ ]]
+}
+
+# ── Install mode helpers ──────────────────────────────────────────────────────
+GB_INSTALL_MODE="module"   # default: safe (no system tuning)
+
+gb_select_install_mode() {
+    for _a in "$@"; do
+        [[ "$_a" == "--module-only"  ]] && { GB_INSTALL_MODE="module"; return; }
+        [[ "$_a" == "--full-install" ]] && { GB_INSTALL_MODE="full";   return; }
+    done
+    gb_separator
+    echo ""
+    printf '%b\n' "  ${C_VIOLET}${C_BOLD}GreenBoost — Choose Installation Mode${C_RESET}"
+    echo ""
+    printf '%b\n' "  ${C_LIME}${C_BOLD}[1]${C_RESET}  ${C_BOLD}${C_GRAY}Kernel module only${C_RESET}  ${C_DIM}DKMS install — no sysctl, GRUB, or service changes${C_RESET}"
+    printf '%b\n' "  ${C_LIME}${C_BOLD}[2]${C_RESET}  ${C_BOLD}${C_GRAY}Full system setup ${C_RESET}  ${C_DIM}Module + AI libs + sysctl + GRUB + systemd services${C_RESET}"
+    echo ""
+    printf '%b\n' "  ${C_DIM}Mode [1] is safe on any machine. Mode [2] tunes sysctl, GRUB, and${C_RESET}"
+    printf '%b\n' "  ${C_DIM}enables system services — recommended only on a dedicated workstation.${C_RESET}"
+    echo ""
+    printf '%b' "  ${C_AMBER}${C_BOLD}❯${C_RESET}  ${C_GRAY}Mode [1/2] (default: 1): ${C_RESET}"
+    read -r _mode_reply
+    case "${_mode_reply:-1}" in
+        2) GB_INSTALL_MODE="full" ;;
+        *) GB_INSTALL_MODE="module" ;;
+    esac
+}
+
+gb_consent_gate() {
+    echo ""
+    printf '%b\n' "  ${C_AMBER}${C_BOLD}⚠  System change:${C_RESET}  ${C_GRAY}$1${C_RESET}"
+    gb_confirm "Apply this change?" && return 0 || return 1
+}
+
+# Compute T2 DDR pool cap in GB.
+# < 64 GB total RAM -> 70%;  >= 64 GB -> 80%.  Minimum 4 GB.
+gb_calc_ddr_cap_gb() {
+    local total_gb=$1
+    local cap_gb
+    if (( total_gb >= 64 )); then
+        cap_gb=$(( total_gb * 80 / 100 ))
+    else
+        cap_gb=$(( total_gb * 70 / 100 ))
+    fi
+    [[ $cap_gb -lt 4 ]] && cap_gb=4
+    echo "$cap_gb"
+}
+
 # ---- Hardware detection ---------------------------------------------------
 # Populates: GB_PHYS, GB_VIRT, GB_RESERVE, GB_NVME_SWAP, GB_NVME_POOL,
 #            GB_PCORES_MAX, GB_GOLDEN_MIN, GB_GOLDEN_MAX, GB_PCORES_ONLY,
@@ -155,8 +209,8 @@ detect_hardware() {
     # System RAM
     local total_kb; total_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
     local total_gb=$(( total_kb / 1024 / 1024 ))
-    GB_VIRT=$(( total_gb * 88 / 100 ))
-    [[ $GB_VIRT -lt 4 ]] && GB_VIRT=4
+    # virtual VRAM pool: 70% of total RAM (< 64 GB) or 80% (>= 64 GB).
+    GB_VIRT=$(gb_calc_ddr_cap_gb "$total_gb")
     GB_RESERVE=$(( total_gb * 8 / 100 ))
     [[ $GB_RESERVE -lt 4  ]] && GB_RESERVE=4
     [[ $GB_RESERVE -gt 10 ]] && GB_RESERVE=10
@@ -250,23 +304,27 @@ detect_hardware() {
         fi
     fi
 
-    # Ollama context — largest that fits T1+T2 with a 4 GB margin
-    local pool_gb=$(( GB_PHYS + GB_VIRT ))
-    local ctx_gb=$(( pool_gb > 4 ? pool_gb - 4 : 1 ))
-    GB_OLLAMA_CTX=$(( ctx_gb * 1024 * 1024 / 2 ))  # bytes → tokens at ~2 bytes/token
-    [[ $GB_OLLAMA_CTX -gt 262144 ]] && GB_OLLAMA_CTX=262144
-    [[ $GB_OLLAMA_CTX -lt 4096   ]] && GB_OLLAMA_CTX=4096
+    # Ollama context — T1+T2 KV headroom only (T3 NVMe excluded).
+    # KV cache never spills to T3; use T1 VRAM + half T2 DDR as budget.
+    # Half of T2 is left for model weights; the other half is KV headroom.
+    local kv_pool_gb=$(( GB_PHYS + GB_VIRT / 2 ))
+    if   [[ $kv_pool_gb -ge 32 ]]; then GB_OLLAMA_CTX=131072
+    elif [[ $kv_pool_gb -ge 16 ]]; then GB_OLLAMA_CTX=65536
+    elif [[ $kv_pool_gb -ge 8  ]]; then GB_OLLAMA_CTX=32768
+    elif [[ $kv_pool_gb -ge 4  ]]; then GB_OLLAMA_CTX=16384
+    else                                 GB_OLLAMA_CTX=8192
+    fi
 }
 
 print_detected_hardware() {
     gb_info "GPU  : ${GPU_NAME}  (${GB_PHYS} GB VRAM → virtual ${GB_VIRT} GB T2 pool)"
     gb_info "RAM  : ${RAM_TYPE}-${RAM_SPEED_MT}  (pool ${GB_VIRT} GB, reserve ${GB_RESERVE} GB)"
-    local _swap_img="/var/lib/greenboost/greenboost_swap.img"
-    if [[ -f "$_swap_img" ]]; then
-        local _t3_gb=$(( $(stat -c%s "$_swap_img" 2>/dev/null || echo 0) / 1073741824 ))
-        gb_info "NVMe : swap ${_t3_gb} GB  (T3 tier)"
+    local _t3_store="/var/lib/greenboost/t3_store"
+    if [[ -f "$_t3_store" ]]; then
+        local _t3_gb=$(( $(stat -c%s "$_t3_store" 2>/dev/null || echo 0) / 1073741824 ))
+        gb_info "NVMe : T3 backing ${_t3_gb} GB"
     else
-        gb_info "NVMe : T3 swap ${GB_NVME_POOL} GB will be created"
+        gb_info "NVMe : T3 backing ${GB_NVME_POOL} GB (created on first use)"
     fi
     gb_info "CPU  : ${CPU_NAME}"
     gb_info "Ctx  : ${GB_OLLAMA_CTX} tokens"
@@ -651,7 +709,7 @@ cmd_unload() {
 }
 
 # ---- OS dependencies (Arch/pacman) -----------------------------------------
-cmd_install_deps() {
+cmd_install_build_deps() {
     need_root install-deps
 
     local headers_pkg; headers_pkg=$(_detect_kernel_headers_pkg)
@@ -660,16 +718,8 @@ cmd_install_deps() {
     pacman -Sy --noconfirm -q 2>/dev/null || true
     printf "\r%*s\r" "$(tput cols 2>/dev/null || echo 80)" ""
 
-    # Package groups — each is one bar step
-    local _groups=(
-        "Build tools + kernel headers"
-        "DKMS + io_uring"
-        "gcc-multilib (32-bit)"
-        "Python runtime"
-        "Monitoring tools"
-        "AI compute libraries"
-        "Microcode"
-    )
+    # Minimal packages required to build and DKMS-register the kernel module.
+    local _groups=( "Build tools + kernel headers" "DKMS + io_uring" "Microcode" )
     local _total=${#_groups[@]} _idx=0
 
     _dep_bar() {
@@ -685,10 +735,53 @@ cmd_install_deps() {
 
     (( _idx++ )); _dep_bar $_idx "${_groups[$_idx-1]}"
     pacman -S --noconfirm --needed -q \
-        base-devel "${headers_pkg}" git curl wget pkg-config sysfsutils 2>/dev/null
+        base-devel "${headers_pkg}" git curl wget pkg-config sysfsutils kmod 2>/dev/null
 
     (( _idx++ )); _dep_bar $_idx "${_groups[$_idx-1]}"
     pacman -S --noconfirm --needed -q dkms liburing 2>/dev/null || true
+
+    (( _idx++ )); _dep_bar $_idx "${_groups[$_idx-1]}"
+    local _cpu_vendor
+    _cpu_vendor=$(grep -m1 "vendor_id" /proc/cpuinfo | awk '{print $3}')
+    if [[ "$_cpu_vendor" == "GenuineIntel" ]]; then
+        pacman -S --noconfirm --needed -q intel-ucode 2>/dev/null || true
+    elif [[ "$_cpu_vendor" == "AuthenticAMD" ]]; then
+        pacman -S --noconfirm --needed -q amd-ucode 2>/dev/null || true
+    fi
+
+    printf "\r%*s\r" "$(tput cols 2>/dev/null || echo 80)" ""
+
+    # Ensure cpuid module loads at boot
+    if ! grep -q cpuid /etc/modules-load.d/*.conf 2>/dev/null; then
+        echo cpuid > /etc/modules-load.d/ai-workstation.conf
+    fi
+
+    gb_ok "Build dependencies installed"
+}
+
+cmd_install_optional_pkgs() {
+    need_root install-optional-pkgs
+
+    # Optional AI/compute libraries and tools. Not required to build the kernel
+    # module — only install these for a full AI workstation setup.
+    local _groups=(
+        "gcc-multilib (32-bit)"
+        "Python runtime"
+        "Monitoring tools"
+        "AI compute libraries"
+    )
+    local _total=${#_groups[@]} _idx=0
+
+    _dep_bar() {
+        local _i=$1 _name="$2"
+        local _pct=$(( _i * 100 / _total ))
+        local _filled=$(( _pct * 40 / 100 )) _empty=$(( 40 - _pct * 40 / 100 ))
+        printf "\r  ${C_GRAY}[%d/%d]${C_RESET} ${C_LIME}%s${C_GRAY}%s${C_RESET} %3d%%  ${C_DIM}%-32s${C_RESET}" \
+            "$_i" "$_total" \
+            "$(printf '█%.0s' $(seq 1 "$_filled" 2>/dev/null || true))" \
+            "$(printf '░%.0s' $(seq 1 "$_empty"  2>/dev/null || true))" \
+            "$_pct" "$_name"
+    }
 
     (( _idx++ )); _dep_bar $_idx "${_groups[$_idx-1]}"
     pacman -S --noconfirm --needed -q multilib-devel lib32-gcc-libs 2>/dev/null || true
@@ -703,22 +796,18 @@ cmd_install_deps() {
     pacman -S --noconfirm --needed -q \
         openblas hwloc numactl openmp opencl-icd-loader cuda 2>/dev/null || true
 
-    (( _idx++ )); _dep_bar $_idx "${_groups[$_idx-1]}"
-    if grep -qi "intel" /proc/cpuinfo 2>/dev/null; then
-        pacman -S --noconfirm --needed -q intel-ucode 2>/dev/null || true
-    elif grep -qi "amd" /proc/cpuinfo 2>/dev/null; then
-        pacman -S --noconfirm --needed -q amd-ucode 2>/dev/null || true
-    fi
-
     printf "\r%*s\r" "$(tput cols 2>/dev/null || echo 80)" ""
 
-    # Ensure cpuid module loads at boot
-    if ! grep -q cpuid /etc/modules-load.d/*.conf 2>/dev/null; then
-        echo cpuid > /etc/modules-load.d/ai-workstation.conf
-    fi
-
-    gb_ok "OS dependencies installed"
+    gb_ok "Optional AI/compute libraries installed"
     gb_info "Note: NVIDIA driver (nvidia/nvidia-dkms) and CUDA must be installed separately"
+}
+
+# cmd_install_deps — installs all dependencies (build + optional).
+# Called when running 'install-deps' directly; full-install uses
+# cmd_install_build_deps (always) + cmd_install_optional_pkgs (gated).
+cmd_install_deps() {
+    cmd_install_build_deps
+    cmd_install_optional_pkgs
 }
 
 # ---- NVMe swap setup -------------------------------------------------------
@@ -763,6 +852,7 @@ Environment="GREENBOOST_ACTIVE=1"
 Environment="LD_PRELOAD=/usr/local/lib/libgreenboost_cuda.so"
 DROPIN
     gb_ok "Ollama drop-in written: $dropin_dir/99-greenboost.conf"
+    gb_ok "Ollama context cap set to ${GB_OLLAMA_CTX} tokens (T1: ${GB_PHYS} GB, T2: ${GB_VIRT} GB)"
 
     # ld.so.preload — LD_AUDIT gatekeeper
     if ! grep -qF "libgreenboost_audit.so" /etc/ld.so.preload 2>/dev/null; then
@@ -1042,11 +1132,11 @@ cmd_clean_memory() {
 
 # ---- Show commands ---------------------------------------------------------
 cmd_show_commands() {
-    local cmds_file="$MODULE_DIR/greenboost_commands.md"
+    local cmds_file="$MODULE_DIR/GREENBOOST_COMMANDS.md"
     if [[ -f "$cmds_file" ]]; then
         cat "$cmds_file"
     else
-        gb_info "greenboost_commands.md not found — run: $0 help"
+        gb_info "GREENBOOST_COMMANDS.md not found — run: $0 help"
     fi
 }
 
@@ -1101,9 +1191,9 @@ cmd_steam_launch_info() {
         gb_warn_ui "greenboost_setup.sh not found"
 }
 
-cmd_install_proton_wayland() {
+cmd_install_proton() {
     local main_script="$MODULE_DIR/greenboost_setup.sh"
-    [[ -x "$main_script" ]] && exec "$main_script" install-proton-wayland || \
+    [[ -x "$main_script" ]] && exec "$main_script" install-proton || \
         gb_warn_ui "greenboost_setup.sh not found"
 }
 
@@ -1602,7 +1692,7 @@ cmd_wizard() {
         gb_menu_item  8  "Remove MangoHud"    "Uninstall MangoHud binaries and MangoHud.conf"  root
 
         gb_section "Maintenance"
-        gb_menu_item  9  " GreenBoost Commands" " All commands reference (also: greenboost help)"
+        gb_menu_item  9  "GreenBoost Commands" "All commands reference (also: greenboost help)"
         gb_menu_item  10 "Clear logs"          "Clear dmesg, journal, Proton logs, and Wine coredumps"
         gb_menu_item  11 "Uninstall"           "Remove GreenBoost (module + all config)"        root
 
@@ -1624,7 +1714,7 @@ cmd_wizard() {
             2)  cmd_status ;;
             3)  cmd_benchmark;                 gb_press_enter ;;
             4)  cmd_profile_wizard ;;
-            5)  cmd_install_proton_wayland;    gb_press_enter ;;
+            5)  cmd_install_proton;    gb_press_enter ;;
             6)  cmd_uninstall_proton;          gb_press_enter ;;
             7)  cmd_install_mangohud;          gb_press_enter ;;
             8)  cmd_uninstall_mangohud;        gb_press_enter ;;
@@ -1638,115 +1728,76 @@ cmd_wizard() {
 }
 
 # ---- Full install ----------------------------------------------------------
-# cmd_create_t3_swap — create a dedicated T3 NVMe swap file sized to guarantee
-# the target model (87 GB nemotron-3-super class) loads on this hardware.
-# Called as the last step of cmd_full_install; creates the T3 swap file automatically.
-cmd_create_t3_swap() {
-    local swap_path="/var/lib/greenboost/greenboost_swap.img"
-    local swap_gb="${GB_NVME_POOL:-0}"
-
-    if [[ $swap_gb -lt 1 ]]; then
-        gb_info "T3 swap: not needed — model fits in T1 (${GB_PHYS} GB) + T2 (${GB_VIRT} GB)"
-        return 0
-    fi
-
-    echo ""
-    gb_separator
-    echo ""
-    echo -e "  ${C_VIOLET}${C_BOLD}◈  T3 NVMe Swap — Required for Large Models${C_RESET}"
-    echo ""
-    echo -e "  ${C_DIM}Your pool :${C_RESET}  T1 ${C_BOLD}${GB_PHYS} GB VRAM${C_RESET}  +  T2 ${C_BOLD}${GB_VIRT} GB DDR${C_RESET}  =  ${C_BOLD}$(( GB_PHYS + GB_VIRT )) GB${C_RESET}"
-    echo -e "  ${C_DIM}Target    :${C_RESET}  ${C_BOLD}nemotron-3-super${C_RESET} (87 GB)"
-    echo -e "  ${C_DIM}T3 needed :${C_RESET}  ${C_BOLD}${C_LIME}${swap_gb} GB${C_RESET}"
-    echo ""
-
-    # Reuse existing swap if it already exists at the correct size — skip
-    # recreation and NVMe wear.  Just ensure it is active and in fstab.
-    if [[ -f "$swap_path" ]]; then
-        local existing_gb=$(( $(stat -c%s "$swap_path" 2>/dev/null || echo 0) / 1073741824 ))
-        if [[ $existing_gb -eq $swap_gb ]]; then
-            gb_ok "T3 swap already exists at correct size (${swap_gb} GB) — reusing"
-            if ! swapon --show=NAME --noheadings 2>/dev/null | grep -qF "$swap_path"; then
-                swapon -p 10 "$swap_path" 2>/dev/null || true
-            fi
-            if ! grep -qF "greenboost_swap" /etc/fstab; then
-                echo "${swap_path} none swap sw,pri=10 0 0" >> /etc/fstab
-            fi
-            return 0
-        fi
-        # Size mismatch — remove old file and recreate below
-        gb_info "T3 swap size changed (${existing_gb} GB on disk → ${swap_gb} GB needed) — recreating"
-        swapoff "$swap_path" 2>/dev/null || true
-        rm -f "$swap_path"
-    fi
-
-    gb_info "Creating T3 swap file: ${swap_path}  (${swap_gb} GB, priority 10)"
-    mkdir -p "$(dirname "$swap_path")"
-
-    gb_step 1 3 "Allocating ${swap_gb} GB T3 swap file..."
-    if command -v fallocate &>/dev/null; then
-        fallocate -l "${swap_gb}G" "$swap_path"
-    else
-        dd if=/dev/zero of="$swap_path" bs=1G count="${swap_gb}" status=progress 2>&1 | tail -1
-    fi
-    chmod 600 "$swap_path"
-    gb_ok "Swap file allocated (${swap_gb} GB)"
-
-    gb_step 2 3 "Formatting as swap..."
-    mkswap "$swap_path"
-    gb_ok "Swap formatted"
-
-    gb_step 3 3 "Activating (priority 10) and persisting in /etc/fstab..."
-    swapon -p 10 "$swap_path"
-    sed -i '\|greenboost_swap|d' /etc/fstab
-    echo "${swap_path} none swap sw,pri=10 0 0" >> /etc/fstab
-    gb_ok "/etc/fstab updated"
-
-    echo ""
-    gb_ok "T3 swap ready: ${swap_path}  (${swap_gb} GB, priority 10)"
-    gb_separator
-    echo ""
-}
-
 cmd_full_install() {
     need_root full-install
     GB_STOPPED_SERVICES=""
+
+    # ── Mode selection — cmd_full_install always targets full system setup.
+    # Only --module-only overrides this (for scripts / CI / direct invocation).
+    GB_INSTALL_MODE="full"
+    for _a in "$@"; do
+        [[ "$_a" == "--module-only" ]] && { GB_INSTALL_MODE="module"; break; }
+    done
 
     detect_hardware
     gb_header
     print_detected_hardware
     echo ""
 
-    # 0/5 — Purge any previous GreenBoost install to guarantee a clean slate
+    # ── SHARED PATH: kernel module (runs for both module-only and full) ──────
+
+    # 0 — Purge any previous GreenBoost install to guarantee a clean slate
     gb_step 0 5 "Purging previous GreenBoost installation (if any)..."
     do_purge 0
     gb_ok "Previous installation purged"
 
-    # 1/5 — OS dependencies
-    gb_step 1 5 "Installing Arch Linux dependencies..."
-    cmd_install_deps
-    gb_ok "OS dependencies installed"
+    # 1 — Build dependencies (minimal — just what's needed to compile the module)
+    gb_step 1 5 "Installing Arch Linux build dependencies..."
+    cmd_install_build_deps
+    gb_ok "Build dependencies installed"
 
-    # 2/5 — Build + install kernel module + CUDA shim
+    # 2 — Build + install kernel module + CUDA shim
     gb_step 2 5 "Building and installing kernel module + CUDA shim..."
     cmd_install
     gb_ok "Kernel module + CUDA shim installed"
 
-    # 3/5 — Load kernel module
+    # 3 — Load kernel module
     gb_step 3 5 "Loading kernel module..."
     cmd_load
     gb_ok "Kernel module loaded"
 
-    # 4/5 — System configs
+    if [[ "$GB_INSTALL_MODE" == "module" ]]; then
+        echo ""
+        gb_ok "Kernel module installed and loaded."
+        gb_info "Run 'sudo ./greenboost_setup_arch.sh status' to verify."
+        gb_info "For full system tuning, re-run and choose option [2]."
+        echo ""
+        return 0
+    fi
+
+    # ── FULL ONLY PATH: all system changes applied automatically (user consented by choosing full mode) ───
+
+    # 4 — System configs
     gb_step 4 5 "Installing system configuration files..."
+    gb_info "Applying: Ollama/inference service config (drop-ins, TurboQuant, udev, cpu-perf)"
     cmd_install_sys_configs
     gb_ok "System configuration installed"
 
-    # 5/5 — Tuning
-    gb_step 5 5 "Applying sysctl tuning and GRUB boot params..."
+    # 4b — Optional AI/compute libraries
+    gb_info "Applying: optional packages (cuda, openblas, python, nvtop, cpupower, multilib-devel, lib32-gcc-libs)"
+    cmd_install_optional_pkgs
+    gb_ok "Optional AI/compute libraries installed"
+
+    # 5 — sysctl tuning
+    gb_step 5 5 "Applying system tuning..."
+    gb_info "Applying: sysctl tuning"
     cmd_tune_sysctl
+    gb_ok "sysctl tuning applied"
+
+    # 5b — GRUB boot parameters (requires reboot)
+    gb_info "Applying: GRUB boot parameters (nvidia-drm.modeset, iommu, numa_balancing)"
     cmd_tune_grub
-    gb_ok "Tuning applied"
+    gb_ok "GRUB updated"
 
     # Generate hardware profile
     if [[ ! -f "${GB_ACTIVE_PROFILE_LINK}" ]]; then
@@ -1755,13 +1806,12 @@ cmd_full_install() {
         gb_ok "Hardware profile generated"
     fi
 
-    # T3 NVMe swap — prompt user to create greenboost_swap.img for T3 backing
-    cmd_create_t3_swap
-
     echo ""
-    gb_ok "GreenBoost v${GB_VERSION} installation complete on Arch Linux!"
+    gb_ok "GreenBoost v${GB_VERSION} full install complete on Arch Linux!"
     gb_info "Reboot recommended to activate GRUB parameters."
     gb_info "Then verify: greenboost status"
+    gb_info "GreenBoost Proton and MangoHud are gaming tools — not part of full install."
+    gb_info "Install them separately from the interactive menu (options [6]–[9])."
 }
 
 # ---- Entry point -----------------------------------------------------------
@@ -1795,9 +1845,10 @@ case "$COMMAND" in
     install-vulkan-layer)cmd_install_vulkan_layer ;;
     install-deps)        cmd_install_deps         ;;
     steam-launch-guide)     cmd_steam_launch_info    ;;
-    install-proton-wayland) cmd_install_proton_wayland ;;
+    install-proton) cmd_install_proton ;;
     setup-swap)          cmd_setup_swap "$@"    ;;
     full-install|setup)  cmd_full_install "$@"  ;;
+    module-only)         GB_INSTALL_MODE="module" cmd_full_install "--module-only" "$@" ;;
     tune)                cmd_tune               ;;
     tune-grub)           cmd_tune_grub          ;;
     tune-sysctl)         cmd_tune_sysctl        ;;

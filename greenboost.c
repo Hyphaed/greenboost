@@ -2,6 +2,7 @@
 /* */
 
 #include <linux/module.h>
+#include <linux/version.h>   /* LINUX_VERSION_CODE, KERNEL_VERSION — kernel-compat guards */
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/fs.h>
@@ -35,18 +36,35 @@
 
 // Needed for Red Hat 5.14 and 5.16+ kernels
 // See for example https://github.com/google/gasket-driver/issues/14
+// MODULE_IMPORT_NS changed from string form to bare-token form in mainline 5.16
+// and in RHEL 9.0 (5.14-based).  Use the appropriate form for each kernel.
 #if __has_include(<linux/dma-buf.h>)
-MODULE_IMPORT_NS("DMA_BUF");
+/* Bare-token form required: mainline 5.16–6.12 and RHEL 9.x (5.14-based).
+ * String form reverted: mainline ≥ 6.13 and all kernels < 5.16.
+ * Nested #elif avoids expanding RHEL_RELEASE_VERSION on non-RHEL kernels
+ * (undefined function-like macros in #if cause a preprocessor error). */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0) && \
+    LINUX_VERSION_CODE <  KERNEL_VERSION(6, 13, 0)
+MODULE_IMPORT_NS(DMA_BUF);          /* bare-token form — mainline 5.16–6.12 */
+#elif defined(RHEL_RELEASE_CODE) && defined(RHEL_RELEASE_VERSION)
+# if RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 0)
+MODULE_IMPORT_NS(DMA_BUF);          /* bare-token form — RHEL 9+            */
+# else
+MODULE_IMPORT_NS("DMA_BUF");        /* string form    — RHEL < 9            */
+# endif
+#else
+MODULE_IMPORT_NS("DMA_BUF");        /* string form    — < 5.16 or ≥ 6.13   */
+#endif
 #endif
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Ferran Duarri");
 MODULE_DESCRIPTION("GreenBoost : CUDA Memory Orchestrator for NVidia GPUs");
-MODULE_VERSION("2.8.0");
+MODULE_VERSION("2.8.1");
 
 /* Single version string — used in banner, status, and pool_brief.
  * Update this when bumping MODULE_VERSION above. */
-#define GB_VERSION  "v2.8"
+#define GB_VERSION  "v2.8.1"
 
 /* 2 MiB hugepage constants */
 #define GB_HPAGE_ORDER  9u
@@ -72,7 +90,7 @@ enum gb_tier { GB_TIER2_SDDR = 2, GB_TIER3_NVME = 3 };
 static int physical_vram_gb  =  0;  /* Physical GPU VRAM in GB (0 = auto-detected by setup script) */
 
 /* Tier 2 */
-static int virtual_vram_gb   =  0;  /* System RAM pool cap in GB (0 = auto-detected; ~88% of total RAM) */
+static int virtual_vram_gb   =  0;  /* System RAM pool cap in GB (0 = auto-detect: 70% if < 64 GB RAM, 80% if >= 64 GB) */
 static int safety_reserve_gb =  4;  /* Always keep ≥N GB free in system RAM (safe minimum) */
 
 /* Tier 3 — GreenBoost-managed backing file (replaces kernel swap for T3) */
@@ -111,7 +129,8 @@ MODULE_PARM_DESC(physical_vram_gb,
 
 module_param(virtual_vram_gb,   int, 0644);
 MODULE_PARM_DESC(virtual_vram_gb,
-	"Tier 2: System RAM pool cap in GB (auto-detected at install; ~88% of total RAM). "
+	"Tier 2: System RAM pool cap in GB. 0 = auto-detect at module load: "
+	"70% of total RAM (< 64 GB) or 80% (>= 64 GB). "
 	"Writable: echo N > /sys/module/greenboost/parameters/virtual_vram_gb");
 
 module_param(safety_reserve_gb, int, 0644);
@@ -209,6 +228,9 @@ struct gb_buf {
 	u8                frozen;       /* 1 = never evict from T2       */
 	u8                t1_priority;  /* 1 = T1-preferred (KV-like);
 					 * weight bufs evicted first      */
+	u8                session_priority; /* 1 = session-protected;
+					 * skipped by auto-evict until
+					 * all unprotected candidates gone */
 	pid_t             owner_pid;    /* PID that allocated this buffer */
 	/* T3 file-backing (v2.8) — pages written to t3_store, RAM freed */
 	u64               t3_file_offset; /* byte offset in t3 backing file */
@@ -266,6 +288,8 @@ struct gb_device {
 	spinlock_t          efd_lock;     /* protects pressure_efd         */
 	struct eventfd_ctx *pressure_efd; /* signaled on pressure change   */
 	atomic_t            teardown_done; /* prevents double-teardown: reboot notifier + gb_exit */
+	/* Async T3 eviction workqueue — prevents ioctl threads from blocking on NVMe I/O */
+	struct workqueue_struct *evict_wq;
 };
 
 static struct gb_device gb_dev;
@@ -421,7 +445,12 @@ static int gb_t3_promote_buf(struct gb_buf *buf)
 		return -ENOMEM;
 
 	for (i = 0; i < buf->npages; i++) {
-		buf->pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		/* __GFP_NORETRY: fail fast rather than looping in direct reclaim
+		 * (a T3→T2 promotion that stalls here would block the CUDA map
+		 *  callback indefinitely, hanging inference).
+		 * __GFP_NOWARN: suppress the kernel splat; -ENOMEM is handled. */
+		buf->pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO |
+					   __GFP_NORETRY | __GFP_NOWARN);
 		if (!buf->pages[i]) {
 			for (j = 0; j < i; j++)
 				__free_page(buf->pages[j]);
@@ -777,6 +806,148 @@ static struct gb_buf *gb_pin_user_buf(u64 vaddr, size_t size, u32 flags)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Pressure-triggered proactive eviction                               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * gb_evict_work — work item for async T3 eviction.
+ *
+ * gb_try_evict_for_alloc() stages buffers for eviction via Phase 1 (accounting
+ * update under lru_lock) and then queues one gb_evict_work per buffer to
+ * gb_dev.evict_wq.  The actual file I/O runs asynchronously in the workqueue
+ * so the ioctl caller (CUDA/ollama thread) is never blocked on NVMe writes.
+ */
+struct gb_evict_work {
+	struct work_struct  work;
+	struct gb_buf      *buf;
+};
+
+static void gb_evict_work_fn(struct work_struct *w)
+{
+	struct gb_evict_work *ew = container_of(w, struct gb_evict_work, work);
+	struct gb_buf *buf = ew->buf;
+
+	kfree(ew);
+
+	if (gb_t3_evict_buf(buf) != 0) {
+		/* I/O failed — roll accounting back to T2 */
+		atomic64_sub(buf->size, &gb_dev.nvme_allocated);
+		atomic64_add(buf->size, &gb_dev.pool_allocated);
+		buf->tier = GB_TIER2_SDDR;
+		spin_lock(&gb_dev.lru_lock);
+		list_add_tail(&buf->lru_node, &gb_dev.lru_list);
+		spin_unlock(&gb_dev.lru_lock);
+	}
+}
+
+/*
+ * gb_try_evict_for_alloc - free T2 space before falling to T3.
+ *
+ * Called from gb_alloc_buf() when T2 is full and the allocation is not KV
+ * cache.  Walks the LRU tail and evicts cold 4K-page T2 buffers until at
+ * least @need_bytes are freed or no eligible candidates remain.
+ *
+ * Two-phase:
+ *   Phase 1 (under lru_lock): select candidates, adjust accounting T2→T3.
+ *   Phase 2 (async):          queue gb_evict_work items to evict_wq.
+ *                             File I/O runs in the workqueue — the ioctl
+ *                             thread is NOT blocked on NVMe writes.
+ *
+ * Returns the number of bytes staged for eviction (accounting already
+ * updated in Phase 1), or 0 if nothing was staged.
+ * Must be called without holding gb_dev.lock (IDR mutex).
+ */
+static u64 gb_try_evict_for_alloc(u64 need_bytes)
+{
+	struct gb_buf *buf, *tmp;
+	LIST_HEAD(evict_list);
+	u64 freed = 0;
+	int staged = 0;
+
+	if (!gb_dev.t3_file)
+		return 0;
+
+	/* Phase 1: select candidates under lru_lock */
+	spin_lock(&gb_dev.lru_lock);
+	list_for_each_entry_safe_reverse(buf, tmp, &gb_dev.lru_list, lru_node) {
+		if (freed >= need_bytes)
+			break;
+		if (buf->alloc_flags & GB_ALLOC_KV_CACHE)
+			continue;
+		if (buf->frozen || buf->t1_priority)
+			continue;
+		if (buf->session_priority >= 1)
+			continue;
+		if (buf->tier != GB_TIER2_SDDR || buf->hugepages)
+			continue;
+
+		atomic64_sub(buf->size, &gb_dev.pool_allocated);
+		atomic64_add(buf->size, &gb_dev.nvme_allocated);
+		buf->tier = GB_TIER3_NVME;
+		list_del_init(&buf->lru_node);
+		list_add_tail(&buf->lru_node, &evict_list);
+		freed += buf->size;
+		staged++;
+	}
+
+	/* Second pass: if still not enough, consider session-protected buffers */
+	if (freed < need_bytes) {
+		list_for_each_entry_safe_reverse(buf, tmp, &gb_dev.lru_list, lru_node) {
+			if (freed >= need_bytes)
+				break;
+			if (buf->alloc_flags & GB_ALLOC_KV_CACHE)
+				continue;
+			if (buf->frozen || buf->t1_priority)
+				continue;
+			if (buf->tier != GB_TIER2_SDDR || buf->hugepages)
+				continue;
+
+			atomic64_sub(buf->size, &gb_dev.pool_allocated);
+			atomic64_add(buf->size, &gb_dev.nvme_allocated);
+			buf->tier = GB_TIER3_NVME;
+			list_del_init(&buf->lru_node);
+			list_add_tail(&buf->lru_node, &evict_list);
+			freed += buf->size;
+			staged++;
+		}
+	}
+	spin_unlock(&gb_dev.lru_lock);
+
+	if (staged == 0)
+		return 0;
+
+	/* Phase 2: queue async work items — do NOT block the ioctl thread on I/O.
+	 * Phase 1 already updated the atomic accounting (T2→T3), so the allocation
+	 * path sees the freed T2 headroom immediately.  The actual NVMe writes run
+	 * in evict_wq asynchronously.  If kmalloc fails for a work item, roll that
+	 * buffer's accounting back to T2 so the system stays consistent. */
+	list_for_each_entry_safe(buf, tmp, &evict_list, lru_node) {
+		struct gb_evict_work *ew;
+
+		list_del_init(&buf->lru_node);
+		ew = kmalloc(sizeof(*ew), GFP_KERNEL);
+		if (!ew) {
+			/* Out of memory for work item — roll back this buffer */
+			atomic64_sub(buf->size, &gb_dev.nvme_allocated);
+			atomic64_add(buf->size, &gb_dev.pool_allocated);
+			buf->tier = GB_TIER2_SDDR;
+			freed -= buf->size;
+			spin_lock(&gb_dev.lru_lock);
+			list_add_tail(&buf->lru_node, &gb_dev.lru_list);
+			spin_unlock(&gb_dev.lru_lock);
+			continue;
+		}
+		INIT_WORK(&ew->work, gb_evict_work_fn);
+		ew->buf = buf;
+		queue_work(gb_dev.evict_wq, &ew->work);
+	}
+
+	if (freed > 0)
+		gb_dbg("alloc-pressure evict: staged %lluMB to T3 (async I/O)\n", freed >> 20);
+	return freed;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Page pool allocator                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -819,6 +990,18 @@ static struct gb_buf *gb_alloc_buf(size_t size, u32 flags)
 				t2_used >> 20, virtual_vram_gb);
 			return ERR_PTR(-ENOSPC);
 		}
+		/* Proactive eviction: try to free cold T2 pages before falling to T3.
+		 * This keeps allocation bandwidth in T2 (32 GB/s DDR) rather than
+		 * immediately spilling to T3 (1.8 GB/s NVMe). */
+		if (gb_dev.t3_file) {
+			u64 freed = gb_try_evict_for_alloc((u64)size);
+			if (freed >= (u64)size) {
+				/* Re-read t2_used after eviction */
+				t2_used = (u64)atomic64_read(&gb_dev.pool_allocated);
+				if (t2_used + size <= t2_max)
+					goto proceed_t2;
+			}
+		}
 		/* T2 full — check T3 safety-net (disabled by default: nvme_pool_gb=0) */
 		if (nvme_pool_gb == 0) {
 			pr_warn(DRIVER_NAME
@@ -838,6 +1021,7 @@ static struct gb_buf *gb_alloc_buf(size_t size, u32 flags)
 			t2_used >> 20, virtual_vram_gb, size >> 20);
 	}
 
+proceed_t2:
 	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
 	if (!buf)
 		return ERR_PTR(-ENOMEM);
@@ -897,7 +1081,11 @@ alloc_4k:
 		if (!buf->pages) { kfree(buf); return ERR_PTR(-ENOMEM); }
 
 		for (i = 0; i < np; i++) {
-			buf->pages[i] = alloc_page(GFP_HIGHUSER | __GFP_ZERO);
+			/* __GFP_NORETRY: fail fast under memory pressure rather than
+			 * spinning in direct reclaim — keeps the ioctl latency bounded.
+			 * __GFP_NOWARN: -ENOMEM is handled; no need for kernel splat. */
+			buf->pages[i] = alloc_page(GFP_HIGHUSER | __GFP_ZERO |
+						   __GFP_NORETRY | __GFP_NOWARN);
 			if (!buf->pages[i]) {
 				for (j = 0; j < i; j++)
 					__free_page(buf->pages[j]);
@@ -931,6 +1119,7 @@ done:
 		buf->frozen      = (flags & GB_ALLOC_FROZEN) ? 1 : 0;
 		buf->t1_priority = 0;
 	}
+	buf->session_priority = (!tier3 && (flags & GB_ALLOC_SESSION_PROTECTED)) ? 1 : 0;
 	INIT_LIST_HEAD(&buf->lru_node);
 
 	if (tier3)
@@ -1314,6 +1503,14 @@ static long gb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			gb_dbg("madvise T1_PREFER buf id=%d — frozen + LRU head\n",
 			       buf->id);
 			break;
+		case GB_MADVISE_SESSION_PROTECT:
+			buf->session_priority = 1;
+			gb_dbg("madvise SESSION_PROTECT buf id=%d\n", buf->id);
+			break;
+		case GB_MADVISE_SESSION_DEMOTE:
+			buf->session_priority = 0;
+			gb_dbg("madvise SESSION_DEMOTE buf id=%d\n", buf->id);
+			break;
 		default:
 			madvise_ret = -EINVAL;
 			break;
@@ -1617,6 +1814,59 @@ static long gb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 		if (copy_to_user((void __user *)arg, &req, sizeof(req)))
 			return -EFAULT;
+		return 0;
+	}
+
+	case GB_IOCTL_SESSION_IDLE:
+	case GB_IOCTL_SESSION_ACTIVE: {
+		struct gb_session_req req;
+		struct gb_buf *buf;
+		struct dma_buf **refs;
+		pid_t target;
+		int id, n = 0, cap, i;
+		int to_head = (cmd == GB_IOCTL_SESSION_ACTIVE);
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+			return -EFAULT;
+
+		target = req.pid ? (pid_t)req.pid : task_pid_vnr(current);
+		if (target != task_pid_vnr(current) && !capable(CAP_SYS_ADMIN))
+			return -EPERM;
+
+		/* Phase 1: collect matching T2 DMA-BUF refs under IDR lock */
+		cap = atomic_read(&gb_dev.active_bufs) + 1;
+		refs = kvmalloc_array(cap, sizeof(*refs), GFP_KERNEL);
+		if (!refs)
+			return -ENOMEM;
+
+		mutex_lock(&gb_dev.lock);
+		idr_for_each_entry(&gb_dev.idr, buf, id) {
+			if (buf->owner_pid == target &&
+			    buf->tier == GB_TIER2_SDDR && n < cap) {
+				get_dma_buf(buf->dmabuf);
+				refs[n++] = buf->dmabuf;
+			}
+		}
+		mutex_unlock(&gb_dev.lock);
+
+		/* Phase 2: move LRU nodes under lru_lock; buf is kept alive by ref */
+		spin_lock(&gb_dev.lru_lock);
+		for (i = 0; i < n; i++) {
+			/* Recover gb_buf from dmabuf->priv */
+			struct gb_buf *b = (struct gb_buf *)refs[i]->priv;
+			if (to_head)
+				list_move(&b->lru_node, &gb_dev.lru_list);
+			else
+				list_move_tail(&b->lru_node, &gb_dev.lru_list);
+		}
+		spin_unlock(&gb_dev.lru_lock);
+
+		for (i = 0; i < n; i++)
+			dma_buf_put(refs[i]);
+		kvfree(refs);
+
+		gb_dbg("session %s for PID %d (%d bufs)\n",
+		       to_head ? "ACTIVE" : "IDLE", target, n);
 		return 0;
 	}
 
@@ -2166,6 +2416,9 @@ static int gb_auto_evict_cold(u64 target_free_bytes)
 		/* Never touch frozen or T1-priority buffers */
 		if (buf->frozen || buf->t1_priority)
 			continue;
+		/* Skip session-protected buffers on first pass (evict unprotected first) */
+		if (buf->session_priority >= 1)
+			continue;
 		/* Only evict T2 4K-page buffers (hugepages are pinned) */
 		if (buf->tier != GB_TIER2_SDDR || buf->hugepages)
 			continue;
@@ -2180,6 +2433,27 @@ static int gb_auto_evict_cold(u64 target_free_bytes)
 
 		freed += buf->size;
 		staged++;
+	}
+	/* Second pass: if target not yet met, allow session-protected buffers */
+	if (freed < target_free_bytes) {
+		list_for_each_entry_safe_reverse(buf, tmp, &gb_dev.lru_list, lru_node) {
+			if (freed >= target_free_bytes)
+				break;
+			if (buf->alloc_flags & GB_ALLOC_KV_CACHE)
+				continue;
+			if (buf->frozen || buf->t1_priority)
+				continue;
+			if (buf->tier != GB_TIER2_SDDR || buf->hugepages)
+				continue;
+
+			atomic64_sub(buf->size, &gb_dev.pool_allocated);
+			atomic64_add(buf->size, &gb_dev.nvme_allocated);
+			buf->tier = GB_TIER3_NVME;
+			list_del_init(&buf->lru_node);
+			list_add_tail(&buf->lru_node, &evict_list);
+			freed += buf->size;
+			staged++;
+		}
 	}
 	spin_unlock(&gb_dev.lru_lock);
 
@@ -2537,6 +2811,12 @@ static int gb_reboot_notify(struct notifier_block *nb,
 		kthread_stop(gb_dev.watchdog);
 		gb_dev.watchdog = NULL;
 	}
+
+	/* Drain async eviction work before reboot so NVMe writes don't race
+	 * with filesystem unmount.  destroy_workqueue is left to gb_exit(). */
+	if (gb_dev.evict_wq)
+		flush_workqueue(gb_dev.evict_wq);
+
 	gb_nvlink_pool_exit();
 	atomic_set(&gb_dev.oom_active, 0);
 
@@ -2584,6 +2864,30 @@ static int __init gb_init(void)
 {
 	int ret;
 
+	/* Auto-detect T2 pool cap when virtual_vram_gb == 0 (no modprobe.conf or
+	 * explicit override). Adaptive DDR limit:
+	 *   total RAM <  64 GB  ->  70% of total RAM
+	 *   total RAM >= 64 GB  ->  80% of total RAM
+	 * safety_reserve_gb is enforced at alloc time by gb_alloc_buf(). */
+	if (virtual_vram_gb == 0) {
+		struct sysinfo _si;
+		u64 total_gb;
+
+		si_meminfo(&_si);
+		total_gb = ((u64)_si.totalram * _si.mem_unit) >> 30;
+
+		if (total_gb >= 64)
+			virtual_vram_gb = (int)(total_gb * 80 / 100);
+		else
+			virtual_vram_gb = (int)(total_gb * 70 / 100);
+
+		if (virtual_vram_gb < 4)
+			virtual_vram_gb = 4;
+
+		pr_info(DRIVER_NAME ": T2 auto-cap: %llu GB RAM -> %d GB pool (%d%%)\n",
+			total_gb, virtual_vram_gb, total_gb >= 64 ? 80 : 70);
+	}
+
 	pr_info(DRIVER_NAME ": =====================================================\n");
 	pr_info(DRIVER_NAME ": GreenBoost " GB_VERSION " — CUDA Memory GPU Memory Pool (LRU+eventfd)\n");
 	pr_info(DRIVER_NAME ": Author  : Ferran Duarri\n");
@@ -2618,6 +2922,16 @@ static int __init gb_init(void)
 	gb_dev.pressure_efd = NULL;
 	gb_dev.t3_file      = NULL;
 	atomic64_set(&gb_dev.t3_next_offset, 0);
+
+	/* Async T3 eviction workqueue — prevents ioctl threads from blocking on
+	 * NVMe writes.  alloc_ordered_workqueue: sequential execution avoids
+	 * write ordering races in the T3 backing file.  WQ_MEM_RECLAIM: kernel
+	 * guarantees a rescue thread even under low-memory conditions. */
+	gb_dev.evict_wq = alloc_ordered_workqueue("gb_evict", WQ_MEM_RECLAIM);
+	if (!gb_dev.evict_wq) {
+		pr_err(DRIVER_NAME ": failed to create evict workqueue\n");
+		return -ENOMEM;
+	}
 
 	/* Compute T3 file cap: t3_max_gb wins, then nvme_pool_gb as alias */
 	if (t3_max_gb > 0)
@@ -2747,6 +3061,14 @@ static void __exit gb_exit(void)
 		if (gb_dev.watchdog) {
 			kthread_stop(gb_dev.watchdog);
 			gb_dev.watchdog = NULL;
+		}
+
+		/* Flush and destroy the async eviction workqueue before closing the
+		 * T3 file — ensures all in-flight NVMe writes complete cleanly. */
+		if (gb_dev.evict_wq) {
+			flush_workqueue(gb_dev.evict_wq);
+			destroy_workqueue(gb_dev.evict_wq);
+			gb_dev.evict_wq = NULL;
 		}
 
 		/* Close T3 backing file after watchdog stops (no more evictions) */
