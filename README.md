@@ -104,10 +104,10 @@ This is an early beta feature — performance gains depend on your game and hard
 ---
 
 ## 🧠 Contributors
-- **Alan Sill** — setup scripts for Red Hat–based systems (Rocky Linux, AlmaLinux, RHEL)
-- **Jerry Nguyen** — kernel-module-free path for containers and VMs
-- **Giuseppe Marco Randazzo** — Debian Trixie support and Linux 6.12+ compatibility
-- **Alexey Masolov** — fixes for PyTorch and vLLM on modern systems
+- **Alan Sill** ([@alansill](https://gitlab.com/alansill)), contributed with setup scripts for Red Hat–based systems (Rocky Linux, AlmaLinux, RHEL)
+- **Jerry Nguyen** ([@phubao](https://gitlab.com/phubao)), contributed with a kernel-module-free path for containers and VMs.
+- **Giuseppe Marco Randazzo** ([@gmrandazzo](https://gitlab.com/gmrandazzo)), contributed with Debian Trixie support and Linux 6.12+ compatibility fixes
+- **Alexey Masolov** ([@alexeymasolov](https://gitlab.com/alexeymasolov)), contributed with fixes for PyTorch and vLLM on modern systems
 
 ---
 
