@@ -28,7 +28,6 @@ Run `greenboost help` at any time to see this reference in your terminal.
 | `sudo greenboost clear logs` | Clear all GreenBoost log sources for a fresh diagnostic baseline (dmesg, journal, log files, Proton logs) |
 | `sudo greenboost clear proton-logs` | Clear Proton/VKD3D game logs only |
 | `sudo greenboost clear inference-logs` | Clear inference service logs only |
-| `greenboost show-commands` | Display this CLI command reference in the terminal |
 
 ---
 
