@@ -91,7 +91,7 @@ GreenBoost takes a different approach: instead of moving computation to the CPU,
 
 ## 🎮 Gaming with GreenBoost (Alpha/Beta)
 
-This feature was released in the alpha/beta stage. I did not plan to release v2.8 at that time. However, I needed to make some changes to avoid infringing trademarks, which led me to push a "developer version" as the main version. "GreenBoost Proton" is a byproduct of GreenBoost and may not work properly at this stage. However, GreenBoost already includes this new Vulkan layer and Proton integration.
+This feature was released in alpha/beta stage. I did not plan to release v2.8 that early. However, I needed to make some changes to avoid infringing trademarks, which led me to push a "developer version" as the main version. 
 Greenboost was made to enhance AI local inference, not to boost gaming. Greenboost vulkan layer + Greenboost proton is a byproduct of original greenboost project.
 
 Starting with version 2.8, GreenBoost can also extend VRAM for games. If a game normally hits VRAM limits (causing texture pop-in or crashes), GreenBoost reports a larger memory pool so the game believes it has more memory available to work with.
