@@ -1036,7 +1036,7 @@ cmd_install_vulkan_layer() {
 
 cmd_steam_launch_info() {
     echo ""
-    echo -e "  ${C_CYAN}${C_BOLD}━━━ GreenBoost Proton Wayland — install location ━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
+    echo -e "  ${C_CYAN}${C_BOLD}━━━ GreenBoost Proton — install location ━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
     echo ""
     local _gpw_path=""
     for _d in \
@@ -1057,7 +1057,7 @@ cmd_steam_launch_info() {
     echo ""
     echo -e "  ${C_VIOLET}◈${C_RESET}  Right-click the game → ${C_BOLD}Properties → Compatibility${C_RESET}"
     echo -e "     Check ${C_BOLD}\"Force the use of a specific Steam Play compatibility tool\"${C_RESET}"
-    echo -e "     and select ${C_LIME}${C_BOLD}GreenBoost Proton Wayland${C_RESET}"
+    echo -e "     and select ${C_LIME}${C_BOLD}GreenBoost Proton${C_RESET}"
     echo ""
     echo -e "  ${C_CYAN}${C_BOLD}━━━ Enable per game in Steam launch options ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
     echo ""
@@ -1996,8 +1996,8 @@ cmd_help() {
         echo -e ""
         echo -e "  ${C_CYAN}${C_BOLD}GAMING:${C_RESET}"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "gaming-mode enable|disable" "Suspend/restore Ollama before/after gaming"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-proton" "Install GreenBoost Proton Wayland for Steam"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "remove-proton"          "Remove GreenBoost Proton Wayland"
+        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-proton" "Install GreenBoost Proton for Steam"
+        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "remove-proton"          "Remove GreenBoost Proton"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "steam-launch-guide"     "Show Steam launch options + Proton setup guide"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-mangohud"       "Build MangoHud from source + install GreenBoost config"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "uninstall-mangohud"     "Remove MangoHud"
@@ -2007,7 +2007,7 @@ cmd_help() {
         echo -e ""
         echo -e "  ${C_VIOLET}◈${C_RESET}  Right-click the game → ${C_BOLD}Properties → Compatibility${C_RESET}"
         echo -e "     Check ${C_BOLD}\"Force the use of a specific Steam Play compatibility tool\"${C_RESET}"
-        echo -e "     and select ${C_LIME}${C_BOLD}GreenBoost Proton Wayland${C_RESET}"
+        echo -e "     and select ${C_LIME}${C_BOLD}GreenBoost Proton${C_RESET}"
         echo -e ""
         echo -e "  ${C_CYAN}${C_BOLD}━━━ Enable per game in Steam launch options ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
         echo -e ""
@@ -2302,7 +2302,7 @@ cmd_gaming_mode() {
             systemctl start greenboost-gaming.service
             gb_ok "Gaming mode active — Ollama suspended, T2 DDR freed for gaming"
             echo ""
-            gb_info "GreenBoost Proton Wayland activates this automatically on game launch."
+            gb_info "GreenBoost Proton activates this automatically on game launch."
             gb_info "Run ${C_LIME}sudo greenboost gaming-mode disable${C_RESET} when done."
             ;;
         disable|stop)
@@ -2318,7 +2318,7 @@ cmd_gaming_mode() {
             echo -e "    ${C_LIME}sudo greenboost gaming-mode enable${C_RESET}   — suspend Ollama before gaming"
             echo -e "    ${C_LIME}sudo greenboost gaming-mode disable${C_RESET}  — restore Ollama after gaming"
             echo ""
-            gb_info "GreenBoost Proton Wayland triggers this automatically on game launch."
+            gb_info "GreenBoost Proton triggers this automatically on game launch."
             gb_info "When Ollama is suspended, pinned T2 DDR pages are freed, giving"
             gb_info "the game full access to system RAM without OOM guard pressure."
             ;;
@@ -2483,7 +2483,11 @@ cmd_logs() {
 
     # ── 3. Vulkan layer events ───────────────────────────────────────────────
     local _vkev=""
-    if command -v journalctl &>/dev/null; then
+    local _gbvk_log="$HOME/.local/share/greenboost/proton-logs/vulkan-layer.log"
+    if [[ -f "$_gbvk_log" ]]; then
+        _vkev=$(grep 'VK_LAYER_GREENBOOST' "$_gbvk_log" | tail -25)
+    fi
+    if [[ -z "$_vkev" ]] && command -v journalctl &>/dev/null; then
         _vkev=$(journalctl --since "1 hour ago" --no-pager -q 2>/dev/null \
             | grep 'VK_LAYER_GREENBOOST' | tail -25)
     fi
@@ -2500,8 +2504,9 @@ cmd_logs() {
             echo -e "  ${C_GRAY}${_vkline}${C_RESET}"
         done <<< "$_vkev"
     else
-        echo -e "  ${C_DIM}(empty — checked: journalctl /var/log/messages /var/log/syslog, last 1h)${C_RESET}"
-        _diag_warns+=("no Vulkan layer events — game may not have reached Vulkan init")
+        echo -e "  ${C_DIM}(empty — checked: journalctl VK_LAYER_GREENBOOST, /var/log/messages)${C_RESET}"
+        echo -e "  ${C_DIM}(also checked: ~/.local/share/greenboost/proton-logs/vulkan-layer.log)${C_RESET}"
+        _diag_warns+=("no Vulkan layer events — GreenBoost Proton may not be selected for this game")
     fi
     echo ""
 

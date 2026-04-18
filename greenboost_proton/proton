@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""GreenBoost Proton Wayland — thin GreenBoost wrapper around Proton Experimental.
+"""GreenBoost Proton — thin wrapper around upstream Steam Proton builds.
 
 Injects GreenBoost environment variables (virtual-VRAM Vulkan layer, Wayland,
 DXR config, shader caches, per-game tweaks) into os.environ, then delegates
-to Proton Experimental's proton script which supplies Wine, VKD3D-Proton,
-DXVK, and the full protonfixes stack.
+to the upstream Proton selected by a 'channel' sidecar file in the same directory:
+  channel=stable       → latest installed stable Proton (e.g. Proton 10.0)
+  channel=experimental → Proton Experimental
 
 All hardware values are auto-detected at runtime — nothing is hard-coded.
 """
@@ -413,48 +414,83 @@ def _append_vkd3d(key, option):
         os.environ[key] = cur + "," + option
 
 
-def _find_proton_experimental():
-    candidates = []
-
+def _steam_common_dirs():
+    dirs = []
     steam_root = os.environ.get("STEAM_COMPAT_CLIENT_INSTALL_PATH", "")
     if steam_root:
-        candidates.append(
-            os.path.join(steam_root, "steamapps", "common", "Proton - Experimental", "proton")
-        )
+        dirs.append(os.path.join(steam_root, "steamapps", "common"))
     for lib in os.environ.get("STEAM_COMPAT_LIBRARY_PATHS", "").split(":"):
         if lib:
-            candidates.append(
-                os.path.join(lib, "common", "Proton - Experimental", "proton")
-            )
+            dirs.append(os.path.join(lib, "common"))
     for base in (
         os.path.expanduser("~/.local/share/Steam"),
         os.path.expanduser("~/.steam/root"),
         os.path.expanduser("~/.steam/steam"),
     ):
-        candidates.append(
-            os.path.join(base, "steamapps", "common", "Proton - Experimental", "proton")
-        )
+        dirs.append(os.path.join(base, "steamapps", "common"))
+    return list(dict.fromkeys(dirs))  # deduplicate, preserve order
 
-    for path in candidates:
-        if os.path.isfile(path):
-            return path
+
+def _find_proton_experimental():
+    for d in _steam_common_dirs():
+        p = os.path.join(d, "Proton - Experimental", "proton")
+        if os.path.isfile(p):
+            return p
     return None
+
+
+def _find_proton_stable():
+    best_ver = (-1, -1)
+    best_path = None
+    for d in _steam_common_dirs():
+        if not os.path.isdir(d):
+            continue
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            continue
+        for entry in entries:
+            m = re.match(r'^Proton\s+(\d+)\.(\d+)$', entry)
+            if not m:
+                continue
+            ver = (int(m.group(1)), int(m.group(2)))
+            p = os.path.join(d, entry, "proton")
+            if os.path.isfile(p) and ver > best_ver:
+                best_ver, best_path = ver, p
+    return best_path
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    proton_exp = _find_proton_experimental()
-    if not proton_exp:
+    # ── Channel detection — read sidecar 'channel' file ──────────────────────
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _channel = "experimental"
+    try:
+        with open(os.path.join(_script_dir, "channel")) as _cf:
+            _channel = _cf.read().strip()
+    except OSError:
+        pass
+
+    if _channel == "stable":
+        proton_upstream = _find_proton_stable()
+        _upstream_label = "Proton (stable)"
+        _upstream_install_hint = "Library → Games → search 'Proton X.Y' → Install"
+    else:
+        proton_upstream = _find_proton_experimental()
+        _upstream_label = "Proton Experimental"
+        _upstream_install_hint = "Library → Tools → Proton Experimental → Install"
+
+    if not proton_upstream:
         sys.stderr.write(
-            "[greenboost-proton] ERROR: Proton Experimental not found.\n"
-            "[greenboost-proton] Install it in Steam: Library → Tools → Proton Experimental\n"
+            f"[greenboost-proton] ERROR: {_upstream_label} not found.\n"
+            f"[greenboost-proton] Install it in Steam: {_upstream_install_hint}\n"
         )
         sys.exit(1)
 
     if os.environ.get("GREENBOOST_DISABLE", "0") == "1":
-        sys.stderr.write(f"[greenboost-proton] GreenBoost disabled — delegating to {proton_exp}\n")
-        os.execv(proton_exp, [proton_exp] + sys.argv[1:])
+        sys.stderr.write(f"[greenboost-proton] GreenBoost disabled — delegating to {proton_upstream}\n")
+        os.execv(proton_upstream, [proton_upstream] + sys.argv[1:])
 
     gpu_name, vram_mb, is_nvidia, supports_rt = _detect_nvidia()
     total_threads, p_cores, cpu_model, p_core_cpus = _detect_cpu()
@@ -480,6 +516,18 @@ def main():
 
     # ── GreenBoost env vars (set before Proton Experimental's init_session) ───
     os.environ.setdefault("GREENBOOST_VULKAN", "1")
+
+    # Ensure the user-local layer manifest is on VK_LAYER_PATH so the Vulkan
+    # loader finds it inside the pressure-vessel container (home is bindmounted;
+    # /etc/vulkan and /usr/local/lib are not).
+    _home = os.environ.get("HOME", os.path.expanduser("~"))
+    _user_layer_dir = os.path.join(_home, ".local", "share", "vulkan", "implicit_layer.d")
+    _existing_vk = os.environ.get("VK_LAYER_PATH", "")
+    if _user_layer_dir not in _existing_vk.split(":"):
+        os.environ["VK_LAYER_PATH"] = (
+            f"{_user_layer_dir}:{_existing_vk}".rstrip(":")
+        )
+
     os.environ.setdefault("PROTON_ENABLE_WAYLAND", "1")
 
     # VKD3D_CONFIG — DXR only on RT-capable GPUs and only for games that support it.
@@ -585,7 +633,7 @@ def main():
             os.environ.get("GREENBOOST_VULKAN", "0"),
         )
     )
-    sys.stderr.write(f"[greenboost-proton] Delegating to: {proton_exp}\n")
+    sys.stderr.write(f"[greenboost-proton] Delegating to: {proton_upstream}  (channel={_channel})\n")
 
     # ── CPU affinity — pin game to P-cores for max single-thread performance ────
     # The affinity is inherited by Proton Experimental → Wine → the game process.
@@ -627,7 +675,7 @@ def main():
         # subprocess.run inherits our modified os.environ automatically (no env= needed).
         # Proton Experimental's proton script uses sys.argv[0] to find its own files/,
         # protonfixes/, and Wine binaries — all supplied by the Proton Experimental install.
-        rc = subprocess.run([proton_exp] + sys.argv[1:]).returncode
+        rc = subprocess.run([proton_upstream] + sys.argv[1:]).returncode
     finally:
         try:
             subprocess.run(

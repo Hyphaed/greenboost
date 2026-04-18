@@ -1,4 +1,4 @@
-# GreenBoost Proton Wayland — Architecture
+# GreenBoost Proton — Architecture
 
 ## Overview
 

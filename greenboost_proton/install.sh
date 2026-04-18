@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — GreenBoost Proton Wayland installer
+# install.sh — GreenBoost Proton installer
 #
 # Usage:
 #   ./install.sh           Install to Steam compatibilitytools.d
@@ -31,22 +31,27 @@ gb_step() { printf '%b\n' "  ${C_CYAN}❯${C_RESET}  $*"; }
 
 gb_header() {
     printf '\n%b\n' "${C_VIOLET}${C_BOLD}  GreenBoost Proton — Installer${C_RESET}"
-    printf '%b\n\n' "${C_DIM}  Thin wrapper around Proton Experimental — virtual-VRAM, Wayland, DXR, NVAPI, shader-cache${C_RESET}"
+    printf '%b\n\n' "${C_DIM}  Two Steam entries: wraps latest stable Proton and Proton Experimental — virtual-VRAM, Wayland, DXR, NVAPI${C_RESET}"
 }
 
-# Canonical install directory — shared Steam compat tools folder
-INSTALL_DIR="$HOME/.local/share/Steam/compatibilitytools.d/greenboost-proton"
+# Canonical install directories — shared Steam compat tools folder
+COMPAT_DIR="$HOME/.local/share/Steam/compatibilitytools.d"
+INSTALL_DIR="$COMPAT_DIR/greenboost-proton"
+INSTALL_DIR_EXP="$COMPAT_DIR/greenboost-proton-experimental"
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 UNINSTALL=0
+FORCE=0
 for _arg in "$@"; do
     case "$_arg" in
         --uninstall) UNINSTALL=1 ;;
+        --force)     FORCE=1 ;;
         --help|-h)
             gb_header
             printf '%b\n' "  ${C_GRAY}Usage:${C_RESET}"
             printf '%b\n' "    ${C_CYAN}./install.sh${C_RESET}             ${C_DIM}Install to Steam compat tools${C_RESET}"
             printf '%b\n' "    ${C_CYAN}./install.sh --uninstall${C_RESET}  ${C_DIM}Remove installation${C_RESET}"
+            printf '%b\n' "    ${C_CYAN}./install.sh --force${C_RESET}      ${C_DIM}Skip hard-fail checks (e.g. Proton Experimental missing)${C_RESET}"
             printf '%b\n' ""
             printf '%b\n' "  ${C_GRAY}Install path:${C_RESET}"
             printf '%b\n' "    ${C_DIM}$INSTALL_DIR${C_RESET}"
@@ -103,9 +108,13 @@ if (( UNINSTALL )); then
     _removed=0
     for _d in \
         "$INSTALL_DIR" \
+        "$INSTALL_DIR_EXP" \
         "$HOME/.steam/root/compatibilitytools.d/greenboost-proton" \
+        "$HOME/.steam/root/compatibilitytools.d/greenboost-proton-experimental" \
         "$HOME/.steam/root/compatibilitytools.d/greenboost-proton-wayland" \
-        "$HOME/.local/share/Steam/compatibilitytools.d/greenboost-proton-wayland"
+        "$HOME/.local/share/Steam/compatibilitytools.d/greenboost-proton-wayland" \
+        "$HOME/.local/share/Steam/compatibilitytools.d/proton-ryzen5-5070" \
+        "$HOME/.steam/root/compatibilitytools.d/proton-ryzen5-5070"
     do
         if [[ -L "$_d" || -d "$_d" ]]; then
             rm -rf "$_d"
@@ -114,6 +123,18 @@ if (( UNINSTALL )); then
         fi
     done
     (( _removed )) || gb_info "Nothing to remove."
+
+    # Remove user-local Vulkan layer files
+    for _vkf in \
+        "$HOME/.local/share/vulkan/libVkLayer_greenboost.so" \
+        "$HOME/.local/share/vulkan/implicit_layer.d/VkLayer_greenboost.json"
+    do
+        if [[ -f "$_vkf" ]]; then
+            rm -f "$_vkf"
+            gb_ok "Removed: ${C_DIM}$_vkf${C_RESET}"
+        fi
+    done
+
     gb_ok "Uninstalled. Restart Steam to apply."
     exit 0
 fi
@@ -131,8 +152,48 @@ done
 if (( _proton_exp_found )); then
     gb_ok "Proton Experimental: installed"
 else
-    gb_warn "Proton Experimental not found — GreenBoost Proton requires it"
+    gb_warn "Proton Experimental not found — GreenBoost Proton Experimental will warn at launch"
     gb_info "  In Steam: Library → Tools → Proton Experimental → Install"
+fi
+
+_proton_stable_found=0
+_proton_stable_name=""
+for _base in \
+    "$HOME/.local/share/Steam/steamapps/common" \
+    "$HOME/.steam/root/steamapps/common"
+do
+    [[ -d "$_base" ]] || continue
+    _best_ver="-1.-1"
+    for _pd in "$_base"/Proton\ [0-9]*; do
+        [[ -f "$_pd/proton" ]] || continue
+        _vstr="$(basename "$_pd" | grep -oP '\d+\.\d+')"
+        [[ -z "$_vstr" ]] && continue
+        _vmaj="${_vstr%%.*}"; _vmin="${_vstr##*.}"
+        _best_maj="${_best_ver%%.*}"; _best_min="${_best_ver##*.}"
+        if (( _vmaj > _best_maj || (_vmaj == _best_maj && _vmin > _best_min) )); then
+            _best_ver="$_vmaj.$_vmin"
+            _proton_stable_name="$(basename "$_pd")"
+            _proton_stable_found=1
+        fi
+    done
+    (( _proton_stable_found )) && break
+done
+if (( _proton_stable_found )); then
+    gb_ok "Proton stable: ${_proton_stable_name}"
+else
+    gb_warn "No stable Proton version found — GreenBoost Proton will warn at launch"
+    gb_info "  In Steam: Library → Games → search 'Proton 10.0' (or newer) → Install"
+fi
+
+if (( ! _proton_exp_found && ! _proton_stable_found )); then
+    if (( FORCE )); then
+        gb_warn "Neither Proton Experimental nor stable Proton found — continuing due to --force"
+    else
+        gb_fail "No Proton version found — cannot install a useful GreenBoost Proton entry"
+        gb_info "  Install at least one Proton version in Steam, then re-run."
+        gb_info "  Or pass ${C_CYAN}--force${C_RESET} to install anyway."
+        exit 1
+    fi
 fi
 
 _sniper_found=0
@@ -153,7 +214,10 @@ fi
 for _legacy in \
     "$HOME/.steam/root/compatibilitytools.d/greenboost-proton-wayland" \
     "$HOME/.steam/root/compatibilitytools.d/greenboost-proton" \
-    "$HOME/.local/share/Steam/compatibilitytools.d/greenboost-proton-wayland"
+    "$HOME/.steam/root/compatibilitytools.d/greenboost-proton-experimental" \
+    "$HOME/.local/share/Steam/compatibilitytools.d/greenboost-proton-wayland" \
+    "$HOME/.local/share/Steam/compatibilitytools.d/proton-ryzen5-5070" \
+    "$HOME/.steam/root/compatibilitytools.d/proton-ryzen5-5070"
 do
     if [[ -L "$_legacy" || -d "$_legacy" ]]; then
         rm -rf "$_legacy"
@@ -161,54 +225,148 @@ do
     fi
 done
 
-# ── Copy tool to shared Steam compat tools directory ─────────────────────────
+# Remove any other stale GreenBoost Proton copies (any dir whose
+# compatibilitytool.vdf claims our display_name but isn't the canonical dir).
+for _base in \
+    "$HOME/.local/share/Steam/compatibilitytools.d" \
+    "$HOME/.steam/root/compatibilitytools.d"
+do
+    [[ -d "$_base" ]] || continue
+    for _vdf in "$_base"/*/compatibilitytool.vdf; do
+        [[ -f "$_vdf" ]] || continue
+        _stale_dir="$(dirname "$_vdf")"
+        case "$(basename "$_stale_dir")" in
+            greenboost-proton|greenboost-proton-experimental) continue ;;
+        esac
+        if grep -qE '"display_name"[[:space:]]+"GreenBoost Proton( Experimental)?"' "$_vdf" 2>/dev/null; then
+            rm -rf "$_stale_dir"
+            gb_info "Removed stale GreenBoost copy: ${C_DIM}$_stale_dir${C_RESET}"
+        fi
+    done
+done
+
+# ── Helper: install one Steam compatibility tool entry ────────────────────────
+# Args: $1=install_dir  $2=display_name  $3=vdf_tool_key  $4=channel (stable|experimental)
+_install_entry() {
+    local _dir="$1" _name="$2" _key="$3" _chan="$4"
+    gb_step "${C_GRAY}Installing '${_name}'...${C_RESET}  ${C_DIM}$_dir${C_RESET}"
+    mkdir -p "$_dir"
+
+    # Copy shared runtime files (proton script, toolmanifest.vdf, version)
+    local _items=(proton toolmanifest.vdf version)
+    if command -v rsync &>/dev/null; then
+        for _item in "${_items[@]}"; do
+            [[ -e "$SELF_DIR/$_item" ]] || { gb_warn "Missing: $SELF_DIR/$_item — skipping"; continue; }
+            rsync -a --delete "$SELF_DIR/$_item" "$_dir/" 2>/dev/null \
+                || rsync -a "$SELF_DIR/$_item" "$_dir/"
+        done
+    else
+        for _item in "${_items[@]}"; do
+            [[ -e "$SELF_DIR/$_item" ]] || { gb_warn "Missing: $SELF_DIR/$_item — skipping"; continue; }
+            rm -rf "${_dir:?}/$_item"
+            cp -r "$SELF_DIR/$_item" "$_dir/"
+        done
+    fi
+    chmod +x "$_dir/proton"
+
+    # Channel sidecar — tells the proton wrapper which upstream to use
+    printf '%s\n' "$_chan" > "$_dir/channel"
+
+    # Generate compatibilitytool.vdf for this entry
+    cat > "$_dir/compatibilitytool.vdf" << VDFEOF
+"compatibilitytools"
+{
+  "compat_tools"
+  {
+    "${_key}"
+    {
+      "install_path" "."
+      "display_name" "${_name}"
+      "from_oslist"  "windows"
+      "to_oslist"    "linux"
+    }
+  }
+}
+VDFEOF
+    gb_ok "'${_name}': installed"
+}
+
+# ── Install both Steam compatibility tool entries ─────────────────────────────
 echo ""
-gb_step "${C_GRAY}Installing to shared Steam compat tools folder...${C_RESET}"
+gb_step "${C_GRAY}Installing Steam compatibility tool entries...${C_RESET}"
 
-mkdir -p "$INSTALL_DIR"
+_install_entry \
+    "$INSTALL_DIR" \
+    "GreenBoost Proton" \
+    "greenboost-proton" \
+    "stable"
 
-# Only the wrapper script and Steam VDF manifests are installed.
-_steam_items=(
-    proton
-    compatibilitytool.vdf
-    toolmanifest.vdf
-    version
-)
+_install_entry \
+    "$INSTALL_DIR_EXP" \
+    "GreenBoost Proton Experimental" \
+    "greenboost-proton-experimental" \
+    "experimental"
 
-if command -v rsync &>/dev/null; then
-    for _item in "${_steam_items[@]}"; do
-        [[ -e "$SELF_DIR/$_item" ]] || { gb_warn "Missing: $SELF_DIR/$_item — skipping"; continue; }
-        rsync -a --delete "$SELF_DIR/$_item" "$INSTALL_DIR/" 2>/dev/null \
-            || rsync -a "$SELF_DIR/$_item" "$INSTALL_DIR/"
-    done
+# ── User-local Vulkan layer (accessible inside pressure-vessel) ───────────────
+# The system-wide layer at /etc/vulkan/implicit_layer.d/ is not bindmounted into
+# SteamLinuxRuntime Sniper's pressure-vessel container.  Install a user-local copy
+# under ~/.local/share/vulkan/ which pressure-vessel does see (home is bindmounted),
+# with library_path updated to the user-local .so location.
+echo ""
+gb_step "${C_GRAY}Installing user-local Vulkan layer (pressure-vessel accessible)...${C_RESET}"
+
+_vk_src_lib="/usr/local/lib/libVkLayer_greenboost.so"
+_vk_user_dir="$HOME/.local/share/vulkan"
+_vk_user_lib="$_vk_user_dir/libVkLayer_greenboost.so"
+_vk_user_manifest_dir="$_vk_user_dir/implicit_layer.d"
+_vk_user_manifest="$_vk_user_manifest_dir/VkLayer_greenboost.json"
+
+if [[ -f "$_vk_src_lib" ]]; then
+    mkdir -p "$_vk_user_manifest_dir"
+    mkdir -p "$HOME/.local/share/greenboost/proton-logs"
+    cp "$_vk_src_lib" "$_vk_user_lib"
+    cat > "$_vk_user_manifest" << VKEOF
+{
+    "file_format_version": "1.0.0",
+    "layer": {
+        "name": "VK_LAYER_GREENBOOST_memory",
+        "type": "GLOBAL",
+        "library_path": "${_vk_user_lib}",
+        "api_version": "1.3.0",
+        "implementation_version": "1",
+        "description": "GreenBoost virtual VRAM — inflates device-local heap and routes overflow to T2/T3 DDR via DMA-BUF",
+        "enable_environment": {
+            "GREENBOOST_VULKAN": "1"
+        }
+    }
+}
+VKEOF
+    gb_ok "Vulkan layer: ${C_DIM}$_vk_user_manifest${C_RESET}"
 else
-    for _item in "${_steam_items[@]}"; do
-        [[ -e "$SELF_DIR/$_item" ]] || { gb_warn "Missing: $SELF_DIR/$_item — skipping"; continue; }
-        rm -rf "${INSTALL_DIR:?}/$_item"
-        cp -r "$SELF_DIR/$_item" "$INSTALL_DIR/"
-    done
+    gb_warn "Vulkan layer library not found at $_vk_src_lib"
+    gb_info "  Run: ${C_CYAN}sudo greenboost_setup.sh install-sys-configs${C_RESET} first"
 fi
-
-chmod +x "$INSTALL_DIR/proton"
-gb_ok "proton script: executable"
 
 # ── Report installation path ──────────────────────────────────────────────────
 echo ""
 printf '%b\n' "${C_VIOLET}${C_BOLD}  Installation complete${C_RESET}"
 echo ""
-gb_ok "Installed at:  ${C_LIME}$INSTALL_DIR${C_RESET}"
+gb_ok "Stable entry:       ${C_LIME}$INSTALL_DIR${C_RESET}"
+gb_ok "Experimental entry: ${C_LIME}$INSTALL_DIR_EXP${C_RESET}"
 echo ""
-gb_info "GreenBoost Proton wraps ${C_CYAN}Proton Experimental${C_RESET} — as Valve updates it, you get the update automatically."
+gb_info "Entries and their upstream Proton:"
+gb_info "  ${C_LIME}GreenBoost Proton${C_RESET}              → wraps latest stable Proton (${_proton_stable_name:-not found})"
+gb_info "  ${C_LIME}GreenBoost Proton Experimental${C_RESET} → wraps Proton Experimental"
 echo ""
 gb_info "Next steps:"
 gb_info "  1. Restart Steam"
 gb_info "  2. Right-click a game → Properties → Compatibility"
-gb_info "  3. Select ${C_LIME}GreenBoost Proton${C_RESET}"
+gb_info "  3. Select ${C_LIME}GreenBoost Proton${C_RESET} (stable) or ${C_LIME}GreenBoost Proton Experimental${C_RESET}"
 gb_info ""
-gb_info "To update GreenBoost itself, re-run this script."
+gb_info "To update, re-run this script."
 gb_info "Optional launch options:"
 printf '%b\n' "         ${C_CYAN}PROTON_ENABLE_WAYLAND=0 %command%${C_RESET}  ${C_DIM}(fall back to XWayland)${C_RESET}"
-printf '%b\n' "         ${C_CYAN}GREENBOOST_NO_DXR=1 %command%${C_RESET}    ${C_DIM}(disable DXR injection — for games that crash with dxr/dxr11)${C_RESET}"
+printf '%b\n' "         ${C_CYAN}GREENBOOST_NO_DXR=1 %command%${C_RESET}    ${C_DIM}(disable DXR injection)${C_RESET}"
 echo ""
 gb_info "Monitor: ${C_CYAN}greenboost vulkan${C_RESET}"
 echo ""

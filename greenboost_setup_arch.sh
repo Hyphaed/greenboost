@@ -1092,7 +1092,7 @@ cmd_gaming_mode() {
             systemctl start greenboost-gaming.service
             gb_ok "Gaming mode active — Ollama suspended, T2 DDR freed for gaming"
             echo ""
-            gb_info "GreenBoost Proton Wayland activates this automatically on game launch."
+            gb_info "GreenBoost Proton activates this automatically on game launch."
             gb_info "Run ${C_LIME}sudo greenboost gaming-mode disable${C_RESET} when done."
             ;;
         disable|stop)
@@ -1108,7 +1108,7 @@ cmd_gaming_mode() {
             echo -e "    ${C_LIME}sudo greenboost gaming-mode enable${C_RESET}   — suspend Ollama before gaming"
             echo -e "    ${C_LIME}sudo greenboost gaming-mode disable${C_RESET}  — restore Ollama after gaming"
             echo ""
-            gb_info "GreenBoost Proton Wayland triggers this automatically on game launch."
+            gb_info "GreenBoost Proton triggers this automatically on game launch."
             gb_info "When Ollama is suspended, pinned T2 DDR pages are freed, giving"
             gb_info "the game full access to system RAM without OOM guard pressure."
             ;;
@@ -1361,7 +1361,11 @@ cmd_logs() {
 
     # ── 3. Vulkan layer events ───────────────────────────────────────────────
     local _vkev=""
-    if command -v journalctl &>/dev/null; then
+    local _gbvk_log="$HOME/.local/share/greenboost/proton-logs/vulkan-layer.log"
+    if [[ -f "$_gbvk_log" ]]; then
+        _vkev=$(grep 'VK_LAYER_GREENBOOST' "$_gbvk_log" | tail -25)
+    fi
+    if [[ -z "$_vkev" ]] && command -v journalctl &>/dev/null; then
         _vkev=$(journalctl --since "1 hour ago" --no-pager -q 2>/dev/null \
             | grep 'VK_LAYER_GREENBOOST' | tail -25)
     fi
@@ -1378,8 +1382,9 @@ cmd_logs() {
             echo -e "  ${C_GRAY}${_vkline}${C_RESET}"
         done <<< "$_vkev"
     else
-        echo -e "  ${C_DIM}(empty — checked: journalctl /var/log/syslog /var/log/messages, last 1h)${C_RESET}"
-        _diag_warns+=("no Vulkan layer events — game may not have reached Vulkan init")
+        echo -e "  ${C_DIM}(empty — checked: journalctl VK_LAYER_GREENBOOST, /var/log/syslog)${C_RESET}"
+        echo -e "  ${C_DIM}(also checked: ~/.local/share/greenboost/proton-logs/vulkan-layer.log)${C_RESET}"
+        _diag_warns+=("no Vulkan layer events — GreenBoost Proton may not be selected for this game")
     fi
     echo ""
 

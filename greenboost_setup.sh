@@ -95,6 +95,10 @@ C_RESET=$'\033[0m'
 
 GB_SPIN_FRAMES=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
 
+# Default log paths (override via env)
+GB_STATUS_LOG="${GB_STATUS_LOG:-$HOME/.local/share/greenboost/status.log}"
+GB_INFER_TEST_LOG="${GB_INFER_TEST_LOG:-$HOME/.local/share/greenboost/inference-test-latest.log}"
+
 # gb_header — branded box header
 gb_header() {
     local cols; cols=$(tput cols 2>/dev/null || echo 64)
@@ -2525,7 +2529,7 @@ cmd_gaming_mode() {
             systemctl start greenboost-gaming.service
             gb_ok "Gaming mode active — Ollama suspended, T2 DDR freed for gaming"
             echo ""
-            gb_info "GreenBoost Proton Wayland activates this automatically on game launch."
+            gb_info "GreenBoost Proton activates this automatically on game launch."
             gb_info "Run ${C_LIME}sudo greenboost gaming-mode disable${C_RESET} when done."
             ;;
         disable|stop)
@@ -2541,7 +2545,7 @@ cmd_gaming_mode() {
             echo -e "    ${C_LIME}sudo greenboost gaming-mode enable${C_RESET}   — suspend Ollama before gaming"
             echo -e "    ${C_LIME}sudo greenboost gaming-mode disable${C_RESET}  — restore Ollama after gaming"
             echo ""
-            gb_info "GreenBoost Proton Wayland triggers this automatically on game launch."
+            gb_info "GreenBoost Proton triggers this automatically on game launch."
             gb_info "When Ollama is suspended, pinned T2 DDR pages are freed, giving"
             gb_info "the game full access to system RAM without OOM guard pressure."
             ;;
@@ -2786,6 +2790,32 @@ STEAMEOF
     info "Launch Steam with: ${C_CYAN}greenboost-steam${C_RESET}"
 }
 
+cmd_proton_clean() {
+    # Removes every entry from Steam's compatibilitytools.d except greenboost-proton
+    # and LegacyRuntime (the Steam-internal entry).  Stale custom builds can cause
+    # Steam to fail loading manifests and appear as ghost entries in the compat tool list.
+    local _removed=0
+    for _compat_dir in \
+        "$HOME/.local/share/Steam/compatibilitytools.d" \
+        "$HOME/.steam/root/compatibilitytools.d"
+    do
+        [[ -d "$_compat_dir" ]] || continue
+        for _tool in "$_compat_dir"/*/; do
+            [[ -d "$_tool" ]] || continue
+            local _name
+            _name=$(basename "$_tool")
+            case "$_name" in
+                greenboost-proton|LegacyRuntime) continue ;;
+            esac
+            rm -rf "$_tool"
+            gb_ok "Removed: ${C_DIM}$_name${C_RESET}"
+            _removed=1
+        done
+    done
+    (( _removed )) || gb_info "Nothing to remove — only greenboost-proton present."
+    gb_info "Restart Steam to apply changes."
+}
+
 # ── cmd_install_proton ────────────────────────────────────────────────
 # Gaming wizard entry point.  Runs as root (need_root) so it can write system
 # files, then drops back to the real user for the Steam-level symlink.
@@ -2797,7 +2827,7 @@ STEAMEOF
 #      /etc/ld.so.preload to use the library name (not a hard path) so that
 #      the dynamic linker resolves the correct ELF class per process automatically
 #      — eliminating the ELFCLASS64 "ignored" spam from 32-bit Steam components.
-#   3. Installs GreenBoost Proton Wayland as a Steam compat tool symlink.
+#   3. Installs GreenBoost Proton as a Steam compat tool symlink.
 #      GREENBOOST_VULKAN=1 is set automatically by the proton script on every
 #      launch — no Steam launch options are required.
 cmd_install_proton() {
@@ -2807,7 +2837,7 @@ cmd_install_proton() {
     local user_home
     user_home="$(eval echo "~${real_user}")"
 
-    gb_section "GreenBoost Proton Wayland"
+    gb_section "GreenBoost Proton"
 
     # ── 1. Full uninstall of any previous version ─────────────────────────────
     # Run the complete uninstall routine so that system-level artifacts (audit
@@ -2890,14 +2920,14 @@ cmd_install_proton() {
         gb_ok "AppArmor abstraction updated — multiarch paths now allowed"
     fi
 
-    # ── 3. Install GreenBoost Proton Wayland compat tool ─────────────────────
+    # ── 3. Install GreenBoost Proton compat tool ─────────────────────
     local proton_installer="$MODULE_DIR/greenboost_proton/install.sh"
     if [[ ! -f "$proton_installer" ]]; then
         gb_warn_ui "Installer not found: $proton_installer"
         return 1
     fi
 
-    gb_step "Installing GreenBoost Proton Wayland..."
+    gb_step "Installing GreenBoost Proton..."
     # Run as the real user so the symlink lands in their Steam directory
     sudo -u "$real_user" bash "$proton_installer"
 
@@ -2938,6 +2968,7 @@ POLKITEOF
 
     systemctl daemon-reload
     gb_ok "Gaming mode service installed (auto gaming-mode on Proton launch)"
+    cmd_fix_steam
     cmd_steam_launch_info
 
 }
@@ -2968,6 +2999,17 @@ cmd_uninstall_proton() {
         done
         (( _removed )) || gb_info "No compat tool directories found."
     fi
+
+    # ── 1b. Remove user-local Vulkan layer files (installed by install-proton) ──
+    for _vkf in \
+        "${user_home}/.local/share/vulkan/libVkLayer_greenboost.so" \
+        "${user_home}/.local/share/vulkan/implicit_layer.d/VkLayer_greenboost.json"
+    do
+        if [[ -f "$_vkf" ]]; then
+            rm -f "$_vkf"
+            gb_ok "Removed: ${C_DIM}$_vkf${C_RESET}"
+        fi
+    done
 
     # ── 2. Remove system-level artifacts installed by install-proton ──
     # gaming service + polkit rule
@@ -3166,6 +3208,7 @@ do_purge() {
         /etc/modprobe.d/greenboost.conf.bak \
         /etc/profile.d/greenboost.sh \
         /usr/local/bin/greenboost \
+        /usr/local/bin/greenboost-steam \
         /etc/modules-load.d/greenboost.conf \
         /etc/udev/rules.d/99-greenboost.rules \
         /etc/udev/rules.d/99-nvme-greenboost.rules \
@@ -3177,6 +3220,7 @@ do_purge() {
     done
     udevadm control --reload-rules 2>/dev/null || true
     [[ $_cfg_removed -gt 0 ]] && gb_ok "Config files removed ($_cfg_removed files)"
+    rm -rf /etc/greenboost
 
     # 6. Disable + remove ALL GreenBoost systemd services — generic glob catches any
     #    service file installed by any version of full-install, regardless of name.
@@ -3201,7 +3245,7 @@ do_purge() {
     rm -f /usr/local/bin/greenboost-turboquant \
           /usr/local/lib/libgreenboost_tq.so \
           /etc/systemd/system/greenboost-turboquant.service
-    rm -rf /usr/local/lib/greenboost/cmd/greenboost-turboquant
+    rm -rf /usr/local/lib/greenboost
 
     # Installed daemon scripts and CLI wrappers (all known names across all versions)
     rm -f /usr/local/sbin/greenboost-recover \
@@ -4169,14 +4213,19 @@ cmd_clear_logs() {
         return
     fi
 
+    local _real_user="${SUDO_USER:-$USER}"
+    local _real_home
+    _real_home="$(getent passwd "$_real_user" | cut -d: -f6)"
+    [[ -z "$_real_home" ]] && _real_home="$HOME"
+
     dmesg -c > /dev/null 2>&1 || true
     journalctl --rotate > /dev/null 2>&1 || true
     journalctl --vacuum-time=1s > /dev/null 2>&1 || true
     rm -rf /var/log/greenboost/* 2>/dev/null || true
     rm -f /tmp/greenboost*.log 2>/dev/null || true
-    local _gbproton_dir="$HOME/.local/share/greenboost/proton-logs"
+    local _gbproton_dir="$_real_home/.local/share/greenboost/proton-logs"
     rm -f "$_gbproton_dir"/steam-*.log 2>/dev/null || true
-    rm -f "$HOME"/steam-*.log 2>/dev/null || true
+    rm -f "$_real_home"/steam-*.log 2>/dev/null || true
     if command -v coredumpctl &>/dev/null; then
         coredumpctl delete wine64 2>/dev/null || true
         coredumpctl delete wineserver 2>/dev/null || true
@@ -4396,8 +4445,9 @@ cmd_logs() {
             format_vulkan_event "$_vkline"
         done <<< "$_vkev"
     else
-        echo -e "  ${C_DIM}(empty — checked: journalctl /var/log/syslog /var/log/messages, last 1h)${C_RESET}"
-        _diag_warns+=("no Vulkan layer events — game may not have reached Vulkan init")
+        echo -e "  ${C_DIM}(empty — checked: journalctl VK_LAYER_GREENBOOST, /var/log/syslog)${C_RESET}"
+        echo -e "  ${C_DIM}(also checked: ~/.local/share/greenboost/proton-logs/vulkan-layer.log)${C_RESET}"
+        _diag_warns+=("no Vulkan layer events — GreenBoost Proton may not be selected for this game")
     fi
     echo ""
 
@@ -4560,6 +4610,7 @@ cmd_proton_logs() {
         echo "gb_proton_logs v=${GB_VERSION} ts=$(date '+%Y-%m-%dT%H:%M')"
         query_dx12_status 2>/dev/null || true
         _llm_section "proton_vkd3d" "$(gather_proton_log_events 40 2>/dev/null)"
+        _llm_section "vulkan_layer" "$(gather_vulkan_events 20 2>/dev/null)"
         _llm_section "steam_client" "$(gather_steam_client_logs 20 2>/dev/null)"
         _llm_section "pressure_vessel" "$(gather_pressure_vessel_logs 15 2>/dev/null)"
         _llm_section "wine_crashes" "$(gather_wine_crash_logs 10 2>/dev/null)"
@@ -4587,6 +4638,22 @@ cmd_proton_logs() {
     else
         echo -e "  ${C_DIM}(empty — checked: ${_gbdir}/ ~/steam-*.log PROTON_LOG_DIR)${C_RESET}"
         _diag_warns+=("no Proton log files found — game did not reach Wine logging stage")
+    fi
+    echo ""
+
+    # ── GreenBoost Vulkan layer events ────────────────────────────────────
+    local _vkev; _vkev=$(gather_vulkan_events 20)
+    local _vkev_n=0; [[ -n "$_vkev" ]] && _vkev_n=$(printf '%s\n' "$_vkev" | wc -l)
+    gb_section "GreenBoost Vulkan Layer  (${_vkev_n} events)"
+    if [[ -n "$_vkev" ]]; then
+        while IFS= read -r _vkline; do
+            [[ -z "$_vkline" ]] && continue
+            format_vulkan_event "$_vkline"
+        done <<< "$_vkev"
+        _diag_ok+=("Vulkan layer active — ${_vkev_n} events recorded")
+    else
+        echo -e "  ${C_DIM}(empty — checked: journalctl VK_LAYER_GREENBOOST, /var/log/syslog)${C_RESET}"
+        _diag_warns+=("no Vulkan layer events — GreenBoost Proton may not be selected for this game")
     fi
     echo ""
 
@@ -4668,6 +4735,38 @@ cmd_proton_logs() {
               done)
         if [[ -n "$_dxr_candidate" ]]; then
             _dxr_crash_appid=$(grep -oP 'compatdata/\K[0-9]+' <<< "$_dxr_candidate" | head -1)
+        fi
+    fi
+
+    # ── GreenBoost stack health checks ──────────────────────────────────
+    # 1. Kernel module
+    if lsmod 2>/dev/null | grep -q '^greenboost'; then
+        local _phys _virt
+        _phys=$(cat /sys/module/greenboost/parameters/physical_vram_gb 2>/dev/null || echo "?")
+        _virt=$(cat /sys/module/greenboost/parameters/virtual_vram_gb 2>/dev/null || echo "?")
+        _diag_ok+=("kernel module loaded — T1=${_phys} GB physical + T2 cap=${_virt} GB virtual")
+    else
+        _diag_errors+=("kernel module NOT loaded — T2 pool unavailable (run: sudo greenboost load)")
+    fi
+    # 2. GreenBoost Proton install
+    if [[ "${GB_PROTON_INSTALLED:-0}" == "1" ]]; then
+        _diag_ok+=("GreenBoost Proton: installed")
+    else
+        _diag_errors+=("GreenBoost Proton NOT installed — run: cd ~/Dev/greenboost/greenboost_proton && ./install.sh  then restart Steam")
+    fi
+    # 3. GREENBOOST_VULKAN=1 in running DX12 game
+    if (( DX12_ACTIVE )); then
+        local _gb_vk=0
+        for _pid in $(pgrep wine64 2>/dev/null | head -10); do
+            if tr '\0' '\n' < "/proc/$_pid/environ" 2>/dev/null \
+                    | grep -q '^GREENBOOST_VULKAN=1'; then
+                _gb_vk=1; break
+            fi
+        done
+        if (( _gb_vk )); then
+            _diag_ok+=("GREENBOOST_VULKAN=1 active in running game — virtual VRAM pool enabled")
+        else
+            _diag_errors+=("GREENBOOST_VULKAN=1 NOT set in running game — T2 pool inactive. In Steam: right-click game → Properties → Compatibility → select 'GreenBoost Proton'")
         fi
     fi
 
@@ -4813,6 +4912,349 @@ cmd_inference_logs() {
 }
 
 # ════════════════════════════════════════════════════════════════════════
+# inference-test — live benchmark that verifies GreenBoost path + perf
+# ════════════════════════════════════════════════════════════════════════
+
+# _infer_test_pick_model [--model NAME]
+# Queries Ollama for pulled models and presents a numbered selection wizard.
+# Prints chosen model name to stdout.
+_infer_test_pick_model() {
+    local _forced_model="$1"
+    [[ -n "$_forced_model" ]] && { echo "$_forced_model"; return 0; }
+
+    local _default="glm4:latest"
+    # Prefer glm-4 variants
+    local _pref_patterns=("glm-4" "glm4" "flash")
+
+    # Query Ollama /api/tags for pulled models
+    local _raw _models=()
+    if command -v curl &>/dev/null; then
+        _raw=$(curl -sf --max-time 4 http://localhost:11434/api/tags 2>/dev/null) || true
+    fi
+    if [[ -n "$_raw" ]] && command -v python3 &>/dev/null; then
+        local _parsed
+        _parsed=$(printf '%s' "$_raw" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    for m in d.get('models', []):
+        n = m.get('name','')
+        if n: print(n)
+except: pass
+" 2>/dev/null) || true
+        while IFS= read -r _m; do
+            [[ -n "$_m" ]] && _models+=("$_m")
+        done <<< "$_parsed"
+    fi
+
+    # Determine default selection
+    local _default_idx=0
+    local _i=0
+    for _m in "${_models[@]}"; do
+        for _pat in "${_pref_patterns[@]}"; do
+            if [[ "${_m,,}" == *"$_pat"* ]]; then
+                _default_idx=$_i
+                break 2
+            fi
+        done
+        (( _i++ ))
+    done
+
+    echo ""
+    echo -e "  ${C_CYAN}${C_BOLD}Select model for inference test${C_RESET}"
+    echo ""
+
+    if [[ ${#_models[@]} -eq 0 ]]; then
+        echo -e "  ${C_AMBER}⚠${C_RESET}  ${C_GRAY}No pulled models found in Ollama.${C_RESET}"
+        echo -e "  ${C_DIM}Defaulting to: ${C_CYAN}${_default}${C_RESET}"
+        echo -e "  ${C_DIM}(pull it first with: ollama pull ${_default})${C_RESET}"
+        echo ""
+        echo "$_default"
+        return 0
+    fi
+
+    local _idx=1
+    for _m in "${_models[@]}"; do
+        local _marker=""
+        (( _idx - 1 == _default_idx )) && _marker=" ${C_LIME}← default${C_RESET}"
+        echo -e "  ${C_GRAY}[${_idx}]${C_RESET}  ${C_CYAN}${_m}${C_RESET}${_marker}"
+        (( _idx++ ))
+    done
+    echo ""
+    echo -e -n "  ${C_AMBER}❯${C_RESET}  ${C_GRAY}Model [$(( _default_idx + 1 ))]: ${C_RESET}"
+
+    local _choice=""
+    read -r _choice 2>/dev/null || true
+    _choice="${_choice// /}"
+
+    if [[ -z "$_choice" ]]; then
+        echo "${_models[$_default_idx]}"
+    elif [[ "$_choice" =~ ^[0-9]+$ ]] && (( _choice >= 1 && _choice <= ${#_models[@]} )); then
+        echo "${_models[$(( _choice - 1 ))]}"
+    else
+        echo -e "  ${C_AMBER}⚠${C_RESET}  ${C_GRAY}Invalid selection — using default.${C_RESET}" >&2
+        echo "${_models[$_default_idx]}"
+    fi
+}
+
+# _infer_test_run_prompt MODEL
+# Runs a fixed benchmark prompt via Ollama streaming API.
+# Sets: IT_TOK_TOTAL, IT_TOK_PER_SEC, IT_FIRST_TOKEN_MS, IT_TOTAL_MS, IT_ERROR
+_infer_test_run_prompt() {
+    local _model="$1"
+    IT_TOK_TOTAL=0; IT_TOK_PER_SEC=0; IT_FIRST_TOKEN_MS=0; IT_TOTAL_MS=0; IT_ERROR=""
+
+    local _prompt="Explain in exactly 3 sentences why memory bandwidth matters for large language model inference throughput."
+    local _t0 _t1 _tfirst=0 _token_count=0 _first_done=0
+
+    _t0=$(date +%s%3N)
+
+    local _resp
+    if ! command -v curl &>/dev/null; then
+        IT_ERROR="curl not available"; return 1
+    fi
+
+    # Stream NDJSON from /api/generate; collect tokens and timing
+    local _tmp; _tmp=$(mktemp)
+    curl -sf --max-time 60 \
+        -X POST http://localhost:11434/api/generate \
+        -H 'Content-Type: application/json' \
+        -d "{\"model\":\"${_model}\",\"prompt\":\"${_prompt}\",\"stream\":true}" \
+        > "$_tmp" 2>/dev/null
+    local _curl_rc=$?
+
+    _t1=$(date +%s%3N)
+    IT_TOTAL_MS=$(( _t1 - _t0 ))
+
+    if [[ $_curl_rc -ne 0 || ! -s "$_tmp" ]]; then
+        IT_ERROR="Ollama API request failed (is ollama running? is '${_model}' pulled?)"
+        rm -f "$_tmp"; return 1
+    fi
+
+    # Parse NDJSON: count tokens, find first-token time from eval_duration
+    if command -v python3 &>/dev/null; then
+        local _parsed
+        _parsed=$(python3 -c "
+import json, sys
+lines = open('$_tmp').readlines()
+tok = 0
+first_ms = 0
+total_ms = 0
+for line in lines:
+    line = line.strip()
+    if not line: continue
+    try:
+        d = json.loads(line)
+        if d.get('response'): tok += 1
+        if d.get('prompt_eval_duration'):
+            first_ms = d['prompt_eval_duration'] // 1_000_000
+        if d.get('eval_duration') and d.get('eval_count'):
+            dur_s = d['eval_duration'] / 1e9
+            total_ms = int(d['eval_duration'] // 1_000_000)
+            tps = d['eval_count'] / dur_s if dur_s > 0 else 0
+            tok = d.get('eval_count', tok)
+            print(f'{tok}|{first_ms}|{total_ms}|{tps:.1f}')
+            sys.exit(0)
+    except: pass
+print(f'{tok}|{first_ms}|{total_ms}|0')
+" 2>/dev/null) || true
+
+        if [[ -n "$_parsed" ]]; then
+            IT_TOK_TOTAL=$(echo "$_parsed"      | cut -d'|' -f1)
+            IT_FIRST_TOKEN_MS=$(echo "$_parsed" | cut -d'|' -f2)
+            IT_TOTAL_MS=$(echo "$_parsed"       | cut -d'|' -f3)
+            IT_TOK_PER_SEC=$(echo "$_parsed"    | cut -d'|' -f4)
+            [[ -z "$IT_TOTAL_MS" || "$IT_TOTAL_MS" == "0" ]] && IT_TOTAL_MS=$(( _t1 - _t0 ))
+        fi
+    fi
+    rm -f "$_tmp"
+}
+
+# _infer_test_write_llm_report — writes structured report to GB_INFER_TEST_LOG
+# and optionally to stdout (when _print=1).
+_infer_test_write_llm_report() {
+    local _model="$1" _print="${2:-0}"
+    local _dir; _dir=$(dirname "$GB_INFER_TEST_LOG")
+    mkdir -p "$_dir" 2>/dev/null || true
+
+    # path verdict
+    local _verdict="UNKNOWN"
+    case "$SS_ACTIVE_PATH" in
+        A0) _verdict="OPTIMAL" ;;
+        A)  _verdict="GOOD" ;;
+        B)  _verdict="FALLBACK" ;;
+        C)  _verdict="LAST_RESORT" ;;
+    esac
+
+    # kernel last 5 greenboost dmesg lines
+    local _kern5
+    _kern5=$(dmesg 2>/dev/null | grep -i greenboost | tail -5 | tr '\n' '|' | sed 's/|$//')
+    [[ -z "$_kern5" ]] && _kern5="none"
+
+    local _report
+    _report=$(cat <<REPORTEOF
+greenboost inference-test v=${GB_VERSION} ts=$(date -Iseconds) model=${_model}
+[path]
+active=${SS_ACTIVE_PATH:-unknown}  a0_delta=${IT_A0_DELTA:-0}  a_delta=${IT_A_DELTA:-0}  b_delta=${IT_B_DELTA:-0}  c_delta=${IT_C_DELTA:-0}  verdict=${_verdict}
+[perf]
+tok_per_sec=${IT_TOK_PER_SEC:-0}  first_token_ms=${IT_FIRST_TOKEN_MS:-0}  total_ms=${IT_TOTAL_MS:-0}  tokens=${IT_TOK_TOTAL:-0}
+[memory]
+vram_used_mb=${GPU_VRAM_USED_MB:-0}  vram_total_mb=${GPU_VRAM_TOTAL_MB:-0}  t2_alloc_mb=${PI_T2_ALLOC_MB:-0}  t3_alloc_mb=${PI_T3_ALLOC_MB:-0}
+[module]
+loaded=$(lsmod 2>/dev/null | grep -c "^${DRIVER_NAME} " || echo 0)  version=${GB_VERSION}  kv_reserve_mb=${PB_KV_RSV_MB:-0}
+[ollama]
+model=${OL_MODEL:--}  ctx_size=${OL_CTX_SIZE:-0}  param_count=${OL_PARAM_COUNT:--}  vram_mb=${OL_VRAM_MB:-0}
+[warnings]
+${IT_ERROR:-none}
+[kernel_last5]
+${_kern5}
+REPORTEOF
+)
+
+    printf '%s\n' "$_report" > "$GB_INFER_TEST_LOG" 2>/dev/null || true
+    if [[ "$_print" == "1" ]]; then
+        echo ""
+        echo -e "  ${C_CYAN}${C_BOLD}━━━ LLM Report (${GB_INFER_TEST_LOG}) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
+        echo ""
+        while IFS= read -r _l; do
+            echo -e "  ${C_DIM}${_l}${C_RESET}"
+        done <<< "$_report"
+        echo ""
+    fi
+}
+
+# cmd_inference_test [--model NAME] [--llm] [--no-load]
+# Interactive inference test: model wizard → pre-flight → run → report.
+cmd_inference_test() {
+    local _forced_model="" _print_llm=0 _no_load=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --model)  _forced_model="$2"; shift 2 ;;
+            --llm)    _print_llm=1; shift ;;
+            --no-load) _no_load=1; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    gb_header
+    echo -e "  ${C_CYAN}${C_BOLD}Inference Test${C_RESET}  ${C_DIM}— verifies GreenBoost path, perf, and memory${C_RESET}"
+    echo ""
+
+    # ── 1. Pre-flight ────────────────────────────────────────────────────
+    detect_hardware 2>/dev/null || true
+    parse_shim_stats || true
+
+    local _pf_errors=() _pf_warns=()
+
+    if ! lsmod 2>/dev/null | grep -q "^${DRIVER_NAME} "; then
+        _pf_warns+=("GreenBoost kernel module not loaded — paths B/C only")
+    fi
+    if ! command -v ollama &>/dev/null && ! curl -sf --max-time 2 http://localhost:11434/api/tags &>/dev/null; then
+        _pf_errors+=("Ollama not running — start with: ollama serve")
+    fi
+
+    for _e in "${_pf_errors[@]}"; do
+        echo -e "  ${C_RED}✗${C_RESET}  ${C_RED}${_e}${C_RESET}"
+    done
+    for _w in "${_pf_warns[@]}"; do
+        echo -e "  ${C_AMBER}⚠${C_RESET}  ${C_GRAY}${_w}${C_RESET}"
+    done
+    if [[ ${#_pf_errors[@]} -gt 0 ]]; then
+        echo ""
+        echo -e "  ${C_RED}Pre-flight failed — fix the above before running inference-test.${C_RESET}"
+        echo ""
+        return 1
+    fi
+
+    # ── 2. Model selection ───────────────────────────────────────────────
+    local _model
+    if [[ -t 0 ]]; then
+        _model=$(_infer_test_pick_model "$_forced_model")
+    else
+        _model="${_forced_model:-glm4:latest}"
+    fi
+    _model="${_model//[$'\n\r']/}"
+    [[ -z "$_model" ]] && _model="glm4:latest"
+
+    echo ""
+    echo -e "  ${C_VIOLET}◈${C_RESET}  ${C_GRAY}Testing model: ${C_CYAN}${C_BOLD}${_model}${C_RESET}"
+    echo ""
+
+    # ── 3. Snapshot BEFORE ───────────────────────────────────────────────
+    parse_pool_brief; parse_pool_info; parse_shim_stats; query_gpu_vram; query_ollama_ps
+    local _a0_before=${SS_PATH_A0:-0} _a_before=${SS_PATH_A:-0}
+    local _b_before=${SS_PATH_B:-0}  _c_before=${SS_PATH_C:-0}
+    local _vram_before=${GPU_VRAM_USED_MB:-0}
+
+    # ── 4. Run inference (with spinner) ──────────────────────────────────
+    echo -e "  ${C_DIM}Running benchmark prompt…${C_RESET}"
+    IT_ERROR=""
+    _infer_test_run_prompt "$_model" &
+    local _infer_pid=$!
+    gb_spin "$_infer_pid" "Running inference on ${_model}"
+    wait "$_infer_pid" 2>/dev/null || true
+
+    # ── 5. Snapshot AFTER ────────────────────────────────────────────────
+    parse_shim_stats; query_gpu_vram; query_ollama_ps
+    IT_A0_DELTA=$(( ${SS_PATH_A0:-0} - _a0_before ))
+    IT_A_DELTA=$(( ${SS_PATH_A:-0}  - _a_before ))
+    IT_B_DELTA=$(( ${SS_PATH_B:-0}  - _b_before ))
+    IT_C_DELTA=$(( ${SS_PATH_C:-0}  - _c_before ))
+
+    # ── 6. Result panel ──────────────────────────────────────────────────
+    gb_separator
+    echo ""
+    echo -e "  ${C_CYAN}${C_BOLD}Results${C_RESET}"
+    echo ""
+
+    # Path verdict
+    local _verdict_color _verdict_label
+    case "$SS_ACTIVE_PATH" in
+        A0) _verdict_color="$C_LIME";  _verdict_label="OPTIMAL  (A0 — fastest path)" ;;
+        A)  _verdict_color="$C_LIME";  _verdict_label="GOOD     (A — fast path)" ;;
+        B)  _verdict_color="$C_AMBER"; _verdict_label="FALLBACK (B — no kernel module)" ;;
+        C)  _verdict_color="$C_RED";   _verdict_label="DEGRADED (C — last resort)" ;;
+        *)  _verdict_color="$C_GRAY";  _verdict_label="UNKNOWN  (shim stats unavailable)" ;;
+    esac
+    echo -e "  ${C_BOLD}Path${C_RESET}       ${_verdict_color}${C_BOLD}${_verdict_label}${C_RESET}"
+
+    # Performance
+    local _tps_color="$C_LIME"
+    (( ${IT_TOK_PER_SEC%.*} < 5 )) 2>/dev/null && _tps_color="$C_RED"
+    echo -e "  ${C_BOLD}Speed${C_RESET}      ${_tps_color}${IT_TOK_PER_SEC:-0} tok/s${C_RESET}  ${C_DIM}first-token: ${IT_FIRST_TOKEN_MS:-0} ms  total: ${IT_TOTAL_MS:-0} ms  tokens: ${IT_TOK_TOTAL:-0}${C_RESET}"
+
+    # Memory
+    local _vram_delta=$(( ${GPU_VRAM_USED_MB:-0} - _vram_before ))
+    echo -e "  ${C_BOLD}VRAM${C_RESET}       ${C_CYAN}${GPU_VRAM_USED_MB:-0}${C_DIM}/${GPU_VRAM_TOTAL_MB:-0} MB${C_RESET}  ${C_DIM}(delta: +${_vram_delta} MB)${C_RESET}"
+    if (( ${PI_T2_ALLOC_MB:-0} > 0 )); then
+        echo -e "  ${C_BOLD}T2 spill${C_RESET}   ${C_AMBER}${PI_T2_ALLOC_MB} MB${C_RESET} ${C_DIM}(VRAM overflow → DDR)${C_RESET}"
+    else
+        echo -e "  ${C_BOLD}T2 spill${C_RESET}   ${C_LIME}none${C_RESET}"
+    fi
+    if (( ${PI_T3_ALLOC_MB:-0} > 0 )); then
+        echo -e "  ${C_BOLD}T3 spill${C_RESET}   ${C_AMBER}${PI_T3_ALLOC_MB} MB${C_RESET} ${C_DIM}(DDR overflow → NVMe)${C_RESET}"
+    fi
+
+    # Alloc delta
+    echo -e "  ${C_BOLD}Allocs${C_RESET}     ${C_DIM}A0:+${IT_A0_DELTA}  A:+${IT_A_DELTA}  B:+${IT_B_DELTA}  C:+${IT_C_DELTA}${C_RESET}"
+
+    # Errors
+    if [[ -n "$IT_ERROR" ]]; then
+        echo ""
+        echo -e "  ${C_RED}✗${C_RESET}  ${C_RED}${IT_ERROR}${C_RESET}"
+    fi
+
+    echo ""
+    gb_separator
+
+    # ── 7. LLM report ────────────────────────────────────────────────────
+    _infer_test_write_llm_report "$_model" "$_print_llm"
+    echo -e "  ${C_DIM}Full report saved: ${C_GRAY}${GB_INFER_TEST_LOG}${C_RESET}"
+    echo -e "  ${C_DIM}Feed to LLM:  ${C_CYAN}cat ${GB_INFER_TEST_LOG} | greenboost inference-test --llm${C_RESET}"
+    echo ""
+}
+
+# ════════════════════════════════════════════════════════════════════════
 # Vulkan dashboard — data helpers + renderer + entry point
 # ════════════════════════════════════════════════════════════════════════
 
@@ -4954,6 +5396,16 @@ gather_vulkan_events() {
     local n=${1:-10}
     local _pat='VK_LAYER_GREENBOOST'
 
+    local _gbvk_log="$HOME/.local/share/greenboost/proton-logs/vulkan-layer.log"
+    if [[ -f "$_gbvk_log" ]]; then
+        local _fout
+        _fout=$(grep "$_pat" "$_gbvk_log" | tail -"$n")
+        if [[ -n "$_fout" ]]; then
+            printf '%s\n' "$_fout"
+            return 0
+        fi
+    fi
+
     if command -v journalctl &>/dev/null; then
         local _jout
         _jout=$(journalctl --since "1 hour ago" --no-pager -q 2>/dev/null \
@@ -4989,9 +5441,9 @@ format_vulkan_event() {
 
     if   printf '%s' "$msg" | grep -q 'CreateInstance: hooked'; then
         printf '%b\n' "  ${prefix}  ${C_LIME}$(printf '%-8s' 'hook')${C_RESET}  ${C_LIME}✓${C_RESET}  ${C_GRAY}${msg}${C_RESET}"
-    elif printf '%s' "$msg" | grep -q 'T2 DMA-BUF fallback OK'; then
+    elif printf '%s' "$msg" | grep -q 'DMA-BUF OK'; then
         printf '%b\n' "  ${prefix}  ${C_CYAN}$(printf '%-8s' 'T2-dma')${C_RESET}  ${C_CYAN}◈${C_RESET}  ${C_GRAY}${msg}${C_RESET}"
-    elif printf '%s' "$msg" | grep -qE 'DMA-BUF fallback failed|returning OOM'; then
+    elif printf '%s' "$msg" | grep -qE 'all tiers failed|returning OOM'; then
         printf '%b\n' "  ${prefix}  ${C_RED}$(printf '%-8s' 'OOM')${C_RESET}  ${C_RED}✗${C_RESET}  ${C_RED}${msg}${C_RESET}"
     elif printf '%s' "$msg" | grep -q 'FreeMemory: closed DMA-BUF'; then
         printf '%b\n' "  ${prefix}  ${C_DIM}$(printf '%-8s' 'free')${C_RESET}  ${C_DIM}·${C_RESET}  ${C_DIM}${msg}${C_RESET}"
@@ -5033,10 +5485,10 @@ query_dx12_status() {
     # Gather T2 stats from layer log regardless of game state.
     local _all_ev; _all_ev=$(gather_vulkan_events 200)
     if [[ -n "$_all_ev" ]]; then
-        DX12_T2_OK=$(printf '%s\n' "$_all_ev" | grep -c 'T2 DMA-BUF fallback OK' || true)
-        DX12_T2_FAIL=$(printf '%s\n' "$_all_ev" | grep -c 'DMA-BUF fallback failed' || true)
+        DX12_T2_OK=$(printf '%s\n' "$_all_ev" | grep -c 'T2 DMA-BUF OK' || true)
+        DX12_T2_FAIL=$(printf '%s\n' "$_all_ev" | grep -c 'all tiers failed\|returning OOM' || true)
         DX12_T2_MB=$(printf '%s\n' "$_all_ev" \
-            | grep -oP 'T2 DMA-BUF fallback OK — \K[0-9]+' \
+            | grep -oP 'T2 DMA-BUF OK — \K[0-9]+' \
             | awk '{s+=$1}END{print s+0}')
     fi
 
@@ -5147,9 +5599,10 @@ gather_proton_log_events() {
 
     [[ -z "$_log" ]] && return 0
 
-    # Filter for events relevant to GreenBoost: VKD3D/DXVK errors and warnings.
+    # Filter for events relevant to GreenBoost: VKD3D/DXVK errors, warnings,
+    # and GreenBoost Proton wrapper status lines.
     grep -E \
-        'ERR[^O]|vkd3d.*warn|WARN|fixme.*d3d|out.of.mem|OOM|alloc.*fail|VK_ERROR' \
+        'ERR[^O]|vkd3d.*warn|WARN|fixme.*d3d|out.of.mem|OOM|alloc.*fail|VK_ERROR|\[greenboost-proton\]' \
         "$_log" 2>/dev/null \
         | grep -vE 'suppress|ignore|stub|trivial' \
         | tail -"$n"
@@ -5159,7 +5612,9 @@ gather_proton_log_events() {
 format_proton_event() {
     local line="$1"
     local msg; msg=$(printf '%s' "$line" | cut -c1-140)
-    if   printf '%s' "$msg" | grep -qiE '\bERR\b|VK_ERROR|alloc.*fail'; then
+    if   printf '%s' "$msg" | grep -q '\[greenboost-proton\]'; then
+        printf '%b\n' "  ${C_LIME}$(printf '%-8s' 'gb')${C_RESET}  ${C_LIME}◈${C_RESET}  ${C_GRAY}${msg}${C_RESET}"
+    elif printf '%s' "$msg" | grep -qiE '\bERR\b|VK_ERROR|alloc.*fail'; then
         printf '%b\n' "  ${C_RED}$(printf '%-8s' 'vkd3d')${C_RESET}  ${C_RED}✗${C_RESET}  ${C_RED}${msg}${C_RESET}"
     elif printf '%s' "$msg" | grep -qiE 'WARN|fixme|warn'; then
         printf '%b\n' "  ${C_AMBER}$(printf '%-8s' 'vkd3d')${C_RESET}  ${C_AMBER}⚠${C_RESET}  ${C_GRAY}${msg}${C_RESET}"
@@ -5662,6 +6117,18 @@ _cmd_status_snapshot() {
     _sys_lines+=("  ${C_VIOLET}◈${C_RESET}  ${C_GRAY}$(_trunc "${prof_name}" 20)${C_RESET}")
     local _gpu_short; _gpu_short=$(_trunc "${GPU_NAME:-Unknown}" 20)
     _sys_lines+=("  ${C_GRAY}◎${C_RESET}  ${C_GRAY}${_gpu_short}${C_DIM}  ${GB_PHYS:-?} GB${C_RESET}")
+    # Active alloc path badge in System column
+    if [[ "$SS_STALE" == "0" && -n "$SS_ACTIVE_PATH" ]]; then
+        local _sys_path_badge
+        case "$SS_ACTIVE_PATH" in
+            A0) _sys_path_badge="${C_LIME}${C_BOLD}●A0${C_RESET} ${C_DIM}optimal path${C_RESET}" ;;
+            A)  _sys_path_badge="${C_LIME}●A${C_RESET}  ${C_DIM}fast path${C_RESET}" ;;
+            B)  _sys_path_badge="${C_AMBER}${C_BOLD}⚠B${C_RESET}  ${C_DIM}fallback path${C_RESET}" ;;
+            C)  _sys_path_badge="${C_RED}${C_BOLD}✗C${C_RESET}  ${C_DIM}last resort${C_RESET}" ;;
+            *)  _sys_path_badge="${C_GRAY}path:${SS_ACTIVE_PATH}${C_RESET}" ;;
+        esac
+        _sys_lines+=("  ${C_DIM}Path${C_RESET}  ${_sys_path_badge}")
+    fi
 
     # Right: AI Inference — Phase and TQ shown here
     local _phase_label="${SS_PHASE:-—}"
@@ -5762,9 +6229,17 @@ _cmd_status_snapshot() {
     # Right: Overflow
     local _alloc_str=""
     if [[ "$SS_STALE" == "0" ]]; then
-        _alloc_str="A0:${SS_PATH_A0:-0} A:${SS_PATH_A:-0} B:${SS_PATH_B:-0} C:${SS_PATH_C:-0}"
-        [[ "$SS_ACTIVE_PATH" == "B" || "$SS_ACTIVE_PATH" == "C" ]] \
-            && _diag_warns+=("CUDA shim on fallback ${SS_ACTIVE_PATH} path")
+        local _path_badge
+        case "$SS_ACTIVE_PATH" in
+            A0) _path_badge="${C_LIME}${C_BOLD}●A0${C_RESET} ${C_DIM}(optimal)${C_RESET}" ;;
+            A)  _path_badge="${C_LIME}●A${C_RESET}  ${C_DIM}(good)${C_RESET}" ;;
+            B)  _path_badge="${C_AMBER}${C_BOLD}⚠B${C_RESET}  ${C_DIM}(fallback)${C_RESET}"
+                _diag_warns+=("CUDA shim on fallback B path") ;;
+            C)  _path_badge="${C_RED}${C_BOLD}✗C${C_RESET}  ${C_DIM}(last resort)${C_RESET}"
+                _diag_warns+=("CUDA shim on fallback C path") ;;
+            *)  _path_badge="${C_GRAY}path:${SS_ACTIVE_PATH:-?}${C_RESET}" ;;
+        esac
+        _alloc_str="${_path_badge}  ${C_DIM}A0:${SS_PATH_A0} A:${SS_PATH_A} B:${SS_PATH_B} C:${SS_PATH_C}${C_RESET}"
     else
         _alloc_str="${C_DIM}(shim stats unavailable)${C_RESET}"
     fi
@@ -5820,8 +6295,74 @@ _cmd_status_snapshot() {
         echo -e "  ${C_LIME}✓${C_RESET}  ${C_GRAY}${_ok_short}${C_RESET}"
     fi
     echo ""
+
+    # Append one structured line to the status log for Ctrl+L log view
+    _status_log_append
 }
 
+
+# ---- _status_log_append — append one line to the status log -----------
+# Called at end of every _cmd_status_snapshot invocation.
+_status_log_append() {
+    local _dir; _dir=$(dirname "$GB_STATUS_LOG")
+    mkdir -p "$_dir" 2>/dev/null || return
+    # Rotate if > 1 MB
+    if [[ -f "$GB_STATUS_LOG" ]] && (( $(stat -c%s "$GB_STATUS_LOG" 2>/dev/null || echo 0) > 1048576 )); then
+        tail -n 2000 "$GB_STATUS_LOG" > "${GB_STATUS_LOG}.tmp" 2>/dev/null \
+            && mv "${GB_STATUS_LOG}.tmp" "$GB_STATUS_LOG" 2>/dev/null || true
+    fi
+    printf '%s path=%s vram=%s/%s t2=%s t3=%s a0=%s a=%s b=%s c=%s phase=%s model=%s\n' \
+        "$(date -Iseconds)" \
+        "${SS_ACTIVE_PATH:-?}" \
+        "${GPU_VRAM_USED_MB:-0}" "${GPU_VRAM_TOTAL_MB:-0}" \
+        "${PI_T2_ALLOC_MB:-0}" "${PI_T3_ALLOC_MB:-0}" \
+        "${SS_PATH_A0:-0}" "${SS_PATH_A:-0}" "${SS_PATH_B:-0}" "${SS_PATH_C:-0}" \
+        "${SS_PHASE:-?}" \
+        "${OL_MODEL:--}" \
+        >> "$GB_STATUS_LOG" 2>/dev/null || true
+}
+
+# ---- _show_log_view — Ctrl+L log view within the status alternate screen
+# Displays GB_STATUS_LOG; Ctrl+S or q returns to live status.
+_show_log_view() {
+    local _log="${1:-$GB_STATUS_LOG}"
+    while true; do
+        printf '\033[H\033[J'   # cursor home + clear screen
+        local _rows; _rows=$(tput lines 2>/dev/null || echo 24)
+        local _cols; _cols=$(tput cols  2>/dev/null || echo 80)
+        echo -e "  ${C_CYAN}${C_BOLD}GreenBoost Status Log${C_RESET}  ${C_DIM}Ctrl+S: back to status  q: back  Ctrl+C: exit\033[K${C_RESET}"
+        echo -e "  ${C_DIM}Log: ${C_GRAY}${_log}\033[K${C_RESET}"
+        gb_separator
+        local _content_rows=$(( _rows - 5 ))
+        (( _content_rows < 5 )) && _content_rows=5
+        if [[ -f "$_log" ]]; then
+            tail -n "$_content_rows" "$_log" | while IFS= read -r _line; do
+                # Colour-code by path: A0→lime, A→lime-dim, B→amber, C→red
+                local _coloured="$_line"
+                if [[ "$_line" =~ path=A0 ]]; then
+                    _coloured="${C_LIME}${_line}${C_RESET}"
+                elif [[ "$_line" =~ path=A[^0] ]]; then
+                    _coloured="${C_GRAY}${_line}${C_RESET}"
+                elif [[ "$_line" =~ path=B ]]; then
+                    _coloured="${C_AMBER}${_line}${C_RESET}"
+                elif [[ "$_line" =~ path=C ]]; then
+                    _coloured="${C_RED}${_line}${C_RESET}"
+                fi
+                echo -e "  ${_coloured}\033[K"
+            done
+        else
+            echo ""
+            echo -e "  ${C_AMBER}⚠${C_RESET}  ${C_GRAY}No log yet — status refreshes write entries here.${C_RESET}"
+            echo -e "  ${C_DIM}Log will appear at: ${C_GRAY}${_log}${C_RESET}"
+        fi
+        printf '\033[J'   # erase trailing lines
+        local _k=""
+        read -t 2 -s -n 1 _k 2>/dev/null || true
+        case "$_k" in
+            $'\x13'|q) return ;;   # Ctrl+S or q → back to status
+        esac
+    done
+}
 
 cmd_status() {
     detect_hardware 2>/dev/null || true
@@ -5846,7 +6387,7 @@ cmd_status() {
         local _t_start=$SECONDS
 
         printf '\033[H'   # cursor home — no erase, no flash
-        echo -e "  ${C_DIM}Updating every 5s — ${C_GRAY}Ctrl+S${C_DIM}: refresh  ${C_GRAY}Ctrl+L${C_DIM}: logs  ${C_GRAY}Ctrl+C${C_DIM}: exit\033[K${C_RESET}"
+        echo -e "  ${C_DIM}Updating every 5s — ${C_GRAY}Ctrl+S${C_DIM}: refresh  ${C_GRAY}Ctrl+L${C_DIM}: log view  ${C_GRAY}Ctrl+C${C_DIM}: exit\033[K${C_RESET}"
         echo ""
 
         _cmd_status_snapshot
@@ -5862,15 +6403,10 @@ cmd_status() {
         case "$_key" in
             $'\x13')  # Ctrl+S: immediate status refresh
                 ;;
-            $'\x0c')  # Ctrl+L: show full logs inline
-                stty "$_saved_stty" 2>/dev/null || true
-                printf '\033[?1049l'
-                cmd_logs
-                echo -e ""
-                echo -e "  ${C_DIM}Press Enter to return to status monitor...${C_RESET}"
-                read -s -n 1
-                stty -ixon 2>/dev/null || true
-                printf '\033[?1049h'
+            $'\x0c')  # Ctrl+L: switch to log view (Ctrl+S inside to return)
+                _show_log_view "$GB_STATUS_LOG"
+                # Return to status: clear and restart the draw loop
+                printf '\033[H\033[J'
                 ;;
         esac
     done
@@ -6098,13 +6634,14 @@ cmd_wizard() {
         gb_section "Gaming"
         gb_menu_item  6  "Install GB Proton"        "T1+T2 CUDA memory pool for Steam games. Select GreenBoost Proton on Steam"  root
         gb_menu_item  7  "Remove GB Proton"         "Uninstall GreenBoost Proton from Steam compat tools"
-        gb_menu_item  8  "Install MangoHud"         "Build MangoHud from source + GreenBoost overlay for benchmarking"  root
-        gb_menu_item  9  "Remove MangoHud"          "Uninstall MangoHud binaries and MangoHud.conf"  root
+        gb_menu_item  8  "Clean custom Protons"     "Remove all non-GreenBoost custom Proton builds from Steam compat tools"
+        gb_menu_item  9  "Install MangoHud"         "Build MangoHud from source + GreenBoost overlay for benchmarking"  root
+        gb_menu_item  10 "Remove MangoHud"          "Uninstall MangoHud binaries and MangoHud.conf"  root
 
         gb_section "Maintenance"
-        gb_menu_item  10 "GreenBoost Commands"     "All commands reference (also: greenboost help)"
-        gb_menu_item  11 "Clear logs"               "Clear dmesg, journal, Proton logs, and Wine coredumps"
-        gb_menu_item  12 "Uninstall"                "Remove GreenBoost (module + all config)"        root
+        gb_menu_item  11 "GreenBoost Commands"     "All commands reference (also: greenboost help)"
+        gb_menu_item  12 "Clear logs"               "Clear dmesg, journal, Proton logs, and Wine coredumps"
+        gb_menu_item  13 "Uninstall"                "Remove GreenBoost (module + all config)"        root
 
         gb_separator
         echo -e "  ${C_DIM}${C_GRAY}[Q]  Quit${C_RESET}"
@@ -6125,13 +6662,14 @@ cmd_wizard() {
             3)  cmd_status ;;
             4)  cmd_benchmark;                 gb_press_enter ;;
             5)  cmd_profile_wizard ;;
-            6)  cmd_install_proton;    gb_press_enter ;;
+            6)  cmd_install_proton;             gb_press_enter ;;
             7)  cmd_uninstall_proton;          gb_press_enter ;;
-            8)  cmd_install_mangohud;          gb_press_enter ;;
-            9)  cmd_uninstall_mangohud;        gb_press_enter ;;
-            10) cmd_show_commands;             gb_press_enter ;;
-            11) cmd_clear_logs;                gb_press_enter ;;
-            12) cmd_uninstall;                 gb_press_enter ;;
+            8)  cmd_proton_clean;              gb_press_enter ;;
+            9)  cmd_install_mangohud;          gb_press_enter ;;
+            10) cmd_uninstall_mangohud;        gb_press_enter ;;
+            11) cmd_show_commands;             gb_press_enter ;;
+            12) cmd_clear_logs;                gb_press_enter ;;
+            13) cmd_uninstall;                 gb_press_enter ;;
             q|Q|"") exit 0 ;;
             *) gb_warn_ui "Unknown option."; sleep 1 ;;
         esac
@@ -6359,14 +6897,15 @@ cmd_help() {
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "logs"                  "Snapshot all GreenBoost log sources (kernel, Ollama, Vulkan, Proton)"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "proton-logs"           "Show Proton/VKD3D game logs"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "inference-logs"        "Show Ollama/inference logs"
+        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "inference-test"        "Benchmark inference + verify fastest path (A0/A); --llm for LLM report"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "clear logs"            "Clear all GreenBoost logs"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "clear proton-logs"     "Clear Proton logs"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "clear inference-logs"  "Clear inference logs"
         echo -e ""
         echo -e "  ${C_CYAN}${C_BOLD}GAMING:${C_RESET}"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "gaming-mode enable|disable" "Suspend/restore Ollama before/after gaming"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-proton" "Install GreenBoost Proton Wayland for Steam"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "remove-proton"          "Remove GreenBoost Proton Wayland"
+        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-proton" "Install GreenBoost Proton for Steam"
+        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "remove-proton"          "Remove GreenBoost Proton"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "steam-launch-guide"     "Show Steam launch options + Proton setup guide"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-mangohud"       "Build MangoHud from source + install GreenBoost config"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "uninstall-mangohud"     "Remove MangoHud"
@@ -6376,7 +6915,7 @@ cmd_help() {
         echo -e ""
         echo -e "  ${C_VIOLET}◈${C_RESET}  Right-click the game → ${C_BOLD}Properties → Compatibility${C_RESET}"
         echo -e "     Check ${C_BOLD}\"Force the use of a specific Steam Play compatibility tool\"${C_RESET}"
-        echo -e "     and select ${C_LIME}${C_BOLD}GreenBoost Proton Wayland${C_RESET}"
+        echo -e "     and select ${C_LIME}${C_BOLD}GreenBoost Proton${C_RESET}"
         echo -e ""
         echo -e "  ${C_CYAN}${C_BOLD}━━━ Enable per game in Steam launch options ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
         echo -e ""
@@ -6605,16 +7144,18 @@ frame_timing
 # Overlay background
 background_alpha=0.5
 
-# GreenBoost: T2 (DDR) and T3 (NVMe) pool usage from sysfs (real-time, no shim)
-exec=awk '/T2 allocated/{match(\$0,/: *([0-9]+) MB/,a); printf "GB T2 DDR: %s MB\\n",a[1]}' /sys/class/greenboost/greenboost/status
-exec=awk '/Swap used/{match(\$0,/: *([0-9]+) MB/,a); printf "GB T3 NVMe: %s MB\\n",a[1]}' /sys/class/greenboost/greenboost/status
+# GreenBoost: Vulkan layer status, T1/T2 pool config, live T2/T3 usage
+exec=[ "\${GREENBOOST_VULKAN:-0}" = "1" ] && { P=\$(cat /sys/module/greenboost/parameters/physical_vram_gb 2>/dev/null||echo ?); V=\$(cat /sys/module/greenboost/parameters/virtual_vram_gb 2>/dev/null||echo ?); printf "GB Layer ON  T1=%sGB T2=%sGB" "\$P" "\$V"; } || printf "GB Layer OFF"
+exec=awk 'BEGIN{u="?";a="?"} /T2 allocated/{match(\$0,/: *([0-9]+)/,x);u=x[1]} /T2 available/{match(\$0,/: *([0-9]+)/,x);a=x[1]} END{printf "GB T2: %s used / %s MB avail",u,a}' /sys/class/greenboost/greenboost/status 2>/dev/null || printf "GB T2: N/A"
+exec=awk '/T3 allocated/{match(\$0,/: *([0-9]+)/,a); printf "GB T3: %s MB NVMe",a[1]; exit}' /sys/class/greenboost/greenboost/status 2>/dev/null
 CONFEOF
 
     chown -R "$real_user:$real_user" "$_conf_dir"
     gb_ok "MangoHud.conf installed to $_conf_dir/"
 
-    # 8. Show Steam launch commands
+    # 8. Show Steam launch commands + MangoHud OSD hint
     cmd_steam_launch_info
+    _mangohud_steam_hint
 }
 
 cmd_uninstall_mangohud() {
@@ -6669,7 +7210,7 @@ cmd_uninstall_mangohud() {
 
 cmd_steam_launch_info() {
     echo ""
-    echo -e "  ${C_CYAN}${C_BOLD}━━━ GreenBoost Proton Wayland — install location ━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
+    echo -e "  ${C_CYAN}${C_BOLD}━━━ GreenBoost Proton — install location ━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
     echo ""
     local _gpw_path=""
     for _d in \
@@ -6690,7 +7231,7 @@ cmd_steam_launch_info() {
     echo ""
     echo -e "  ${C_VIOLET}◈${C_RESET}  Right-click the game → ${C_BOLD}Properties → Compatibility${C_RESET}"
     echo -e "     Check ${C_BOLD}\"Force the use of a specific Steam Play compatibility tool\"${C_RESET}"
-    echo -e "     and select ${C_LIME}${C_BOLD}GreenBoost Proton Wayland${C_RESET}"
+    echo -e "     and select ${C_LIME}${C_BOLD}GreenBoost Proton${C_RESET}"
     echo ""
     echo -e "  ${C_CYAN}${C_BOLD}━━━ Enable per game in Steam launch options ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
     echo ""
@@ -6707,6 +7248,23 @@ cmd_steam_launch_info() {
     echo ""
     echo -e "  ${C_AMBER}  Example — preset M:${C_RESET}"
     echo -e "  ${C_LIME}DXVK_NVAPI_DRS_NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION=render_preset_m %command%${C_RESET}"
+    echo ""
+}
+
+# ---- MangoHud OSD hint -------------------------------------------------
+# Shown after install-mangohud and via steam-launch-guide.
+_mangohud_steam_hint() {
+    echo ""
+    echo -e "  ${C_CYAN}${C_BOLD}━━━ Show MangoHud benchmark OSD in Steam ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
+    echo ""
+    echo -e "  ${C_AMBER}▸ Use this command in Steam launch options to show the MangoHud OSD:${C_RESET}"
+    echo ""
+    echo -e "  ${C_LIME}${C_BOLD}MANGOHUD=1 %command%${C_RESET}"
+    echo ""
+    echo -e "  ${C_DIM}Combined with HDR:${C_RESET}"
+    echo -e "  ${C_LIME}MANGOHUD=1 PROTON_ENABLE_HDR=1 %command%${C_RESET}"
+    echo ""
+    echo -e "  ${C_DIM}Right-click the game → Properties → General → Launch Options${C_RESET}"
     echo ""
 }
 
@@ -6935,7 +7493,6 @@ cmd_full_install() {
     gb_info "Applying: Ollama/inference service config (drop-ins, TurboQuant, udev, NVMe, cpu-perf)"
     cmd_install_sys_configs
     cmd_install_llama_configs
-    cmd_fix_steam
     gb_ok "System configuration installed"
 
     # 4b — Optional AI/compute libraries (CUDA toolkit, OpenBLAS, Python, nvtop, etc.)
@@ -7084,12 +7641,14 @@ case "$COMMAND" in
     install-sys-configs)    cmd_install_sys_configs   ;;
     install-llama-configs)  cmd_install_llama_configs ;;
     install-vulkan-layer)   cmd_install_vulkan_layer  ;;
-    steam-launch-guide)     cmd_steam_launch_info     ;;
+    steam-launch-guide)     cmd_steam_launch_info; _mangohud_steam_hint ;;
     fix-steam)              cmd_fix_steam             ;;
+    proton-clean)           cmd_proton_clean          ;;
     install-proton) cmd_install_proton ;;
     remove-proton)          cmd_uninstall_proton      ;;
     install-mangohud)       cmd_install_mangohud      ;;
     uninstall-mangohud)     cmd_uninstall_mangohud    ;;
+    inference-test)         cmd_inference_test        "${@:2}" ;;
     # Default: interactive wizard
     "")
         cmd_wizard ;;

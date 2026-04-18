@@ -43,6 +43,8 @@
 #include <pthread.h>
 #include <syslog.h>
 #include <time.h>
+#include <stdarg.h>
+#include <sys/stat.h>
 
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
@@ -71,11 +73,82 @@ static int g_gbvk_debug = 0;
 
 /* ── Logging ──────────────────────────────────────────────────────────── */
 
-#define gbvk_log(fmt, ...) \
-    syslog(LOG_INFO, "[VK_LAYER_GREENBOOST] " fmt, ##__VA_ARGS__)
+static int             g_gbvk_log_fd    = -1;
+static pthread_mutex_t g_gbvk_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-#define gbvk_dbg(fmt, ...) \
-    do { if (g_gbvk_debug) syslog(LOG_DEBUG, "[VK_LAYER_GREENBOOST] " fmt, ##__VA_ARGS__); } while(0)
+static void gbvk_mkdirs(const char *path)
+{
+    char buf[4096];
+    snprintf(buf, sizeof(buf), "%s", path);
+    for (char *p = buf + 1; *p; p++) {
+        if (*p == '/') { *p = '\0'; mkdir(buf, 0755); *p = '/'; }
+    }
+    mkdir(buf, 0755);
+}
+
+__attribute__((constructor))
+static void gbvk_init_logging(void)
+{
+    const char *xdg  = getenv("XDG_DATA_HOME");
+    const char *home = getenv("HOME");
+    char dir[4096];
+    if (xdg && xdg[0])
+        snprintf(dir, sizeof(dir), "%s/greenboost/proton-logs", xdg);
+    else
+        snprintf(dir, sizeof(dir), "%s/.local/share/greenboost/proton-logs",
+                 (home && home[0]) ? home : "/tmp");
+    gbvk_mkdirs(dir);
+
+    char logpath[4200];
+    snprintf(logpath, sizeof(logpath), "%s/vulkan-layer.log", dir);
+    g_gbvk_log_fd = open(logpath, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+
+    openlog("VK_LAYER_GREENBOOST", LOG_PID | LOG_NDELAY, LOG_USER);
+
+    const char *dbg = getenv("GREENBOOST_VK_DEBUG");
+    if (dbg && dbg[0] == '1') g_gbvk_debug = 1;
+}
+
+__attribute__((destructor))
+static void gbvk_fini_logging(void)
+{
+    closelog();
+    if (g_gbvk_log_fd >= 0) { close(g_gbvk_log_fd); g_gbvk_log_fd = -1; }
+}
+
+static void gbvk_emit(int level, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+static void gbvk_emit(int level, const char *fmt, ...)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm;
+    gmtime_r(&ts.tv_sec, &tm);
+
+    char msg[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+
+    char buf[2304];
+    int len = snprintf(buf, sizeof(buf),
+        "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ [VK_LAYER_GREENBOOST] %s\n",
+        tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+        tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000L, msg);
+    if (len < 0 || len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
+
+    if (g_gbvk_log_fd >= 0) {
+        pthread_mutex_lock(&g_gbvk_log_mutex);
+        (void)write(g_gbvk_log_fd, buf, (size_t)len);
+        pthread_mutex_unlock(&g_gbvk_log_mutex);
+    }
+    syslog(level, "[VK_LAYER_GREENBOOST] %s", msg);
+    fwrite(buf, 1, (size_t)len, stderr);
+}
+
+#define gbvk_log(fmt, ...) gbvk_emit(LOG_INFO,  fmt, ##__VA_ARGS__)
+#define gbvk_dbg(fmt, ...) do { if (g_gbvk_debug) gbvk_emit(LOG_DEBUG, fmt, ##__VA_ARGS__); } while(0)
 
 /* ── Persistent /dev/greenboost fd ───────────────────────────────────── */
 
