@@ -63,7 +63,7 @@ Allocates pinned system DDR pages (2 MB hugepages) and exports them as DMA-BUF f
 Intercepts CUDA calls. 
 Small allocations pass through to the NVIDIA driver. 
 Large ones that overflow T1 VRAM are redirected to T2 DDR via the kernel module. 
-A phase detector (`INIT → MODEL_LOAD → INFERENCE → STEADY`) automatically classifies large allocations as KV cache during inference and keeps them in T1 at full GPU bandwidth.
+A phase detector (`INIT → MODEL_LOAD → INFERENCE → STEADY`) automatically classifies large allocations as KV cache during inference and keeps them in T1 at full GPU bandwidth. T3 local NVMe acts as a fallback memory tier, loading there the layers that do not fit on T1+T2, yet is far slower and greenboost avoid its use.
 
 **`libVkLayer_greenboost.so`**, the Vulkan layer. Reports the inflated T1+T2 VRAM total to Vulkan games and routes overflow allocations to T2 DDR via DMA-BUF when T1 is full.
 
@@ -79,19 +79,19 @@ See **[CONTAINER_VM_MODE.md](CONTAINER_VM_MODE.md)** for setup instructions spec
 
 ---
 
-## 🛡️ GreenBoost vs. CPU Offload: Why This Approach Is Better
+## 🛡️ GreenBoost Vs CPU Offload
 
-Some AI tools try to speed up by offloading computations to your CPU when the GPU runs out of memory. Sounds good, but not a proper solution:
+Some AI tools try to speed up by offloading tensor computations to your CPU when the GPU runs out of memory. A beautiful idea, but not a proper solution:
 
-Modern CPUs aren't built for heavy AI math. They have a few specialized units (AVX), but they're designed for general-purpose work. Trying to run tensor computation on them creates a massive bottleneck, your CPU becomes the limiting factor, local AI inference slows down.
+Modern CPUs aren't built for heavy tensor computation. Trying to run tensor computation on them creates a massive bottleneck, your CPU becomes the limiting factor, local AI inference slows down.
 
-GreenBoost takes a different approach: instead of moving computation to the CPU, it moves memory around and lets the GPU do all the tensor computation. Since GPUs have specialized cores to perform those tasks. The GPU simply reaches across your PCIe connection to grab data from system RAM as needed, much faster than waiting for the CPU to do the work.
+GreenBoost takes a different approach: instead of moving computation to the CPU, it orchestrates memory flow between T1+T2+T3 (GPU VRam + System DDR Ram + NVMe or other disk solution) and lets the GPU do all the tensor computation. Since GPUs have specialized cores to perform those tasks. The GPU simply reaches across your PCIe connection to grab data from system RAM as needed, much faster than waiting for the CPU to do the work.
 
 ---
 
 ## 🎮 Gaming with GreenBoost (Alpha/Beta)
 
-This feature was released in alpha/beta stage. I did not plan to release v2.8 that early. However, I needed to make some changes to avoid infringing trademarks, which led me to push a "developer version" as the main version. 
+This feature was released at alpha/beta stage. I did not plan to release v2.8 that early. However, I needed to make some changes to avoid infringing trademarks, which led me to push a "developer version" as the main version. 
 Greenboost was made to enhance AI local inference, not to boost gaming. Greenboost vulkan layer + Greenboost proton is a byproduct of original greenboost project.
 
 The final goal of GreenBoost vulkan layer + Greenboost Proton is to also be able to use the CUDA pool for games. 
