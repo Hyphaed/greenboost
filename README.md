@@ -94,14 +94,12 @@ GreenBoost takes a different approach: instead of moving computation to the CPU,
 This feature was released in alpha/beta stage. I did not plan to release v2.8 that early. However, I needed to make some changes to avoid infringing trademarks, which led me to push a "developer version" as the main version. 
 Greenboost was made to enhance AI local inference, not to boost gaming. Greenboost vulkan layer + Greenboost proton is a byproduct of original greenboost project.
 
-Starting with version 2.8, GreenBoost can also extend VRAM for games. If a game normally hits VRAM limits (causing texture pop-in or crashes), GreenBoost reports a larger memory pool so the game believes it has more memory available to work with.
+The final goal of GreenBoost vulkan layer + Greenboost Proton is to also be able to use the CUDA pool for games. 
 
 **To enable it for a Steam game:**
 1. Right-click the game → **Properties**
 2. Go to **Compatibility**
 3. Select **"GreenBoost Proton"**
-
-This is an early beta feature — performance gains depend on your game and hardware. See [GREENBOOST_PROTON.md](GREENBOOST_PROTON.md) for DLSS preset overrides, HDR, and MangoHud setup.
 
 ---
 
