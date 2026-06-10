@@ -1,4 +1,4 @@
-# GreenBoost DeviceClass — standalone manifest (no Helm required).
+# GreenBoost DeviceClass - standalone manifest (no Helm required).
 # Apply with: kubectl apply -f deviceclass.yaml
 # Requires Kubernetes 1.33+ with DRA feature gate enabled.
 #

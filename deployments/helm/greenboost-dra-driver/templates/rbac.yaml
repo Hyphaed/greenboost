@@ -15,10 +15,10 @@ rules:
 - apiGroups: ["resource.k8s.io"]
   resources: ["resourceclaims", "resourceclaims/status"]
   verbs: ["get", "list", "watch"]
-# Node info (advertise capacity per node)
+# Node info (read-only: advertise capacity per node)
 - apiGroups: [""]
   resources: ["nodes"]
-  verbs: ["get", "list", "watch", "update", "patch"]
+  verbs: ["get", "list", "watch"]
 # Pod info (detect active workloads for KV orchestration)
 - apiGroups: [""]
   resources: ["pods"]

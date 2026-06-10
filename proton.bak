@@ -1,0 +1,590 @@
+#!/usr/bin/env python3
+"""GreenBoost Proton Wayland - thin GreenBoost wrapper around Proton Experimental.
+
+Injects GreenBoost environment variables (virtual-VRAM Vulkan layer, Wayland,
+DXR config, shader caches, per-game tweaks) into os.environ, then delegates
+to Proton Experimental's proton script which supplies Wine, VKD3D-Proton,
+DXVK, and the full protonfixes stack.
+
+All hardware values are auto-detected at runtime - nothing is hard-coded.
+"""
+
+import glob
+import os
+import re
+import subprocess
+import sys
+
+# ── Per-game VKD3D overrides ───────────────────────────────────────────────────
+# Games in this set get DXR disabled (dxr / dxr11 not injected into VKD3D_CONFIG).
+# Add AppIDs here when a game has a known DXR crash or incompatibility.
+_NO_DXR_GAMES = {
+    "3764200",  # Resident Evil 9: Requiem - DirectStorage init fails with DXR
+}
+
+# ── Per-game Wine/env overrides ────────────────────────────────────────────────
+# Maps AppID → dict of env var overrides applied before Proton Experimental runs.
+# WINEDLLOVERRIDES entries are appended to any existing value (not replaced).
+_GAME_OVERRIDES = {
+}
+
+
+# ── Hardware detection ─────────────────────────────────────────────────────────
+
+def _detect_nvidia():
+    """Returns (gpu_name, vram_mb, is_nvidia, supports_rt). Auto-detected only."""
+    gpu_name, vram_mb, is_nvidia, supports_rt = "", 0, False, False
+
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
+            timeout=3, stderr=subprocess.DEVNULL,
+        ).decode().strip().splitlines()
+        if out:
+            parts = out[0].split(",", 1)
+            gpu_name = parts[0].strip()
+            m = re.search(r"(\d+)", parts[1]) if len(parts) > 1 else None
+            if m:
+                vram_mb = int(m.group(1))
+            is_nvidia = True
+    except Exception:
+        pass
+
+    if not gpu_name:
+        for info_path in glob.glob("/proc/driver/nvidia/gpus/*/information"):
+            try:
+                text = open(info_path).read()
+                m_name = re.search(r"^Model:\s+(.+)$", text, re.M)
+                m_vram = re.search(r"^Video Memory:\s+(\d+)", text, re.M)
+                if m_name:
+                    gpu_name = m_name.group(1).strip()
+                    is_nvidia = True
+                if m_vram:
+                    vram_mb = int(m_vram.group(1))
+                if gpu_name:
+                    break
+            except Exception:
+                pass
+
+    if not gpu_name:
+        try:
+            for line in subprocess.check_output(
+                ["lspci"], timeout=3, stderr=subprocess.DEVNULL,
+            ).decode().splitlines():
+                if re.search(r"VGA compatible|3D controller|Display controller", line, re.I):
+                    gpu_name = re.sub(r".+: ", "", line).strip()
+                    gpu_name = re.sub(r" \(.*\)", "", gpu_name)
+                    if "nvidia" in gpu_name.lower():
+                        is_nvidia = True
+                    break
+        except Exception:
+            pass
+
+    if is_nvidia and gpu_name:
+        if re.search(
+            r"rtx|a\d{3,4}[^d]|h\d{2,3}|l\d{2,3}|b\d{3}|blackwell|lovelace|ampere|turing",
+            gpu_name, re.I,
+        ):
+            supports_rt = True
+        else:
+            try:
+                if "VK_KHR_ray_tracing_pipeline" in subprocess.check_output(
+                    ["vulkaninfo", "--summary"], timeout=5, stderr=subprocess.DEVNULL,
+                ).decode():
+                    supports_rt = True
+            except Exception:
+                pass
+
+    return gpu_name, vram_mb, is_nvidia, supports_rt
+
+
+def _detect_cpu():
+    """Returns (total_threads, p_cores, cpu_model, p_core_cpus).
+    p_core_cpus is a sorted list of logical CPU indices that are P-cores
+    (includes both HT threads of each P-core). On uniform systems (AMD or
+    non-hybrid Intel) all CPUs are returned as p_core_cpus."""
+    cpu_model = ""
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    cpu_model = line.split(":", 1)[1].strip()
+                    break
+    except Exception:
+        pass
+
+    total_threads = os.cpu_count() or 1
+    p_cpu_set, e_cpu_set = set(), set()
+
+    # Primary: core_type sysfs (Intel hybrid: 1=P-core, 0=E-core)
+    for ct_path in glob.glob("/sys/devices/system/cpu/cpu*/topology/core_type"):
+        try:
+            ct = int(open(ct_path).read().strip())
+            idx = int(re.search(r"/cpu(\d+)/", ct_path).group(1))
+            (p_cpu_set if ct == 1 else e_cpu_set).add(idx)
+        except Exception:
+            pass
+    if p_cpu_set and e_cpu_set:
+        p_core_cpus = sorted(p_cpu_set)
+        return total_threads, len(p_core_cpus), cpu_model, p_core_cpus
+
+    # Fallback: thread_siblings_list - P-cores are hyperthreaded (have siblings),
+    # E-cores are single-thread (no siblings)
+    p_sibling_groups = set()
+    for sib_path in glob.glob("/sys/devices/system/cpu/cpu*/topology/thread_siblings_list"):
+        try:
+            sib = open(sib_path).read().strip()
+            idx = int(re.search(r"/cpu(\d+)/", sib_path).group(1))
+            if "-" in sib or "," in sib:
+                p_cpu_set.add(idx)
+                p_sibling_groups.add(sib)
+            else:
+                e_cpu_set.add(idx)
+        except Exception:
+            pass
+    if p_cpu_set and e_cpu_set:
+        p_core_cpus = sorted(p_cpu_set)
+        return total_threads, len(p_sibling_groups), cpu_model, p_core_cpus
+
+    # Uniform CPU (AMD or non-hybrid Intel) - all logical CPUs are P-cores
+    p_core_cpus = list(range(total_threads))
+    return total_threads, total_threads, cpu_model, p_core_cpus
+
+
+def _restore_ue5_rt(gameid):
+    """Remove GreenBoost-written RT disable keys from Engine.ini.
+
+    Called when a game is promoted back to DXR-enabled after the underlying
+    driver bug is fixed (e.g. NVIDIA 595 fixes the BMWu GPU hang / Xid errors).
+    Strips r.RayTracing, r.RayTracing.EnableInGame, r.Lumen.HardwareRayTracing
+    from the ini so game defaults (RT on) apply again. A marker file prevents
+    repeated rewrites on every launch.
+    """
+    _UE5_RT_RESTORE_GAMES = {
+        "2358720": ("b1", "Windows"),  # Black Myth: Wukong - NVIDIA 595 fixes GPU hang/Xid
+    }
+    if gameid not in _UE5_RT_RESTORE_GAMES:
+        return
+
+    app_name, config_subdir = _UE5_RT_RESTORE_GAMES[gameid]
+    compat_root = os.path.expanduser(
+        f"~/.local/share/Steam/steamapps/compatdata/{gameid}/pfx"
+        f"/drive_c/users/steamuser/AppData/Local"
+    )
+    config_dir = os.path.join(compat_root, app_name, "Saved", "Config", config_subdir)
+    engine_ini = os.path.join(config_dir, "Engine.ini")
+
+    if not os.path.isfile(engine_ini):
+        return
+
+    marker = os.path.join(config_dir, ".greenboost_rt_restored")
+    if os.path.exists(marker):
+        return  # Already restored.
+
+    rt_keys = {"r.RayTracing", "r.RayTracing.EnableInGame", "r.Lumen.HardwareRayTracing"}
+
+    try:
+        with open(engine_ini, encoding="utf-8-sig") as f:
+            lines = f.readlines()
+    except Exception:
+        return
+
+    out_lines = [
+        line for line in lines
+        if line.rstrip().split("=", 1)[0].strip() not in rt_keys
+    ]
+
+    try:
+        with open(engine_ini, "w", encoding="utf-8") as f:
+            f.writelines(out_lines)
+        open(marker, "w").close()
+        sys.stderr.write(
+            f"[greenboost-proton] Engine.ini RT overrides removed (DXR re-enabled): {engine_ini}\n"
+        )
+    except Exception as e:
+        sys.stderr.write(
+            f"[greenboost-proton] WARNING: could not restore Engine.ini RT settings: {e}\n"
+        )
+
+
+def _inject_ue5_rt_disable(gameid):
+    """Write UE5 Engine.ini overrides to disable ray tracing for affected games.
+
+    VKD3D-Proton's internal game database can re-enable DXR even when no_dxr is
+    set in VKD3D_CONFIG. Writing r.RayTracing=0 at the UE5 engine level prevents
+    the game from ever issuing DX12 RT calls, regardless of what VKD3D-Proton
+    advertises via CheckFeatureSupport.
+    """
+    _UE5_RT_DISABLE_GAMES = {
+    }
+    if gameid not in _UE5_RT_DISABLE_GAMES:
+        return
+
+    app_name, config_subdir = _UE5_RT_DISABLE_GAMES[gameid]
+    compat_root = os.path.expanduser(
+        f"~/.local/share/Steam/steamapps/compatdata/{gameid}/pfx"
+        f"/drive_c/users/steamuser/AppData/Local"
+    )
+    config_dir = os.path.join(compat_root, app_name, "Saved", "Config", config_subdir)
+    engine_ini = os.path.join(config_dir, "Engine.ini")
+
+    rt_section = "[/Script/Engine.RendererSettings]"
+    rt_keys = {
+        "r.RayTracing": "0",
+        "r.RayTracing.EnableInGame": "0",
+        "r.Lumen.HardwareRayTracing": "0",
+    }
+
+    if not os.path.isdir(config_dir):
+        return  # Prefix not initialised yet - game hasn't run once; skip.
+
+    # Parse existing ini, preserve all non-RT content, inject/overwrite RT keys.
+    existing_lines = []
+    if os.path.isfile(engine_ini):
+        try:
+            with open(engine_ini, encoding="utf-8-sig") as f:
+                existing_lines = f.readlines()
+        except Exception:
+            pass
+
+    in_section = False
+    seen_keys = set()
+    out_lines = []
+
+    for line in existing_lines:
+        stripped = line.rstrip()
+        if stripped == rt_section:
+            in_section = True
+            out_lines.append(line)
+            continue
+        if in_section and stripped.startswith("["):
+            # Flush any unseen RT keys before the next section starts.
+            for k, v in rt_keys.items():
+                if k not in seen_keys:
+                    out_lines.append(f"{k}={v}\n")
+                    seen_keys.add(k)
+            in_section = False
+        if in_section:
+            key = stripped.split("=", 1)[0].strip()
+            if key in rt_keys:
+                out_lines.append(f"{key}={rt_keys[key]}\n")
+                seen_keys.add(key)
+                continue
+        out_lines.append(line)
+
+    # Section was never found - append it.
+    if rt_section not in "".join(out_lines):
+        if out_lines and not out_lines[-1].endswith("\n"):
+            out_lines.append("\n")
+        out_lines.append(f"{rt_section}\n")
+        for k, v in rt_keys.items():
+            out_lines.append(f"{k}={v}\n")
+    elif in_section:
+        # Section was last in file - flush remaining keys.
+        for k, v in rt_keys.items():
+            if k not in seen_keys:
+                out_lines.append(f"{k}={v}\n")
+
+    try:
+        with open(engine_ini, "w", encoding="utf-8") as f:
+            f.writelines(out_lines)
+        sys.stderr.write(
+            f"[greenboost-proton] Engine.ini RT override written: {engine_ini}\n"
+        )
+    except Exception as e:
+        sys.stderr.write(
+            f"[greenboost-proton] WARNING: could not write Engine.ini: {e}\n"
+        )
+
+
+def _cleanup_dxr_pipeline_cache(gameid):
+    """Remove stale DXR-containing pipeline cache entries for affected games.
+
+    After disabling DXR, any previously compiled DXR pipelines in the fossilize
+    cache are no longer valid and will produce replay warnings (or worse, be
+    referenced by in-progress render work before the RT disable takes effect).
+    A marker file prevents repeated deletions on every launch.
+    """
+    _CACHE_CLEANUP_GAMES = set()
+    if gameid not in _CACHE_CLEANUP_GAMES:
+        return
+
+    shadercache = os.path.expanduser(
+        f"~/.local/share/Steam/steamapps/shadercache/{gameid}"
+    )
+    marker = os.path.join(shadercache, ".greenboost_no_dxr_cleaned")
+    if os.path.exists(marker):
+        return  # Already cleaned.
+
+    foz_root = os.path.join(shadercache, "fozpipelinesv6")
+    if not os.path.isdir(foz_root):
+        return
+
+    import shutil
+    cleaned = 0
+    for entry in os.listdir(foz_root):
+        if entry.startswith("steamapprun_pipeline_cache."):
+            target = os.path.join(foz_root, entry)
+            try:
+                shutil.rmtree(target)
+                cleaned += 1
+            except Exception as e:
+                sys.stderr.write(
+                    f"[greenboost-proton] WARNING: could not remove cache {target}: {e}\n"
+                )
+
+    try:
+        open(marker, "w").close()
+    except Exception:
+        pass
+
+    if cleaned:
+        sys.stderr.write(
+            f"[greenboost-proton] Cleared {cleaned} stale DXR pipeline cache(s) for AppID {gameid}\n"
+        )
+
+
+def _read_sysfs_int(path, default=0):
+    """Read an integer from a sysfs/procfs path; return default on any error."""
+    try:
+        return int(open(path).read().strip())
+    except Exception:
+        return default
+
+
+def _append_vkd3d(key, option):
+    cur = os.environ.get(key, "")
+    if not cur:
+        os.environ[key] = option
+    elif "," + option + "," not in "," + cur + ",":
+        os.environ[key] = cur + "," + option
+
+
+def _find_proton_experimental():
+    candidates = []
+
+    steam_root = os.environ.get("STEAM_COMPAT_CLIENT_INSTALL_PATH", "")
+    if steam_root:
+        candidates.append(
+            os.path.join(steam_root, "steamapps", "common", "Proton - Experimental", "proton")
+        )
+    for lib in os.environ.get("STEAM_COMPAT_LIBRARY_PATHS", "").split(":"):
+        if lib:
+            candidates.append(
+                os.path.join(lib, "common", "Proton - Experimental", "proton")
+            )
+    for base in (
+        os.path.expanduser("~/.local/share/Steam"),
+        os.path.expanduser("~/.steam/root"),
+        os.path.expanduser("~/.steam/steam"),
+    ):
+        candidates.append(
+            os.path.join(base, "steamapps", "common", "Proton - Experimental", "proton")
+        )
+
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+def main():
+    proton_exp = _find_proton_experimental()
+    if not proton_exp:
+        sys.stderr.write(
+            "[greenboost-proton] ERROR: Proton Experimental not found.\n"
+            "[greenboost-proton] Install it in Steam: Library → Tools → Proton Experimental\n"
+        )
+        sys.exit(1)
+
+    if os.environ.get("GREENBOOST_DISABLE", "0") == "1":
+        sys.stderr.write(f"[greenboost-proton] GreenBoost disabled - delegating to {proton_exp}\n")
+        os.execv(proton_exp, [proton_exp] + sys.argv[1:])
+
+    gpu_name, vram_mb, is_nvidia, supports_rt = _detect_nvidia()
+    total_threads, p_cores, cpu_model, p_core_cpus = _detect_cpu()
+    _threads_env = os.environ.get("GREENBOOST_SHADER_THREADS", "")
+    if _threads_env.isdigit() and int(_threads_env) > 0:
+        compiler_threads = max(2, int(_threads_env))
+    else:
+        compiler_threads = max(2, p_cores)
+    gameid = os.environ.get("SteamGameId", "")
+
+    # ── Per-game fixes (Engine.ini patches, cache cleanup) ───────────────────
+    _restore_ue5_rt(gameid)
+    _inject_ue5_rt_disable(gameid)
+    _cleanup_dxr_pipeline_cache(gameid)
+
+    # ── Per-game overrides ────────────────────────────────────────────────────
+    for _key, _val in _GAME_OVERRIDES.get(gameid, {}).items():
+        if _key == "WINEDLLOVERRIDES":
+            _existing = os.environ.get(_key, "")
+            os.environ[_key] = f"{_existing};{_val}" if _existing else _val
+        else:
+            os.environ.setdefault(_key, _val)
+
+    # ── GreenBoost env vars (set before Proton Experimental's init_session) ───
+    os.environ.setdefault("GREENBOOST_VULKAN", "1")
+    os.environ.setdefault("PROTON_ENABLE_WAYLAND", "1")
+
+    # VKD3D_CONFIG - DXR only on RT-capable GPUs and only for games that support it.
+    # Modern vkd3d-proton auto-enables DXR on RTX GPUs by default; "no_dxr" must be
+    # injected explicitly for blocklisted games - not adding "dxr" is not enough.
+    if supports_rt and gameid not in _NO_DXR_GAMES and os.environ.get("GREENBOOST_NO_DXR", "0") != "1":
+        _append_vkd3d("VKD3D_CONFIG", "dxr")
+        _append_vkd3d("VKD3D_CONFIG", "dxr11")
+    else:
+        _append_vkd3d("VKD3D_CONFIG", "no_dxr")
+
+    for opt in os.environ.get("GREENBOOST_VKD3D_CONFIG", "").split(","):
+        opt = opt.strip()
+        if opt:
+            _append_vkd3d("VKD3D_CONFIG", opt)
+
+    _append_vkd3d("VKD3D_CONFIG", "pipeline_library_app_cache")
+    # Improves constant buffer view performance in DX12-to-Vulkan translation.
+    _append_vkd3d("VKD3D_CONFIG", "force_static_cbv")
+
+    os.environ.setdefault("VKD3D_DEBUG", os.environ.get("VKD3D_DEBUG_OVERRIDE") or "warn")
+
+    if is_nvidia:
+        os.environ.setdefault("DXVK_ENABLE_NVAPI", "1")
+        # Threaded OpenGL dispatch - significant for OpenGL games and DXVK's GL fallback path.
+        os.environ.setdefault("__GL_THREADED_OPTIMIZATIONS", "1")
+        # Prevent driver from yielding CPU time in spin-waits; reduces frame time jitter.
+        os.environ.setdefault("__GL_YIELD", "NOTHING")
+
+    os.environ.setdefault("DXVK_NUM_COMPILER_THREADS", str(compiler_threads))
+
+    # Log routing - errors and warnings only to avoid multi-GB log files.
+    # Proton Experimental sets WINEDEBUG to very verbose levels when PROTON_LOG=1;
+    # override it to capture crashes (seh, loaddll) without trace/unwind spam.
+    gb_log_dir = os.path.expanduser("~/.local/share/greenboost/proton-logs")
+    os.makedirs(gb_log_dir, exist_ok=True)
+    os.environ.setdefault("PROTON_LOG", "1")
+    os.environ.setdefault("PROTON_LOG_DIR", gb_log_dir)
+    os.environ.setdefault("DXVK_LOG_PATH", gb_log_dir)
+    # Restrict Wine debug channels: keep err+all for crash diagnostics, warn for SEH,
+    # loaddll for DLL load tracking - suppress trace/unwind/mscoree/threadname.
+    os.environ.setdefault("WINEDEBUG", "err+all,warn+seh,+loaddll,-threadname,-unwind,-mscoree")
+
+    # Shader caches
+    gb_cache_dir = os.path.expanduser("~/.local/share/greenboost/proton-cache")
+    for sub in ("gl-shaders", "dxvk-state", "vkd3d-shader", "mesa-shader"):
+        os.makedirs(os.path.join(gb_cache_dir, sub), exist_ok=True)
+
+    if is_nvidia:
+        os.environ.setdefault("__GL_SHADER_DISK_CACHE", "1")
+        os.environ.setdefault("__GL_SHADER_DISK_CACHE_PATH", os.path.join(gb_cache_dir, "gl-shaders"))
+        _cache_gb = int(os.environ.get("GREENBOOST_SHADER_CACHE_GB", "8"))
+        os.environ.setdefault("__GL_SHADER_DISK_CACHE_SIZE", str(_cache_gb * 1024 * 1024 * 1024))
+        os.environ.setdefault("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1")
+        os.environ.setdefault("DXVK_STATE_CACHE", "1")
+        os.environ.setdefault("DXVK_STATE_CACHE_PATH", os.path.join(gb_cache_dir, "dxvk-state"))
+
+    os.environ.setdefault("VKD3D_SHADER_CACHE_PATH", os.path.join(gb_cache_dir, "vkd3d-shader"))
+    os.environ.setdefault("MESA_SHADER_CACHE_DIR", os.path.join(gb_cache_dir, "mesa-shader"))
+
+    # ── GreenBoost Vulkan layer - memory budget ───────────────────────────────
+    # Lower overflow threshold for gaming: start T2 fallback at 32 MB (vs 64 MB for AI)
+    os.environ.setdefault("GREENBOOST_VK_OVERFLOW_MIN_MB", "32")
+    # Tell the Vulkan layer how much T2 budget is available from the kernel module
+    virt_gb = _read_sysfs_int("/sys/module/greenboost/parameters/virtual_vram_gb")
+    if virt_gb > 0:
+        os.environ.setdefault("GREENBOOST_VK_T2_BUDGET_MB", str(virt_gb * 1024))
+    total_pool_mb = vram_mb + (virt_gb * 1024) if virt_gb > 0 else vram_mb
+
+    # ── WINE_CPU_TOPOLOGY - report only P-cores to Windows games ─────────────
+    # Prevents DXVK/VKD3D and the game's own thread pool from scheduling render
+    # threads on E-cores, which have lower IPC and a different cache topology.
+    if p_core_cpus and len(p_core_cpus) < total_threads:
+        os.environ.setdefault(
+            "WINE_CPU_TOPOLOGY",
+            "{:d}:{:s}".format(len(p_core_cpus), ",".join(str(c) for c in p_core_cpus)),
+        )
+
+    # ── Status line ────────────────────────────────────────────────────────────
+    sys.stderr.write(
+        "[greenboost-proton] GPU: {} {} MiB  VirtualPool:{} MiB  RT:{}  Wayland:{}  NVAPI:{}\n".format(
+            gpu_name or "unknown", vram_mb, total_pool_mb,
+            int(supports_rt),
+            os.environ.get("PROTON_ENABLE_WAYLAND", "0"),
+            os.environ.get("DXVK_ENABLE_NVAPI", "0"),
+        )
+    )
+    _affinity_str = (
+        "P-cores {:s}".format(str(sorted(p_core_cpus)))
+        if p_core_cpus and len(p_core_cpus) < total_threads
+        else "all {:d} threads".format(total_threads)
+    )
+    sys.stderr.write(
+        "[greenboost-proton] CPU: {}  P-cores:{}  threads:{}  compiler-threads:{}  affinity:{}\n".format(
+            cpu_model or "unknown", p_cores, total_threads,
+            os.environ.get("DXVK_NUM_COMPILER_THREADS", str(compiler_threads)),
+            _affinity_str,
+        )
+    )
+    sys.stderr.write(
+        "[greenboost-proton] VKD3D_CONFIG={}  GREENBOOST_VULKAN={}\n".format(
+            os.environ.get("VKD3D_CONFIG", "<defaults>"),
+            os.environ.get("GREENBOOST_VULKAN", "0"),
+        )
+    )
+    sys.stderr.write(f"[greenboost-proton] Delegating to: {proton_exp}\n")
+
+    # ── CPU affinity - pin game to P-cores for max single-thread performance ────
+    # The affinity is inherited by Proton Experimental → Wine → the game process.
+    # Only applied on hybrid CPUs (where p_core_cpus is a strict subset of all CPUs).
+    if p_core_cpus and len(p_core_cpus) < total_threads:
+        try:
+            os.sched_setaffinity(0, set(p_core_cpus))
+        except OSError:
+            pass  # Non-fatal: CAP_SYS_NICE or cgroup restriction may prevent this
+
+    # ── Process priority - elevate game above background nice-0 tasks ─────────
+    # Requires /etc/security/limits.d/99-greenboost-gaming.conf: @video hard nice -5
+    # (installed by greenboost_setup.sh full-install / install-sys-configs)
+    try:
+        os.setpriority(os.PRIO_PROCESS, 0, -5)
+    except OSError:
+        pass  # Non-fatal: falls back to default nice 0
+
+    # ── I/O priority - best-effort class 2, level 0 (highest BE) ─────────────
+    try:
+        subprocess.run(
+            ["ionice", "-c2", "-n0", "-p", str(os.getpid())],
+            check=False, stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        pass  # ionice not available on this system
+
+    # ── Gaming mode service (try/finally ensures stop even on crash) ───────────
+    try:
+        subprocess.run(
+            ["systemctl", "start", "greenboost-gaming.service"],
+            check=False, stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        pass
+
+    rc = 0
+    try:
+        # subprocess.run inherits our modified os.environ automatically (no env= needed).
+        # Proton Experimental's proton script uses sys.argv[0] to find its own files/,
+        # protonfixes/, and Wine binaries - all supplied by the Proton Experimental install.
+        rc = subprocess.run([proton_exp] + sys.argv[1:]).returncode
+    finally:
+        try:
+            subprocess.run(
+                ["systemctl", "stop", "greenboost-gaming.service"],
+                check=False, stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            pass
+
+    sys.exit(rc)
+
+
+main()

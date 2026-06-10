@@ -11,32 +11,6 @@ metadata:
   name: {{ include "greenboost-dra-driver.name" . }}-plugin
   namespace: {{ include "greenboost-dra-driver.namespace" . }}
 ---
-{{- if .Values.rbac.create }}
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: {{ include "greenboost-dra-driver.name" . }}-plugin
-rules:
-- apiGroups: [""]
-  resources: ["nodes", "pods"]
-  verbs: ["get", "list", "watch"]
-- apiGroups: ["resource.k8s.io"]
-  resources: ["resourceclaims", "resourceclaims/status", "devices"]
-  verbs: ["get", "list", "watch", "update"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: {{ include "greenboost-dra-driver.name" . }}-plugin
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: {{ include "greenboost-dra-driver.name" . }}-plugin
-subjects:
-- kind: ServiceAccount
-  name: {{ include "greenboost-dra-driver.name" . }}-plugin
-  namespace: {{ include "greenboost-dra-driver.namespace" . }}
-{{- end }}
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -87,7 +61,7 @@ spec:
               nvlink_pool_enable={{ .Values.greenboost.nvlinkPool | ternary "1" "0" }} \
               use_hugepages={{ .Values.greenboost.useHugepages | ternary "1" "0" }} \
               pcores_only={{ .Values.greenboost.pcoresOnly | ternary "1" "0" }} \
-              active_profile_name={{ .Values.greenboost.profileName }} \
+              active_profile_name="{{ .Values.greenboost.profileName }}" \
               debug_mode=0
             echo "GreenBoost module loaded"
           else
@@ -112,7 +86,7 @@ spec:
         - name: KUBELET_REGISTRAR_DIRECTORY_PATH
           value: {{ .Values.kubeletPlugin.kubeletRegistrarDirectoryPath | quote }}
         - name: GREENBOOST_SYSFS_PATH
-          value: "/sys/class/greenboost"
+          value: "/sys/class/greenboost/greenboost"
         - name: GREENBOOST_NVLINK_POOL
           value: {{ .Values.greenboost.nvlinkPool | quote }}
         - name: GREENBOOST_PROFILE_NAME
@@ -160,7 +134,7 @@ spec:
         - name: METRICS_PATH
           value: {{ .Values.metricsExporter.path | quote }}
         - name: GREENBOOST_SYSFS_PATH
-          value: "/sys/class/greenboost"
+          value: "/sys/class/greenboost/greenboost"
         volumeMounts:
         - name: greenboost-sysfs
           mountPath: /sys/class/greenboost
@@ -213,7 +187,6 @@ apiVersion: resource.k8s.io/v1beta1
 kind: DeviceClass
 metadata:
   name: greenboost.nvidia.com
-  namespace: greenboost-system
 spec:
   nodeSelector:
     matchLabels:

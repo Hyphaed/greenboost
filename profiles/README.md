@@ -56,7 +56,7 @@ cross-checks against the profile. Conflicts are resolved as follows:
 
 | Field | Rule |
 |-------|------|
-| `physical_vram_gb` | Always use detected — cannot claim VRAM that doesn't exist |
+| `physical_vram_gb` | Always use detected - cannot claim VRAM that doesn't exist |
 | `virtual_vram_gb` | Use profile value if ≤ 90% of RAM, else cap |
 | `safety_reserve_gb` | Use max(profile, 10% of RAM) |
 | `nvme_swap_gb` | Use profile value if ≤ NVMe capacity, else cap |
@@ -75,8 +75,8 @@ cross-checks against the profile. Conflicts are resolved as follows:
 
 ## Example Profiles
 
-- `examples/workstation_i9_rtx5070.md` — i9-14900KF + RTX 5070, 64 GB DDR4
-- `examples/cluster_node_v100_8gpu.md` — Dual Xeon + 8× V100, 384 GB DDR4 ECC
+- `examples/workstation_i9_rtx5070.md` - i9-14900KF + RTX 5070, 64 GB DDR4
+- `examples/cluster_node_v100_8gpu.md` - Dual Xeon + 8× V100, 384 GB DDR4 ECC
 
 ## Sysfs (post-load)
 

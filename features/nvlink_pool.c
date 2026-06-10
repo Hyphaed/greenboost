@@ -1,10 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0
- * GreenBoost v3.0 — NVLink Pooling Feature
+ * GreenBoost v3.0 - NVLink Pooling Feature
  *
  * Aggregates multiple GPU VRAM into a unified T1 pool via NVLink 2.0.
  *
  * V100 correction (BUG-009):
- *   V100 uses NVLink 2.0 direct P2P — NOT an NVSwitch fabric.
+ *   V100 uses NVLink 2.0 direct P2P - NOT an NVSwitch fabric.
  *   nvmlDeviceGetGpuFabricInfo() returns GPU_FABRIC_STATE_NOT_SUPPORTED for V100.
  *   Readiness must be verified via nvmlDeviceGetP2PStatus() from user-space (kubelet plugin),
  *   which then writes 1 to /sys/class/greenboost/greenboost/nvlink_ready.
@@ -16,6 +16,7 @@
 
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/mutex.h>
 #include <linux/slab.h>
 #include "nvlink_pool.h"
 
@@ -25,6 +26,9 @@
 #ifndef DRIVER_NAME
 #define DRIVER_NAME "greenboost"
 #endif
+
+/* F-L2-11: module-level mutex protecting all accesses to nvlink_pool fields */
+static DEFINE_MUTEX(nvlink_pool_lock);
 
 /* Global NVLink pool state */
 static struct gb_nvlink_pool nvlink_pool = {
@@ -53,7 +57,7 @@ MODULE_PARM_DESC(nvlink_gpu_count,
 	"Number of NVLink-connected GPUs (0=auto; kubelet plugin writes nvlink_ready)");
 
 /*
- * gb_nvlink_pool_init — Initialize the NVLink pooling subsystem.
+ * gb_nvlink_pool_init - Initialize the NVLink pooling subsystem.
  *
  * BUG-009 fix: Does NOT fail when fabric is not immediately ready.
  * For V100, the fabric state is always GB_NVLINK_STATE_NOT_SUPPORTED
@@ -62,61 +66,72 @@ MODULE_PARM_DESC(nvlink_gpu_count,
  */
 int gb_nvlink_pool_init(void)
 {
+	mutex_lock(&nvlink_pool_lock);
 	nvlink_pool.enabled   = nvlink_pool_enable;
 	nvlink_pool.gpu_count = (u32)nvlink_gpu_count;
 
 	if (!nvlink_pool.enabled) {
+		mutex_unlock(&nvlink_pool_lock);
 		/* BUG-007 fix: use \n (one backslash in source = newline) */
 		pr_info(DRIVER_NAME ": NVLink pooling disabled (nvlink_pool_enable=0)\n");
 		return 0;
 	}
 
-	pr_info(DRIVER_NAME ": NVLink pooling enabled — waiting for kubelet plugin P2P verification\n");
-	pr_info(DRIVER_NAME ": NVLink expected GPU count: %d\n", nvlink_gpu_count);
-	pr_info(DRIVER_NAME ": V100 note: fabric state is NOT_SUPPORTED (no NVSwitch); "
-		"P2P checked via NVML by kubelet plugin\n");
-
 	/* fabric_ready starts false; set to true when kubelet plugin writes nvlink_ready=1 */
 	nvlink_pool.fabric_ready  = false;
 	nvlink_pool.clique_valid  = false;
 	nvlink_pool.total_vram_gb = 0;
+	mutex_unlock(&nvlink_pool_lock);
+
+	pr_info(DRIVER_NAME ": NVLink pooling enabled - waiting for kubelet plugin P2P verification\n");
+	pr_info(DRIVER_NAME ": NVLink expected GPU count: %d\n", nvlink_gpu_count);
+	pr_info(DRIVER_NAME ": V100 note: fabric state is NOT_SUPPORTED (no NVSwitch); "
+		"P2P checked via NVML by kubelet plugin\n");
 
 	return 0; /* BUG-009 fix: succeed even though fabric not ready yet */
 }
 
 /*
- * gb_nvlink_set_ready — Called when kubelet plugin writes nvlink_ready sysfs.
+ * gb_nvlink_set_ready - Called when kubelet plugin writes nvlink_ready sysfs.
  * Updates pool state to reflect confirmed P2P topology.
  */
 void gb_nvlink_set_ready(bool ready, u32 gpu_count, u64 vram_per_gpu_gb)
 {
+	u64 total;
+
+	mutex_lock(&nvlink_pool_lock);
 	nvlink_pool.fabric_ready  = ready;
 	nvlink_pool.clique_valid  = ready;
 	if (ready) {
 		nvlink_pool.gpu_count     = gpu_count;
 		nvlink_pool.total_vram_gb = gpu_count * vram_per_gpu_gb;
-		pr_info(DRIVER_NAME ": NVLink pool ready — %u GPUs × %llu GB = %llu GB T1\n",
-			gpu_count, vram_per_gpu_gb, nvlink_pool.total_vram_gb);
+		total = nvlink_pool.total_vram_gb;
+		mutex_unlock(&nvlink_pool_lock);
+		pr_info(DRIVER_NAME ": NVLink pool ready - %u GPUs × %llu GB = %llu GB T1\n",
+			gpu_count, vram_per_gpu_gb, total);
 	} else {
 		nvlink_pool.total_vram_gb = 0;
+		mutex_unlock(&nvlink_pool_lock);
 		pr_info(DRIVER_NAME ": NVLink pool cleared\n");
 	}
 }
 
 /*
- * gb_nvlink_pool_exit — Shut down the NVLink pooling subsystem.
+ * gb_nvlink_pool_exit - Shut down the NVLink pooling subsystem.
  */
 void gb_nvlink_pool_exit(void)
 {
 	pr_info(DRIVER_NAME ": NVLink pooling subsystem shutdown\n");
+	mutex_lock(&nvlink_pool_lock);
 	memset(&nvlink_pool, 0, sizeof(nvlink_pool));
+	mutex_unlock(&nvlink_pool_lock);
 }
 
 /*
- * gb_nvlink_query_fabric — Query NVLink fabric state.
+ * gb_nvlink_query_fabric - Query NVLink fabric state.
  *
  * BUG-009 fix: For V100, always returns GB_NVLINK_STATE_NOT_SUPPORTED.
- * This is correct — V100 has no NVSwitch fabric.
+ * This is correct - V100 has no NVSwitch fabric.
  * Actual P2P capability is verified from user-space via nvmlDeviceGetP2PStatus().
  */
 int gb_nvlink_query_fabric(struct gb_gpu_fabric_state *state)
@@ -129,7 +144,7 @@ int gb_nvlink_query_fabric(struct gb_gpu_fabric_state *state)
 	/*
 	 * V100 NVLink 2.0 correction:
 	 *   - nvmlDeviceGetGpuFabricInfo() → GPU_FABRIC_STATE_NOT_SUPPORTED
-	 *   - This is expected — V100 has direct P2P, not an NVSwitch fabric
+	 *   - This is expected - V100 has direct P2P, not an NVSwitch fabric
 	 *   - Actual readiness is set via gb_nvlink_set_ready() from kubelet plugin
 	 */
 	state->state   = GB_NVLINK_STATE_NOT_SUPPORTED;
@@ -140,51 +155,81 @@ int gb_nvlink_query_fabric(struct gb_gpu_fabric_state *state)
 }
 
 /*
- * gb_nvlink_is_poolable — Check if NVLink pooling is active and ready.
+ * gb_nvlink_is_poolable - Check if NVLink pooling is active and ready.
  */
 bool gb_nvlink_is_poolable(void)
 {
-	return nvlink_pool.enabled && nvlink_pool.fabric_ready;
+	bool ret;
+
+	mutex_lock(&nvlink_pool_lock);
+	ret = nvlink_pool.enabled && nvlink_pool.fabric_ready;
+	mutex_unlock(&nvlink_pool_lock);
+	return ret;
 }
 
 /*
- * gb_nvlink_get_aggregated_vram — Return aggregated T1 VRAM in GB.
+ * gb_nvlink_get_aggregated_vram - Return aggregated T1 VRAM in GB.
  */
 u64 gb_nvlink_get_aggregated_vram(void)
 {
-	if (!nvlink_pool.enabled || !nvlink_pool.fabric_ready)
-		return 0;
-	return nvlink_pool.total_vram_gb;
+	u64 ret;
+
+	mutex_lock(&nvlink_pool_lock);
+	ret = (nvlink_pool.enabled && nvlink_pool.fabric_ready) ?
+	      nvlink_pool.total_vram_gb : 0;
+	mutex_unlock(&nvlink_pool_lock);
+	return ret;
 }
 
 /*
- * gb_nvlink_get_gpu_info — Return per-GPU VRAM info.
+ * gb_nvlink_get_gpu_info - Return per-GPU VRAM info.
  */
 int gb_nvlink_get_gpu_info(u32 gpu_id, struct gb_gpu_vram_info *info)
 {
+	u32 gpu_count;
+	u64 total_vram_gb;
+	bool clique_valid;
+
 	if (!info)
 		return -EINVAL;
 
+	mutex_lock(&nvlink_pool_lock);
+	gpu_count     = nvlink_pool.gpu_count;
+	total_vram_gb = nvlink_pool.total_vram_gb;
+	clique_valid  = nvlink_pool.clique_valid;
+	mutex_unlock(&nvlink_pool_lock);
+
+	/* F-L2-10: bounds check - reject out-of-range gpu_id */
+	if (gpu_count > 0 && gpu_id >= gpu_count)
+		return -ENODEV;
+
 	memset(info, 0, sizeof(*info));
 	info->gpu_id       = gpu_id;
-	info->vram_size_gb = 32; /* V100 default: 32 GB HBM2 */
-	info->nvlink_peers = (nvlink_pool.gpu_count > 0) ?
-	                     nvlink_pool.gpu_count - 1 : 7;
-	info->in_clique    = nvlink_pool.clique_valid;
+	/* F-L2-10: derive per-GPU VRAM from pool total instead of hardcoding 32.
+	 * Guard against division by zero when gpu_count is 0. */
+	info->vram_size_gb = (gpu_count > 0) ? (total_vram_gb / gpu_count) : 32;
+	info->nvlink_peers = (gpu_count > 0) ? gpu_count - 1 : 7;
+	info->in_clique    = clique_valid;
 
 	return 0;
 }
 
 /*
- * gb_nvlink_update_shim_vram — Update CUDA shim's virtual VRAM aggregation.
+ * gb_nvlink_update_shim_vram - Update CUDA shim's virtual VRAM aggregation.
  * Called by the CUDA shim at init if nvlink_ready sysfs reads 1.
  */
 void gb_nvlink_update_shim_vram(u64 *virtual_vram_gb)
 {
-	if (!nvlink_pool.enabled || !nvlink_pool.fabric_ready)
-		return;
+	u64 total;
 
-	pr_info(DRIVER_NAME ": NVLink pooling active: T1=%llu GB aggregated\n",
-		nvlink_pool.total_vram_gb);
+	mutex_lock(&nvlink_pool_lock);
+	if (!nvlink_pool.enabled || !nvlink_pool.fabric_ready) {
+		mutex_unlock(&nvlink_pool_lock);
+		return;
+	}
+	total = nvlink_pool.total_vram_gb;
+	mutex_unlock(&nvlink_pool_lock);
+
+	pr_info(DRIVER_NAME ": NVLink pooling active: T1=%llu GB aggregated\n", total);
 	/* The shim reads nvlink_ready + gpu_count_per_node sysfs directly */
 }

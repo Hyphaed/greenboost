@@ -1,0 +1,31 @@
+[Unit]
+Description=GreenBoost Network Feeder Daemon
+Documentation=man:greenboost-netd(8)
+After=network-online.target nvidia-persistenced.service
+Wants=network-online.target
+ConditionPathExists=/usr/local/bin/greenboost-netd
+
+[Service]
+Type=forking
+ExecStart=/usr/local/bin/greenboost-netd -d
+PIDFile=/run/greenboost/netd.pid
+RuntimeDirectory=greenboost
+RuntimeDirectoryMode=0755
+LogsDirectory=greenboost
+Restart=on-failure
+RestartSec=5
+LimitMEMLOCK=infinity
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# Audit F-L3-04: filesystem sandbox - root is read-only; only declared paths
+# are writable.  /dev/ is unaffected (CUDA needs /dev/nvidia*).
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/run/greenboost /var/log/greenboost /etc/greenboost /tmp /dev/shm
+
+[Install]
+WantedBy=multi-user.target

@@ -81,7 +81,7 @@ tier3_backend: lustre
 nvlink_pool: true
 
 ## Cluster Aggregate Capabilities
-# Informational only — GreenBoost operates per-node.
+# Informational only - GreenBoost operates per-node.
 
 cluster_total_gpus: 1600
 cluster_total_gpu_memory_tb: 51.2
@@ -106,4 +106,4 @@ Compute node in 20-rack V100 cluster. GreenBoost extends per-node T1 across
 NVLink (8 GPUs unified) and DDR4 pool (307 GB via DMA-BUF). Lustre parallel
 filesystem serves as T3 instead of local NVMe (higher sustained throughput for
 large model weights). cuMemAllocAsync disabled (V100 compute capability 7.0 <
-8.0 requirement). ECC DDR4 — THP disabled. Xeon has no P/E split — pcores_only=0.
+8.0 requirement). ECC DDR4 - THP disabled. Xeon has no P/E split - pcores_only=0.

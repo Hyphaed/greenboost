@@ -1,0 +1,74 @@
+#!/usr/bin/env bpftrace
+/*
+ * cuda_uprobe.bt - per-call latency histograms for the hottest CUDA driver
+ * entry points, attached to libcuda.so via uprobes.
+ *
+ * Audit reference: AUDIT_2026-05-13.md F-L6-01.
+ *
+ * Usage:
+ *   sudo bpftrace observability/ebpf/cuda_uprobe.bt
+ *
+ * Output: histograms keyed by symbol, in microseconds.  Ctrl-C to dump.
+ *
+ * Notes:
+ *   - Probes attach by name; libcuda.so.1 path is auto-resolved by libbpf via
+ *     the loaded process map.  If multiple processes load different libcuda
+ *     versions, bpftrace attaches to whatever is currently in the address
+ *     space; restart the script after an upgrade.
+ *   - This is intentionally CO-RE-free - bpftrace handles user-space probes
+ *     without needing vmlinux.h.  For production, port to libbpf + ringbuf.
+ *
+ * Symbol coverage:
+ *   - cuMemAlloc_v2       - local T1 VRAM allocation
+ *   - cuMemFree_v2        - symmetric free
+ *   - cuMemcpyHtoD_v2     - H2D bandwidth path
+ *   - cuMemcpyDtoH_v2     - D2H bandwidth path
+ *   - cuLaunchKernel      - kernel dispatch hot path
+ */
+
+BEGIN {
+    printf("greenboost cuda uprobe histograms - Ctrl-C to dump\n");
+}
+
+uprobe:libcuda.so.1:cuMemAlloc_v2       { @start[tid, "cuMemAlloc_v2"]    = nsecs; }
+uretprobe:libcuda.so.1:cuMemAlloc_v2 /@start[tid, "cuMemAlloc_v2"]/    {
+    @us["cuMemAlloc_v2"]    = hist((nsecs - @start[tid, "cuMemAlloc_v2"])    / 1000);
+    delete(@start[tid, "cuMemAlloc_v2"]);
+}
+
+uprobe:libcuda.so.1:cuMemFree_v2        { @start[tid, "cuMemFree_v2"]     = nsecs; }
+uretprobe:libcuda.so.1:cuMemFree_v2 /@start[tid, "cuMemFree_v2"]/      {
+    @us["cuMemFree_v2"]     = hist((nsecs - @start[tid, "cuMemFree_v2"])     / 1000);
+    delete(@start[tid, "cuMemFree_v2"]);
+}
+
+uprobe:libcuda.so.1:cuMemcpyHtoD_v2     { @start[tid, "cuMemcpyHtoD_v2"]  = nsecs; }
+uretprobe:libcuda.so.1:cuMemcpyHtoD_v2 /@start[tid, "cuMemcpyHtoD_v2"]/ {
+    @us["cuMemcpyHtoD_v2"]  = hist((nsecs - @start[tid, "cuMemcpyHtoD_v2"])  / 1000);
+    delete(@start[tid, "cuMemcpyHtoD_v2"]);
+}
+
+uprobe:libcuda.so.1:cuMemcpyDtoH_v2     { @start[tid, "cuMemcpyDtoH_v2"]  = nsecs; }
+uretprobe:libcuda.so.1:cuMemcpyDtoH_v2 /@start[tid, "cuMemcpyDtoH_v2"]/ {
+    @us["cuMemcpyDtoH_v2"]  = hist((nsecs - @start[tid, "cuMemcpyDtoH_v2"])  / 1000);
+    delete(@start[tid, "cuMemcpyDtoH_v2"]);
+}
+
+uprobe:libcuda.so.1:cuLaunchKernel      { @start[tid, "cuLaunchKernel"]   = nsecs; }
+uretprobe:libcuda.so.1:cuLaunchKernel /@start[tid, "cuLaunchKernel"]/   {
+    @us["cuLaunchKernel"]   = hist((nsecs - @start[tid, "cuLaunchKernel"])   / 1000);
+    delete(@start[tid, "cuLaunchKernel"]);
+}
+
+/* Flush orphaned @start entries every 60 s.  Threads that exit abnormally
+ * before their uretprobe fires leave entries permanently; bpftrace's default
+ * map limit is 4096 entries - once hit, new entries are silently dropped and
+ * histograms become incorrect.  Flushing periodically prevents overflow at
+ * the cost of losing in-flight measurements that straddle the boundary. */
+interval:s:60 {
+    clear(@start);
+}
+
+END {
+    clear(@start);
+}

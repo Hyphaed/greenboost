@@ -10,13 +10,13 @@
 #
 # INSTALLATION (managed by greenboost_setup.sh install-sys-configs):
 #
-#   Layer A — abstractions/base injection (automatic, global):
+#   Layer A - abstractions/base injection (automatic, global):
 #     The installer adds this include to /etc/apparmor.d/abstractions/base,
 #     so every profile that pulls in <abstractions/base> inherits these
 #     permissions automatically.  New packages installed by apt or snap are
 #     covered without re-running setup.
 #
-#   Layer B — dynamic profile scan (catches profiles not using base):
+#   Layer B - dynamic profile scan (catches profiles not using base):
 #     The installer also scans all profiles in /etc/apparmor.d/ and adds
 #     the include to any that don't already have it, excluding:
 #       - abstractions/, tunables/, disable/, force-complain/, local/, abi/
@@ -28,7 +28,7 @@
 #   #include <abstractions/greenboost-audit>
 
   # Allow the linker to open/mmap the audit stub (every preload process).
-  # /etc/ld.so.preload uses $LIB token — glibc expands it per ELF class:
+  # /etc/ld.so.preload uses $LIB token - glibc expands it per ELF class:
   #   64-bit → /usr/local/lib/x86_64-linux-gnu/libgreenboost_audit.so
   #   32-bit → /usr/local/lib/i386-linux-gnu/libgreenboost_audit.so
   # The bare /usr/local/lib/ path is kept for legacy install-sys-configs installs.
@@ -39,6 +39,7 @@
   r  /usr/local/lib/i386-linux-gnu/libgreenboost_audit.so,
   mr /usr/local/lib/i386-linux-gnu/libgreenboost_audit.so,
 
-  # Allow the full CUDA shim — only reached in CUDA processes
-  mr /usr/local/lib/libgreenboost_cuda.so,
-  mr /usr/local/lib/x86_64-linux-gnu/libgreenboost_cuda.so,
+  # The CUDA shim (libgreenboost_cuda.so) must NOT be granted mr here because
+  # this abstraction is injected into ALL confined processes via abstractions/base.
+  # Only CUDA processes (ollama, python3, etc.) need execute-mmap on the shim -
+  # add `mr /usr/local/lib/libgreenboost_cuda.so,` directly to those profiles.

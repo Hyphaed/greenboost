@@ -1,0 +1,3 @@
+# go.sum - run `go mod tidy` inside cmd/ to populate hashes.
+# Pinned module versions are declared in go.mod; this file is intentionally
+# empty until `go mod tidy` runs (requires network + Go toolchain).

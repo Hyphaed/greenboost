@@ -25,7 +25,7 @@ const (
 func main() {
 	app := &cli.App{
 		Name:    "greenboost-kubelet-plugin",
-		Usage:   "GreenBoost DRA Kubelet Plugin — extended VRAM via Dynamic Resource Allocation",
+		Usage:   "GreenBoost DRA Kubelet Plugin - extended VRAM via Dynamic Resource Allocation",
 		Version: version,
 		Flags: []cli.Flag{
 			&cli.StringFlag{
@@ -147,7 +147,7 @@ func parseFeatureGates(gates string) map[string]bool {
 		}
 		idx := strings.Index(pair, "=")
 		if idx < 0 {
-			// bare name with no value — treat as enabled
+			// bare name with no value - treat as enabled
 			features[pair] = true
 			continue
 		}

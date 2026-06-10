@@ -1,0 +1,1 @@
+blacklist  /etc/modprobe.d/99-greenboost-blacklist.conf

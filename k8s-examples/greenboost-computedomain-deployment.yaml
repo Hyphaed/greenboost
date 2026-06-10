@@ -7,7 +7,7 @@
 #   - InfiniBand scheduling topology annotations
 #
 # V100 note: IMEX channels are NOT supported (V100 has no NVSwitch).
-#   ComputeDomain passive mode is used — GreenBoost optimises per-node T2
+#   ComputeDomain passive mode is used - GreenBoost optimises per-node T2
 #   allocation; cross-node communication uses NCCL over InfiniBand.
 #
 # Per-node virtual VRAM: 256 GB T1 (NVLink) + 307 GB T2 DDR4 = 563 GB
@@ -29,7 +29,7 @@ spec:
         count: 1
 
 ---
-# 4-replica StatefulSet — one pod per node, spread across InfiniBand topology
+# 4-replica StatefulSet - one pod per node, spread across InfiniBand topology
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -49,7 +49,7 @@ spec:
       labels:
         app: llm-inference
       annotations:
-        # InfiniBand topology hint — place pods on nodes with direct IB links
+        # InfiniBand topology hint - place pods on nodes with direct IB links
         network.alpha.kubernetes.io/infiniband-topology: "required"
         greenboost.nvidia.com/kv-tier: "T1"
         greenboost.nvidia.com/compute-domain-mode: "passive"
@@ -93,7 +93,7 @@ spec:
             nvidia.com/gpu: "8"
 
         env:
-        # GreenBoost KV cache orchestration — all overflow treated as KV for LLM
+        # GreenBoost KV cache orchestration - all overflow treated as KV for LLM
         - name: GREENBOOST_ACTIVE
           value: "1"
         - name: GREENBOOST_DAEMON

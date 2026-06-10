@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GreenBoost Workstation Benchmark — gb_workstation_bench.py
+GreenBoost Workstation Benchmark - gb_workstation_bench.py
 Measures T1/T2/T3 memory bandwidth on live hardware.
 
 Usage:
@@ -17,6 +17,7 @@ falls back to PCIe estimates and nvidia-smi. Install CuPy with:
 import os
 import sys
 import json
+import struct
 import time
 import tempfile
 import argparse
@@ -26,7 +27,7 @@ import threading
 import itertools
 from pathlib import Path
 
-# ── Rich UI (optional — degrades to plain text) ───────────────────────────────
+# ── Rich UI (optional - degrades to plain text) ───────────────────────────────
 try:
     from rich.console import Console
     from rich.table import Table
@@ -247,8 +248,11 @@ def query_greenboost():
     if dev_path.exists():
         try:
             fd = open(dev_path, "rb+")
-            GB_IOCTL_GET_INFO = (2 << 8) | (ord('G')) | (144 << 16) | (0x80000000)
-            buf = bytearray(144)
+            # struct gb_info layout: 7×u64, 2×u32, 4×u64, 7×u32, 1×u64
+            _GB_INFO_FMT = "=7Q2I4Q7IQ"
+            _gb_info_size = struct.calcsize(_GB_INFO_FMT)
+            GB_IOCTL_GET_INFO = (2 << 30) | (_gb_info_size << 16) | (ord('G') << 8) | 2
+            buf = bytearray(_gb_info_size)
             fcntl.ioctl(fd, GB_IOCTL_GET_INFO, buf)
             info["ioctl_available"] = True
             fd.close()
@@ -274,7 +278,7 @@ def _nvme_bench_dir(mount):
     return str(p.parent) if p.is_file() else str(p)
 
 
-# Known theoretical peak GPU memory bandwidth (GB/s) — used when CuPy is absent
+# Known theoretical peak GPU memory bandwidth (GB/s) - used when CuPy is absent
 _GPU_BW_GBS = {
     # Blackwell (RTX 50xx)
     "5090": 1792, "5080": 960, "5070 Ti": 896, "5070": 336, "5060 Ti": 448,
@@ -356,7 +360,7 @@ def bench_t2():
         import cupy as cp
         import numpy as np
         result["cupy_available"] = True
-        SIZE = 1024 * 1024 * 1024  # 1 GB — exceeds any L3 cache
+        SIZE = 1024 * 1024 * 1024  # 1 GB - exceeds any L3 cache
         result["size_mb"] = SIZE // (1024 ** 2)
 
         # ── single-stream measurement ──────────────────────────────────────
@@ -435,7 +439,7 @@ def bench_t2():
 def bench_t3():
     """
     NVMe sequential read/write and random 4K read.
-    Uses buffered I/O + fsync (O_DIRECT dropped — requires aligned buffers
+    Uses buffered I/O + fsync (O_DIRECT dropped - requires aligned buffers
     and is not universally supported; fsync gives accurate seq-write timing).
     """
     result = {
@@ -454,6 +458,7 @@ def bench_t3():
     RAND_OPS  = 512
     buf_write = os.urandom(SEQ_SIZE)
 
+    fname = None
     try:
         with tempfile.NamedTemporaryFile(dir=bench_dir, delete=False, suffix=".gb_bench") as tf:
             fname = tf.name
@@ -502,10 +507,11 @@ def bench_t3():
 
     except Exception as e:
         result["method"] = f"error:{e}"
-        try:
-            os.unlink(fname)
-        except Exception:
-            pass
+        if fname is not None:
+            try:
+                os.unlink(fname)
+            except Exception:
+                pass
 
     return result
 
@@ -516,8 +522,8 @@ def _bw_cell(bw_val, method, unit="GB/s"):
     """Format a bandwidth cell for the results table."""
     if bw_val is None:
         if "not_installed" in method:
-            return f"[dim {GRAY}]— CuPy not installed[/]", method
-        return f"[dim {GRAY}]— {method}[/]", method
+            return f"[dim {GRAY}]- CuPy not installed[/]", method
+        return f"[dim {GRAY}]- {method}[/]", method
     return f"[bold {LIME}]{bw_val} {unit}[/]", method
 
 
@@ -549,7 +555,7 @@ def _recommendations(results):
     if not t1.get("cupy_available") or not t2.get("cupy_available"):
         pkg = _cupy_install_hint()
         recs.append(("⚠", AMBER,
-            f"CuPy not installed — T1/T2 readings are estimates only.\n"
+            f"CuPy not installed - T1/T2 readings are estimates only.\n"
             f"    Install for accurate GPU + PCIe measurements:\n"
             f"    [bold {CYAN}]pip install {pkg}[/]  (inside the GreenBoost venv)"))
 
@@ -558,7 +564,7 @@ def _recommendations(results):
         free_mb  = gb.get("free_ram_mb", 0) or 0
         safe_mb  = gb.get("safety_reserve_mb", 0) or 0
         recs.append(("⚠", AMBER,
-            f"T2 pool unavailable — RAM too low for GreenBoost overflow.\n"
+            f"T2 pool unavailable - RAM too low for GreenBoost overflow.\n"
             f"    Free: {free_mb} MB  |  Safety reserve: {safe_mb} MB\n"
             f"    Fix: close other apps, or reduce safety_reserve_gb when loading the module."))
 
@@ -571,7 +577,7 @@ def _recommendations(results):
     # T3 slow
     if t3.get("seq_read_gbs") is not None and t3["seq_read_gbs"] < 1.0:
         recs.append(("⚠", AMBER,
-            "NVMe sequential read < 1 GB/s — check NVMe scheduler and swap file fragmentation.\n"
+            "NVMe sequential read < 1 GB/s - check NVMe scheduler and swap file fragmentation.\n"
             f"    Run: [bold {CYAN}]sudo ./greenboost_setup.sh tune[/]"))
 
     # Healthy T2 DDR bandwidth (use sustained if available, single-stream otherwise)
@@ -775,14 +781,14 @@ def print_plain_report(results):
     if t1["bandwidth_gbs"]:
         t1_bw = f"{t1['bandwidth_gbs']} GB/s  ({t1['method']})"
     else:
-        t1_bw = f"— {t1['method']}"
+        t1_bw = f"- {t1['method']}"
     print(f"  │  T1    GPU VRAM       {str(vram_gb)+' GB':<12} {t1_bw:<28}│")
 
     ram_gb = ram["total_mb"] // 1024
     if t2["bandwidth_gbs"]:
         t2_bw = f"{t2['bandwidth_gbs']} GB/s  ({t2['method']})"
     else:
-        t2_bw = f"— {t2['method']}"
+        t2_bw = f"- {t2['method']}"
     print(f"  │  T2    DDR pool       {str(ram_gb)+' GB':<12} {t2_bw:<28}│")
     sus = t2.get("sustained_bandwidth_gbs")
     if sus:
@@ -876,9 +882,6 @@ def main():
         else:
             print_plain_report(results)
 
-    if args.output and not args.json:
-        js = json.dumps(results, indent=2)
-        Path(args.output).write_text(js)
 
 
 if __name__ == "__main__":

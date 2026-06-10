@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// GreenBoost Metrics Exporter v3.0
+// GreenBoost Metrics Exporter v3.0 (Kubernetes / DRA sidecar).
 // Exposes GreenBoost tiered memory metrics in Prometheus format.
 // Reads GB_IOCTL_GET_POOL_INFO_V3 (via sysfs text fallback) and serves /metrics.
+// Canonical metric reference: observability/METRICS.md
+// NOTE: memory metrics use bytes (not MiB) - see METRICS.md §Unit discrepancy.
 
 package main
 
@@ -11,8 +13,10 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -77,11 +81,11 @@ var (
 	})
 	allocationsTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "greenboost_allocations_total",
-		Help: "Total DMA-BUF allocations (approximate — tracks active_buffers increases)",
+		Help: "Total DMA-BUF allocations (approximate - tracks active_buffers increases)",
 	})
 	evictionsTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "greenboost_evictions_total",
-		Help: "Total T3 eviction events (approximate — tracks watchdog pressure transitions)",
+		Help: "Total T3 eviction events (approximate - tracks watchdog pressure transitions)",
 	})
 )
 
@@ -89,6 +93,7 @@ var (
 	sysfsBase      string
 	prevActiveBufs float64
 	prevPressure   float64
+	prevMu         sync.Mutex
 )
 
 func init() {
@@ -162,16 +167,49 @@ func runMetricsCollector(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// collectMetricsOnce reads all sysfs attributes and updates Prometheus gauges.
-func collectMetricsOnce() {
-	poolText, err := readSysfsAttr(sysfsBase, "pool_info")
-	if err != nil {
-		klog.V(3).InfoS("Cannot read pool_info", "error", err)
-		return
-	}
-	updateFromPoolInfo(poolText)
+// Compiled once - pool_brief format:
+// T1:12GB T2:1024/65536GB(1%) T3:0/0GB PRESSURE:ok KV_RSV:2048MB KV_T2:512MB
+var (
+	reT1     = regexp.MustCompile(`T1:(\d+)GB`)
+	reT2Used = regexp.MustCompile(`T2:(\d+)/`)
+	reT2Tot  = regexp.MustCompile(`T2:\d+/(\d+)GB`)
+	reT3Used = regexp.MustCompile(`T3:(\d+)/`)
+	reT3Tot  = regexp.MustCompile(`T3:\d+/(\d+)GB`)
+	rePres   = regexp.MustCompile(`PRESSURE:(\w+)`)
+)
 
-	// nvlink_ready — BUG-014 fix: read "nvlink_ready", NOT "compute_domain_active"
+// collectMetricsOnce reads pool_brief + individual sysfs attributes.
+// pool_info no longer exists - it was replaced by pool_brief (compact one-liner)
+// and per-attribute files (kv_reserve_mb, active_buffers).
+func collectMetricsOnce() {
+	// pool_brief: T1:12GB T2:1024/65536GB(1%) T3:0/0GB PRESSURE:ok KV_RSV:2048MB KV_T2:512MB
+	if brief, err := readSysfsAttr(sysfsBase, "pool_brief"); err == nil {
+		updateFromPoolBrief(brief)
+	} else {
+		klog.V(3).InfoS("Cannot read pool_brief", "error", err)
+	}
+
+	// kv_reserve_mb - dedicated single-integer attribute
+	if val, err := readSysfsAttr(sysfsBase, "kv_reserve_mb"); err == nil {
+		if n, err2 := strconv.ParseFloat(strings.TrimSpace(val), 64); err2 == nil {
+			kvReserveBytes.Set(n * 1024 * 1024)
+		}
+	}
+
+	// active_buffers - single integer
+	if val, err := readSysfsAttr(sysfsBase, "active_buffers"); err == nil {
+		if n, err2 := strconv.ParseFloat(strings.TrimSpace(val), 64); err2 == nil {
+			prevMu.Lock()
+			if n > prevActiveBufs {
+				allocationsTotal.Add(n - prevActiveBufs)
+			}
+			prevActiveBufs = n
+			prevMu.Unlock()
+			activeBuffers.Set(n)
+		}
+	}
+
+	// nvlink_ready
 	if val, err := readSysfsAttr(sysfsBase, "nvlink_ready"); err == nil {
 		if strings.TrimSpace(val) == "1" {
 			nvlinkReady.Set(1)
@@ -183,92 +221,77 @@ func collectMetricsOnce() {
 	klog.V(5).InfoS("Metrics collected")
 }
 
-// updateFromPoolInfo parses pool_info sysfs text and updates gauges.
-func updateFromPoolInfo(text string) {
-	var (
-		t1MB, t2TotalMB, t2UsedMB, t3TotalMB, t3UsedMB float64
-		activeBufs, kvResMB, pressure                   float64
-	)
+// updateFromPoolBrief parses the pool_brief compact sysfs line.
+func updateFromPoolBrief(brief string) {
+	const GB = 1024.0 * 1024.0 * 1024.0
+	const MB = 1024.0 * 1024.0
 
-	for _, line := range strings.Split(text, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "=") || strings.HasPrefix(line, "#") {
-			continue
-		}
-		kv := strings.SplitN(line, ":", 2)
-		if len(kv) != 2 {
-			continue
-		}
-		key := strings.TrimSpace(kv[0])
-		fields := strings.Fields(strings.TrimSpace(kv[1]))
-		if len(fields) == 0 {
-			continue
-		}
-		num, err := strconv.ParseFloat(fields[0], 64)
-		if err != nil {
-			continue
-		}
-
-		switch {
-		case strings.Contains(key, "physical_vram_gb") || strings.Contains(key, "vram_physical"):
-			t1MB = num * 1024
-		case key == "max_pool_mb":
-			t2TotalMB = num
-		case key == "allocated_mb" || key == "pool_allocated_mb" || strings.Contains(key, "t2_allocated"):
-			t2UsedMB = num
-		case strings.Contains(key, "nvme") && strings.Contains(key, "total"):
-			t3TotalMB = num
-		case strings.Contains(key, "nvme") && strings.Contains(key, "alloc"):
-			t3UsedMB = num
-		case key == "active_buffers":
-			activeBufs = num
-		case key == "kv_reserve_mb":
-			kvResMB = num
-		case key == "t2_pressure" || key == "watchdog_pressure":
-			pressure = num
+	if m := reT1.FindStringSubmatch(brief); m != nil {
+		if n, err := strconv.ParseFloat(m[1], 64); err == nil {
+			t1TotalBytes.Set(n * GB)
 		}
 	}
-
-	t1TotalBytes.Set(t1MB * 1024 * 1024)
-	t2TotalBytes.Set(t2TotalMB * 1024 * 1024)
-	t2UsedBytes.Set(t2UsedMB * 1024 * 1024)
-	t3TotalBytes.Set(t3TotalMB * 1024 * 1024)
-	t3UsedBytes.Set(t3UsedMB * 1024 * 1024)
-	activeBuffers.Set(activeBufs)
-	kvReserveBytes.Set(kvResMB * 1024 * 1024)
-	watchdogPressure.Set(pressure)
-
-	// Approximate counters from deltas
-	if activeBufs > prevActiveBufs {
-		allocationsTotal.Add(activeBufs - prevActiveBufs)
+	var t2UsedGB, t2TotGB float64
+	if m := reT2Used.FindStringSubmatch(brief); m != nil {
+		t2UsedGB, _ = strconv.ParseFloat(m[1], 64)
 	}
-	prevActiveBufs = activeBufs
-
-	if pressure > prevPressure && pressure >= 2 {
-		evictionsTotal.Add(1)
+	if m := reT2Tot.FindStringSubmatch(brief); m != nil {
+		t2TotGB, _ = strconv.ParseFloat(m[1], 64)
 	}
-	prevPressure = pressure
+	t2UsedBytes.Set(t2UsedGB * GB)
+	t2TotalBytes.Set(t2TotGB * GB)
 
-	// Virtual total: T1 NVLink (if set) + T2, else T1 physical + T2
-	nvlText, _ := readSysfsAttr(sysfsBase, "nvlink_ready")
-	if strings.TrimSpace(nvlText) == "1" {
-		// NVLink pool active — report aggregated T1 + T2
-		// t1NVLinkBytes is set by a future IOCTL; for now mirror physical
-		t1NVLinkBytes.Set(t1MB * 1024 * 1024)
-	} else {
-		t1NVLinkBytes.Set(0)
+	var t3UsedGB, t3TotGB float64
+	if m := reT3Used.FindStringSubmatch(brief); m != nil {
+		t3UsedGB, _ = strconv.ParseFloat(m[1], 64)
 	}
-	virtualTotalBytes.Set((t1MB + t2TotalMB) * 1024 * 1024)
+	if m := reT3Tot.FindStringSubmatch(brief); m != nil {
+		t3TotGB, _ = strconv.ParseFloat(m[1], 64)
+	}
+	t3UsedBytes.Set(t3UsedGB * GB)
+	t3TotalBytes.Set(t3TotGB * GB)
+
+	if m := rePres.FindStringSubmatch(brief); m != nil {
+		pmap := map[string]float64{"ok": 0, "warn": 1, "CRITICAL": 2}
+		pressure := pmap[m[1]]
+		watchdogPressure.Set(pressure)
+		prevMu.Lock()
+		if pressure > prevPressure {
+			evictionsTotal.Add(pressure - prevPressure)
+		}
+		prevPressure = pressure
+		prevMu.Unlock()
+	}
+
+	// virtualTotalBytes = T1 + T2 (pool_brief doesn't report NVLink separately)
+	t1GB := float64(0)
+	if m := reT1.FindStringSubmatch(brief); m != nil {
+		t1GB, _ = strconv.ParseFloat(m[1], 64)
+	}
+	virtualTotalBytes.Set((t1GB + t2TotGB) * GB)
+	t1NVLinkBytes.Set(0) // populated by future NVLink IOCTL path
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	if _, err := readSysfsAttr(sysfsBase, "pool_info"); err != nil {
+	type sysfsResult struct{ err error }
+	ch := make(chan sysfsResult, 1)
+	go func() {
+		_, err := readSysfsAttr(sysfsBase, "pool_brief")
+		ch <- sysfsResult{err}
+	}()
+	select {
+	case res := <-ch:
+		if res.err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprintf(w, "GreenBoost sysfs not readable: %v", res.err)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "OK")
+	case <-time.After(2 * time.Second):
 		w.WriteHeader(http.StatusServiceUnavailable)
-		fmt.Fprintf(w, "GreenBoost sysfs not readable: %v", err)
-		return
+		fmt.Fprint(w, "GreenBoost sysfs timeout")
 	}
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, "OK")
 }
 
 func readSysfsAttr(base, attr string) (string, error) {

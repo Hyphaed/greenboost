@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GreenBoost v2.8.2 — Setup & installation script (Ubuntu / Debian and derivatives)
+# GreenBoost v2.9 - Setup & installation script (Ubuntu / Debian and derivatives)
 # Supports: Ubuntu, Debian, Pop!_OS, Mint, and other apt-based distros.
 # Delegates to greenboost_setup_rocky.sh on RHEL/Fedora and
 # greenboost_setup_arch.sh on Arch-based systems.
@@ -8,49 +8,99 @@
 # No hardware-specific values are hard-coded.
 #
 # USAGE:
-#   (no args)                                    — interactive wizard
-#   sudo ./greenboost_setup.sh setup             — full install (prompts for mode)
-#   sudo ./greenboost_setup.sh module-only       — kernel module only (safe on any machine)
-#   sudo ./greenboost_setup.sh install           — build + install module + shim
-#   sudo ./greenboost_setup.sh uninstall         — remove module + all config
-#   sudo ./greenboost_setup.sh load              — insmod with default params
-#   sudo ./greenboost_setup.sh unload            — rmmod
-#   sudo ./greenboost_setup.sh tune              — runtime tuning (governor, NVMe, sysctl)
-#   sudo ./greenboost_setup.sh tune-all          — run all tune-* commands
-#        ./greenboost_setup.sh status            — show pool info + system state
-#        ./greenboost_setup.sh benchmark         — cuda memory pool bandwidth benchmark (T1/T2/T3)
-#        ./greenboost_setup.sh help              — show common commands
-#        ./greenboost_setup.sh help --all        — show all commands + env vars
+#   (no args)                                    - interactive wizard
+#   sudo ./greenboost_setup.sh setup             - full install (prompts for mode)
+#   sudo ./greenboost_setup.sh module-only       - kernel module only (safe on any machine)
+#   sudo ./greenboost_setup.sh install           - build + install module + shim
+#   sudo ./greenboost_setup.sh uninstall         - remove module + all config
+#   sudo ./greenboost_setup.sh load              - insmod with default params
+#   sudo ./greenboost_setup.sh unload            - rmmod
+#   sudo ./greenboost_setup.sh tune              - runtime tuning (governor, NVMe, sysctl)
+#   sudo ./greenboost_setup.sh tune-all          - run all tune-* commands
+#        ./greenboost_setup.sh status            - show pool info + system state
+#        ./greenboost_setup.sh benchmark         - cuda memory pool bandwidth benchmark (T1/T2/T3)
+#        ./greenboost_setup.sh help              - show common commands
+#        ./greenboost_setup.sh help --all        - show all commands + env vars
 #
 # GLOBAL FLAGS (before or after the command):
 #   --skip-update-check  Skip GitLab version check (offline workstations)
 #
-# ENVIRONMENT (for load command — all values auto-detected at runtime):
+# ENVIRONMENT (for load command - all values auto-detected at runtime):
 #   GPU_PHYS_GB    physical VRAM in GB       (detected via nvidia-smi)
 #   VIRT_VRAM_GB   system RAM pool size in GB (80% of total RAM)
 #   RESERVE_GB     minimum free system RAM to always maintain
 #   NVME_SWAP_GB   total NVMe swap capacity  (auto-detected)
 #   NVME_POOL_GB   GreenBoost soft cap on T3 allocations
 
+set -euo pipefail
+
 DRIVER_NAME="greenboost"
 SHIM_LIB="libgreenboost_cuda.so"
 AUDIT_LIB="libgreenboost_audit.so"
 AUDIT_LIB32="libgreenboost_audit32.so"
-VULKAN_LAYER_LIB="libVkLayer_greenboost.so"
-VULKAN_LAYER_MANIFEST="VkLayer_greenboost.json"
-VULKAN_IMPLICIT_LAYER_DIR="/etc/vulkan/implicit_layer.d"
 SHIM_DEST="/usr/local/lib"
+
+# ── Preload sanity - pure bash, zero external commands ───────────────────────
+# Remove stale /etc/ld.so.preload entries whose .so files no longer exist.
+# Must run before the first subprocess (MODULE_DIR assignment below spawns
+# dirname/pwd).  Prevents "cannot be preloaded" spam in every forked process
+# throughout this session (e.g. during detect_hardware, _gb_backup_create).
+# Note: install/full-install handlers additionally strip the preload entry
+# proactively at the top of their function to avoid LD_AUDIT mode errors
+# from glibc 2.38+ before the new audit lib is in place.
+if [[ $EUID -eq 0 && -f /etc/ld.so.preload ]]; then
+    _gb_ps_lines=() _gb_ps_changed=0
+    while IFS= read -r _gb_ps_line || [[ -n "$_gb_ps_line" ]]; do
+        if [[ "$_gb_ps_line" == *libgreenboost* && ! -f "$_gb_ps_line" ]]; then
+            _gb_ps_changed=1
+        else
+            _gb_ps_lines+=("$_gb_ps_line")
+        fi
+    done < /etc/ld.so.preload
+    if (( _gb_ps_changed )); then
+        if (( ${#_gb_ps_lines[@]} > 0 )); then
+            printf '%s\n' "${_gb_ps_lines[@]}" > /etc/ld.so.preload
+        else
+            > /etc/ld.so.preload
+        fi
+    fi
+    unset _gb_ps_lines _gb_ps_changed _gb_ps_line
+fi
+
 MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# PR-GG: locate the shared lib/ directory.  Look in the source tree first
+# (for `./greenboost_setup.sh` from a development checkout), then the
+# system install path that `make install` populates.  The lib/ scripts
+# contain color palette definitions, the canonical _gb_run_tui_loop
+# helper, and SSH-option helpers - small, well-bounded modules.  If
+# none are found, fall back to the inline definitions further down so
+# upgrading from an old install that lacks lib/ continues to work.
+GB_LIB_DIR=""
+for _candidate in \
+        "$MODULE_DIR/lib" \
+        "/usr/local/share/greenboost/lib" \
+        "/usr/share/greenboost/lib"; do
+    if [[ -d "$_candidate" ]]; then
+        GB_LIB_DIR="$_candidate"; break
+    fi
+done
+if [[ -n "$GB_LIB_DIR" ]]; then
+    # shellcheck disable=SC1090,SC1091
+    for _libf in gb_colors.sh gb_tui.sh gb_ssh.sh; do
+        [[ -r "$GB_LIB_DIR/$_libf" ]] && source "$GB_LIB_DIR/$_libf"
+    done
+fi
 
 GB_PROFILES_DIR="/etc/greenboost/profiles"
 GB_ACTIVE_PROFILE_LINK="/etc/greenboost/active_profile.md"
 
-# Dynamic swapfile — GreenBoost provisions this automatically when no adequate swap exists
+# Dynamic swapfile - GreenBoost provisions this automatically when no adequate swap exists
 GB_SWAP_FILE="/var/lib/greenboost/swapfile"
 GB_SWAP_MIN_GB=8      # minimum existing swap to consider adequate (skip provisioning)
 GB_SWAP_MAX_GB=120    # cap for auto-provisioned swapfile
 
-GB_VERSION="2.8.2"
+GB_VERSION="2.9"
 GB_REPO_API="https://gitlab.com/api/v4/projects/IsolatedOctopi%2Fgreenboost/repository/tags"
 
 # Colours
@@ -64,34 +114,94 @@ info()  { echo -e "${GRN}[GreenBoost]${NC} $*"; }
 warn()  { echo -e "${YLW}[GreenBoost] WARN:${NC} $*"; }
 die()   { echo -e "${RED}[GreenBoost] ERROR:${NC} $*" >&2; exit 1; }
 
+# ── Distro / kernel helpers ────────────────────────────────────────────────────
+
+# Semantic kernel version comparison - true when running kernel ≥ want_major.want_minor
+_kernel_at_least() {
+    local want_major=$1 want_minor=$2
+    local cur cur_major cur_minor
+    cur=$(uname -r | grep -oP '^\d+\.\d+' || echo "0.0")
+    cur_major=${cur%%.*}
+    cur_minor=${cur##*.}
+    [[ $cur_major -gt $want_major ]] || \
+      { [[ $cur_major -eq $want_major ]] && [[ $cur_minor -ge $want_minor ]]; }
+}
+
+# Return distro family: debian | fedora | arch | suse | alpine | void | unknown
+_detect_distro_family() {
+    local id id_like
+    id=$(. /etc/os-release 2>/dev/null && echo "${ID:-}" | tr '[:upper:]' '[:lower:]')
+    id_like=$(. /etc/os-release 2>/dev/null && echo "${ID_LIKE:-}" | tr '[:upper:]' '[:lower:]')
+    case "$id" in
+        ubuntu|debian|kali|linuxmint|pop|raspbian) echo "debian"  ; return ;;
+        fedora|rhel|centos|rocky|almalinux|ol)     echo "fedora"  ; return ;;
+        arch|manjaro|endeavouros|cachyos|garuda)   echo "arch"    ; return ;;
+        opensuse*|sles)                             echo "suse"    ; return ;;
+        alpine)                                     echo "alpine"  ; return ;;
+        void)                                       echo "void"    ; return ;;
+    esac
+    # Fall back to ID_LIKE for derivatives
+    case "$id_like" in
+        *ubuntu*|*debian*)  echo "debian"  ; return ;;
+        *rhel*|*fedora*)    echo "fedora"  ; return ;;
+        *arch*)             echo "arch"    ; return ;;
+        *suse*)             echo "suse"    ; return ;;
+    esac
+    echo "unknown"
+}
+
+# Idempotent kernel header install - uses the appropriate package manager
+_ensure_kernel_headers() {
+    local kver family
+    kver=$(uname -r)
+    family=$(_detect_distro_family)
+    case "$family" in
+        debian) sudo apt-get install -y "linux-headers-${kver}" ;;
+        fedora) sudo dnf install -y "kernel-devel-${kver}" 2>/dev/null || \
+                sudo yum install -y "kernel-devel-${kver}" ;;
+        arch)   local pkg="linux-headers"
+                uname -r | grep -qi lts && pkg="linux-lts-headers"
+                sudo pacman -S --needed --noconfirm "$pkg" ;;
+        suse)   sudo zypper install -y "kernel-default-devel=${kver}" ;;
+        alpine) sudo apk add linux-headers ;;
+        void)   sudo xbps-install -y "kernel-headers-${kver}" ;;
+        *)      warn "Unknown distro family; cannot auto-install kernel headers for ${kver}" ;;
+    esac
+}
+
 # ---- Brand palette + UI primitives -------------------------------------
 # Matches synapse_cli color scheme (#6C71C4 violet, #E6FF3C lime, etc.)
 # All functions degrade to 16-color ANSI when COLORTERM is unset/8bit.
 
-_gb_truecolor() { [[ "${COLORTERM:-}" =~ ^(truecolor|24bit)$ ]]; }
-
-if _gb_truecolor; then
-    C_VIOLET=$'\033[38;2;108;113;196m'    # #6C71C4 — brand accent
-    C_LIME=$'\033[38;2;230;255;60m'       # #E6FF3C — success / active
-    C_GRAY=$'\033[38;2;208;207;204m'      # #D0CFCC — body text
-    C_CYAN=$'\033[38;2;48;200;255m'       # #30C8FF — section headers
-    C_AMBER=$'\033[38;2;255;191;0m'       # #FFBF00 — prompt ❯ / warnings
-    C_PURPLE=$'\033[38;2;167;139;250m'    # #a78bfa — wizard headers
-    C_RED=$'\033[38;2;255;92;50m'         # #FF5C32 — error / critical
-    C_WHITE=$'\033[38;2;255;255;255m'     # #FFFFFF — code block text
-else
-    C_VIOLET=$'\033[0;34m'
-    C_LIME=$'\033[0;32m'
-    C_GRAY=$'\033[0;37m'
-    C_CYAN=$'\033[0;36m'
-    C_AMBER=$'\033[1;33m'
-    C_PURPLE=$'\033[0;35m'
-    C_RED=$'\033[0;31m'
-    C_WHITE=$'\033[1;37m'
+# PR-GG: inline color fallback.  If lib/gb_colors.sh was already sourced
+# above, the C_* vars are already set and this whole block is a no-op
+# (the `-z "${C_RESET:-}"` guard).  Kept as a fallback so old installs
+# that lack /usr/local/share/greenboost/lib/ still work.
+if [[ -z "${C_RESET:-}" ]]; then
+    _gb_truecolor() { [[ "${COLORTERM:-}" =~ ^(truecolor|24bit)$ ]]; }
+    if _gb_truecolor; then
+        C_VIOLET=$'\033[38;2;108;113;196m'
+        C_LIME=$'\033[38;2;230;255;60m'
+        C_GRAY=$'\033[38;2;208;207;204m'
+        C_CYAN=$'\033[38;2;48;200;255m'
+        C_AMBER=$'\033[38;2;255;191;0m'
+        C_PURPLE=$'\033[38;2;167;139;250m'
+        C_RED=$'\033[38;2;255;92;50m'
+        C_WHITE=$'\033[38;2;255;255;255m'
+    else
+        C_VIOLET=$'\033[0;34m'
+        C_LIME=$'\033[0;32m'
+        C_GRAY=$'\033[0;37m'
+        C_CYAN=$'\033[0;36m'
+        C_AMBER=$'\033[1;33m'
+        C_PURPLE=$'\033[0;35m'
+        C_RED=$'\033[0;31m'
+        C_WHITE=$'\033[1;37m'
+    fi
+    C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
+    C_RESET=$'\033[0m'
 fi
-C_BOLD=$'\033[1m'
-C_DIM=$'\033[2m'
-C_RESET=$'\033[0m'
 
 GB_SPIN_FRAMES=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
 
@@ -99,10 +209,24 @@ GB_SPIN_FRAMES=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
 GB_STATUS_LOG="${GB_STATUS_LOG:-$HOME/.local/share/greenboost/status.log}"
 GB_INFER_TEST_LOG="${GB_INFER_TEST_LOG:-$HOME/.local/share/greenboost/inference-test-latest.log}"
 
-# gb_header — branded box header
+# gb_header - branded box header with build timestamp
 gb_header() {
+    local _bi_date="" _bi_git=""
+    for _bi in "${MODULE_DIR}/build_info" ./build_info /etc/greenboost/build_info; do
+        if [[ -f "$_bi" ]]; then
+            local _ep _gh
+            _ep=$(grep '^BUILD_EPOCH=' "$_bi" 2>/dev/null | cut -d= -f2-)
+            _gh=$(grep '^BUILD_GIT='   "$_bi" 2>/dev/null | cut -d= -f2-)
+            [[ -n "$_ep" ]] && _bi_date=$(date -d "@${_ep}" '+%Y-%m-%d %H:%M' 2>/dev/null || true)
+            [[ -n "$_gh" ]] && _bi_git="$_gh"
+            break
+        fi
+    done
+    local _build_str=""
+    [[ -n "$_bi_date" ]] && _build_str="  built ${_bi_date}"
+    [[ -n "$_bi_git"  ]] && _build_str+=" (${_bi_git})"
     local cols; cols=$(tput cols 2>/dev/null || echo 64)
-    local title=" GreenBoost v${GB_VERSION} — CUDA Memory Orchestrator for NVidia GPUs"
+    local title=" GreenBoost v${GB_VERSION}${_build_str} - CUDA Memory Orchestrator for NVidia GPUs"
     echo -e ""
     echo -e "${C_VIOLET}${C_BOLD}  ╔$(printf '═%.0s' $(seq 1 $((cols - 4))))╗${C_RESET}"
     echo -e "${C_VIOLET}${C_BOLD}  ║${C_RESET} ${C_GRAY}${C_BOLD}${title}$(printf ' %.0s' $(seq 1 $((cols - 4 - ${#title} - 1))))${C_VIOLET}${C_BOLD}║${C_RESET}"
@@ -110,7 +234,7 @@ gb_header() {
     echo -e ""
 }
 
-# gb_separator — full-width thin line
+# gb_separator - full-width thin line
 gb_separator() {
     local cols; cols=$(tput cols 2>/dev/null || echo 64)
     echo -e "${C_DIM}$(printf '─%.0s' $(seq 1 $((cols - 2))))${C_RESET}"
@@ -122,12 +246,13 @@ gb_step() {
     echo -e "${C_CYAN}${C_BOLD}  [$1/$2]${C_RESET} ${C_GRAY}${C_BOLD}$3${C_RESET}"
 }
 
-# gb_ok / gb_fail / gb_warn — status messages
-gb_ok()   { echo -e "  ${C_LIME}✓${C_RESET}  ${C_GRAY}$*${C_RESET}"; }
-gb_fail() { echo -e "  ${C_RED}✗${C_RESET}  $*"; }
+# gb_ok / gb_fail / gb_warn - status messages
+gb_ok()      { echo -e "  ${C_LIME}✓${C_RESET}  ${C_GRAY}$*${C_RESET}"; }
+gb_fail()    { echo -e "  ${C_RED}✗${C_RESET}  $*"; }
+gb_warn()    { echo -e "  ${C_AMBER}⚠${C_RESET}  ${C_AMBER}$*${C_RESET}"; }
 gb_warn_ui() { echo -e "  ${C_AMBER}⚠${C_RESET}  $*"; }
 
-# gb_spin PID "message" — braille spinner until PID exits
+# gb_spin PID "message" - braille spinner until PID exits
 gb_spin() {
     local pid=$1 msg="$2" i=0 start_time
     start_time=$(date +%s)
@@ -147,11 +272,11 @@ gb_spin() {
     printf "\r  ${C_LIME}✓${C_RESET}  ${C_GRAY}%s${C_RESET}                             \n" "$msg"
 }
 
-# gb_info — replaces info() with brand style (keeps [GreenBoost] prefix for log compat)
+# gb_info - replaces info() with brand style (keeps [GreenBoost] prefix for log compat)
 gb_info() { echo -e "  ${C_VIOLET}◈${C_RESET}  ${C_GRAY}$*${C_RESET}"; }
 
-# ---- Panel primitives (used by cmd_status) ----------------------------
-# gb_panel_top "Title" — violet box top border with embedded cyan title
+# ---- Panel primitives (used by cmd_vitals) ----------------------------
+# gb_panel_top "Title" - violet box top border with embedded cyan title
 gb_panel_top() {
     local title="$1"
     local cols; cols=$(tput cols 2>/dev/null || echo 80)
@@ -164,7 +289,7 @@ gb_panel_top() {
     printf '%b\n' "╗${C_RESET}"
 }
 
-# gb_panel_bottom — violet box bottom border
+# gb_panel_bottom - violet box bottom border
 gb_panel_bottom() {
     local cols; cols=$(tput cols 2>/dev/null || echo 80)
     local inner=$(( cols - 4 ))
@@ -173,7 +298,7 @@ gb_panel_bottom() {
     printf '%b\n' "╝${C_RESET}"
 }
 
-# gb_panel_row "content" — bordered content row, ANSI-aware padding
+# gb_panel_row "content" - bordered content row, ANSI-aware padding
 gb_panel_row() {
     local cols; cols=$(tput cols 2>/dev/null || echo 80)
     local inner=$(( cols - 6 ))   # usable chars between ║ + space and space + ║
@@ -189,10 +314,10 @@ gb_panel_row() {
     printf '%b\n' " ${C_VIOLET}${C_BOLD}║${C_RESET}"
 }
 
-# gb_panel_empty — empty bordered spacer row
+# gb_panel_empty - empty bordered spacer row
 gb_panel_empty() { gb_panel_row ""; }
 
-# gb_bar pct fill_color empty_color width — inline progress bar (no newline)
+# gb_bar pct fill_color empty_color width - inline progress bar (no newline)
 gb_bar() {
     local pct=$1 fill_c="$2" empty_c="$3" width=${4:-30}
     local filled=$(( pct * width / 100 ))
@@ -205,7 +330,7 @@ gb_bar() {
     printf '%b' "${C_RESET}"
 }
 
-# gb_tier_color pct — echo ANSI color for a utilization percentage
+# gb_tier_color pct - echo ANSI color for a utilization percentage
 gb_tier_color() {
     local pct=$1
     if   (( pct >= 90 )); then printf '%b' "${C_RED}"
@@ -214,14 +339,14 @@ gb_tier_color() {
     fi
 }
 
-# gb_section "Title" — purple bold section header + separator (mirrors unlocker ui_section)
+# gb_section "Title" - purple bold section header + separator (mirrors unlocker ui_section)
 gb_section() {
     echo -e ""
     echo -e "  ${C_PURPLE}${C_BOLD}$1${C_RESET}"
     gb_separator
 }
 
-# gb_col_width — usable character width of each column in a 2-col layout
+# gb_col_width - usable character width of each column in a 2-col layout
 gb_col_width() {
     local cols; cols=$(tput cols 2>/dev/null || echo 80)
     local w=$(( (cols - 7) / 2 ))
@@ -229,12 +354,12 @@ gb_col_width() {
     echo "$w"
 }
 
-# gb_strip_ansi — remove ANSI color/SGR codes from stdin (for visible-width counting)
+# gb_strip_ansi - remove ANSI color/SGR codes from stdin (for visible-width counting)
 gb_strip_ansi() {
     sed 's/\x1b\[[0-9;]*[mK]//g'
 }
 
-# _trunc "string" max_len — truncates string to max_len chars, adding ".." if cut
+# _trunc "string" max_len - truncates string to max_len chars, adding ".." if cut
 _trunc() { local s="$1" n="$2"; (( ${#s} > n )) && s="${s:0:$((n-2))}.."; echo "$s"; }
 
 # gb_render_2col left_arr right_arr
@@ -253,7 +378,10 @@ gb_render_2col() {
         local vlen=${#vis}
         local pad=$(( cw - vlen ))
         (( pad < 0 )) && pad=0
-        printf '%s%*s  %b│%b  %s\n' "$L" "$pad" "" "${C_DIM}" "${C_RESET}" "$R"
+        # Project style: avoid vertical pipes for column alignment.
+        # Use a faint em-dash between the columns instead - alignment is
+        # already enforced by `pad` above.
+        printf '%s%*s  %b-%b  %s\n' "$L" "$pad" "" "${C_DIM}" "${C_RESET}" "$R"
     done
 }
 
@@ -272,20 +400,20 @@ gb_menu_item() {
     printf "%b\n" "${root_tag}${full_tag}"
 }
 
-# gb_prompt "label" — amber ❯ prompt; result in $REPLY
+# gb_prompt "label" - amber ❯ prompt; result in $REPLY
 gb_prompt() {
     printf "\n  ${C_AMBER}${C_BOLD}❯${C_RESET}  ${C_GRAY}${1:-Choice}${C_RESET}: "
     read -r REPLY
 }
 
-# gb_confirm "Question" — amber ❯ Y/n; returns 0 if yes
+# gb_confirm "Question" - amber ❯ Y/n; returns 0 if yes
 gb_confirm() {
     printf "  ${C_AMBER}${C_BOLD}❯${C_RESET}  ${C_GRAY}$1${C_RESET} ${C_DIM}[Y/n]${C_RESET}: "
     read -r _confirm_reply
     [[ "${_confirm_reply:-Y}" =~ ^[Yy]$ ]]
 }
 
-# gb_press_enter — pause prompt at the end of a wizard action
+# gb_press_enter - pause prompt at the end of a wizard action
 gb_press_enter() {
     echo -e ""
     printf "  ${C_DIM}${C_GRAY}Press Enter to return to menu…${C_RESET}"
@@ -295,7 +423,7 @@ gb_press_enter() {
 # ── Install mode helpers ──────────────────────────────────────────────────────
 GB_INSTALL_MODE="module"   # default: safe (no system tuning)
 
-# gb_select_install_mode — interactive or flag-driven mode selection.
+# gb_select_install_mode - interactive or flag-driven mode selection.
 # Sets GB_INSTALL_MODE to "module" or "full".
 # Pass --module-only or --full-install to skip the prompt (for scripts/CI).
 gb_select_install_mode() {
@@ -305,13 +433,13 @@ gb_select_install_mode() {
     done
     gb_separator
     echo ""
-    printf '%b\n' "  ${C_VIOLET}${C_BOLD}GreenBoost — Choose Installation Mode${C_RESET}"
+    printf '%b\n' "  ${C_VIOLET}${C_BOLD}GreenBoost - Choose Installation Mode${C_RESET}"
     echo ""
-    printf '%b\n' "  ${C_LIME}${C_BOLD}[1]${C_RESET}  ${C_BOLD}${C_GRAY}Kernel module only${C_RESET}  ${C_DIM}DKMS install — no sysctl, GRUB, or service changes${C_RESET}"
+    printf '%b\n' "  ${C_LIME}${C_BOLD}[1]${C_RESET}  ${C_BOLD}${C_GRAY}Kernel module only${C_RESET}  ${C_DIM}DKMS install - no sysctl, GRUB, or service changes${C_RESET}"
     printf '%b\n' "  ${C_LIME}${C_BOLD}[2]${C_RESET}  ${C_BOLD}${C_GRAY}Full system setup ${C_RESET}  ${C_DIM}Module + AI libs + sysctl + GRUB + systemd services${C_RESET}"
     echo ""
     printf '%b\n' "  ${C_DIM}Mode [1] is safe on any machine. Mode [2] tunes sysctl, GRUB, and${C_RESET}"
-    printf '%b\n' "  ${C_DIM}enables system services — recommended only on a dedicated workstation.${C_RESET}"
+    printf '%b\n' "  ${C_DIM}enables system services - recommended only on a dedicated workstation.${C_RESET}"
     echo ""
     printf '%b' "  ${C_AMBER}${C_BOLD}❯${C_RESET}  ${C_GRAY}Mode [1/2] (default: 1): ${C_RESET}"
     read -r _mode_reply
@@ -321,7 +449,7 @@ gb_select_install_mode() {
     esac
 }
 
-# gb_consent_gate "description" — per-phase confirmation before a system change.
+# gb_consent_gate "description" - per-phase confirmation before a system change.
 # Returns 0 if the user confirms, 1 if they decline.
 gb_consent_gate() {
     echo ""
@@ -329,7 +457,7 @@ gb_consent_gate() {
     gb_confirm "Apply this change?" && return 0 || return 1
 }
 
-# ---- Pool data parsers (used by cmd_status) ---------------------------
+# ---- Pool data parsers (used by cmd_vitals) ---------------------------
 # Strip non-digit chars from a named variable and default to 0 if empty.
 # Usage: _sanitize_int VARNAME  (no subshell, uses printf -v nameref)
 _sanitize_int() { local _v="${!1}"; _v="${_v%%[^0-9]*}"; printf -v "$1" '%s' "${_v:-0}"; }
@@ -338,7 +466,7 @@ _sanitize_int() { local _v="${!1}"; _v="${_v%%[^0-9]*}"; printf -v "$1" '%s' "${
 # Format: T1:12GB T2:0/51GB(0%) T3:0/64GB PRESSURE:ok KV_RSV:2048MB KV_T2:0MB
 parse_pool_brief() {
     PB_T1_GB=0; PB_T2_USED_GB=0; PB_T2_MAX_GB=0; PB_T2_PCT=0
-    PB_T3_USED_GB=0; PB_T3_MAX_GB=0; PB_PRESSURE="—"
+    PB_T3_USED_GB=0; PB_T3_MAX_GB=0; PB_PRESSURE="-"
     PB_KV_RSV_MB=0; PB_KV_T2_MB=0
     local brief_f="/sys/class/greenboost/greenboost/pool_brief"
     [[ -r "$brief_f" ]] || return 1
@@ -349,7 +477,7 @@ parse_pool_brief() {
     PB_T2_PCT=$(echo "$brief"    | grep -oP 'T2:[^(]+\(\K[0-9]+'  | head -1 || echo 0)
     PB_T3_USED_GB=$(echo "$brief"| grep -oP 'T3:\K[0-9]+'         | head -1 || echo 0)
     PB_T3_MAX_GB=$(echo "$brief" | grep -oP 'T3:[0-9]+/\K[0-9]+'  | head -1 || echo 0)
-    PB_PRESSURE=$(echo "$brief"  | grep -oP 'PRESSURE:\K\S+' || echo "—")
+    PB_PRESSURE=$(echo "$brief"  | grep -oP 'PRESSURE:\K\S+' || echo "-")
     PB_KV_RSV_MB=$(echo "$brief" | grep -oP 'KV_RSV:\K[0-9]+'     | head -1 || echo 0)
     PB_KV_T2_MB=$(echo "$brief"  | grep -oP 'KV_T2:\K[0-9]+'      | head -1 || echo 0)
     _sanitize_int PB_T1_GB; _sanitize_int PB_T2_USED_GB; _sanitize_int PB_T2_MAX_GB
@@ -361,9 +489,9 @@ parse_pool_brief() {
 parse_pool_info() {
     PI_RAM_TOTAL_MB=0; PI_RAM_FREE_MB=0; PI_SAFETY_RSV_MB=0
     PI_T2_ALLOC_MB=0; PI_T2_AVAIL_MB=0; PI_ACTIVE_BUFS=0
-    PI_OOM_GUARD="no"; PI_PAGE_MODE="—"
+    PI_OOM_GUARD="no"; PI_PAGE_MODE="-"
     PI_KV_T1_RSV_MB=0; PI_KV_T2_MB=0; PI_KV_T3_MB=0; PI_KV_TOTAL_MB=0
-    PI_KV_PLACEMENT="—"; PI_TURBO_STATUS="disabled"
+    PI_KV_PLACEMENT="-"
     PI_SWAP_TOTAL_MB=0; PI_SWAP_USED_MB=0; PI_SWAP_FREE_MB=0; PI_T3_ALLOC_MB=0
     local pool_f="/sys/class/greenboost/greenboost/status"
     [[ -r "$pool_f" ]] || return 1
@@ -376,15 +504,13 @@ parse_pool_info() {
     PI_ACTIVE_BUFS=$(echo "$info"   | grep -oP 'Active DMA-BUF objects\s*:\s*\K[0-9]+' | head -1 || echo 0)
     PI_OOM_GUARD=$(echo "$info"     | grep -oP 'OOM guard\s*:\s*\K\S+'                || echo "no")
     PI_PAGE_MODE=$(echo "$info"     | grep -oP 'Page mode\s*:\s*\K[^\n]+'  | head -1 | sed 's/[[:space:]]*$//')
-    PI_PAGE_MODE="${PI_PAGE_MODE:-—}"
+    PI_PAGE_MODE="${PI_PAGE_MODE:--}"
     PI_KV_T1_RSV_MB=$(echo "$info"  | grep -oP 'KV in T1.*reserve:\s*\K[0-9]+'        | head -1 || echo 0)
     PI_KV_T2_MB=$(echo "$info"      | grep -oP 'KV in T2[^:]*:\s*\K[0-9]+'            | head -1 || echo 0)
     PI_KV_T3_MB=$(echo "$info"      | grep -oP 'KV in T3[^:]*:\s*\K[0-9]+'            | head -1 || echo 0)
     PI_KV_TOTAL_MB=$(echo "$info"   | grep -oP 'KV tagged total[^:]*:\s*\K[0-9]+'      | head -1 || echo 0)
     PI_KV_PLACEMENT=$(echo "$info"  | grep -oP 'KV cache placement\s*:\s*\K[^\n]+' | head -1 | sed 's/[[:space:]]*$//')
-    PI_KV_PLACEMENT="${PI_KV_PLACEMENT:-—}"
-    PI_TURBO_STATUS=$(echo "$info"  | grep -oP 'TurboQuant Compression\s*:\s*\K[^\n]+' | head -1 | sed 's/[[:space:]]*$//')
-    PI_TURBO_STATUS="${PI_TURBO_STATUS:-disabled}"
+    PI_KV_PLACEMENT="${PI_KV_PLACEMENT:--}"
     PI_SWAP_TOTAL_MB=$(echo "$info" | grep -oP 'Swap total\s*:\s*\K[0-9]+'             | head -1 || echo 0)
     PI_SWAP_USED_MB=$(echo "$info"  | grep -oP 'Swap used\s*:\s*\K[0-9]+'              | head -1 || echo 0)
     PI_SWAP_FREE_MB=$(echo "$info"  | grep -oP 'Swap free\s*:\s*\K[0-9]+'              | head -1 || echo 0)
@@ -397,16 +523,18 @@ parse_pool_info() {
     _sanitize_int PI_T3_ALLOC_MB
 }
 
-# ---- Shim stats reader (used by cmd_status) ---------------------------
+# ---- Shim stats reader (used by cmd_vitals) ---------------------------
 # Sets SS_* vars from shim_stats (written by the CUDA shim).
 # Primary location: /run/greenboost/shim_stats
 # Fallback location: /tmp/greenboost_shim_stats (used when Ollama can't write to /run/greenboost/)
-# SS_ACTIVE_PATH: A0 | A | B | C | none | unknown
+# SS_ACTIVE_PATH: A | B | none | unknown
 # SS_STALE: 1 if the file is older than 30 s (shim not running or crashed)
 parse_shim_stats() {
     SS_ACTIVE_PATH="unknown"; SS_STALE=1
-    SS_PATH_A0=0; SS_PATH_A=0; SS_PATH_B=0; SS_PATH_C=0
+    SS_PATH_A=0; SS_PATH_B=0
     SS_PHASE=""; SS_KV_RSV_NOM=0; SS_KV_RSV_EFF=0; SS_KV_T1_MB=0; SS_HEADROOM_MB=0
+    SS_LOCAL_T1_MB=0; SS_REMOTE_ALLOC_COUNT=0; SS_REMOTE_ALLOC_MB=0
+    SS_H2D_MB=0; SS_D2H_MB=0; SS_KERNEL_DISPATCH=0
     local stats_f="/run/greenboost/shim_stats"
     [[ -r "$stats_f" ]] || stats_f="/tmp/greenboost_shim_stats"
     [[ -r "$stats_f" ]] || return 1
@@ -414,19 +542,54 @@ parse_shim_stats() {
     local ts; ts=$(echo "$content" | grep -oP 'timestamp=\K[0-9]+' | head -1 || echo 0)
     local now; now=$(date +%s)
     (( now - ts <= 30 )) && SS_STALE=0
-    SS_ACTIVE_PATH=$(echo "$content"  | grep -oP 'active_path=\K\S+'              | head -1 || echo "unknown")
-    SS_PATH_A0=$(echo "$content"      | grep -oP 'path_a0_count=\K[0-9]+'         | head -1 || echo 0)
-    SS_PATH_A=$(echo "$content"       | grep -oP 'path_a_count=\K[0-9]+'          | head -1 || echo 0)
-    SS_PATH_B=$(echo "$content"       | grep -oP 'path_b_count=\K[0-9]+'          | head -1 || echo 0)
-    SS_PATH_C=$(echo "$content"       | grep -oP 'path_c_count=\K[0-9]+'          | head -1 || echo 0)
-    SS_PHASE=$(echo "$content"        | grep -oP 'phase=\K\S+'                    | head -1 || echo "")
-    SS_KV_RSV_NOM=$(echo "$content"   | grep -oP 'kv_reserve_nominal_mb=\K[0-9]+' | head -1 || echo 0)
-    SS_KV_RSV_EFF=$(echo "$content"   | grep -oP 'kv_reserve_effective_mb=\K[0-9]+' | head -1 || echo 0)
-    SS_KV_T1_MB=$(echo "$content"     | grep -oP 'kv_t1_tracked_mb=\K[0-9]+'     | head -1 || echo 0)
-    SS_HEADROOM_MB=$(echo "$content"  | grep -oP 'vram_headroom_mb=\K[0-9]+'      | head -1 || echo 0)
+    SS_ACTIVE_PATH=$(echo "$content"      | grep -oP 'active_path=\K\S+'                | head -1 || echo "unknown")
+    SS_PATH_A=$(echo "$content"           | grep -oP 'path_a_count=\K[0-9]+'            | head -1 || echo 0)
+    SS_PATH_B=$(echo "$content"           | grep -oP 'path_b_count=\K[0-9]+'            | head -1 || echo 0)
+    SS_PHASE=$(echo "$content"            | grep -oP 'phase=\K\S+'                      | head -1 || echo "")
+    SS_KV_RSV_NOM=$(echo "$content"       | grep -oP 'kv_reserve_nominal_mb=\K[0-9]+'   | head -1 || echo 0)
+    SS_KV_RSV_EFF=$(echo "$content"       | grep -oP 'kv_reserve_effective_mb=\K[0-9]+' | head -1 || echo 0)
+    SS_KV_T1_MB=$(echo "$content"         | grep -oP 'kv_t1_tracked_mb=\K[0-9]+'       | head -1 || echo 0)
+    SS_HEADROOM_MB=$(echo "$content"      | grep -oP 'vram_headroom_mb=\K[0-9]+'        | head -1 || echo 0)
+    SS_LOCAL_T1_MB=$(echo "$content"      | grep -oP 'local_t1_alloc_mb=\K[0-9]+'      | head -1 || echo 0)
+    SS_REMOTE_ALLOC_COUNT=$(echo "$content" | grep -oP 'remote_alloc_count=\K[0-9]+'   | head -1 || echo 0)
+    SS_REMOTE_ALLOC_MB=$(echo "$content"  | grep -oP 'remote_alloc_mb=\K[0-9]+'        | head -1 || echo 0)
+    SS_H2D_MB=$(echo "$content"           | grep -oP 'h2d_mb=\K[0-9]+'                 | head -1 || echo 0)
+    SS_D2H_MB=$(echo "$content"           | grep -oP 'd2h_mb=\K[0-9]+'                 | head -1 || echo 0)
+    SS_KERNEL_DISPATCH=$(echo "$content"  | grep -oP 'kernel_dispatch_count=\K[0-9]+'   | head -1 || echo 0)
+    SS_T2_WARN_ADJ=$(echo "$content"     | grep -oP 't2_warn_adj_pct=\K-?[0-9]+'       | head -1 || echo 0)
+    SS_COLD_EVICT=$(echo "$content"      | grep -oP 'cold_epoch_evict_count=\K[0-9]+'  | head -1 || echo 0)
+    SS_KV_DEDUP=$(echo "$content"        | grep -oP 'kv_dedup_hits=\K[0-9]+'           | head -1 || echo 0)
+    SS_KV_FRAG_MB=$(echo "$content"      | grep -oP 'kv_internal_frag_mb=\K[0-9]+'    | head -1 || echo 0)
+    SS_PINNED_FREE=$(echo "$content"     | grep -oP 'pinned_pool_bufs_free=\K[0-9]+'   | head -1 || echo "")
+    # Per-tier lifetime stats (from tier_<name>_{alloc_count,lifetime_mb,peak_mb})
+    local _tc; _tc="$content"
+    SS_TIER_T1_LOCAL_COUNT=$(echo "$_tc"   | grep -oP 'tier_t1_local_alloc_count=\K-?[0-9]+'   | head -1 || echo 0)
+    SS_TIER_T1_LOCAL_MB=$(echo "$_tc"      | grep -oP 'tier_t1_local_lifetime_mb=\K-?[0-9]+'   | head -1 || echo 0)
+    SS_TIER_T1_LOCAL_PEAK=$(echo "$_tc"    | grep -oP 'tier_t1_local_peak_mb=\K-?[0-9]+'       | head -1 || echo 0)
+    SS_TIER_T1_FEEDER_COUNT=$(echo "$_tc"  | grep -oP 'tier_t1_feeder_alloc_count=\K-?[0-9]+'  | head -1 || echo 0)
+    SS_TIER_T1_FEEDER_MB=$(echo "$_tc"     | grep -oP 'tier_t1_feeder_lifetime_mb=\K-?[0-9]+'  | head -1 || echo 0)
+    SS_TIER_T1_FEEDER_PEAK=$(echo "$_tc"   | grep -oP 'tier_t1_feeder_peak_mb=\K-?[0-9]+'      | head -1 || echo 0)
+    SS_TIER_T2_LOCAL_COUNT=$(echo "$_tc"   | grep -oP 'tier_t2_local_alloc_count=\K-?[0-9]+'   | head -1 || echo 0)
+    SS_TIER_T2_LOCAL_MB=$(echo "$_tc"      | grep -oP 'tier_t2_local_lifetime_mb=\K-?[0-9]+'   | head -1 || echo 0)
+    SS_TIER_T2_LOCAL_PEAK=$(echo "$_tc"    | grep -oP 'tier_t2_local_peak_mb=\K-?[0-9]+'       | head -1 || echo 0)
+    SS_TIER_T2_FEEDER_COUNT=$(echo "$_tc"  | grep -oP 'tier_t2_feeder_alloc_count=\K-?[0-9]+'  | head -1 || echo 0)
+    SS_TIER_T2_FEEDER_MB=$(echo "$_tc"     | grep -oP 'tier_t2_feeder_lifetime_mb=\K-?[0-9]+'  | head -1 || echo 0)
+    SS_TIER_T2_FEEDER_PEAK=$(echo "$_tc"   | grep -oP 'tier_t2_feeder_peak_mb=\K-?[0-9]+'      | head -1 || echo 0)
+    SS_TIER_T3_LOCAL_COUNT=$(echo "$_tc"   | grep -oP 'tier_t3_local_alloc_count=\K-?[0-9]+'   | head -1 || echo 0)
+    SS_TIER_T3_LOCAL_MB=$(echo "$_tc"      | grep -oP 'tier_t3_local_lifetime_mb=\K-?[0-9]+'   | head -1 || echo 0)
+    SS_TIER_T3_LOCAL_PEAK=$(echo "$_tc"    | grep -oP 'tier_t3_local_peak_mb=\K-?[0-9]+'       | head -1 || echo 0)
+    SS_TIER_T3_FEEDER_COUNT=$(echo "$_tc"  | grep -oP 'tier_t3_feeder_alloc_count=\K-?[0-9]+'  | head -1 || echo 0)
+    SS_TIER_T3_FEEDER_MB=$(echo "$_tc"     | grep -oP 'tier_t3_feeder_lifetime_mb=\K-?[0-9]+'  | head -1 || echo 0)
+    SS_TIER_T3_FEEDER_PEAK=$(echo "$_tc"   | grep -oP 'tier_t3_feeder_peak_mb=\K-?[0-9]+'      | head -1 || echo 0)
+    SS_TIER_VMM_COUNT=$(echo "$_tc"        | grep -oP 'tier_vmm_alloc_count=\K-?[0-9]+'        | head -1 || echo 0)
+    SS_TIER_VMM_MB=$(echo "$_tc"           | grep -oP 'tier_vmm_lifetime_mb=\K-?[0-9]+'        | head -1 || echo 0)
+    SS_TIER_VMM_PEAK=$(echo "$_tc"         | grep -oP 'tier_vmm_peak_mb=\K-?[0-9]+'            | head -1 || echo 0)
+    SS_TIER_PATH_B_COUNT=$(echo "$_tc"     | grep -oP 'tier_path_b_alloc_count=\K-?[0-9]+'     | head -1 || echo 0)
+    SS_TIER_PATH_B_MB=$(echo "$_tc"        | grep -oP 'tier_path_b_lifetime_mb=\K-?[0-9]+'     | head -1 || echo 0)
+    SS_TIER_PATH_B_PEAK=$(echo "$_tc"      | grep -oP 'tier_path_b_peak_mb=\K-?[0-9]+'         | head -1 || echo 0)
 }
 
-# ---- Live GPU VRAM query (used by cmd_status) -------------------------
+# ---- Live GPU VRAM query (used by cmd_vitals) -------------------------
 # Sets GPU_VRAM_USED_MB, GPU_VRAM_TOTAL_MB, GPU_VRAM_PCT from nvidia-smi.
 # Silently falls back to zeros if nvidia-smi is unavailable or times out.
 query_gpu_vram() {
@@ -445,7 +608,7 @@ query_gpu_vram() {
     fi
 }
 
-# ---- Live system swap query (used by cmd_status) ----------------------
+# ---- Live system swap query (used by cmd_vitals) ----------------------
 # Sets LIVE_SWAP_TOTAL_MB, LIVE_SWAP_USED_MB, LIVE_SWAP_PCT from /proc/swaps.
 # Always reflects actual kernel swap accounting, not kernel module parameters.
 query_live_swap() {
@@ -465,7 +628,138 @@ query_live_swap() {
     fi
 }
 
-# ---- Ollama loaded-model query (used by cmd_status) -------------------
+# ---- Extended GPU vitals query ----------------------------------------
+# Sets GPU_NAME, GPU_TEMP_C, GPU_POWER_W, GPU_POWER_LIMIT_W,
+# GPU_UTIL_PCT, GPU_MEM_UTIL_PCT, GPU_SM_CLOCK_MHZ, GPU_MEM_CLOCK_MHZ,
+# GPU_VRAM_USED_MB, GPU_VRAM_TOTAL_MB, GPU_VRAM_PCT.
+query_gpu_extended() {
+    GPU_NAME=""; GPU_TEMP_C=0; GPU_POWER_W=0; GPU_POWER_LIMIT_W=0
+    GPU_UTIL_PCT=0; GPU_MEM_UTIL_PCT=0; GPU_SM_CLOCK_MHZ=0; GPU_MEM_CLOCK_MHZ=0
+    GPU_VRAM_USED_MB=0; GPU_VRAM_TOTAL_MB=0; GPU_VRAM_PCT=0
+    command -v nvidia-smi &>/dev/null || return 0
+    local raw
+    raw=$(timeout 3 nvidia-smi \
+        --query-gpu=name,temperature.gpu,power.draw,power.limit,utilization.gpu,\
+utilization.memory,clocks.current.sm,clocks.current.memory,memory.used,memory.total \
+        --format=csv,noheader,nounits 2>/dev/null | head -1) || return 0
+    [[ -z "$raw" ]] && return 0
+    IFS=',' read -r GPU_NAME GPU_TEMP_C GPU_POWER_W GPU_POWER_LIMIT_W \
+        GPU_UTIL_PCT GPU_MEM_UTIL_PCT GPU_SM_CLOCK_MHZ GPU_MEM_CLOCK_MHZ \
+        GPU_VRAM_USED_MB GPU_VRAM_TOTAL_MB <<< "$raw"
+    GPU_NAME=$(echo "${GPU_NAME:-}" | xargs)
+    GPU_TEMP_C=$(echo "${GPU_TEMP_C:-0}"          | tr -dc '0-9.'); GPU_TEMP_C="${GPU_TEMP_C:-0}"
+    GPU_POWER_W=$(echo "${GPU_POWER_W:-0}"        | tr -dc '0-9.'); GPU_POWER_W="${GPU_POWER_W:-0}"
+    GPU_POWER_LIMIT_W=$(echo "${GPU_POWER_LIMIT_W:-0}" | tr -dc '0-9.'); GPU_POWER_LIMIT_W="${GPU_POWER_LIMIT_W:-0}"
+    GPU_UTIL_PCT=$(echo "${GPU_UTIL_PCT:-0}"      | tr -dc '0-9');  GPU_UTIL_PCT="${GPU_UTIL_PCT:-0}"
+    GPU_MEM_UTIL_PCT=$(echo "${GPU_MEM_UTIL_PCT:-0}" | tr -dc '0-9'); GPU_MEM_UTIL_PCT="${GPU_MEM_UTIL_PCT:-0}"
+    GPU_SM_CLOCK_MHZ=$(echo "${GPU_SM_CLOCK_MHZ:-0}" | tr -dc '0-9'); GPU_SM_CLOCK_MHZ="${GPU_SM_CLOCK_MHZ:-0}"
+    GPU_MEM_CLOCK_MHZ=$(echo "${GPU_MEM_CLOCK_MHZ:-0}" | tr -dc '0-9'); GPU_MEM_CLOCK_MHZ="${GPU_MEM_CLOCK_MHZ:-0}"
+    GPU_VRAM_USED_MB=$(echo "${GPU_VRAM_USED_MB:-0}"   | tr -dc '0-9'); GPU_VRAM_USED_MB="${GPU_VRAM_USED_MB:-0}"
+    GPU_VRAM_TOTAL_MB=$(echo "${GPU_VRAM_TOTAL_MB:-0}" | tr -dc '0-9'); GPU_VRAM_TOTAL_MB="${GPU_VRAM_TOTAL_MB:-0}"
+    if (( GPU_VRAM_TOTAL_MB > 0 )); then
+        GPU_VRAM_PCT=$(( GPU_VRAM_USED_MB * 100 / GPU_VRAM_TOTAL_MB ))
+    fi
+}
+
+# ---- NVTX event log tail reader ----------------------------------------
+# Sets NVTX_TAIL to the last N lines from /run/greenboost/nvtx_events.log.
+read_nvtx_tail() {
+    local n="${1:-10}"
+    NVTX_TAIL=""
+    local log_f="/run/greenboost/nvtx_events.log"
+    [[ -r "$log_f" ]] || return 0
+    NVTX_TAIL=$(tail -n "$n" "$log_f" 2>/dev/null || true)
+}
+
+# ---- NVTX log diagnostic aggregator ------------------------------------
+# Reads the full NVTX event log (current + rotated .1) and aggregates
+# OOM counts, eviction counts, zero-copy fallbacks, and per-sub-path alloc
+# stats into DIAG_* variables.  Called once per _cmd_vitals_snapshot tick.
+_nvtx_parse_diag() {
+    DIAG_OOM_MEMAVAIL=0; DIAG_OOM_PATH_B_FAIL=0; DIAG_OOM_FULL=0
+    DIAG_OOM_T1_LOCAL=0; DIAG_OOM_T2_CAP=0; DIAG_OOM_VMM_HOST=0; DIAG_OOM_TOTAL=0
+    DIAG_ZEROCOPY_FAIL=0; DIAG_EVICT_COUNT=0; DIAG_EVICT_MB=0; DIAG_LAST_PHASE=""
+    DIAG_PATH_A_ZC_COUNT=0; DIAG_PATH_A_ZC_MB=0
+    DIAG_PATH_A_POOL_COUNT=0; DIAG_PATH_A_POOL_MB=0
+    DIAG_PATH_A_PIN_COUNT=0; DIAG_PATH_A_PIN_MB=0
+
+    local log_f="/run/greenboost/nvtx_events.log"
+    local log_f1="/run/greenboost/nvtx_events.log.1"
+    local log_fb="/tmp/greenboost_nvtx_events.log"
+    local _src_files=()
+    [[ -r "$log_f1" ]] && _src_files+=("$log_f1")
+    [[ -r "$log_f"  ]] && _src_files+=("$log_f")
+    if [[ ${#_src_files[@]} -eq 0 ]]; then
+        [[ -r "$log_fb" ]] && _src_files+=("$log_fb") || return 0
+    fi
+
+    local _awk_out
+    _awk_out=$(cat "${_src_files[@]}" 2>/dev/null | awk '
+        {
+            i = 1
+            if ($i+0 > 0 || $i ~ /^[0-9]+$/) { epoch=$i; i++ } else next
+            if ($i == "NETD" || $i == "SHIM" || $i == "GB") i++
+            ev = $i; i++
+            tier = $i; i++
+            mb_s = $i; gsub(/[^0-9]/, "", mb_s); mb = mb_s + 0
+
+            if      (ev == "OOM_MEMAVAIL")         oom_mem++
+            else if (ev == "OOM_PATH_B_FAIL")       oom_b++
+            else if (ev == "OOM_FULL")              oom_full++
+            else if (ev == "OOM_T1_LOCAL")          oom_t1++
+            else if (ev == "OOM_T2_CAP")            oom_t2cap++
+            else if (ev == "OOM_VMM_HOST")          oom_vmm++
+            else if (ev == "ALLOC_A_ZEROCOPY_FAIL") zc_fail++
+            else if (ev == "EVICT_BATCH_MADVISE" || ev == "EVICT_ARC_KV" || ev == "SWA_EVICT") {
+                evict++; evict_mb += mb
+            }
+            else if (ev == "ALLOC_A_ZEROCOPY")  { a_zc++;   a_zc_mb   += mb }
+            else if (ev == "ALLOC_A_POOL")       { a_pool++; a_pool_mb += mb }
+            else if (ev == "ALLOC_A_PINNED")     { a_pin++;  a_pin_mb  += mb }
+            if (substr(ev, 1, 6) == "PHASE_") last_phase = ev
+        }
+        END {
+            printf "oom_mem=%d\n",      oom_mem+0
+            printf "oom_b=%d\n",        oom_b+0
+            printf "oom_full=%d\n",     oom_full+0
+            printf "oom_t1=%d\n",       oom_t1+0
+            printf "oom_t2cap=%d\n",    oom_t2cap+0
+            printf "oom_vmm=%d\n",      oom_vmm+0
+            printf "zc_fail=%d\n",      zc_fail+0
+            printf "evict=%d\n",        evict+0
+            printf "evict_mb=%d\n",     evict_mb+0
+            printf "last_phase=%s\n",   last_phase
+            printf "a_zc=%d\n",         a_zc+0
+            printf "a_zc_mb=%d\n",      a_zc_mb+0
+            printf "a_pool=%d\n",       a_pool+0
+            printf "a_pool_mb=%d\n",    a_pool_mb+0
+            printf "a_pin=%d\n",        a_pin+0
+            printf "a_pin_mb=%d\n",     a_pin_mb+0
+        }
+    ')
+    DIAG_OOM_MEMAVAIL=$(  echo "$_awk_out" | grep -oP 'oom_mem=\K[0-9]+'   | head -1 || echo 0)
+    DIAG_OOM_PATH_B_FAIL=$(echo "$_awk_out" | grep -oP 'oom_b=\K[0-9]+'    | head -1 || echo 0)
+    DIAG_OOM_FULL=$(       echo "$_awk_out" | grep -oP 'oom_full=\K[0-9]+'  | head -1 || echo 0)
+    DIAG_OOM_T1_LOCAL=$(   echo "$_awk_out" | grep -oP 'oom_t1=\K[0-9]+'   | head -1 || echo 0)
+    DIAG_OOM_T2_CAP=$(     echo "$_awk_out" | grep -oP 'oom_t2cap=\K[0-9]+' | head -1 || echo 0)
+    DIAG_OOM_VMM_HOST=$(   echo "$_awk_out" | grep -oP 'oom_vmm=\K[0-9]+'  | head -1 || echo 0)
+    DIAG_ZEROCOPY_FAIL=$(  echo "$_awk_out" | grep -oP 'zc_fail=\K[0-9]+'  | head -1 || echo 0)
+    DIAG_EVICT_COUNT=$(    echo "$_awk_out" | grep -oP 'evict=\K[0-9]+'    | head -1 || echo 0)
+    DIAG_EVICT_MB=$(       echo "$_awk_out" | grep -oP 'evict_mb=\K[0-9]+' | head -1 || echo 0)
+    DIAG_LAST_PHASE=$(     echo "$_awk_out" | grep -oP 'last_phase=\K\S+'  | head -1 || echo "")
+    DIAG_PATH_A_ZC_COUNT=$(   echo "$_awk_out" | grep -oP 'a_zc=\K[0-9]+'      | head -1 || echo 0)
+    DIAG_PATH_A_ZC_MB=$(      echo "$_awk_out" | grep -oP 'a_zc_mb=\K[0-9]+'   | head -1 || echo 0)
+    DIAG_PATH_A_POOL_COUNT=$(  echo "$_awk_out" | grep -oP 'a_pool=\K[0-9]+'   | head -1 || echo 0)
+    DIAG_PATH_A_POOL_MB=$(     echo "$_awk_out" | grep -oP 'a_pool_mb=\K[0-9]+'| head -1 || echo 0)
+    DIAG_PATH_A_PIN_COUNT=$(   echo "$_awk_out" | grep -oP 'a_pin=\K[0-9]+'    | head -1 || echo 0)
+    DIAG_PATH_A_PIN_MB=$(      echo "$_awk_out" | grep -oP 'a_pin_mb=\K[0-9]+' | head -1 || echo 0)
+    DIAG_OOM_TOTAL=$(( DIAG_OOM_MEMAVAIL + DIAG_OOM_PATH_B_FAIL + DIAG_OOM_FULL + DIAG_OOM_T1_LOCAL + DIAG_OOM_T2_CAP + DIAG_OOM_VMM_HOST ))
+}
+
+# ---- Debug vitals flag check -------------------------------------------
+_debug_vitals_enabled() { [[ -f /etc/greenboost/debug_vitals.enabled ]]; }
+
+# ---- Ollama loaded-model query (used by cmd_vitals) -------------------
 # Sets OL_MODEL, OL_PARAM_COUNT, OL_CTX_SIZE, OL_VRAM_MB.
 # Falls back to empty strings if Ollama is not running or no model is loaded.
 query_ollama_ps() {
@@ -519,7 +813,7 @@ except Exception as e:
     OL_VRAM_MB=$(echo "$parsed"    | cut -d'|' -f4)
 }
 
-# ---- KV size estimator (used by cmd_status) ---------------------------
+# ---- KV size estimator (used by cmd_vitals) ---------------------------
 # estimate_kv_mb ctx_size param_count_str
 # Returns estimated KV cache size in MB, accounting for q8_0 quantization.
 estimate_kv_mb() {
@@ -543,31 +837,31 @@ estimate_kv_mb() {
     echo "$mb"
 }
 
-# ---- Memory flow event log (used by cmd_status) -----------------------
+# ---- Memory flow event log (used by cmd_vitals) -----------------------
 # Patterns that indicate a tier transition or notable orchestration event
 _GB_FLOW_PAT='KV spill|Evicted.*cold|T2 auto-evict|T2 WARN:|T2 CRITICAL:|T3 CRITICAL:|KV cache T2 full|T3 safety-net|KV reserve set|New process PID|Process PID.*exited|T2 DDR pool|T3 NVMe swap CRITICAL|T2 OOM guard|overflow|Phase →|KV reserve auto|VRAM:.*OVERFLOW|kv_allocated_t1|T3 cap'
 
-# gather_flow_events N — emit last N tier-transition log lines from kernel
+# gather_flow_events N - emit last N tier-transition log lines from kernel
 gather_flow_events() {
     local n=${1:-12}
     dmesg 2>/dev/null \
         | grep -E "greenboost.*($( echo "$_GB_FLOW_PAT" | tr '|' '|'))" | tail -"$n"
 }
 
-# format_flow_event "raw log line" — emit a branded, colored status line
+# format_flow_event "raw log line" - emit a branded, colored status line
 format_flow_event() {
     local line="$1"
     # Extract just the message (after journalctl prefix or kernel timestamp)
     local msg
     msg=$(printf '%s' "$line" | sed 's/.*greenboost[d]*[^:]*: //' | sed 's/.*\] //')
-    # Extract short timestamp HH:MM:SS — handles journalctl ISO and dmesg [NNN.NN] formats
+    # Extract short timestamp HH:MM:SS - handles journalctl ISO and dmesg [NNN.NN] formats
     local ts
     ts=$(printf '%s' "$line" | grep -oP 'T\d\d:\d\d:\d\d' | head -1)
     if [[ -z "$ts" ]]; then
         ts=$(printf '%s' "$line" | grep -oP '\d\d:\d\d:\d\d' | head -1)
     fi
     if [[ -z "$ts" ]]; then
-        # dmesg kernel uptime: [NNNNN.NNN] — convert to wall-clock HH:MM:SS
+        # dmesg kernel uptime: [NNNNN.NNN] - convert to wall-clock HH:MM:SS
         local _ksec; _ksec=$(printf '%s' "$line" | grep -oP '^\[\s*\K[0-9]+' | head -1)
         if [[ -n "$_ksec" ]]; then
             local _uptime_s; _uptime_s=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)
@@ -611,13 +905,13 @@ format_flow_event() {
 check_update() {
     local raw latest
 
-    # Fetch the tag list — try curl first, then wget
+    # Fetch the tag list - try curl first, then wget
     if command -v curl &>/dev/null; then
         raw=$(curl -fsSL --max-time 5 "$GB_REPO_API" 2>/dev/null)
     elif command -v wget &>/dev/null; then
         raw=$(wget -qO- --timeout=5 "$GB_REPO_API" 2>/dev/null)
     else
-        return   # no HTTP client available — skip silently
+        return   # no HTTP client available - skip silently
     fi
 
     [[ -z "$raw" ]] && return   # network unavailable or empty response
@@ -657,10 +951,10 @@ check_update() {
                         && _pull_ok=1
                 fi
                 if [[ $_pull_ok -eq 1 ]]; then
-                    info "Update complete — restarting installer..."
+                    info "Update complete - restarting installer..."
                     exec "$0" "${GB_ORIG_ARGS[@]}"
                 else
-                    warn "git pull failed — continuing with v${GB_VERSION}."
+                    warn "git pull failed - continuing with v${GB_VERSION}."
                 fi
             fi
         fi
@@ -688,7 +982,7 @@ gb_calc_ddr_cap_gb() {
 # GB_PCORES_MAX, GB_GOLDEN_MIN, GB_GOLDEN_MAX, GB_PCORES_ONLY,
 # RAM_TYPE, RAM_SPEED_MT, GPU_NAME, CPU_NAME, NVME_SIZE_GB,
 # PCIE_GEN, PCIE_WIDTH, PCIE_BW_GBS, PCIE_MAX_GEN, PCIE_MAX_BW_GBS.
-# Safe to call multiple times — idempotent.
+# Safe to call multiple times - idempotent.
 
 detect_hardware() {
     [[ "${_GB_HW_DETECTED:-0}" -eq 1 ]] && return 0
@@ -703,12 +997,12 @@ detect_hardware() {
             --format=csv,noheader,nounits 2>/dev/null | head -1)
         smi_ec=${PIPESTATUS[0]}
         if [[ $smi_ec -eq 124 ]]; then
-            warn "nvidia-smi timed out (>30 s) — GPU driver may be wedged."
+            warn "nvidia-smi timed out (>30 s) - GPU driver may be wedged."
             warn "  Try: sudo systemctl restart nvidia-persistenced && sudo nvidia-smi"
             GPU_NAME="Unknown (nvidia-smi timeout)"
             GB_PHYS=12
         elif [[ -z "$smi_line" ]]; then
-            warn "nvidia-smi returned no output — check: sudo nvidia-smi"
+            warn "nvidia-smi returned no output - check: sudo nvidia-smi"
             GPU_NAME="Unknown (nvidia-smi no output)"
             GB_PHYS=12
         else
@@ -720,7 +1014,7 @@ detect_hardware() {
     else
         GPU_NAME="Unknown (nvidia-smi not found)"
         GB_PHYS=8
-        warn "nvidia-smi not found — assuming 8 GB VRAM. Install NVIDIA driver."
+        warn "nvidia-smi not found - assuming 8 GB VRAM. Install NVIDIA driver."
     fi
 
     # ── System RAM ───────────────────────────────────────────────────────
@@ -738,7 +1032,7 @@ detect_hardware() {
     [[ -z "$RAM_SPEED_MT" || "$RAM_SPEED_MT" == "Unknown" ]] && RAM_SPEED_MT="?"
 
     # ── PCIe link (GPU slot) ──────────────────────────────────────────────
-    # current_link_speed is unreliable — PCIe ASPM downclock to Gen 1 when the
+    # current_link_speed is unreliable - PCIe ASPM downclock to Gen 1 when the
     # GPU is in idle/P8 power state.  Use the parent bridge max_link_speed for
     # the slot capability, and the GPU sysfs max_link_speed for GPU hardware max.
     PCIE_GEN=0; PCIE_WIDTH="x?"; PCIE_BW_GBS=0
@@ -795,7 +1089,7 @@ detect_hardware() {
 
     # virtual VRAM pool: 70% of total RAM (< 64 GB) or 80% (>= 64 GB).
     # The safety_reserve_gb is enforced dynamically by the kernel watchdog at
-    # allocation time — do NOT subtract it here or T2 is under-provisioned.
+    # allocation time - do NOT subtract it here or T2 is under-provisioned.
     GB_VIRT=$(gb_calc_ddr_cap_gb "$total_ram_gb")
 
     # ── CPU topology ─────────────────────────────────────────────────────
@@ -803,10 +1097,10 @@ detect_hardware() {
     local total_cpus; total_cpus=$(nproc)
 
     # Detect Intel hybrid P/E core split.
-    # Primary:   lscpu -p — count CPUs per physical core; ≥2 = P-core (HT), 1 = E-core.
+    # Primary:   lscpu -p - count CPUs per physical core; ≥2 = P-core (HT), 1 = E-core.
     #            Always available (util-linux); survives containers and newer kernels.
-    # Secondary: thread_siblings_list — "N-M" range = P-core, bare integer = E-core.
-    # Tertiary:  core_type sysfs integer (1=P, 0=E) — kernel 5.17+ Intel-only.
+    # Secondary: thread_siblings_list - "N-M" range = P-core, bare integer = E-core.
+    # Tertiary:  core_type sysfs integer (1=P, 0=E) - kernel 5.17+ Intel-only.
     # Fallback:  non-hybrid path (AMD, older Intel, containers without sysfs).
     local has_ecores=0
     local -a p_cpu_list=() e_cpu_list=()
@@ -892,7 +1186,7 @@ detect_hardware() {
             GB_GOLDEN_MIN=$_gold_min
             GB_GOLDEN_MAX=$_gold_max
         else
-            # No cpufreq — fall back to arithmetic heuristic
+            # No cpufreq - fall back to arithmetic heuristic
             local _pcores_count=$(( GB_PCORES_MAX + 1 ))
             GB_GOLDEN_MIN=$(( _pcores_count / 4 ))
             GB_GOLDEN_MAX=$(( _pcores_count / 4 + 3 ))
@@ -955,7 +1249,22 @@ detect_hardware() {
     # ── Ollama CTX based on T1+T2 KV headroom (T3 NVMe excluded) ────────
     # KV cache never spills to T3; use T1 VRAM + half T2 DDR as budget.
     # Half of T2 is left for model weights; the other half is KV headroom.
-    local kv_pool_gb=$(( GB_PHYS + GB_VIRT / 2 ))
+    #
+    # Blackwell (cc >= 12.0): T2 DDR is served via cuMemAllocManaged and
+    # reserved for model-weight overflow (the cuMemAddressReserve intercept
+    # in the GreenBoost shim forces ggml-cuda to the cudaMalloc legacy pool).
+    # KV cache must stay in T1 VRAM for SM latency - only GB_PHYS contributes
+    # to the KV headroom budget on Blackwell desktop PCIe.
+    local _cc_major_ctx
+    _cc_major_ctx=$(timeout 5 nvidia-smi --query-gpu=compute_cap \
+                        --format=csv,noheader,nounits 2>/dev/null \
+                        | head -1 | cut -d. -f1 | xargs || echo 0)
+    local kv_pool_gb
+    if [[ "${_cc_major_ctx:-0}" -ge 12 ]]; then
+        kv_pool_gb=$GB_PHYS          # T2 is weight-only on Blackwell PCIe
+    else
+        kv_pool_gb=$(( GB_PHYS + GB_VIRT / 2 ))
+    fi
     if   [[ $kv_pool_gb -ge 32 ]]; then GB_OLLAMA_CTX=131072
     elif [[ $kv_pool_gb -ge 16 ]]; then GB_OLLAMA_CTX=65536
     elif [[ $kv_pool_gb -ge 8  ]]; then GB_OLLAMA_CTX=32768
@@ -1032,9 +1341,6 @@ print_detected_hardware() {
         pcie_info="unknown (GPU PCI address not found)"
     else
         pcie_info="Gen ${PCIE_GEN} ${PCIE_WIDTH}  (~${PCIE_BW_GBS} GB/s)"
-        if [[ $PCIE_MAX_GEN -gt $PCIE_GEN ]]; then
-            pcie_info+="  |  GPU max: Gen ${PCIE_MAX_GEN} x${PCIE_WIDTH#x}  (~${PCIE_MAX_BW_GBS} GB/s if slot supports it)"
-        fi
     fi
     info "Detected hardware:"
     info "  GPU   : ${GPU_NAME}  (${GB_PHYS} GB VRAM)"
@@ -1044,11 +1350,17 @@ print_detected_hardware() {
     local _t3_store="/var/lib/greenboost/t3_store"
     if [[ -f "$_t3_store" ]]; then
         local _t3_gb=$(( $(stat -c%s "$_t3_store" 2>/dev/null || echo 0) / 1073741824 ))
-        info "  NVMe  : ${NVME_SIZE_GB} GB  ->  T3 backing ${_t3_gb} GB"
-        info "  Pool  : T1=${GB_PHYS}GB + T2=${GB_VIRT}GB + T3=${_t3_gb}GB = $(( GB_PHYS + GB_VIRT + _t3_gb )) GB"
+        if [[ $_t3_gb -gt 0 ]]; then
+            info "  NVMe  : ${NVME_SIZE_GB} GB  ->  T3 backing ${_t3_gb} GB used  (cap ${GB_NVME_POOL} GB)"
+            info "  Pool  : T1=${GB_PHYS}GB + T2=${GB_VIRT}GB + T3=${_t3_gb}GB used / ${GB_NVME_POOL}GB cap = $(( GB_PHYS + GB_VIRT + GB_NVME_POOL )) GB"
+        else
+            # File placeholder exists but is empty - show configured cap as potential T3
+            info "  NVMe  : ${NVME_SIZE_GB} GB  ->  T3 cap ${GB_NVME_POOL} GB  (sparse file, grows on demand)"
+            info "  Pool  : T1=${GB_PHYS}GB + T2=${GB_VIRT}GB + T3=${GB_NVME_POOL}GB cap = $(( GB_PHYS + GB_VIRT + GB_NVME_POOL )) GB"
+        fi
     else
-        info "  NVMe  : ${NVME_SIZE_GB} GB  ->  T3 backing ${GB_NVME_POOL} GB (created on first use)"
-        info "  Pool  : T1=${GB_PHYS}GB + T2=${GB_VIRT}GB + T3=${GB_NVME_POOL}GB = $(( GB_PHYS + GB_VIRT + GB_NVME_POOL )) GB"
+        info "  NVMe  : ${NVME_SIZE_GB} GB  ->  T3 cap ${GB_NVME_POOL} GB  (created on first use)"
+        info "  Pool  : T1=${GB_PHYS}GB + T2=${GB_VIRT}GB + T3=${GB_NVME_POOL}GB cap = $(( GB_PHYS + GB_VIRT + GB_NVME_POOL )) GB"
     fi
     info "  CTX   : OLLAMA_NUM_CTX=${GB_OLLAMA_CTX}"
 }
@@ -1221,12 +1533,12 @@ resolve_profile() {
     local _mem_kb; _mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}'); _mem_kb="${_mem_kb:-0}"
     local total_ram_gb=$(( _mem_kb / 1024 / 1024 ))
 
-    # Rule: physical_vram_gb — always use detected; ignore if profile claims more
+    # Rule: physical_vram_gb - always use detected; ignore if profile claims more
     if [[ -n "$PROF_VRAM_GB" && "$PROF_VRAM_GB" -gt "$GB_PHYS" ]]; then
         conflicts+="physical_vram_gb overridden ${PROF_VRAM_GB}→${GB_PHYS} GB (physical limit); "
     fi
 
-    # Rule: virtual_vram_gb — use profile value if <= 95% RAM, else cap
+    # Rule: virtual_vram_gb - use profile value if <= 95% RAM, else cap
     if [[ -n "$PROF_VIRT" ]]; then
         local max_virt=$(( total_ram_gb * 95 / 100 ))
         if [[ "$PROF_VIRT" -le "$max_virt" ]]; then
@@ -1237,7 +1549,7 @@ resolve_profile() {
         fi
     fi
 
-    # Rule: safety_reserve_gb — use max(profile, 6% RAM)
+    # Rule: safety_reserve_gb - use max(profile, 6% RAM)
     if [[ -n "$PROF_RESERVE" ]]; then
         local min_reserve=$(( total_ram_gb * 6 / 100 ))
         [[ $min_reserve -lt 4 ]] && min_reserve=4
@@ -1249,7 +1561,7 @@ resolve_profile() {
         fi
     fi
 
-    # Rule: nvme_swap_gb — use profile if <= free NVMe space, else cap at 90% free
+    # Rule: nvme_swap_gb - use profile if <= free NVMe space, else cap at 90% free
     if [[ -n "$PROF_NVME_SWAP" ]]; then
         local nvme_free_gb; nvme_free_gb=$(df -BG "${GB_NVME_SWAPFILE:-/}" 2>/dev/null | awk 'NR==2{gsub("G",""); print $4}' || echo 0)
         nvme_free_gb="${nvme_free_gb:-0}"
@@ -1263,26 +1575,37 @@ resolve_profile() {
         fi
     fi
 
-    # Rule: nvme_pool_gb — min(profile, nvme_swap * 0.89)
+    # Rule: nvme_pool_gb - cap at 80% of free disk on the T3 store location.
+    # T3 is a backing FILE on the NVMe, completely separate from the OS swap
+    # partition; capping it to nvme_swap size would incorrectly restrict it.
     if [[ -n "$PROF_NVME_POOL" ]]; then
-        local max_pool=$(( resolved_nvme_sw * 89 / 100 ))
-        if [[ "$PROF_NVME_POOL" -le "$max_pool" ]]; then
-            resolved_nvme_pool=$PROF_NVME_POOL
+        local _t3_free_gb
+        _t3_free_gb=$(df -BG /var/lib/greenboost 2>/dev/null | awk 'NR==2{gsub("G",""); print $4}')
+        [[ -z "$_t3_free_gb" ]] && _t3_free_gb=$(df -BG /var/lib 2>/dev/null | awk 'NR==2{gsub("G",""); print $4}')
+        [[ -z "$_t3_free_gb" ]] && _t3_free_gb=$(df -BG / 2>/dev/null | awk 'NR==2{gsub("G",""); print $4}')
+        _t3_free_gb="${_t3_free_gb:-0}"
+        if [[ $_t3_free_gb -gt 0 ]]; then
+            local max_pool=$(( _t3_free_gb * 80 / 100 ))
+            if [[ "$PROF_NVME_POOL" -le "$max_pool" ]]; then
+                resolved_nvme_pool=$PROF_NVME_POOL
+            else
+                resolved_nvme_pool=$max_pool
+                conflicts+="nvme_pool_gb capped ${PROF_NVME_POOL}→${resolved_nvme_pool} GB (80% of ${_t3_free_gb} GB free disk); "
+            fi
         else
-            resolved_nvme_pool=$max_pool
-            conflicts+="nvme_pool_gb capped ${PROF_NVME_POOL}→${resolved_nvme_pool} GB (89% of nvme_swap); "
+            resolved_nvme_pool=$PROF_NVME_POOL
         fi
     fi
 
-    # Rule: ecores_only — warn if P/E split not detected
+    # Rule: ecores_only - warn if P/E split not detected
     if [[ "$resolved_pcores" == "1" && "${DET_HAS_PE_SPLIT}" == "false" ]]; then
-        warn "ecores_only=1 in profile but no P/E-core split detected — module will use all CPUs"
+        warn "ecores_only=1 in profile but no P/E-core split detected - module will use all CPUs"
     fi
 
     # Rule: nvlink_pool warning
     local prof_nvlink_pool; prof_nvlink_pool=$(parse_profile_field "$user_file" nvlink_pool)
     if [[ "$prof_nvlink_pool" == "true" && "${DET_NVLINK}" == "false" ]]; then
-        warn "nvlink_pool=true in profile but no NVLink topology detected — overriding to false"
+        warn "nvlink_pool=true in profile but no NVLink topology detected - overriding to false"
         prof_nvlink_pool="false"
         conflicts+="nvlink_pool overridden true→false (no NVLink detected); "
     fi
@@ -1328,7 +1651,7 @@ RESOLVED_EOF
 
 cmd_profile_create() {
     need_root "profile create"
-    _GB_HW_DETECTED=0   # force fresh detection — discard any cached state
+    _GB_HW_DETECTED=0   # force fresh detection - discard any cached state
     detect_hardware
     mkdir -p "$GB_PROFILES_DIR"
     local out="${GB_PROFILES_DIR}/default.md"
@@ -1378,6 +1701,34 @@ cmd_profile_activate() {
     fi
     ln -sf "$abs" "$GB_ACTIVE_PROFILE_LINK"
     info "Active profile: $abs"
+
+    # S3: Live-reload - if the module is loaded and profile changes a kernel
+    # parameter (nvme_pool_gb or t2_pool_gb), offer to reload the module.
+    if lsmod 2>/dev/null | grep -q "^greenboost "; then
+        local sysfs_nvme="/sys/module/greenboost/parameters/nvme_pool_gb"
+        local sysfs_t2="/sys/module/greenboost/parameters/t2_pool_gb"
+        load_profile_values "$abs" 2>/dev/null || true
+        local needs_reload=0
+        if [[ -r "$sysfs_nvme" && -n "${PROF_NVME_POOL:-}" ]]; then
+            local cur_nvme; cur_nvme=$(cat "$sysfs_nvme" 2>/dev/null || echo "0")
+            [[ "$cur_nvme" != "${PROF_NVME_POOL}" ]] && needs_reload=1
+        fi
+        if [[ -r "$sysfs_t2" && -n "${PROF_VIRT:-}" ]]; then
+            local cur_t2; cur_t2=$(cat "$sysfs_t2" 2>/dev/null || echo "0")
+            [[ "$cur_t2" != "${PROF_VIRT}" ]] && needs_reload=1
+        fi
+        if [[ "$needs_reload" -eq 1 ]]; then
+            gb_warn_ui "Profile changes a kernel parameter - module reload required."
+            read -rp "  Reload GreenBoost module now? [y/N] " _reload_ans
+            if [[ "${_reload_ans,,}" == y* ]]; then
+                cmd_unload
+                cmd_load
+                gb_ok "Module reloaded with new profile parameters."
+            else
+                gb_warn_ui "Reload skipped. Changes will take effect on next: sudo greenboost unload && sudo greenboost load"
+            fi
+        fi
+    fi
 }
 
 cmd_profile_diff() {
@@ -1413,26 +1764,64 @@ cmd_profile_diff() {
     echo ""
 }
 
+# cmd_profile_export_json [profile-file]
+# Emit the active (or supplied) profile as JSON to stdout. Lets external
+# tooling - e.g. the hyphaed kernel-build wizard at ~/Dev/kernel_inference
+# - consume the profile without parsing the Markdown/YAML hybrid format.
+cmd_profile_export_json() {
+    local file="${1:-}"
+    if [[ -z "$file" ]]; then
+        [[ -L "$GB_ACTIVE_PROFILE_LINK" || -f "$GB_ACTIVE_PROFILE_LINK" ]] \
+            || die "No active profile. Provide a file or run: sudo $0 profile create"
+        file=$(readlink -f "$GB_ACTIVE_PROFILE_LINK")
+    fi
+    [[ -f "$file" ]] || die "Profile file not found: $file"
+
+    # Parse `key: value` lines (skip headings, frontmatter, blank lines, comments)
+    # then emit a flat JSON object via awk. Values are emitted as strings -
+    # the consumer can re-type them.
+    awk '
+        BEGIN { printf "{"; first = 1 }
+        /^[[:space:]]*$/ { next }
+        /^#/ { next }
+        /^---$/ { next }
+        /^##/ { next }
+        /^[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*:/ {
+            key = $0; sub(/[[:space:]]*:.*$/, "", key)
+            val = $0; sub(/^[^:]*:[[:space:]]*/, "", val)
+            gsub(/^"|"$/, "", val)            # strip surrounding quotes
+            gsub(/\\/, "\\\\", val)           # escape backslashes
+            gsub(/"/, "\\\"", val)            # escape quotes
+            gsub(/\t/, "\\t", val)            # escape tabs
+            if (!first) printf ","
+            printf "\"%s\":\"%s\"", key, val
+            first = 0
+        }
+        END { print "}" }
+    ' "$file"
+}
+
 cmd_profile() {
     local sub="${1:-show}"
     shift 2>/dev/null || true
     case "$sub" in
-        create)   cmd_profile_create ;;
-        show)     cmd_profile_show "$@" ;;
-        list)     cmd_profile_list ;;
-        activate) cmd_profile_activate "$@" ;;
-        diff)     cmd_profile_diff "$@" ;;
-        *) die "Unknown profile subcommand: '$sub'. Use: create|show|list|activate|diff" ;;
+        create)        cmd_profile_create ;;
+        show)          cmd_profile_show "$@" ;;
+        list)          cmd_profile_list ;;
+        activate)      cmd_profile_activate "$@" ;;
+        diff)          cmd_profile_diff "$@" ;;
+        export-json)   cmd_profile_export_json "$@" ;;
+        *) die "Unknown profile subcommand: '$sub'. Use: create|show|list|activate|diff|export-json" ;;
     esac
 }
 
-# ── cmd_profile_wizard — interactive profile management sub-menu ──────────
+# ── cmd_profile_wizard - interactive profile management sub-menu ──────────
 cmd_profile_wizard() {
     while true; do
         clear
         # ── Header ──────────────────────────────────────────────────────
         local cols; cols=$(tput cols 2>/dev/null || echo 72)
-        local title=" GreenBoost v${GB_VERSION} — Profile Management"
+        local title=" GreenBoost v${GB_VERSION} - Profile Management"
         echo -e ""
         echo -e "${C_VIOLET}${C_BOLD}  ╔$(printf '═%.0s' $(seq 1 $((cols - 4))))╗${C_RESET}"
         echo -e "${C_VIOLET}${C_BOLD}  ║${C_RESET} ${C_GRAY}${C_BOLD}${title}$(printf ' %.0s' $(seq 1 $((cols - 4 - ${#title} - 1))))${C_VIOLET}${C_BOLD}║${C_RESET}"
@@ -1458,7 +1847,7 @@ cmd_profile_wizard() {
             gb_panel_row "  ${C_CYAN}NVMe${C_RESET}  ${C_GRAY}T3 swap ${p_nvme:-?} GB  ·  ctx ${p_ctx:-?} tokens${C_RESET}"
             gb_panel_bottom
         else
-            echo -e "  ${C_AMBER}⚠${C_RESET}  ${C_AMBER}${C_BOLD}No active profile${C_RESET}  ${C_DIM}— select [1] to auto-detect hardware and create one${C_RESET}"
+            echo -e "  ${C_AMBER}⚠${C_RESET}  ${C_AMBER}${C_BOLD}No active profile${C_RESET}  ${C_DIM}- select [1] to auto-detect hardware and create one${C_RESET}"
         fi
         echo -e ""
 
@@ -1494,7 +1883,7 @@ cmd_profile_wizard() {
         echo -e ""
 
         if [[ "$(id -u)" != "0" ]]; then
-            gb_warn_ui "Not root — options marked ${C_RED}⚠ root${C_AMBER} require sudo."
+            gb_warn_ui "Not root - options marked ${C_RED}⚠ root${C_AMBER} require sudo."
             echo -e ""
         fi
 
@@ -1514,12 +1903,12 @@ cmd_profile_wizard() {
             3)
                 # Build numbered list of available profiles for selection
                 if [[ ! -d "$GB_PROFILES_DIR" ]]; then
-                    gb_warn_ui "No profiles directory — run option 1 first."
+                    gb_warn_ui "No profiles directory - run option 1 first."
                     gb_press_enter; continue
                 fi
                 local profiles=( "$GB_PROFILES_DIR"/*.md )
                 if [[ ! -f "${profiles[0]}" ]]; then
-                    gb_warn_ui "No profiles found — run option 1 first."
+                    gb_warn_ui "No profiles found - run option 1 first."
                     gb_press_enter; continue
                 fi
                 echo -e "  ${C_CYAN}${C_BOLD}Available profiles:${C_RESET}"
@@ -1557,7 +1946,7 @@ cmd_profile_wizard() {
     done
 }
 
-# Owner-workstation preset — hard-coded optimal for known hardware:
+# Owner-workstation preset - hard-coded optimal for known hardware:
 # ASRock B760M-ITX/D4 | i9-14900KF | RTX 5070 OC 12GB | 64GB DDR4-3600 dual-ch | Samsung 990 EVO Plus 4TB
 
 set_owner_workstation_params() {
@@ -1606,32 +1995,27 @@ check_deps() {
         _make_hint="apt install build-essential"; _gcc_hint="apt install gcc"
         _hdr_hint="apt install linux-headers-$(uname -r)"
     fi
-    command -v make >/dev/null || die "make not found — install with: sudo ${_make_hint}"
-    command -v gcc  >/dev/null || die "gcc not found — install with: sudo ${_gcc_hint}"
+    command -v make >/dev/null || die "make not found - install with: sudo ${_make_hint}"
+    command -v gcc  >/dev/null || die "gcc not found - install with: sudo ${_gcc_hint}"
 
     local kdir="/lib/modules/$(uname -r)/build"
     [[ -d "$kdir" ]] || die "Kernel headers not found at $kdir
     Install with: sudo ${_hdr_hint}"
     info "Kernel headers : $kdir  ✓"
 
-    if lsmod | grep -q "^nvidia "; then
+    if lsmod 2>/dev/null | grep -qE "^nvidia[[:space:]]" \
+            || [[ -c /dev/nvidia0 ]] \
+            || [[ -f /proc/driver/nvidia/version ]]; then
         info "NVIDIA driver  : loaded  ✓"
     else
-        warn "NVIDIA driver not loaded — run: sudo modprobe nvidia"
-    fi
-
-    if lsmod | grep -q "^nvidia_uvm "; then
-        info "NVIDIA UVM     : loaded  ✓  (managed memory / system RAM overflow ready)"
-    else
-        warn "nvidia_uvm not loaded — CUDA UVM overflow unavailable"
-        warn "Fix: sudo modprobe nvidia_uvm"
+        warn "NVIDIA driver not loaded - run: sudo modprobe nvidia"
     fi
 }
 
 # ---- Commands ----------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# cmd_install_recovery — install greenboost-recovery + greenboost-sentinel
+# cmd_install_recovery - install greenboost-recovery + greenboost-sentinel
 #   systemd services and the /usr/local/sbin/greenboost-recover script.
 #
 # greenboost-sentinel.service  writes a sentinel file when GreenBoost is
@@ -1661,6 +2045,7 @@ Before=ollama.service shutdown.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+TimeoutStopSec=10
 ExecStartPre=/bin/mkdir -p /var/lib/greenboost
 ExecStart=/bin/touch /var/lib/greenboost/running
 ExecStop=/bin/mv -f /var/lib/greenboost/running /var/lib/greenboost/sentinel
@@ -1684,12 +2069,12 @@ RemainAfterExit=yes
 ExecStart=/usr/local/sbin/greenboost-recover
 StandardOutput=journal
 StandardError=journal
-TimeoutStartSec=120
+TimeoutStartSec=45
+TimeoutStopSec=10
 Restart=no
 
 [Install]
-WantedBy=multi-user.target
-RequiredBy=ollama.service
+WantedBy=multi-user.target ollama.service
 RECOVERYEOF
 
     # ── 3. Recovery script ──────────────────────────────────────────────────
@@ -1697,7 +2082,7 @@ RECOVERYEOF
     # Uses the same brand palette: Violet/Lime/Cyan/Amber and braille spinner.
     cat > /usr/local/sbin/greenboost-recover << 'RECOVEREOF'
 #!/usr/bin/env bash
-# greenboost-recover — pre-boot crash recovery for GreenBoost
+# greenboost-recover - pre-boot crash recovery for GreenBoost
 # Called by greenboost-recovery.service before ollama.service starts.
 # Safe to run manually: sudo greenboost-recover
 set -euo pipefail
@@ -1710,6 +2095,10 @@ C_CYAN=$'\033[38;2;48;200;255m'
 C_VIOLET=$'\033[38;2;108;113;196m'
 C_RESET=$'\033[0m'
 C_BOLD=$'\033[1m'
+
+# Audit F-L4-24: single timestamp format for every TUI header.  Use as
+#   local ts; ts=$(date "$GB_TS_FORMAT")
+GB_TS_FORMAT='+%Y-%m-%dT%H:%M:%S'
 
 _ok()   { echo -e "  ${C_LIME}✓${C_RESET} $*"; }
 _fail() { echo -e "  ${C_RED}✗${C_RESET} $*" >&2; }
@@ -1734,9 +2123,9 @@ _step 0 3 "Checking shutdown state..."
 _dirty=0
 if [[ -f "$STATE_DIR/sentinel" || -f "$STATE_DIR/running" ]]; then
     _dirty=1
-    _warn "Dirty shutdown detected — running full recovery sequence"
+    _warn "Dirty shutdown detected - running full recovery sequence"
 else
-    _info "No dirty-shutdown sentinel — last boot was clean"
+    _info "No dirty-shutdown sentinel - last boot was clean"
 fi
 
 # ── 1/3 Kernel module ───────────────────────────────────────────────────────
@@ -1744,11 +2133,11 @@ _step 1 3 "Verifying kernel module..."
 if lsmod | grep -q "^${DRIVER_NAME} "; then
     _ok "greenboost.ko loaded"
 else
-    _warn "Module not loaded — attempting modprobe..."
+    _warn "Module not loaded - attempting modprobe..."
     if modprobe "$DRIVER_NAME" 2>/dev/null; then
         _ok "greenboost.ko loaded via modprobe"
     else
-        _fail "modprobe greenboost failed — DKMS build may be incomplete"
+        _fail "modprobe greenboost failed - DKMS build may be incomplete"
         _fail "Run: sudo ./greenboost_setup.sh build && sudo make load"
         exit 1
     fi
@@ -1771,18 +2160,104 @@ PYEOF
     then
         _ok "OOM guard cleared"
     else
-        _warn "GB_IOCTL_RESET failed — module may still be initializing; non-fatal"
+        _warn "GB_IOCTL_RESET failed - module may still be initializing; non-fatal"
     fi
 else
-    _warn "$DEV_NODE not present — skipping OOM reset"
+    _warn "$DEV_NODE not present - skipping OOM reset"
 fi
+
+# ── 2b/3 D6: Fault classification ───────────────────────────────────────────
+# Inspect recent logs to classify why GreenBoost crashed.  Sets
+# /run/greenboost/recovery_class so greenboost status can surface the cause,
+# and takes tier-specific recovery actions before Ollama restarts.
+mkdir -p /run/greenboost
+# Audit F-L4-06: harden /run/greenboost from 0777 to 0775 with the `ollama`
+# group when present (ollama service user needs to write shim_stats etc.).
+# Falls back to 0755 if no ollama group exists.
+if getent group ollama >/dev/null 2>&1; then
+    chgrp ollama /run/greenboost 2>/dev/null || true
+    chmod 0775 /run/greenboost
+else
+    chmod 0755 /run/greenboost
+fi
+_fault="unknown"
+_fault_detail=""
+
+# OOM kill - kernel OOM killer terminated a process
+if journalctl -k --since="30 minutes ago" 2>/dev/null | grep -qE "Killed process.*oom"; then
+    _fault="oom_kill"
+    _fault_detail=$(journalctl -k --since="30 minutes ago" 2>/dev/null | grep -E "Killed process.*oom" | tail -1)
+fi
+
+# NVIDIA Xid GPU fault (driver page fault, NVRM crash, etc.)
+if journalctl --since="30 minutes ago" 2>/dev/null | grep -qE "Xid.*[0-9]+: GPU "; then
+    _fault="xid_fault"
+    _fault_detail=$(journalctl --since="30 minutes ago" 2>/dev/null | grep -E "Xid" | tail -1)
+fi
+
+# ECC double-bit error (hardware uncorrectable - needs driver restart)
+if journalctl --since="30 minutes ago" 2>/dev/null | grep -qiE "ecc.*double.bit|uncorrectable.*ecc|nvml.*dbe"; then
+    _fault="ecc_dbe"
+    _fault_detail="ECC double-bit error - GPU memory may be unreliable"
+fi
+
+# Thermal throttle / shutdown
+if journalctl --since="30 minutes ago" 2>/dev/null | grep -qiE "thermal.*throttl|nvidia.*thermal|gpu.*temp.*critical"; then
+    _fault="thermal"
+    _fault_detail="GPU thermal event - add cooling or reduce workload"
+fi
+
+# AppArmor denial for GreenBoost libraries
+if journalctl --since="30 minutes ago" 2>/dev/null | grep -qE "apparmor.*DENIED.*greenboost|apparmor.*DENIED.*libgreenboost"; then
+    _fault="apparmor"
+    _fault_detail=$(journalctl --since="30 minutes ago" 2>/dev/null | grep -E "apparmor.*DENIED.*greenboost" | tail -1)
+fi
+
+echo "$_fault" > /run/greenboost/recovery_class
+_info "Fault class: ${C_AMBER}${_fault}${C_RESET}${_fault_detail:+ - ${_fault_detail:0:80}}"
+
+case "$_fault" in
+    ecc_dbe)
+        _warn "ECC DBE - writing /run/greenboost/ecc_dbe_flag to reduce T1 quota"
+        echo "1" > /run/greenboost/ecc_dbe_flag
+        ;;
+    thermal)
+        _warn "Thermal fault - inserting 10 s cooling pause before Ollama restart"
+        sleep 10
+        ;;
+    apparmor)
+        _warn "AppArmor denial - patching snap-confine profiles and reloading"
+        # Ensure the system binary local override is present
+        _sc_local="/etc/apparmor.d/local/usr.lib.snapd.snap-confine.real"
+        if [[ -f "$_sc_local" ]] && ! grep -q "libgreenboost_audit" "$_sc_local" 2>/dev/null; then
+            { echo "/usr/local/lib/libgreenboost_audit.so mr,"
+              echo "/usr/local/lib/x86_64-linux-gnu/libgreenboost_audit.so mr,"; } >> "$_sc_local"
+        fi
+        apparmor_parser -r /etc/apparmor.d/usr.lib.snapd.snap-confine.real 2>/dev/null || true
+        # Also patch the snapd snap's own profile (snapd may have reset it)
+        _sp=""
+        _sp=$(find /var/lib/snapd/apparmor/profiles/ \
+            -name "snap-confine.snapd.*" -o -name "snap-confine.*" 2>/dev/null | head -1)
+        if [[ -n "$_sp" ]] && ! grep -q "libgreenboost_audit" "$_sp" 2>/dev/null; then
+            { echo ""; echo "/usr/local/lib/libgreenboost_audit.so mr,"
+              echo "/usr/local/lib/x86_64-linux-gnu/libgreenboost_audit.so mr,"; } >> "$_sp"
+            apparmor_parser -r "$_sp" 2>/dev/null || true
+        fi
+        systemctl restart apparmor 2>/dev/null || true
+        ;;
+    xid_fault)
+        _warn "Xid GPU fault - forcing NVIDIA driver module reset"
+        rmmod nvidia_drm nvidia_modeset nvidia 2>/dev/null || true
+        modprobe nvidia 2>/dev/null || true
+        ;;
+esac
 
 # ── 3/3 Sentinel cleanup ────────────────────────────────────────────────────
 _step 3 3 "Cleaning up sentinel files..."
 rm -f "$STATE_DIR/sentinel" "$STATE_DIR/running"
 mkdir -p "$STATE_DIR"
 date -Iseconds > "$STATE_DIR/last_clean_boot"
-_ok "Recovery complete — sentinel cleared"
+_ok "Recovery complete - sentinel cleared (fault class: $_fault)"
 echo ""
 RECOVEREOF
 
@@ -1795,12 +2270,12 @@ RECOVEREOF
     # browser hardware video decode + Ollama both competing for the same 12 GB
     # of physical VRAM with only 1 GB of headroom configured.
     #
-    # The watchdog does NOT modify allocations — it only logs and writes a
+    # The watchdog does NOT modify allocations - it only logs and writes a
     # pressure file so 'greenboost status' can surface it.  All thresholds are auto-detected fractions of physical
-    # VRAM — no hard-coded values.
+    # VRAM - no hard-coded values.
     cat > /usr/local/sbin/greenboost-vram-watchdog << 'VWEOF'
 #!/usr/bin/env bash
-# greenboost-vram-watchdog — physical VRAM pressure monitor
+# greenboost-vram-watchdog - physical VRAM pressure monitor
 # Detects when non-GreenBoost GPU consumers (browser NVDEC, compositor, etc.)
 # reduce the headroom available for the T1 pool.
 set -euo pipefail
@@ -1809,7 +2284,7 @@ STATE_DIR="/var/lib/greenboost"
 PRESSURE_FILE="$STATE_DIR/vram_pressure"
 POLL_INTERVAL=3   # seconds between nvidia-smi polls
 
-# Thresholds expressed as percentages of physical VRAM — hardware-agnostic.
+# Thresholds expressed as percentages of physical VRAM - hardware-agnostic.
 # WARN fires when non-GreenBoost GPU usage > WARN_PCT% of physical VRAM.
 # CRITICAL fires when free VRAM < CRIT_FREE_PCT% of physical VRAM.
 WARN_PCT="${GREENBOOST_VRAM_WATCHDOG_WARN_PCT:-10}"      # 10% = 1.2 GB on 12 GB GPU
@@ -1820,18 +2295,18 @@ mkdir -p "$STATE_DIR"
 # Detect total physical VRAM once at startup.
 _total_mib=0
 if command -v nvidia-smi &>/dev/null; then
-    _total_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheaders,nounits \
+    _total_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits \
                  2>/dev/null | head -1 | tr -d ' ') || _total_mib=0
 fi
 if [[ "$_total_mib" -le 0 ]]; then
-    echo "greenboost-vram-watchdog: nvidia-smi unavailable — exiting" >&2
+    echo "greenboost-vram-watchdog: nvidia-smi unavailable - exiting" >&2
     exit 0
 fi
 
 _warn_mib=$(( _total_mib * WARN_PCT / 100 ))
 _crit_free_mib=$(( _total_mib * CRIT_FREE_PCT / 100 ))
 
-echo "greenboost-vram-watchdog: started — GPU ${_total_mib} MiB, warn threshold ${_warn_mib} MiB non-GB usage, crit free ${_crit_free_mib} MiB"
+echo "greenboost-vram-watchdog: started - GPU ${_total_mib} MiB, warn threshold ${_warn_mib} MiB non-GB usage, crit free ${_crit_free_mib} MiB"
 
 _prev_state="ok"
 
@@ -1840,7 +2315,7 @@ while true; do
 
     # Read current VRAM used + free from nvidia-smi
     _line=$(nvidia-smi --query-gpu=memory.used,memory.free \
-            --format=csv,noheaders,nounits 2>/dev/null | head -1) || continue
+            --format=csv,noheader,nounits 2>/dev/null | head -1) || continue
     _used_mib=$(echo "$_line" | awk -F',' '{gsub(/ /,"",$1); print $1}')
     _free_mib=$(echo "$_line" | awk -F',' '{gsub(/ /,"",$2); print $2}')
     [[ -z "$_used_mib" || -z "$_free_mib" ]] && continue
@@ -1868,15 +2343,15 @@ while true; do
         case "$_state" in
             critical)
                 logger -t greenboost-vram-watchdog -p kern.crit \
-                    "CRITICAL: free VRAM ${_free_mib} MiB < threshold ${_crit_free_mib} MiB — non-GreenBoost consumers: ${_non_gb_mib} MiB (browser NVDEC / compositor?). Consider closing GPU-heavy apps or increasing GREENBOOST_VRAM_HEADROOM_MB."
+                    "CRITICAL: free VRAM ${_free_mib} MiB < threshold ${_crit_free_mib} MiB - non-GreenBoost consumers: ${_non_gb_mib} MiB (browser NVDEC / compositor?). Consider closing GPU-heavy apps or increasing GREENBOOST_VRAM_HEADROOM_MB."
                 ;;
             warn)
                 logger -t greenboost-vram-watchdog -p kern.warning \
-                    "WARN: non-GreenBoost GPU usage ${_non_gb_mib} MiB > ${_warn_mib} MiB threshold — free VRAM ${_free_mib} MiB. Running browser hardware video decode alongside inference reduces T1 headroom."
+                    "WARN: non-GreenBoost GPU usage ${_non_gb_mib} MiB > ${_warn_mib} MiB threshold - free VRAM ${_free_mib} MiB. Running browser hardware video decode alongside inference reduces T1 headroom."
                 ;;
             ok)
                 logger -t greenboost-vram-watchdog -p kern.info \
-                    "OK: physical VRAM pressure cleared — used ${_used_mib} MiB, free ${_free_mib} MiB"
+                    "OK: physical VRAM pressure cleared - used ${_used_mib} MiB, free ${_free_mib} MiB"
                 ;;
         esac
         _prev_state="$_state"
@@ -1902,6 +2377,7 @@ Type=simple
 ExecStart=/usr/local/sbin/greenboost-vram-watchdog
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=10
 StandardOutput=journal
 StandardError=journal
 
@@ -1909,21 +2385,18 @@ StandardError=journal
 WantedBy=multi-user.target
 VWSEOF
 
-    # ── Enable services ─────────────────────────────────────────────────────
     systemctl daemon-reload
-    systemctl enable greenboost-recovery.service \
-                     greenboost-sentinel.service \
-                     greenboost-vram-watchdog.service 2>/dev/null || true
-    gb_ok "greenboost-recovery + greenboost-sentinel + greenboost-vram-watchdog installed and enabled"
+    gb_ok "greenboost-recovery + greenboost-sentinel + greenboost-vram-watchdog installed (not auto-enabled)"
+    gb_info "Enable manually if needed: systemctl enable greenboost-recovery greenboost-sentinel greenboost-vram-watchdog"
 }
 
 cmd_install_sys_configs() {
     need_root install-sys-configs
     detect_hardware
 
-    info "Installing GreenBoost v2.8.2 system configuration files..."
+    info "Installing GreenBoost v2.9 system configuration files..."
 
-    # 1. Ollama service — inject GreenBoost env vars + LD_PRELOAD (always refresh)
+    # 1. Ollama service - inject GreenBoost env vars + LD_PRELOAD (always refresh)
     local svc="/etc/systemd/system/ollama.service"
     if [[ -f "$svc" ]]; then
         # Remove any previously injected GreenBoost lines first (idempotent upgrade)
@@ -1936,15 +2409,15 @@ cmd_install_sys_configs() {
 /GREENBOOST_/d
 /libgreenboost/d' "$svc"
         # Inject fresh v2.7 env vars
-        sed -i "/^\[Service\]/a Environment=\"OLLAMA_FLASH_ATTENTION=1\"\nEnvironment=\"OLLAMA_KV_CACHE_TYPE=q8_0\"\nEnvironment=\"OLLAMA_NUM_CTX=${GB_OLLAMA_CTX}\"\nEnvironment=\"OLLAMA_MAX_LOADED_MODELS=1\"\nEnvironment=\"OLLAMA_KEEP_ALIVE=-1\"\nEnvironment=\"OLLAMA_NUM_GPU=999\"\nEnvironment=\"GREENBOOST_VIRTUAL_VRAM_MB=$((GB_VIRT * 1024))\"\nEnvironment=\"GREENBOOST_DEBUG=0\"\nEnvironment=\"GREENBOOST_ACTIVE=1\"\nEnvironment=\"LD_PRELOAD=/usr/local/lib/libgreenboost_cuda.so\"" "$svc"
+        sed -i "/^\[Service\]/a Environment=\"OLLAMA_FLASH_ATTENTION=1\"\nEnvironment=\"OLLAMA_KV_CACHE_TYPE=q8_0\"\nEnvironment=\"OLLAMA_NUM_CTX=${GB_OLLAMA_CTX}\"\nEnvironment=\"OLLAMA_MAX_LOADED_MODELS=1\"\nEnvironment=\"OLLAMA_KEEP_ALIVE=-1\"\nEnvironment=\"OLLAMA_NUM_GPU=999\"\nEnvironment=\"GREENBOOST_VIRTUAL_VRAM_MB=$((GB_VIRT * 1024))\"\nEnvironment=\"GREENBOOST_DEBUG=0\"\nEnvironment=\"GREENBOOST_ACTIVE=1\"\nEnvironment=\"LD_PRELOAD=/usr/local/lib/libgreenboost_vmm_override.so:/usr/local/lib/libgreenboost_cuda.so\"" "$svc"
         systemctl daemon-reload
-        info "Ollama service: GreenBoost v2.8.2 env vars injected (refreshed)"
+        info "Ollama service: GreenBoost v2.9 env vars injected (refreshed)"
         gb_ok "Ollama context cap set to ${GB_OLLAMA_CTX} tokens (T1: ${GB_PHYS} GB, T2: ${GB_VIRT} GB)"
     else
-        warn "Ollama service not found at $svc — skipping"
+        warn "Ollama service not found at $svc - skipping"
     fi
 
-    # 1b. Drop-in override — write 99-greenboost.conf so GreenBoost vars always win
+    # 1b. Drop-in override - write 99-greenboost.conf so GreenBoost vars always win
     # over any third-party drop-ins (boost.conf, override.conf, etc.) that may set
     # conflicting values for OLLAMA_NUM_CTX, LD_PRELOAD, or OLLAMA_GPU_OVERHEAD.
     local dropin_dir="/etc/systemd/system/ollama.service.d"
@@ -1952,7 +2425,9 @@ cmd_install_sys_configs() {
 
     # Remove conflicting entries from other drop-in files before writing 99-greenboost.conf
     local gb_vars=(OLLAMA_NUM_CTX LD_PRELOAD OLLAMA_GPU_OVERHEAD OLLAMA_FLASH_ATTENTION
-                   OLLAMA_KV_CACHE_TYPE OLLAMA_MAX_LOADED_MODELS OLLAMA_KEEP_ALIVE OLLAMA_NUM_GPU)
+                   OLLAMA_KV_CACHE_TYPE OLLAMA_MAX_LOADED_MODELS OLLAMA_KEEP_ALIVE OLLAMA_NUM_GPU
+                   GREENBOOST_KV_RESERVE_MB GREENBOOST_VIRTUAL_VRAM_MB GREENBOOST_DEBUG
+                   GREENBOOST_ACTIVE)
     local _conflict_found=0
     for _f in "$dropin_dir"/*.conf; do
         [[ -f "$_f" ]] || continue
@@ -1966,13 +2441,26 @@ cmd_install_sys_configs() {
         done
     done
 
-    # Write 99-greenboost.conf — alphabetically last, so it always wins
+    # Ensure GB_KV_RESERVE_MB is computed before writing the drop-in.
+    # install-sys-configs may be called standalone without cmd_kmod_install
+    # having run first, so the auto-scale must be replicated here.
+    if [[ -z "${GB_KV_RESERVE_MB:-}" ]]; then
+        local _ctx_for_kv="${GB_OLLAMA_CTX:-32768}"
+        if   [[ $_ctx_for_kv -le 8192   ]]; then GB_KV_RESERVE_MB=1024
+        elif [[ $_ctx_for_kv -le 32768  ]]; then GB_KV_RESERVE_MB=2048
+        elif [[ $_ctx_for_kv -le 65536  ]]; then GB_KV_RESERVE_MB=4096
+        elif [[ $_ctx_for_kv -le 131072 ]]; then GB_KV_RESERVE_MB=6144
+        else                                      GB_KV_RESERVE_MB=8192
+        fi
+    fi
+
+    # Write 99-greenboost.conf - alphabetically last, so it always wins
     cat > "$dropin_dir/99-greenboost.conf" << DROPINEOF
-# GreenBoost v2.8.2 — managed file, do not edit manually
+# GreenBoost v2.9 - managed file, do not edit manually
 # Re-generated by: sudo ./greenboost_setup.sh install-sys-configs
 [Unit]
 After=greenboost-recovery.service greenboost-sentinel.service
-Requires=greenboost-recovery.service
+Wants=greenboost-recovery.service
 
 [Service]
 Environment="OLLAMA_FLASH_ATTENTION=1"
@@ -1983,17 +2471,18 @@ Environment="OLLAMA_KEEP_ALIVE=-1"
 Environment="OLLAMA_NUM_GPU=999"
 Environment="GREENBOOST_VIRTUAL_VRAM_MB=$((GB_VIRT * 1024))"
 Environment="GREENBOOST_DEBUG=0"
+Environment="GREENBOOST_KV_RESERVE_MB=${GB_KV_RESERVE_MB}"
 Environment="GREENBOOST_ACTIVE=1"
-Environment="LD_PRELOAD=/usr/local/lib/libgreenboost_cuda.so"
+Environment="LD_PRELOAD=/usr/local/lib/libgreenboost_vmm_override.so:/usr/local/lib/libgreenboost_cuda.so"
 DROPINEOF
     systemctl daemon-reload
     if [[ $_conflict_found -eq 1 ]]; then
-        gb_ok "99-greenboost.conf written — conflicting entries removed from other drop-ins"
+        gb_ok "99-greenboost.conf written - conflicting entries removed from other drop-ins"
     else
         gb_ok "99-greenboost.conf written (no conflicts detected)"
     fi
 
-    # 1c. Other known inference tool services — inject LD_PRELOAD + GREENBOOST_ACTIVE
+    # 1c. Other known inference tool services - inject LD_PRELOAD + GREENBOOST_ACTIVE
     # if the service file exists (idempotent: skip if already patched).
     local shim_path="$SHIM_DEST/$SHIM_LIB"
     local _reloaded=0
@@ -2008,9 +2497,9 @@ DROPINEOF
     done
     [[ $_reloaded -eq 1 ]] && systemctl daemon-reload
 
-    # 2a. GreenBoost device udev rule — allow video group (includes ollama) access
+    # 2a. GreenBoost device udev rule - allow video group (includes ollama) access
     cat > /etc/udev/rules.d/99-greenboost.rules << 'UDEVEOF'
-# GreenBoost kernel module — allow video group (includes ollama) to access /dev/greenboost
+# GreenBoost kernel module - allow video group (includes ollama) to access /dev/greenboost
 KERNEL=="greenboost", GROUP="video", MODE="0660"
 UDEVEOF
     info "GreenBoost device udev rule installed: /etc/udev/rules.d/99-greenboost.rules"
@@ -2021,12 +2510,12 @@ UDEVEOF
         || true
     udevadm settle 2>/dev/null || true
 
-    # 2b. NVMe udev rule — scheduler=none, read_ahead=4096, nr_requests=1023
+    # 2b. NVMe udev rule - scheduler=none, read_ahead=4096, nr_requests=1023
     # ENV{DEVTYPE}=="disk" restricts rules to whole-disk nodes only (nvme0n1, nvme1n1 …),
     # excluding partition nodes (nvme0n1p1 …) which have no queue/ sysfs directory.
-    # nr_requests capped at 1023 — Samsung 990 EVO Plus hardware limit (max_hw_sectors_kb=512).
+    # nr_requests capped at 1023 - Samsung 990 EVO Plus hardware limit (max_hw_sectors_kb=512).
     cat > /etc/udev/rules.d/99-nvme-greenboost.rules << 'UDEVEOF'
-# GreenBoost v2.8.2 — NVMe tuning for T3 swap performance
+# GreenBoost v2.9 - NVMe tuning for T3 swap performance
 ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ENV{DEVTYPE}=="disk", ATTR{queue/scheduler}="none"
 ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ENV{DEVTYPE}=="disk", ATTR{queue/read_ahead_kb}="4096"
 ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ENV{DEVTYPE}=="disk", ATTR{queue/nr_requests}="1023"
@@ -2034,7 +2523,16 @@ UDEVEOF
     udevadm control --reload-rules && udevadm trigger || true
     info "NVMe udev rule installed: /etc/udev/rules.d/99-nvme-greenboost.rules"
 
-    # 3. CPU governor service — P-cores only (E-cores stay on powersave)
+    # 2c. NVIDIA shutdown fix - prevent driver from hanging 10-30s during reboot/shutdown.
+    # NVreg_PreserveVideoMemoryAllocations=1 (default) makes the driver save GPU state to RAM
+    # on suspend/shutdown. With large models loaded this blocks reboot for up to 30s and can
+    # hang indefinitely on RTX 50xx + kernel 6.19. Setting to 0 disables that save/restore.
+    cat > /etc/modprobe.d/99-nvidia-greenboost.conf << 'NVEOF'
+options nvidia NVreg_PreserveVideoMemoryAllocations=0
+NVEOF
+    info "NVIDIA shutdown fix installed: /etc/modprobe.d/99-nvidia-greenboost.conf"
+
+    # 3. CPU governor service - P-cores only (E-cores stay on powersave)
     cat > /etc/systemd/system/cpu-perf.service << CPUEOF
 [Unit]
 Description=GreenBoost CPU performance governor (P-cores 0-${GB_PCORES_MAX})
@@ -2045,22 +2543,23 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/bin/bash -c 'for cpu in \$(seq 0 ${GB_PCORES_MAX}); do echo performance > /sys/devices/system/cpu/cpu\${cpu}/cpufreq/scaling_governor; done; cset set -c ${GB_GOLDEN_MIN}-${GB_GOLDEN_MAX} -s inference_set || true; cset proc -m -f root -t inference_set -k || true'
 ExecStop=/bin/bash  -c 'for cpu in \$(seq 0 ${GB_PCORES_MAX}); do echo powersave  > /sys/devices/system/cpu/cpu\${cpu}/cpufreq/scaling_governor; done; cset set -d inference_set || true'
+TimeoutStopSec=10
 
 [Install]
 WantedBy=multi-user.target
 CPUEOF
     systemctl daemon-reload
-    systemctl enable --now cpu-perf.service
-    info "CPU governor service installed and started (includes cset for golden cores)"
+    gb_ok "cpu-perf service installed (not auto-enabled)"
+    gb_info "Enable manually if needed: systemctl enable --now cpu-perf.service"
 
-    # 4. THP sysfs.d — transparent hugepages for compaction + THP performance
+    # 4. THP sysfs.d - transparent hugepages for compaction + THP performance
     # NOTE: gb_alloc_buf() uses alloc_pages(GFP_KERNEL|__GFP_COMP, order=9) which draws
     # from the BUDDY ALLOCATOR, NOT the HugeTLB pool.  Pre-allocating HugeTLB pages
     # (vm.nr_hugepages=26112) locks 51 GB in the HugeTLB pool, leaving <12 GB free RAM,
     # which triggers the OOM guard and makes T2 unavailable.  Keep nr_hugepages=0.
     mkdir -p /etc/sysfs.d
     cat > /etc/sysfs.d/greenboost-hugepages.conf << 'HPEOF'
-# GreenBoost v2.8.2 — THP config (no HugeTLB pre-allocation: gb_alloc_buf uses buddy allocator)
+# GreenBoost v2.9 - THP config (no HugeTLB pre-allocation: gb_alloc_buf uses buddy allocator)
 kernel/mm/transparent_hugepage/enabled = always
 HPEOF
     info "THP sysfs conf: /etc/sysfs.d/greenboost-hugepages.conf"
@@ -2069,12 +2568,12 @@ HPEOF
     if [[ "$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null)" != "0" ]]; then
         echo 0 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null \
             && info "HugeTLB pages released: freed $(( $(cat /proc/meminfo | grep HugePages_Total | awk '{print $2}') * 2 )) kB back to buddy allocator" \
-            || warn "Could not set nr_hugepages=0 — reboot to apply"
+            || warn "Could not set nr_hugepages=0 - reboot to apply"
     else
-        info "HugeTLB: already 0 (correct — GreenBoost T2 uses buddy allocator)"
+        info "HugeTLB: already 0 (correct - GreenBoost T2 uses buddy allocator)"
     fi
 
-    # 5. VM sysctl — handled by cmd_tune_sysctl (99-zzz-greenboost.conf)
+    # 5. VM sysctl - handled by cmd_tune_sysctl (99-zzz-greenboost.conf)
     # The definitive sysctl file is written by tune-sysctl/tune-all and uses
     # the 99-zzz- prefix so it sorts last and wins over any other conf.
     # No separate 99-greenboost.conf sysctl block here to avoid conflicting values.
@@ -2083,7 +2582,7 @@ HPEOF
     # The audit library (< 5 KB, no CUDA code) sits in /etc/ld.so.preload and
     # injects the full CUDA shim ONLY into processes that load libcuda.so or
     # libcudart.so.  PAM helpers, GDM, snap-confine, and every other non-CUDA
-    # process are never touched — AppArmor blast radius is one r/mr permission
+    # process are never touched - AppArmor blast radius is one r/mr permission
     # for the tiny audit stub, not the full shim.
     local audit_src="$MODULE_DIR/$AUDIT_LIB"
     local audit_dest="$SHIM_DEST/$AUDIT_LIB"
@@ -2092,10 +2591,10 @@ HPEOF
         ldconfig 2>/dev/null || true
         info "LD_AUDIT library installed: $audit_dest"
     else
-        warn "LD_AUDIT library not found at $audit_src — run 'make audit' first"
+        warn "LD_AUDIT library not found at $audit_src - run 'make audit' first"
     fi
 
-    # AppArmor abstraction — allows confined profiles to open the audit stub
+    # AppArmor abstraction - allows confined profiles to open the audit stub
     # (and the full shim, but only in CUDA processes).
     #
     # What this does (in plain language):
@@ -2105,38 +2604,99 @@ HPEOF
     #   and the GPU memory expansion would do nothing.
     #
     # Strategy (two layers for complete coverage):
-    #   A) Inject into abstractions/base  — any profile that includes <abstractions/base>
+    #   A) Inject into abstractions/base  - any profile that includes <abstractions/base>
     #      (the vast majority) automatically inherits the permission.  New profiles
     #      installed by apt/snap are covered without re-running setup.
-    #   B) Dynamic scan of all profiles in /etc/apparmor.d/ — catches profiles that
+    #   B) Dynamic scan of all profiles in /etc/apparmor.d/ - catches profiles that
     #      don't use <abstractions/base> (e.g. ubuntu_pro_*, wsdd, lsblk, lsusb).
     #      snap-confine is skipped: snapd overwrites its profile on every update.
     local aa_dir="/etc/apparmor.d/abstractions"
     local aa_src="$MODULE_DIR/apparmor/abstractions/greenboost-audit"
     local aa_dest="$aa_dir/greenboost-audit"
-    if [[ -d "$aa_dir" && -f "$aa_src" ]]; then
+
+    # AppArmor injection is OPT-IN since v2.10.  Reason: the snap-confine
+    # patch breaks snapd's self-integrity check (`snap-confine has elevated
+    # permissions and is not confined but should be - refusing to continue`),
+    # which makes every snap app - Firefox, VSCode, Slack, etc. - refuse to
+    # launch.  GreenBoost itself does not need AppArmor permissions: the
+    # standard pipeline scripts (art_wizard.sh, factory.sh) set LD_PRELOAD
+    # explicitly when launching CUDA workloads, which works without any
+    # AppArmor changes for unconfined processes.  Set GB_APPARMOR_INSTALL=1
+    # to opt back in if you genuinely need confined snap apps to load the
+    # shim (rare - most users do not).
+    if [[ "${GB_APPARMOR_INSTALL:-0}" != "1" ]]; then
         echo -e ""
-        echo -e "  ${C_VIOLET}◈${C_RESET}  ${C_GRAY}${C_BOLD}Security sandbox (AppArmor)${C_RESET}"
-        echo -e "  ${C_DIM}  Granting GPU apps permission to use GreenBoost.${C_RESET}"
-        echo -e "  ${C_DIM}  This is safe — we only add the minimum read permission needed.${C_RESET}"
+        echo -e "  ${C_DIM}◈ AppArmor injection skipped (default since v2.10).${C_RESET}"
+        echo -e "  ${C_DIM}  Set GB_APPARMOR_INSTALL=1 to re-enable - only needed if you${C_RESET}"
+        echo -e "  ${C_DIM}  want confined snap apps to load libgreenboost_audit.so.${C_RESET}"
+    elif [[ -d "$aa_dir" && -f "$aa_src" ]]; then
+        echo -e ""
+        echo -e "  ${C_VIOLET}◈${C_RESET}  ${C_GRAY}${C_BOLD}Security sandbox (AppArmor) - OPT-IN${C_RESET}"
+        echo -e "  ${C_DIM}  GB_APPARMOR_INSTALL=1 detected - installing audit abstraction.${C_RESET}"
+        echo -e "  ${C_AMBER}  WARNING: this WILL break snap apps until snap-confine's profile${C_RESET}"
+        echo -e "  ${C_AMBER}  state stabilises.  Run \`sudo greenboost apparmor-uninstall\` to revert.${C_RESET}"
         echo -e ""
 
         cp "$aa_src" "$aa_dest"
         gb_ok "AppArmor abstraction installed"
 
-        # Layer A — inject into abstractions/base for global coverage
+        # Layer A - inject into abstractions/base for global coverage
         local base_abs="/etc/apparmor.d/abstractions/base"
         if [[ -f "$base_abs" ]] && ! grep -q "greenboost-audit" "$base_abs"; then
             sed -i '/^  abi <abi\//a\  #include <abstractions\/greenboost-audit>' "$base_abs"
-            gb_ok "Added to abstractions/base — all new apps auto-covered"
+            gb_ok "Added to abstractions/base - all new apps auto-covered"
         else
             gb_info "abstractions/base already includes greenboost-audit (skip)"
         fi
 
-        # Layer B — dynamic scan: patch profiles that don't inherit from base.
+        # snap-confine local override - snapd overwrites the main profile on every
+        # update, so we inject into the local/ override file instead, which is
+        # never touched by snapd.  Without this, snap apps that load CUDA trigger
+        # AppArmor denials for libgreenboost_audit.so (mmap permission denied).
+        local sc_local="/etc/apparmor.d/local/usr.lib.snapd.snap-confine.real"
+        if [[ -d "/etc/apparmor.d/local" ]]; then
+            if ! grep -q "libgreenboost_audit" "$sc_local" 2>/dev/null; then
+                {
+                    echo "# GreenBoost: allow snap-confine to mmap the LD_AUDIT stub"
+                    echo "/usr/local/lib/libgreenboost_audit.so mr,"
+                    echo "/usr/local/lib/x86_64-linux-gnu/libgreenboost_audit.so mr,"
+                } >> "$sc_local"
+                gb_ok "snap-confine local override: audit library mmap allowed"
+            else
+                gb_info "snap-confine local override already set (skip)"
+            fi
+        fi
+
+        # snap-confine inside snapd snap - the snap ships its own confined binary
+        # (/snap/snapd/NNNN/usr/lib/snapd/snap-confine) whose AppArmor profile is
+        # stored in /var/lib/snapd/apparmor/profiles/ and loaded by snapd directly
+        # (not by apparmor_parser from /etc/apparmor.d/).  The local/ override
+        # above only affects the system binary.  Patch the snapd snap profile too.
+        local _snapd_profile
+        _snapd_profile=$(find /var/lib/snapd/apparmor/profiles/ \
+            -name "snap-confine.snapd.*" -o -name "snap-confine.*" 2>/dev/null \
+            | head -1)
+        if [[ -n "$_snapd_profile" ]]; then
+            if ! grep -q "libgreenboost_audit" "$_snapd_profile" 2>/dev/null; then
+                {
+                    echo ""
+                    echo "# GreenBoost: allow snap-confine (snapd snap) to mmap audit stub"
+                    echo "/usr/local/lib/libgreenboost_audit.so mr,"
+                    echo "/usr/local/lib/x86_64-linux-gnu/libgreenboost_audit.so mr,"
+                } >> "$_snapd_profile"
+                apparmor_parser -r "$_snapd_profile" 2>/dev/null && \
+                    gb_ok "snapd snap-confine profile patched and reloaded: $(basename "$_snapd_profile")" || \
+                    gb_warn "snapd snap-confine profile patched but reload failed (will apply on next snapd start)"
+            else
+                gb_info "snapd snap-confine profile already patched (skip)"
+            fi
+        fi
+
+        # Layer B - dynamic scan: patch profiles that don't inherit from base.
         # Skip: sub-directories, abstractions, tunables, disable, force-complain,
         #        local overrides, abi files, ldd (inlines base), and snap-confine
-        #        (snapd manages and overwrites it on every snapd upgrade).
+        #        (snapd manages and overwrites the main profile on every upgrade;
+        #         handled above via the persistent local/ override instead).
         #
         # Collect profile list first so we can show N/total progress.
         local _profiles=()
@@ -2180,153 +2740,37 @@ HPEOF
         apparmor_parser -r /etc/apparmor.d/ 2>/dev/null &
         gb_spin $! "Reloading AppArmor rules..."
     else
-        [[ -d "$aa_dir" ]] || gb_info "AppArmor not active on this system — skipping"
+        [[ -d "$aa_dir" ]] || gb_info "AppArmor not active on this system - skipping"
     fi
-
-    # 7b. Gaming PAM limits — allow video group to nice -5 (game process elevation)
-    # Written here so the Proton wrapper's os.setpriority(PRIO_PROCESS, 0, -5) succeeds
-    # without requiring the game to run as root.  Users in the video group (which GPU
-    # users already are for /dev/greenboost access) inherit this limit automatically.
-    mkdir -p /etc/security/limits.d
-    cat > /etc/security/limits.d/99-greenboost-gaming.conf << 'LIMITSEOF'
-# GreenBoost gaming process priority — allow video group members to elevate games
-# to nice -5 so the game process runs above nice-0 background tasks.
-# The GreenBoost Proton wrapper calls os.setpriority(PRIO_PROCESS, 0, -5) which
-# requires the effective nice ceiling set here.
-@video  hard  nice  -5
-@video  soft  nice  -5
-LIMITSEOF
-    gb_ok "Gaming PAM limits: /etc/security/limits.d/99-greenboost-gaming.conf"
-
-    # 8. Gaming / Vulkan shader boost service
-    cmd_install_shader_boost
 
     # 8b. Idle memory reclaim daemon
     cmd_install_idle_reclaim
 
-    # 9. Vulkan implicit layer (VK_LAYER_GREENBOOST_memory)
-    cmd_install_vulkan_layer
-
-    # 10. Crash recovery services (greenboost-recovery + greenboost-sentinel)
+    # 9. Crash recovery services (greenboost-recovery + greenboost-sentinel)
     cmd_install_recovery
 
-    # 11. TurboQuant KV cache compression daemon
-    local _tq_src="$MODULE_DIR/cmd/greenboost-turboquant"
-    if [[ -d "$_tq_src" ]]; then
-        local _tq_dest="/usr/local/lib/greenboost/cmd/greenboost-turboquant"
-        mkdir -p "$_tq_dest"
-        cp "$_tq_src/"*.py "$_tq_dest/" 2>/dev/null || true
-        install -m 755 "$_tq_src/greenboost-turboquant" /usr/local/bin/greenboost-turboquant
-        install -m 644 "$_tq_src/greenboost-turboquant.service" /etc/systemd/system/greenboost-turboquant.service
-        systemctl daemon-reload
-        systemctl enable greenboost-turboquant.service 2>/dev/null || true
-        if lsmod | grep -q "^greenboost "; then
-            systemctl restart greenboost-turboquant.service 2>/dev/null || true
-        fi
-        gb_ok "TurboQuant daemon installed + enabled"
-    else
-        gb_info "TurboQuant daemon source not found at $_tq_src — skipping"
-    fi
+    # 10. LD_AUDIT / LD_PRELOAD shim injection (merged from install-llama-configs)
+    cmd_install_llama_configs
+
+    # 11. tmpfiles.d - Audit F-L4-06: mode 0775 (was 0777) with the `ollama`
+    #     group (or `root` if missing).  Ollama and the shim need to write
+    #     metrics/NVTX/phase here, but no unprivileged third-party user should.
+    local _tmpfiles_group="root"
+    if getent group ollama >/dev/null 2>&1; then _tmpfiles_group="ollama"; fi
+    printf 'd /run/greenboost 0775 root %s -\n' "$_tmpfiles_group" \
+        > /etc/tmpfiles.d/greenboost.conf
+    systemd-tmpfiles --create /etc/tmpfiles.d/greenboost.conf 2>/dev/null
+    gb_ok "tmpfiles.d/greenboost.conf installed - /run/greenboost mode 0775 root:${_tmpfiles_group}"
 
     echo ""
     info "System config installation complete."
-    warn "Restart Ollama to pick up new env vars: sudo systemctl restart ollama"
-}
-
-cmd_install_shader_boost() {
-    # Gaming / Vulkan Shader Compilation Boost
-    # ─────────────────────────────────────────
-    # Steam launches fossilize_replay (Proton VKD3D pipeline pre-compilation)
-    # at nice 10 (low priority), causing 168k-shader precompiles to take 60+ minutes.
-    # This daemon detects fossilize_replay worker processes and boosts them:
-    #   renice -5   → elevate above nice 0 background tasks
-    #   ionice -c2 -n0 → best-effort I/O, highest level
-    #   taskset 0-<pcores_max> → pin to P-cores (avoids E-core cache thrash)
-    # Safe to run root: only affects fossilize_replay owned by any user.
-    local boost_bin="/usr/local/bin/greenboost-shader-boost"
-    local boost_svc="/etc/systemd/system/greenboost-shader-boost.service"
-
-    cat > "$boost_bin" << 'SHADERBOOSTEOF'
-#!/bin/bash
-# GreenBoost Vulkan Shader Compilation Boost Daemon
-# Monitors for fossilize_replay workers (Steam/Proton pipeline pre-compilation)
-# and boosts them: renice -5, ionice best-effort/0, pin to P-cores.
-# Managed by greenboost-shader-boost.service (runs as root).
-
-# Detect highest P-core CPU number (Intel hybrid topology).
-# Primary: thread_siblings_list — CPU with "N-M" range = P-core (HyperThreaded).
-# Secondary: core_type integer 1=P when primary finds no P-cores.
-# Falls back to half of total CPUs for AMD or uniform Intel systems.
-pcores_max=0
-total_cpus_boost=$(nproc)
-for (( _i=0; _i < total_cpus_boost; _i++ )); do
-    _sib=$(cat "/sys/devices/system/cpu/cpu${_i}/topology/thread_siblings_list" 2>/dev/null)
-    [[ -z "$_sib" ]] && continue
-    [[ "$_sib" == *"-"* ]] || continue
-    (( _i > pcores_max )) && pcores_max=$_i
-done
-if (( pcores_max == 0 )); then
-    # Try core_type integer fallback (1=P-core)
-    for f in /sys/devices/system/cpu/cpu*/topology/core_type; do
-        [[ -r "$f" ]] || continue
-        [[ "$(< "$f")" == "1" ]] || continue
-        n=${f##*cpu}; n=${n%%/*}
-        (( n > pcores_max )) && pcores_max=$n
-    done
-fi
-(( pcores_max == 0 )) && pcores_max=$(( total_cpus_boost / 2 - 1 ))
-cpuset="0-${pcores_max}"
-
-declare -A seen
-
-while true; do
-    new_pids=()
-    while IFS= read -r pid; do
-        [[ -z "$pid" || -n "${seen[$pid]}" ]] && continue
-        seen[$pid]=1
-        new_pids+=("$pid")
-        renice    -n -5    -p "$pid" >/dev/null 2>&1
-        ionice    -c 2 -n 0 -p "$pid" >/dev/null 2>&1
-        taskset   -acp "$cpuset" "$pid" >/dev/null 2>&1
-    done < <(pgrep -f fossilize_replay 2>/dev/null)
-
-    if (( ${#new_pids[@]} > 0 )); then
-        logger -t greenboost-shader-boost "Detected fossilize_replay — boosting PIDs: ${new_pids[*]}"
-        logger -t greenboost-shader-boost "Applied: renice -5, ionice best-effort/0, taskset 0-${pcores_max}"
+    if systemctl is-active --quiet ollama.service 2>/dev/null; then
+        systemctl restart ollama.service 2>/dev/null \
+            && gb_ok "Ollama restarted - new env vars active" \
+            || warn "Ollama restart failed - run: sudo systemctl restart ollama"
     fi
-
-    # Prune dead PIDs from seen map
-    for pid in "${!seen[@]}"; do
-        [[ -d /proc/$pid ]] || unset "seen[$pid]"
-    done
-
-    sleep 1
-done
-SHADERBOOSTEOF
-    chmod +x "$boost_bin"
-
-    cat > "$boost_svc" << 'SHADERUNITEOF'
-[Unit]
-Description=GreenBoost Vulkan Shader Compilation Boost
-Documentation=https://gitlab.com/IsolatedOctopi/greenboost
-After=multi-user.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/greenboost-shader-boost
-Restart=always
-RestartSec=2
-Nice=0
-
-[Install]
-WantedBy=multi-user.target
-SHADERUNITEOF
-
-    systemctl daemon-reload
-    systemctl enable --now greenboost-shader-boost.service 2>/dev/null \
-        && gb_ok "Gaming boost service installed and running (fossilize_replay → renice -5 + P-cores)" \
-        || gb_warn_ui "Gaming boost service installed but failed to start — check: systemctl status greenboost-shader-boost"
 }
+
 
 cmd_install_idle_reclaim() {
     # GreenBoost Idle Memory Reclaim Daemon
@@ -2343,7 +2787,7 @@ cmd_install_idle_reclaim() {
     #   Systemd-managed services (Restart=always) restart automatically on demand.
     #
     # Note: abrupt termination (user kills the process, crash, Ctrl+C) is ALREADY
-    #   handled by the kernel — gb_close() fires regardless. This daemon only adds
+    #   handled by the kernel - gb_close() fires regardless. This daemon only adds
     #   the idle case where the process is still running but not being used.
     local reclaim_bin="/usr/local/bin/greenboost-idle-reclaim"
     local reclaim_svc="/etc/systemd/system/greenboost-idle-reclaim.service"
@@ -2357,7 +2801,7 @@ cmd_install_idle_reclaim() {
 # How it works:
 #   1. Watches /run/greenboost/phase (written by CUDA shim every 30 s).
 #   2. On DEEP_IDLE: confirms GPU compute utilization is 0% (avoids false triggers).
-#   3. Finds every process with /dev/greenboost open via fuser — these are the
+#   3. Finds every process with /dev/greenboost open via fuser - these are the
 #      only processes with active GreenBoost T2/T3 allocations.
 #   4. Sends SIGTERM. The process exits, kernel gb_close() fires automatically,
 #      all T2 DMA-BUF released. NVIDIA driver frees T1 VRAM (KV cache).
@@ -2410,24 +2854,24 @@ do_reclaim() {
     pids=$(gb_active_pids)
 
     if [[ -z "$pids" ]]; then
-        log "DEEP_IDLE (${idle_ms} ms): no active GreenBoost processes — memory already free"
+        log "DEEP_IDLE (${idle_ms} ms): no active GreenBoost processes - memory already free"
         return
     fi
 
-    log "DEEP_IDLE (${idle_ms} ms): reclaiming T1 VRAM + T2 RAM — PIDs: $(echo "$pids" | tr '\n' ' ')"
+    log "DEEP_IDLE (${idle_ms} ms): reclaiming T1 VRAM + T2 RAM - PIDs: $(echo "$pids" | tr '\n' ' ')"
 
     for pid in $pids; do
         [[ -d /proc/$pid ]] || continue
         local comm
         comm=$(cat /proc/"$pid"/comm 2>/dev/null || echo unknown)
 
-        # Ollama: prefer REST API — service stays alive and auto-reloads on next request
+        # Ollama: prefer REST API - service stays alive and auto-reloads on next request
         if [[ "$comm" == "ollama"* ]]; then
             log "PID ${pid} (${comm}): using Ollama REST API for graceful unload"
             if ollama_unload_all; then
                 continue
             fi
-            log "PID ${pid} (${comm}): REST API failed — falling back to SIGTERM"
+            log "PID ${pid} (${comm}): REST API failed - falling back to SIGTERM"
         fi
 
         # Universal path: SIGTERM → process exits → kernel gb_close() runs automatically
@@ -2435,7 +2879,7 @@ do_reclaim() {
         # → NVIDIA driver frees T1 VRAM when CUDA context refcount → 0
         # Systemd-managed processes (Restart=always) restart when next request arrives.
         if kill -TERM "$pid" 2>/dev/null; then
-            log "PID ${pid} (${comm}): SIGTERM sent — kernel will free T2 on exit"
+            log "PID ${pid} (${comm}): SIGTERM sent - kernel will free T2 on exit"
         else
             log "PID ${pid} (${comm}): already exited or no permission (OK)"
         fi
@@ -2471,13 +2915,13 @@ while true; do
         IDLE)
             gpu_zero_streak=0
             [[ "$last_phase" != "IDLE" ]] \
-                && log "IDLE phase — monitoring (reclaim at DEEP_IDLE after GPU confirms 0%)"
+                && log "IDLE phase - monitoring (reclaim at DEEP_IDLE after GPU confirms 0%)"
             last_phase="IDLE"
             ;;
         MODEL_LOAD|INFERENCE|STEADY)
             gpu_zero_streak=0
             [[ "$last_phase" == "DEEP_IDLE" || "$last_phase" == "IDLE" ]] \
-                && log "Activity resumed (phase=${phase}) — standing by"
+                && log "Activity resumed (phase=${phase}) - standing by"
             last_phase="$phase"
             ;;
         INIT)
@@ -2500,6 +2944,7 @@ Type=simple
 ExecStart=/usr/local/bin/greenboost-idle-reclaim
 Restart=always
 RestartSec=5
+TimeoutStopSec=10
 Environment=GREENBOOST_OLLAMA_URL=http://127.0.0.1:11434
 
 [Install]
@@ -2507,51 +2952,17 @@ WantedBy=multi-user.target
 RECLAIMUNITEOF
 
     systemctl daemon-reload
-    systemctl enable --now greenboost-idle-reclaim.service 2>/dev/null \
-        && gb_ok "Idle reclaim daemon installed and running (T1+T2 freed after ~17 min idle, all frameworks)" \
-        || gb_warn_ui "Idle reclaim daemon installed but failed to start — check: systemctl status greenboost-idle-reclaim"
+    gb_ok "Idle reclaim daemon installed (not auto-enabled)"
+    gb_info "Enable manually if needed: systemctl enable --now greenboost-idle-reclaim.service"
 }
 
 # ── clean-memory ──────────────────────────────────────────────────────────────
 # Force-release T1 VRAM + T2 RAM + T3 NVMe immediately.
 # Framework-agnostic: finds every process with /dev/greenboost open via fuser,
-# cmd_gaming_mode — stop/start Ollama to free T2 DDR before/after gaming.
+# cmd_gaming_mode - stop/start Ollama to free T2 DDR before/after gaming.
 # When OLLAMA_KEEP_ALIVE=-1 a loaded model stays pinned in T2 DDR indefinitely.
 # Combined RAM pressure (model + game + OS) can push free RAM below safety_reserve_gb,
 # triggering the OOM guard and crashing the game.  Stopping Ollama releases all T2 pages.
-cmd_gaming_mode() {
-    local action="${1:-}"
-    case "$action" in
-        enable|start)
-            need_root gaming-mode
-            gb_header
-            gb_info "Gaming mode: suspending AI inference..."
-            systemctl start greenboost-gaming.service
-            gb_ok "Gaming mode active — Ollama suspended, T2 DDR freed for gaming"
-            echo ""
-            gb_info "GreenBoost Proton activates this automatically on game launch."
-            gb_info "Run ${C_LIME}sudo greenboost gaming-mode disable${C_RESET} when done."
-            ;;
-        disable|stop)
-            need_root gaming-mode
-            gb_header
-            gb_info "Gaming mode: restoring AI inference..."
-            systemctl stop greenboost-gaming.service
-            gb_ok "AI inference restored — Ollama running"
-            ;;
-        *)
-            gb_header
-            echo -e "  ${C_BOLD}Usage:${C_RESET}"
-            echo -e "    ${C_LIME}sudo greenboost gaming-mode enable${C_RESET}   — suspend Ollama before gaming"
-            echo -e "    ${C_LIME}sudo greenboost gaming-mode disable${C_RESET}  — restore Ollama after gaming"
-            echo ""
-            gb_info "GreenBoost Proton triggers this automatically on game launch."
-            gb_info "When Ollama is suspended, pinned T2 DDR pages are freed, giving"
-            gb_info "the game full access to system RAM without OOM guard pressure."
-            ;;
-    esac
-}
-
 # prefers Ollama REST API when Ollama is among them, sends SIGTERM to everything else.
 # The kernel's gb_close() → gb_release_pid_buffers() frees T2 DMA-BUF on exit.
 cmd_t3_memory() {
@@ -2562,16 +2973,16 @@ cmd_t3_memory() {
         return 1
     fi
 
-    # Parse value — strip suffix, allow G/GB/g
+    # Parse value - strip suffix, allow G/GB/g
     local cap_gb
     cap_gb=$(echo "$raw" | sed 's/[Gg][Bb]*$//' | tr -d ' ')
     if ! [[ "$cap_gb" =~ ^[0-9]+$ ]]; then
-        die "Invalid size '$raw' — expected a number in GB (e.g. 100GB or 100)"
+        die "Invalid size '$raw' - expected a number in GB (e.g. 100GB or 100)"
     fi
     local cap_mb=$(( cap_gb * 1024 ))
 
     if [[ ! -e /dev/greenboost ]]; then
-        die "GreenBoost kernel module not loaded — run: sudo greenboost load"
+        die "GreenBoost kernel module not loaded - run: sudo greenboost load"
     fi
 
     gb_header
@@ -2593,7 +3004,7 @@ except Exception as e:
     print("ERR:" + str(e), file=sys.stderr)
     sys.exit(1)
 PYEOF
-) || die "Failed to set T3 cap — are you root? (run with sudo)"
+) || die "Failed to set T3 cap - are you root? (run with sudo)"
 
     if [[ "$cap_gb" -eq 0 ]]; then
         gb_ok "T3 pool set to disk-limited (unlimited); was ${prev_mb} MB"
@@ -2611,7 +3022,11 @@ PYEOF
         sed -i "s/GREENBOOST_VIRTUAL_VRAM_MB=[0-9]*/GREENBOOST_VIRTUAL_VRAM_MB=${total_virtual_mb}/" "$svc_drop"
         gb_info "Updated GREENBOOST_VIRTUAL_VRAM_MB=${total_virtual_mb} MB in Ollama service drop-in"
         systemctl daemon-reload
-        gb_info "Restart Ollama to apply: sudo systemctl restart ollama"
+        if systemctl is-active --quiet ollama.service 2>/dev/null; then
+            systemctl restart ollama.service 2>/dev/null \
+                && gb_ok "Ollama restarted - GREENBOOST_VIRTUAL_VRAM_MB active" \
+                || warn "Ollama restart failed - run: sudo systemctl restart ollama"
+        fi
     fi
 
     # Show new T3 stats
@@ -2623,6 +3038,10 @@ PYEOF
 }
 
 cmd_clean_memory() {
+    # Deprecated: unified into cmd_clear_memory_pool (greenboost clear memory-pool)
+    gb_warn_ui "Note: 'greenboost clean memory' is deprecated - use 'greenboost clear memory-pool'"
+    cmd_clear_memory_pool
+    return
     local ollama_base="${GREENBOOST_OLLAMA_URL:-http://127.0.0.1:11434}"
 
     gb_header
@@ -2651,7 +3070,7 @@ cmd_clean_memory() {
         gb_info "No active GreenBoost processes found"
         if [[ $(cat /sys/class/greenboost/greenboost/active_buffers 2>/dev/null) == "0" ]] \
             || [[ ! -e /dev/greenboost ]]; then
-            gb_info "T2 pool is empty — memory already free"
+            gb_info "T2 pool is empty - memory already free"
             return 0
         fi
     fi
@@ -2665,7 +3084,7 @@ cmd_clean_memory() {
         local comm
         comm=$(cat /proc/"$pid"/comm 2>/dev/null || echo unknown)
 
-        # Ollama: REST API unload — cleaner, service stays alive, auto-reloads on next request
+        # Ollama: REST API unload - cleaner, service stays alive, auto-reloads on next request
         if [[ "$comm" == "ollama"* ]]; then
             local models
             models=$(curl -sf --max-time 5 "${ollama_base}/api/ps" 2>/dev/null \
@@ -2691,10 +3110,10 @@ cmd_clean_memory() {
 
         # Universal: SIGTERM → process exits → kernel frees all its T2 DMA-BUF automatically
         if kill -TERM "$pid" 2>/dev/null; then
-            gb_ok "Stopped: ${comm} (PID ${pid}) — kernel freeing T2 DMA-BUF"
+            gb_ok "Stopped: ${comm} (PID ${pid}) - kernel freeing T2 DMA-BUF"
             (( reclaimed++ ))
         else
-            gb_warn_ui "Could not signal PID ${pid} (${comm}) — may need sudo"
+            gb_warn_ui "Could not signal PID ${pid} (${comm}) - may need sudo"
         fi
     done
 
@@ -2726,329 +3145,7 @@ cmd_clean_memory() {
         printf "  ${C_CYAN}◈${C_RESET}  GreenBoost pool : %s\n" "$brief"
     fi
     echo ""
-    gb_ok "Memory reclaim complete — inference apps reload on next request"
-}
-
-cmd_install_vulkan_layer() {
-    # VK_LAYER_GREENBOOST_memory — implicit Vulkan layer
-    # ───────────────────────────────────────────────────
-    # Inflates the device-local heap reported to Vulkan games to match the
-    # virtual VRAM the CUDA shim reports (auto-detected from kernel module params),
-    # so games choose maximum quality presets and never self-limit based on VRAM.
-    # On VK_ERROR_OUT_OF_DEVICE_MEMORY (allocs ≥ 64 MB), attempts a fallback
-    # through GreenBoost T2 DDR via DMA-BUF import (VK_KHR_external_memory_fd).
-    #
-    # Activated on demand: GREENBOOST_VULKAN=1 %command% in Steam launch options.
-    # Zero cost for all other Vulkan applications when the env var is absent.
-
-    local layer_src="$MODULE_DIR/$VULKAN_LAYER_LIB"
-    local layer_dest="$SHIM_DEST/$VULKAN_LAYER_LIB"
-    local manifest_src="$MODULE_DIR/$VULKAN_LAYER_MANIFEST"
-    local manifest_dest="$VULKAN_IMPLICIT_LAYER_DIR/$VULKAN_LAYER_MANIFEST"
-
-    if [[ ! -f "$layer_src" ]]; then
-        gb_warn_ui "Vulkan layer not built — run 'make vulkan' first, then re-run install-sys-configs"
-        return 0
-    fi
-
-    mkdir -p "$VULKAN_IMPLICIT_LAYER_DIR"
-    cp "$layer_src" "$layer_dest"
-    cp "$manifest_src" "$manifest_dest"
-    ldconfig
-
-    gb_ok "Vulkan layer installed — use GREENBOOST_VULKAN=1 %command% in Steam launch options"
-}
-
-cmd_fix_steam() {
-    need_root fix-steam
-
-    # ── 1. System-level: Steam launch wrapper (GTK2/XIM SIGBUS fix) ──────────
-    local wrapper="/usr/local/bin/greenboost-steam"
-    gb_step "Installing Steam launch wrapper → $wrapper"
-
-    cat > "$wrapper" << 'STEAMEOF'
-#!/usr/bin/env bash
-# GreenBoost Steam wrapper — prevents SIGBUS from broken GTK2 theme + XIM failure.
-# GTK2_RC_FILES=/dev/null  : bypasses Yaru-purple-dark (contains GTK3 syntax at main.rc:775)
-# XMODIFIERS=""            : suppresses XOpenIM() so GTK2 does not enter degraded state
-export GTK2_RC_FILES=/dev/null
-export XMODIFIERS=""
-# Forward WAYLAND_DISPLAY when launched from a .desktop entry (session manager
-# may not export it).  Without this, PROTON_ENABLE_WAYLAND=1 silently falls
-# back to X11 because winewayland.drv checks WAYLAND_DISPLAY at init time.
-if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
-    for _wd in /run/user/"$(id -u)"/wayland-0 /run/user/"$(id -u)"/wayland-1; do
-        [[ -S "$_wd" ]] && export WAYLAND_DISPLAY="${_wd##*/}" && break
-    done
-fi
-exec /usr/bin/steam "$@"
-STEAMEOF
-    chmod 755 "$wrapper"
-    gb_ok "Wrapper installed: greenboost-steam"
-
-    echo ""
-    info "Launch Steam with: ${C_CYAN}greenboost-steam${C_RESET}"
-}
-
-cmd_proton_clean() {
-    # Removes every entry from Steam's compatibilitytools.d except greenboost-proton
-    # and LegacyRuntime (the Steam-internal entry).  Stale custom builds can cause
-    # Steam to fail loading manifests and appear as ghost entries in the compat tool list.
-    local _removed=0
-    for _compat_dir in \
-        "$HOME/.local/share/Steam/compatibilitytools.d" \
-        "$HOME/.steam/root/compatibilitytools.d"
-    do
-        [[ -d "$_compat_dir" ]] || continue
-        for _tool in "$_compat_dir"/*/; do
-            [[ -d "$_tool" ]] || continue
-            local _name
-            _name=$(basename "$_tool")
-            case "$_name" in
-                greenboost-proton|LegacyRuntime) continue ;;
-            esac
-            rm -rf "$_tool"
-            gb_ok "Removed: ${C_DIM}$_name${C_RESET}"
-            _removed=1
-        done
-    done
-    (( _removed )) || gb_info "Nothing to remove — only greenboost-proton present."
-    gb_info "Restart Steam to apply changes."
-}
-
-# ── cmd_install_proton ────────────────────────────────────────────────
-# Gaming wizard entry point.  Runs as root (need_root) so it can write system
-# files, then drops back to the real user for the Steam-level symlink.
-#
-# What it does:
-#   1. Removes all previous GreenBoost Proton versions (legacy + current names)
-#      from both Steam compat tool directories.
-#   2. Installs the 32-bit audit stub to the i386 multiarch path and updates
-#      /etc/ld.so.preload to use the library name (not a hard path) so that
-#      the dynamic linker resolves the correct ELF class per process automatically
-#      — eliminating the ELFCLASS64 "ignored" spam from 32-bit Steam components.
-#   3. Installs GreenBoost Proton as a Steam compat tool symlink.
-#      GREENBOOST_VULKAN=1 is set automatically by the proton script on every
-#      launch — no Steam launch options are required.
-cmd_install_proton() {
-    need_root install-proton
-
-    local real_user="${SUDO_USER:-$USER}"
-    local user_home
-    user_home="$(eval echo "~${real_user}")"
-
-    gb_section "GreenBoost Proton"
-
-    # ── 1. Full uninstall of any previous version ─────────────────────────────
-    # Run the complete uninstall routine so that system-level artifacts (audit
-    # libs, /etc/ld.so.preload entry, systemd unit, polkit rule) and user-level
-    # compat-tool directories are all removed before the fresh install begins.
-    gb_step "Running pre-install cleanup of any previous GreenBoost Proton version..."
-    cmd_uninstall_proton
-
-    # ── 2. Fix libgreenboost_audit.so ELFCLASS mismatch ──────────────────────
-    # /etc/ld.so.preload processes every spawned process (including 32-bit ones).
-    # Using a bare library name lets glibc's ldconfig cache resolve the right
-    # ELF class per architecture — no more ELFCLASS64 errors in 32-bit processes.
-    gb_step "Installing multiarch audit stubs..."
-
-    # Remove any existing audit preload entry NOW — before spawning cp — so that
-    # child processes don't inherit a stale/mismatched libgreenboost_audit.so via
-    # /etc/ld.so.preload.  A broken preloaded library causes every spawned child
-    # (including cp itself) to SIGSEGV before it can do any useful work.
-    # The new $LIB-based entry is written back below, after both copies succeed.
-    if [[ -f /etc/ld.so.preload ]]; then
-        sed -i '/libgreenboost_audit/d' /etc/ld.so.preload
-    fi
-
-    local audit64_src="$MODULE_DIR/$AUDIT_LIB"
-    local audit32_src="$MODULE_DIR/$AUDIT_LIB32"
-    local dest64="/usr/local/lib/x86_64-linux-gnu"
-    local dest32="/usr/local/lib/i386-linux-gnu"
-
-    if [[ -f "$audit64_src" ]]; then
-        mkdir -p "$dest64"
-        local _tmp64="${dest64}/libgreenboost_audit.so.new"
-        if cp "$audit64_src" "$_tmp64" && mv "$_tmp64" "${dest64}/libgreenboost_audit.so"; then
-            gb_info "64-bit: ${C_DIM}${dest64}/libgreenboost_audit.so${C_RESET}"
-        else
-            rm -f "$_tmp64"
-            gb_warn_ui "Could not install 64-bit audit library — run 'make audit' and retry"
-        fi
-    fi
-
-    if [[ -f "$audit32_src" ]]; then
-        mkdir -p "$dest32"
-        local _tmp32="${dest32}/libgreenboost_audit.so.new"
-        if cp "$audit32_src" "$_tmp32" && mv "$_tmp32" "${dest32}/libgreenboost_audit.so"; then
-            gb_info "32-bit: ${C_DIM}${dest32}/libgreenboost_audit.so${C_RESET}"
-        else
-            rm -f "$_tmp32"
-            gb_warn_ui "32-bit stub not found or copy failed — run 'make audit32' and retry"
-        fi
-    else
-        gb_warn_ui "32-bit stub not found at $audit32_src — run 'make audit32' to build it"
-    fi
-
-    # Refresh ldconfig so both arch versions are indexed
-    ldconfig 2>/dev/null || true
-
-    # Update /etc/ld.so.preload: use $LIB token so glibc expands to the correct
-    # multiarch path per ELF class before open():
-    #   64-bit → /usr/local/lib/x86_64-linux-gnu/libgreenboost_audit.so
-    #   32-bit → /usr/local/lib/i386-linux-gnu/libgreenboost_audit.so
-    # Both libraries are installed (make audit + make audit32). $LIB is resolved
-    # to a full absolute path by the dynamic linker before open(), so it works in
-    # AppArmor-confined namespaces without relying on ldconfig.
-    # Single-quotes prevent shell expansion here — $LIB must appear literally in
-    # ld.so.preload for glibc to expand it at process-load time.
-    echo '/usr/local/$LIB/libgreenboost_audit.so' >> /etc/ld.so.preload
-    gb_ok "ld.so.preload updated (\$LIB multiarch)"
-
-    # Sync updated AppArmor abstraction so the multiarch path is allowed.
-    # install-sys-configs deploys the abstraction from the repo, but a user who
-    # ran install-sys-configs before install-steam has the old file on disk
-    # (only /usr/local/lib/ path, missing x86_64-linux-gnu/).  Redeploy and
-    # reload so confined processes (unix-chkpwd, lsblk, dig, …) stop getting
-    # DENIED in the audit log.
-    local aa_src="$MODULE_DIR/apparmor/abstractions/greenboost-audit"
-    local aa_dest="/etc/apparmor.d/abstractions/greenboost-audit"
-    if [[ -f "$aa_src" && -d /etc/apparmor.d/abstractions ]]; then
-        cp "$aa_src" "$aa_dest"
-        apparmor_parser -r /etc/apparmor.d/ 2>/dev/null &
-        gb_spin $! "Reloading AppArmor rules (multiarch paths)..."
-        gb_ok "AppArmor abstraction updated — multiarch paths now allowed"
-    fi
-
-    # ── 3. Install GreenBoost Proton compat tool ─────────────────────
-    local proton_installer="$MODULE_DIR/greenboost_proton/install.sh"
-    if [[ ! -f "$proton_installer" ]]; then
-        gb_warn_ui "Installer not found: $proton_installer"
-        return 1
-    fi
-
-    gb_step "Installing GreenBoost Proton..."
-    # Run as the real user so the symlink lands in their Steam directory
-    sudo -u "$real_user" bash "$proton_installer"
-
-    # ── 4. Install greenboost-gaming.service + polkit rule ────────────────────
-    # greenboost-gaming.service stops Ollama on start and restores it on stop.
-    # The proton script calls systemctl start/stop without sudo — the polkit rule
-    # grants any active local user permission to control this specific service.
-    gb_step "Installing gaming mode service and polkit rule..."
-
-    cat > /etc/systemd/system/greenboost-gaming.service << 'GAMINGEOF'
-[Unit]
-Description=GreenBoost Gaming Mode — suspend AI inference during gaming session
-After=ollama.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/bin/systemctl stop ollama.service
-ExecStop=/usr/bin/systemctl start ollama.service
-
-[Install]
-WantedBy=multi-user.target
-GAMINGEOF
-
-    mkdir -p /etc/polkit-1/rules.d
-    cat > /etc/polkit-1/rules.d/50-greenboost-gaming.rules << 'POLKITEOF'
-/* GreenBoost: allow any active local user to start/stop greenboost-gaming.service
- * without a password prompt.  This lets the Proton script trigger gaming mode
- * automatically on game launch without requiring sudo. */
-polkit.addRule(function(action, subject) {
-    if (action.id == "org.freedesktop.systemd1.manage-units" &&
-        action.lookup("unit") == "greenboost-gaming.service" &&
-        subject.local && subject.active) {
-        return polkit.Result.YES;
-    }
-});
-POLKITEOF
-
-    systemctl daemon-reload
-    gb_ok "Gaming mode service installed (auto gaming-mode on Proton launch)"
-    cmd_fix_steam
-    cmd_steam_launch_info
-
-}
-
-cmd_uninstall_proton() {
-    local real_user="${SUDO_USER:-$USER}"
-    local user_home
-    user_home="$(eval echo "~${real_user}")"
-
-    # ── 1. Remove user-level compat tool directory ────────────────────────────
-    local proton_installer="$MODULE_DIR/greenboost_proton/install.sh"
-    if [[ -f "$proton_installer" ]]; then
-        sudo -u "$real_user" bash "$proton_installer" --uninstall
-    else
-        # Fallback: remove known install paths directly
-        local _removed=0
-        for _d in \
-            "${user_home}/.local/share/Steam/compatibilitytools.d/greenboost-proton" \
-            "${user_home}/.steam/root/compatibilitytools.d/greenboost-proton" \
-            "${user_home}/.local/share/Steam/compatibilitytools.d/greenboost-proton-wayland" \
-            "${user_home}/.steam/root/compatibilitytools.d/greenboost-proton-wayland"
-        do
-            if [[ -L "$_d" || -d "$_d" ]]; then
-                rm -rf "$_d"
-                gb_ok "Removed: ${C_DIM}$_d${C_RESET}"
-                _removed=1
-            fi
-        done
-        (( _removed )) || gb_info "No compat tool directories found."
-    fi
-
-    # ── 1b. Remove user-local Vulkan layer files (installed by install-proton) ──
-    for _vkf in \
-        "${user_home}/.local/share/vulkan/libVkLayer_greenboost.so" \
-        "${user_home}/.local/share/vulkan/implicit_layer.d/VkLayer_greenboost.json"
-    do
-        if [[ -f "$_vkf" ]]; then
-            rm -f "$_vkf"
-            gb_ok "Removed: ${C_DIM}$_vkf${C_RESET}"
-        fi
-    done
-
-    # ── 2. Remove system-level artifacts installed by install-proton ──
-    # gaming service + polkit rule
-    for _f in \
-        /etc/systemd/system/greenboost-gaming.service \
-        /etc/polkit-1/rules.d/50-greenboost-gaming.rules
-    do
-        if [[ -f "$_f" ]]; then
-            local _svcname; _svcname=$(basename "$_f")
-            # Disable service before removing
-            [[ "$_f" == *.service ]] && systemctl disable --now "$_svcname" 2>/dev/null || true
-            rm -f "$_f"
-            gb_ok "Removed: ${C_DIM}$_f${C_RESET}"
-        fi
-    done
-    systemctl daemon-reload 2>/dev/null || true
-
-    # multiarch audit libraries (installed into multiarch paths by install-proton)
-    # Remove the $LIB-based preload entry first — unconditionally — so that no
-    # child process inherits a stale reference even if the .so files are already gone.
-    if [[ -f /etc/ld.so.preload ]] && grep -q 'libgreenboost_audit' /etc/ld.so.preload; then
-        sed -i '/libgreenboost_audit/d' /etc/ld.so.preload
-    fi
-
-    local _audit_removed=0
-    for _lib in \
-        /usr/local/lib/x86_64-linux-gnu/libgreenboost_audit.so \
-        /usr/local/lib/i386-linux-gnu/libgreenboost_audit.so
-    do
-        if [[ -f "$_lib" ]]; then
-            rm -f "$_lib"
-            (( _audit_removed++ )) || true
-            gb_info "Removed audit lib: ${C_DIM}$_lib${C_RESET}"
-        fi
-    done
-    ldconfig 2>/dev/null || true
-    gb_ok "Audit libraries removed and ldconfig refreshed"
-
-    gb_ok "GreenBoost Proton uninstalled. Restart Steam to apply."
+    gb_ok "Memory reclaim complete - inference apps reload on next request"
 }
 
 cmd_install_llama_configs() {
@@ -3056,28 +3153,50 @@ cmd_install_llama_configs() {
 
     local audit_path="$SHIM_DEST/$AUDIT_LIB"
 
-    # /etc/ld.so.preload — place the tiny LD_AUDIT library (NOT the full shim).
-    # The audit library fires la_objopen() and injects the full shim only into
-    # processes that load libcuda.so or libcudart.so — zero AppArmor blast radius
-    # on non-CUDA confined processes (GDM, PAM, snap-confine).
+    # /etc/ld.so.preload - ordered list of three GreenBoost libraries:
+    #
+    # 1. libgreenboost_vmm_override.so  (FIRST - Blackwell VMM PLT fix)
+    # 2. libgreenboost_cuda.so          (full CUDA shim - memory inflation etc.)
+    # 3. libgreenboost_audit.so         (LD_AUDIT - CUDA-process injection)
+    #
+    # WHY libgreenboost_vmm_override.so must be FIRST:
+    #   libcuda.so.1 exports cuDeviceGetAttribute and cuMemAddressReserve as BARE
+    #   UNVERSIONED symbols.  The CUDA shim exports them as @@GB_HOOKS (versioned).
+    #   glibc explicitly PREFERS unversioned definitions for unversioned PLT
+    #   references - so libcuda always wins the PLT race over the shim regardless
+    #   of ld.so.preload order.  The VMM override library also exports these symbols
+    #   as BARE UNVERSIONED and is loaded BEFORE libcuda enters the link map, so
+    #   glibc finds OUR unversioned definition first.  On Blackwell (cc >= 12) it
+    #   zeroes the VMM_SUPPORTED attribute, forcing ggml-cuda to select pool_leg
+    #   (cudaMalloc-based) whose overflow routes through managed-UVM (SM-accessible).
     if [[ ! -f "$audit_path" ]]; then
-        warn "LD_AUDIT library not found at $audit_path — run 'make audit' and re-run this command"
+        warn "LD_AUDIT library not found at $audit_path - run 'make audit' and re-run this command"
         return 1
     fi
 
-    # Remove any legacy full-shim entry from prior installs
-    if [[ -f /etc/ld.so.preload ]] && grep -q "$SHIM_LIB" /etc/ld.so.preload; then
-        sed -i "/$SHIM_LIB/d" /etc/ld.so.preload
-        info "ld.so.preload: removed legacy full-shim entry"
-    fi
-    if ! grep -q "$AUDIT_LIB" /etc/ld.so.preload 2>/dev/null; then
-        echo "$audit_path" >> /etc/ld.so.preload
-        info "ld.so.preload: added $audit_path (LD_AUDIT CUDA-aware injection)"
-    else
-        info "ld.so.preload: already contains $AUDIT_LIB (skip)"
-    fi
+    local vmm_override_lib="libgreenboost_vmm_override.so"
+    local vmm_override_path="$SHIM_DEST/$vmm_override_lib"
+    local shim_path_full="$SHIM_DEST/$SHIM_LIB"
 
-    # Remove any stale i386 companion entry — ld.so.preload has no architecture
+    # Rebuild ld.so.preload from scratch to guarantee correct ordering.
+    # Preserve any non-GreenBoost entries, then prepend our three libs in order.
+    local _tmp
+    _tmp=$(mktemp)
+    # 1. VMM override first (unversioned PLT race winner)
+    echo "$vmm_override_path" >> "$_tmp"
+    # 2. Full CUDA shim (memory inflation, T1→T2 overflow, dlsym hooks)
+    echo "$shim_path_full" >> "$_tmp"
+    # 3. Audit library (la_objopen CUDA-process injection)
+    echo "$audit_path" >> "$_tmp"
+    # 4. Preserve existing non-GreenBoost entries (e.g. vendor overrides)
+    if [[ -f /etc/ld.so.preload ]]; then
+        grep -v "libgreenboost_\|i386-linux-gnu" /etc/ld.so.preload >> "$_tmp" || true
+    fi
+    mv "$_tmp" /etc/ld.so.preload
+    info "ld.so.preload rebuilt (vmm_override → cuda_shim → audit):"
+    cat /etc/ld.so.preload | sed 's/^/    /'
+
+    # Remove any stale i386 companion entry - ld.so.preload has no architecture
     # filter, so the 32-bit lib generates ELFCLASS32 errors in every 64-bit
     # process.  The single ELFCLASS64 warning from Steam's 32-bit bootstrap
     # (ubuntu12_32/steam) is harmless and marked "ignored" by ld.so.
@@ -3087,19 +3206,563 @@ cmd_install_llama_configs() {
     fi
 
     echo ""
-    info "ld.so.preload configured — GreenBoost shim injects automatically into CUDA processes."
+    info "ld.so.preload configured - GreenBoost shim injects automatically into CUDA processes."
 }
 
-# ---- do_purge — remove ALL previously installed GreenBoost artifacts -----
-# Internal helper (no root check — callers must ensure root).
+# ── Restore functions - undo each Additional Install step individually ──────
+
+cmd_restore_sys_configs() {
+    need_root restore-sys-configs
+
+    gb_info "Restoring sys configs - removing GreenBoost service/udev/governor/shim entries..."
+
+    # Ollama drop-in
+    local _dropin="/etc/systemd/system/ollama.service.d/99-greenboost.conf"
+    if [[ -f "$_dropin" ]]; then
+        rm -f "$_dropin"
+        gb_ok "Removed Ollama drop-in: ${_dropin}"
+    fi
+    # Remove inline GreenBoost injections from ollama.service (legacy direct edit)
+    local _svc="/etc/systemd/system/ollama.service"
+    if [[ -f "$_svc" ]] && grep -q "GREENBOOST\|libgreenboost" "$_svc"; then
+        sed -i '/OLLAMA_FLASH_ATTENTION/d;/OLLAMA_KV_CACHE_TYPE/d;/OLLAMA_NUM_CTX/d
+/OLLAMA_MAX_LOADED_MODELS/d;/OLLAMA_KEEP_ALIVE/d;/OLLAMA_NUM_GPU/d
+/GREENBOOST_/d;/libgreenboost/d' "$_svc"
+        gb_ok "Removed GreenBoost vars from ollama.service"
+    fi
+    systemctl daemon-reload 2>/dev/null || true
+
+    # LD_PRELOAD / LD_AUDIT injection
+    if [[ -f /etc/ld.so.preload ]] && grep -q "greenboost\|libgreenboost" /etc/ld.so.preload; then
+        sed -i '/greenboost/d;/libgreenboost/d' /etc/ld.so.preload
+        [[ -s /etc/ld.so.preload ]] || rm -f /etc/ld.so.preload
+        ldconfig 2>/dev/null || true
+        gb_ok "Removed GreenBoost entries from /etc/ld.so.preload"
+    fi
+
+    # udev rules
+    for _r in /etc/udev/rules.d/99-greenboost.rules \
+               /etc/udev/rules.d/99-nvme-greenboost.rules; do
+        [[ -f "$_r" ]] && rm -f "$_r" && gb_ok "Removed udev rule: ${_r}"
+    done
+    udevadm control --reload-rules 2>/dev/null || true
+
+    # NVIDIA shutdown fix
+    if [[ -f /etc/modprobe.d/99-nvidia-greenboost.conf ]]; then
+        rm -f /etc/modprobe.d/99-nvidia-greenboost.conf
+        gb_ok "Removed NVIDIA shutdown fix conf"
+    fi
+
+    # CPU governor service
+    if systemctl is-enabled --quiet cpu-perf.service 2>/dev/null; then
+        systemctl disable --now cpu-perf.service 2>/dev/null || true
+    fi
+    [[ -f /etc/systemd/system/cpu-perf.service ]] && \
+        rm -f /etc/systemd/system/cpu-perf.service && gb_ok "Removed cpu-perf.service"
+    systemctl daemon-reload 2>/dev/null || true
+
+    # THP sysfs conf
+    if [[ -f /etc/sysfs.d/greenboost-hugepages.conf ]]; then
+        rm -f /etc/sysfs.d/greenboost-hugepages.conf
+        gb_ok "Removed THP sysfs conf"
+    fi
+
+    # AppArmor abstraction
+    if [[ -f /etc/apparmor.d/abstractions/greenboost-audit ]]; then
+        rm -f /etc/apparmor.d/abstractions/greenboost-audit
+        local _base="/etc/apparmor.d/abstractions/base"
+        [[ -f "$_base" ]] && sed -i '/greenboost-audit/d' "$_base"
+        apparmor_parser -r /etc/apparmor.d/ 2>/dev/null || true
+        gb_ok "Removed AppArmor greenboost-audit abstraction"
+    fi
+
+    echo ""
+    gb_ok "Sys configs restored. Restart Ollama: sudo systemctl restart ollama"
+}
+
+cmd_restore_tune_runtime() {
+    need_root restore-tune-runtime
+
+    gb_info "Restoring runtime tuning - resetting CPU governor, NVMe scheduler, PCIe, VM..."
+
+    # CPU governor → schedutil (modern default)
+    for _g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        echo schedutil > "$_g" 2>/dev/null || echo powersave > "$_g" 2>/dev/null || true
+    done
+    gb_ok "CPU governor → schedutil (default)"
+
+    # NVMe scheduler → mq-deadline (kernel default)
+    for _s in /sys/block/nvme*/queue/scheduler; do
+        echo mq-deadline > "$_s" 2>/dev/null || true
+    done
+    gb_ok "NVMe scheduler → mq-deadline (default)"
+
+    # Re-enable PCIe runtime PM
+    for _pm in /sys/bus/pci/devices/*/power/control; do
+        echo auto > "$_pm" 2>/dev/null || true
+    done
+    gb_ok "PCIe runtime PM → auto (default)"
+
+    # VM defaults
+    sysctl -w vm.swappiness=60 vm.dirty_ratio=20 vm.dirty_background_ratio=10 \
+              kernel.numa_balancing=1 >/dev/null 2>&1 && \
+        gb_ok "VM tunables reset to defaults (swappiness=60, dirty_ratio=20)"
+
+    # Remove any runtime-only NVMe tuning persist file written by tune
+    local _nvme_conf="/etc/udev/rules.d/99-greenboost-nvme-runtime.rules"
+    [[ -f "$_nvme_conf" ]] && rm -f "$_nvme_conf" && \
+        udevadm control --reload-rules 2>/dev/null || true
+
+    echo ""
+    gb_ok "Runtime tuning restored. Note: these are live changes - persist via tune-sysctl."
+}
+
+cmd_restore_tune_sysctl() {
+    need_root restore-tune-sysctl
+
+    local _conf="/etc/sysctl.d/99-zzz-greenboost.conf"
+    if [[ -f "$_conf" ]]; then
+        rm -f "$_conf"
+        gb_ok "Removed ${_conf}"
+        # Reload remaining sysctl confs
+        sysctl --system >/dev/null 2>&1 && gb_ok "Reloaded kernel tunables from remaining conf files"
+    else
+        gb_info "No GreenBoost sysctl conf found at ${_conf} - nothing to remove"
+    fi
+    echo ""
+    gb_ok "Sysctl restored. Kernel defaults apply after next sysctl --system or reboot."
+}
+
+cmd_restore_tune_grub() {
+    need_root restore-tune-grub
+
+    local _grub="/etc/default/grub"
+    [[ -f "$_grub" ]] || { gb_warn_ui "GRUB config not found: ${_grub}"; return 1; }
+
+    gb_info "Removing GreenBoost GRUB parameters from ${_grub}..."
+
+    # Backup before touching
+    cp --preserve=all "$_grub" "${_grub}.gb-restore-$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+
+    # Parameters added by cmd_tune_grub
+    local _gb_params=(
+        "transparent_hugepage=always"
+        "skew_tick=1"
+        "numa_balancing=disable"
+        "workqueue.power_efficient=0"
+    )
+    # Regex-removable pattern params (value varies per machine)
+    local _gb_patterns=(
+        "rcu_nocbs=[^ \"]*"
+        "nohz_full=[^ \"]*"
+    )
+
+    local _line
+    _line=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$_grub" | head -1 \
+            | sed 's/^GRUB_CMDLINE_LINUX_DEFAULT=//;s/^"//;s/"$//')
+
+    local _new="$_line"
+    for _p in "${_gb_params[@]}"; do
+        _new=$(echo "$_new" | sed "s/ *${_p}//g; s/${_p} *//g")
+    done
+    for _re in "${_gb_patterns[@]}"; do
+        _new=$(echo "$_new" | sed "s/ *${_re}//g; s/${_re} *//g")
+    done
+    _new=$(echo "$_new" | tr -s ' ' | sed 's/^ //;s/ $//')
+
+    sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"${_new}\"|" "$_grub"
+    gb_ok "Removed GreenBoost params - new cmdline: ${_new}"
+
+    # Regenerate GRUB config
+    if command -v update-grub &>/dev/null; then
+        update-grub 2>/dev/null && gb_ok "GRUB config updated (update-grub)"
+    elif command -v grub-mkconfig &>/dev/null; then
+        grub-mkconfig -o /boot/grub/grub.cfg 2>/dev/null && gb_ok "GRUB config updated (grub-mkconfig)"
+    else
+        gb_warn_ui "Could not update GRUB automatically - run: sudo update-grub"
+    fi
+
+    echo ""
+    gb_ok "GRUB restored. Changes take effect after next reboot."
+}
+
+# ---- _rmmod_with_retry - unload the kernel module, retrying up to ~15 s ----
+# Usage: _rmmod_with_retry [quiet]
+# Returns 0 on success, 1 if the module is still loaded after all retries.
+# Strategy:
+#   1. Kill every process with /dev/greenboost open (fuser + lsof fallback).
+#   2. sync + drop page-cache so DMA-BUF kernel references are released.
+#   3. Retry rmmod up to MAX_TRIES times with 1 s sleep between attempts.
+#      Each failed attempt repeats the fuser kill in case new processes appeared.
+_rmmod_with_retry() {
+    local quiet="${1:-}"
+    local MAX_TRIES=15
+    local attempt=0
+
+    # Helper: kill everything holding the device open.
+    _kill_dev_users() {
+        if [[ -e /dev/greenboost ]]; then
+            fuser -k /dev/greenboost 2>/dev/null || true
+            # lsof fallback - catches processes fuser sometimes misses
+            local _pids
+            _pids=$(lsof /dev/greenboost 2>/dev/null | awk 'NR>1 {print $2}' | sort -u || true)
+            [[ -n "$_pids" ]] && kill -9 $( echo "$_pids" ) 2>/dev/null || true
+        fi
+    }
+
+    lsmod | grep -q "^${DRIVER_NAME} " || return 0   # not loaded - nothing to do
+
+    # Check if the module is already stuck in Unloading state (MODULE_STATE_GOING).
+    # This happens when a previous rmmod process was killed before the exit function
+    # could complete. The kernel won't let a new rmmod succeed while in this state.
+    # Strategy:
+    #   1. Wait up to 15 s for the exit function to complete naturally.
+    #   2. If still stuck, try rmmod -f (force; requires CONFIG_MODULE_FORCE_UNLOAD).
+    #   3. If force also fails, give up - caller should schedule boot-time cleanup.
+    if grep -q "^${DRIVER_NAME}.*Unloading" /proc/modules 2>/dev/null; then
+        # Parse refcount - if -1, the module is permanently stuck (kernel ABI crash in gb_exit).
+        # Waiting is pointless; skip straight to force-unload.
+        local _rc
+        _rc=$(awk "/^${DRIVER_NAME} /{print \$3}" /proc/modules 2>/dev/null)
+        if [[ "$_rc" != "-1" ]]; then
+            gb_warn_ui "Module is in 'Unloading' state - waiting up to 15s for exit to complete…"
+            local _waited=0
+            while (( _waited < 15 )); do
+                sleep 2; (( _waited += 2 ))
+                if ! grep -q "^${DRIVER_NAME}" /proc/modules 2>/dev/null; then
+                    gb_ok "Module finished unloading after ${_waited}s"
+                    return 0
+                fi
+                ! grep -q "^${DRIVER_NAME}.*Unloading" /proc/modules 2>/dev/null && break
+            done
+        fi
+
+        if grep -q "^${DRIVER_NAME}.*Unloading" /proc/modules 2>/dev/null; then
+            local _msg="Still stuck"
+            [[ "$_rc" == "-1" ]] && _msg="Module is permanently stuck (refcnt=-1)"
+            gb_warn_ui "${_msg} - trying rmmod -f (force)…"
+            if rmmod -f "$DRIVER_NAME" 2>/dev/null; then
+                gb_ok "Module force-unloaded (kernel tainted; harmless for next load)"
+                return 0
+            fi
+            gb_warn_ui "rmmod -f also failed - a reboot is required."
+            gb_warn_ui "After rebooting: sudo ./greenboost_setup.sh full-install"
+            return 1
+        fi
+    fi
+
+    _kill_dev_users
+    sync
+    # Drop page-cache + slab objects so DMA-BUF pinned pages are returned to buddy.
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    sleep 0.3
+
+    while (( attempt < MAX_TRIES )); do
+        if rmmod "$DRIVER_NAME" 2>/dev/null; then
+            [[ -z "$quiet" ]] && gb_ok "Kernel module unloaded (attempt $((attempt+1)))"
+            return 0
+        fi
+        (( attempt++ ))
+        # Re-check: rmmod may have triggered the exit function and the module is
+        # now transitioning. If so, wait for it to finish rather than giving up.
+        if grep -q "^${DRIVER_NAME}.*Unloading" /proc/modules 2>/dev/null; then
+            gb_warn_ui "Module entered 'Unloading' state - waiting for exit to complete…"
+            local _uw=0
+            while (( _uw < 15 )); do
+                sleep 2; (( _uw += 2 ))
+                grep -q "^${DRIVER_NAME}" /proc/modules 2>/dev/null || { gb_ok "Module unloaded"; return 0; }
+                grep -q "^${DRIVER_NAME}.*Unloading" /proc/modules 2>/dev/null || break
+            done
+            grep -q "^${DRIVER_NAME}.*Unloading" /proc/modules 2>/dev/null || continue
+            rmmod -f "$DRIVER_NAME" 2>/dev/null && { gb_ok "Module force-unloaded"; return 0; }
+            gb_warn_ui "Unloading stuck and force failed - reboot required."
+            return 1
+        fi
+        local refcnt
+        refcnt=$(cat /sys/module/${DRIVER_NAME}/refcnt 2>/dev/null || echo "?")
+        [[ -z "$quiet" ]] && \
+            gb_warn_ui "rmmod attempt ${attempt}/${MAX_TRIES} - refcnt=${refcnt}, retrying…"
+        _kill_dev_users
+        sleep 1
+    done
+
+    gb_warn_ui "rmmod failed after ${MAX_TRIES} attempts - module still loaded (refcnt=$(cat /sys/module/${DRIVER_NAME}/refcnt 2>/dev/null || echo '?'))."
+    gb_warn_ui "Run manually: sudo rmmod ${DRIVER_NAME}   (or reboot)"
+    return 1
+}
+
+# ---- _try_install_fixed_module -----------------------------------------------
+# When rmmod fails (module stuck in STATE_GOING), the underlying cause is often
+# a crash in gb_exit (e.g. unregister_kretprobe on a NULL rph because the compiled
+# .ko predates the g_kretprobe_ok guard).  This helper recompiles greenboost.ko
+# from the current source (which has the fix) and installs it WITHOUT calling rmmod,
+# so the next boot loads the corrected module.
+#
+# Returns 0 on success (fixed .ko installed - caller should NOT schedule boot cleanup,
+# the stuck STATE_GOING module clears naturally on reboot).
+# Returns 1 on failure (build unavailable - caller should fall back to boot cleanup).
+_try_install_fixed_module() {
+    local KVER; KVER=$(uname -r)
+    local INSTALL_DIR="/lib/modules/${KVER}/extra"
+
+    gb_info "Attempting to compile + install fixed module (skipping rmmod)…"
+
+    # Compile - module target only, not full build
+    if ! make -C "$MODULE_DIR" module > /tmp/gb_fix_build.log 2>&1; then
+        gb_warn_ui "Could not compile fixed module - see /tmp/gb_fix_build.log"
+        return 1
+    fi
+
+    mkdir -p "$INSTALL_DIR"
+    cp "$MODULE_DIR/greenboost.ko" "$INSTALL_DIR/greenboost.ko"
+    depmod -a "$KVER" 2>/dev/null || true
+    gb_ok "Fixed greenboost.ko installed to $INSTALL_DIR"
+
+    # Ensure the module auto-loads on the next boot (may have been removed by a
+    # previous boot cleanup or partial purge).
+    [[ ! -f /etc/modules-load.d/greenboost.conf ]] \
+        && echo "greenboost" > /etc/modules-load.d/greenboost.conf
+
+    # Remove any stale blacklist that would prevent loading.
+    rm -f /etc/modprobe.d/99-greenboost-blacklist.conf
+
+    # Update DKMS source tree so kernel updates also use the fixed source.
+    local GB_VER; GB_VER=$(grep -m1 '^GB_VERSION' "$MODULE_DIR/Makefile" 2>/dev/null \
+                           | awk -F':?=' '{gsub(/ /,"",$2); print $2}')
+    local DKMS_ROOT="/usr/src/greenboost-${GB_VER}"
+    if command -v dkms &>/dev/null && [[ -d "$DKMS_ROOT" ]]; then
+        cp "$MODULE_DIR/greenboost.c" "$DKMS_ROOT/"
+        cp "$MODULE_DIR/greenboost_ioctl.h" "$DKMS_ROOT/" 2>/dev/null || true
+        gb_ok "Updated DKMS source tree at $DKMS_ROOT"
+    fi
+
+    return 0
+}
+
+# ---- _schedule_boot_cleanup - called when module is stuck in MODULE_STATE_GOING.
+# Removes any legacy boot-cleanup artifacts and prints SysRq force-reboot instructions.
+# No boot service is installed - it caused more problems than it solved.
+_schedule_boot_cleanup() {
+    # Remove any leftover boot-cleanup service from old installs
+    systemctl disable --now greenboost-boot-cleanup.service 2>/dev/null || true
+    rm -f /etc/systemd/system/greenboost-boot-cleanup.service
+    rm -f /etc/systemd/system/sysinit.target.wants/greenboost-boot-cleanup.service
+    rm -f /etc/systemd/system/rescue.target.wants/greenboost-boot-cleanup.service
+    rm -f /etc/systemd/system/emergency.target.wants/greenboost-boot-cleanup.service
+    rm -f /usr/local/sbin/greenboost-boot-cleanup
+    rm -f /lib/systemd/system-shutdown/greenboost-stuck.sh
+    systemctl daemon-reload 2>/dev/null || true
+
+    gb_warn_ui "Module stuck in Unloading - reboot required."
+    echo ""
+    echo -e "  ${C_BOLD}Force-reboot now (instant, no hang):${C_RESET}"
+    echo -e "    sync && echo b | sudo tee /proc/sysrq-trigger"
+    echo ""
+    echo -e "  Wait ~30s, reconnect, then re-run:"
+    echo -e "    sudo ./greenboost_setup.sh full-install"
+    echo ""
+}
+
+# ---- _gb_backup_create - snapshot pre-install system state ---------------
+_GB_BACKUP_DIR="/etc/greenboost/backup"
+_gb_backup_create() {
+    local stamp; stamp=$(date +%Y%m%d_%H%M%S)
+    local bdir="${_GB_BACKUP_DIR}/${stamp}"
+    mkdir -p "$bdir" || { gb_warn_ui "Backup: cannot create ${bdir}"; return 1; }
+
+    # GRUB config
+    [[ -f /etc/default/grub ]] && cp --preserve=all /etc/default/grub "${bdir}/grub"
+    # ld.so.preload
+    [[ -f /etc/ld.so.preload ]] && cp --preserve=all /etc/ld.so.preload "${bdir}/ld.so.preload"
+    # Kernel tunables (vm/kernel/net subset)
+    sysctl -a --ignore-errors 2>/dev/null \
+        | grep -E '^(vm\.|kernel\.|net\.)' > "${bdir}/sysctl_state.conf" || true
+    # CPU governor
+    cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null \
+        > "${bdir}/cpu_governor.txt" || true
+    # NVMe scheduler (first nvme device if present)
+    local _nvme; _nvme=$(ls /sys/block/nvme*/queue/scheduler 2>/dev/null | head -1)
+    [[ -n "$_nvme" ]] && cat "$_nvme" > "${bdir}/nvme_scheduler.txt" 2>/dev/null || true
+    # Ollama service environment
+    local _olenv="/etc/systemd/system/ollama.service.d/override.conf"
+    [[ -f "$_olenv" ]] && cp --preserve=all "$_olenv" "${bdir}/ollama_service_env.txt"
+    # Manifest
+    printf 'stamp=%s\nhostname=%s\nkernel=%s\n' \
+        "$stamp" "$(hostname)" "$(uname -r)" > "${bdir}/manifest.txt"
+
+    gb_ok "System backup created: ${bdir}"
+}
+
+# ---- _gb_backup_restore - apply most recent backup -----------------------
+_gb_backup_restore() {
+    local bdir; bdir=$(ls -1d "${_GB_BACKUP_DIR}"/[0-9]* 2>/dev/null | sort | tail -1)
+    if [[ -z "$bdir" ]]; then
+        gb_warn_ui "No backup found under ${_GB_BACKUP_DIR}"
+        return 1
+    fi
+    local stamp; stamp=$(basename "$bdir")
+    gb_info "Restoring from backup: ${stamp}"
+
+    [[ -f "${bdir}/grub" ]]        && cp --preserve=all "${bdir}/grub" /etc/default/grub       && gb_ok "Restored /etc/default/grub"
+    [[ -f "${bdir}/ld.so.preload" ]] && cp --preserve=all "${bdir}/ld.so.preload" /etc/ld.so.preload && gb_ok "Restored /etc/ld.so.preload"
+    [[ -f "${bdir}/sysctl_state.conf" ]] && sysctl --load "${bdir}/sysctl_state.conf" &>/dev/null && gb_ok "Restored sysctl state"
+    if [[ -f "${bdir}/cpu_governor.txt" ]]; then
+        local _gov; _gov=$(cat "${bdir}/cpu_governor.txt" | tr -d '[:space:]')
+        [[ -n "$_gov" ]] && \
+            for _g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+                echo "$_gov" > "$_g" 2>/dev/null || true
+            done && gb_ok "Restored CPU governor: ${_gov}"
+    fi
+    if [[ -f "${bdir}/nvme_scheduler.txt" ]]; then
+        local _sched; _sched=$(cat "${bdir}/nvme_scheduler.txt" | grep -oP '^\[\K[^]]+' || cat "${bdir}/nvme_scheduler.txt" | tr -d '[:space:]')
+        [[ -n "$_sched" ]] && \
+            for _ns in /sys/block/nvme*/queue/scheduler; do
+                echo "$_sched" > "$_ns" 2>/dev/null || true
+            done && gb_ok "Restored NVMe scheduler: ${_sched}"
+    fi
+    [[ -f "${bdir}/ollama_service_env.txt" ]] && \
+        { mkdir -p /etc/systemd/system/ollama.service.d && \
+          cp --preserve=all "${bdir}/ollama_service_env.txt" /etc/systemd/system/ollama.service.d/override.conf && \
+          systemctl daemon-reload 2>/dev/null || true; \
+          gb_ok "Restored Ollama service override"; }
+    gb_ok "Restore complete from backup ${stamp}"
+}
+
+# ---- _do_purge_apparmor - roll back every AppArmor change made by the ----
+# install.  Idempotent; safe to re-run.  Used by both `cmd_uninstall` (via
+# do_purge) and the standalone `cmd_apparmor_uninstall` so a single helper
+# is the source of truth for what gets reverted.
+#
+# Reverses, in order:
+#   1) abstractions/greenboost-audit                - the abstraction file itself
+#   2) abstractions/base                            - Layer A: `#include` injection
+#   3) /etc/apparmor.d/*                            - Layer B: per-profile includes
+#   4) local/usr.lib.snapd.snap-confine.real        - snap-confine override
+#   5) /var/lib/snapd/apparmor/profiles/snap-confine*  - snapd-snap profile patch
+#   6) apparmor_parser -r /etc/apparmor.d/          - make the kernel forget
+#   7) snapd-shipped snap-confine profile reload    - restore self-integrity check
+# ---------------------------------------------------------------------------
+_do_purge_apparmor() {
+    [[ -d /etc/apparmor.d ]] || return 0
+
+    local removed=0 patched=0
+
+    # 1) Remove the abstraction file
+    if [[ -f /etc/apparmor.d/abstractions/greenboost-audit ]]; then
+        rm -f /etc/apparmor.d/abstractions/greenboost-audit
+        (( removed++ )) || true
+    fi
+
+    # 2) Layer A - abstractions/base
+    local base_abs="/etc/apparmor.d/abstractions/base"
+    if [[ -f "$base_abs" ]] && grep -q "greenboost-audit" "$base_abs"; then
+        sed -i '/greenboost-audit/d' "$base_abs"
+        (( removed++ )) || true
+    fi
+
+    # 3) Layer B - every profile in /etc/apparmor.d/ that we patched
+    local _profiles=() pf
+    while IFS= read -r pf; do
+        _profiles+=("$pf")
+    done < <(find /etc/apparmor.d/ -maxdepth 1 -type f 2>/dev/null | sort)
+    for pf in "${_profiles[@]}"; do
+        [[ -d "$pf" ]] && continue
+        if grep -q "greenboost-audit" "$pf" 2>/dev/null; then
+            sed -i '/greenboost-audit/d' "$pf"
+            (( patched++ )) || true
+        fi
+    done
+
+    # 4) snap-confine local override - this is the file whose modification
+    #    trips `snap-confine has elevated permissions and is not confined
+    #    but should be - refusing to continue`.  Remove our two lines and the
+    #    preceding comment.  If the file ends up empty, remove it entirely so
+    #    snapd's profile reload picks up a pristine state.
+    local sc_local="/etc/apparmor.d/local/usr.lib.snapd.snap-confine.real"
+    if [[ -f "$sc_local" ]] && grep -q "libgreenboost_audit" "$sc_local"; then
+        sed -i \
+            -e '/^# GreenBoost: allow snap-confine to mmap the LD_AUDIT stub$/d' \
+            -e '/libgreenboost_audit/d' \
+            "$sc_local"
+        # Trim leading/trailing blank lines; remove if pure whitespace.
+        sed -i '/./,$!d; :a; /^\s*$/{$d;N;ba}' "$sc_local"
+        [[ -s "$sc_local" ]] || rm -f "$sc_local"
+        (( removed++ )) || true
+    fi
+
+    # 5) snapd-shipped snap-confine profile (lives outside /etc/apparmor.d/)
+    local snapd_profile
+    while IFS= read -r snapd_profile; do
+        [[ -f "$snapd_profile" ]] || continue
+        if grep -q "libgreenboost_audit" "$snapd_profile" 2>/dev/null; then
+            sed -i \
+                -e '/^# GreenBoost: allow snap-confine (snapd snap) to mmap audit stub$/d' \
+                -e '/libgreenboost_audit/d' \
+                "$snapd_profile"
+            apparmor_parser -r "$snapd_profile" 2>/dev/null || true
+            (( patched++ )) || true
+        fi
+    done < <(find /var/lib/snapd/apparmor/profiles/ \
+        \( -name "snap-confine.snapd.*" -o -name "snap-confine.*" \) \
+        2>/dev/null)
+
+    if (( removed > 0 || patched > 0 )); then
+        gb_ok "AppArmor: reverted $removed file edit(s) + $patched profile patch(es)"
+    else
+        gb_info "AppArmor: nothing to revert"
+    fi
+
+    # 6) Tell the kernel to forget the old profile data.
+    apparmor_parser -r /etc/apparmor.d/ 2>/dev/null &
+    gb_spin $! "Reloading AppArmor rules..."
+
+    # 7) snap-confine's self-integrity check uses the profile loaded by snapd.
+    #    Force snapd to reload its shipped snap-confine profile so the
+    #    refused-elevated-permissions error stops triggering.  snapd holds the
+    #    canonical profile in /var/lib/snapd/apparmor/profiles/ and reloads it
+    #    on service start; restart snapd to be safe.
+    if systemctl is-active snapd >/dev/null 2>&1; then
+        systemctl restart snapd 2>/dev/null \
+            && gb_ok "snapd restarted - snap-confine self-check restored" \
+            || gb_warn_ui "snapd restart failed - run: sudo systemctl restart snapd"
+    fi
+}
+
+# ---- cmd_apparmor_uninstall - standalone entrypoint for the helper -------
+# Lets users fix the snap-confine breakage without a full GreenBoost
+# uninstall.  Usage:  sudo greenboost apparmor-uninstall
+# ---------------------------------------------------------------------------
+cmd_apparmor_uninstall() {
+    need_root apparmor-uninstall
+    echo ""
+    info "Reverting GreenBoost AppArmor modifications..."
+    _do_purge_apparmor
+    echo ""
+    info "Done.  Snap apps (Firefox, VSCode, etc.) should now launch normally."
+    info "Test with: snap run firefox  (or just click the icon)"
+}
+
+# ---- do_purge - remove ALL previously installed GreenBoost artifacts -----
+# Internal helper (no root check - callers must ensure root).
 # Called by cmd_uninstall and cmd_full_install.
 do_purge() {
     # restart_after=1 → restart stopped services at the end (cmd_uninstall).
     # restart_after=0 → leave them stopped (cmd_full_install handles restart after fresh install).
     local restart_after="${1:-0}"
 
+    # 0. Remove any legacy boot-cleanup artifacts from previous failed install attempts.
+    #    These services caused more problems than they solved (kernel oops during boot).
+    systemctl disable --now greenboost-boot-cleanup.service 2>/dev/null || true
+    rm -f /etc/systemd/system/greenboost-boot-cleanup.service
+    rm -f /etc/systemd/system/sysinit.target.wants/greenboost-boot-cleanup.service
+    rm -f /etc/systemd/system/rescue.target.wants/greenboost-boot-cleanup.service
+    rm -f /etc/systemd/system/emergency.target.wants/greenboost-boot-cleanup.service
+    rm -f /usr/local/sbin/greenboost-boot-cleanup
+    rm -f /lib/systemd/system-shutdown/greenboost-stuck.sh
+    systemctl daemon-reload 2>/dev/null || true
+
     # 1. Stop services that hold /dev/greenboost open (prevents rmmod EBUSY).
-    #    Ollama and llama-server are NOT uninstalled — only stopped temporarily.
+    #    Ollama and llama-server are NOT uninstalled - only stopped temporarily.
     local _stopped_svcs=""
     for svc in ollama llama-server; do
         if systemctl is-active --quiet "$svc.service" 2>/dev/null; then
@@ -3137,7 +3800,7 @@ do_purge() {
     { depmod -a 2>/dev/null || true; } &
     gb_spin $! "Rebuilding module dependency tree..."
 
-    # 3. Remove GreenBoost entries from /etc/ld.so.preload FIRST — before deleting
+    # 3. Remove GreenBoost entries from /etc/ld.so.preload FIRST - before deleting
     #    the .so files (prevents "cannot be preloaded" linker errors on forked procs).
     if [[ -f /etc/ld.so.preload ]] && grep -q "libgreenboost" /etc/ld.so.preload; then
         sed -i '/libgreenboost/d' /etc/ld.so.preload
@@ -3147,82 +3810,49 @@ do_purge() {
 
     # 4. Remove CUDA shim and LD_AUDIT library
     local _libs_removed=0
-    for lib in "$SHIM_DEST/$SHIM_LIB" "$SHIM_DEST/$AUDIT_LIB" "$SHIM_DEST/$VULKAN_LAYER_LIB"; do
+    for lib in "$SHIM_DEST/$SHIM_LIB" "$SHIM_DEST/$AUDIT_LIB"; do
         [[ -f "$lib" ]] && rm -f "$lib" && (( _libs_removed++ )) || true
     done
-    rm -f "$VULKAN_IMPLICIT_LAYER_DIR/$VULKAN_LAYER_MANIFEST" 2>/dev/null || true
     { ldconfig 2>/dev/null || true; } &
     gb_spin $! "Refreshing dynamic linker cache..."
-    [[ $_libs_removed -gt 0 ]] && gb_ok "CUDA shim + audit library + Vulkan layer removed"
+    [[ $_libs_removed -gt 0 ]] && gb_ok "CUDA shim + audit library removed"
 
-    # 4b. Remove AppArmor abstraction + all injected includes
-    #     Progress bar over profile list — no per-profile noise.
-    if [[ -f /etc/apparmor.d/abstractions/greenboost-audit ]]; then
-        rm -f /etc/apparmor.d/abstractions/greenboost-audit
+    # 4b. Remove AppArmor abstraction + all injected includes + snap-confine
+    #     modifications.  Calls the shared helper so the standalone
+    #     `greenboost apparmor-uninstall` command and the full uninstall both
+    #     reverse exactly the same set of changes.
+    _do_purge_apparmor
 
-        # Layer A — remove from abstractions/base
-        local base_abs="/etc/apparmor.d/abstractions/base"
-        if [[ -f "$base_abs" ]] && grep -q "greenboost-audit" "$base_abs"; then
-            sed -i '/greenboost-audit/d' "$base_abs"
-        fi
-
-        # Layer B — scan all profiles; show progress bar, suppress per-profile output
-        local _aa_profiles=()
-        while IFS= read -r _pf; do
-            _aa_profiles+=("$_pf")
-        done < <(find /etc/apparmor.d/ -maxdepth 1 -type f | sort)
-
-        local _aa_total="${#_aa_profiles[@]}"
-        local _aa_cleaned=0 _aa_idx=0
-        for profile in "${_aa_profiles[@]}"; do
-            (( _aa_idx++ )) || true
-            [[ -d "$profile" ]] && continue
-            grep -q "greenboost-audit" "$profile" 2>/dev/null || continue
-            sed -i '/greenboost-audit/d' "$profile"
-            (( _aa_cleaned++ )) || true
-            # Progress bar: overwrite same line
-            local _pct=$(( _aa_idx * 100 / _aa_total ))
-            local _filled=$(( _pct / 2 )) _empty=$(( 50 - _pct / 2 ))
-            printf "\r  ${C_GRAY}[%d/%d]${C_RESET} ${C_AMBER}%s${C_GRAY}%s${C_RESET} %3d%%  ${C_DIM}Reverting AppArmor permissions...${C_RESET}" \
-                "$_aa_idx" "$_aa_total" \
-                "$(printf '█%.0s' $(seq 1 "$_filled" 2>/dev/null || true))" \
-                "$(printf '░%.0s' $(seq 1 "$_empty"  2>/dev/null || true))" \
-                "$_pct"
-        done
-        printf "\r%*s\r" "$(tput cols 2>/dev/null || echo 80)" ""
-
-        if [[ $_aa_cleaned -gt 0 ]]; then
-            gb_ok "AppArmor: reverted $_aa_cleaned profiles"
-        else
-            gb_info "AppArmor: no profiles needed reverting"
-        fi
-
-        apparmor_parser -r /etc/apparmor.d/ 2>/dev/null &
-        gb_spin $! "Reloading AppArmor rules..."
-    fi
-
-    # 5. Remove static config files (silent batch — no per-file noise)
+    # 5. Remove static config files (silent batch - no per-file noise)
     local _cfg_removed=0
     for f in \
         /etc/modprobe.d/greenboost.conf \
         /etc/modprobe.d/greenboost.conf.bak \
+        /etc/modprobe.d/99-greenboost-blacklist.conf \
         /etc/profile.d/greenboost.sh \
         /usr/local/bin/greenboost \
-        /usr/local/bin/greenboost-steam \
         /etc/modules-load.d/greenboost.conf \
         /etc/udev/rules.d/99-greenboost.rules \
         /etc/udev/rules.d/99-nvme-greenboost.rules \
+        /etc/udev/rules.d/99-usb-greenboost.rules \
         /etc/sysctl.d/99-greenboost.conf \
         /etc/sysctl.d/99-zzz-greenboost.conf \
         /etc/sysfs.d/greenboost-hugepages.conf \
-        /etc/security/limits.d/99-greenboost-gaming.conf; do
+        /lib/systemd/system-shutdown/greenboost-stuck.sh \
+        /etc/modprobe.d/99-nvidia-greenboost.conf; do
         [[ -f "$f" ]] && rm -f "$f" && (( _cfg_removed++ )) || true
     done
+    # Strip greenboost from ai-workstation.conf (nvidia/cpuid still needed - don't delete)
+    local _ml_ai="/etc/modules-load.d/ai-workstation.conf"
+    if [[ -f "$_ml_ai" ]] && grep -q "^greenboost[[:space:]]*$" "$_ml_ai"; then
+        sed -i '/^greenboost[[:space:]]*$/d' "$_ml_ai"
+        (( _cfg_removed++ )) || true
+    fi
     udevadm control --reload-rules 2>/dev/null || true
     [[ $_cfg_removed -gt 0 ]] && gb_ok "Config files removed ($_cfg_removed files)"
     rm -rf /etc/greenboost
 
-    # 6. Disable + remove ALL GreenBoost systemd services — generic glob catches any
+    # 6. Disable + remove ALL GreenBoost systemd services - generic glob catches any
     #    service file installed by any version of full-install, regardless of name.
     local _svcs_removed=0
     for _svc_file in /etc/systemd/system/greenboost*.service \
@@ -3235,13 +3865,11 @@ do_purge() {
         (( _svcs_removed++ )) || true
     done
     [[ $_svcs_removed -gt 0 ]] && gb_ok "$_svcs_removed GreenBoost service(s) removed"
-    # Gaming mode polkit rule
-    rm -f /etc/polkit-1/rules.d/50-greenboost-gaming.rules
     # Ollama drop-in override
     rm -f /etc/systemd/system/ollama.service.d/99-greenboost.conf
     rmdir --ignore-fail-on-non-empty /etc/systemd/system/ollama.service.d/ 2>/dev/null || true
-    # TurboQuant daemon
-    systemctl disable greenboost-turboquant.service 2>/dev/null || true
+    # TurboQuant daemon (optional install - clean up if present)
+    systemctl disable --now greenboost-turboquant.service 2>/dev/null || true
     rm -f /usr/local/bin/greenboost-turboquant \
           /usr/local/lib/libgreenboost_tq.so \
           /etc/systemd/system/greenboost-turboquant.service
@@ -3251,7 +3879,6 @@ do_purge() {
     rm -f /usr/local/sbin/greenboost-recover \
           /usr/local/sbin/greenboost-vram-watchdog \
           /usr/local/sbin/greenboostd \
-          /usr/local/bin/greenboost-shader-boost \
           /usr/local/bin/greenboost-idle-reclaim \
           /usr/local/bin/greenboost-run \
           /usr/local/bin/greenboost-run-tgi \
@@ -3296,7 +3923,7 @@ do_purge() {
         gb_ok "Removed /opt/greenboost"
     fi
 
-    # 8b. Remove /swap_nvme.img if present — created by older GreenBoost versions.
+    # 8b. Remove /swap_nvme.img if present - created by older GreenBoost versions.
     #     Only this specific file is touched; the system's regular swap (/swap.img,
     #     /swapfile, swap partitions) is never modified.
     if [[ -f /swap_nvme.img ]]; then
@@ -3311,7 +3938,7 @@ do_purge() {
         fi
     fi
 
-    # 8b2. Remove greenboost_swap.img if present — T3 swap file created by v2.9+
+    # 8b2. Remove greenboost_swap.img if present - T3 swap file created by v2.9+
     local _gb_swap="/var/lib/greenboost/greenboost_swap.img"
     if [[ -f "$_gb_swap" ]]; then
         swapoff "$_gb_swap" 2>/dev/null || true
@@ -3320,7 +3947,7 @@ do_purge() {
         gb_ok "Removed T3 swap file (${_gb_swap})"
     fi
 
-    # 8c. Remove T3 backing file — created by GreenBoost v2.8+ as a sparse file.
+    # 8c. Remove T3 backing file - created by GreenBoost v2.8+ as a sparse file.
     #     The module closes the file before rmmod, so it is safe to remove.
     if [[ -f /var/lib/greenboost/t3_store ]]; then
         rm -f /var/lib/greenboost/t3_store
@@ -3328,51 +3955,65 @@ do_purge() {
     fi
     rmdir /var/lib/greenboost 2>/dev/null || true
 
-    # 9. Unload kernel module — done last so all consumers are gone.
-    if lsmod | grep -q "^${DRIVER_NAME} "; then
-        if rmmod "$DRIVER_NAME" 2>/dev/null; then
-            gb_ok "Kernel module unloaded"
-        else
-            fuser -k /dev/greenboost 2>/dev/null || true
-            sleep 1
-            if rmmod "$DRIVER_NAME" 2>/dev/null; then
-                gb_ok "Kernel module unloaded (after retry)"
-            else
-                gb_warn_ui "rmmod failed — module still loaded."
-                gb_warn_ui "Run manually: sudo rmmod ${DRIVER_NAME}"
-            fi
-        fi
-    fi
+    # 9. Unload kernel module - done last so all consumers are gone.
+    _rmmod_with_retry || return 1
 
     # 10. Restart services that were stopped before the purge.
     #     Only done on standalone uninstall (restart_after=1).
-    #     On full-install (restart_after=0) services stay stopped — cmd_full_install
+    #     On full-install (restart_after=0) services stay stopped - cmd_full_install
     #     restarts them once at the very end, after the fresh install completes.
     if [[ $restart_after -eq 1 ]]; then
+        # Offer to restore pre-install system settings if a backup exists
+        local _latest_backup; _latest_backup=$(ls -1d "${_GB_BACKUP_DIR}"/[0-9]* 2>/dev/null | sort | tail -1)
+        if [[ -n "$_latest_backup" ]]; then
+            local _bstamp; _bstamp=$(basename "$_latest_backup")
+            if [[ -t 0 ]]; then
+                echo ""
+                echo -e "  ${C_CYAN}Backup from ${_bstamp} found.${C_RESET}"
+                echo -n "  Restore pre-GreenBoost system settings (GRUB, sysctl, CPU governor)? [y/N] "
+                local _ans; read -r _ans
+                [[ "$_ans" =~ ^[Yy] ]] && _gb_backup_restore
+            fi
+        fi
         for svc in $GB_STOPPED_SERVICES; do
             systemctl start "$svc" 2>/dev/null \
                 && gb_ok "$svc restarted" \
-                || gb_warn_ui "$svc failed to restart — check: journalctl -u $svc"
+                || gb_warn_ui "$svc failed to restart - check: journalctl -u $svc"
         done
     fi
 }
 
 cmd_build() {
     [[ -d /usr/local/cuda/bin ]] && export PATH="/usr/local/cuda/bin:$PATH"
-    make -C "$MODULE_DIR" all &>/tmp/gb_build.log &
-    gb_spin $! "Compiling kernel module + CUDA shim..."
+    make -C "$MODULE_DIR" clean all &>/tmp/gb_build.log &
+    gb_spin $! "Clean-building kernel module + CUDA shim..."
     if ! wait $!; then
         gb_fail() { echo -e "  ${RED}✗${C_RESET}  Build failed:"; }
         cat /tmp/gb_build.log >&2
-        die "Build failed — see output above"
+        die "Build failed - see output above"
     fi
-    gb_ok "Build complete  (greenboost.ko · ${SHIM_LIB} · ${AUDIT_LIB} · ${VULKAN_LAYER_LIB})"
+    gb_ok "Build complete  (greenboost.ko · ${SHIM_LIB} · ${AUDIT_LIB} · greenboost-netd)"
 }
 
 cmd_install() {
     need_root install
+
+    # Strip libgreenboost entries from ld.so.preload before spawning any
+    # subprocess (detect_hardware, check_deps, backup, etc.).  With la_version
+    # exported the dynamic linker tries to open the audit lib in LD_AUDIT mode
+    # for every child process; in certain subprocess contexts that open fails and
+    # prints "cannot be preloaded" noise.  The install_ld_preload step later
+    # re-adds the correct entry once the new lib is in place.
+    if [[ -f /etc/ld.so.preload ]]; then
+        sed -i '/libgreenboost/d' /etc/ld.so.preload
+        [[ -s /etc/ld.so.preload ]] || rm -f /etc/ld.so.preload
+    fi
+
     detect_hardware
     check_deps
+
+    # Capture pre-install system state for potential rollback
+    _gb_backup_create
 
     # Step 0: clean previous installation to guarantee a fresh install
     # Skip when called from cmd_full_install which already ran do_purge at step 0/5.
@@ -3392,16 +4033,17 @@ cmd_install() {
         echo "" >&2
         cat "$_install_log" >&2
         rm -f "$_install_log"
-        die "Module install failed — see output above"
+        die "Module install failed - see output above"
     fi
     rm -f "$_install_log"
     gb_ok "Kernel module installed"
 
     cp "$MODULE_DIR/$SHIM_LIB" "$SHIM_DEST/"
     [[ -f "$MODULE_DIR/$AUDIT_LIB" ]] && cp "$MODULE_DIR/$AUDIT_LIB" "$SHIM_DEST/"
-    [[ -f "$MODULE_DIR/$VULKAN_LAYER_LIB" ]] && cp "$MODULE_DIR/$VULKAN_LAYER_LIB" "$SHIM_DEST/"
+    [[ -f "$MODULE_DIR/libgreenboost_vmm_override.so" ]] && \
+        cp "$MODULE_DIR/libgreenboost_vmm_override.so" "$SHIM_DEST/"
     { ldconfig 2>/dev/null; } &
-    gb_spin $! "Installing CUDA shim + LD_AUDIT library + Vulkan layer..."
+    gb_spin $! "Installing CUDA shim + VMM override + LD_AUDIT library..."
     gb_ok "Libraries installed to $SHIM_DEST/"
 
     # modprobe defaults
@@ -3409,19 +4051,19 @@ cmd_install() {
     mkdir -p /var/lib/greenboost
 
     cat > /etc/modprobe.d/greenboost.conf << MODEOF
-# GreenBoost — cuda memory pool (auto-configured for detected hardware)
+# GreenBoost - cuda memory pool (auto-configured for detected hardware)
 # GPU   : ${GPU_NAME}  (${GB_PHYS} GB VRAM)
 # RAM   : ${RAM_TYPE}-${RAM_SPEED_MT}  (pool ${GB_VIRT} GB, reserve ${GB_RESERVE} GB)
 # T3    : file-backed (/var/lib/greenboost/t3_store, cap ${GB_NVME_POOL} GB)
 options greenboost physical_vram_gb=${GB_PHYS} virtual_vram_gb=${GB_VIRT} safety_reserve_gb=${GB_RESERVE} nvme_pool_gb=${GB_NVME_POOL} t3_max_gb=${GB_NVME_POOL} t3_file_path=/var/lib/greenboost/t3_store pcores_max_cpu=${GB_PCORES_MAX} golden_cpu_min=${GB_GOLDEN_MIN} golden_cpu_max=${GB_GOLDEN_MAX} ecores_only=${GB_PCORES_ONLY}
 MODEOF
 
-    # profile.d — auto-activate GreenBoost for all CUDA inference tools launched
+    # profile.d - auto-activate GreenBoost for all CUDA inference tools launched
     # from a login shell (terminal, SSH).  GREENBOOST_ACTIVE=1 is exported globally
     # so vLLM, PyTorch scripts, TGI, Transformers, etc. all work without any wrapper.
     # The greenboost() function remains available as a fallback for non-login contexts.
     cat > /etc/profile.d/greenboost.sh << PROFEOF
-# GreenBoost v2.8.2 — auto-activation for CUDA inference tools
+# GreenBoost v2.9 - auto-activation for CUDA inference tools
 export GREENBOOST_ACTIVE=1
 export GREENBOOST_SHIM="$SHIM_DEST/$SHIM_LIB"
 # 'greenboost run' is a fallback for non-login contexts (cron, Docker entrypoints)
@@ -3434,7 +4076,7 @@ greenboost() {
 export -f greenboost
 PROFEOF
 
-    # Standalone wrapper — fallback for non-login contexts where profile.d is not sourced
+    # Standalone wrapper - fallback for non-login contexts where profile.d is not sourced
     cat > /usr/local/bin/greenboost << WRAPEOF
 #!/usr/bin/env bash
 # GreenBoost CLI wrapper
@@ -3442,11 +4084,20 @@ PROFEOF
 # Run 'greenboost help' for the full command reference.
 GB_SETUP="$MODULE_DIR/greenboost_setup.sh"
 case "\$1" in
-    status)       exec "\$GB_SETUP" status "\${@:2}" ;;
     clean)        exec "\$GB_SETUP" clean "\${@:2}" ;;
     clean-memory) exec "\$GB_SETUP" clean-memory ;;
     benchmark)    exec "\$GB_SETUP" benchmark "\${@:2}" ;;
     profile)      exec "\$GB_SETUP" profile "\${@:2}" ;;
+    build|build-info) exec "\$GB_SETUP" build-info "\${@:2}" ;;
+    compile)      exec "\$GB_SETUP" compile "\${@:2}" ;;
+    feed)         exec "\$GB_SETUP" feed "\${@:2}" ;;
+    connect)         exec "\$GB_SETUP" connect "\${@:2}" ;;
+    disconnect)      exec "\$GB_SETUP" disconnect "\${@:2}" ;;
+    cluster)         exec "\$GB_SETUP" cluster ;;
+    update)          exec "\$GB_SETUP" update "\${@:2}" ;;
+    update-feeders)  exec "\$GB_SETUP" update-feeders ;;
+    feeders)         exec "\$GB_SETUP" feeders "\${@:2}" ;;
+    built-stamp)     exec "\$GB_SETUP" built-stamp "\${@:2}" ;;
     load)         exec "\$GB_SETUP" load "\${@:2}" ;;
     unload)       exec "\$GB_SETUP" unload ;;
     tune)         exec "\$GB_SETUP" tune "\${@:2}" ;;
@@ -3454,20 +4105,24 @@ case "\$1" in
     tune-sysctl)  exec "\$GB_SETUP" tune-sysctl ;;
     tune-libs)    exec "\$GB_SETUP" tune-libs ;;
     tune-all)     exec "\$GB_SETUP" tune-all ;;
+    turboquant)   exec "\$GB_SETUP" turboquant "\${@:2}" ;;
+    vitals)       exec "\$GB_SETUP" vitals "\${@:2}" ;;
+    debug)        exec "\$GB_SETUP" debug "\${@:2}" ;;
+    gen-inference-config) exec "\$GB_SETUP" gen-inference-config "\${@:2}" ;;
     setup|install|full-install) exec "\$GB_SETUP" "\$@" ;;
-    steam-launch-guide) exec "\$GB_SETUP" steam-launch-guide ;;
-    fix-steam)          exec "\$GB_SETUP" fix-steam ;;
-    remove-proton)      exec "\$GB_SETUP" remove-proton ;;
-    uninstall-mangohud) exec "\$GB_SETUP" uninstall-mangohud ;;
-    vulkan)       exec "\$GB_SETUP" vulkan "\${@:2}" ;;
+    uninstall)          exec "\$GB_SETUP" uninstall ;;
+    apparmor-uninstall) exec "\$GB_SETUP" apparmor-uninstall ;;
     logs)            exec "\$GB_SETUP" logs "\${@:2}" ;;
-    proton-logs)     exec "\$GB_SETUP" proton-logs "\${@:2}" ;;
+    nvtx-logs)       exec "\$GB_SETUP" nvtx-logs "\${@:2}" ;;
+    nvtx)            exec "\$GB_SETUP" nvtx "\${@:2}" ;;
+    diag)            exec "\$GB_SETUP" diag "\${@:2}" ;;
     inference-logs)  exec "\$GB_SETUP" inference-logs "\${@:2}" ;;
     clear)           exec "\$GB_SETUP" clear "\${@:2}" ;;
     clean-logs)      exec "\$GB_SETUP" clean-logs ;;
+    test)            exec "\$GB_SETUP" test "\${@:2}" ;;
     run)          shift; GREENBOOST_ACTIVE=1 LD_PRELOAD="$SHIM_DEST/$SHIM_LIB" "\$@" ;;
     help|--help|-h|"") exec "\$GB_SETUP" show-commands ;;
-    *)            echo "Unknown command: '\$1'  — run: greenboost help" >&2; exit 1 ;;
+    *)            echo "Unknown command: '\$1'  - run: greenboost help" >&2; exit 1 ;;
 esac
 WRAPEOF
     chmod +x /usr/local/bin/greenboost
@@ -3478,16 +4133,48 @@ WRAPEOF
         install -m 644 "$MODULE_DIR/GREENBOOST_COMMANDS.md" /usr/local/share/greenboost/GREENBOOST_COMMANDS.md
     fi
 
+    # PR-GG: install lib/ helpers so installed-from-PATH greenboost can
+    # source them.  The lib/ directory contains gb_colors.sh, gb_tui.sh,
+    # gb_ssh.sh - small, well-bounded modules that the top of the main
+    # script auto-discovers via the GB_LIB_DIR lookup.  If a prior install
+    # lacked lib/, the inline fallbacks in the main script ensure
+    # functionality regardless; this install just makes the lib variant
+    # the canonical one.
+    if [[ -d "$MODULE_DIR/lib" ]]; then
+        mkdir -p /usr/local/share/greenboost/lib
+        for _libf in "$MODULE_DIR"/lib/*.sh; do
+            [[ -f "$_libf" ]] && install -m 644 "$_libf" /usr/local/share/greenboost/lib/
+        done
+        gb_ok "Installed lib/ helpers to /usr/local/share/greenboost/lib/"
+    fi
+
+    # Write build_info stamp (readable by 'greenboost build')
+    mkdir -p /etc/greenboost
+    local _git_hash
+    _git_hash=$(git -C "$MODULE_DIR" rev-parse --short HEAD 2>/dev/null || echo "nogit")
+    printf 'BUILD_ID=%s\nBUILD_VERSION=%s\nBUILD_HOST=%s\nBUILD_GIT=%s\nBUILD_EPOCH=%s\n' \
+        "$(date +%d%m-%H%M)" "$GB_VERSION" "$(hostname)" "$_git_hash" "$(date +%s)" \
+        > /etc/greenboost/build_info
+    gb_ok "Build stamp written  ($(date '+%d/%m %H:%M') · ${_git_hash})"
+
+    # Always generate a hardware profile so the shim's DDR-speed lookup
+    # (greenboost_cuda_shim.c get_local_ddr_speed) has a non-root source.
+    gb_info "Generating hardware profile..."
+    cmd_profile_create || gb_warn "profile create failed - DDR speed will default to 2400 MT/s"
+
     gb_ok "Installation complete"
     gb_info "Load:    sudo modprobe greenboost"
-    gb_info "Status:  greenboost status"
+    gb_info "Status:  greenboost vitals"
+
+    # Push update to all connected feeders (unattended, best-effort)
+    _gb_update_all_feeders
 }
 
 cmd_load() {
     need_root load
     detect_hardware
 
-    # Load active profile values (lowest priority — env vars and CLI flags override)
+    # Load active profile values (lowest priority - env vars and CLI flags override)
     if [[ -n "$GB_PROFILE_FILE" ]]; then
         resolve_profile "$GB_PROFILE_FILE"
     elif [[ -f "$GB_ACTIVE_PROFILE_LINK" ]]; then
@@ -3526,18 +4213,17 @@ cmd_load() {
     fi
 
     if lsmod | grep -q "^${DRIVER_NAME} "; then
-        warn "Module already loaded — reloading..."
+        warn "Module already loaded - reloading..."
         # Stop consumers before rmmod to avoid EBUSY
         for svc in ollama llama-server; do
             systemctl is-active --quiet "$svc" 2>/dev/null && \
-                systemctl stop "$svc" 2>/dev/null || true
+                systemctl stop --wait "$svc" 2>/dev/null || true
         done
-        [[ -e /dev/greenboost ]] && { fuser -k /dev/greenboost 2>/dev/null || true; sleep 0.5; }
-        rmmod "$DRIVER_NAME" || die "Failed to unload existing module"
+        _rmmod_with_retry || die "Failed to unload existing module - try: sudo rmmod greenboost"
     fi
 
     local ko="$MODULE_DIR/greenboost.ko"
-    [[ -f "$ko" ]] || die "greenboost.ko not found — run: make  or  $0 build"
+    [[ -f "$ko" ]] || die "greenboost.ko not found - run: make  or  $0 build"
 
     insmod "$ko" \
         physical_vram_gb="$phys"  \
@@ -3551,9 +4237,9 @@ cmd_load() {
         ecores_only="$ecores_only" \
         kv_reserve_mb="${GB_KV_RESERVE_MB:-2048}" \
         active_profile_name="${PROF_NAME:-autodetect}" \
-        || die "insmod failed — check: dmesg | tail -20"
+        || die "insmod failed - check: dmesg | tail -20"
 
-    info "GreenBoost v2.8.2 loaded — cuda memory pool active!"
+    info "GreenBoost v2.9 loaded - cuda memory pool active!"
     info ""
     info "  T1 ${GPU_NAME} : ${phys} GB  [hot layers]"
     info "  T2 ${RAM_TYPE} pool         : ${virt} GB  [cold layers]"
@@ -3561,7 +4247,7 @@ cmd_load() {
     info "  ─────────────────────────────────────────"
     info "  Combined view              : $(( phys + virt + nvme_sw )) GB total model capacity"
     info ""
-    info "Status     : greenboost status"
+    info "Status     : greenboost vitals"
     info "Kernel log : dmesg | grep greenboost"
     echo ""
     dmesg | grep greenboost | tail -8 | sed 's/^/  /'
@@ -3570,8 +4256,7 @@ cmd_load() {
 cmd_unload() {
     need_root unload
     if lsmod | grep -q "^${DRIVER_NAME} "; then
-        rmmod "$DRIVER_NAME" && info "GreenBoost unloaded" \
-            || die "rmmod failed — check: dmesg | tail -5"
+        _rmmod_with_retry || die "rmmod failed - check: dmesg | tail -5"
     else
         info "GreenBoost is not loaded"
     fi
@@ -3582,7 +4267,7 @@ cmd_uninstall() {
     GB_STOPPED_SERVICES=""
 
     info "============================================================"
-    info " GreenBoost — Uninstall"
+    info " GreenBoost - Uninstall"
     info "============================================================"
     info ""
     info "What will be removed:"
@@ -3601,25 +4286,39 @@ cmd_uninstall() {
     info "  - /usr/local/bin/greenboost (CLI wrapper)"
     info ""
     info "What will NOT be touched:"
-    info "  - Ollama itself (not uninstalled — only GreenBoost env vars removed)"
-    info "  - llama-server itself (not uninstalled — only GreenBoost env vars removed)"
+    info "  - Ollama itself (not uninstalled - only GreenBoost env vars removed)"
+    info "  - llama-server itself (not uninstalled - only GreenBoost env vars removed)"
     info "  - /etc/ld.so.preload entries not related to GreenBoost"
     info "  - NVIDIA drivers, CUDA toolkit, Steam, Wine, Proton"
     info "  - Any user data, models, or application configs"
-    info "  - System swap (/swap.img, swap partitions) — system swap is never touched"
-    info "  - /swap_nvme.img (old GreenBoost swap) — removed if present"
+    info "  - System swap (/swap.img, swap partitions) - system swap is never touched"
+    info "  - /swap_nvme.img (old GreenBoost swap) - removed if present"
     info ""
     info "Starting purge..."
     info ""
 
-    do_purge 1
+    if ! do_purge 1; then
+        gb_warn_ui "Scheduling boot-time cleanup so the next reboot finishes the removal…"
+        _schedule_boot_cleanup
+        info ""
+        info "============================================================"
+        info " GreenBoost partially uninstalled."
+        info " All config files and the .ko have been removed from disk."
+        info " The running module is stuck in 'Unloading' - it will be"
+        info " fully gone after a reboot."
+        info ""
+        info " Reboot now to complete uninstallation."
+        info " (The boot cleanup service runs automatically before module load.)"
+        info "============================================================"
+        return 0
+    fi
 
     info ""
     info "============================================================"
     info " GreenBoost uninstalled cleanly."
     info ""
     info " Ollama and llama-server (if installed) have been restarted"
-    info " without GreenBoost — they will use native VRAM only."
+    info " without GreenBoost - they will use native VRAM only."
     info ""
     info " To reinstall GreenBoost at any time:"
     info "   sudo ./greenboost_setup.sh full-install"
@@ -3710,20 +4409,30 @@ cmd_tune() {
     sysctl -qw vm.dirty_background_ratio=10
     info "vm.dirty_ratio    : 40 / background: 10"
 
+    # ── USB storage scheduler → none + larger read-ahead ─────────────────
+    local _usb_tuned=0
+    for sched in /sys/block/sd*/queue/scheduler; do
+        [[ -w "$sched" ]] && echo none > "$sched" 2>/dev/null && (( _usb_tuned++ )) || true
+    done
+    for ra in /sys/block/sd*/queue/read_ahead_kb; do
+        [[ -w "$ra" ]] && echo 2048 > "$ra" 2>/dev/null || true
+    done
+    [[ $_usb_tuned -gt 0 ]] && info "USB storage       : scheduler=none, read_ahead=2048 KB ($_usb_tuned device(s))"
+
     echo ""
     gb_ok "Runtime tuning applied (active until next reboot)"
 
     # ── Persist settings unconditionally ──────────────────────────────────
     _tune_persist_sysctl
     _tune_persist_nvme "$ra_kb"
-    gb_ok "Settings saved — will apply automatically on every boot"
+    gb_ok "Settings saved - will apply automatically on every boot"
 }
 
 # Write sysctl tunables to the drop-in file (also called by tune-sysctl)
 _tune_persist_sysctl() {
     local conf="/etc/sysctl.d/99-zzz-greenboost.conf"
     cat > "$conf" << 'SCTL'
-# GreenBoost — persistent sysctl tunables
+# GreenBoost - persistent sysctl tunables
 # Written by: greenboost_setup.sh tune
 vm.swappiness            = 10
 vm.dirty_ratio           = 40
@@ -3737,19 +4446,25 @@ SCTL
 _tune_persist_nvme() {
     local ra_kb="${1:-4096}"
 
-    # udev rule — fires on every NVMe block device add/change
+    # udev rule - fires on every NVMe block device add/change
     local udev_rule="/etc/udev/rules.d/99-nvme-greenboost.rules"
     cat > "$udev_rule" << UDEV
-# GreenBoost — NVMe tuning applied at boot via udev
+# GreenBoost - NVMe tuning applied at boot via udev
 ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ENV{DEVTYPE}=="disk", ATTR{queue/scheduler}="none", ATTR{queue/read_ahead_kb}="${ra_kb}", ATTR{queue/nr_requests}="1023"
 UDEV
+    # USB storage udev rule - scheduler=none, larger read-ahead for any USB block device
+    local usb_rule="/etc/udev/rules.d/99-usb-greenboost.rules"
+    cat > "$usb_rule" << 'USB_UDEV'
+# GreenBoost - USB storage tuning applied at boot via udev
+ACTION=="add|change", KERNEL=="sd[a-z]", SUBSYSTEMS=="usb", ATTR{queue/scheduler}="none", ATTR{queue/read_ahead_kb}="2048"
+USB_UDEV
     udevadm control --reload-rules 2>/dev/null || true
-    gb_ok "udev rule: wrote $udev_rule"
+    gb_ok "udev rule: wrote $udev_rule (NVMe) + $usb_rule (USB)"
 
     # THP via sysfs.d (applied by sysfsutils at boot)
     local sysfs_conf="/etc/sysfs.d/greenboost-hugepages.conf"
     cat > "$sysfs_conf" << 'SYSFS'
-# GreenBoost — Transparent Huge Pages must stay 'always' for T2 pool
+# GreenBoost - Transparent Huge Pages must stay 'always' for T2 pool
 kernel/mm/transparent_hugepage/enabled = always
 SYSFS
     gb_ok "sysfs.d: wrote $sysfs_conf (THP=always on boot)"
@@ -3766,14 +4481,14 @@ _kcfg_has()  { grep -q "^${1}=y" /boot/config-"$(uname -r)" 2>/dev/null; }
 _grub_check_flag() {
     local flag="$1" desc="$2" kcfg="$3"
     if _grub_has "$flag"; then
-        info "  [skip]    $flag  — already active"
+        info "  [skip]    $flag  - already active"
         return 1
     fi
     if [[ -n "$kcfg" ]] && ! _kcfg_has "$kcfg"; then
-        warn "  [skip]    $flag  — kernel not built with $kcfg"
+        warn "  [skip]    $flag  - kernel not built with $kcfg"
         return 1
     fi
-    info "  [add]     $flag  — $desc"
+    info "  [add]     $flag  - $desc"
     return 0
 }
 
@@ -3800,7 +4515,7 @@ cmd_tune_grub() {
     # ── Flag: transparent_hugepage=always ───────────────────────────────
     # GreenBoost T2 pool allocates 2MB compound pages. THP=always ensures
     # the kernel tries to satisfy those allocs from huge pages at boot.
-    # Currently set to 'madvise' in GRUB — change to 'always'.
+    # Currently set to 'madvise' in GRUB - change to 'always'.
     if _kcfg_has "CONFIG_TRANSPARENT_HUGEPAGE"; then
         if echo "$current_line" | grep -q "transparent_hugepage=madvise"; then
             info "  [fix]     transparent_hugepage=madvise -> always  (GreenBoost T2 hugepage pool)"
@@ -3809,7 +4524,7 @@ cmd_tune_grub() {
             info "  [add]     transparent_hugepage=always  (GreenBoost T2 hugepage pool)"
             new_flags="$new_flags transparent_hugepage=always"
         else
-            info "  [skip]    transparent_hugepage=always  — already active"
+            info "  [skip]    transparent_hugepage=always  - already active"
         fi
     fi
 
@@ -3817,9 +4532,9 @@ cmd_tune_grub() {
     # Staggers per-CPU timer ticks on the i9-14900KF hybrid topology
     # (8 P-cores + 16 E-cores). Reduces lock contention when all 32 CPUs
     # fire timer interrupts simultaneously.
-    # Runtime test: always safe — no kernel config dependency.
+    # Runtime test: always safe - no kernel config dependency.
     _grub_check_flag "skew_tick=1" \
-        "stagger timer ticks — reduces lock contention on hybrid P/E cores" "" \
+        "stagger timer ticks - reduces lock contention on hybrid P/E cores" "" \
         && new_flags="$new_flags skew_tick=1"
 
     # ── Flag: rcu_nocbs=<ecores> ─────────────────────────────────────────
@@ -3840,7 +4555,7 @@ cmd_tune_grub() {
     # ── Flag: nohz_full=<golden> ─────────────────────────────────────────
     # Makes the highest-frequency cores tick-less when they have exactly
     # one runnable thread. Eliminates timer interrupts during dense matrix
-    # multiplications — reduces LLM token latency.
+    # multiplications - reduces LLM token latency.
     # Range derived from detected golden-core topology (GB_GOLDEN_MIN/MAX).
     if [[ $GB_PCORES_ONLY -eq 1 && $GB_GOLDEN_MIN -lt $GB_GOLDEN_MAX ]]; then
         _grub_check_flag "nohz_full=${GB_GOLDEN_MIN}-${GB_GOLDEN_MAX}" \
@@ -3855,7 +4570,7 @@ cmd_tune_grub() {
     # pages that will never need to move. Already disabled at runtime
     # via sysctl, this makes it persistent across reboots.
     _grub_check_flag "numa_balancing=disable" \
-        "single NUMA node — disable page-migration scanning overhead" "" \
+        "single NUMA node - disable page-migration scanning overhead" "" \
         && new_flags="$new_flags numa_balancing=disable"
 
     # ── Flag: workqueue.power_efficient=0 ──────────────────────────────
@@ -3870,7 +4585,7 @@ cmd_tune_grub() {
     # ── Fix: deduplicate nvidia-drm.modeset=1 ──────────────────────────
     local count; count=$(echo "$current_line" | grep -o "nvidia-drm.modeset=1" | wc -l)
     if [[ "$count" -gt 1 ]]; then
-        info "  [fix]     nvidia-drm.modeset=1 appears ${count}× — deduplicating"
+        info "  [fix]     nvidia-drm.modeset=1 appears ${count}× - deduplicating"
         # Remove all occurrences then add one back
         current_line=$(echo "$current_line" | sed 's/nvidia-drm\.modeset=1//g' | tr -s ' ')
         current_line="$current_line nvidia-drm.modeset=1"
@@ -3883,7 +4598,7 @@ cmd_tune_grub() {
 
     if [[ "$new_line" == "$current_line" ]] && [[ -z "$new_flags" ]]; then
         info ""
-        info "GRUB is already fully optimised — nothing to change."
+        info "GRUB is already fully optimised - nothing to change."
         return 0
     fi
 
@@ -3913,7 +4628,7 @@ cmd_tune_grub() {
 
 # ---- tune-sysctl -------------------------------------------------------
 # Consolidate conflicting sysctl files and add missing compute settings.
-# Writes /etc/sysctl.d/99-zzz-greenboost.conf — loaded last, wins all
+# Writes /etc/sysctl.d/99-zzz-greenboost.conf - loaded last, wins all
 # conflicts. Previous files are left untouched (history/documentation).
 
 cmd_tune_sysctl() {
@@ -3935,8 +4650,8 @@ cmd_tune_sysctl() {
     info "  kernel.sched_autogroup_enabled: 1 → 0 (bad for compute, groups by session)"
     info "New settings added:"
     if [[ -e /proc/sys/kernel/sched_migration_cost_ns ]]; then
-        info "  kernel.sched_migration_cost_ns: 5000000 (5ms — keep threads on P-cores)"
-        info "  kernel.sched_min_granularity_ns: 10000000 (10ms — better for large tasks)"
+        info "  kernel.sched_migration_cost_ns: 5000000 (5ms - keep threads on P-cores)"
+        info "  kernel.sched_min_granularity_ns: 10000000 (10ms - better for large tasks)"
         info "  kernel.sched_wakeup_granularity_ns: 15000000 (reduces spurious wakeups)"
     else
         info "  CFS sched knobs: skipped (kernel $(uname -r) uses EEVDF, not CFS)"
@@ -3944,11 +4659,11 @@ cmd_tune_sysctl() {
     echo ""
 
     # Write the header line with detected hardware (variables don't expand in 'HEREDOC')
-    printf '# GreenBoost v2.8.2 — Definitive sysctl config\n' > "$dest"
+    printf '# GreenBoost v2.9 - Definitive sysctl config\n' > "$dest"
     printf '# Hardware: %s | %s | %s-%s MT/s | PCIe Gen %s %s (~%s GB/s) | %s GB NVMe\n' \
         "${CPU_NAME}" "${GPU_NAME}" "${RAM_TYPE}" "${RAM_SPEED_MT}" \
         "${PCIE_GEN}" "${PCIE_WIDTH}" "${PCIE_BW_GBS}" "${NVME_SIZE_GB}" >> "$dest"
-    printf '# Loaded last (99-zzz) — wins all conflicts with earlier sysctl.d files.\n' >> "$dest"
+    printf '# Loaded last (99-zzz) - wins all conflicts with earlier sysctl.d files.\n' >> "$dest"
     printf '# Do NOT edit other sysctl.d files; make changes here instead.\n' >> "$dest"
 
     # vm.nr_overcommit_hugepages: scale to T2 pool size so the kernel can back
@@ -3963,7 +4678,7 @@ vm.swappiness = 10
 
 # ── Write-back (Samsung 990 EVO Plus sustains 6,300 MB/s writes) ─────────
 # Allow up to 40% dirty pages before throttling writes (~25 GB at 64 GB RAM).
-# Background flush at 10% (~6.4 GB) — keeps NVMe busy without stalling allocs.
+# Background flush at 10% (~6.4 GB) - keeps NVMe busy without stalling allocs.
 vm.dirty_ratio = 40
 vm.dirty_background_ratio = 10
 vm.dirty_writeback_centisecs = 1500
@@ -3978,26 +4693,26 @@ vm.overcommit_memory = 1
 # file segments. Default 65530 is too low; 2M covers any realistic case.
 vm.max_map_count = 2147483642
 
-# Always keep 512 MB free — prevents latency spikes under allocation storms.
+# Always keep 512 MB free - prevents latency spikes under allocation storms.
 vm.min_free_kbytes = 524288
 
 # Proactive compaction: GreenBoost T2 needs contiguous 2 MB hugepage ranges.
 # Value 20 = moderate background compaction (0=off, 100=aggressive).
 vm.compaction_proactiveness = 20
 
-# Keep inode/dentry caches alive — LLM loaders open thousands of weight files.
+# Keep inode/dentry caches alive - LLM loaders open thousands of weight files.
 vm.vfs_cache_pressure = 50
 SYSCTL_EOF
 
     # Overcommit hugepage pool: sized to cover the full T2 System DDR pool.
     # Formula: GB_VIRT × 512 = number of 2 MB pages.  RAM speed ${RAM_SPEED_MT} MT/s.
-    printf '# Overcommit hugepage pool: %d × 2 MB = %d GB — covers T2 pool (%d GB, %s-%s MT/s)\n' \
+    printf '# Overcommit hugepage pool: %d × 2 MB = %d GB - covers T2 pool (%d GB, %s-%s MT/s)\n' \
         "$overcommit_hp" "$(( overcommit_hp * 2 / 1024 ))" "$GB_VIRT" "$RAM_TYPE" "$RAM_SPEED_MT" >> "$dest"
     printf 'vm.nr_overcommit_hugepages = %d\n' "$overcommit_hp" >> "$dest"
 
     cat >> "$dest" << 'SYSCTL_EOF'
 
-# Disable zone reclaim: single NUMA node — cross-zone reclaim wastes cycles.
+# Disable zone reclaim: single NUMA node - cross-zone reclaim wastes cycles.
 vm.zone_reclaim_mode = 0
 
 # ── CPU scheduler (i9-14900KF P-core / E-core hybrid) ────────────────────
@@ -4013,7 +4728,7 @@ kernel.sched_autogroup_enabled = 0
 # on kernel 7.0+. Attempting to set them produces harmless but noisy errors.
 
 # ── NUMA ──────────────────────────────────────────────────────────────────
-# Single-socket i9-14900KF — all CPUs are on NUMA node 0. Automatic NUMA
+# Single-socket i9-14900KF - all CPUs are on NUMA node 0. Automatic NUMA
 # balancing scans pages and attempts cross-node migrations that will never
 # happen. Disable to remove the page-scanning overhead.
 kernel.numa_balancing = 0
@@ -4042,7 +4757,7 @@ kernel.kptr_restrict = 0
 SYSCTL_EOF
 
     # CFS scheduler params: only present on kernels < 6.6 (CFS).
-    # Kernel 6.6+ uses EEVDF — these knobs were removed entirely.
+    # Kernel 6.6+ uses EEVDF - these knobs were removed entirely.
     _sysctl_if_exists() {
         local key="$1" val="$2" proc_path="$3"
         if [[ -e "$proc_path" ]]; then
@@ -4071,37 +4786,26 @@ cmd_tune_libs() {
 
     # ── APT packages ──────────────────────────────────────────────────────
     local pkgs=(
-        # BLAS/LAPACK — OpenBLAS compiled with AVX2/FMA or equivalent
-        libopenblas-dev
-        libblas-dev
-        liblapack-dev
+        # BLAS/LAPACK - OpenBLAS compiled with AVX2/FMA or equivalent
 
-        # OpenMP — multi-threaded CPU inference (llama.cpp uses this heavily)
-        libomp-dev
+        # OpenMP - multi-threaded CPU inference (llama.cpp uses this heavily)
 
-        # hwloc — hardware topology library used by Ollama/llama.cpp for
         # CPU pinning; without it Ollama uses a generic thread affinity model
-        hwloc
-        libhwloc-dev
 
-        # libnuma — NUMA-aware memory allocation (single node but still used
+        # libnuma - NUMA-aware memory allocation (single node but still used
         # by CUDA and some ML runtimes for memory locality hints)
-        libnuma-dev
 
-        # OpenCL — GPU compute via OpenCL API (some inference backends use it)
-        ocl-icd-opencl-dev
+        # OpenCL - GPU compute via OpenCL API (some inference backends use it)
 
-        # nvtop — real-time GPU + CPU monitor (shows all 3 tiers at a glance)
-        nvtop
     )
 
-    # CPU frequency tools — package names differ between Debian and Ubuntu/others
+    # CPU frequency tools - package names differ between Debian and Ubuntu/others
     local os_id
     os_id=$(grep -oP '^ID=\K.*' /etc/os-release | tr -d '"')
     if [[ "$os_id" == "debian" ]]; then
-        pkgs+=(linux-cpupower linux-perf psmisc)
+        pkgs+=(psmisc)
     else
-        pkgs+=(cpufrequtils linux-tools-generic psmisc)
+        pkgs+=(psmisc)
     fi
 
     # CPU vendor-specific microcode
@@ -4109,10 +4813,10 @@ cmd_tune_libs() {
     cpu_vendor=$(grep -m1 "vendor_id" /proc/cpuinfo | awk '{print $3}')
     if [[ "$cpu_vendor" == "GenuineIntel" ]]; then
         pkgs+=(intel-microcode)
-        info "CPU vendor: Intel — adding intel-microcode"
+        info "CPU vendor: Intel - adding intel-microcode"
     elif [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
         pkgs+=(amd64-microcode)
-        info "CPU vendor: AMD — adding amd64-microcode"
+        info "CPU vendor: AMD - adding amd64-microcode"
     fi
 
     info "Packages to install:"
@@ -4139,7 +4843,7 @@ cmd_tune_libs() {
     # ── Kernel modules ────────────────────────────────────────────────────
     info "Kernel modules:"
 
-    # cpuid — lets userspace read CPUID leaves directly. Used by turbostat,
+    # cpuid - lets userspace read CPUID leaves directly. Used by turbostat,
     # CUDA diagnostics, and intel-microcode update verification.
     if lsmod | grep -q "^cpuid "; then
         info "  [ok]      cpuid  (loaded)"
@@ -4161,17 +4865,14 @@ cmd_tune_libs() {
     # ── OpenBLAS CPU target selection ─────────────────────────────────────
     # Make sure the system BLAS points to OpenBLAS (AVX2/FMA optimised)
     # rather than the reference BLAS implementation.
-    if command -v update-alternatives &>/dev/null && dpkg -l libopenblas-dev 2>/dev/null | grep -q "^ii"; then
         update-alternatives --set libblas.so.3-x86_64-linux-gnu \
             /usr/lib/x86_64-linux-gnu/openblas-pthread/libblas.so.3 2>/dev/null \
             && info "BLAS alternative: set to OpenBLAS (AVX2/FMA)" \
-            || info "BLAS alternative: already set or path differs — check manually"
-    fi
+            || info "BLAS alternative: already set or path differs - check manually"
 
     echo ""
     info "tune-libs complete."
     info "  Turbostat (P/E core monitoring): sudo turbostat --quiet --Summary"
-    info "  nvtop (GPU + CPU):               nvtop"
     local os_id_tip
     os_id_tip=$(grep -oP '^ID=\K.*' /etc/os-release | tr -d '"')
     if [[ "$os_id_tip" == "debian" ]]; then
@@ -4185,7 +4886,7 @@ cmd_tune_libs() {
 
 cmd_tune_all() {
     need_root tune-all
-    info "Running full system tuning for GreenBoost v2.8.2..."
+    info "Running full system tuning for GreenBoost v2.9..."
     echo ""
     cmd_tune
     echo ""
@@ -4203,8 +4904,7 @@ cmd_clear_logs() {
     need_root "clear logs"
     gb_header
     echo -e "  ${C_CYAN}${C_BOLD}Clear All GreenBoost Logs${C_RESET}"
-    echo -e "  ${C_DIM}Clears kernel ring buffer, journal, GreenBoost log files, Proton game logs, and Wine coredumps.${C_RESET}"
-    echo -e "  ${C_DIM}Steam's own logs (compat_log.txt, pressure-vessel) are Steam-managed and are not deleted.${C_RESET}"
+    echo -e "  ${C_DIM}Clears kernel ring buffer, journal, and GreenBoost log files.${C_RESET}"
     echo -e ""
     local choice
     read -r -p "  Clear all GreenBoost-related logs now? [Y/n] " choice
@@ -4223,37 +4923,7 @@ cmd_clear_logs() {
     journalctl --vacuum-time=1s > /dev/null 2>&1 || true
     rm -rf /var/log/greenboost/* 2>/dev/null || true
     rm -f /tmp/greenboost*.log 2>/dev/null || true
-    local _gbproton_dir="$_real_home/.local/share/greenboost/proton-logs"
-    rm -f "$_gbproton_dir"/steam-*.log 2>/dev/null || true
-    rm -f "$_real_home"/steam-*.log 2>/dev/null || true
-    if command -v coredumpctl &>/dev/null; then
-        coredumpctl delete wine64 2>/dev/null || true
-        coredumpctl delete wineserver 2>/dev/null || true
-        coredumpctl delete winedevice 2>/dev/null || true
-    fi
-    gb_ok "All GreenBoost logs (dmesg, journal, /var/log/greenboost, Proton, Wine coredumps) cleared."
-}
-
-cmd_clear_proton_logs() {
-    gb_header
-    echo -e "  ${C_CYAN}${C_BOLD}Clear Proton Logs${C_RESET}"
-    echo -e "  ${C_DIM}Clears GreenBoost Proton game logs and Wine coredumps. No root required.${C_RESET}"
-    echo -e ""
-    local choice
-    read -r -p "  Clear Proton logs now? [Y/n] " choice
-    if [[ "$choice" =~ ^[Nn] ]]; then
-        gb_info "Skipping."
-        return
-    fi
-    local _gbproton_dir="$HOME/.local/share/greenboost/proton-logs"
-    rm -f "$_gbproton_dir"/steam-*.log 2>/dev/null || true
-    rm -f "$HOME"/steam-*.log 2>/dev/null || true
-    if command -v coredumpctl &>/dev/null; then
-        coredumpctl delete wine64 2>/dev/null || true
-        coredumpctl delete wineserver 2>/dev/null || true
-        coredumpctl delete winedevice 2>/dev/null || true
-    fi
-    gb_ok "Proton logs (${_gbproton_dir}/, ~/steam-*.log, Wine coredumps) cleared."
+    gb_ok "All GreenBoost logs (dmesg, journal, /var/log/greenboost) cleared."
 }
 
 cmd_clear_inference_logs() {
@@ -4276,11 +4946,403 @@ cmd_clear_inference_logs() {
     gb_ok "Inference logs (dmesg, journal, /var/log/greenboost, /tmp/greenboost*.log) cleared."
 }
 
-# Backward-compat alias — kept so existing scripts/bookmarks still work.
+cmd_clear_nvtx_logs() {
+    need_root "clear nvtx-logs"
+    local log_file="/run/greenboost/nvtx_events.log"
+    local log_old="/run/greenboost/nvtx_events.log.1"
+    local cleared=0
+    if [[ -f "$log_file" ]]; then
+        > "$log_file"
+        gb_ok "Cleared $log_file"
+        cleared=1
+    fi
+    if [[ -f "$log_old" ]]; then
+        rm -f "$log_old"
+        gb_ok "Removed $log_old"
+        cleared=1
+    fi
+    [[ $cleared -eq 0 ]] && gb_info "No NVTX log files found (nothing to clear)"
+}
+
+# ── cmd_debug / cmd_debug_vitals - toggleable deep diagnostics ──────────────
+# Usage: greenboost debug vitals [on|off]
+#
+# on:   writes /etc/greenboost/debug_vitals.enabled - scripts check this flag
+#       to show the extended vitals panel automatically.
+# off:  removes the flag file.
+# (no arg): shows the full vitals dump regardless of flag state.
+
+_show_debug_vitals_dump() {
+    _cmd_vitals_snapshot
+}
+
+_vitals_set_kernel_debug() {
+    local val="${1:-0}"
+    local dbg_f="/sys/module/greenboost/parameters/debug_mode"
+    if [[ -w "$dbg_f" ]]; then
+        echo "$val" > "$dbg_f"
+        return 0
+    fi
+    return 1
+}
+
+_vitals_write_profiled() {
+    local enabled="${1:-0}"
+    local profiled="/etc/profile.d/greenboost-vitals.sh"
+    if (( enabled )); then
+        cat > "$profiled" << 'VITPROFEOF'
+# GreenBoost Debug Vitals - set when /etc/greenboost/debug_vitals.enabled exists
+[ -f /etc/greenboost/debug_vitals.enabled ] && export GREENBOOST_NVTX_VERBOSE=1
+VITPROFEOF
+        gb_ok "profile.d: GREENBOOST_NVTX_VERBOSE=1 exported for new login shells"
+    else
+        rm -f "$profiled"
+    fi
+}
+
+_vitals_restart_service() {
+    local svc="$1" label="$2"
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        if systemctl restart "$svc" 2>/dev/null; then
+            gb_ok "Restarted ${label} (picks up new vitals settings)"
+        else
+            gb_warn "Could not restart ${label} - may need manual restart"
+        fi
+    fi
+}
+
+_vitals_find_gb_services() {
+    local -a _svcs=()
+    for _unit in /etc/systemd/system/*.service /usr/lib/systemd/system/*.service; do
+        [[ -f "$_unit" ]] || continue
+        grep -q 'GREENBOOST_ACTIVE=1' "$_unit" 2>/dev/null || continue
+        local _name; _name=$(basename "$_unit" .service)
+        [[ "$_name" == "greenboost-"* ]] && continue
+        _svcs+=("$_name")
+    done
+    printf '%s\n' "${_svcs[@]}"
+}
+
+cmd_debug_vitals() {
+    local subcmd="${1:-}"
+    local flag_file="/etc/greenboost/debug_vitals.enabled"
+    local reboot_needed=0
+
+    case "$subcmd" in
+        on)
+            need_root "debug vitals on"
+            mkdir -p /etc/greenboost
+            touch "$flag_file"
+            echo ""
+            gb_ok "Debug vitals ENABLED  (flag: ${flag_file})"
+            echo ""
+
+            # 1. Kernel debug_mode (live, no restart needed)
+            if _vitals_set_kernel_debug 1; then
+                gb_ok "Kernel debug_mode=1  (verbose dmesg - view: journalctl -k --grep=greenboost -f)"
+            else
+                gb_warn "Module not loaded or debug_mode not writable - load module first: sudo greenboost load"
+            fi
+
+            # 2. profile.d for new login shells
+            _vitals_write_profiled 1
+
+            # 3. GREENBOOST_NVTX_VERBOSE live hint (current session only)
+            export GREENBOOST_NVTX_VERBOSE=1
+            gb_info "GREENBOOST_NVTX_VERBOSE=1 set for this shell session"
+
+            # 4. Restart greenboost-idle-reclaim if running
+            systemctl daemon-reload 2>/dev/null || true
+            _vitals_restart_service "greenboost-idle-reclaim" "greenboost-idle-reclaim"
+
+            # 5. Restart other GB-aware services (ollama, vllm, etc.)
+            local _need_restart=()
+            while IFS= read -r _svc; do
+                [[ -n "$_svc" ]] && _need_restart+=("$_svc")
+            done < <(_vitals_find_gb_services)
+
+            if (( ${#_need_restart[@]} > 0 )); then
+                echo ""
+                gb_warn "The following services use GreenBoost but are NOT yet restarted:"
+                for _s in "${_need_restart[@]}"; do
+                    printf "  ${C_AMBER}◈${C_RESET}  ${C_GRAY}%s${C_RESET}  ${C_DIM}(restart: sudo systemctl restart %s)${C_RESET}\n" "$_s" "$_s"
+                done
+                gb_info "Restart them to pick up GREENBOOST_NVTX_VERBOSE=1 in their sessions."
+                echo ""
+            fi
+
+            # 6. Check if LD_PRELOAD is globally applied - if not, new processes won't get shim
+            if ! grep -q 'libgreenboost_cuda.so' /etc/ld.so.preload 2>/dev/null; then
+                gb_warn "/etc/ld.so.preload does not include libgreenboost_cuda.so"
+                gb_info "Only processes launched with explicit LD_PRELOAD will generate NVTX events."
+                gb_info "For system-wide shim: sudo greenboost install-sys-configs"
+                reboot_needed=1
+            fi
+
+            echo ""
+            gb_info "Instrumentation applied:"
+            gb_info "  • Kernel debug_mode=1       → /sys/module/greenboost/parameters/debug_mode"
+            gb_info "  • GREENBOOST_NVTX_VERBOSE=1 → /etc/profile.d/greenboost-vitals.sh"
+            gb_info "  • Flag: ${flag_file}"
+            echo ""
+            gb_info "Data sources now active:"
+            gb_info "  /run/greenboost/nvtx_events.log  - allocation/phase/OOM events"
+            gb_info "  /run/greenboost/shim_stats        - path/frag/dispatch counters"
+            gb_info "  /run/greenboost/metrics.json      - JSON + feeder data"
+            gb_info "  /run/greenboost/phase             - current phase"
+            gb_info "  journalctl -k --grep=greenboost   - kernel module events"
+            gb_info "  nvidia-smi (extended)             - GPU temp/power/clocks/util"
+            echo ""
+            gb_info "View all vitals: greenboost debug vitals"
+            gb_info "Disable:         sudo greenboost debug vitals off"
+
+            if (( reboot_needed )); then
+                echo ""
+                gb_warn "Some changes require processes to be (re)started or a reboot to take full effect."
+                gb_warn "Reboot: sudo reboot  (ensures all services pick up the new profile.d settings)"
+            fi
+            echo ""
+            ;;
+
+        off)
+            need_root "debug vitals off"
+            rm -f "$flag_file"
+            echo ""
+            gb_ok "Debug vitals DISABLED"
+
+            # 1. Reset kernel debug_mode to 0
+            if _vitals_set_kernel_debug 0; then
+                gb_ok "Kernel debug_mode=0  (verbose dmesg disabled)"
+            fi
+
+            # 2. Remove profile.d
+            _vitals_write_profiled 0
+            gb_ok "profile.d: GREENBOOST_NVTX_VERBOSE removed"
+
+            # 3. Restart services
+            systemctl daemon-reload 2>/dev/null || true
+            _vitals_restart_service "greenboost-idle-reclaim" "greenboost-idle-reclaim"
+
+            local _need_restart=()
+            while IFS= read -r _svc; do
+                [[ -n "$_svc" ]] && _need_restart+=("$_svc")
+            done < <(_vitals_find_gb_services)
+
+            if (( ${#_need_restart[@]} > 0 )); then
+                echo ""
+                gb_info "Services that should be restarted to fully disable verbose NVTX:"
+                for _s in "${_need_restart[@]}"; do
+                    printf "  ${C_GRAY}◈${C_RESET}  ${C_DIM}%s${C_RESET}\n" "$_s"
+                done
+            fi
+
+            echo ""
+            gb_info "Overhead removed. Extended vitals panel suppressed in scripts."
+            gb_info "On-demand dump still available: greenboost debug vitals"
+            echo ""
+            ;;
+
+        "--llm")
+            # Audit F-L4-27: machine-readable compact vitals for LLM/script consumers.
+            detect_hardware 2>/dev/null || true
+            local _strip='s/\x1b\[[0-9;]*[mKHJsu]//g'
+            _cmd_vitals_snapshot | sed "$_strip" | sed 's/^[[:space:]]*//' | grep -v '^─'
+            return
+            ;;
+
+        ""|vitals)
+            detect_hardware 2>/dev/null || true
+            if [[ ! -t 0 ]]; then
+                _cmd_vitals_snapshot
+                return
+            fi
+            local _saved_stty
+            _saved_stty=$(stty -g 2>/dev/null || true)
+            stty -ixon 2>/dev/null || true
+            printf '\033[?1049h'
+            trap 'stty "${_saved_stty:-}"  2>/dev/null || true; printf "\033[?1049l"; exit 0' INT TERM EXIT
+            while true; do
+                local _t_start=$SECONDS
+                printf '\033[2J\033[H'
+                echo -e "  ${C_DIM}Updating every 5s - ${C_GRAY}Ctrl+S${C_DIM}: refresh  ${C_GRAY}Ctrl+L${C_DIM}: log view  ${C_GRAY}Ctrl+C${C_DIM}: exit${C_RESET}"
+                echo ""
+                _cmd_vitals_snapshot
+                local _elapsed=$(( SECONDS - _t_start ))
+                local _sleep=$(( 5 - _elapsed ))
+                (( _sleep < 1 )) && _sleep=1
+                local _key=""
+                read -t "$_sleep" -s -n 1 _key 2>/dev/null || true
+                case "$_key" in
+                    $'\x13') ;;  # Ctrl+S: refresh now
+                    $'\x0c')     # Ctrl+L: log view
+                        _show_log_view "$GB_STATUS_LOG"
+                        printf '\033[2J\033[H'
+                        ;;
+                esac
+            done
+            ;;
+        *)
+            gb_fail "Unknown subcommand: '${subcmd}'  (use: on | off, or no arg to show vitals)"
+            echo ""
+            return 1
+            ;;
+    esac
+}
+
+cmd_debug() {
+    local subcmd="${1:-vitals}"
+    case "$subcmd" in
+        vitals) cmd_debug_vitals "${@:2}" ;;
+        *)
+            gb_fail "Unknown debug subcommand: '${subcmd}'  (use: vitals [on|off])"
+            echo ""
+            return 1
+            ;;
+    esac
+}
+
+# Returns 0 (true) if a process comm is essential and must never be killed.
+# Matched against /proc/<pid>/comm, which the kernel truncates to 15 chars -
+# so all patterns use globs/prefixes to survive truncation (e.g.
+# "gnome-session-binary" appears as "gnome-session-b").
+_gb_proc_is_protected() {
+    # Protected categories (comments kept outside the pattern list because bash
+    # forbids comments between '\'-continued case patterns):
+    #   GNOME/desktop shell + session, display managers, X/Wayland, KDE,
+    #   init/session/bus/audio daemons, NVIDIA + GreenBoost daemons.
+    case "$1" in
+        gnome-shell|gnome-shell-*|gnome-session*|gnome-control-*|gnome-software*|gnome-keyring*|mutter|gjs|tracker-*|\
+        gdm|gdm-*|Xorg|Xorg.bin|Xwayland|Xwayland*|X|\
+        kwin|kwin_*|plasmashell|kded*|ksmserver|sddm|sddm-*|lightdm|\
+        systemd|systemd-*|init|dbus-daemon|dbus-broker|elogind|seatd|\
+        pipewire|pipewire-*|wireplumber|pulseaudio|\
+        nvidia-persiste*|nvidia-*|greenboost*|greenboost-netd)
+            return 0 ;;
+    esac
+    return 1
+}
+
+cmd_clear_memory_pool() {
+    local GB_DEV=/dev/greenboost
+    local SYSFS=/sys/class/greenboost/greenboost
+
+    gb_header
+    echo -e "  ${C_CYAN}${C_BOLD}Clear Memory Pool${C_RESET}"
+    echo -e "  ${C_DIM}Releases GPU + T2/T3 memory held by inference processes."
+    echo -e "  Kills heavy GPU compute jobs (CUDA / GreenBoost); desktop & GNOME processes are protected.${C_RESET}"
+    echo -e ""
+
+    [[ -c "$GB_DEV" ]] || die "GreenBoost module not loaded (/dev/greenboost not found)"
+
+    local before
+    before=$(cat "$SYSFS/pool_brief" 2>/dev/null || echo "unavailable")
+    echo -e "  Before: ${C_DIM}${before}${C_RESET}"
+
+    # Minimum GPU memory (MiB) for a *compute* process to count as "big data"
+    # worth killing.  Desktop GPU-rasterised apps (browsers, Electron) stay well
+    # below this in the CUDA context; inference jobs use gigabytes.
+    # Override with GB_KILL_MIN_MB.
+    local kill_min_mb="${GB_KILL_MIN_MB:-512}"
+
+    # Never target our own process tree.
+    local self_pids=" $$ ${PPID:-0} ${GB_SELF_PID:-0} "
+
+    # ── Map every CUDA compute process → GPU MiB (graphics-only desktop procs
+    #    such as gnome-shell never appear in this query). ────────────────────
+    local -A gpu_mb=()
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        local cpid cmem
+        while IFS=',' read -r cpid cmem; do
+            cpid="${cpid//[[:space:]]/}"; cmem="${cmem//[[:space:]]/}"
+            [[ "$cpid" =~ ^[0-9]+$ ]] || continue
+            [[ "$cmem" =~ ^[0-9]+$ ]] || cmem=0
+            gpu_mb["$cpid"]="$cmem"
+        done < <(nvidia-smi --query-compute-apps=pid,used_memory \
+                     --format=csv,noheader,nounits 2>/dev/null || true)
+    fi
+
+    # ── Build candidate set ─────────────────────────────────────────────────
+    #   (a) processes holding /dev/greenboost open  → GreenBoost pool users
+    #       (always candidates, any size - that's what "clear pool" targets)
+    #   (b) CUDA compute processes using >= kill_min_mb MiB
+    local -A cand=()
+    local p
+    for p in $(fuser "$GB_DEV" 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+$' || true); do
+        cand["$p"]=1
+    done
+    for p in "${!gpu_mb[@]}"; do
+        if (( ${gpu_mb[$p]:-0} >= kill_min_mb )); then cand["$p"]=1; fi
+    done
+
+    # ── Filter: drop self, PID 1, and protected desktop/system processes ────
+    local kill_list=() comm
+    for p in "${!cand[@]}"; do
+        [[ "$p" == "1" ]] && continue
+        case "$self_pids" in *" $p "*) continue ;; esac
+        comm=$(cat "/proc/$p/comm" 2>/dev/null || true)
+        [[ -z "$comm" ]] && continue                 # already gone
+        if _gb_proc_is_protected "$comm"; then
+            gb_info "Protected (skipped): PID $p (${comm}, ${gpu_mb[$p]:-0} MiB)"
+            continue
+        fi
+        kill_list+=("$p")
+    done
+
+    if (( ${#kill_list[@]} == 0 )); then
+        gb_info "No killable GPU inference processes found (desktop/GNOME processes are protected)."
+    else
+        echo -e "  ${C_AMBER}Terminating GPU inference processes:${C_RESET}"
+        for p in "${kill_list[@]}"; do
+            comm=$(cat "/proc/$p/comm" 2>/dev/null || echo "?")
+            echo -e "    ${C_AMBER}• PID $p (${comm}) - ${gpu_mb[$p]:-?} MiB${C_RESET}"
+        done
+        # SIGTERM first for a clean CUDA teardown, then SIGKILL any stragglers.
+        for p in "${kill_list[@]}"; do kill -TERM "$p" 2>/dev/null || true; done
+        sleep 2
+        for p in "${kill_list[@]}"; do
+            if kill -0 "$p" 2>/dev/null; then
+                kill -9 "$p" 2>/dev/null && gb_info "  SIGKILL PID $p" || gb_info "  PID $p unkillable"
+            else
+                gb_info "  PID $p exited"
+            fi
+        done
+        sleep 1
+    fi
+
+    # Root path: force-release T2/T3 buffers via GB_IOCTL_RELEASE_PID
+    # struct gb_release_pid_req { uint32_t pid; uint32_t _pad; }  magic=0x47, nr=16
+    if [[ $EUID -eq 0 ]]; then
+        python3 - "$GB_DEV" "${kill_list[@]}" <<'PYEOF'
+import sys, os, fcntl, struct
+GB_MAGIC = ord('G')
+NR = (1 << 30) | (8 << 16) | (GB_MAGIC << 8) | 16
+dev  = sys.argv[1]
+pids = [int(x) for x in sys.argv[2:] if x.strip()]
+fd   = os.open(dev, os.O_RDWR)
+for pid in pids:
+    req = bytearray(struct.pack("II", pid, 0))
+    try:
+        fcntl.ioctl(fd, NR, req)
+        print(f"  IOCTL GB_RELEASE_PID({pid}): ok")
+    except OSError as e:
+        print(f"  IOCTL GB_RELEASE_PID({pid}): {e}")
+os.close(fd)
+PYEOF
+    else
+        gb_info "  (run as root for kernel-level buffer release via GB_IOCTL_RELEASE_PID)"
+    fi
+
+    local after
+    after=$(cat "$SYSFS/pool_brief" 2>/dev/null || echo "unavailable")
+    echo -e "  After:  ${C_DIM}${after}${C_RESET}"
+    gb_ok "Memory pool clear complete."
+}
+
+# Backward-compat alias - kept so existing scripts/bookmarks still work.
 cmd_clean_logs() { cmd_clear_logs; }
 
 # ════════════════════════════════════════════════════════════════════════
-# _logs_llm — compact, token-efficient log output for LLM/AI tools.
+# _logs_llm - compact, token-efficient log output for LLM/AI tools.
 # No ANSI colors, no human-readable decoration, deduplicated lines.
 # Format: key=value header, labeled sections, [Nx] for repeated lines.
 _logs_llm() {
@@ -4289,20 +5351,11 @@ _logs_llm() {
     # Header
     local _mod="MISSING"
     lsmod 2>/dev/null | grep -q '^greenboost' && _mod="loaded"
-    local _layer="MISSING"
-    [[ -f /etc/vulkan/implicit_layer.d/VkLayer_greenboost.json ]] && _layer="ok"
-    local _proton="MISSING"
-    for _pp in \
-        "$HOME/.steam/root/compatibilitytools.d/greenboost-proton-wayland" \
-        "$HOME/.local/share/Steam/compatibilitytools.d/greenboost-proton-wayland" \
-        "$HOME/.steam/root/compatibilitytools.d/greenboost-proton" \
-        "$HOME/.local/share/Steam/compatibilitytools.d/greenboost-proton"
-    do [[ -f "$_pp/proton" ]] && _proton="installed" && break; done
     local _vram="?"
     _vram=$(journalctl -u ollama --no-pager -q -n 50 2>/dev/null \
         | grep -oP 'total="\K[^"]+' | tail -1)
     [[ -z "$_vram" ]] && _vram="?"
-    echo "gb_logs v=${GB_VERSION} ts=$(date '+%Y-%m-%dT%H:%M') mod=${_mod} vram=${_vram} layer=${_layer} proton=${_proton}"
+    echo "gb_logs v=${GB_VERSION} ts=$(date '+%Y-%m-%dT%H:%M') mod=${_mod} vram=${_vram}"
 
     # Helper: dedup + limit a block of text, keep only actionable lines
     _llm_section() {
@@ -4325,25 +5378,14 @@ _logs_llm() {
         dmesg 2>/dev/null | grep -E 'greenboost' | tail -50)
     _llm_section "kernel" "$_kern"
 
-    # 2. Services — inference only (ollama, idle-reclaim, sentinel, recovery)
+    # 2. Services - inference only (ollama, idle-reclaim, sentinel, recovery)
     local _svc
     _svc=$(journalctl --since "1 hour ago" --no-pager -q \
         -u ollama -u greenboost-idle-reclaim \
         -u greenboost-sentinel -u greenboost-recovery 2>/dev/null | tail -60)
     _llm_section "services" "$_svc"
 
-    # 3. Vulkan layer
-    local _vkev; _vkev=$(gather_vulkan_events 30 2>/dev/null || \
-        journalctl --since "1 hour ago" --no-pager -q 2>/dev/null \
-            | grep 'VK_LAYER_GREENBOOST' | tail -30)
-    _llm_section "vulkan" "$_vkev"
-
-    # 4. Proton / VKD3D
-    query_dx12_status 2>/dev/null || true
-    local _proton_ev; _proton_ev=$(gather_proton_log_events 30 2>/dev/null)
-    _llm_section "proton" "$_proton_ev"
-
-    # 5. AppArmor
+    # 3. AppArmor
     local _aa
     _aa=$(journalctl -k --no-pager -q -n 200 2>/dev/null \
         | grep -iE 'apparmor="DENIED".*greenboost|greenboost.*apparmor="DENIED"' | tail -10)
@@ -4352,9 +5394,6 @@ _logs_llm() {
     # Diagnostic summary
     local _errs=() _warns=() _ok=()
     [[ "$_mod" == "loaded" ]] && _ok+=("module=loaded") || _errs+=("module=MISSING")
-    [[ "$_layer" == "ok" ]]   && _ok+=("vulkan_layer=ok") || _warns+=("vulkan_layer=MISSING")
-    [[ "$_proton" == "installed" ]] && _ok+=("proton=installed") || _warns+=("proton=MISSING")
-    [[ -z "${WAYLAND_DISPLAY:-}" ]] && _warns+=("WAYLAND_DISPLAY=unset")
     local _ec=${#_errs[@]} _wc=${#_warns[@]} _oc=${#_ok[@]}
     echo "[diag] errors=${_ec} warns=${_wc} ok=${_oc}"
     for _e in "${_errs[@]}";  do echo "  ERR: ${_e}"; done
@@ -4362,49 +5401,24 @@ _logs_llm() {
     for _o in "${_ok[@]}";    do echo "  OK: ${_o}"; done
 }
 
-cmd_logs() {
-    local _llm_mode=0
-    for _a in "$@"; do [[ "$_a" == "--llm" ]] && _llm_mode=1; done
-    if (( _llm_mode )); then _logs_llm; return; fi
-
-    # ── Compact status header (LLM-friendly: no banner, info-dense 1-liner) ──
+_cmd_logs_snapshot() {
     local _mod_status="MISSING"
     lsmod 2>/dev/null | grep -q '^greenboost' && _mod_status="loaded"
     local _vram_str="?"
     _vram_str=$(journalctl -u ollama --no-pager -q -n 50 2>/dev/null \
         | grep -oP 'total="\K[^"]+' | tail -1)
     [[ -z "$_vram_str" ]] && _vram_str="?"
-    local _layer_status="MISSING"
-    [[ -f /etc/vulkan/implicit_layer.d/VkLayer_greenboost.json ]] && _layer_status="ok"
-    local _proton_install_status="MISSING"
-    for _pp in \
-        "$HOME/.steam/root/compatibilitytools.d/greenboost-proton-wayland" \
-        "$HOME/.local/share/Steam/compatibilitytools.d/greenboost-proton-wayland" \
-        "$HOME/.steam/root/compatibilitytools.d/greenboost-proton" \
-        "$HOME/.local/share/Steam/compatibilitytools.d/greenboost-proton"
-    do
-        [[ -f "$_pp/proton" ]] && _proton_install_status="installed" && break
-    done
     local _ts; _ts=$(date '+%Y-%m-%dT%H:%M')
     echo -e ""
-    echo -e "  ${C_VIOLET}${C_BOLD}GreenBoost v${GB_VERSION} logs${C_RESET}  ${C_DIM}·  ${_ts}  ·  module:${_mod_status}  vram:${_vram_str}  layer:${_layer_status}  proton:${_proton_install_status}${C_RESET}"
+    echo -e "  ${C_VIOLET}${C_BOLD}GreenBoost v${GB_VERSION} logs${C_RESET}  ${C_DIM}·  ${_ts}  ·  module:${_mod_status}  vram:${_vram_str}${C_RESET}"
     echo -e ""
 
-    # Track findings for DIAGNOSTIC SUMMARY
     local _diag_errors=() _diag_warns=() _diag_ok=()
     [[ "$_mod_status" == "loaded" ]] \
-        && _diag_ok+=("kernel module loaded — VRAM ${_vram_str} reported to apps") \
-        || _diag_errors+=("kernel module NOT loaded — no T2/T3 memory available")
-    [[ "$_layer_status" == "ok" ]] \
-        && _diag_ok+=("Vulkan layer: /etc/vulkan/implicit_layer.d/VkLayer_greenboost.json") \
-        || _diag_warns+=("Vulkan layer JSON missing — games won't see inflated virtual VRAM")
-    [[ "$_proton_install_status" == "installed" ]] \
-        && _diag_ok+=("GreenBoost Proton: compat tool installed") \
-        || _diag_warns+=("GreenBoost Proton not found in compatibilitytools.d")
-    [[ -z "${WAYLAND_DISPLAY:-}" ]] \
-        && _diag_warns+=("WAYLAND_DISPLAY not set — PROTON_ENABLE_WAYLAND=1 may silently fall back to X11")
+        && _diag_ok+=("kernel module loaded - VRAM ${_vram_str} reported to apps") \
+        || _diag_errors+=("kernel module NOT loaded - no T2/T3 memory available")
 
-    # ── 1. Kernel module events ─────────────────────────────────────────────
+    # 1. Kernel module events
     local _flow; _flow=$(gather_flow_events 25)
     local _flow_n=0; [[ -n "$_flow" ]] && _flow_n=$(printf '%s\n' "$_flow" | wc -l)
     gb_section "Kernel Module (dmesg)  (${_flow_n} events)"
@@ -4414,14 +5428,14 @@ cmd_logs() {
             echo -e "  ${C_DIM}${_fline}${C_RESET}"
         done <<< "$_flow"
     else
-        echo -e "  ${C_DIM}(empty — dmesg grep: greenboost tier-transitions)${C_RESET}"
+        echo -e "  ${C_DIM}(empty - dmesg grep: greenboost tier-transitions)${C_RESET}"
     fi
     echo ""
 
-    # ── 2. GreenBoost service journal ───────────────────────────────────────
+    # 2. Service journal
     local _svc
     _svc=$(journalctl --since "1 hour ago" --no-pager -q \
-        -u ollama -u greenboost-idle-reclaim -u greenboost-shader-boost \
+        -u ollama -u greenboost-idle-reclaim \
         -u greenboost-sentinel -u greenboost-recovery 2>/dev/null | tail -25)
     local _svc_n=0; [[ -n "$_svc" ]] && _svc_n=$(printf '%s\n' "$_svc" | wc -l)
     gb_section "Services (last 1h)  (${_svc_n} events)"
@@ -4431,98 +5445,11 @@ cmd_logs() {
             echo -e "  ${C_GRAY}${_sline}${C_RESET}"
         done <<< "$_svc"
     else
-        echo -e "  ${C_DIM}(empty — units: ollama greenboost-idle-reclaim greenboost-shader-boost greenboost-sentinel greenboost-recovery)${C_RESET}"
+        echo -e "  ${C_DIM}(empty - units: ollama greenboost-idle-reclaim greenboost-sentinel greenboost-recovery)${C_RESET}"
     fi
     echo ""
 
-    # ── 3. Vulkan layer events ───────────────────────────────────────────────
-    local _vkev; _vkev=$(gather_vulkan_events 25)
-    local _vk_n=0; [[ -n "$_vkev" ]] && _vk_n=$(printf '%s\n' "$_vkev" | wc -l)
-    gb_section "Vulkan Layer (VK_LAYER_GREENBOOST)  (${_vk_n} events)"
-    if [[ -n "$_vkev" ]]; then
-        while IFS= read -r _vkline; do
-            [[ -z "$_vkline" ]] && continue
-            format_vulkan_event "$_vkline"
-        done <<< "$_vkev"
-    else
-        echo -e "  ${C_DIM}(empty — checked: journalctl VK_LAYER_GREENBOOST, /var/log/syslog)${C_RESET}"
-        echo -e "  ${C_DIM}(also checked: ~/.local/share/greenboost/proton-logs/vulkan-layer.log)${C_RESET}"
-        _diag_warns+=("no Vulkan layer events — GreenBoost Proton may not be selected for this game")
-    fi
-    echo ""
-
-    # ── 4. Proton / VKD3D log events ────────────────────────────────────────
-    # Populate DX12_APPID so gather_proton_log_events can locate steam-<id>.log
-    query_dx12_status
-    local _proton; _proton=$(gather_proton_log_events 20)
-    local _proton_n=0; [[ -n "$_proton" ]] && _proton_n=$(printf '%s\n' "$_proton" | wc -l)
-    local _gbdir="$HOME/.local/share/greenboost/proton-logs"
-    gb_section "Proton / VKD3D Logs  (${_proton_n} events)"
-    if [[ -n "$_proton" ]]; then
-        while IFS= read -r _pline; do
-            [[ -z "$_pline" ]] && continue
-            format_proton_event "$_pline"
-        done <<< "$_proton"
-    else
-        echo -e "  ${C_DIM}(empty — checked: ${_gbdir}/ ~/steam-*.log PROTON_LOG_DIR)${C_RESET}"
-        _diag_warns+=("no Proton log files found — game did not reach Wine logging stage")
-    fi
-    echo ""
-
-    # ── 5. Steam client logs ─────────────────────────────────────────────────
-    local _stcl; _stcl=$(gather_steam_client_logs 15)
-    local _stcl_n=0; [[ -n "$_stcl" ]] && _stcl_n=$(printf '%s\n' "$_stcl" | wc -l)
-    gb_section "Steam Client Logs  (${_stcl_n} events)"
-    if [[ -n "$_stcl" ]]; then
-        while IFS= read -r _sl; do
-            [[ -z "$_sl" ]] && continue
-            if printf '%s' "$_sl" | grep -qiE 'error|exception|traceback|fail|crash'; then
-                echo -e "  ${C_RED}✗${C_RESET}  ${C_RED}${_sl:0:140}${C_RESET}"
-                _diag_errors+=("steam: ${_sl:0:100}")
-            else
-                echo -e "  ${C_AMBER}⚠${C_RESET}  ${C_GRAY}${_sl:0:140}${C_RESET}"
-            fi
-        done <<< "$_stcl"
-    else
-        echo -e "  ${C_DIM}(empty — checked: ~/.local/share/Steam/logs/compat_log.txt content_log.txt ~/.steam/steam.log)${C_RESET}"
-    fi
-    echo ""
-
-    # ── 6. Pressure vessel / SteamLinuxRuntime ───────────────────────────────
-    local _pvl; _pvl=$(gather_pressure_vessel_logs 10)
-    local _pvl_n=0; [[ -n "$_pvl" ]] && _pvl_n=$(printf '%s\n' "$_pvl" | wc -l)
-    gb_section "Pressure Vessel / SteamLinuxRuntime  (${_pvl_n} events)"
-    if [[ -n "$_pvl" ]]; then
-        while IFS= read -r _pvline; do
-            [[ -z "$_pvline" ]] && continue
-            if printf '%s' "$_pvline" | grep -qiE 'error|fail|crash'; then
-                echo -e "  ${C_RED}✗${C_RESET}  ${C_RED}${_pvline:0:140}${C_RESET}"
-                _diag_errors+=("pressure-vessel: ${_pvline:0:100}")
-            else
-                echo -e "  ${C_AMBER}⚠${C_RESET}  ${C_GRAY}${_pvline:0:140}${C_RESET}"
-            fi
-        done <<< "$_pvl"
-    else
-        echo -e "  ${C_DIM}(empty — checked: ~/.local/share/Steam/steamapps/common/SteamLinuxRuntime_*/var/slr/log/ /tmp/pressure-vessel-*)${C_RESET}"
-    fi
-    echo ""
-
-    # ── 7. Wine / Proton crashes ─────────────────────────────────────────────
-    local _wcl; _wcl=$(gather_wine_crash_logs 8)
-    local _wcl_n=0; [[ -n "$_wcl" ]] && _wcl_n=$(printf '%s\n' "$_wcl" | wc -l)
-    gb_section "Wine / Proton Crashes  (${_wcl_n} events)"
-    if [[ -n "$_wcl" ]]; then
-        while IFS= read -r _wcline; do
-            [[ -z "$_wcline" ]] && continue
-            echo -e "  ${C_RED}✗${C_RESET}  ${C_RED}${_wcline:0:140}${C_RESET}"
-        done <<< "$_wcl"
-        _diag_errors+=("wine64/wineserver crash detected — see Wine / Proton Crashes section above")
-    else
-        echo -e "  ${C_DIM}(empty — checked: coredumpctl wine64/wineserver/winedevice, compatdata/*.dmp)${C_RESET}"
-    fi
-    echo ""
-
-    # ── 8. AppArmor denials ──────────────────────────────────────────────────
+    # 3. AppArmor denials
     local _aa
     _aa=$(journalctl -k --no-pager -q -n 200 2>/dev/null \
         | grep -iE 'apparmor="DENIED".*greenboost|greenboost.*apparmor="DENIED"' | tail -10)
@@ -4537,40 +5464,7 @@ cmd_logs() {
         echo ""
     fi
 
-    # ── DXR crash detection ──────────────────────────────────────────────────
-    # Check whether the last GreenBoost session had DXR active AND the most
-    # recently modified game log in compatdata contains the d3d12core NULL ptr
-    # crash signature.  If so, surface the GREENBOOST_NO_DXR=1 hint.
-    local _dxr_crash_appid=""
-    local _last_vkd3d_line
-    _last_vkd3d_line=$(grep '\[greenboost-proton\] VKD3D_CONFIG=' \
-        "$HOME/.local/share/Steam/logs/console-linux.txt" 2>/dev/null | tail -1)
-    if [[ "$_last_vkd3d_line" == *"dxr"* ]]; then
-        local _dxr_candidate
-        _dxr_candidate=$(find "$HOME/.local/share/Steam/steamapps/compatdata" \
-            -maxdepth 8 -name '*.log' 2>/dev/null \
-            | xargs -r ls -t 2>/dev/null | head -10 \
-            | while IFS= read -r _f; do
-                grep -ql 'EXCEPTION_ACCESS_VIOLATION' "$_f" 2>/dev/null \
-                    && grep -ql 'd3d12core' "$_f" 2>/dev/null \
-                    && echo "$_f" && break
-              done)
-        if [[ -n "$_dxr_candidate" ]]; then
-            _dxr_crash_appid=$(grep -oP 'compatdata/\K[0-9]+' <<< "$_dxr_candidate" | head -1)
-        fi
-    fi
-
-    # ── Diagnostic Summary ───────────────────────────────────────────────────
     gb_section "Diagnostic Summary"
-
-    if [[ -n "$_dxr_crash_appid" ]]; then
-        echo -e "  ${C_RED}✗${C_RESET}  ${C_RED}${C_BOLD}DXR crash detected${C_RESET}  ${C_RED}— NULL pointer in d3d12core.dll (AppID ${_dxr_crash_appid})${C_RESET}"
-        echo -e "  ${C_AMBER}⚠${C_RESET}  ${C_GRAY}This game crashes when DXR (ray tracing) is active via VKD3D-Proton.${C_RESET}"
-        echo -e "  ${C_VIOLET}◈${C_RESET}  ${C_GRAY}Fix: add to Steam launch options for this game:${C_RESET}"
-        echo -e "  ${C_VIOLET}◈${C_RESET}  ${C_CYAN}${C_BOLD}  GREENBOOST_NO_DXR=1 %command%${C_RESET}"
-        echo -e ""
-        _diag_errors+=("DXR crash in AppID ${_dxr_crash_appid}: add GREENBOOST_NO_DXR=1 %command% to Steam launch options")
-    fi
     for _e in "${_diag_errors[@]}"; do
         echo -e "  ${C_RED}✗${C_RESET}  ${C_RED}${_e}${C_RESET}"
     done
@@ -4581,266 +5475,60 @@ cmd_logs() {
         echo -e "  ${C_LIME}✓${C_RESET}  ${C_GRAY}${_o}${C_RESET}"
     done
     if [[ ${#_diag_errors[@]} -eq 0 && ${#_diag_warns[@]} -eq 0 ]]; then
-        echo -e "  ${C_LIME}✓${C_RESET}  ${C_GRAY}All checks passed — no errors or warnings detected.${C_RESET}"
+        echo -e "  ${C_LIME}✓${C_RESET}  ${C_GRAY}All checks passed - no errors or warnings detected.${C_RESET}"
     fi
-    echo ""
+    echo -e "  ${C_DIM}[Ctrl+C exit · Ctrl+S refresh]${C_RESET}"
 }
 
-# cmd_proton_logs — focused view: Proton/VKD3D, Steam client, pressure-vessel,
-# Wine crashes, and DXR crash detection.  No kernel/inference sections.
-cmd_proton_logs() {
-    local _llm_mode=0
-    for _a in "$@"; do [[ "$_a" == "--llm" ]] && _llm_mode=1; done
-    if (( _llm_mode )); then
-        # LLM mode: gaming-only compact output
-        local _strip='s/\x1b\[[0-9;]*[mKHJsu]//g'
-        _llm_section() {
-            local _label="$1" _text="$2" _limit="${3:-15}"
-            local _filtered
-            _filtered=$(printf '%s\n' "$_text" \
-                | grep -iE 'err|warn|fail|crash|denied|dxr|vkd3d|vulkan|dx12' \
-                | sed "$_strip" | sed 's/^[[:space:]]*//' \
-                | sort | uniq -c | sort -rn \
-                | awk '{c=$1; $1=""; sub(/^ /,""); if(c>1) printf "[%dx] %s\n",c,$0; else print $0}' \
-                | head -"$_limit")
-            local _n=0; [[ -n "$_filtered" ]] && _n=$(printf '%s\n' "$_filtered" | wc -l)
-            echo "[${_label}] ${_n} events"
-            [[ -n "$_filtered" ]] && printf '%s\n' "$_filtered" | sed 's/^/  /'
-        }
-        echo "gb_proton_logs v=${GB_VERSION} ts=$(date '+%Y-%m-%dT%H:%M')"
-        query_dx12_status 2>/dev/null || true
-        _llm_section "proton_vkd3d" "$(gather_proton_log_events 40 2>/dev/null)"
-        _llm_section "vulkan_layer" "$(gather_vulkan_events 20 2>/dev/null)"
-        _llm_section "steam_client" "$(gather_steam_client_logs 20 2>/dev/null)"
-        _llm_section "pressure_vessel" "$(gather_pressure_vessel_logs 15 2>/dev/null)"
-        _llm_section "wine_crashes" "$(gather_wine_crash_logs 10 2>/dev/null)"
+cmd_logs() {
+    if [[ "${1:-}" == "--llm" ]]; then _logs_llm; return; fi
+
+    if [[ ! -t 0 ]]; then
+        _cmd_logs_snapshot
         return
     fi
 
-    local _ts; _ts=$(date '+%Y-%m-%dT%H:%M')
-    echo -e ""
-    echo -e "  ${C_VIOLET}${C_BOLD}GreenBoost Proton logs${C_RESET}  ${C_DIM}·  ${_ts}${C_RESET}"
-    echo -e ""
-
-    local _diag_errors=() _diag_warns=() _diag_ok=()
-
-    # ── Proton / VKD3D log events ────────────────────────────────────────
-    query_dx12_status
-    local _proton; _proton=$(gather_proton_log_events 40)
-    local _proton_n=0; [[ -n "$_proton" ]] && _proton_n=$(printf '%s\n' "$_proton" | wc -l)
-    local _gbdir="$HOME/.local/share/greenboost/proton-logs"
-    gb_section "Proton / VKD3D Logs  (${_proton_n} events)"
-    if [[ -n "$_proton" ]]; then
-        while IFS= read -r _pline; do
-            [[ -z "$_pline" ]] && continue
-            format_proton_event "$_pline"
-        done <<< "$_proton"
-    else
-        echo -e "  ${C_DIM}(empty — checked: ${_gbdir}/ ~/steam-*.log PROTON_LOG_DIR)${C_RESET}"
-        _diag_warns+=("no Proton log files found — game did not reach Wine logging stage")
-    fi
-    echo ""
-
-    # ── GreenBoost Vulkan layer events ────────────────────────────────────
-    local _vkev; _vkev=$(gather_vulkan_events 20)
-    local _vkev_n=0; [[ -n "$_vkev" ]] && _vkev_n=$(printf '%s\n' "$_vkev" | wc -l)
-    gb_section "GreenBoost Vulkan Layer  (${_vkev_n} events)"
-    if [[ -n "$_vkev" ]]; then
-        while IFS= read -r _vkline; do
-            [[ -z "$_vkline" ]] && continue
-            format_vulkan_event "$_vkline"
-        done <<< "$_vkev"
-        _diag_ok+=("Vulkan layer active — ${_vkev_n} events recorded")
-    else
-        echo -e "  ${C_DIM}(empty — checked: journalctl VK_LAYER_GREENBOOST, /var/log/syslog)${C_RESET}"
-        _diag_warns+=("no Vulkan layer events — GreenBoost Proton may not be selected for this game")
-    fi
-    echo ""
-
-    # ── Steam client logs ─────────────────────────────────────────────────
-    local _stcl; _stcl=$(gather_steam_client_logs 20)
-    local _stcl_n=0; [[ -n "$_stcl" ]] && _stcl_n=$(printf '%s\n' "$_stcl" | wc -l)
-    gb_section "Steam Client Logs  (${_stcl_n} events)"
-    if [[ -n "$_stcl" ]]; then
-        local _has_vdf_error=0
-        while IFS= read -r _sl; do
-            [[ -z "$_sl" ]] && continue
-            if printf '%s' "$_sl" | grep -qiE 'error|exception|traceback|fail|crash'; then
-                echo -e "  ${C_RED}✗${C_RESET}  ${C_RED}${_sl:0:140}${C_RESET}"
-                _diag_errors+=("steam: ${_sl:0:100}")
-                # Detect libraryfolders.vdf load failures — Steam can't find its game library.
-                if printf '%s' "$_sl" | grep -q 'libraryfolders.vdf' && _has_vdf_error=0; then
-                    _has_vdf_error=1
-                fi
-            else
-                echo -e "  ${C_AMBER}⚠${C_RESET}  ${C_GRAY}${_sl:0:140}${C_RESET}"
-            fi
-        done <<< "$_stcl"
-        if (( _has_vdf_error )); then
-            _diag_errors+=("Steam library config unreadable (libraryfolders.vdf) — run: steam steam://validate or delete and re-login to Steam")
-        fi
-    else
-        echo -e "  ${C_DIM}(empty — checked: ~/.local/share/Steam/logs/ ~/.steam/steam.log)${C_RESET}"
-    fi
-    echo ""
-
-    # ── Pressure vessel / SteamLinuxRuntime ───────────────────────────────
-    local _pvl; _pvl=$(gather_pressure_vessel_logs 10)
-    local _pvl_n=0; [[ -n "$_pvl" ]] && _pvl_n=$(printf '%s\n' "$_pvl" | wc -l)
-    gb_section "Pressure Vessel / SteamLinuxRuntime  (${_pvl_n} events)"
-    if [[ -n "$_pvl" ]]; then
-        while IFS= read -r _pvline; do
-            [[ -z "$_pvline" ]] && continue
-            if printf '%s' "$_pvline" | grep -qiE 'error|fail|crash'; then
-                echo -e "  ${C_RED}✗${C_RESET}  ${C_RED}${_pvline:0:140}${C_RESET}"
-                _diag_errors+=("pressure-vessel: ${_pvline:0:100}")
-            else
-                echo -e "  ${C_AMBER}⚠${C_RESET}  ${C_GRAY}${_pvline:0:140}${C_RESET}"
-            fi
-        done <<< "$_pvl"
-    else
-        echo -e "  ${C_DIM}(empty — checked: SteamLinuxRuntime_*/var/slr/log/ /tmp/pressure-vessel-*)${C_RESET}"
-    fi
-    echo ""
-
-    # ── Wine / Proton crashes ─────────────────────────────────────────────
-    local _wcl; _wcl=$(gather_wine_crash_logs 8)
-    local _wcl_n=0; [[ -n "$_wcl" ]] && _wcl_n=$(printf '%s\n' "$_wcl" | wc -l)
-    gb_section "Wine / Proton Crashes  (${_wcl_n} events)"
-    if [[ -n "$_wcl" ]]; then
-        while IFS= read -r _wcline; do
-            [[ -z "$_wcline" ]] && continue
-            echo -e "  ${C_RED}✗${C_RESET}  ${C_RED}${_wcline:0:140}${C_RESET}"
-        done <<< "$_wcl"
-        _diag_errors+=("wine64/wineserver crash detected — see Wine / Proton Crashes section above")
-    else
-        echo -e "  ${C_DIM}(empty — checked: coredumpctl wine64/wineserver/winedevice, compatdata/*.dmp)${C_RESET}"
-    fi
-    echo ""
-
-    # ── DXR crash detection ──────────────────────────────────────────────
-    local _dxr_crash_appid=""
-    local _last_vkd3d_line
-    _last_vkd3d_line=$(grep '\[greenboost-proton\] VKD3D_CONFIG=' \
-        "$HOME/.local/share/Steam/logs/console-linux.txt" 2>/dev/null | tail -1)
-    if [[ "$_last_vkd3d_line" == *"dxr"* ]]; then
-        local _dxr_candidate
-        _dxr_candidate=$(find "$HOME/.local/share/Steam/steamapps/compatdata" \
-            -maxdepth 8 -name '*.log' 2>/dev/null \
-            | xargs -r ls -t 2>/dev/null | head -10 \
-            | while IFS= read -r _f; do
-                grep -ql 'EXCEPTION_ACCESS_VIOLATION' "$_f" 2>/dev/null \
-                    && grep -ql 'd3d12core' "$_f" 2>/dev/null \
-                    && echo "$_f" && break
-              done)
-        if [[ -n "$_dxr_candidate" ]]; then
-            _dxr_crash_appid=$(grep -oP 'compatdata/\K[0-9]+' <<< "$_dxr_candidate" | head -1)
-        fi
-    fi
-
-    # ── GreenBoost stack health checks ──────────────────────────────────
-    # 1. Kernel module
-    if lsmod 2>/dev/null | grep -q '^greenboost'; then
-        local _phys _virt
-        _phys=$(cat /sys/module/greenboost/parameters/physical_vram_gb 2>/dev/null || echo "?")
-        _virt=$(cat /sys/module/greenboost/parameters/virtual_vram_gb 2>/dev/null || echo "?")
-        _diag_ok+=("kernel module loaded — T1=${_phys} GB physical + T2 cap=${_virt} GB virtual")
-    else
-        _diag_errors+=("kernel module NOT loaded — T2 pool unavailable (run: sudo greenboost load)")
-    fi
-    # 2. GreenBoost Proton install
-    if [[ "${GB_PROTON_INSTALLED:-0}" == "1" ]]; then
-        _diag_ok+=("GreenBoost Proton: installed")
-    else
-        _diag_errors+=("GreenBoost Proton NOT installed — run: cd ~/Dev/greenboost/greenboost_proton && ./install.sh  then restart Steam")
-    fi
-    # 3. GREENBOOST_VULKAN=1 in running DX12 game
-    if (( DX12_ACTIVE )); then
-        local _gb_vk=0
-        for _pid in $(pgrep wine64 2>/dev/null | head -10); do
-            if tr '\0' '\n' < "/proc/$_pid/environ" 2>/dev/null \
-                    | grep -q '^GREENBOOST_VULKAN=1'; then
-                _gb_vk=1; break
-            fi
-        done
-        if (( _gb_vk )); then
-            _diag_ok+=("GREENBOOST_VULKAN=1 active in running game — virtual VRAM pool enabled")
-        else
-            _diag_errors+=("GREENBOOST_VULKAN=1 NOT set in running game — T2 pool inactive. In Steam: right-click game → Properties → Compatibility → select 'GreenBoost Proton'")
-        fi
-    fi
-
-    # ── Diagnostic Summary ───────────────────────────────────────────────
-    gb_section "Diagnostic Summary"
-    if [[ -n "$_dxr_crash_appid" ]]; then
-        echo -e "  ${C_RED}✗${C_RESET}  ${C_RED}${C_BOLD}DXR crash detected${C_RESET}  ${C_RED}— NULL pointer in d3d12core.dll (AppID ${_dxr_crash_appid})${C_RESET}"
-        echo -e "  ${C_AMBER}⚠${C_RESET}  ${C_GRAY}This game crashes when DXR (ray tracing) is active via VKD3D-Proton.${C_RESET}"
-        echo -e "  ${C_VIOLET}◈${C_RESET}  ${C_GRAY}Fix: add to Steam launch options for this game:${C_RESET}"
-        echo -e "  ${C_VIOLET}◈${C_RESET}  ${C_CYAN}${C_BOLD}  GREENBOOST_NO_DXR=1 %command%${C_RESET}"
-        echo -e ""
-        _diag_errors+=("DXR crash in AppID ${_dxr_crash_appid}: add GREENBOOST_NO_DXR=1 %command% to Steam launch options")
-    fi
-    for _e in "${_diag_errors[@]}"; do
-        echo -e "  ${C_RED}✗${C_RESET}  ${C_RED}${_e}${C_RESET}"
-    done
-    for _w in "${_diag_warns[@]}"; do
-        echo -e "  ${C_AMBER}⚠${C_RESET}  ${C_GRAY}${_w}${C_RESET}"
-    done
-    for _o in "${_diag_ok[@]}"; do
-        echo -e "  ${C_LIME}✓${C_RESET}  ${C_GRAY}${_o}${C_RESET}"
-    done
-    if [[ ${#_diag_errors[@]} -eq 0 && ${#_diag_warns[@]} -eq 0 ]]; then
-        echo -e "  ${C_LIME}✓${C_RESET}  ${C_GRAY}All checks passed — no errors or warnings detected.${C_RESET}"
-    fi
-    echo ""
+    # PR-BB: shared TUI loop helper.
+    _gb_run_tui_loop _cmd_logs_snapshot
 }
 
-# cmd_inference_logs — focused view: kernel tier-transitions, GreenBoost services,
-# Vulkan layer.  No Proton/Steam/Wine sections.
-cmd_inference_logs() {
-    local _llm_mode=0
-    for _a in "$@"; do [[ "$_a" == "--llm" ]] && _llm_mode=1; done
-    if (( _llm_mode )); then
-        # LLM mode: inference-only compact output (kernel + AI services, no gaming)
-        local _strip='s/\x1b\[[0-9;]*[mKHJsu]//g'
-        _llm_section() {
-            local _label="$1" _text="$2" _limit="${3:-15}"
-            local _filtered
-            _filtered=$(printf '%s\n' "$_text" \
-                | grep -iE 'err|warn|fail|oom|crash|denied|evict|tier|transition|alloc|timeout|CRITICAL' \
-                | sed "$_strip" | sed 's/^[[:space:]]*//' \
-                | sort | uniq -c | sort -rn \
-                | awk '{c=$1; $1=""; sub(/^ /,""); if(c>1) printf "[%dx] %s\n",c,$0; else print $0}' \
-                | head -"$_limit")
-            local _n=0; [[ -n "$_filtered" ]] && _n=$(printf '%s\n' "$_filtered" | wc -l)
-            echo "[${_label}] ${_n} events"
-            [[ -n "$_filtered" ]] && printf '%s\n' "$_filtered" | sed 's/^/  /'
-        }
-        local _mod="MISSING"
-        lsmod 2>/dev/null | grep -q '^greenboost' && _mod="loaded"
-        echo "gb_inference_logs v=${GB_VERSION} ts=$(date '+%Y-%m-%dT%H:%M') mod=${_mod}"
-        _llm_section "kernel" "$(gather_flow_events 50 2>/dev/null)"
-        _llm_section "services" "$(journalctl --since '1 hour ago' --no-pager -q \
-            -u ollama -u greenboost-idle-reclaim \
-            -u greenboost-sentinel -u greenboost-recovery 2>/dev/null | tail -60)"
-        return
-    fi
+_cmd_inference_logs_llm() {
+    local _strip='s/\x1b\[[0-9;]*[mKHJsu]//g'
+    _il_section() {
+        local _label="$1" _text="$2" _limit="${3:-15}"
+        local _filtered
+        _filtered=$(printf '%s\n' "$_text" \
+            | grep -iE 'err|warn|fail|oom|crash|denied|evict|tier|transition|alloc|timeout|CRITICAL' \
+            | sed "$_strip" | sed 's/^[[:space:]]*//' \
+            | sort | uniq -c | sort -rn \
+            | awk '{c=$1; $1=""; sub(/^ /,""); if(c>1) printf "[%dx] %s\n",c,$0; else print $0}' \
+            | head -"$_limit")
+        local _n=0; [[ -n "$_filtered" ]] && _n=$(printf '%s\n' "$_filtered" | wc -l)
+        echo "[${_label}] ${_n} events"
+        [[ -n "$_filtered" ]] && printf '%s\n' "$_filtered" | sed 's/^/  /'
+    }
+    local _mod="MISSING"
+    lsmod 2>/dev/null | grep -q '^greenboost' && _mod="loaded"
+    echo "gb_inference_logs v=${GB_VERSION} ts=$(date '+%Y-%m-%dT%H:%M') mod=${_mod}"
+    _il_section "kernel" "$(gather_flow_events 50 2>/dev/null)"
+    _il_section "services" "$(journalctl --since '1 hour ago' --no-pager -q \
+        -u ollama -u greenboost-idle-reclaim \
+        -u greenboost-sentinel -u greenboost-recovery 2>/dev/null | tail -60)"
+}
 
+_cmd_inference_logs_snapshot() {
     local _ts; _ts=$(date '+%Y-%m-%dT%H:%M')
     echo -e ""
     echo -e "  ${C_VIOLET}${C_BOLD}GreenBoost inference logs${C_RESET}  ${C_DIM}·  ${_ts}${C_RESET}"
     echo -e ""
 
     local _diag_errors=() _diag_warns=() _diag_ok=()
-
-    # Check module status for summary
     local _mod_status="MISSING"
     lsmod 2>/dev/null | grep -q '^greenboost' && _mod_status="loaded"
     [[ "$_mod_status" == "loaded" ]] \
         && _diag_ok+=("kernel module loaded") \
-        || _diag_errors+=("kernel module NOT loaded — no T2/T3 memory available")
+        || _diag_errors+=("kernel module NOT loaded - no T2/T3 memory available")
 
-    # ── Kernel module events ──────────────────────────────────────────────
     local _flow; _flow=$(gather_flow_events 40)
     local _flow_n=0; [[ -n "$_flow" ]] && _flow_n=$(printf '%s\n' "$_flow" | wc -l)
     gb_section "Kernel Module (dmesg)  (${_flow_n} events)"
@@ -4850,11 +5538,10 @@ cmd_inference_logs() {
             echo -e "  ${C_DIM}${_fline}${C_RESET}"
         done <<< "$_flow"
     else
-        echo -e "  ${C_DIM}(empty — dmesg grep: greenboost tier-transitions)${C_RESET}"
+        echo -e "  ${C_DIM}(empty - dmesg grep: greenboost tier-transitions)${C_RESET}"
     fi
     echo ""
 
-    # ── AI inference service journal (no gaming services) ─────────────────
     local _svc
     _svc=$(journalctl --since "1 hour ago" --no-pager -q \
         -u ollama -u greenboost-idle-reclaim \
@@ -4867,11 +5554,10 @@ cmd_inference_logs() {
             echo -e "  ${C_GRAY}${_sline}${C_RESET}"
         done <<< "$_svc"
     else
-        echo -e "  ${C_DIM}(empty — units: ollama greenboost-idle-reclaim greenboost-sentinel greenboost-recovery)${C_RESET}"
+        echo -e "  ${C_DIM}(empty - units: ollama greenboost-idle-reclaim greenboost-sentinel greenboost-recovery)${C_RESET}"
     fi
     echo ""
 
-    # ── OOM / memory-pressure detection ──────────────────────────────────
     local _oom_events
     _oom_events=$(printf '%s\n' "$_svc" \
         | grep -iE 'oom.kill|OOM killer|Failed.*oom-kill|killed.*OOM')
@@ -4882,19 +5568,17 @@ cmd_inference_logs() {
             | grep -oP '^[0-9]+(\.[0-9]+)?[GMKT]i?')
         local _peak_note=""
         [[ -n "$_mem_peak" ]] && _peak_note=" (peak: ${_mem_peak})"
-        _diag_errors+=("OOM kill detected in ollama service${_peak_note} — KV cache + model overflow exceeded available system RAM")
+        _diag_errors+=("OOM kill detected in ollama service${_peak_note} - KV cache + model overflow exceeded available system RAM")
         _diag_errors+=("  Likely cause: virtual VRAM total included NVMe T3 pool, inflating context length")
         _diag_errors+=("  Fix: sudo greenboost set-kv-reserve <MB>  or  set OLLAMA_NUM_CTX=<smaller value>")
     fi
 
-    # Warn if ollama chose a very large default context (can lead to OOM KV allocation)
     local _num_ctx
     _num_ctx=$(printf '%s\n' "$_svc" | grep -oP 'default_num_ctx=\K[0-9]+' | head -1)
     if [[ -n "$_num_ctx" ]] && (( _num_ctx >= 131072 )); then
-        _diag_warns+=("Ollama default_num_ctx=${_num_ctx} — KV cache will be very large; verify T2 has enough headroom (sudo greenboost status)")
+        _diag_warns+=("Ollama default_num_ctx=${_num_ctx} - KV cache will be very large; verify T2 has enough headroom (sudo greenboost vitals)")
     fi
 
-    # ── Diagnostic Summary ────────────────────────────────────────────────
     gb_section "Diagnostic Summary"
     for _e in "${_diag_errors[@]}"; do
         echo -e "  ${C_RED}✗${C_RESET}  ${C_RED}${_e}${C_RESET}"
@@ -4906,13 +5590,25 @@ cmd_inference_logs() {
         echo -e "  ${C_LIME}✓${C_RESET}  ${C_GRAY}${_o}${C_RESET}"
     done
     if [[ ${#_diag_errors[@]} -eq 0 && ${#_diag_warns[@]} -eq 0 ]]; then
-        echo -e "  ${C_LIME}✓${C_RESET}  ${C_GRAY}All checks passed — no errors or warnings detected.${C_RESET}"
+        echo -e "  ${C_LIME}✓${C_RESET}  ${C_GRAY}All checks passed - no errors or warnings detected.${C_RESET}"
     fi
-    echo ""
+    echo -e "  ${C_DIM}[Ctrl+C exit · Ctrl+S refresh]${C_RESET}"
+}
+
+cmd_inference_logs() {
+    if [[ "${1:-}" == "--llm" ]]; then _cmd_inference_logs_llm; return; fi
+
+    if [[ ! -t 0 ]]; then
+        _cmd_inference_logs_snapshot
+        return
+    fi
+
+    # PR-BB: shared TUI loop helper.
+    _gb_run_tui_loop _cmd_inference_logs_snapshot
 }
 
 # ════════════════════════════════════════════════════════════════════════
-# inference-test — live benchmark that verifies GreenBoost path + perf
+# inference-test - live benchmark that verifies GreenBoost path + perf
 # ════════════════════════════════════════════════════════════════════════
 
 # _infer_test_pick_model [--model NAME]
@@ -4992,7 +5688,7 @@ except: pass
     elif [[ "$_choice" =~ ^[0-9]+$ ]] && (( _choice >= 1 && _choice <= ${#_models[@]} )); then
         echo "${_models[$(( _choice - 1 ))]}"
     else
-        echo -e "  ${C_AMBER}⚠${C_RESET}  ${C_GRAY}Invalid selection — using default.${C_RESET}" >&2
+        echo -e "  ${C_AMBER}⚠${C_RESET}  ${C_GRAY}Invalid selection - using default.${C_RESET}" >&2
         echo "${_models[$_default_idx]}"
     fi
 }
@@ -5070,7 +5766,7 @@ print(f'{tok}|{first_ms}|{total_ms}|0')
     rm -f "$_tmp"
 }
 
-# _infer_test_write_llm_report — writes structured report to GB_INFER_TEST_LOG
+# _infer_test_write_llm_report - writes structured report to GB_INFER_TEST_LOG
 # and optionally to stdout (when _print=1).
 _infer_test_write_llm_report() {
     local _model="$1" _print="${2:-0}"
@@ -5080,10 +5776,9 @@ _infer_test_write_llm_report() {
     # path verdict
     local _verdict="UNKNOWN"
     case "$SS_ACTIVE_PATH" in
-        A0) _verdict="OPTIMAL" ;;
         A)  _verdict="GOOD" ;;
         B)  _verdict="FALLBACK" ;;
-        C)  _verdict="LAST_RESORT" ;;
+        *)  _verdict="UNKNOWN" ;;
     esac
 
     # kernel last 5 greenboost dmesg lines
@@ -5095,7 +5790,7 @@ _infer_test_write_llm_report() {
     _report=$(cat <<REPORTEOF
 greenboost inference-test v=${GB_VERSION} ts=$(date -Iseconds) model=${_model}
 [path]
-active=${SS_ACTIVE_PATH:-unknown}  a0_delta=${IT_A0_DELTA:-0}  a_delta=${IT_A_DELTA:-0}  b_delta=${IT_B_DELTA:-0}  c_delta=${IT_C_DELTA:-0}  verdict=${_verdict}
+active=${SS_ACTIVE_PATH:-unknown}  a_delta=${IT_A_DELTA:-0}  b_delta=${IT_B_DELTA:-0}  verdict=${_verdict}
 [perf]
 tok_per_sec=${IT_TOK_PER_SEC:-0}  first_token_ms=${IT_FIRST_TOKEN_MS:-0}  total_ms=${IT_TOTAL_MS:-0}  tokens=${IT_TOK_TOTAL:-0}
 [memory]
@@ -5137,7 +5832,7 @@ cmd_inference_test() {
     done
 
     gb_header
-    echo -e "  ${C_CYAN}${C_BOLD}Inference Test${C_RESET}  ${C_DIM}— verifies GreenBoost path, perf, and memory${C_RESET}"
+    echo -e "  ${C_CYAN}${C_BOLD}Inference Test${C_RESET}  ${C_DIM}- verifies GreenBoost path, perf, and memory${C_RESET}"
     echo ""
 
     # ── 1. Pre-flight ────────────────────────────────────────────────────
@@ -5147,10 +5842,10 @@ cmd_inference_test() {
     local _pf_errors=() _pf_warns=()
 
     if ! lsmod 2>/dev/null | grep -q "^${DRIVER_NAME} "; then
-        _pf_warns+=("GreenBoost kernel module not loaded — paths B/C only")
+        _pf_warns+=("GreenBoost kernel module not loaded - paths B/C only")
     fi
     if ! command -v ollama &>/dev/null && ! curl -sf --max-time 2 http://localhost:11434/api/tags &>/dev/null; then
-        _pf_errors+=("Ollama not running — start with: ollama serve")
+        _pf_errors+=("Ollama not running - start with: ollama serve")
     fi
 
     for _e in "${_pf_errors[@]}"; do
@@ -5161,7 +5856,7 @@ cmd_inference_test() {
     done
     if [[ ${#_pf_errors[@]} -gt 0 ]]; then
         echo ""
-        echo -e "  ${C_RED}Pre-flight failed — fix the above before running inference-test.${C_RESET}"
+        echo -e "  ${C_RED}Pre-flight failed - fix the above before running inference-test.${C_RESET}"
         echo ""
         return 1
     fi
@@ -5182,8 +5877,8 @@ cmd_inference_test() {
 
     # ── 3. Snapshot BEFORE ───────────────────────────────────────────────
     parse_pool_brief; parse_pool_info; parse_shim_stats; query_gpu_vram; query_ollama_ps
-    local _a0_before=${SS_PATH_A0:-0} _a_before=${SS_PATH_A:-0}
-    local _b_before=${SS_PATH_B:-0}  _c_before=${SS_PATH_C:-0}
+    local _a_before=${SS_PATH_A:-0}
+    local _b_before=${SS_PATH_B:-0}
     local _vram_before=${GPU_VRAM_USED_MB:-0}
 
     # ── 4. Run inference (with spinner) ──────────────────────────────────
@@ -5196,10 +5891,8 @@ cmd_inference_test() {
 
     # ── 5. Snapshot AFTER ────────────────────────────────────────────────
     parse_shim_stats; query_gpu_vram; query_ollama_ps
-    IT_A0_DELTA=$(( ${SS_PATH_A0:-0} - _a0_before ))
     IT_A_DELTA=$(( ${SS_PATH_A:-0}  - _a_before ))
     IT_B_DELTA=$(( ${SS_PATH_B:-0}  - _b_before ))
-    IT_C_DELTA=$(( ${SS_PATH_C:-0}  - _c_before ))
 
     # ── 6. Result panel ──────────────────────────────────────────────────
     gb_separator
@@ -5210,10 +5903,8 @@ cmd_inference_test() {
     # Path verdict
     local _verdict_color _verdict_label
     case "$SS_ACTIVE_PATH" in
-        A0) _verdict_color="$C_LIME";  _verdict_label="OPTIMAL  (A0 — fastest path)" ;;
-        A)  _verdict_color="$C_LIME";  _verdict_label="GOOD     (A — fast path)" ;;
-        B)  _verdict_color="$C_AMBER"; _verdict_label="FALLBACK (B — no kernel module)" ;;
-        C)  _verdict_color="$C_RED";   _verdict_label="DEGRADED (C — last resort)" ;;
+        A)  _verdict_color="$C_LIME";  _verdict_label="GOOD     (A - DMA-BUF pinned DDR)" ;;
+        B)  _verdict_color="$C_AMBER"; _verdict_label="FALLBACK (B - HostReg no-kernel)" ;;
         *)  _verdict_color="$C_GRAY";  _verdict_label="UNKNOWN  (shim stats unavailable)" ;;
     esac
     echo -e "  ${C_BOLD}Path${C_RESET}       ${_verdict_color}${C_BOLD}${_verdict_label}${C_RESET}"
@@ -5236,7 +5927,7 @@ cmd_inference_test() {
     fi
 
     # Alloc delta
-    echo -e "  ${C_BOLD}Allocs${C_RESET}     ${C_DIM}A0:+${IT_A0_DELTA}  A:+${IT_A_DELTA}  B:+${IT_B_DELTA}  C:+${IT_C_DELTA}${C_RESET}"
+    echo -e "  ${C_BOLD}Allocs${C_RESET}     ${C_DIM}A:+${IT_A_DELTA}  B:+${IT_B_DELTA}${C_RESET}"
 
     # Errors
     if [[ -n "$IT_ERROR" ]]; then
@@ -5254,797 +5945,6 @@ cmd_inference_test() {
     echo ""
 }
 
-# ════════════════════════════════════════════════════════════════════════
-# Vulkan dashboard — data helpers + renderer + entry point
-# ════════════════════════════════════════════════════════════════════════
-
-# query_vulkan_layer — check layer installation state, query device/driver info.
-# Sets: VKL_MANIFEST_OK (0/1), VKL_SO_OK (0/1), VKL_MANIFEST_PATH, VKL_SO_PATH,
-#       VKL_GPU_DEVICE, VKL_DRIVER_VERSION.
-query_vulkan_layer() {
-    VKL_MANIFEST_OK=0; VKL_SO_OK=0
-    VKL_MANIFEST_PATH="$VULKAN_IMPLICIT_LAYER_DIR/$VULKAN_LAYER_MANIFEST"
-    VKL_SO_PATH="$SHIM_DEST/$VULKAN_LAYER_LIB"
-    VKL_GPU_DEVICE="—"; VKL_DRIVER_VERSION="—"
-
-    [[ -f "$VKL_MANIFEST_PATH" ]] && VKL_MANIFEST_OK=1
-    [[ -f "$VKL_SO_PATH"       ]] && VKL_SO_OK=1
-
-    # Try vulkaninfo --summary first (fastest; available when vulkan-tools installed).
-    if command -v vulkaninfo &>/dev/null; then
-        local _vksum
-        _vksum=$(timeout 5 vulkaninfo --summary 2>/dev/null) || _vksum=""
-        if [[ -n "$_vksum" ]]; then
-            local _dev _drv
-            _dev=$(printf '%s' "$_vksum" \
-                | grep -m1 'deviceName' | grep -oP '=\s*\K.+' | sed 's/[[:space:]]*$//')
-            _drv=$(printf '%s' "$_vksum" \
-                | grep -m1 -iE 'driverVersion|driverInfo' \
-                | grep -oP '=\s*\K.+' | sed 's/[[:space:]]*$//')
-            [[ -n "$_dev" ]] && VKL_GPU_DEVICE="$_dev"
-            [[ -n "$_drv" ]] && VKL_DRIVER_VERSION="$_drv"
-        fi
-    fi
-
-    # Fallback to GPU_NAME (detect_hardware) for device name.
-    if [[ "$VKL_GPU_DEVICE" == "—" && -n "${GPU_NAME:-}" ]]; then
-        VKL_GPU_DEVICE="$GPU_NAME"
-    fi
-
-    # Fallback to nvidia-smi for driver version.
-    if [[ "$VKL_DRIVER_VERSION" == "—" ]] && command -v nvidia-smi &>/dev/null; then
-        local _drv2
-        _drv2=$(timeout 2 nvidia-smi --query-gpu=driver_version \
-            --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')
-        [[ -n "$_drv2" ]] && VKL_DRIVER_VERSION="$_drv2"
-    fi
-}
-
-# query_vulkan_processes — detect live Vulkan/Proton processes and their VRAM usage.
-# Sets: VKP_PROCS (newline-separated "pid name vram_mb"), VKP_COUNT.
-query_vulkan_processes() {
-    VKP_PROCS=""; VKP_COUNT=0
-
-    local _pids
-    _pids=$(pgrep -f 'wine64|wine|proton|fossilize_replay|SteamLinuxRuntime' \
-        2>/dev/null | sort -u)
-    [[ -z "$_pids" ]] && return 0
-
-    # Single nvidia-smi call to get per-process VRAM.
-    local _nvsmi_procs=""
-    if command -v nvidia-smi &>/dev/null; then
-        _nvsmi_procs=$(timeout 3 nvidia-smi \
-            --query-compute-apps=pid,used_gpu_memory \
-            --format=csv,noheader,nounits 2>/dev/null) || _nvsmi_procs=""
-    fi
-
-    local _count=0 _out=""
-    while IFS= read -r _pid; do
-        [[ -z "$_pid" ]] && continue
-        local _name
-        _name=$(ps -p "$_pid" -o comm= 2>/dev/null | head -1)
-        [[ -z "$_name" ]] && continue  # process vanished
-
-        local _vram="?"
-        if [[ -n "$_nvsmi_procs" ]]; then
-            local _hit
-            _hit=$(printf '%s' "$_nvsmi_procs" \
-                | grep -E "^[[:space:]]*${_pid}[[:space:]]*,")
-            if [[ -n "$_hit" ]]; then
-                local _v; _v=$(printf '%s' "$_hit" | cut -d, -f2 | tr -dc '0-9')
-                [[ -n "$_v" ]] && _vram="$_v"
-            fi
-        fi
-
-        _out+="${_pid} ${_name} ${_vram}"$'\n'
-        (( _count++ )) || true
-    done <<< "$_pids"
-
-    VKP_PROCS="${_out%$'\n'}"
-    VKP_COUNT=$_count
-}
-
-# query_shader_boost — query shader-boost service state and fossilize_replay scheduling.
-# Sets: SB_ACTIVE (active|inactive|failed|unknown), SB_FOSSIL_PIDS,
-#       SB_FOSSIL_NICE, SB_FOSSIL_IONICE, SB_FOSSIL_AFFINITY.
-query_shader_boost() {
-    SB_ACTIVE="unknown"
-    SB_FOSSIL_PIDS=""
-    SB_FOSSIL_NICE="—"; SB_FOSSIL_IONICE="—"; SB_FOSSIL_AFFINITY="—"
-
-    if command -v systemctl &>/dev/null; then
-        local _a
-        _a=$(systemctl is-active greenboost-shader-boost 2>/dev/null || echo "unknown")
-        SB_ACTIVE="${_a:-unknown}"
-    fi
-
-    local _fpids
-    _fpids=$(pgrep -f fossilize_replay 2>/dev/null | tr '\n' ' ')
-    _fpids="${_fpids%% }"
-    SB_FOSSIL_PIDS="$_fpids"
-    [[ -z "$_fpids" ]] && return 0
-
-    local _fpid; _fpid=$(echo "$_fpids" | awk '{print $1}')
-    [[ -z "$_fpid" ]] && return 0
-
-    local _n
-    _n=$(ps -p "$_fpid" -o nice= 2>/dev/null | tr -d ' ')
-    [[ -n "$_n" ]] && SB_FOSSIL_NICE="$_n"
-
-    if command -v ionice &>/dev/null; then
-        local _iout
-        _iout=$(ionice -p "$_fpid" 2>/dev/null)
-        if [[ -n "$_iout" ]]; then
-            local _cls _pri
-            _cls=$(printf '%s' "$_iout" | awk -F: '{print $1}' | tr -d ' ')
-            _pri=$(printf '%s' "$_iout" | grep -oP 'prio \K[0-9]+' || echo "?")
-            SB_FOSSIL_IONICE="${_cls}/${_pri}"
-        fi
-    fi
-
-    if command -v taskset &>/dev/null; then
-        local _aff
-        _aff=$(taskset -acp "$_fpid" 2>/dev/null \
-            | grep -oP 'current affinity list: \K.+' || echo "")
-        [[ -n "$_aff" ]] && SB_FOSSIL_AFFINITY="$_aff"
-    fi
-}
-
-# gather_vulkan_events N — emit last N [VK_LAYER_GREENBOOST] syslog lines.
-# Tries journalctl first, then /var/log/syslog, then /var/log/messages.
-gather_vulkan_events() {
-    local n=${1:-10}
-    local _pat='VK_LAYER_GREENBOOST'
-
-    local _gbvk_log="$HOME/.local/share/greenboost/proton-logs/vulkan-layer.log"
-    if [[ -f "$_gbvk_log" ]]; then
-        local _fout
-        _fout=$(grep "$_pat" "$_gbvk_log" | tail -"$n")
-        if [[ -n "$_fout" ]]; then
-            printf '%s\n' "$_fout"
-            return 0
-        fi
-    fi
-
-    if command -v journalctl &>/dev/null; then
-        local _jout
-        _jout=$(journalctl --since "1 hour ago" --no-pager -q 2>/dev/null \
-            | grep "$_pat" | tail -"$n")
-        if [[ -n "$_jout" ]]; then
-            printf '%s\n' "$_jout"
-            return 0
-        fi
-    fi
-
-    local _slog=""
-    for _sf in /var/log/syslog /var/log/messages; do
-        [[ -r "$_sf" ]] && _slog="$_sf" && break
-    done
-    [[ -n "$_slog" ]] && grep "$_pat" "$_slog" | tail -"$n"
-    return 0
-}
-
-# format_vulkan_event "raw log line" — emit a branded, colored Vulkan event line.
-format_vulkan_event() {
-    local line="$1"
-    local msg
-    msg=$(printf '%s' "$line" \
-        | sed 's/.*\[VK_LAYER_GREENBOOST\][[:space:]]*//')
-
-    local ts=""
-    ts=$(printf '%s' "$line" | grep -oP '\d\d:\d\d:\d\d' | head -1)
-    if [[ -z "$ts" ]]; then
-        ts=$(printf '%s' "$line" | grep -oP 'T\K\d\d:\d\d:\d\d' | head -1)
-    fi
-    local ts_fmt; ts_fmt=$(printf '%-10s' "${ts:-?}")
-    local prefix="${C_DIM}${ts_fmt}${C_RESET}"
-
-    if   printf '%s' "$msg" | grep -q 'CreateInstance: hooked'; then
-        printf '%b\n' "  ${prefix}  ${C_LIME}$(printf '%-8s' 'hook')${C_RESET}  ${C_LIME}✓${C_RESET}  ${C_GRAY}${msg}${C_RESET}"
-    elif printf '%s' "$msg" | grep -q 'DMA-BUF OK'; then
-        printf '%b\n' "  ${prefix}  ${C_CYAN}$(printf '%-8s' 'T2-dma')${C_RESET}  ${C_CYAN}◈${C_RESET}  ${C_GRAY}${msg}${C_RESET}"
-    elif printf '%s' "$msg" | grep -qE 'all tiers failed|returning OOM'; then
-        printf '%b\n' "  ${prefix}  ${C_RED}$(printf '%-8s' 'OOM')${C_RESET}  ${C_RED}✗${C_RESET}  ${C_RED}${msg}${C_RESET}"
-    elif printf '%s' "$msg" | grep -q 'FreeMemory: closed DMA-BUF'; then
-        printf '%b\n' "  ${prefix}  ${C_DIM}$(printf '%-8s' 'free')${C_RESET}  ${C_DIM}·${C_RESET}  ${C_DIM}${msg}${C_RESET}"
-    else
-        printf '%b\n' "  ${prefix}  ${C_DIM}$(printf '%-8s' '·')${C_RESET}  ${C_DIM}·${C_RESET}  ${C_GRAY}${msg}${C_RESET}"
-    fi
-}
-
-# query_dx12_status — detect running DX12 game and VKD3D-Proton environment.
-# Sets: DX12_ACTIVE (0/1), DX12_APPID, DX12_GAME_NAME, DX12_PROTON_VER,
-#       DX12_VKD3D_DEBUG, DX12_VKD3D_CONFIG, DX12_VKD3D_SHADER_DEBUG,
-#       DX12_T2_OK, DX12_T2_FAIL, DX12_T2_MB, GB_PROTON_INSTALLED (0/1).
-query_dx12_status() {
-    DX12_ACTIVE=0; DX12_APPID=""; DX12_GAME_NAME=""; DX12_PROTON_VER="—"
-    DX12_VKD3D_DEBUG="—"; DX12_VKD3D_CONFIG="—"; DX12_VKD3D_SHADER_DEBUG="—"
-    DX12_T2_OK=0; DX12_T2_FAIL=0; DX12_T2_MB=0
-    GB_PROTON_INSTALLED=0
-
-    # Check if greenboost-proton is installed as a Steam compat tool.
-    local _gbp_paths=(
-        "$HOME/.steam/root/compatibilitytools.d/greenboost-proton"
-        "$HOME/.local/share/Steam/compatibilitytools.d/greenboost-proton"
-        "$HOME/Dev/greenboost_proton/greenboost-proton"
-    )
-    for _p in "${_gbp_paths[@]}"; do
-        [[ -f "$_p/proton" ]] && GB_PROTON_INSTALLED=1 && break
-    done
-
-    # Find wine64 process with vkd3d-proton loaded in its maps (DX12 game).
-    local _dx12_pid=""
-    for _pid in $(pgrep wine64 2>/dev/null | head -10); do
-        if [[ -r "/proc/$_pid/maps" ]] && grep -ql 'vkd3d' /proc/"$_pid"/maps 2>/dev/null; then
-            _dx12_pid="$_pid"
-            DX12_ACTIVE=1
-            break
-        fi
-    done
-
-    # Gather T2 stats from layer log regardless of game state.
-    local _all_ev; _all_ev=$(gather_vulkan_events 200)
-    if [[ -n "$_all_ev" ]]; then
-        DX12_T2_OK=$(printf '%s\n' "$_all_ev" | grep -c 'T2 DMA-BUF OK' || true)
-        DX12_T2_FAIL=$(printf '%s\n' "$_all_ev" | grep -c 'all tiers failed\|returning OOM' || true)
-        DX12_T2_MB=$(printf '%s\n' "$_all_ev" \
-            | grep -oP 'T2 DMA-BUF OK — \K[0-9]+' \
-            | awk '{s+=$1}END{print s+0}')
-    fi
-
-    [[ -z "$_dx12_pid" ]] && return 0
-
-    # Read env vars from the running game process.
-    if [[ -r "/proc/$_dx12_pid/environ" ]]; then
-        local _env
-        _env=$(tr '\0' '\n' < "/proc/$_dx12_pid/environ" 2>/dev/null)
-
-        DX12_APPID=$(printf '%s' "$_env" \
-            | grep '^SteamAppId=' | cut -d= -f2- | head -1)
-        local _vd; _vd=$(printf '%s' "$_env" \
-            | grep '^VKD3D_DEBUG=' | cut -d= -f2- | head -1)
-        [[ -n "$_vd" ]] && DX12_VKD3D_DEBUG="$_vd"
-        local _vc; _vc=$(printf '%s' "$_env" \
-            | grep '^VKD3D_CONFIG=' | cut -d= -f2- | head -1)
-        [[ -n "$_vc" ]] && DX12_VKD3D_CONFIG="$_vc"
-        local _vs; _vs=$(printf '%s' "$_env" \
-            | grep '^VKD3D_SHADER_DEBUG=' | cut -d= -f2- | head -1)
-        [[ -n "$_vs" ]] && DX12_VKD3D_SHADER_DEBUG="$_vs"
-
-        # Detect Proton version from compat tool path env vars.
-        local _compat=""
-        _compat=$(printf '%s' "$_env" \
-            | grep '^STEAM_COMPAT_TOOL_PATHS=\|^STEAM_COMPAT_INSTALL_PATH=' \
-            | head -1 | cut -d= -f2-)
-        if printf '%s' "$_compat" | grep -qi 'greenboost.proton\|greenboost-proton'; then
-            DX12_PROTON_VER="greenboost-proton"
-        elif printf '%s' "$_compat" | grep -qi 'proton_experimental\|Proton Experimental'; then
-            DX12_PROTON_VER="Proton Experimental"
-        elif [[ -n "$_compat" ]]; then
-            DX12_PROTON_VER=$(printf '%s' "$_compat" \
-                | tr ':' '\n' | grep -iv 'pressure.vessel\|sniper\|steam-runtime' \
-                | xargs -I{} basename {} 2>/dev/null | head -1)
-            [[ -z "$DX12_PROTON_VER" ]] && DX12_PROTON_VER="—"
-        fi
-    fi
-
-    # Resolve game name from appmanifest.
-    if [[ -n "$DX12_APPID" ]]; then
-        local _acf
-        _acf=$(find "$HOME/.local/share/Steam/steamapps" \
-            -maxdepth 1 -name "appmanifest_${DX12_APPID}.acf" 2>/dev/null | head -1)
-        if [[ -n "$_acf" && -r "$_acf" ]]; then
-            local _gn; _gn=$(grep -oP '"name"\s*"\K[^"]+' "$_acf" | head -1)
-            [[ -n "$_gn" ]] && DX12_GAME_NAME="$_gn"
-        fi
-    fi
-}
-
-# gather_proton_log_events N — emit last N VKD3D/DXVK warn/error log lines.
-# Reads from greenboost-proton log dir, then standard Proton log, then journalctl.
-gather_proton_log_events() {
-    local n=${1:-8}
-    local _log=""
-
-    # greenboost-proton routes PROTON_LOG_DIR here
-    local _gbdir="$HOME/.local/share/greenboost/proton-logs"
-
-    if [[ -n "${DX12_APPID:-}" ]]; then
-        local _candidate
-        for _candidate in \
-            "$_gbdir/steam-${DX12_APPID}.log" \
-            "$HOME/steam-${DX12_APPID}.log"
-        do
-            [[ -r "$_candidate" ]] && _log="$_candidate" && break
-        done
-    fi
-
-    # Also try SteamGameId — Proton's setup_logging() uses SteamGameId for the
-    # filename, not SteamAppId.  They differ for non-standard/shortcut launches.
-    local _sgid="${STEAM_GAMEID:-${SteamGameId:-}}"
-    if [[ -n "$_sgid" && -z "$_log" ]]; then
-        local _candidate
-        for _candidate in \
-            "$_gbdir/steam-${_sgid}.log" \
-            "$HOME/steam-${_sgid}.log"
-        do
-            [[ -r "$_candidate" ]] && _log="$_candidate" && break
-        done
-    fi
-
-    # Fallback: most recently modified steam-*.log
-    if [[ -z "$_log" ]]; then
-        local _recent
-        _recent=$(find "$_gbdir" "$HOME" -maxdepth 1 \
-            -name 'steam-*.log' 2>/dev/null \
-            | xargs -r ls -t 2>/dev/null | head -1) || true
-        [[ -n "$_recent" && -r "$_recent" ]] && _log="$_recent"
-    fi
-
-    # Also check PROTON_LOG_DIR from any running wine64 process environ
-    if [[ -z "$_log" ]]; then
-        local _pid
-        for _pid in $(pgrep -x wine64 2>/dev/null | head -5); do
-            local _pld
-            _pld=$(tr '\0' '\n' < "/proc/$_pid/environ" 2>/dev/null \
-                | grep '^PROTON_LOG_DIR=' | cut -d= -f2- | head -1)
-            if [[ -n "$_pld" ]]; then
-                local _pld_recent
-                _pld_recent=$(find "$_pld" -maxdepth 1 -name 'steam-*.log' 2>/dev/null \
-                    | xargs -r ls -t 2>/dev/null | head -1) || true
-                [[ -n "$_pld_recent" && -r "$_pld_recent" ]] && _log="$_pld_recent" && break
-            fi
-        done
-    fi
-
-    [[ -z "$_log" ]] && return 0
-
-    # Filter for events relevant to GreenBoost: VKD3D/DXVK errors, warnings,
-    # and GreenBoost Proton wrapper status lines.
-    grep -E \
-        'ERR[^O]|vkd3d.*warn|WARN|fixme.*d3d|out.of.mem|OOM|alloc.*fail|VK_ERROR|\[greenboost-proton\]' \
-        "$_log" 2>/dev/null \
-        | grep -vE 'suppress|ignore|stub|trivial' \
-        | tail -"$n"
-}
-
-# format_proton_event "raw line" — emit a branded, colored Proton log line.
-format_proton_event() {
-    local line="$1"
-    local msg; msg=$(printf '%s' "$line" | cut -c1-140)
-    if   printf '%s' "$msg" | grep -q '\[greenboost-proton\]'; then
-        printf '%b\n' "  ${C_LIME}$(printf '%-8s' 'gb')${C_RESET}  ${C_LIME}◈${C_RESET}  ${C_GRAY}${msg}${C_RESET}"
-    elif printf '%s' "$msg" | grep -qiE '\bERR\b|VK_ERROR|alloc.*fail'; then
-        printf '%b\n' "  ${C_RED}$(printf '%-8s' 'vkd3d')${C_RESET}  ${C_RED}✗${C_RESET}  ${C_RED}${msg}${C_RESET}"
-    elif printf '%s' "$msg" | grep -qiE 'WARN|fixme|warn'; then
-        printf '%b\n' "  ${C_AMBER}$(printf '%-8s' 'vkd3d')${C_RESET}  ${C_AMBER}⚠${C_RESET}  ${C_GRAY}${msg}${C_RESET}"
-    else
-        printf '%b\n' "  ${C_DIM}$(printf '%-8s' 'proton')${C_RESET}  ${C_DIM}·${C_RESET}  ${C_DIM}${msg}${C_RESET}"
-    fi
-}
-
-# gather_steam_client_logs N — emit last N error/warning lines from Steam's own logs.
-# Primary source for compat-tool launch failures and Python exceptions in the proton script.
-gather_steam_client_logs() {
-    local n=${1:-15}
-    local _pat='fail|error|exception|traceback|exit code [1-9]|crash|cannot|not found|no such|permission denied'
-    local _found=""
-
-    # compat_log.txt — records every compat tool invocation and exit code
-    for _f in \
-        "$HOME/.local/share/Steam/logs/compat_log.txt" \
-        "$HOME/.steam/root/logs/compat_log.txt"
-    do
-        if [[ -r "$_f" ]]; then
-            _found=$(grep -iE "$_pat" "$_f" 2>/dev/null | grep -iv 'no error' | tail -"$n")
-            [[ -n "$_found" ]] && printf '%s\n' "$_found" && return 0
-        fi
-    done
-
-    # content_log.txt — app launch/download errors
-    for _f in \
-        "$HOME/.local/share/Steam/logs/content_log.txt" \
-        "$HOME/.steam/root/logs/content_log.txt"
-    do
-        if [[ -r "$_f" ]]; then
-            _found=$(grep -iE "$_pat" "$_f" 2>/dev/null | grep -iv 'no error' | tail -"$n")
-            [[ -n "$_found" ]] && printf '%s\n' "$_found" && return 0
-        fi
-    done
-
-    # main steam.log as last resort
-    for _f in \
-        "$HOME/.steam/steam.log" \
-        "$HOME/.local/share/Steam/steam.log"
-    do
-        if [[ -r "$_f" ]]; then
-            _found=$(grep -iE "$_pat" "$_f" 2>/dev/null | grep -iv 'no error' | tail -"$n")
-            [[ -n "$_found" ]] && printf '%s\n' "$_found" && return 0
-        fi
-    done
-    return 0
-}
-
-# gather_pressure_vessel_logs N — emit last N error/warning lines from SteamLinuxRuntime.
-gather_pressure_vessel_logs() {
-    local n=${1:-10}
-    local _pat='error|warn|fail|cannot|missing|not found|permission'
-    local _found=""
-
-    # SteamLinuxRuntime Sniper log directory
-    local _slr_base="$HOME/.local/share/Steam/steamapps/common"
-    local _slr_log
-    _slr_log=$(find "$_slr_base" -maxdepth 4 \
-        -path '*/SteamLinuxRuntime*/var/slr/log/*.log' 2>/dev/null \
-        | xargs -r ls -t 2>/dev/null | head -1) || true
-    if [[ -n "$_slr_log" && -r "$_slr_log" ]]; then
-        _found=$(grep -iE "$_pat" "$_slr_log" 2>/dev/null | tail -"$n")
-        [[ -n "$_found" ]] && printf '%s\n' "$_found" && return 0
-    fi
-
-    # Pressure vessel temp files (written during container setup)
-    local _pv_tmp
-    _pv_tmp=$(find /tmp -maxdepth 1 -name 'pressure-vessel-*' -newer /proc/1/exe 2>/dev/null \
-        | xargs -r ls -t 2>/dev/null | head -1) || true
-    if [[ -n "$_pv_tmp" && -r "$_pv_tmp" ]]; then
-        _found=$(grep -iE "$_pat" "$_pv_tmp" 2>/dev/null | tail -"$n")
-        [[ -n "$_found" ]] && printf '%s\n' "$_found"
-    fi
-    return 0
-}
-
-# gather_wine_crash_logs N — emit recent wine64/wineserver crash evidence.
-gather_wine_crash_logs() {
-    local n=${1:-8}
-    local _found=""
-
-    # systemd coredumps for Wine processes
-    if command -v coredumpctl &>/dev/null; then
-        _found=$(coredumpctl list --no-pager 2>/dev/null \
-            | grep -E 'wine64|wineserver|winedevice|proton' | tail -"$n")
-        [[ -n "$_found" ]] && printf '%s\n' "$_found"
-    fi
-
-    # Wine crash dump files in compatdata (written by Wine's built-in crash handler)
-    local _dumps
-    _dumps=$(find "$HOME/.local/share/Steam/steamapps/compatdata" \
-        -maxdepth 4 -name '*.dmp' -newer /proc/1/exe 2>/dev/null \
-        | head -5) || true
-    if [[ -n "$_dumps" ]]; then
-        while IFS= read -r _d; do
-            printf 'crash-dump: %s  (%s)\n' "$_d" \
-                "$(stat -c '%y' "$_d" 2>/dev/null | cut -c1-19)"
-        done <<< "$_dumps"
-    fi
-    return 0
-}
-
-# _cmd_vulkan_snapshot — render the Vulkan dashboard (5 panels).
-_cmd_vulkan_snapshot() {
-    # Gather all data
-    query_vulkan_layer
-    query_vulkan_processes
-    query_shader_boost
-    query_gpu_vram
-    query_dx12_status
-
-    # ════════════════════════════════════════════════════════════════════
-    # Panel 1 — Vulkan Device & Layer
-    # ════════════════════════════════════════════════════════════════════
-    gb_panel_top "Vulkan Device & Layer"
-    gb_panel_empty
-
-    if [[ -n "${VKL_GPU_DEVICE:-}" && "$VKL_GPU_DEVICE" != "—" ]]; then
-        gb_panel_row "${C_GRAY}◎  GPU Device        ${C_RESET}${C_GRAY}${VKL_GPU_DEVICE}${C_RESET}"
-    else
-        gb_panel_row "${C_GRAY}◎  GPU Device        ${C_DIM}(unavailable — install vulkan-tools or nvidia-smi)${C_RESET}"
-    fi
-    gb_panel_row "   ${C_GRAY}Driver              ${C_RESET}${C_GRAY}${VKL_DRIVER_VERSION:-—}${C_RESET}"
-    gb_panel_empty
-
-    # Manifest status
-    local _mi _mc _ml
-    if [[ "$VKL_MANIFEST_OK" -eq 1 ]]; then
-        _mi="${C_LIME}✓${C_RESET}"; _mc="$C_LIME"; _ml="installed"
-    else
-        _mi="${C_RED}✗${C_RESET}"; _mc="$C_RED"; _ml="NOT FOUND"
-    fi
-    gb_panel_row "${_mi}  ${C_GRAY}Layer manifest      ${_mc}${_ml}${C_RESET}${C_DIM}   ${VKL_MANIFEST_PATH}${C_RESET}"
-
-    # Library status
-    local _si _sc _sl
-    if [[ "$VKL_SO_OK" -eq 1 ]]; then
-        _si="${C_LIME}✓${C_RESET}"; _sc="$C_LIME"; _sl="present"
-    else
-        _si="${C_RED}✗${C_RESET}"; _sc="$C_RED"; _sl="NOT FOUND"
-    fi
-    gb_panel_row "${_si}  ${C_GRAY}Layer library       ${_sc}${_sl}${C_RESET}${C_DIM}   ${VKL_SO_PATH}${C_RESET}"
-    gb_panel_empty
-
-    # Virtual VRAM + real VRAM bar
-    local _vk_total_gb=$(( ${GB_PHYS:-0} + ${GB_VIRT:-0} ))
-    local _vk_total_str="${_vk_total_gb} GB"
-    (( _vk_total_gb == 0 )) && _vk_total_str="auto-detected"
-    gb_panel_row "${C_VIOLET}◈${C_RESET}  ${C_GRAY}Virtual VRAM        ${C_RESET}${C_CYAN}${_vk_total_str}${C_RESET}${C_DIM}   (reported to apps when GREENBOOST_VULKAN=1)${C_RESET}"
-
-    if (( ${GPU_VRAM_TOTAL_MB:-0} > 0 )); then
-        local _vt1_used_gb _vt1_total_gb _vt1_color _vt1_bar
-        _vt1_used_gb=$(awk "BEGIN{printf \"%.1f\", ${GPU_VRAM_USED_MB:-0}/1024}" 2>/dev/null || echo "?")
-        _vt1_total_gb=$(( GPU_VRAM_TOTAL_MB / 1024 ))
-        _vt1_color=$(gb_tier_color "${GPU_VRAM_PCT:-0}")
-        _vt1_bar=$(gb_bar "${GPU_VRAM_PCT:-0}" "$_vt1_color" "${C_DIM}" 32)
-        gb_panel_row "   ${C_GRAY}VRAM usage          ${_vt1_color}${_vt1_used_gb}/${_vt1_total_gb} GB${C_RESET}"
-        gb_panel_row "   ${_vt1_bar}  ${_vt1_color}${GPU_VRAM_PCT}%${C_RESET}"
-    else
-        gb_panel_row "   ${C_GRAY}VRAM usage          ${C_DIM}(nvidia-smi unavailable)${C_RESET}"
-    fi
-    gb_panel_empty
-
-    if [[ "$VKL_MANIFEST_OK" -eq 1 && "$VKL_SO_OK" -eq 1 ]]; then
-        gb_panel_row "   ${C_DIM}Activate: add ${C_GRAY}GREENBOOST_VULKAN=1 %command%${C_DIM} in Steam launch options${C_RESET}"
-    else
-        gb_panel_row "   ${C_AMBER}⚠${C_RESET}  ${C_AMBER}Layer not installed — run: sudo greenboost install-sys-configs${C_RESET}"
-    fi
-    gb_panel_empty
-    gb_panel_bottom
-
-    # ════════════════════════════════════════════════════════════════════
-    # Panel 2 — Active Vulkan Processes
-    # ════════════════════════════════════════════════════════════════════
-    gb_panel_top "Active Vulkan Processes"
-    gb_panel_empty
-
-    if (( VKP_COUNT > 0 )); then
-        gb_panel_row "${C_DIM}$(printf '%-8s' 'PID')  $(printf '%-22s' 'Process')  VRAM MB${C_RESET}"
-        gb_panel_empty
-        while IFS= read -r _proc_line; do
-            [[ -z "$_proc_line" ]] && continue
-            local _ppid _pname _pvram
-            _ppid=$(echo "$_proc_line"  | awk '{print $1}')
-            _pname=$(echo "$_proc_line" | awk '{print $2}')
-            _pvram=$(echo "$_proc_line" | awk '{print $3}')
-            local _vram_str
-            if [[ "$_pvram" == "?" ]]; then
-                _vram_str="${C_DIM}?${C_RESET}"
-            else
-                _vram_str="${C_CYAN}${_pvram} MB${C_RESET}"
-            fi
-            gb_panel_row "${C_LIME}$(printf '%-8s' "$_ppid")${C_RESET}  ${C_GRAY}$(printf '%-22s' "$_pname")${C_RESET}  ${_vram_str}"
-        done <<< "$VKP_PROCS"
-        gb_panel_empty
-    else
-        gb_panel_row "  ${C_DIM}◎  No active Vulkan/Proton processes${C_RESET}"
-        gb_panel_empty
-    fi
-
-    # Shader boost service status
-    local _sb_icon _sb_color _sb_label
-    case "$SB_ACTIVE" in
-        active)   _sb_icon="${C_LIME}✓${C_RESET}"; _sb_color="$C_LIME";   _sb_label="active"   ;;
-        inactive) _sb_icon="${C_AMBER}⚠${C_RESET}"; _sb_color="$C_AMBER"; _sb_label="inactive" ;;
-        failed)   _sb_icon="${C_RED}✗${C_RESET}";  _sb_color="$C_RED";    _sb_label="failed"   ;;
-        *)        _sb_icon="${C_DIM}·${C_RESET}";  _sb_color="$C_DIM";    _sb_label="unknown"  ;;
-    esac
-    gb_panel_row "${_sb_icon}  ${C_GRAY}shader-boost svc    ${_sb_color}${_sb_label}${C_RESET}"
-
-    if [[ -n "$SB_FOSSIL_PIDS" ]]; then
-        gb_panel_row "   ${C_GRAY}fossilize_replay    ${C_RESET}${C_CYAN}PIDs: ${SB_FOSSIL_PIDS}${C_RESET}"
-        gb_panel_row "   ${C_DIM}nice ${SB_FOSSIL_NICE}   ionice ${SB_FOSSIL_IONICE}   affinity ${SB_FOSSIL_AFFINITY}${C_RESET}"
-    else
-        gb_panel_row "   ${C_DIM}fossilize_replay    not running${C_RESET}"
-    fi
-    gb_panel_empty
-    gb_panel_bottom
-
-    # ════════════════════════════════════════════════════════════════════
-    # Panel 3 — DX12 / VKD3D-Proton
-    # ════════════════════════════════════════════════════════════════════
-    gb_panel_top "DX12 / VKD3D-Proton"
-    gb_panel_empty
-
-    if (( DX12_ACTIVE )); then
-        # Running game info
-        if [[ -n "$DX12_GAME_NAME" ]]; then
-            gb_panel_row "${C_VIOLET}◈${C_RESET}  ${C_GRAY}Game               ${C_RESET}${C_CYAN}${DX12_GAME_NAME}${C_DIM}${DX12_APPID:+   (AppID ${DX12_APPID})}${C_RESET}"
-        else
-            gb_panel_row "${C_VIOLET}◈${C_RESET}  ${C_GRAY}Game               ${C_DIM}AppID ${DX12_APPID:-?}${C_RESET}"
-        fi
-
-        # Proton version — highlight if using greenboost-proton
-        local _pv_color="$C_GRAY"
-        [[ "$DX12_PROTON_VER" == "greenboost-proton" ]] && _pv_color="$C_LIME"
-        gb_panel_row "   ${C_GRAY}Proton             ${_pv_color}${DX12_PROTON_VER}${C_RESET}"
-        gb_panel_empty
-
-        # VKD3D-Proton env vars from the live process
-        local _dbg_color="$C_GRAY"
-        [[ "$DX12_VKD3D_DEBUG" == "none" || "$DX12_VKD3D_DEBUG" == "—" ]] && _dbg_color="$C_DIM"
-        gb_panel_row "   ${C_GRAY}VKD3D_DEBUG        ${_dbg_color}${DX12_VKD3D_DEBUG}${C_RESET}"
-        gb_panel_row "   ${C_GRAY}VKD3D_SHADER_DEBUG ${C_DIM}${DX12_VKD3D_SHADER_DEBUG}${C_RESET}"
-
-        if [[ "$DX12_VKD3D_CONFIG" != "—" && -n "$DX12_VKD3D_CONFIG" ]]; then
-            gb_panel_row "   ${C_GRAY}VKD3D_CONFIG       ${C_CYAN}${DX12_VKD3D_CONFIG}${C_RESET}"
-        else
-            gb_panel_row "   ${C_GRAY}VKD3D_CONFIG       ${C_DIM}<defaults>${C_RESET}"
-        fi
-        gb_panel_empty
-    else
-        gb_panel_row "  ${C_DIM}◎  No DX12 game active${C_RESET}"
-        gb_panel_empty
-    fi
-
-    # T2 DMA-BUF allocation statistics (from last hour of layer logs)
-    if (( DX12_T2_OK > 0 || DX12_T2_FAIL > 0 )); then
-        local _t2_icon _t2_color
-        if (( DX12_T2_FAIL > 0 )); then
-            _t2_icon="${C_AMBER}⚠${C_RESET}"; _t2_color="$C_AMBER"
-        else
-            _t2_icon="${C_LIME}✓${C_RESET}"; _t2_color="$C_LIME"
-        fi
-        gb_panel_row "${_t2_icon}  ${C_GRAY}T2 DMA-BUF (1 hr)  ${_t2_color}${DX12_T2_OK} OK${C_RESET}${C_DIM}  →  ${C_RESET}${C_CYAN}${DX12_T2_MB:-0} MB${C_RESET}${C_DIM}   ${DX12_T2_FAIL} failed${C_RESET}"
-    else
-        gb_panel_row "   ${C_DIM}T2 DMA-BUF (1 hr)  no overflow allocs recorded${C_RESET}"
-    fi
-
-    # greenboost-proton install hint
-    gb_panel_empty
-    if (( GB_PROTON_INSTALLED )); then
-        gb_panel_row "   ${C_DIM}Compat tool        ${C_LIME}greenboost-proton installed${C_RESET}"
-    else
-        gb_panel_row "   ${C_DIM}Compat tool        ${C_AMBER}greenboost-proton not installed${C_RESET}${C_DIM}  →  greenboost_proton/install.sh${C_RESET}"
-    fi
-    gb_panel_empty
-    gb_panel_bottom
-
-    # ════════════════════════════════════════════════════════════════════
-    # Panel 4 — GreenBoost Vulkan Activity
-    # ════════════════════════════════════════════════════════════════════
-    gb_panel_top "GreenBoost Vulkan Activity"
-    gb_panel_empty
-
-    local _vk_events
-    _vk_events=$(gather_vulkan_events 8)
-    if [[ -n "$_vk_events" ]]; then
-        while IFS= read -r _vkline; do
-            [[ -z "$_vkline" ]] && continue
-            gb_panel_row "$(format_vulkan_event "$_vkline")"
-        done <<< "$_vk_events"
-    else
-        gb_panel_row "  ${C_DIM}(no VK_LAYER_GREENBOOST events in the last hour)${C_RESET}"
-        gb_panel_row "  ${C_DIM}Start a game with GREENBOOST_VULKAN=1 to see activity here.${C_RESET}"
-    fi
-
-    # VKD3D/DXVK log events from greenboost-proton log dir (if available)
-    local _proton_events
-    _proton_events=$(gather_proton_log_events 5)
-    if [[ -n "$_proton_events" ]]; then
-        gb_panel_empty
-        gb_panel_row "  ${C_DIM}── VKD3D / DXVK ──────────────────────────────────────────────${C_RESET}"
-        while IFS= read -r _pline; do
-            [[ -z "$_pline" ]] && continue
-            gb_panel_row "$(format_proton_event "$_pline")"
-        done <<< "$_proton_events"
-    fi
-    gb_panel_empty
-    gb_panel_bottom
-
-    # ════════════════════════════════════════════════════════════════════
-    # Panel 5 — Issues
-    # ════════════════════════════════════════════════════════════════════
-    gb_panel_top "Issues"
-    gb_panel_empty
-
-    local _all_events _issue_count=0
-    _all_events=$(gather_vulkan_events 50)
-
-    if [[ -n "$_all_events" ]]; then
-        local _fail_lines
-        _fail_lines=$(printf '%s\n' "$_all_events" \
-            | grep -E 'DMA-BUF fallback failed|returning OOM')
-        if [[ -n "$_fail_lines" ]]; then
-            gb_panel_row "${C_RED}✗${C_RESET}  ${C_RED}T2 DMA-BUF fallback failures (last hour):${C_RESET}"
-            while IFS= read -r _fl; do
-                [[ -z "$_fl" ]] && continue
-                gb_panel_row "$(format_vulkan_event "$_fl")"
-                (( _issue_count++ )) || true
-            done <<< "$_fail_lines"
-            gb_panel_empty
-        fi
-    fi
-
-    # DX12 game running but VKD3D_DEBUG=none → diagnostics blind
-    if (( DX12_ACTIVE )) && \
-       [[ "$DX12_VKD3D_DEBUG" == "none" || "$DX12_VKD3D_DEBUG" == "—" ]]; then
-        gb_panel_row "${C_AMBER}⚠${C_RESET}  ${C_AMBER}VKD3D_DEBUG=none — use greenboost-proton for automatic warn logging${C_RESET}"
-        (( _issue_count++ )) || true
-        gb_panel_empty
-    fi
-
-    # DX12 game active but not using greenboost-proton
-    if (( DX12_ACTIVE )) && \
-       [[ "$DX12_PROTON_VER" != "greenboost-proton" ]] && (( GB_PROTON_INSTALLED )); then
-        gb_panel_row "${C_AMBER}⚠${C_RESET}  ${C_AMBER}DX12 game running without greenboost-proton${C_RESET}"
-        gb_panel_row "   ${C_DIM}Switch in Steam: Properties → Compatibility → GreenBoost Proton${C_RESET}"
-        (( _issue_count++ )) || true
-        gb_panel_empty
-    fi
-
-    # Shader boost warnings from journalctl
-    if command -v journalctl &>/dev/null; then
-        local _boost_issues
-        _boost_issues=$(journalctl -t greenboost-shader-boost \
-            --since "1 hour ago" --no-pager -q 2>/dev/null \
-            | grep -iE 'error|fail|warn' | tail -5)
-        if [[ -n "$_boost_issues" ]]; then
-            gb_panel_row "${C_AMBER}⚠${C_RESET}  ${C_AMBER}Shader boost warnings:${C_RESET}"
-            while IFS= read -r _bl; do
-                [[ -z "$_bl" ]] && continue
-                local _bmsg
-                _bmsg=$(printf '%s' "$_bl" | sed 's/.*greenboost-shader-boost[^:]*: //')
-                gb_panel_row "   ${C_DIM}${_bmsg}${C_RESET}"
-                (( _issue_count++ )) || true
-            done <<< "$_boost_issues"
-            gb_panel_empty
-        fi
-    fi
-
-    # Layer not installed is itself an issue
-    if [[ "$VKL_MANIFEST_OK" -eq 0 || "$VKL_SO_OK" -eq 0 ]]; then
-        gb_panel_row "${C_RED}✗${C_RESET}  ${C_RED}Vulkan layer not fully installed${C_RESET}"
-        [[ "$VKL_MANIFEST_OK" -eq 0 ]] && \
-            gb_panel_row "   ${C_DIM}Missing: ${VKL_MANIFEST_PATH}${C_RESET}"
-        [[ "$VKL_SO_OK" -eq 0 ]] && \
-            gb_panel_row "   ${C_DIM}Missing: ${VKL_SO_PATH}${C_RESET}"
-        gb_panel_row "   ${C_AMBER}Fix: sudo greenboost install-sys-configs${C_RESET}"
-        (( _issue_count++ )) || true
-        gb_panel_empty
-    fi
-
-    if (( _issue_count == 0 )); then
-        gb_panel_row "  ${C_LIME}✓${C_RESET}  ${C_GRAY}No issues detected in the last hour${C_RESET}"
-        gb_panel_empty
-    fi
-
-    gb_panel_bottom
-    echo ""
-}
-
-# cmd_vulkan — Vulkan layer + gaming dashboard entry point.
-cmd_vulkan() {
-    detect_hardware 2>/dev/null || true
-
-    # Non-interactive (pipe/script): single snapshot, no prompts
-    if [[ ! -t 0 ]]; then
-        gb_header
-        _cmd_vulkan_snapshot
-        return
-    fi
-
-    # Interactive: continuous loop with alternate screen
-    printf '\033[?1049h'
-    trap 'printf "\033[?1049l"; exit 0' INT TERM EXIT
-
-    while true; do
-        local _t=$SECONDS
-        printf '\033[H'
-        gb_header
-        echo -e "  ${C_DIM}Vulkan · DX12 · VKD3D-Proton dashboard — updating every 5s — Ctrl+C to exit\033[K${C_RESET}"
-        echo ""
-        _cmd_vulkan_snapshot
-        printf '\033[J'
-        local _s=$(( 5 - (SECONDS - _t) )); (( _s < 1 )) && _s=1
-        sleep $_s
-    done
-}
-
-# get_tier_bw_label <tier>
-# Returns a short bandwidth label for a memory tier, derived from detected
-# hardware where available. Never uses hardcoded model-specific values.
-#
-# Usage:
-#   T1_LABEL=$(get_tier_bw_label t1)   # GPU VRAM — "GDDR6X" / "GDDR7" / "VRAM"
-#   T2_LABEL=$(get_tier_bw_label t2)   # PCIe — "PCIe gen N" / "PCIe DMA"
-#   T3_LABEL=$(get_tier_bw_label t3)   # NVMe — "NVMe" always
 get_tier_bw_label() {
     local tier="${1:-t1}"
     case "$tier" in
@@ -6078,12 +5978,25 @@ get_tier_bw_label() {
 
 # ════════════════════════════════════════════════════════════════════════
 # ---- Single-shot status snapshot (no prompts, no loop) ----------------
-# Called by cmd_status when non-interactive, and by the monitor loop each iteration.
-_cmd_status_snapshot() {
+# Called by cmd_vitals - renders the full unified vitals snapshot.
+_cmd_vitals_snapshot() {
     local _ts; _ts=$(date '+%Y-%m-%dT%H:%M')
     local prof_f="/sys/class/greenboost/greenboost/active_profile"
     local prof_name="default"
     [[ -r "$prof_f" ]] && prof_name=$(cat "$prof_f")
+
+    # Read build stamp from /etc/greenboost/build_info (written by setup/install)
+    local _build_badge=""
+    for _sbi in "${MODULE_DIR}/build_info" ./build_info /etc/greenboost/build_info; do
+        if [[ -f "$_sbi" ]]; then
+            local _bid _bgit
+            _bid=$(grep  '^BUILD_ID='  "$_sbi" 2>/dev/null | cut -d= -f2-)
+            _bgit=$(grep '^BUILD_GIT=' "$_sbi" 2>/dev/null | cut -d= -f2-)
+            [[ -n "$_bid"  ]] && _build_badge="  build ${_bid}"
+            [[ -n "$_bgit" ]] && _build_badge+=" · ${_bgit}"
+            break
+        fi
+    done
 
     # Gather data from sysfs and live queries
     parse_pool_brief
@@ -6092,6 +6005,8 @@ _cmd_status_snapshot() {
     query_gpu_vram
     query_live_swap
     query_ollama_ps
+    read_nvtx_tail 100
+    _nvtx_parse_diag
     local kv_est_mb=0
     if [[ -n "$OL_CTX_SIZE" && -n "$OL_PARAM_COUNT" ]] && (( ${OL_CTX_SIZE:-0} > 0 )); then
         kv_est_mb=$(estimate_kv_mb "$OL_CTX_SIZE" "$OL_PARAM_COUNT")
@@ -6100,7 +6015,7 @@ _cmd_status_snapshot() {
     local _diag_errors=() _diag_warns=() _diag_ok=()
 
     # ── Title (1 line) ────────────────────────────────────────────────
-    echo -e "  ${C_VIOLET}${C_BOLD}GreenBoost${C_RESET} ${C_DIM}v${GB_VERSION} · ${_ts}${C_RESET}"
+    echo -e "  ${C_VIOLET}${C_BOLD}GreenBoost Vitals${C_RESET} ${C_DIM}v${GB_VERSION} · ${_ts}${_build_badge}${C_RESET}"
 
     # ── ROW 1 (4 lines): System | AI Inference ────────────────────────
     local -a _sys_lines=() _ai_lines=()
@@ -6112,7 +6027,7 @@ _cmd_status_snapshot() {
         _diag_ok+=("kernel module loaded")
     else
         _sys_lines+=("  ${C_RED}✗${C_RESET}  ${C_GRAY}Module ${C_RED}not loaded${C_RESET}")
-        _diag_errors+=("kernel module not loaded — T2/T3 memory unavailable")
+        _diag_errors+=("kernel module not loaded - T2/T3 memory unavailable")
     fi
     _sys_lines+=("  ${C_VIOLET}◈${C_RESET}  ${C_GRAY}$(_trunc "${prof_name}" 20)${C_RESET}")
     local _gpu_short; _gpu_short=$(_trunc "${GPU_NAME:-Unknown}" 20)
@@ -6121,23 +6036,15 @@ _cmd_status_snapshot() {
     if [[ "$SS_STALE" == "0" && -n "$SS_ACTIVE_PATH" ]]; then
         local _sys_path_badge
         case "$SS_ACTIVE_PATH" in
-            A0) _sys_path_badge="${C_LIME}${C_BOLD}●A0${C_RESET} ${C_DIM}optimal path${C_RESET}" ;;
-            A)  _sys_path_badge="${C_LIME}●A${C_RESET}  ${C_DIM}fast path${C_RESET}" ;;
-            B)  _sys_path_badge="${C_AMBER}${C_BOLD}⚠B${C_RESET}  ${C_DIM}fallback path${C_RESET}" ;;
-            C)  _sys_path_badge="${C_RED}${C_BOLD}✗C${C_RESET}  ${C_DIM}last resort${C_RESET}" ;;
+            A)  _sys_path_badge="${C_LIME}●A${C_RESET}  ${C_DIM}DMA-BUF pinned${C_RESET}" ;;
+            B)  _sys_path_badge="${C_AMBER}${C_BOLD}⚠B${C_RESET}  ${C_DIM}HostReg (no-kernel)${C_RESET}" ;;
             *)  _sys_path_badge="${C_GRAY}path:${SS_ACTIVE_PATH}${C_RESET}" ;;
         esac
         _sys_lines+=("  ${C_DIM}Path${C_RESET}  ${_sys_path_badge}")
     fi
 
-    # Right: AI Inference — Phase and TQ shown here
-    local _phase_label="${SS_PHASE:-—}"
-    local _tq_short
-    if [[ "$PI_TURBO_STATUS" == "disabled" || -z "$PI_TURBO_STATUS" ]]; then
-        _tq_short="${C_DIM}TQ: off${C_RESET}"
-    else
-        _tq_short="${C_LIME}TQ: ${PI_TURBO_STATUS}${C_RESET}"
-    fi
+    # Right: AI Inference
+    local _phase_label="${SS_PHASE:--}"
 
     _ai_lines+=("  ${C_BOLD}AI Inference${C_RESET}")
     if [[ -n "$OL_MODEL" ]]; then
@@ -6154,12 +6061,11 @@ _cmd_status_snapshot() {
             _ai_lines+=("  ${C_LIME}✓${C_RESET}  ${C_GRAY}${_model_short}${_param_str}")
             _ai_lines+=("     ${C_AMBER}⚠ Loading model...${C_RESET}")
         fi
-        # Phase + TurboQuant on one line
         local _phase_color="${C_DIM}"
         case "${SS_PHASE:-}" in INFERENCE|STEADY) _phase_color="$C_LIME" ;; MODEL_LOAD) _phase_color="$C_AMBER" ;; esac
-        _ai_lines+=("     ${_phase_color}${_phase_label}${C_RESET}  ${_tq_short}")
+        _ai_lines+=("     ${_phase_color}${_phase_label}${C_RESET}")
     else
-        _ai_lines+=("  ${C_DIM}◎  no active model — idle${C_RESET}")
+        _ai_lines+=("  ${C_DIM}◎  no active model - idle${C_RESET}")
         _ai_lines+=("")
         _ai_lines+=("")
     fi
@@ -6170,7 +6076,7 @@ _cmd_status_snapshot() {
     # ── ROW 2 (4 lines): Memory Tiers (1 line each + combined) ────────
     local _combined_gb=$(( ${PB_T1_GB:-0} + ${PB_T2_MAX_GB:-0} + ${PB_T3_MAX_GB:-0} ))
 
-    # T1 — GPU VRAM
+    # T1 - GPU VRAM
     if (( ${GPU_VRAM_TOTAL_MB:-0} > 0 )); then
         local _t1_used_f; _t1_used_f=$(awk "BEGIN{printf \"%.1f\", ${GPU_VRAM_USED_MB:-0}/1024}" 2>/dev/null || echo "${PB_T1_GB:-0}")
         local _t1_tot=$(( ${GPU_VRAM_TOTAL_MB:-0} / 1024 ))
@@ -6182,25 +6088,107 @@ _cmd_status_snapshot() {
         echo -e "  ${C_CYAN}T1${C_RESET}  ${C_GRAY}GPU VRAM   ${C_LIME}${PB_T1_GB} GB${C_RESET}"
     fi
 
-    # T2 — System RAM pool
+    # T2 - System RAM pool
     local _t2_pct="${PB_T2_PCT:-0}"
     local _t2_col; _t2_col=$(gb_tier_color "$_t2_pct")
     local _t2_bar; _t2_bar=$(gb_bar "$_t2_pct" "$_t2_col" "${C_DIM}" 28)
     echo -e "  ${C_CYAN}T2${C_RESET}  ${C_GRAY}System RAM ${C_RESET}${_t2_bar}  ${_t2_col}${PB_T2_USED_GB}/${PB_T2_MAX_GB} GB  ${_t2_pct}%${C_RESET}"
     if [[ "$PI_OOM_GUARD" == "YES" ]]; then
-        _diag_errors+=("OOM guard — T2 full; system RAM at safety limit")
+        _diag_errors+=("OOM guard - T2 full; system RAM at safety limit")
     fi
 
-    # T3 — NVMe swap
+    # T3 - NVMe swap
     local _t3_pct=0
     (( ${PB_T3_MAX_GB:-0} > 0 )) && _t3_pct=$(( ${PB_T3_USED_GB:-0} * 100 / ${PB_T3_MAX_GB:-1} ))
     local _t3_col; _t3_col=$(gb_tier_color "$_t3_pct")
     local _t3_bar; _t3_bar=$(gb_bar "$_t3_pct" "$_t3_col" "${C_DIM}" 28)
     echo -e "  ${C_CYAN}T3${C_RESET}  ${C_GRAY}NVMe swap  ${C_RESET}${_t3_bar}  ${_t3_col}${PB_T3_USED_GB}/${PB_T3_MAX_GB} GB  ${_t3_pct}%${C_RESET}"
-    (( _t3_pct >= 90 )) && _diag_errors+=("T3 NVMe swap near cap (${_t3_pct}%) — cold weights may not evict")
+    (( _t3_pct >= 90 )) && _diag_errors+=("T3 NVMe swap near cap (${_t3_pct}%) - cold weights may not evict")
     (( _t3_pct >= 75 && _t3_pct < 90 )) && _diag_warns+=("T3 NVMe swap at ${_t3_pct}%")
 
-    echo -e "  ${C_DIM}Combined: ${C_GRAY}${C_BOLD}${_combined_gb} GB${C_RESET}"
+    # Remote Feeders (Cluster) - Combined line + per-feeder bars
+    local _remote_gpus=0
+    local _remote_t1=0
+    local _remote_t2=0
+    local _remote_t3=0
+    local _feeder_labels=""
+    local -a _feeder_bar_lines=()
+    if [[ -f "$GB_CLUSTER_CONF" ]]; then
+        while IFS= read -r line; do
+            [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+            local addr nickname
+            addr=$(echo "$line" | awk '{print $1}')
+            nickname=$(echo "$line" | awk '{print $2}')
+            local ip port; ip=$(echo "$addr" | cut -d: -f1); port=$(echo "$addr" | cut -d: -f2)
+            [[ -z "$port" ]] && port=$GB_NET_PORT
+            local probe_out; probe_out=$(_gb_net_handshake "$ip" "$port" 2>/dev/null)
+            if echo "$probe_out" | grep -q "^OK:"; then
+                local _ft2_done=0 _ft3_done=0
+                local _mem_t1f=0 _mem_t1t=0 _mem_t2f=0 _mem_t2t=0 _mem_t3f=0 _mem_t3t=0
+                while IFS= read -r gl; do
+                    if [[ "$gl" == GPU:* ]]; then
+                        local fv; fv=$(echo "$gl" | cut -d: -f4)
+                        _remote_t1=$((_remote_t1 + (fv + 536870912) / 1073741824))
+                        _remote_gpus=$((_remote_gpus + 1))
+                        if (( _ft2_done == 0 )); then
+                            local ft2; ft2=$(echo "$gl" | cut -d: -f6)
+                            [[ "$ft2" =~ ^[0-9]+$ && ft2 -gt 0 ]] && _remote_t2=$((_remote_t2 + (ft2 + 536870912) / 1073741824))
+                            _ft2_done=1
+                        fi
+                        if (( _ft3_done == 0 )); then
+                            local ft3; ft3=$(echo "$gl" | cut -d: -f7)
+                            [[ "$ft3" =~ ^[0-9]+$ && ft3 -gt 0 ]] && _remote_t3=$((_remote_t3 + (ft3 + 536870912) / 1073741824))
+                            _ft3_done=1
+                        fi
+                    elif [[ "$gl" == MEM:0:* ]]; then
+                        # MEM:{dev_id}:{t1f}:{t1t}:{t2f}:{t2t}:{t3f}:{t3t} (bytes)
+                        _mem_t1f=$(echo "$gl" | cut -d: -f3)
+                        _mem_t1t=$(echo "$gl" | cut -d: -f4)
+                        _mem_t2f=$(echo "$gl" | cut -d: -f5)
+                        _mem_t2t=$(echo "$gl" | cut -d: -f6)
+                        _mem_t3f=$(echo "$gl" | cut -d: -f7)
+                        _mem_t3t=$(echo "$gl" | cut -d: -f8)
+                    fi
+                done <<< "$probe_out"
+                local _fn; _fn="${nickname:-$ip}"
+                _feeder_labels="${_feeder_labels}${_fn} "
+
+                # Build per-feeder bar lines if MEM data is available
+                if (( _mem_t1t > 0 || _mem_t2t > 0 )); then
+                    local _fn_pad; printf -v _fn_pad "%-6s" "${_fn:0:6}"
+                    # T1 bar
+                    local _ft1u=$(( (_mem_t1t - _mem_t1f + 536870912) / 1073741824 ))
+                    local _ft1tot=$(( (_mem_t1t + 536870912) / 1073741824 ))
+                    local _ft1pct=0; (( _ft1tot > 0 )) && _ft1pct=$(( (_ft1u * 100) / _ft1tot ))
+                    local _ft1col; _ft1col=$(gb_tier_color "$_ft1pct")
+                    local _ft1bar; _ft1bar=$(gb_bar "$_ft1pct" "$_ft1col" "${C_DIM}" 18)
+                    # T2 bar
+                    local _ft2u=$(( (_mem_t2t - _mem_t2f + 536870912) / 1073741824 ))
+                    local _ft2tot=$(( (_mem_t2t + 536870912) / 1073741824 ))
+                    local _ft2pct=0; (( _ft2tot > 0 )) && _ft2pct=$(( (_ft2u * 100) / _ft2tot ))
+                    local _ft2col; _ft2col=$(gb_tier_color "$_ft2pct")
+                    local _ft2bar; _ft2bar=$(gb_bar "$_ft2pct" "$_ft2col" "${C_DIM}" 18)
+                    # T3 bar
+                    local _ft3u=$(( (_mem_t3t - _mem_t3f + 536870912) / 1073741824 ))
+                    local _ft3tot=$(( (_mem_t3t + 536870912) / 1073741824 ))
+                    local _ft3pct=0; (( _ft3tot > 0 )) && _ft3pct=$(( (_ft3u * 100) / _ft3tot ))
+                    local _ft3col; _ft3col=$(gb_tier_color "$_ft3pct")
+                    local _ft3bar; _ft3bar=$(gb_bar "$_ft3pct" "$_ft3col" "${C_DIM}" 18)
+                    _feeder_bar_lines+=("  ${C_DIM}↳${C_RESET} ${C_CYAN}${_fn_pad}${C_RESET}  ${C_DIM}T1${C_RESET} ${_ft1bar} ${_ft1col}${_ft1u}/${_ft1tot} GB${C_RESET}  ${C_DIM}T2${C_RESET} ${_ft2bar} ${_ft2col}${_ft2u}/${_ft2tot} GB${C_RESET}  ${C_DIM}T3${C_RESET} ${_ft3bar} ${_ft3col}${_ft3u}/${_ft3tot} GB${C_RESET}")
+                fi
+            fi
+        done < "$GB_CLUSTER_CONF"
+    fi
+    if (( _remote_gpus > 0 )); then
+        local _cl_total=$((_remote_t1 + _remote_t2 + _remote_t3))
+        local _gpu_label; (( _remote_gpus == 1 )) && _gpu_label="${_remote_gpus} GPU" || _gpu_label="${_remote_gpus} GPUs"
+        echo -e "  ${C_CYAN}CL${C_RESET}  ${C_GRAY}Cluster    ${C_LIME}${_cl_total} GB${C_RESET}  ${C_DIM}(T1:${_remote_t1} + T2:${_remote_t2} + T3:${_remote_t3} · ${_gpu_label} · ${_feeder_labels% })${C_RESET}"
+        local _bl; for _bl in "${_feeder_bar_lines[@]}"; do echo -e "$_bl"; done
+        local _combined_total=$(( ${_combined_gb} + _cl_total ))
+        echo -e "  ${C_DIM}Combined: ${C_GRAY}${C_BOLD}${_combined_total} GB${C_RESET}  ${C_DIM}(local ${_combined_gb} + cluster ${_cl_total})${C_RESET}"
+    else
+        echo -e "  ${C_DIM}Combined: ${C_GRAY}${C_BOLD}${_combined_gb} GB${C_RESET}"
+    fi
     gb_separator
 
     # ── ROW 3 (4 lines): KV Cache | Overflow ─────────────────────────
@@ -6212,10 +6200,10 @@ _cmd_status_snapshot() {
         local _kv_icon _kv_pc
         if (( ${PI_KV_T3_MB:-0} > 0 )); then
             _kv_icon="${C_RED}●${C_RESET}"; _kv_pc="${C_RED}"
-            _diag_errors+=("KV in T3 (${PI_KV_T3_MB} MB) — generation speed degraded")
+            _diag_errors+=("KV in T3 (${PI_KV_T3_MB} MB) - generation speed degraded")
         else
             _kv_icon="${C_AMBER}●${C_RESET}"; _kv_pc="${C_AMBER}"
-            _diag_warns+=("KV spilled to T2 DDR (${PI_KV_T2_MB} MB) — consider increasing kv_reserve_mb")
+            _diag_warns+=("KV spilled to T2 DDR (${PI_KV_T2_MB} MB) - consider increasing kv_reserve_mb")
         fi
         _kv_lines+=("  ${_kv_icon}  ${C_GRAY}Placement ${_kv_pc}${PI_KV_PLACEMENT}${C_RESET}")
     else
@@ -6231,15 +6219,12 @@ _cmd_status_snapshot() {
     if [[ "$SS_STALE" == "0" ]]; then
         local _path_badge
         case "$SS_ACTIVE_PATH" in
-            A0) _path_badge="${C_LIME}${C_BOLD}●A0${C_RESET} ${C_DIM}(optimal)${C_RESET}" ;;
-            A)  _path_badge="${C_LIME}●A${C_RESET}  ${C_DIM}(good)${C_RESET}" ;;
-            B)  _path_badge="${C_AMBER}${C_BOLD}⚠B${C_RESET}  ${C_DIM}(fallback)${C_RESET}"
-                _diag_warns+=("CUDA shim on fallback B path") ;;
-            C)  _path_badge="${C_RED}${C_BOLD}✗C${C_RESET}  ${C_DIM}(last resort)${C_RESET}"
-                _diag_warns+=("CUDA shim on fallback C path") ;;
+            A)  _path_badge="${C_LIME}●A${C_RESET}  ${C_DIM}(DMA-BUF pinned DDR)${C_RESET}" ;;
+            B)  _path_badge="${C_AMBER}${C_BOLD}⚠B${C_RESET}  ${C_DIM}(HostReg no-kernel)${C_RESET}"
+                _diag_warns+=("CUDA shim on fallback Path B - no kernel module") ;;
             *)  _path_badge="${C_GRAY}path:${SS_ACTIVE_PATH:-?}${C_RESET}" ;;
         esac
-        _alloc_str="${_path_badge}  ${C_DIM}A0:${SS_PATH_A0} A:${SS_PATH_A} B:${SS_PATH_B} C:${SS_PATH_C}${C_RESET}"
+        _alloc_str="${_path_badge}  ${C_DIM}A:${SS_PATH_A} B:${SS_PATH_B}${C_RESET}"
     else
         _alloc_str="${C_DIM}(shim stats unavailable)${C_RESET}"
     fi
@@ -6250,10 +6235,15 @@ _cmd_status_snapshot() {
         _oom_str="${C_LIME}OOM: no${C_RESET}"
     fi
 
+    local _adj_sign=""; (( SS_T2_WARN_ADJ > 0 )) && _adj_sign="+"
+    local _pinned_str=""
+    [[ -n "$SS_PINNED_FREE" ]] && _pinned_str="  Pinned: ${SS_PINNED_FREE}/8"
     _ov_lines+=("  ${C_BOLD}Overflow${C_RESET}")
     _ov_lines+=("  ${C_GRAY}${_alloc_str}${C_RESET}")
     _ov_lines+=("  ${_oom_str}${C_DIM} · Bufs: ${PI_ACTIVE_BUFS}${C_RESET}")
     _ov_lines+=("  ${C_DIM}T2 free: ${PI_T2_AVAIL_MB} MB · Safety: ${PI_SAFETY_RSV_MB} MB${C_RESET}")
+    _ov_lines+=("  ${C_DIM}Refault adj ${_adj_sign}${SS_T2_WARN_ADJ}%  KV dedup ${SS_KV_DEDUP} hits  Frag ${SS_KV_FRAG_MB} MB${C_RESET}")
+    _ov_lines+=("  ${C_DIM}Cold evict ${SS_COLD_EVICT}${_pinned_str}${C_RESET}")
 
     gb_render_2col _kv_lines _ov_lines
     gb_separator
@@ -6266,7 +6256,7 @@ _cmd_status_snapshot() {
         _aa_denials=$(journalctl -k -q --no-pager -n 200 2>/dev/null \
             | grep -cE 'apparmor="DENIED".*greenboost|greenboost.*apparmor="DENIED"' || true)
         _aa_count=${_aa_denials:-0}
-        (( _aa_count > 0 )) && _diag_errors+=("AppArmor denials (${_aa_count}) — run: sudo greenboost install-steam")
+        (( _aa_count > 0 )) && _diag_errors+=("AppArmor denials (${_aa_count}) - run: sudo greenboost install-sys-configs")
     fi
 
     # Remove blank placeholder ok entries
@@ -6296,13 +6286,90 @@ _cmd_status_snapshot() {
     fi
     echo ""
 
+    # ── Diagnostic Summary ────────────────────────────────────────────────
+    local _dsep; _dsep=$(printf '─%.0s' $(seq 1 $(( $(tput cols 2>/dev/null || echo 72) - 2 ))))
+    echo ""
+    printf '  %b\n' "${C_PURPLE}${C_BOLD}Diagnostic Summary${C_RESET}"
+    printf '%b\n'   "  ${C_DIM}${_dsep}${C_RESET}"
+
+    # Tier allocation history (from shim_stats per-tier counters)
+    local _any_tier=0
+    _ds_tier() {
+        local _label="$1" _desc="$2" _cnt="$3" _mb="$4" _peak="$5"
+        (( ${_cnt:-0} <= 0 )) && return
+        _any_tier=1
+        printf "  ${C_LIME}✓${C_RESET}  %-18s ${C_DIM}%-22s${C_RESET}  ${C_CYAN}%6d${C_RESET} alloc(s)  ${C_GRAY}%7d MB${C_RESET}  ${C_DIM}peak: %d MB${C_RESET}\n" \
+            "$_label" "$_desc" "${_cnt:-0}" "${_mb:-0}" "${_peak:-0}"
+    }
+    _ds_tier "T1 local"    "(cudaMalloc)"            "${SS_TIER_T1_LOCAL_COUNT:-0}"  "${SS_TIER_T1_LOCAL_MB:-0}"  "${SS_TIER_T1_LOCAL_PEAK:-0}"
+    _ds_tier "T1 feeder"   "(remote VRAM)"           "${SS_TIER_T1_FEEDER_COUNT:-0}" "${SS_TIER_T1_FEEDER_MB:-0}" "${SS_TIER_T1_FEEDER_PEAK:-0}"
+    _ds_tier "T2 local"    "(DDR pool / Path A)"     "${SS_TIER_T2_LOCAL_COUNT:-0}"  "${SS_TIER_T2_LOCAL_MB:-0}"  "${SS_TIER_T2_LOCAL_PEAK:-0}"
+    _ds_tier "T2 feeder"   "(remote DDR)"            "${SS_TIER_T2_FEEDER_COUNT:-0}" "${SS_TIER_T2_FEEDER_MB:-0}" "${SS_TIER_T2_FEEDER_PEAK:-0}"
+    _ds_tier "T3 local"    "(NVMe GDS)"              "${SS_TIER_T3_LOCAL_COUNT:-0}"  "${SS_TIER_T3_LOCAL_MB:-0}"  "${SS_TIER_T3_LOCAL_PEAK:-0}"
+    _ds_tier "T3 feeder"   "(remote NVMe)"           "${SS_TIER_T3_FEEDER_COUNT:-0}" "${SS_TIER_T3_FEEDER_MB:-0}" "${SS_TIER_T3_FEEDER_PEAK:-0}"
+    _ds_tier "VMM"         "(cuMemCreate)"           "${SS_TIER_VMM_COUNT:-0}"       "${SS_TIER_VMM_MB:-0}"       "${SS_TIER_VMM_PEAK:-0}"
+    _ds_tier "Path B"      "(HostReg fallback)"      "${SS_TIER_PATH_B_COUNT:-0}"    "${SS_TIER_PATH_B_MB:-0}"    "${SS_TIER_PATH_B_PEAK:-0}"
+    (( _any_tier == 0 )) && printf "  ${C_DIM}No tier stats - shim not active${C_RESET}\n"
+    unset -f _ds_tier
+
+    # Allocation sub-paths from NVTX log
+    echo ""
+    printf "  ${C_DIM}Allocation paths${C_RESET}\n"
+    local _nvtx_data=0
+    (( DIAG_PATH_A_ZC_COUNT > 0 )) && {
+        _nvtx_data=1
+        printf "  ${C_LIME}✓${C_RESET}  %-38s  ${C_CYAN}%6d${C_RESET} alloc(s)  ${C_GRAY}%7d MB${C_RESET}\n" \
+            "Path A  zero-copy  (OpaqueFd DMA-BUF)" "${DIAG_PATH_A_ZC_COUNT}" "${DIAG_PATH_A_ZC_MB}"
+    }
+    (( DIAG_PATH_A_POOL_COUNT > 0 )) && {
+        _nvtx_data=1
+        printf "  ${C_LIME}✓${C_RESET}  %-38s  ${C_CYAN}%6d${C_RESET} alloc(s)  ${C_GRAY}%7d MB${C_RESET}\n" \
+            "Path A  pool (inner sub-alloc slab)" "${DIAG_PATH_A_POOL_COUNT}" "${DIAG_PATH_A_POOL_MB}"
+    }
+    (( DIAG_PATH_A_PIN_COUNT > 0 )) && {
+        _nvtx_data=1
+        printf "  ${C_LIME}✓${C_RESET}  %-38s  ${C_CYAN}%6d${C_RESET} alloc(s)  ${C_GRAY}%7d MB${C_RESET}\n" \
+            "Path A  pinned (mmap→cuMemHostReg)" "${DIAG_PATH_A_PIN_COUNT}" "${DIAG_PATH_A_PIN_MB}"
+    }
+    (( DIAG_ZEROCOPY_FAIL > 0 )) && {
+        _nvtx_data=1
+        printf "  ${C_AMBER}⚠${C_RESET}  Path A zero-copy fell to pinned sub-method:  ${C_AMBER}%d${C_RESET} time(s)\n" \
+            "${DIAG_ZEROCOPY_FAIL}"
+    }
+    (( _nvtx_data == 0 )) && printf "  ${C_DIM}No path events - log empty or shim not active${C_RESET}\n"
+
+    # OOM events
+    echo ""
+    if (( DIAG_OOM_TOTAL > 0 )); then
+        printf "  ${C_RED}✗${C_RESET}  ${C_RED}${C_BOLD}OOM events: %d total${C_RESET}\n" "${DIAG_OOM_TOTAL}"
+        (( DIAG_OOM_MEMAVAIL   > 0 )) && printf "     ${C_RED}✗${C_RESET}  ${C_GRAY}%-42s${C_RESET}  ${C_RED}%d${C_RESET} time(s)\n" "MemAvailable guard triggered"    "${DIAG_OOM_MEMAVAIL}"
+        (( DIAG_OOM_PATH_B_FAIL> 0 )) && printf "     ${C_RED}✗${C_RESET}  ${C_GRAY}%-42s${C_RESET}  ${C_RED}%d${C_RESET} time(s)\n" "Path B cuMemHostRegister failed" "${DIAG_OOM_PATH_B_FAIL}"
+        (( DIAG_OOM_FULL       > 0 )) && printf "     ${C_RED}✗${C_RESET}  ${C_GRAY}%-42s${C_RESET}  ${C_RED}%d${C_RESET} time(s)\n" "All tiers exhausted (smart_alloc)" "${DIAG_OOM_FULL}"
+        (( DIAG_OOM_T1_LOCAL   > 0 )) && printf "     ${C_RED}✗${C_RESET}  ${C_GRAY}%-42s${C_RESET}  ${C_RED}%d${C_RESET} time(s)\n" "T1 VRAM OOM (cudaMalloc)"        "${DIAG_OOM_T1_LOCAL}"
+        (( DIAG_OOM_T2_CAP     > 0 )) && printf "     ${C_RED}✗${C_RESET}  ${C_GRAY}%-42s${C_RESET}  ${C_RED}%d${C_RESET} time(s)\n" "T2 pool cap exceeded"            "${DIAG_OOM_T2_CAP}"
+        (( DIAG_OOM_VMM_HOST   > 0 )) && printf "     ${C_RED}✗${C_RESET}  ${C_GRAY}%-42s${C_RESET}  ${C_RED}%d${C_RESET} time(s)\n" "VMM host pinned failed"          "${DIAG_OOM_VMM_HOST}"
+    else
+        printf "  ${C_LIME}✓${C_RESET}  ${C_GRAY}No OOM events${C_RESET}\n"
+    fi
+    if (( DIAG_EVICT_COUNT > 0 )); then
+        printf "  ${C_AMBER}⚠${C_RESET}  Evictions: ${C_AMBER}%d${C_RESET}  (${C_GRAY}%d MB${C_RESET})  ${C_DIM}- T2 KV pool under pressure${C_RESET}\n" \
+            "${DIAG_EVICT_COUNT}" "${DIAG_EVICT_MB}"
+    fi
+
+    # Last phase + total alloc count from tier stats
+    local _total_allocs=$(( ${SS_TIER_T1_LOCAL_COUNT:-0} + ${SS_TIER_T1_FEEDER_COUNT:-0} + ${SS_TIER_T2_LOCAL_COUNT:-0} + ${SS_TIER_T2_FEEDER_COUNT:-0} + ${SS_TIER_T3_LOCAL_COUNT:-0} + ${SS_TIER_T3_FEEDER_COUNT:-0} + ${SS_TIER_VMM_COUNT:-0} + ${SS_TIER_PATH_B_COUNT:-0} ))
+    local _phase_disp="${DIAG_LAST_PHASE:-${SS_PHASE:----}}"
+    printf "  ${C_DIM}Last phase: ${C_RESET}${C_VIOLET}%-22s${C_RESET}  ${C_DIM}Total allocs: ${C_RESET}${C_CYAN}%d${C_RESET}  ${C_DIM}H2D: %d MB  D2H: %d MB${C_RESET}\n" \
+        "${_phase_disp}" "${_total_allocs}" "${SS_H2D_MB:-0}" "${SS_D2H_MB:-0}"
+    echo ""
+
     # Append one structured line to the status log for Ctrl+L log view
     _status_log_append
 }
 
 
-# ---- _status_log_append — append one line to the status log -----------
-# Called at end of every _cmd_status_snapshot invocation.
+# ---- _status_log_append - append one line to the status log -----------
+# Called at end of every _cmd_vitals_snapshot invocation.
 _status_log_append() {
     local _dir; _dir=$(dirname "$GB_STATUS_LOG")
     mkdir -p "$_dir" 2>/dev/null || return
@@ -6311,23 +6378,23 @@ _status_log_append() {
         tail -n 2000 "$GB_STATUS_LOG" > "${GB_STATUS_LOG}.tmp" 2>/dev/null \
             && mv "${GB_STATUS_LOG}.tmp" "$GB_STATUS_LOG" 2>/dev/null || true
     fi
-    printf '%s path=%s vram=%s/%s t2=%s t3=%s a0=%s a=%s b=%s c=%s phase=%s model=%s\n' \
+    printf '%s path=%s vram=%s/%s t2=%s t3=%s a=%s b=%s phase=%s model=%s\n' \
         "$(date -Iseconds)" \
         "${SS_ACTIVE_PATH:-?}" \
         "${GPU_VRAM_USED_MB:-0}" "${GPU_VRAM_TOTAL_MB:-0}" \
         "${PI_T2_ALLOC_MB:-0}" "${PI_T3_ALLOC_MB:-0}" \
-        "${SS_PATH_A0:-0}" "${SS_PATH_A:-0}" "${SS_PATH_B:-0}" "${SS_PATH_C:-0}" \
+        "${SS_PATH_A:-0}" "${SS_PATH_B:-0}" \
         "${SS_PHASE:-?}" \
         "${OL_MODEL:--}" \
         >> "$GB_STATUS_LOG" 2>/dev/null || true
 }
 
-# ---- _show_log_view — Ctrl+L log view within the status alternate screen
+# ---- _show_log_view - Ctrl+L log view within the status alternate screen
 # Displays GB_STATUS_LOG; Ctrl+S or q returns to live status.
 _show_log_view() {
     local _log="${1:-$GB_STATUS_LOG}"
     while true; do
-        printf '\033[H\033[J'   # cursor home + clear screen
+        printf '\033[2J\033[H'  # clear entire screen then cursor home
         local _rows; _rows=$(tput lines 2>/dev/null || echo 24)
         local _cols; _cols=$(tput cols  2>/dev/null || echo 80)
         echo -e "  ${C_CYAN}${C_BOLD}GreenBoost Status Log${C_RESET}  ${C_DIM}Ctrl+S: back to status  q: back  Ctrl+C: exit\033[K${C_RESET}"
@@ -6337,22 +6404,18 @@ _show_log_view() {
         (( _content_rows < 5 )) && _content_rows=5
         if [[ -f "$_log" ]]; then
             tail -n "$_content_rows" "$_log" | while IFS= read -r _line; do
-                # Colour-code by path: A0→lime, A→lime-dim, B→amber, C→red
+                # Colour-code by path: A→lime, B→amber
                 local _coloured="$_line"
-                if [[ "$_line" =~ path=A0 ]]; then
+                if [[ "$_line" =~ path=A ]]; then
                     _coloured="${C_LIME}${_line}${C_RESET}"
-                elif [[ "$_line" =~ path=A[^0] ]]; then
-                    _coloured="${C_GRAY}${_line}${C_RESET}"
                 elif [[ "$_line" =~ path=B ]]; then
                     _coloured="${C_AMBER}${_line}${C_RESET}"
-                elif [[ "$_line" =~ path=C ]]; then
-                    _coloured="${C_RED}${_line}${C_RESET}"
                 fi
                 echo -e "  ${_coloured}\033[K"
             done
         else
             echo ""
-            echo -e "  ${C_AMBER}⚠${C_RESET}  ${C_GRAY}No log yet — status refreshes write entries here.${C_RESET}"
+            echo -e "  ${C_AMBER}⚠${C_RESET}  ${C_GRAY}No log yet - status refreshes write entries here.${C_RESET}"
             echo -e "  ${C_DIM}Log will appear at: ${C_GRAY}${_log}${C_RESET}"
         fi
         printf '\033[J'   # erase trailing lines
@@ -6364,13 +6427,1403 @@ _show_log_view() {
     done
 }
 
-cmd_status() {
-    detect_hardware 2>/dev/null || true
+# ---- Network Fabric: feed / connect / disconnect / cluster --------
+# Distributed GPU compute + memory across machines via TCP.
+# Feeder machine: greenboost feed      (starts greenboost-netd daemon)
+# Host machine:   greenboost connect <IP>  (connects to feeder)
+
+GB_NET_PORT=9740
+GB_NETD_BIN="/usr/local/bin/greenboost-netd"
+GB_NETD_PID="/run/greenboost/netd.pid"
+GB_CLUSTER_CONF="/etc/greenboost/cluster.conf"
+# Audit F-L4-02: cluster-scoped known_hosts so feeder SSH calls can pin the
+# host key instead of using `StrictHostKeyChecking=no`.  cmd_connect adds an
+# entry on first contact; later calls can opt into strict checking by passing
+# `-o UserKnownHostsFile="$GB_KNOWN_HOSTS" -o StrictHostKeyChecking=yes` (see
+# _gb_ssh_opts helper below).
+GB_KNOWN_HOSTS="/etc/greenboost/known_hosts"
+
+# _gb_ssh_opts <ip> - emit SSH options that prefer strict checking against
+# the pinned key file.  If the host has not been pinned yet, fall back to the
+# accept-new policy on the SAME file so that subsequent connects upgrade to
+# strict automatically.  Call sites that currently use `-o StrictHostKeyChecking=no`
+# can migrate by replacing those two options with `$(_gb_ssh_opts "$ip")`.
+# PR-GG: inline fallback - only defined if lib/gb_ssh.sh wasn't sourced.
+if ! declare -F _gb_ssh_opts >/dev/null 2>&1; then
+_gb_ssh_opts() {
+    local ip="$1"
+    mkdir -p "$(dirname "$GB_KNOWN_HOSTS")" 2>/dev/null || true
+    if [[ -f "$GB_KNOWN_HOSTS" ]] && ssh-keygen -F "$ip" -f "$GB_KNOWN_HOSTS" >/dev/null 2>&1; then
+        printf -- '-o UserKnownHostsFile=%s -o StrictHostKeyChecking=yes' "$GB_KNOWN_HOSTS"
+    else
+        printf -- '-o UserKnownHostsFile=%s -o StrictHostKeyChecking=accept-new' "$GB_KNOWN_HOSTS"
+    fi
+}
+fi
+
+# PR-BB: _gb_run_tui_loop <snapshot_fn> [refresh_sec]
+#
+# The TUI command paradigm requires every
+# interactive status command to:
+#   1. Enter the alternate-screen buffer (preserve terminal history)
+#   2. Hide the cursor
+#   3. Loop: home cursor → render snapshot → clear-to-end-of-screen → wait up
+#      to N seconds for a keypress
+#   4. On Ctrl+C / SIGTERM: restore cursor + leave alt-screen + restore stty.
+#
+# Before this helper, six command implementations each had ~25 lines of
+# boilerplate doing exactly that - drift between them was an ongoing audit
+# finding (the prior audit flagged this as "massive duplication in TUI loop
+# lines 5317-5340, 5454-5475, 7651-7674, 7768-7780, 8162-8183, 5064-5085").
+#
+# Each caller now passes its snapshot function name and (optionally) the
+# refresh interval.  The trap is local to the function - exit-from-this-shell
+# semantics restore on signal.
+# PR-GG: inline fallback - only defined if lib/gb_tui.sh wasn't sourced.
+if ! declare -F _gb_run_tui_loop >/dev/null 2>&1; then
+_gb_run_tui_loop() {
+    local _snapshot_fn="$1"
+    local _refresh="${2:-5}"
+    local _saved_stty; _saved_stty=$(stty -g 2>/dev/null || true)
+    stty -ixon 2>/dev/null || true
+    printf '\033[?1049h'
+    printf '\033[?25l'
+    trap 'printf "\033[?25h\033[?1049l"; [[ -n "$_saved_stty" ]] && stty "${_saved_stty:-}"  2>/dev/null || true; exit 0' INT TERM EXIT
+    local _key=""
+    while true; do
+        printf '\033[H'
+        "$_snapshot_fn"
+        printf '\033[J'
+        if read -t "$_refresh" -s -n 1 _key 2>/dev/null; then
+            case "$_key" in
+                $'\x03') break ;;
+                $'\x13') ;;
+                *) ;;
+            esac
+        fi
+    done
+    printf '\033[?25h\033[?1049l'
+    [[ -n "$_saved_stty" ]] && stty "${_saved_stty:-}"  2>/dev/null || true
+    trap - INT TERM EXIT
+}
+fi
+
+cmd_feed() {
+    need_root "feed"
+    local action="${1:-start}"
+    case "$action" in
+        start|"")
+            if [[ ! -x "$GB_NETD_BIN" ]]; then
+                die "greenboost-netd not found at $GB_NETD_BIN - build it first: make netd && sudo cp greenboost-netd /usr/local/bin/"
+            fi
+            if [[ -f "$GB_NETD_PID" ]] && kill -0 "$(cat "$GB_NETD_PID" 2>/dev/null)" 2>/dev/null; then
+                info "Feeder daemon already running (pid $(cat "$GB_NETD_PID"))"
+                return 0
+            fi
+            # Ensure T3 swap is provisioned: minimum T1 × 2, floor 16 GB
+            local _t1_mib=0
+            _t1_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits \
+                      2>/dev/null | head -1 | tr -d ' ') || _t1_mib=0
+            local _t1_gb=$(( (_t1_mib + 512) / 1024 ))
+            local _t3_min=$(( _t1_gb * 2 ))
+            [[ $_t3_min -lt 16 ]] && _t3_min=16
+            mkdir -p /var/lib/greenboost
+            local _swap_target="$GB_SWAP_FILE"
+            local _cur_swap_gb=0
+            if [[ -f "$_swap_target" ]]; then
+                _cur_swap_gb=$(( $(stat -c%s "$_swap_target" 2>/dev/null || echo 0) / 1073741824 ))
+            fi
+            if [[ $_cur_swap_gb -lt $_t3_min ]]; then
+                local _disk_free
+                _disk_free=$(df -BG /var/lib/greenboost 2>/dev/null | awk 'NR==2{gsub("G",""); print $4}')
+                local _disk_cap=$(( ${_disk_free:-0} * 80 / 100 ))
+                [[ $_t3_min -gt $_disk_cap ]] && _t3_min=$_disk_cap
+                if [[ $_t3_min -gt 0 ]]; then
+                    info "Provisioning T3 swap: ${_t3_min} GB (T1=${_t1_gb} GB × 2) → ${_swap_target}"
+                    swapoff "$_swap_target" 2>/dev/null || true
+                    fallocate -l "${_t3_min}G" "$_swap_target" 2>/dev/null \
+                        || dd if=/dev/zero of="$_swap_target" bs=1G count="$_t3_min" status=none
+                    chmod 600 "$_swap_target"
+                    mkswap "$_swap_target" >/dev/null
+                    swapon -p 10 "$_swap_target"
+                    if ! grep -qF "$_swap_target" /etc/fstab 2>/dev/null; then
+                        echo "${_swap_target} swap swap defaults,nofail 0 0" >> /etc/fstab
+                    fi
+                    gb_ok "T3 swap: ${_t3_min} GB ready at ${_swap_target}"
+                else
+                    gb_warn_ui "Insufficient disk space for T3 swap - feeder T3 will rely on existing swap"
+                fi
+            else
+                gb_ok "T3 swap: ${_cur_swap_gb} GB already provisioned at ${_swap_target}"
+            fi
+
+            # Disable cuFile (GPUDirect Storage) in any Ollama service on this feeder.
+            # The CUFileThreadPoolWorker assertion fires when nvidia-fs is absent or
+            # misconfigured; GreenBoost handles NVMe via its own T3 path on the feeder.
+            if systemctl is-enabled ollama.service &>/dev/null 2>&1; then
+                mkdir -p /etc/systemd/system/ollama.service.d
+                cat >/etc/systemd/system/ollama.service.d/99-greenboost-feed.conf <<'OEOF'
+[Service]
+Environment=NVCUFILE_DISABLE=1
+OEOF
+                systemctl daemon-reload
+                systemctl restart ollama.service &>/dev/null || true
+                gb_ok "Disabled cuFile in feeder Ollama (prevents CUFileThreadPoolWorker crash)"
+            fi
+
+            # N6: MPS daemon setup - start and validate nvidia-cuda-mps-server if requested
+            local _mps_started_by_us=0
+            if [[ "${GREENBOOST_MPS:-0}" == "1" ]]; then
+                # Audit F-L4-17: use controlled paths under /run/greenboost (not world-
+                # writable /tmp) so MPS socket and logs are not accessible to all users.
+                export CUDA_MPS_PIPE_DIRECTORY="${CUDA_MPS_PIPE_DIRECTORY:-/run/greenboost/nvidia-mps}"
+                export CUDA_MPS_LOG_DIRECTORY="${CUDA_MPS_LOG_DIRECTORY:-/var/log/greenboost/mps}"
+                mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
+                chmod o-rwx "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
+                if ! pgrep -x nvidia-cuda-mps-server >/dev/null 2>&1; then
+                    info "N6: Starting nvidia-cuda-mps-control daemon for MPS SM% control..."
+                    nvidia-cuda-mps-control -d 2>/dev/null || true
+                    sleep 1
+                    if pgrep -x nvidia-cuda-mps-server >/dev/null 2>&1; then
+                        gb_ok "MPS daemon started - CUDA_MPS_PIPE_DIRECTORY=$CUDA_MPS_PIPE_DIRECTORY"
+                        _mps_started_by_us=1
+                    else
+                        gb_warn_ui "MPS daemon failed to start - disabling GREENBOOST_MPS"
+                        export GREENBOOST_MPS=0
+                    fi
+                else
+                    gb_ok "MPS daemon already running"
+                fi
+            fi
+
+            info "Starting network feeder daemon on port $GB_NET_PORT..."
+            mkdir -p /run/greenboost /var/log/greenboost
+            local _netd_stderr_tmp
+            _netd_stderr_tmp=$(mktemp /tmp/gb-netd-XXXXXX)
+            # Export _mps_started_by_us so the stop action can clean up MPS if we started it
+            echo "$_mps_started_by_us" > /run/greenboost/mps_owned 2>/dev/null || true
+            "$GB_NETD_BIN" -d -p "$GB_NET_PORT" 2>"$_netd_stderr_tmp"
+            sleep 1
+            if [[ -f "$GB_NETD_PID" ]] && kill -0 "$(cat "$GB_NETD_PID" 2>/dev/null)" 2>/dev/null; then
+                rm -f "$_netd_stderr_tmp"
+                gb_ok "Feeder daemon started (pid $(cat "$GB_NETD_PID"))"
+                echo -e "\n  ${C_LIME}Run the following command on the AI workstation to connect to this machine:${C_RESET}";
+                echo -e "  ${C_BOLD}sudo greenboost connect $(hostname -I | awk '{print $1}')${C_RESET}\n"
+            else
+                if [[ -s "$_netd_stderr_tmp" ]]; then
+                    gb_warn_ui "Startup error:"
+                    while IFS= read -r _el; do gb_info "  $_el"; done < "$_netd_stderr_tmp"
+                elif [[ -s "/var/log/greenboost/netd.log" ]]; then
+                    gb_warn_ui "Last log entries:"
+                    tail -5 "/var/log/greenboost/netd.log" | while IFS= read -r _el; do gb_info "  $_el"; done
+                fi
+                rm -f "$_netd_stderr_tmp"
+                die "Feeder daemon failed to start - for details run: sudo $GB_NETD_BIN -p $GB_NET_PORT"
+            fi
+            ;;
+        --stop|stop)
+            if [[ -f "$GB_NETD_PID" ]]; then
+                local pid
+                pid=$(cat "$GB_NETD_PID" 2>/dev/null)
+                if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                    kill "$pid"
+                    sleep 0.5
+                    gb_ok "Feeder daemon stopped (pid $pid)"
+                else
+                    info "Feeder daemon not running"
+                fi
+                rm -f "$GB_NETD_PID"
+                # N6: shut down MPS daemon if we started it
+                local _mps_owned=0
+                [[ -f /run/greenboost/mps_owned ]] && _mps_owned=$(cat /run/greenboost/mps_owned 2>/dev/null || echo 0)
+                if [[ "$_mps_owned" == "1" ]] && pgrep -x nvidia-cuda-mps-server >/dev/null 2>&1; then
+                    echo quit | nvidia-cuda-mps-control 2>/dev/null || true
+                    gb_ok "MPS daemon stopped (was started by greenboost feed start)"
+                fi
+                rm -f /run/greenboost/mps_owned
+            else
+                info "Feeder daemon not running"
+            fi
+            ;;
+        --foreground|fg)
+            if [[ ! -x "$GB_NETD_BIN" ]]; then
+                die "greenboost-netd not found - build it first: make netd"
+            fi
+            mkdir -p /run/greenboost /var/log/greenboost
+            exec "$GB_NETD_BIN" -p "$GB_NET_PORT"
+            ;;
+        *)
+            echo "Usage: greenboost feed [start|stop|fg]" >&2
+            exit 1
+            ;;
+    esac
+}
+
+_gb_net_handshake() {
+    local ip="$1" port="${2:-$GB_NET_PORT}"
+    local timeout=5
+
+    # Binary handshake: send HANDSHAKE_REQ, read HANDSHAKE_RESP
+    # Wire protocol v3: gb_net_header is 16 bytes (magic+msg_type+flags+payload_len+seq_num).
+    python3 -c "
+import socket, struct, sys, hashlib, hmac, os
+
+ip, port = sys.argv[1], int(sys.argv[2])
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.settimeout($timeout)
+try:
+    sock.connect((ip, port))
+except Exception as e:
+    print(f'ERROR:connect:{e}', file=sys.stderr)
+    sys.exit(1)
+
+# PSK auth: if cluster.key present, recv 32-byte nonce and send HMAC-SHA256 response.
+_GB_KEY_PATH = '/etc/greenboost/cluster.key'
+def _load_psk():
+    try:
+        with open(_GB_KEY_PATH) as f:
+            h = f.readline().strip()
+        return bytes.fromhex(h[:64]) if len(h) >= 64 else None
+    except (OSError, ValueError):
+        return None
+
+psk = _load_psk()
+if psk is not None:
+    nonce = b''
+    while len(nonce) < 32:
+        chunk = sock.recv(32 - len(nonce))
+        if not chunk:
+            print('ERROR:psk_nonce_truncated', file=sys.stderr)
+            sys.exit(1)
+        nonce += chunk
+    mac = hmac.new(psk, nonce, hashlib.sha256).digest()
+    sock.sendall(mac)
+
+# Wire protocol v3: header = magic(4) + msg_type(2) + flags(2) + payload_len(4) + seq_num(4) = 16 bytes
+HDR_FMT  = '<IHHII'
+HDR_SIZE = struct.calcsize(HDR_FMT)   # 16
+magic    = 0x47424E46
+send_seq = 0
+
+def send_msg(msg_type, payload):
+    global send_seq
+    hdr = struct.pack(HDR_FMT, magic, msg_type, 0, len(payload), send_seq)
+    send_seq += 1
+    sock.sendall(hdr + payload)
+
+def recv_hdr():
+    buf = b''
+    while len(buf) < HDR_SIZE:
+        chunk = sock.recv(HDR_SIZE - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return struct.unpack(HDR_FMT, buf)   # magic, type, flags, payload_len, seq_num
+
+def recv_payload(length):
+    buf = b''
+    while len(buf) < length:
+        chunk = sock.recv(length - len(buf))
+        if not chunk:
+            return buf
+        buf += chunk
+    return buf
+
+# Build HANDSHAKE_REQ payload: proto_version(4) + gpu_count(4) + hostname(64) + gpus(8*100)
+hostname = os.uname().nodename[:63]
+proto_ver = 3
+gpu_count = 0
+payload = struct.pack('<II', proto_ver, gpu_count)
+payload += hostname.encode('utf-8').ljust(64, b'\x00')[:64]
+payload += b'\x00' * (8 * 100)
+
+send_msg(0x01, payload)   # GB_MSG_HANDSHAKE_REQ = 0x01
+
+resp = recv_hdr()
+if not resp:
+    print('ERROR:short_header', file=sys.stderr)
+    sys.exit(1)
+r_magic, r_type, r_flags, r_len, r_seq = resp
+if r_magic != magic:
+    print('ERROR:bad_magic', file=sys.stderr)
+    sys.exit(1)
+
+resp_payload = recv_payload(r_len)
+
+# Parse HANDSHAKE_RESP: status(4) + feeder_id(4) + proto_ver(4) + gpu_count(4) + hostname(64) + gpus
+status, feeder_id, proto_ver, gpu_count = struct.unpack_from('<IIII', resp_payload, 0)
+feeder_hostname = resp_payload[16:80].split(b'\x00')[0].decode('utf-8', errors='replace')
+
+if status != 0:
+    print(f'ERROR:rejected:{status}', file=sys.stderr)
+    sys.exit(1)
+
+# Parse GPU info: offset 80, each entry is 100 bytes
+# gpu_id(4) + vram_bytes(8) + cc_major(4) + cc_minor(4) + ram_available(8) + t3_bytes(8) + name(64)
+offset = 80
+for i in range(min(gpu_count, 8)):
+    gid, vram, cc_maj, cc_min, ram_avail, t3 = struct.unpack_from('<IQIIQQ', resp_payload, offset)
+    name = resp_payload[offset+36:offset+100].split(b'\x00')[0].decode('utf-8', errors='replace')
+    print(f'GPU:{gid}:{name}:{vram}:{cc_maj}.{cc_min}:{ram_avail}:{t3}')
+    offset += 100
+
+print(f'OK:{feeder_id}:{feeder_hostname}:{gpu_count}')
+
+# MEM_INFO query (msg_type=0x31) - get live T1/T2/T3 free+total for bars
+try:
+    for dev_id in range(min(gpu_count, 8)):
+        mem_payload = struct.pack('<II', dev_id, 0)  # gb_net_mem_info: device_id(4) t2_speed_mts(4)
+        send_msg(0x31, mem_payload)
+
+        mhdr = recv_hdr()
+        if not mhdr: break
+        _, _, _, mr_len, _ = mhdr
+        mpay = recv_payload(mr_len)
+        if len(mpay) < 36: break
+
+        # gb_net_mem_info_resp: status(4) t2_speed(4) free(8) total(8) t1_free(8) t1_total(8)
+        #   t2_free(8) t2_total(8) t3_free(8) t3_total(8) = 72 bytes
+        if len(mpay) >= 72:
+            st, spd, fb, tb, t1f, t1t, t2f, t2t, t3f, t3t = struct.unpack_from('<IIqqqqqqqq', mpay, 0)
+        else:
+            st, spd, fb, tb = struct.unpack_from('<IIqq', mpay, 0)
+            t1f = t1t = t2f = t2t = t3f = t3t = 0
+        print(f'MEM:{dev_id}:{t1f}:{t1t}:{t2f}:{t2t}:{t3f}:{t3t}')
+except Exception:
+    pass
+
+sock.close()
+" "$ip" "$port" 2>&1
+}
+
+# PR-CC: _gb_write_cluster_extra_mem is now a stub.
+#
+# The kernel module's cluster_extra_mem_gb parameter was removed in PR-K
+# because nothing in the module ever read it.  The function is preserved as
+# a no-op so existing call-sites (cmd_connect, cmd_disconnect) don't need
+# editing; the cluster-memory-aware sysinfo() behaviour the original sysfs
+# write was supposed to enable is implemented entirely in the CUDA shim's
+# cuDeviceTotalMem / nvmlDeviceGetMemoryInfo interception.  See Chapter G
+# of greenboost_documentation_extension_official_nvidia.md.
+_gb_write_cluster_extra_mem() {
+    return 0
+}
+
+cmd_connect() {
+    local ip="${1:-}"
+    local port="${2:-$GB_NET_PORT}"
+
+    if [[ -z "$ip" ]]; then
+        echo "Usage: greenboost connect <IP> [PORT]" >&2
+        exit 1
+    fi
+
+    info "Connecting to ${ip}:${port}..."
+
+    local output
+    output=$(_gb_net_handshake "$ip" "$port")
+    local rc=$?
+
+    if [[ $rc -ne 0 ]] || echo "$output" | grep -q "^ERROR:"; then
+        local err
+        err=$(echo "$output" | grep "^ERROR:" | head -1)
+        die "Connection failed: ${err:-unknown error}"
+    fi
+
+    # Parse handshake response
+    local ok_line
+    ok_line=$(echo "$output" | grep "^OK:")
+    local feeder_id feeder_host gpu_count
+    feeder_id=$(echo "$ok_line" | cut -d: -f2)
+    feeder_host=$(echo "$ok_line" | cut -d: -f3)
+    gpu_count=$(echo "$ok_line" | cut -d: -f4)
+
+    gb_ok "Connected - feeder \"${feeder_host}\" (${gpu_count} GPU(s))"
+
+    # Show GPU details
+    while IFS= read -r line; do
+        if [[ "$line" == GPU:* ]]; then
+            local gid gname vram cc_ver
+            gid=$(echo "$line" | cut -d: -f2)
+            gname=$(echo "$line" | cut -d: -f3)
+            vram=$(echo "$line" | cut -d: -f4)
+            cc_ver=$(echo "$line" | cut -d: -f5)
+            local vram_gb=$(( (vram + 536870912) / 1073741824 ))
+            gb_info "  GPU ${gid}: ${gname} - ${vram_gb} GB VRAM (cc ${cc_ver})"
+        fi
+    done <<< "$output"
+
+    # Use invoking user as the remote SSH user (same person running sudo greenboost connect)
+    local ssh_user="${SUDO_USER:-$USER}"
+
+    # Save to cluster.conf (format: IP:PORT hostname ssh_user)
+    mkdir -p /etc/greenboost
+    # Audit F-L4-04: validate IP strictly before interpolating into a sed
+    # expression.  Earlier code interpolated $ip directly; an IP carrying sed
+    # metacharacters (& | / etc.) could craft an arbitrary substitution.
+    if [[ ! "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        echo "[GreenBoost] ERROR: refusing non-IPv4-literal feeder address: $ip" >&2
+        exit 1
+    fi
+    local entry="${ip}:${port} ${feeder_host} ${ssh_user}"
+    if grep -q "^${ip}:" "$GB_CLUSTER_CONF" 2>/dev/null; then
+        # Audit F-L4-26: atomic write - build the new conf in a temp file,
+        # then mv into place so a crash mid-write can't corrupt cluster.conf.
+        local _tmp
+        _tmp=$(mktemp "${GB_CLUSTER_CONF}.XXXXXX") || _tmp="${GB_CLUSTER_CONF}.tmp"
+        awk -v ip="$ip" -v repl="$entry" \
+            '($0 ~ "^"ip":") { print repl; next } { print }' \
+            "$GB_CLUSTER_CONF" > "$_tmp" && mv "$_tmp" "$GB_CLUSTER_CONF"
+        gb_info "Updated feeder entry in $GB_CLUSTER_CONF"
+    else
+        echo "$entry" >> "$GB_CLUSTER_CONF"
+        gb_info "Added feeder to $GB_CLUSTER_CONF"
+    fi
+    # PR-J: cluster.conf contains feeder IPs + SSH usernames - sensitive
+    # enough to deny world read.  Default umask (022) leaves the file
+    # mode 0644 = world-readable.  Tighten to 0640 (root:root, group can
+    # read for monitoring/observability scripts).
+    chmod 0640 "$GB_CLUSTER_CONF" 2>/dev/null || true
+    gb_info "SSH user: ${ssh_user}"
+    _gb_write_cluster_extra_mem
+}
+
+# ── cmd_health_check - one-shot comprehensive cluster health audit (S1) ──────
+# Usage: greenboost health-check [--llm]
+#
+# Checks: module, shim, NVML, T2/T3 pool, each feeder handshake.
+# Prints PASS/FAIL/WARN per check.  --llm strips ANSI and emits STATUS:OK or
+# STATUS:FAIL:<reason> for machine-readable consumption.
+cmd_health_check() {
+    local llm_mode=0
+    [[ "${1:-}" == "--llm" ]] && llm_mode=1
+
+    local C_PASS="${C_LIME}" C_FAIL="${C_RED}" C_WARN="${C_AMBER}" C_RST="${C_RESET}"
+    if [[ $llm_mode -eq 1 ]]; then
+        C_PASS="" C_FAIL="" C_WARN="" C_RST=""
+    fi
+
+    local fail_reason="" fails=0 warns=0
+
+    _hc_pass() { echo -e "  ${C_PASS}PASS${C_RST}  $1"; }
+    _hc_fail() { echo -e "  ${C_FAIL}FAIL${C_RST}  $1"; fails=$(( fails + 1 )); fail_reason="${fail_reason}${1}; "; }
+    _hc_warn() { echo -e "  ${C_WARN}WARN${C_RST}  $1"; warns=$(( warns + 1 )); }
+
+    # Audit F-L4-08: SSH identity - prefer the original invoking user so BatchMode
+    # key-based auth works when running under sudo.
+    local _hc_ssh_as=()
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+        _hc_ssh_as=(runuser -u "$SUDO_USER" --)
+    fi
+
+    [[ $llm_mode -eq 0 ]] && { gb_header; gb_section "GreenBoost Health Check  $(date '+%Y-%m-%d %H:%M:%S')"; echo ""; }
+
+    # 1. Kernel module
+    if lsmod 2>/dev/null | grep -q "^greenboost "; then
+        _hc_pass "Kernel module: greenboost loaded"
+    else
+        _hc_fail "Kernel module: greenboost NOT loaded (run: sudo greenboost load)"
+    fi
+
+    # 2. CUDA shim
+    local shim_path
+    for shim_path in /usr/local/lib/libgreenboost_cuda.so \
+                     /usr/lib/libgreenboost_cuda.so \
+                     /usr/local/lib/libgreenboost_cuda_shim.so; do
+        [[ -f "$shim_path" ]] && break || shim_path=""
+    done
+    if [[ -n "$shim_path" ]]; then
+        _hc_pass "CUDA shim: $shim_path"
+    else
+        _hc_warn "CUDA shim: not found in standard paths (run: sudo make install)"
+    fi
+
+    # 3. NVML / nvidia-smi
+    if nvidia-smi -L &>/dev/null; then
+        local gpu_line; gpu_line=$(nvidia-smi -L 2>/dev/null | head -1)
+        _hc_pass "NVML: ${gpu_line:-OK}"
+    else
+        _hc_fail "NVML: nvidia-smi not accessible (driver issue or not a GPU host)"
+    fi
+
+    # 4. T2 pool sysfs
+    local sysfs_t2="/sys/module/greenboost/parameters/t2_pool_gb"
+    if [[ -r "$sysfs_t2" ]]; then
+        local t2_val; t2_val=$(cat "$sysfs_t2")
+        _hc_pass "T2 pool: ${t2_val} GB (from sysfs)"
+    else
+        _hc_warn "T2 pool: sysfs not available (module not loaded or param not exposed)"
+    fi
+
+    # 5. T3 NVMe file
+    local sysfs_nvme="/sys/module/greenboost/parameters/nvme_pool_gb"
+    local t3_file="/var/lib/greenboost/nvme_swap.img"
+    if [[ -f "$t3_file" ]]; then
+        local t3_sz; t3_sz=$(du -sh "$t3_file" 2>/dev/null | awk '{print $1}')
+        _hc_pass "T3 NVMe file: $t3_file (${t3_sz})"
+    else
+        local nvme_val=0
+        [[ -r "$sysfs_nvme" ]] && nvme_val=$(cat "$sysfs_nvme")
+        if [[ "$nvme_val" -gt 0 ]]; then
+            _hc_fail "T3 NVMe file: $t3_file missing but nvme_pool_gb=$nvme_val (run: sudo greenboost setup)"
+        else
+            _hc_warn "T3 NVMe: not configured (optional)"
+        fi
+    fi
+
+    # 6. Feeder handshakes
+    if [[ ! -f "$GB_CLUSTER_CONF" ]] || ! grep -q . "$GB_CLUSTER_CONF" 2>/dev/null; then
+        _hc_warn "Cluster: no feeders configured in $GB_CLUSTER_CONF"
+    else
+        while IFS=: read -r _ip _port _rest || [[ -n "$_ip" ]]; do
+            [[ -z "$_ip" || "$_ip" == \#* ]] && continue
+            # Audit F-L4-13: cluster.conf line is "IP:PORT hostname user".  With
+            # IFS=: the second field (_port) captures "PORT hostname user" because
+            # the hostname is space-separated, not colon-separated.  Strip the
+            # trailing fields so _port_num carries only the numeric port.
+            local _port_num="${_port%% *}"
+            _port_num="${_port_num:-9740}"
+            # Extract SSH user: _port is "PORT hostname user"; strip port, then last word.
+            local _after_port="${_port#"${_port_num}"}"
+            _after_port="${_after_port# }"  # strip leading space
+            local _feeder_user
+            _feeder_user="${_after_port##* }"  # last space-delimited word
+            [[ "$_feeder_user" == "$_after_port" && -z "$_after_port" ]] && _feeder_user=""
+            _feeder_user="${_feeder_user:-root}"
+
+            # TCP handshake
+            local _hs; _hs=$(_gb_net_handshake "$_ip" "$_port_num" 2>&1)
+            if echo "$_hs" | grep -q "^OK:"; then
+                _hc_pass "Feeder ${_ip}:${_port_num}: netd reachable"
+            else
+                _hc_fail "Feeder ${_ip}:${_port_num}: handshake failed (${_hs%%$'\n'*})"
+            fi
+
+            # Audit F-L4-02: pin host keys via $GB_KNOWN_HOSTS through _gb_ssh_opts.
+            # On first contact for an IP the helper falls back to accept-new on the
+            # same file, so subsequent calls automatically upgrade to strict checking.
+            local _ssh_rc=0
+            "${_hc_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=10 \
+                $(_gb_ssh_opts "$_ip") "${_feeder_user}@${_ip}" "true" 2>/dev/null \
+                || _ssh_rc=$?
+            if [[ $_ssh_rc -eq 0 ]]; then
+                _hc_pass "Feeder ${_ip}: SSH auth ok (user=${_feeder_user})"
+            else
+                _hc_warn "Feeder ${_ip}: SSH auth failed (user=${_feeder_user}, rc=${_ssh_rc}) - upgrade-greenboost needs key auth"
+            fi
+        done < "$GB_CLUSTER_CONF"
+    fi
+
+    echo ""
+    if [[ $llm_mode -eq 1 ]]; then
+        if [[ $fails -eq 0 ]]; then
+            echo "STATUS:OK warns=${warns}"
+        else
+            echo "STATUS:FAIL:${fail_reason%%; }"
+        fi
+    else
+        if [[ $fails -eq 0 && $warns -eq 0 ]]; then
+            gb_ok "All checks passed."
+        elif [[ $fails -eq 0 ]]; then
+            gb_warn_ui "${warns} warning(s) - system functional."
+        else
+            echo -e "  ${C_RED}${fails} check(s) FAILED.${C_RESET} Review output above."
+        fi
+        gb_separator
+    fi
+}
+
+cmd_disconnect() {
+    local ip="${1:-}"
+    if [[ -z "$ip" ]]; then
+        echo "Usage: greenboost disconnect <IP>" >&2
+        exit 1
+    fi
+    # Audit F-L4-04: validate IP literal before using it in a sed/awk anchor.
+    if [[ ! "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        echo "[GreenBoost] ERROR: refusing non-IPv4-literal feeder address: $ip" >&2
+        exit 1
+    fi
+
+    if [[ -f "$GB_CLUSTER_CONF" ]] && grep -q "^${ip}:" "$GB_CLUSTER_CONF"; then
+        # Audit F-L4-26: atomic delete via temp + mv.
+        local _tmp
+        _tmp=$(mktemp "${GB_CLUSTER_CONF}.XXXXXX") || _tmp="${GB_CLUSTER_CONF}.tmp"
+        awk -v ip="$ip" '!($0 ~ "^"ip":")' "$GB_CLUSTER_CONF" > "$_tmp" \
+            && mv "$_tmp" "$GB_CLUSTER_CONF"
+        gb_ok "Disconnected feeder $ip"
+    else
+        echo "[GreenBoost] ERROR: feeder $ip is not in the cluster configuration (${GB_CLUSTER_CONF})" >&2
+        echo "[GreenBoost] Run 'greenboost cluster' to list currently connected feeders." >&2
+        exit 1
+    fi
+    _gb_write_cluster_extra_mem
+}
+
+# _gb_update_all_feeders - push new daemon + script to every feeder in cluster.conf.
+# Called automatically at the end of cmd_install / cmd_full_install.
+# Completely unattended: uses SSH key auth (BatchMode); skips feeders that are
+# unreachable or missing key auth with a warning instead of aborting.
+_gb_update_all_feeders() {
+    [[ ! -f "$GB_CLUSTER_CONF" ]] && return 0
+    local _has_feeders=0
+    while IFS= read -r _line; do
+        [[ -z "$_line" || "$_line" == \#* ]] && continue
+        _has_feeders=1; break
+    done < "$GB_CLUSTER_CONF"
+    (( _has_feeders == 0 )) && return 0
+
+    local _netd_bin="$MODULE_DIR/greenboost-netd"
+    local _setup_sh="$MODULE_DIR/greenboost_setup.sh"
+    local _build_info="$MODULE_DIR/build_info"
+
+    if [[ ! -f "$_netd_bin" ]]; then
+        warn "Feeder update skipped - greenboost-netd binary not found (run: make netd)"
+        return 0
+    fi
+
+    # SSH/SCP must run as the invoking user, not root - root has no feeder keys
+    local _ssh_as=()
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+        _ssh_as=(runuser -u "$SUDO_USER" --)
+    fi
+
+    info "Pushing update to connected feeders..."
+
+    while IFS= read -r _line; do
+        [[ -z "$_line" || "$_line" == \#* ]] && continue
+
+        # Parse: IP:PORT hostname [ssh_user]
+        local _addr _hostname _ssh_user
+        _addr=$(echo "$_line" | awk '{print $1}')
+        _hostname=$(echo "$_line" | awk '{print $2}')
+        _ssh_user=$(echo "$_line" | awk '{print $3}')
+        _ssh_user="${_ssh_user:-root}"
+
+        local _ip _port
+        _ip="${_addr%%:*}"
+        _port="${_addr##*:}"
+        [[ "$_port" == "$_ip" ]] && _port="$GB_NET_PORT"
+
+        # Audit F-L4-19: _port is expanded into the remote heredoc;
+        # validate it is a numeric port before use.
+        if [[ ! "$_port" =~ ^[0-9]{1,5}$ ]] || (( _port < 1 || _port > 65535 )); then
+            printf "  %-20s %b\n" "${_hostname:-$_ip}" "${C_RED}✗  invalid port '${_port}' - skipping${C_RESET}" >&2
+            continue
+        fi
+
+        printf "  %-20s %s@%s  " "${_hostname:-$_ip}" "$_ssh_user" "$_ip"
+
+        # PR-J/F-L4-02: pin host key via $GB_KNOWN_HOSTS through _gb_ssh_opts
+        # (the four call sites below were the highest-value security gap - root
+        # binary transfer + remote root install - and now no longer accept
+        # arbitrary new host keys mid-upgrade).
+        local _ssh_keyopts
+        _ssh_keyopts=$(_gb_ssh_opts "$_ip")
+
+        # Test SSH key auth before attempting transfer
+        if ! "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 $_ssh_keyopts \
+                "${_ssh_user}@${_ip}" true 2>/dev/null; then
+            printf '%b\n' "${C_AMBER}⚠  SSH key auth failed - run: ssh-copy-id ${_ssh_user}@${_ip}${C_RESET}"
+            continue
+        fi
+
+        # SCP files to feeder
+        local _tmp_files=("$_netd_bin" "$_setup_sh")
+        [[ -f "$_build_info" ]] && _tmp_files+=("$_build_info")
+
+        if ! "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=10 $_ssh_keyopts \
+                "${_ssh_user}@${_ip}" "mkdir -p /tmp/gb_update" 2>/dev/null; then
+            printf '%b\n' "${C_RED}✗  mkdir on feeder failed${C_RESET}"
+            continue
+        fi
+
+        if ! "${_ssh_as[@]}" scp -o BatchMode=yes -o ConnectTimeout=10 $_ssh_keyopts \
+                -q "${_tmp_files[@]}" "${_ssh_user}@${_ip}:/tmp/gb_update/" 2>/dev/null; then
+            printf '%b\n' "${C_RED}✗  SCP failed (unreachable or permission denied)${C_RESET}"
+            continue
+        fi
+
+        # Remote silent install
+        local _rc=0
+        "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=30 $_ssh_keyopts \
+            "${_ssh_user}@${_ip}" "bash -s" 2>/dev/null << REMOTE_INSTALL || _rc=$?
+set -e
+NETD=/tmp/gb_update/greenboost-netd
+SETUP=/tmp/gb_update/greenboost_setup.sh
+
+# Stop running feeder daemon
+systemctl stop greenboost-netd 2>/dev/null || true
+pkill -x greenboost-netd 2>/dev/null || true
+sleep 1
+
+# Install new binaries
+chmod +x "\$NETD" "\$SETUP"
+cp "\$NETD"  /usr/local/bin/greenboost-netd
+cp "\$SETUP" /usr/local/bin/greenboost
+chmod +x /usr/local/bin/greenboost-netd /usr/local/bin/greenboost
+
+# Propagate build_info
+mkdir -p /etc/greenboost
+[ -f /tmp/gb_update/build_info ] && cp /tmp/gb_update/build_info /etc/greenboost/build_info
+
+# Restart feeder daemon (unattended)
+mkdir -p /run/greenboost /var/log/greenboost
+nohup /usr/local/bin/greenboost-netd -d -p ${_port} \
+    >>/var/log/greenboost/netd.log 2>&1 &
+echo \$! > /run/greenboost/greenboost-netd.pid
+
+rm -rf /tmp/gb_update
+REMOTE_INSTALL
+
+        if (( _rc == 0 )); then
+            printf '%b\n' "${C_LIME}✓  updated + restarted${C_RESET}"
+        else
+            printf '%b\n' "${C_RED}✗  remote install script failed (rc=${_rc})${C_RESET}"
+        fi
+
+    done < "$GB_CLUSTER_CONF"
+}
+
+cmd_update_feeders() {
+    need_root "update-feeders"
+    if [[ ! -f "$GB_CLUSTER_CONF" ]]; then
+        die "No feeders configured - run: greenboost connect <IP>"
+    fi
+
+    # Ensure the netd binary is up to date before pushing
+    local _netd_bin="$MODULE_DIR/greenboost-netd"
+    if [[ ! -f "$_netd_bin" ]]; then
+        info "Building greenboost-netd..."
+        make -C "$MODULE_DIR" netd 2>&1 | tail -5 || die "Build failed - run: make netd"
+    fi
+
+    _gb_update_all_feeders
+
+    info "Done. Verify with: greenboost cluster"
+}
+
+# cmd_feeders_setup_sudo - configure passwordless sudo for GreenBoost on all feeders.
+# Runs interactively (prompts for feeder sudo password once per feeder).
+# Usage: sudo greenboost feeders setup-sudo
+cmd_feeders_setup_sudo() {
+    need_root "feeders setup-sudo"
+    if [[ ! -f "$GB_CLUSTER_CONF" ]] || ! grep -q '[^[:space:]]' "$GB_CLUSTER_CONF" 2>/dev/null; then
+        die "No feeders configured - run: sudo greenboost connect <IP>"
+    fi
+
+    local _ssh_as=()
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+        _ssh_as=(runuser -u "$SUDO_USER" --)
+    fi
+
+    gb_section "GreenBoost Feeder sudo Setup"
+
+    while IFS= read -r _line; do
+        [[ -z "$_line" || "$_line" == \#* ]] && continue
+        local _addr _hostname _ssh_user
+        _addr=$(echo "$_line" | awk '{print $1}')
+        _hostname=$(echo "$_line" | awk '{print $2}')
+        _ssh_user=$(echo "$_line" | awk '{print $3}')
+        _ssh_user="${_ssh_user:-root}"
+        # Audit F-L4-18: reject usernames that could inject content into the sudoers
+        # file via the unquoted shell interpolation at the SSH command below.
+        if [[ ! "$_ssh_user" =~ ^[a-zA-Z_][a-zA-Z0-9._-]{0,31}$ ]]; then
+            printf "    %b\n" "${C_RED}✗  invalid feeder username '${_ssh_user}' - skipping${C_RESET}" >&2
+            continue
+        fi
+        local _ip="${_addr%%:*}"
+        printf "\n  ${C_VIOLET}%-22s${C_RESET} %s@%s\n" "${_hostname:-$_ip}" "$_ssh_user" "$_ip"
+
+        # Read password from /dev/tty so it works even when stdin is redirected by sudo
+        local _sudo_pass="" _char
+        printf "    Feeder sudo password: " > /dev/tty
+        while IFS= read -r -s -n1 _char < /dev/tty; do
+            case "$_char" in
+                '')            break ;;           # Enter
+                $'\x7f'|$'\b') if [[ -n "$_sudo_pass" ]]; then
+                                   _sudo_pass="${_sudo_pass%?}"; printf '\b \b' > /dev/tty
+                               fi ;;              # Backspace / DEL
+                *)             _sudo_pass+="$_char"; printf '*' > /dev/tty ;;
+            esac
+        done
+        printf '\n' > /dev/tty
+
+        # sudo -S reads the password from stdin - no TTY or PTY needed
+        local _setup_rc=0
+        "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=30 \
+            -o StrictHostKeyChecking=no "${_ssh_user}@${_ip}" \
+            "sudo -S sh -c 'echo \"${_ssh_user} ALL=(root) NOPASSWD: /bin/bash\" > /etc/sudoers.d/greenboost && chmod 440 /etc/sudoers.d/greenboost && echo SUDOERS_OK' 2>/dev/null" \
+            <<< "$_sudo_pass" | grep -q "SUDOERS_OK" || _setup_rc=$?
+        if (( _setup_rc == 0 )); then
+            printf "    %b\n" "${C_LIME}✓  sudo configured - upgrade-greenboost will now work${C_RESET}"
+        else
+            printf "    %b\n" "${C_RED}✗  sudo setup failed (rc=${_setup_rc})${C_RESET}"
+        fi
+    done < "$GB_CLUSTER_CONF"
+}
+
+# cmd_feeders_diag - run T1/T2/T3 and compute diagnostic against feeder.
+# Usage: greenboost feeders diag [t1|t2|t3|compute|all]
+cmd_feeders_diag() {
+    local _sub="${1:-all}"
+    local _diag_script="$MODULE_DIR/gb_feeder_diag.py"
+    if [[ ! -f "$_diag_script" ]]; then
+        die "Diagnostic script not found: $_diag_script"
+    fi
+    # Audit F-L4-12: timeout + exit-code check so a hung feeder doesn't block
+    # indefinitely and failures are surfaced rather than silently swallowed.
+    local _rc=0
+    timeout 120 python3 "$_diag_script" "$_sub" || _rc=$?
+    [[ $_rc -eq 124 ]] && die "Diagnostic timed out after 120s - feeder may be unresponsive"
+    [[ $_rc -ne 0  ]] && die "Diagnostic script failed (rc=${_rc}) - see output above"
+    return 0
+}
+
+# PR-WW: cmd_stability_monitor - long-running invariant watcher.
+# Polls shim_stats / metrics.json and flags monotone-counter regressions,
+# tier-gauge leaks (gauge stuck high long after phase left INFERENCE), and
+# fragmentation drift.  Wraps the Python implementation.
+# Usage: greenboost stability [--interval N] [--duration N] [--strict] [--json] [--log PATH]
+cmd_stability_monitor() {
+    local _script="$MODULE_DIR/gb_stability_monitor.py"
+    if [[ ! -f "$_script" ]]; then
+        die "Stability monitor script not found: $_script"
+    fi
+    # Pass through args; default to 30 s interval, forever.
+    exec python3 "$_script" "$@"
+}
+
+# cmd_feeders_upgrade_greenboost - full GreenBoost push to all feeders.
+# Pushes: greenboost-netd, greenboost_setup.sh, libgreenboost_cuda.so, build_info.
+# Restarts greenboost-netd on each feeder after install.
+# Usage: sudo greenboost feeders upgrade-greenboost
+cmd_feeders_upgrade_greenboost() {
+    need_root "feeders upgrade-greenboost"
+    if [[ ! -f "$GB_CLUSTER_CONF" ]] || ! grep -q '[^[:space:]]' "$GB_CLUSTER_CONF" 2>/dev/null; then
+        die "No feeders configured - run: sudo greenboost connect <IP>"
+    fi
+
+    local _netd_bin="$MODULE_DIR/greenboost-netd"
+    local _setup_sh="$MODULE_DIR/greenboost_setup.sh"
+    local _shim_lib="$SHIM_DEST/$SHIM_LIB"
+    local _build_info="$MODULE_DIR/build_info"
+    [[ ! -f "$_build_info" ]] && _build_info="/etc/greenboost/build_info"
+
+    if [[ ! -f "$_netd_bin" ]]; then
+        info "greenboost-netd not found - building..."
+        make -C "$MODULE_DIR" netd 2>&1 | tail -5 || die "Build failed - run: make netd"
+    fi
+
+    local _ssh_as=()
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+        _ssh_as=(runuser -u "$SUDO_USER" --)
+    fi
+
+    local _local_stamp=""
+    [[ -f "$_build_info" ]] && _local_stamp=$(grep BUILD_ID "$_build_info" 2>/dev/null | cut -d= -f2)
+    gb_section "GreenBoost Feeder Upgrade  (local stamp: ${_local_stamp:-unknown})"
+
+    local _ok=0 _fail=0
+
+    while IFS= read -r _line; do
+        [[ -z "$_line" || "$_line" == \#* ]] && continue
+
+        local _addr _hostname _ssh_user
+        _addr=$(echo "$_line" | awk '{print $1}')
+        _hostname=$(echo "$_line" | awk '{print $2}')
+        _ssh_user=$(echo "$_line" | awk '{print $3}')
+        _ssh_user="${_ssh_user:-root}"
+
+        local _ip _port
+        _ip="${_addr%%:*}"
+        _port="${_addr##*:}"
+        [[ "$_port" == "$_ip" ]] && _port="$GB_NET_PORT"
+
+        # Audit F-L4-19: _port is interpolated into the SSH command string;
+        # validate it is numeric before use to prevent remote shell injection
+        # from a tampered cluster.conf.
+        if [[ ! "$_port" =~ ^[0-9]{1,5}$ ]] || (( _port < 1 || _port > 65535 )); then
+            printf "    %b\n" "${C_RED}✗  invalid port '${_port}' in cluster.conf - skipping${C_RESET}" >&2
+            _fail=$(( _fail + 1 ))
+            continue
+        fi
+
+        printf "\n  ${C_VIOLET}%-22s${C_RESET} %s@%s\n" "${_hostname:-$_ip}" "$_ssh_user" "$_ip"
+
+        # Check SSH key auth
+        if ! "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 \
+                -o StrictHostKeyChecking=no "${_ssh_user}@${_ip}" true 2>/dev/null; then
+            printf "    %b\n" "${C_AMBER}⚠  SSH key auth failed - run: ssh-copy-id ${_ssh_user}@${_ip}${C_RESET}"
+            _fail=$(( _fail + 1 ))
+            continue
+        fi
+
+        # Check passwordless sudo using the same binary the install script will use
+        if ! "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 \
+                -o StrictHostKeyChecking=no "${_ssh_user}@${_ip}" \
+                "sudo -n bash -c 'true'" 2>/dev/null; then
+            printf "    %b\n" "${C_RED}✗  No passwordless sudo on feeder${C_RESET}"
+            printf "    %b\n" "${C_AMBER}   Run: sudo greenboost feeders setup-sudo${C_RESET}"
+            _fail=$(( _fail + 1 ))
+            continue
+        fi
+
+        # Show feeder's current stamp before upgrade
+        local _remote_stamp
+        _remote_stamp=$("${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 \
+            -o StrictHostKeyChecking=no "${_ssh_user}@${_ip}" \
+            "grep BUILD_ID /etc/greenboost/build_info 2>/dev/null | cut -d= -f2 || echo '?'" 2>/dev/null)
+        printf "    ${C_DIM}feeder stamp: %-12s → %s${C_RESET}\n" "${_remote_stamp:-?}" "${_local_stamp:-?}"
+
+        # Create staging dir on feeder
+        if ! "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=10 \
+                -o StrictHostKeyChecking=no "${_ssh_user}@${_ip}" \
+                "mkdir -p /tmp/gb_update" 2>/dev/null; then
+            printf "    %b\n" "${C_RED}✗  mkdir on feeder failed${C_RESET}"
+            _fail=$(( _fail + 1 ))
+            continue
+        fi
+
+        # Build file list to transfer
+        local _files=("$_netd_bin" "$_setup_sh")
+        [[ -f "$_shim_lib" ]] && _files+=("$_shim_lib")
+        [[ -f "$_build_info" ]] && _files+=("$_build_info")
+
+        printf "    Pushing %d file(s)... " "${#_files[@]}"
+        if ! "${_ssh_as[@]}" scp -o BatchMode=yes -o ConnectTimeout=30 \
+                -o StrictHostKeyChecking=no -q \
+                "${_files[@]}" "${_ssh_user}@${_ip}:/tmp/gb_update/" 2>/dev/null; then
+            printf '%b\n' "${C_RED}✗  SCP failed${C_RESET}"
+            _fail=$(( _fail + 1 ))
+            continue
+        fi
+        printf '%b\n' "${C_LIME}ok${C_RESET}"
+
+        # Remote install script
+        printf "    Installing on feeder... "
+        local _rc=0
+        local _err_tmp; _err_tmp=$(mktemp /tmp/gb_install_err.XXXXXX)
+        "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=60 \
+            -o StrictHostKeyChecking=no "${_ssh_user}@${_ip}" \
+            "sudo -n bash -s -- $_port" 2>"$_err_tmp" << 'REMOTE_SCRIPT' || _rc=$?
+set -e
+PORT="${1:-9740}"
+NETD=/tmp/gb_update/greenboost-netd
+SETUP=/tmp/gb_update/greenboost_setup.sh
+SHIM=/tmp/gb_update/libgreenboost_cuda.so
+BI=/tmp/gb_update/build_info
+
+# Stop old daemon - SIGTERM first, then SIGKILL to guarantee no ETXTBSY on cp
+systemctl stop greenboost-netd 2>/dev/null || true
+pkill -x    greenboost-netd 2>/dev/null || true
+sleep 1
+pkill -9 -x greenboost-netd 2>/dev/null || true
+sleep 1
+
+# Install binaries - 'install' writes to a temp then renames atomically,
+# avoiding ETXTBSY even if a stale copy is still mapped in memory
+install -m 755 "$NETD"  /usr/local/bin/greenboost-netd
+install -m 755 "$SETUP" /usr/local/bin/greenboost_setup.sh
+
+# Install CUDA shim if provided
+if [[ -f "$SHIM" ]]; then
+    mkdir -p /usr/local/lib
+    install -m 755 "$SHIM" /usr/local/lib/libgreenboost_cuda.so
+    ldconfig 2>/dev/null || true
+fi
+
+# Install build stamp
+mkdir -p /etc/greenboost
+[[ -f "$BI" ]] && cp "$BI" /etc/greenboost/build_info
+
+# Restart feeder daemon
+mkdir -p /run/greenboost /var/log/greenboost
+# Remove stale PID file so we can detect when the daemon writes a fresh one
+# PID file path matches GB_NETD_PID_FILE in features/net_fabric.h
+rm -f /run/greenboost/netd.pid
+nohup /usr/local/bin/greenboost-netd -d -p "$PORT" \
+    >>/var/log/greenboost/netd.log 2>&1 &
+# daemonize() runs before probe_gpus() (CUDA fork-safety).
+# The daemon writes its PID file after fork; poll for it instead of checking $!.
+_started=0
+for _i in $(seq 1 20); do
+    sleep 0.5
+    _pid=$(cat /run/greenboost/netd.pid 2>/dev/null)
+    if [[ -n "$_pid" ]] && kill -0 "$_pid" 2>/dev/null; then
+        _started=1; break
+    fi
+done
+if (( _started )); then
+    echo "STARTED"
+else
+    echo "FAILED_TO_START"
+    exit 1
+fi
+
+rm -rf /tmp/gb_update
+REMOTE_SCRIPT
+
+        if (( _rc == 0 )); then
+            printf '%b\n' "${C_LIME}✓  upgraded + daemon restarted${C_RESET}"
+            _ok=$(( _ok + 1 ))
+        else
+            local _errmsg; _errmsg=$(head -3 "$_err_tmp" 2>/dev/null)
+            printf '%b\n' "${C_RED}✗  remote install failed (rc=${_rc})${C_RESET}"
+            [[ -n "$_errmsg" ]] && printf "    %b\n" "${C_DIM}${_errmsg}${C_RESET}"
+            _fail=$(( _fail + 1 ))
+        fi
+        rm -f "$_err_tmp"
+
+    done < "$GB_CLUSTER_CONF"
+
+    echo ""
+    if (( _ok > 0 && _fail == 0 )); then
+        gb_ok "All ${_ok} feeder(s) upgraded successfully."
+    elif (( _ok > 0 )); then
+        gb_warn_ui "${_ok} upgraded, ${_fail} failed."
+    else
+        die "All feeder upgrades failed."
+    fi
+    gb_info "Verify with: greenboost cluster"
+    gb_info "Check stamp: greenboost built-stamp --feeders"
+}
+
+# cmd_built_stamp - print build stamp (local and/or feeders).
+# Usage: greenboost built-stamp [--feeders]
+cmd_built_stamp() {
+    local _show_feeders=0
+    for _a in "$@"; do [[ "$_a" == "--feeders" ]] && _show_feeders=1; done
+
+    local _bi=""
+    for _bic in "${MODULE_DIR}/build_info" ./build_info /etc/greenboost/build_info; do
+        [[ -f "$_bic" ]] && { _bi="$_bic"; break; }
+    done
+
+    gb_section "GreenBoost Build Stamp - $(hostname)"
+    if [[ -n "$_bi" ]]; then
+        local _id _ver _host _git _epoch _date=""
+        _id=$(grep BUILD_ID      "$_bi" 2>/dev/null | cut -d= -f2)
+        _ver=$(grep BUILD_VERSION "$_bi" 2>/dev/null | cut -d= -f2)
+        _host=$(grep BUILD_HOST  "$_bi" 2>/dev/null | cut -d= -f2)
+        _git=$(grep BUILD_GIT    "$_bi" 2>/dev/null | cut -d= -f2)
+        _epoch=$(grep BUILD_EPOCH "$_bi" 2>/dev/null | cut -d= -f2)
+        [[ -n "$_epoch" ]] && _date=$(date -d "@${_epoch}" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "${_epoch}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "")
+        printf "  ${C_DIM}%-14s${C_RESET} %b\n"  "ID"      "${C_LIME}${_id:-?}${C_RESET}"
+        printf "  ${C_DIM}%-14s${C_RESET} %b\n"  "Version" "${C_LIME}${_ver:-?}${C_RESET}"
+        printf "  ${C_DIM}%-14s${C_RESET} %b\n"  "Host"    "${C_GRAY}${_host:-?}${C_RESET}"
+        printf "  ${C_DIM}%-14s${C_RESET} %b\n"  "Git"     "${C_GRAY}${_git:-?}${C_RESET}"
+        printf "  ${C_DIM}%-14s${C_RESET} %b\n"  "Built"   "${C_GRAY}${_date:-${_epoch:-?}}${C_RESET}"
+    else
+        printf "  ${C_AMBER}⚠  No build_info found - run: sudo greenboost install${C_RESET}\n"
+    fi
+
+    (( _show_feeders == 0 )) && { echo ""; return 0; }
+
+    [[ ! -f "$GB_CLUSTER_CONF" ]] && { echo ""; return 0; }
+
+    local _ssh_as=()
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+        _ssh_as=(runuser -u "$SUDO_USER" --)
+    fi
+
+    while IFS= read -r _line; do
+        [[ -z "$_line" || "$_line" == \#* ]] && continue
+
+        local _addr _hostname _ssh_user
+        _addr=$(echo "$_line" | awk '{print $1}')
+        _hostname=$(echo "$_line" | awk '{print $2}')
+        _ssh_user=$(echo "$_line" | awk '{print $3}')
+        _ssh_user="${_ssh_user:-root}"
+
+        local _ip
+        _ip="${_addr%%:*}"
+
+        echo ""
+        gb_section "Feeder - ${_hostname:-$_ip}  (${_ssh_user}@${_ip})"
+
+        if ! "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 \
+                -o StrictHostKeyChecking=no "${_ssh_user}@${_ip}" true 2>/dev/null; then
+            printf "  %b\n" "${C_AMBER}⚠  SSH unreachable${C_RESET}"
+            continue
+        fi
+
+        local _remote_info
+        _remote_info=$("${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=10 \
+            -o StrictHostKeyChecking=no "${_ssh_user}@${_ip}" \
+            "cat /etc/greenboost/build_info 2>/dev/null || echo BUILD_ID=not-installed" 2>/dev/null)
+
+        if [[ -z "$_remote_info" ]]; then
+            printf "  %b\n" "${C_AMBER}⚠  Could not read build_info on feeder${C_RESET}"
+            continue
+        fi
+
+        local _rid _rver _rhost _rgit _repoch _rdate=""
+        _rid=$(echo "$_remote_info"   | grep BUILD_ID      | cut -d= -f2)
+        _rver=$(echo "$_remote_info"  | grep BUILD_VERSION | cut -d= -f2)
+        _rhost=$(echo "$_remote_info" | grep BUILD_HOST    | cut -d= -f2)
+        _rgit=$(echo "$_remote_info"  | grep BUILD_GIT     | cut -d= -f2)
+        _repoch=$(echo "$_remote_info" | grep BUILD_EPOCH  | cut -d= -f2)
+        [[ -n "$_repoch" ]] && _rdate=$(date -d "@${_repoch}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "")
+
+        local _match_col="${C_LIME}"
+        [[ -n "$_id" && "$_rid" != "$_id" ]] && _match_col="${C_AMBER}"
+
+        printf "  ${C_DIM}%-14s${C_RESET} %b\n"  "ID"      "${_match_col}${_rid:-?}${C_RESET}"
+        printf "  ${C_DIM}%-14s${C_RESET} %b\n"  "Version" "${C_GRAY}${_rver:-?}${C_RESET}"
+        printf "  ${C_DIM}%-14s${C_RESET} %b\n"  "Host"    "${C_GRAY}${_rhost:-?}${C_RESET}"
+        printf "  ${C_DIM}%-14s${C_RESET} %b\n"  "Git"     "${C_GRAY}${_rgit:-?}${C_RESET}"
+        printf "  ${C_DIM}%-14s${C_RESET} %b\n"  "Built"   "${C_GRAY}${_rdate:-${_repoch:-?}}${C_RESET}"
+
+        [[ -n "$_id" && "$_rid" != "$_id" ]] && \
+            printf "  %b\n" "${C_AMBER}⚠  Stamp mismatch - run: sudo greenboost feeders upgrade-greenboost${C_RESET}"
+
+    done < "$GB_CLUSTER_CONF"
+
+    echo ""
+}
+
+
+_cmd_cluster_snapshot() {
+    local _ts; _ts=$(date '+%Y-%m-%dT%H:%M')
+
+    gb_section "GreenBoost Cluster Status  (${_ts})"
+
+    printf "  ${C_BOLD}%-8s %-16s %-23s %-9s %-9s %-9s %-9s %-9s %-16s${C_RESET}\n" \
+           "ROLE" "HOST" "GPU" "T1 VRAM" "T2 DDR" "T3 NVMe" "HEALTH" "BW" "STATUS"
+    echo -e "  ${C_DIM}$(printf '─%.0s' $(seq 1 115))${C_RESET}"
+
+    # N5: read per-feeder BW and health from shim metrics JSON
+    declare -A _fdr_bw _fdr_health
+    local _metrics_json="/run/greenboost/metrics.json"
+    if [[ -f "$_metrics_json" ]] && command -v python3 &>/dev/null; then
+        while IFS='|' read -r _fip _fbw _fhealth; do
+            _fdr_bw["$_fip"]="$_fbw"
+            _fdr_health["$_fip"]="$_fhealth"
+        done < <(python3 -c "
+import json
+try:
+    d=json.load(open('$_metrics_json'))
+    for f in d.get('feeders',[]):
+        ip=f.get('feeder','?')  # feeder key is the IP address
+        print(ip+'|'+str(f.get('bw_measured_mbs',0))+'|'+str(f.get('health_state',0)))
+except: pass
+" 2>/dev/null)
+    fi
+
+    # Read shim stats for per-tier health badges (D2/D3)
+    local _shim_stats="/run/greenboost/shim_stats"
+    local _t2_warn=0 _t2_frag=0
+    if [[ -f "$_shim_stats" ]]; then
+        _t2_warn=$(grep '^t2_above_warn=' "$_shim_stats" 2>/dev/null | cut -d= -f2 || echo 0)
+        _t2_frag=$(grep '^t2_pool_frag_pct=' "$_shim_stats" 2>/dev/null | cut -d= -f2 || echo 0)
+    fi
+
+    # Local GPU info
+    local local_gpu="(unknown)"
+    local local_vram=0 local_temp="" local_power="" local_throttle=""
+    if command -v nvidia-smi &>/dev/null; then
+        local_gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | xargs)
+        local_vram=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs)
+        local_vram=$(( (local_vram + 512) / 1024 ))
+        local _tmp _pwr _clk
+        _tmp=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs || echo "")
+        _pwr=$(nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs || echo "")
+        _clk=$(nvidia-smi --query-gpu=clocks_throttle_reasons.active --format=csv,noheader 2>/dev/null | head -1 | xargs || echo "")
+        [[ -n "$_tmp" && "$_tmp" =~ ^[0-9]+$ ]] && local_temp="${_tmp}°C"
+        [[ -n "$_pwr" && "$_pwr" =~ ^[0-9] ]] && local_power="${_pwr%.*}W"
+        [[ "$_clk" != "Not Active" && -n "$_clk" ]] && local_throttle=" ${C_RED}[T]${C_RESET}"
+    fi
+    local_gpu=$(_trunc "$local_gpu" 22)
+
+    # Local T2: total system RAM
+    local local_t2=0
+    if [[ -f /proc/meminfo ]]; then
+        local _memkb; _memkb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+        local_t2=$(( _memkb / 1048576 ))
+    fi
+
+    # Local T3: prefer GreenBoost kernel module pool size; fall back to /proc/swaps.
+    local local_t3=0
+    local _gb_nvme_pool
+    _gb_nvme_pool=$(cat /sys/module/greenboost/parameters/nvme_pool_gb 2>/dev/null || echo 0)
+    if [[ "$_gb_nvme_pool" =~ ^[0-9]+$ && $_gb_nvme_pool -gt 0 ]]; then
+        local_t3=$_gb_nvme_pool
+    elif [[ -f /proc/swaps ]]; then
+        local _swkb=0
+        while read -r _sf _st _ssz _sus _spri; do
+            [[ "$_sf" == Filename ]] && continue
+            [[ "$_ssz" =~ ^[0-9]+$ ]] && _swkb=$(( _swkb + _ssz ))
+        done < /proc/swaps
+        local_t3=$(( _swkb / 1048576 ))
+    fi
+
+    # D4: T2 warn/fragmentation badges
+    local _t2_badge=""
+    [[ "$_t2_warn" == "1" ]] && _t2_badge+=" ${C_AMBER}[T2>75%]${C_RESET}"
+    [[ "$_t2_frag" =~ ^[0-9]+$ && $_t2_frag -gt 80 ]] && _t2_badge+=" ${C_AMBER}[FRAG]${C_RESET}"
+
+    local _local_status="active${local_throttle}${_t2_badge}"
+    local _local_info=""
+    [[ -n "$local_temp" ]] && _local_info+=" ${local_temp}"
+    [[ -n "$local_power" ]] && _local_info+=" ${local_power}"
+
+    printf "  ${C_CYAN}%-8s${C_RESET} ${C_GRAY}%-16s${C_RESET} ${C_GRAY}%-23s${C_RESET} ${C_LIME}%5s GB${C_RESET}  ${C_AMBER}%5s GB${C_RESET}  ${C_GRAY}%5s GB${C_RESET}  ${C_LIME}%-9s${C_RESET} ${C_DIM}%-9s${C_RESET} ${C_LIME}%-10s${C_RESET}%s\n" \
+           "host" "$(_trunc "$(hostname -s)" 16)" "$local_gpu" "$local_vram" "$local_t2" "$local_t3" "HEALTHY" "local" "active" "$_local_info"
+
+    # Remote feeders from cluster.conf
+    local total_gpus=1 total_t1=$local_vram total_t2=$local_t2 total_t3=$local_t3
+    if [[ -f "$GB_CLUSTER_CONF" ]]; then
+        while IFS= read -r line; do
+            [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+            local addr nickname
+            addr=$(echo "$line" | awk '{print $1}')
+            nickname=$(echo "$line" | awk '{print $2}')
+            local ip port
+            ip=$(echo "$addr" | cut -d: -f1)
+            port=$(echo "$addr" | cut -d: -f2)
+            [[ -z "$port" ]] && port=$GB_NET_PORT
+
+            local probe_out
+            probe_out=$(_gb_net_handshake "$ip" "$port" 2>/dev/null)
+            local fstatus="offline"
+            local fgpu="-" fvram="-" fddr="-" fnvme="-"
+
+            # N5: look up BW and health from metrics JSON
+            local _fhealth_num="${_fdr_health[$ip]:-}"
+            local _fhealth_str="-"
+            case "$_fhealth_num" in
+                0) _fhealth_str="HEALTHY"  ;;
+                1) _fhealth_str="DEGRAD"   ;;
+                2) _fhealth_str="UNHLTHY"  ;;
+                3) _fhealth_str="QUAR"     ;;
+                4) _fhealth_str="DISAB"    ;;
+            esac
+            local _fbw_num="${_fdr_bw[$ip]:-0}"
+            local _fbw_str="-"
+            [[ "$_fbw_num" =~ ^[0-9]+$ && $_fbw_num -gt 0 ]] && _fbw_str="${_fbw_num} MiB/s"
+
+            if echo "$probe_out" | grep -q "^OK:"; then
+                fstatus="connected"
+                local _ft2_done=0 _ft3_done=0
+                local _feeder_t2=0 _feeder_t3=0
+                # D2: check feeder throttle/temp via SSH (best-effort, skips if SSH unavailable)
+                local _feeder_throttle="" _feeder_temp="" _feeder_ecc=""
+                local _fsmi
+                _fsmi=$(ssh -o ConnectTimeout=2 -o BatchMode=yes "${GB_SSH_USER:-${SUDO_USER:-$USER}}@${ip}" \
+                    "nvidia-smi --query-gpu=temperature.gpu,clocks_throttle_reasons.active,ecc.errors.uncorrected.aggregate.total --format=csv,noheader,nounits 2>/dev/null | head -1" 2>/dev/null || echo "")
+                if [[ -n "$_fsmi" ]]; then
+                    IFS=',' read -r _ftemp _fthrottle _fecc <<< "$_fsmi"
+                    _ftemp=$(echo "$_ftemp" | xargs)
+                    _fthrottle=$(echo "$_fthrottle" | xargs)
+                    _fecc=$(echo "$_fecc" | xargs)
+                    [[ "$_ftemp" =~ ^[0-9]+$ ]] && _feeder_temp=" ${_ftemp}°C"
+                    [[ "$_fthrottle" != "Not Active" && -n "$_fthrottle" ]] && _feeder_throttle=" ${C_RED}[T]${C_RESET}"
+                    [[ "$_fecc" =~ ^[1-9] ]] && _feeder_ecc=" ${C_RED}[ECC!]${C_RESET}"
+                fi
+                while IFS= read -r gl; do
+                    if [[ "$gl" == GPU:* ]]; then
+                        fgpu=$(_trunc "$(echo "$gl" | cut -d: -f3)" 22)
+                        local fv; fv=$(echo "$gl" | cut -d: -f4)
+                        fvram=$(( (fv + 536870912) / 1073741824 ))
+                        if (( _ft2_done == 0 )); then
+                            local ft2r; ft2r=$(echo "$gl" | cut -d: -f6)
+                            [[ "$ft2r" =~ ^[0-9]+$ && ft2r -gt 0 ]] && _feeder_t2=$(( (ft2r + 536870912) / 1073741824 ))
+                            fddr="${_feeder_t2}"
+                            _ft2_done=1
+                        fi
+                        if (( _ft3_done == 0 )); then
+                            local ft3r; ft3r=$(echo "$gl" | cut -d: -f7)
+                            [[ "$ft3r" =~ ^[0-9]+$ && ft3r -gt 0 ]] && _feeder_t3=$(( (ft3r + 536870912) / 1073741824 ))
+                            fnvme="${_feeder_t3}"
+                            _ft3_done=1
+                        fi
+                        printf "  ${C_PURPLE}%-8s${C_RESET} ${C_GRAY}%-16s${C_RESET} ${C_GRAY}%-23s${C_RESET} ${C_LIME}%5s GB${C_RESET}  ${C_AMBER}%5s GB${C_RESET}  ${C_GRAY}%5s GB${C_RESET}  ${C_CYAN}%-9s${C_RESET} ${C_DIM}%-9s${C_RESET} ${C_LIME}%-10s${C_RESET}%s%s%s%s\n" \
+                               "feeder" "$(_trunc "${nickname:-$ip}" 16)" "$fgpu" "$fvram" "$fddr" "$fnvme" \
+                               "$_fhealth_str" "$_fbw_str" "$fstatus" \
+                               "$_feeder_throttle" "$_feeder_ecc" "$_feeder_temp"
+                        total_gpus=$((total_gpus + 1))
+                        total_t1=$((total_t1 + fvram))
+                    fi
+                done <<< "$probe_out"
+                total_t2=$((total_t2 + _feeder_t2))
+                total_t3=$((total_t3 + _feeder_t3))
+            else
+                printf "  ${C_PURPLE}%-8s${C_RESET} ${C_GRAY}%-16s${C_RESET} ${C_DIM}%-23s${C_RESET} ${C_DIM}%9s${C_RESET} ${C_DIM}%9s${C_RESET} ${C_DIM}%9s${C_RESET}  ${C_DIM}%-9s${C_RESET} ${C_DIM}%-9s${C_RESET} ${C_RED}%-10s${C_RESET}\n" \
+                       "feeder" "$(_trunc "${nickname:-$ip}" 16)" "-" "-" "-" "-" "-" "-" "offline"
+            fi
+        done < "$GB_CLUSTER_CONF"
+    fi
+
+    echo -e "  ${C_DIM}$(printf '─%.0s' $(seq 1 92))${C_RESET}"
+    local total_combined=$(( total_t1 + total_t2 + total_t3 ))
+    echo -e "  ${C_BOLD}Combined:${C_RESET} ${C_GRAY}${total_gpus} GPU(s)${C_RESET}   ${C_GRAY}T1:${C_LIME}${total_t1} GB${C_RESET}   ${C_GRAY}T2:${C_AMBER}${total_t2} GB${C_RESET}   ${C_GRAY}T3:${total_t3} GB${C_RESET}   ${C_GRAY}Total: ${C_BOLD}${total_combined} GB${C_RESET}"
+
+    # Build stamp summary - local + each feeder
+    local _local_bi=""
+    for _bic in "${MODULE_DIR}/build_info" /etc/greenboost/build_info; do
+        [[ -f "$_bic" ]] && { _local_bi="$_bic"; break; }
+    done
+    echo ""
+    echo -e "  ${C_DIM}Build stamps:${C_RESET}"
+    local _local_stamp_id _local_stamp_epoch _local_stamp_date
+    if [[ -n "$_local_bi" ]]; then
+        _local_stamp_id=$(grep BUILD_ID "$_local_bi" 2>/dev/null | cut -d= -f2)
+        _local_stamp_epoch=$(grep BUILD_EPOCH "$_local_bi" 2>/dev/null | cut -d= -f2)
+        _local_stamp_date=$(date -d "@${_local_stamp_epoch}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "${_local_stamp_epoch}")
+        printf "  ${C_CYAN}%-12s${C_RESET}  ${C_LIME}%s${C_RESET}  ${C_DIM}%s${C_RESET}\n" \
+            "$(hostname -s)" "${_local_stamp_id:-?}" "${_local_stamp_date}"
+    else
+        printf "  ${C_CYAN}%-12s${C_RESET}  ${C_DIM}no build_info${C_RESET}\n" "$(hostname -s)"
+    fi
+
+    if [[ -f "$GB_CLUSTER_CONF" ]]; then
+        while IFS= read -r _bline; do
+            [[ "$_bline" =~ ^#.*$ || -z "$_bline" ]] && continue
+            local _baddr _bnick _bssh
+            _baddr=$(echo "$_bline" | awk '{print $1}')
+            _bnick=$(echo "$_bline" | awk '{print $2}')
+            _bssh=$(echo "$_bline" | awk '{print $3}')
+            _bssh="${_bssh:-root}"
+            local _bip; _bip="${_baddr%%:*}"
+
+            local _rbi
+            _rbi=$(ssh -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=no \
+                "${_bssh}@${_bip}" \
+                "cat /etc/greenboost/build_info 2>/dev/null" 2>/dev/null)
+
+            local _rid _repoch _rdate
+            _rid=$(echo "$_rbi" | grep BUILD_ID | cut -d= -f2)
+            _repoch=$(echo "$_rbi" | grep BUILD_EPOCH | cut -d= -f2)
+            if [[ -n "$_repoch" ]]; then
+                _rdate=$(date -d "@${_repoch}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "${_repoch}")
+            else
+                _rdate="unreachable"
+            fi
+
+            local _stamp_col="${C_LIME}"
+            [[ -n "$_local_stamp_id" && "$_rid" != "$_local_stamp_id" ]] && _stamp_col="${C_AMBER}"
+
+            printf "  ${C_PURPLE}%-12s${C_RESET}  ${_stamp_col}%s${C_RESET}  ${C_DIM}%s${C_RESET}\n" \
+                "${_bnick:-$_bip}" "${_rid:-?}" "${_rdate}"
+
+        done < "$GB_CLUSTER_CONF"
+    fi
+    echo ""
+}
+
+cmd_cluster() {
+    local _llm_mode=0
+    for _a in "$@"; do [[ "$_a" == "--llm" ]] && _llm_mode=1; done
+    if (( _llm_mode )); then
+        local _strip='s/\x1b\[[0-9;]*[mKHJsu]//g'
+        _cmd_cluster_snapshot | sed "$_strip" | sed 's/^[[:space:]]*//' | grep -v '^─'
+        return
+    fi
 
     # Non-interactive: single snapshot, no prompts, no infinite loop
-    # Safe for use from scripts, pipes, and synapse CLI bash tool
     if [[ ! -t 0 ]]; then
-        _cmd_status_snapshot
+        _cmd_cluster_snapshot
         return
     fi
 
@@ -6381,17 +7834,15 @@ cmd_status() {
 
     # Enter alternate screen so terminal history is preserved; restore on exit
     printf '\033[?1049h'
-    trap 'stty "$_saved_stty" 2>/dev/null || true; printf "\033[?1049l"; exit 0' INT TERM EXIT
+    trap 'stty "${_saved_stty:-}"  2>/dev/null || true; printf "\033[?1049l"; exit 0' INT TERM EXIT
 
     while true; do
         local _t_start=$SECONDS
 
-        printf '\033[H'   # cursor home — no erase, no flash
-        echo -e "  ${C_DIM}Updating every 5s — ${C_GRAY}Ctrl+S${C_DIM}: refresh  ${C_GRAY}Ctrl+L${C_DIM}: log view  ${C_GRAY}Ctrl+C${C_DIM}: exit\033[K${C_RESET}"
-        echo ""
+        printf '\033[2J\033[H'  # clear entire screen then cursor home
+        echo -e "  ${C_DIM}Updating every 5s - ${C_GRAY}Ctrl+S${C_DIM}: refresh  ${C_GRAY}Ctrl+C${C_DIM}: exit${C_RESET}"
 
-        _cmd_status_snapshot
-        printf '\033[J'   # erase any trailing lines from a previous taller draw
+        _cmd_cluster_snapshot
 
         local _elapsed=$(( SECONDS - _t_start ))
         local _sleep=$(( 5 - _elapsed ))
@@ -6403,15 +7854,675 @@ cmd_status() {
         case "$_key" in
             $'\x13')  # Ctrl+S: immediate status refresh
                 ;;
-            $'\x0c')  # Ctrl+L: switch to log view (Ctrl+S inside to return)
-                _show_log_view "$GB_STATUS_LOG"
-                # Return to status: clear and restart the draw loop
-                printf '\033[H\033[J'
-                ;;
         esac
     done
 }
 
+_cmd_build_snapshot() {
+    local _bi=""
+    for _bic in "${MODULE_DIR}/build_info" ./build_info /etc/greenboost/build_info; do
+        [[ -f "$_bic" ]] && { _bi="$_bic"; break; }
+    done
+    local _build_id _build_ver _build_host _build_git _build_epoch _build_date
+    if [[ -n "$_bi" && -f "$_bi" ]]; then
+        _build_id=$(    grep '^BUILD_ID='      "$_bi" | cut -d= -f2-)
+        _build_ver=$(   grep '^BUILD_VERSION=' "$_bi" | cut -d= -f2-)
+        _build_host=$(  grep '^BUILD_HOST='    "$_bi" | cut -d= -f2-)
+        _build_git=$(   grep '^BUILD_GIT='     "$_bi" | cut -d= -f2-)
+        _build_epoch=$( grep '^BUILD_EPOCH='   "$_bi" | cut -d= -f2-)
+        if [[ -n "$_build_epoch" ]]; then
+            _build_date=$(date -d "@${_build_epoch}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+                          || date -r "$_build_epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+                          || echo "unknown")
+        else
+            _build_date="unknown"
+        fi
+    else
+        _build_id="-"; _build_ver="$GB_VERSION"; _build_host="-"
+        _build_git="-"; _build_date="-"
+    fi
+
+    # Count connected feeders
+    local _feeder_count=0
+    if [[ -f "$GB_CLUSTER_CONF" ]]; then
+        while IFS= read -r _l; do
+            [[ -z "$_l" || "$_l" == \#* ]] && continue
+            (( _feeder_count++ ))
+        done < "$GB_CLUSTER_CONF"
+    fi
+    local _feeders_str
+    if (( _feeder_count == 0 )); then
+        _feeders_str="${C_DIM}none connected${C_RESET}"
+    else
+        _feeders_str="${C_LIME}${_feeder_count} connected${C_RESET}  ${C_DIM}(greenboost cluster for details)${C_RESET}"
+    fi
+
+    local _ts; _ts=$(date '+%H:%M:%S')
+    local _w=54
+    local _div; printf -v _div '%*s' "$_w" ''; _div="${_div// /─}"
+
+    printf '%b\n' "${C_DIM}${_div}${C_RESET}  ${C_DIM}${_ts}${C_RESET}"
+    printf '%b\n' " ${C_BOLD}${C_CYAN}GreenBoost v${GB_VERSION}${C_RESET}${C_BOLD} - Build Information${C_RESET}"
+    echo ""
+    printf '  %-16s %b\n' "Build ID"    "${C_BOLD}${_build_id}${C_RESET}"
+    printf '  %-16s %s\n' "Version"     "${_build_ver}"
+    printf '  %-16s %s\n' "Git commit"  "${_build_git}"
+    printf '  %-16s %s\n' "Built on"    "${_build_host}"
+    printf '  %-16s %s\n' "Build time"  "${_build_date}"
+    echo ""
+    printf '%b\n' "  ${C_DIM}Binary paths${C_RESET}"
+    printf '  %-16s %s\n' "  Daemon"    "/usr/local/bin/greenboost-netd"
+    printf '  %-16s %s\n' "  CUDA shim" "/usr/local/lib/libgreenboost_cuda.so"
+    printf '  %-16s %s\n' "  CLI"       "/usr/local/bin/greenboost"
+    echo ""
+    printf '  %-16s %b\n' "Feeders"     "$_feeders_str"
+    printf '%b\n' "${C_DIM}${_div}${C_RESET}"
+
+    if [[ ! -f "$_bi" ]]; then
+        echo ""
+        printf '%b\n' "  ${C_AMBER}⚠  No build stamp found - run: sudo greenboost install${C_RESET}"
+    fi
+}
+
+cmd_build_info() {
+    local _llm_mode=0
+    for _a in "$@"; do [[ "$_a" == "--llm" ]] && _llm_mode=1; done
+    if (( _llm_mode )); then
+        local _bi=""
+        for _bic in "${MODULE_DIR}/build_info" ./build_info /etc/greenboost/build_info; do
+            [[ -f "$_bic" ]] && { _bi="$_bic"; break; }
+        done
+        if [[ -n "$_bi" ]]; then
+            cat "$_bi"
+        else
+            printf 'BUILD_ID=not-installed\nBUILD_VERSION=%s\n' "$GB_VERSION"
+        fi
+        return
+    fi
+
+    if [[ ! -t 0 ]]; then
+        _cmd_build_snapshot
+        return
+    fi
+
+    local _saved_stty
+    _saved_stty=$(stty -g 2>/dev/null || true)
+    stty -ixon 2>/dev/null || true
+
+    printf '\033[?1049h'
+    trap 'stty "${_saved_stty:-}"  2>/dev/null || true; printf "\033[?1049l"; exit 0' INT TERM EXIT
+
+    while true; do
+        local _t_start=$SECONDS
+        printf '\033[2J\033[H'
+        echo -e "  ${C_DIM}Updating every 5s - ${C_GRAY}Ctrl+S${C_DIM}: refresh  ${C_GRAY}Ctrl+C${C_DIM}: exit${C_RESET}"
+        _cmd_build_snapshot
+        local _elapsed=$(( SECONDS - _t_start ))
+        local _sleep=$(( 5 - _elapsed ))
+        (( _sleep < 1 )) && _sleep=1
+        local _key=""
+        read -t "$_sleep" -s -n 1 _key 2>/dev/null || true
+        case "$_key" in
+            $'\x13') ;;  # Ctrl+S: immediate refresh
+        esac
+    done
+}
+
+# ---- NVTX Event Log viewer -----------------------------------------
+
+_cmd_nvtx_logs_snapshot() {
+    local _ts; _ts=$(date '+%Y-%m-%dT%H:%M:%S')
+    local log_file="/run/greenboost/nvtx_events.log"
+    local log_old="/run/greenboost/nvtx_events.log.1"
+    local log_fallback="/tmp/greenboost_nvtx_events.log"
+    local log_fallback_old="/tmp/greenboost_nvtx_events.log.1"
+    local _tail="${1:-50}"
+    local _filter="${2:-}"
+    local _llm="${3:-0}"
+
+    # Prefer /run/greenboost; fall back to /tmp if the shim couldn't write there
+    local _using_fallback=0
+    if [[ ! -f "$log_file" ]] && [[ ! -f "$log_old" ]] && \
+       { [[ -f "$log_fallback" ]] || [[ -f "$log_fallback_old" ]]; }; then
+        log_file="$log_fallback"
+        log_old="$log_fallback_old"
+        _using_fallback=1
+    fi
+
+    local _sz="n/a"
+    if [[ -f "$log_file" ]]; then
+        _sz=$(du -sh "$log_file" 2>/dev/null | cut -f1)
+    fi
+
+    if [[ "$_llm" -eq 1 ]]; then
+        echo "# GreenBoost NVTX Event Log - ${_ts}"
+        echo "# log=${log_file} size=${_sz} tail=${_tail} filter=${_filter:-all}"
+        [[ "$_using_fallback" -eq 1 ]] && echo "# NOTE: using /tmp fallback - /run/greenboost not writable by ollama user"
+        echo "#"
+        if [[ -f "$log_file" ]]; then
+            if [[ -n "$_filter" ]]; then
+                grep -i "$_filter" "$log_file" 2>/dev/null | tail -n "$_tail"
+            else
+                tail -n "$_tail" "$log_file" 2>/dev/null
+            fi
+        else
+            echo "# no log file found"
+        fi
+        return
+    fi
+
+    local _W=120
+    local _div
+    _div=$(printf '─%.0s' $(seq 1 $_W))
+
+    echo ""
+    echo -e "  ${C_CYAN}${C_BOLD}GreenBoost NVTX Event Log${C_RESET}  ${C_DIM}${_ts}${C_RESET}"
+    if [[ "$_using_fallback" -eq 1 ]]; then
+        echo -e "  ${C_DIM}Log: ${log_file}  (${_sz})  ${C_RESET}\033[33m(fallback: /tmp - fix /run/greenboost perms)\033[0m   Showing last ${_tail} events"
+    else
+        echo -e "  ${C_DIM}Log: ${log_file}  (${_sz})   Showing last ${_tail} events${C_RESET}"
+    fi
+    [[ -n "$_filter" ]] && echo -e "  ${C_DIM}Filter: ${_filter}${C_RESET}"
+    echo ""
+    echo -e "  ${C_DIM}${_div}${C_RESET}"
+    printf "  ${C_BOLD}%-24s  %-22s  %-14s  %8s  %-18s  %s${C_RESET}\n" \
+        "TIMESTAMP(ms)" "EVENT_TYPE" "TIER" "SIZE" "PTR" "DETAIL"
+    echo -e "  ${C_DIM}${_div}${C_RESET}"
+
+    local _found=0
+    if [[ -f "$log_file" ]] || [[ -f "$log_old" ]]; then
+        _found=1
+        # Combine old + current, get last N lines, optional filter
+        local _src=""
+        [[ -f "$log_old"  ]] && _src="$log_old"
+        [[ -f "$log_file" ]] && _src="${_src:+$_src }${log_file}"
+        local _lines
+        if [[ -n "$_filter" ]]; then
+            _lines=$(cat $_src 2>/dev/null | grep -i "$_filter" | tail -n "$_tail")
+        else
+            _lines=$(cat $_src 2>/dev/null | tail -n "$_tail")
+        fi
+
+        while IFS= read -r _line; do
+            [[ -z "$_line" ]] && continue
+            local _ts_ms _etype _tier _sz_f _ptr _det
+            read -r _ts_ms _etype _tier _sz_f _ptr _det <<< "$_line"
+            local _color="${C_RESET}"
+            case "$_etype" in
+                # T1 GPU VRAM
+                ALLOC_T1_LOCAL|ALLOC_VMM_T1)   _color="\033[92m" ;;
+                OOM_T1_LOCAL)                   _color="\033[31m${C_BOLD}" ;;
+                # T2 DDR Path A (DMA-BUF pinned)
+                ALLOC_A_ZEROCOPY|ALLOC_A_POOL|ALLOC_A_PINNED) _color="${C_CYAN}" ;;
+                ALLOC_A_ZEROCOPY_FAIL)          _color="\033[38;5;208m" ;;
+                # T2 DDR VMM HOST (cuMemCreate pinned)
+                ALLOC_VMM_HOST)                 _color="\033[38;5;51m" ;;
+                # T2 DDR Path B (HostReg no-kernel)
+                ALLOC_B_HOSTREG)                _color="\033[38;5;214m" ;;
+                # T2 pool inner (sub-alloc from pre-reg slab)
+                ALLOC_T2_POOL)                  _color="\033[38;5;87m" ;;
+                # Feeder allocs
+                ALLOC_T1_FEEDER|ALLOC_T2_FEEDER) _color="${C_VIOLET}" ;;
+                # Free / release
+                FREE_A_ZEROCOPY|FREE_T2_PINNED|FREE*) _color="${C_DIM}" ;;
+                # Data movement - local T2 PCIe DMA
+                MEMCPY_H2D_T2|MEMCPY_D2H_T2)   _color="\033[34m" ;;
+                # Data movement - remote feeder network
+                MEMCPY_H2D_NET|MEMCPY_D2H_NET)  _color="\033[36m" ;;
+                # Phase transitions
+                PHASE_MODEL_LOAD)               _color="\033[38;5;208m" ;;
+                PHASE_INFERENCE|PHASE_STEADY)   _color="\033[35m" ;;
+                PHASE*)                         _color="\033[35m" ;;
+                # OOM - red bold
+                OOM*)                           _color="\033[31m${C_BOLD}" ;;
+                # Eviction, pressure
+                EVICT*|SWA_EVICT)               _color="\033[33m" ;;
+                MEM_PRESS*)                     _color="\033[31m" ;;
+                # Kernel feeder dispatch
+                KERNEL_FEEDER)                  _color="\033[32m" ;;
+                # GDS T3 I/O
+                GDS_WRITE_OK|GDS_READ_OK)       _color="\033[33m" ;;
+                GDS_WRITE_FAIL|GDS_READ_FAIL)   _color="\033[31m" ;;
+                # Init / misc
+                SHIM_INIT)                      _color="${C_DIM}" ;;
+            esac
+            printf "  ${_color}%-24s  %-22s  %-14s  %8s  %-18s  %s${C_RESET}\n" \
+                "$_ts_ms" "$_etype" "$_tier" "$_sz_f" "$_ptr" "$_det"
+        done <<< "$_lines"
+    fi
+
+    if [[ $_found -eq 0 ]]; then
+        echo -e "  ${C_DIM}  No NVTX log file found at ${log_file}${C_RESET}"
+        echo -e "  ${C_DIM}  (also checked ${log_fallback})${C_RESET}"
+        echo -e "  ${C_DIM}  Start Ollama with GreenBoost active to generate events.${C_RESET}"
+    fi
+
+    echo -e "  ${C_DIM}${_div}${C_RESET}"
+
+    # Diagnostic Summary - single awk pass over combined log
+    local _diag_src=""
+    [[ -f "$log_old"  ]] && _diag_src="$log_old"
+    [[ -f "$log_file" ]] && _diag_src="${_diag_src:+$_diag_src }$log_file"
+
+    if [[ -n "$_diag_src" ]]; then
+        local _W2=113
+        local _div2; _div2=$(printf '─%.0s' $(seq 1 $_W2))
+        echo ""
+        echo -e "  ${C_BOLD}Diagnostic Summary${C_RESET}"
+        echo -e "  ${C_DIM}${_div2}${C_RESET}"
+
+        # Single awk pass - emits tagged lines; no bashisms required in awk body
+        local _stats
+        _stats=$(cat $_diag_src 2>/dev/null | awk '
+        {
+            etype=$2; tier=$3; sz=$4
+            gsub(/MB$/,"",sz); sz+=0
+            if (etype ~ /^ALLOC/) {
+                alloc_cnt++
+                # Tier totals (skip non-memory tier labels)
+                if (tier !~ /^(SYSTEM|PHASE|ALL)$/) {
+                    tier_mb[tier]+=sz; tier_cnt[tier]++
+                    if (sz > tier_peak[tier]) tier_peak[tier]=sz
+                    if (sz > gpeak) { gpeak=sz; gpeak_tier=tier }
+                }
+                # Per-event-type alloc breakdown
+                ev_cnt[etype]++; ev_mb[etype]+=sz
+            }
+            if (etype ~ /^MEMCPY_H2D/) { h2d_cnt++; h2d_mb+=sz }
+            if (etype ~ /^MEMCPY_D2H/) { d2h_cnt++; d2h_mb+=sz }
+            if (etype ~ /^FREE/)        { free_cnt++; freed_mb+=sz }
+            if (etype ~ /^OOM/)         { oom_cnt++; oom_ev[etype]++ }
+            if (etype ~ /^EVICT|^SWA/)  { evict_cnt++; evict_mb+=sz }
+            if (etype ~ /^KERNEL/)        kern_cnt++
+            if (etype ~ /^MEM_PRESS/)     press_cnt++
+            if (etype ~ /^PHASE/)         last_phase=etype
+        }
+        END {
+            print "ALLOC_CNT " alloc_cnt+0
+            print "FREE_CNT  " free_cnt+0
+            print "OOM_CNT   " oom_cnt+0
+            print "H2D_CNT   " h2d_cnt+0
+            print "H2D_MB    " h2d_mb+0
+            print "D2H_CNT   " d2h_cnt+0
+            print "D2H_MB    " d2h_mb+0
+            print "EVICT_CNT " evict_cnt+0
+            print "EVICT_MB  " evict_mb+0
+            print "KERN_CNT  " kern_cnt+0
+            print "PRESS_CNT " press_cnt+0
+            print "LAST_PHASE " last_phase
+            print "GPEAK_MB  " gpeak+0
+            print "GPEAK_TIER " gpeak_tier
+            for (t in tier_mb)  printf "TIER %s %d %d %d\n", t, tier_mb[t], tier_cnt[t], tier_peak[t]
+            for (e in ev_cnt)   printf "EVTYPE %s %d %d\n",  e, ev_cnt[e], ev_mb[e]
+            for (o in oom_ev)   printf "OOMEV %s %d\n",      o, oom_ev[o]
+        }')
+
+        # Parse awk output into bash vars
+        local _alloc_cnt=0 _free_cnt=0 _oom_cnt=0
+        local _h2d_cnt=0 _h2d_mb=0 _d2h_cnt=0 _d2h_mb=0
+        local _evict_cnt=0 _evict_mb=0 _kern_cnt=0 _press_cnt=0
+        local _last_phase="" _gpeak_mb=0 _gpeak_tier=""
+        declare -A _tier_mb _tier_cnt _tier_peak _ev_cnt _ev_mb _oom_ev 2>/dev/null || true
+        while IFS= read -r _line; do
+            case "$_line" in
+                "ALLOC_CNT "*)   _alloc_cnt="${_line#ALLOC_CNT }" ;;
+                "FREE_CNT  "*)   _free_cnt="${_line#FREE_CNT  }" ;;
+                "OOM_CNT   "*)   _oom_cnt="${_line#OOM_CNT   }" ;;
+                "H2D_CNT   "*)   _h2d_cnt="${_line#H2D_CNT   }" ;;
+                "H2D_MB    "*)   _h2d_mb="${_line#H2D_MB    }" ;;
+                "D2H_CNT   "*)   _d2h_cnt="${_line#D2H_CNT   }" ;;
+                "D2H_MB    "*)   _d2h_mb="${_line#D2H_MB    }" ;;
+                "EVICT_CNT "*)   _evict_cnt="${_line#EVICT_CNT }" ;;
+                "EVICT_MB  "*)   _evict_mb="${_line#EVICT_MB  }" ;;
+                "KERN_CNT  "*)   _kern_cnt="${_line#KERN_CNT  }" ;;
+                "PRESS_CNT "*)   _press_cnt="${_line#PRESS_CNT }" ;;
+                "LAST_PHASE "*)  _last_phase="${_line#LAST_PHASE }" ;;
+                "GPEAK_MB  "*)   _gpeak_mb="${_line#GPEAK_MB  }" ;;
+                "GPEAK_TIER "*)  _gpeak_tier="${_line#GPEAK_TIER }" ;;
+                "TIER "*)
+                    read -r _ _t _tmb _tcnt _tpeak <<< "$_line"
+                    _tier_mb[$_t]=$_tmb; _tier_cnt[$_t]=$_tcnt; _tier_peak[$_t]=$_tpeak ;;
+                "EVTYPE "*)
+                    read -r _ _e _ecnt _emb <<< "$_line"
+                    _ev_cnt[$_e]=$_ecnt; _ev_mb[$_e]=$_emb ;;
+                "OOMEV "*)
+                    read -r _ _o _ocnt <<< "$_line"
+                    _oom_ev[$_o]=$_ocnt ;;
+            esac
+        done <<< "$_stats"
+
+        # ── Tier allocation rows (correct tier names from shim) ──────────────
+        # Order: local tiers first, then feeder, T3 last (warns on spillover)
+        local _tier_order=(T1_GPU T2_DDR T3_LOCAL T1_FEEDER T2_FEEDER T3_FEEDER)
+        local -A _tier_label=([T1_GPU]="T1 GPU VRAM  (local)" [T2_DDR]="T2 DDR       (local)"
+                             [T3_LOCAL]="T3 NVMe      (local)" [T1_FEEDER]="T1 GPU VRAM  (feeder)"
+                             [T2_FEEDER]="T2 DDR       (feeder)" [T3_FEEDER]="T3 NVMe      (feeder)")
+        local _any_tier=0
+        for _t in "${_tier_order[@]}"; do
+            [[ -z "${_tier_mb[$_t]+x}" ]] && continue
+            _any_tier=1
+            local _mb=${_tier_mb[$_t]} _cnt=${_tier_cnt[$_t]} _pk=${_tier_peak[$_t]}
+            local _icon="✓" _col="\033[92m"
+            [[ "$_t" == T2_DDR   ]] && _col="${C_CYAN}"
+            [[ "$_t" == T2_FEEDER ]] && _col="\033[36m"
+            [[ "$_t" == T3_LOCAL || "$_t" == T3_FEEDER ]] && _icon="⚠" _col="\033[33m"
+            [[ "$_t" == T1_FEEDER ]] && _col="\033[35m"
+            local _lbl="${_tier_label[$_t]:-$_t}"
+            printf "  ${_col}${_icon}${C_RESET}  %-24s  %6d MB  %4d alloc(s)  peak single: %4d MB\n" \
+                "$_lbl" "$_mb" "$_cnt" "$_pk"
+        done
+        # Catch any unexpected tier names
+        for _t in "${!_tier_mb[@]}"; do
+            case "$_t" in T1_GPU|T2_DDR|T3_LOCAL|T1_FEEDER|T2_FEEDER|T3_FEEDER) continue ;; esac
+            printf "  \033[36m?${C_RESET}  %-24s  %6d MB  %4d alloc(s)  peak single: %4d MB\n" \
+                "$_t" "${_tier_mb[$_t]}" "${_tier_cnt[$_t]}" "${_tier_peak[$_t]}"
+        done
+
+        # ── Per-path alloc breakdown (key insight into which path served the model) ─
+        echo ""
+        echo -e "  ${C_BOLD}Allocation paths${C_RESET}"
+        # Ordered from best to worst
+        local _path_order=(
+            ALLOC_VMM_T1      "VMM T1  device VRAM     (cuMemCreate native)"
+            ALLOC_A_ZEROCOPY  "Path A  zero-copy        (cudaImportExtMem)"
+            ALLOC_A_POOL      "Path A  pool sub-alloc   (pre-reg slab)"
+            ALLOC_A_PINNED    "Path A  pinned per-alloc (DMA-BUF+HostReg)"
+            ALLOC_VMM_HOST    "Path B  VMM host-pinned  (cuMemCreate HOST)"
+            ALLOC_B_HOSTREG   "Path B  HostReg no-kmod  (mmap+cuMemHostReg)"
+            ALLOC_T1_LOCAL    "T1 local (cudaMalloc)"
+            ALLOC_T2_POOL     "T2 pool  (inner sub-alloc from slab)"
+            ALLOC_T1_FEEDER   "T1 feeder VRAM"
+            ALLOC_T2_FEEDER   "T2 feeder DDR"
+        )
+        local _any_path=0
+        local _i=0
+        while (( _i < ${#_path_order[@]} )); do
+            local _ev="${_path_order[$_i]}"
+            local _lbl="${_path_order[$(( _i + 1 ))]}"
+            _i=$(( _i + 2 ))
+            [[ -z "${_ev_cnt[$_ev]+x}" ]] && continue
+            _any_path=1
+            local _ec=${_ev_cnt[$_ev]} _em=${_ev_mb[$_ev]}
+            local _pc="\033[92m"
+            [[ "$_ev" == ALLOC_A_* || "$_ev" == ALLOC_VMM_HOST ]] && _pc="${C_CYAN}"
+            [[ "$_ev" == ALLOC_B_* ]] && _pc="\033[38;5;214m"
+            [[ "$_ev" == ALLOC_T2_POOL ]] && _pc="\033[38;5;87m"
+            printf "  ${_pc}✓${C_RESET}  %-46s  %4d alloc(s)  %6d MB total\n" "$_lbl" "$_ec" "$_em"
+        done
+        [[ $_any_path -eq 0 ]] && echo -e "  ${C_DIM}  No allocation events recorded yet${C_RESET}"
+
+        # One-off: ALLOC_A_ZEROCOPY_FAIL - tells if zero-copy fell to pinned
+        if [[ -n "${_ev_cnt[ALLOC_A_ZEROCOPY_FAIL]+x}" ]]; then
+            printf "  \033[38;5;208m⚠${C_RESET}  Path A zero-copy fell to pinned sub-method:  %d time(s)\n" \
+                "${_ev_cnt[ALLOC_A_ZEROCOPY_FAIL]}"
+        fi
+
+        # ── Tensor data movement through T2 DDR (PCIe DMA path) ─────────────
+        if (( _h2d_cnt + _d2h_cnt > 0 )); then
+            echo ""
+            echo -e "  ${C_BOLD}Tensor data movement (T2 DDR ↔ GPU via PCIe)${C_RESET}"
+            (( _h2d_cnt > 0 )) && \
+                printf "  \033[34m→${C_RESET}  H2D (host→device):  %4d transfer(s)  %6d MB  (weights/KV loaded to GPU)\n" \
+                    "$_h2d_cnt" "$_h2d_mb"
+            (( _d2h_cnt > 0 )) && \
+                printf "  \033[34m←${C_RESET}  D2H (device→host):  %4d transfer(s)  %6d MB  (KV written back to T2)\n" \
+                    "$_d2h_cnt" "$_d2h_mb"
+        fi
+
+        # ── OOM breakdown ────────────────────────────────────────────────────
+        echo ""
+        if [[ "$_oom_cnt" -gt 0 ]]; then
+            printf "  \033[31m✗${C_RESET}  OOM events: %d total\n" "$_oom_cnt"
+            local _oom_labels=(
+                OOM_T2_CAP       "T2 pool capacity cap exceeded"
+                OOM_MEMAVAIL     "MemAvailable guard triggered"
+                OOM_VMM_HOST     "cuMemCreate HOST pinned failed"
+                OOM_PATH_B_FAIL  "Path B cuMemHostRegister failed"
+                OOM_FULL         "All tiers exhausted (smart_alloc)"
+                OOM_T1_LOCAL     "T1 VRAM OOM (cudaMalloc)"
+            )
+            local _oi=0
+            while (( _oi < ${#_oom_labels[@]} )); do
+                local _oe="${_oom_labels[$_oi]}" _ol="${_oom_labels[$(( _oi + 1 ))]}"
+                _oi=$(( _oi + 2 ))
+                [[ -z "${_oom_ev[$_oe]+x}" ]] && continue
+                printf "  \033[31m  ✗${C_RESET}  %-38s  %d time(s)\n" "$_ol" "${_oom_ev[$_oe]}"
+            done
+        else
+            echo -e "  \033[32m✓${C_RESET}  No OOM events"
+        fi
+
+        # ── Eviction / pressure / feeder ────────────────────────────────────
+        [[ "$_evict_cnt" -gt 0 ]] && \
+            printf "  \033[33m⚠${C_RESET}  Evictions: %d  (%d MB)  - T2 KV pool under pressure\n" \
+                "$_evict_cnt" "$_evict_mb"
+        [[ "$_press_cnt" -gt 0 ]] && \
+            printf "  \033[33m⚠${C_RESET}  Memory pressure events: %d\n" "$_press_cnt"
+        [[ "$_kern_cnt" -gt 0 ]] && \
+            printf "  \033[32m✓${C_RESET}  Feeder GPU kernel dispatches: %d\n" "$_kern_cnt"
+
+        # ── Phase / totals ───────────────────────────────────────────────────
+        echo ""
+        [[ -n "$_last_phase" ]] && \
+            printf "  ${C_DIM}Last phase: %-20s  Allocs: %d  Frees: %d  Peak single alloc: %d MB (%s)%b\n" \
+                "$_last_phase" "$_alloc_cnt" "$_free_cnt" "$_gpeak_mb" "$_gpeak_tier" "$C_RESET"
+
+        echo -e "  ${C_DIM}${_div2}${C_RESET}"
+    fi
+
+    echo ""
+    echo -e "  ${C_DIM}[Ctrl+S: refresh]  [Ctrl+C: exit]  Use --tail N  --filter TYPE  --llm for options${C_RESET}"
+    echo ""
+}
+
+cmd_nvtx_logs() {
+    local _tail=50
+    local _filter=""
+    local _llm=0
+
+    # Parse flags
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --tail)   shift; _tail="${1:-50}" ;;
+            --tail=*) _tail="${1#--tail=}" ;;
+            --filter) shift; _filter="${1:-}" ;;
+            --filter=*) _filter="${1#--filter=}" ;;
+            --llm)    _llm=1 ;;
+            *) ;;
+        esac
+        shift
+    done
+
+    if [[ "$_llm" -eq 1 ]]; then
+        _cmd_nvtx_logs_snapshot "$_tail" "$_filter" 1
+        return
+    fi
+
+    if [[ ! -t 0 ]]; then
+        _cmd_nvtx_logs_snapshot "$_tail" "$_filter" 0
+        return
+    fi
+
+    # Interactive TUI loop - alternate screen, 5-second auto-refresh
+    local _strip='s/\x1b\[[0-9;]*m//g'
+    printf '\033[?1049h'   # enter alternate screen
+    printf '\033[?25l'     # hide cursor
+    stty -ixon 2>/dev/null || true
+    trap 'printf "\033[?25h\033[?1049l"; stty ixon 2>/dev/null || true; exit 0' INT TERM
+
+    while true; do
+        printf '\033[H'
+        _cmd_nvtx_logs_snapshot "$_tail" "$_filter" 0
+        printf '\033[J'
+        # Wait up to 5 s for keypress
+        if read -t 5 -s -n 1 _key 2>/dev/null; then
+            case "$_key" in
+                $'\x03') break ;;   # Ctrl+C
+                $'\x13') ;;         # Ctrl+S - just refresh
+                *) ;;
+            esac
+        fi
+    done
+
+    printf '\033[?25h\033[?1049l'   # show cursor, restore screen
+    stty ixon 2>/dev/null || true
+}
+
+# cmd_nvtx_vitals - live merged tail of local shim + feeder daemon NVTX events.
+# Both logs use the same format: epoch_ms SOURCE EVENT TIER SIZE ptr detail
+# Merges streams via a named FIFO; Python formatter colorises by event/tier.
+# Usage: greenboost nvtx vitals [--last N] [--filter EV1,EV2] [--feeder-only] [--local-only] [--llm]
+cmd_nvtx_vitals() {
+    local _last=0 _filter="" _feeder_only=0 _local_only=0 _llm=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --last)        shift; _last="${1:-50}" ;;
+            --last=*)      _last="${1#--last=}" ;;
+            --filter)      shift; _filter="${1:-}" ;;
+            --filter=*)    _filter="${1#--filter=}" ;;
+            --feeder-only) _feeder_only=1 ;;
+            --local-only)  _local_only=1 ;;
+            --llm)         _llm=1 ;;
+            *) ;;
+        esac
+        shift
+    done
+
+    local _local_log="/run/greenboost/nvtx_events.log"
+    local _local_fallback="/tmp/greenboost_nvtx_events.log"
+    [[ ! -f "$_local_log" && -f "$_local_fallback" ]] && _local_log="$_local_fallback"
+
+    local _feeder_ip="" _feeder_port="9740"
+    if [[ -f "$GB_CLUSTER_CONF" ]]; then
+        local _cline
+        _cline=$(grep -v '^#\|^[[:space:]]*$' "$GB_CLUSTER_CONF" 2>/dev/null | head -1)
+        if [[ -n "$_cline" ]]; then
+            local _addr; _addr=$(echo "$_cline" | awk '{print $1}')
+            _feeder_ip="${_addr%%:*}"
+            local _p="${_addr##*:}"
+            [[ "$_p" != "$_feeder_ip" ]] && _feeder_port="$_p"
+        fi
+    fi
+    local _feeder_user="${GB_SSH_USER:-${SUDO_USER:-$USER}}"
+    local _ssh_as=()
+    [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]] && _ssh_as=(runuser -u "$SUDO_USER" --)
+
+    # LLM mode: raw tail, no colour
+    if [[ "$_llm" -eq 1 ]]; then
+        echo "# GreenBoost NVTX Vitals - $(date '+%Y-%m-%dT%H:%M:%S')"
+        echo "# local=$_local_log feeder=${_feeder_ip:-none}:${_feeder_port}"
+        [[ -f "$_local_log" ]] && tail -n "${_last:-50}" "$_local_log" | sed 's/^/LOCAL:/'
+        if [[ -n "$_feeder_ip" ]]; then
+            "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 \
+                -o StrictHostKeyChecking=no "${_feeder_user}@${_feeder_ip}" \
+                "tail -n ${_last:-50} /run/greenboost/nvtx_events.log 2>/dev/null" \
+                | sed 's/^/FEEDER:/' || true
+        fi
+        return
+    fi
+
+    # Write Python formatter to temp file - avoids heredoc-within-function issues
+    local _pyfmt; _pyfmt=$(mktemp /tmp/gb_nvtx_fmt.XXXXXX.py)
+    local _fifo_dir; _fifo_dir=$(mktemp -d /run/greenboost/nvtx.XXXXXX 2>/dev/null || mktemp -d)
+    local _fifo="${_fifo_dir}/merge"
+    mkfifo "$_fifo"
+    trap 'rm -rf "$_fifo_dir" 2>/dev/null; rm -f "$_pyfmt" 2>/dev/null; kill 0 2>/dev/null || true' EXIT INT TERM
+
+    cat > "$_pyfmt" << 'NVTX_PY'
+import sys, time
+filter_str = sys.argv[1] if len(sys.argv) > 1 else ""
+filters = [f.strip().upper() for f in filter_str.split(",") if f.strip()] if filter_str else []
+R="\033[0m"; DIM="\033[2m"
+EV_COL={
+    "ALLOC_T1_GPU":"\033[92m","ALLOC_T2_DDR":"\033[94m","ALLOC_T2_POOL":"\033[34m",
+    "ALLOC_T3_MMAP":"\033[36m","FREE_OK":"\033[90m","OOM_T1_GPU":"\033[91;1m",
+    "OOM_T2_DDR":"\033[91;1m","OOM_T3":"\033[91;1m","EXEC_KERNEL":"\033[93m",
+    "EXEC_DISPATCH":"\033[93;1m","EXEC_LOCAL":"\033[33m","MEMCPY_H2D":"\033[96m",
+    "MEMCPY_D2H":"\033[96m","MEMCPY_D2D":"\033[96m","ALLOC_A_ZEROCOPY_FAIL":"\033[91;1m",
+    "ALLOC_A_ZEROCOPY":"\033[32m","CLIENT_CONN":"\033[35m","CLIENT_DISC":"\033[90m",
+    "PHASE_DEEP_IDLE":"\033[90m","HANDSHAKE":"\033[35m",
+}
+TIER_COL={
+    "T1_GPU":"\033[92;1m","T2_DDR":"\033[94;1m","T3_NVMe":"\033[36;1m",
+    "NET":"\033[35;1m","PHASE":"\033[90m","T2_DDR_POOL":"\033[34m",
+}
+def fts(ms):
+    try: n=int(ms); return time.strftime("%H:%M:%S",time.localtime(n/1000))+f".{n%1000:03d}"
+    except: return ms
+def fsz(s):
+    try:
+        n=int(s.replace("MB","").strip())
+        if n==0: return DIM+"   -   "+R
+        return ("\033[93m" if n>=1024 else "")+f"{n:5d}MB"+R
+    except: return f"{s:>7}"
+for raw in sys.stdin:
+    raw=raw.rstrip("\n")
+    if not raw: continue
+    if raw.startswith("LOCAL:"): src="LOCAL"; line=raw[6:]
+    elif raw.startswith("FEEDER:"): src="FEEDER"; line=raw[7:]
+    else: src="?"; line=raw
+    p=line.split()
+    if len(p)<3: continue
+    i=0
+    try: epoch=p[i]; int(epoch); i+=1
+    except (ValueError,IndexError): continue
+    if i<len(p) and p[i] in ("NETD","SHIM","GB"): i+=1
+    ev    =p[i] if i<len(p) else "?";  i+=1
+    tier  =p[i] if i<len(p) else "?";  i+=1
+    size  =p[i] if i<len(p) else "0MB";i+=1
+    ptr   =p[i] if i<len(p) else "";   i+=1
+    detail=" ".join(p[i:])
+    if filters and not any(f in ev.upper() for f in filters): continue
+    sc="\033[97;1m" if src=="LOCAL" else "\033[95;1m"
+    st="◀ LOCAL " if src=="LOCAL" else "▶ FEEDER"
+    print(f"  {DIM}{fts(epoch)}{R}  {sc}{st}{R}  "
+          f"{EV_COL.get(ev,chr(27)+'[37m')}{ev:<22}{R}  "
+          f"{TIER_COL.get(tier,chr(27)+'[37m')}{tier:<12}{R}  "
+          f"{fsz(size)}  {DIM}{ptr:<22} {detail}{R}")
+    sys.stdout.flush()
+NVTX_PY
+
+    # Header
+    printf "\n  ${C_BOLD}${C_CYAN}GreenBoost NVTX Vitals${C_RESET}  ${C_DIM}%s${C_RESET}\n" \
+        "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf "  ${C_DIM}local : %s${C_RESET}\n" "$_local_log"
+    [[ -n "$_feeder_ip" ]] && printf "  ${C_DIM}feeder: %s:%s${C_RESET}\n" "$_feeder_ip" "$_feeder_port"
+    [[ -n "$_filter" ]]    && printf "  ${C_AMBER}filter: %s${C_RESET}\n" "$_filter"
+    printf "\n  ${C_DIM}Colour: "
+    printf "\033[92mALLOC_T1\033[0m${C_DIM} · \033[94mALLOC_T2\033[0m${C_DIM} · "
+    printf "\033[36mALLOC_T3\033[0m${C_DIM} · \033[91;1mOOM\033[0m${C_DIM} · "
+    printf "\033[93mEXEC\033[0m${C_DIM} · \033[96mMEMCPY\033[0m${C_DIM} · "
+    printf "\033[90mFREE/IDLE\033[0m${C_DIM}"
+    printf "\n  Ctrl+C to exit  ·  ◀ LOCAL = host shim  ·  ▶ FEEDER = remote daemon${C_RESET}\n"
+    printf "  ${C_DIM}─────────────────────────────────────────────────────────────────${C_RESET}\n\n"
+
+    # Launch tail streams - both write to the same FIFO; Python reads from it
+    local _tail_args="-n 0 -F"
+    [[ "$_last" -gt 0 ]] && _tail_args="-n $_last"
+
+    if [[ "$_feeder_only" -eq 0 ]]; then
+        if [[ -f "$_local_log" ]]; then
+            # shellcheck disable=SC2086
+            tail $_tail_args "$_local_log" 2>/dev/null | sed -u 's/^/LOCAL:/' > "$_fifo" &
+        else
+            printf "  ${C_AMBER}⚠${C_RESET}  Local NVTX log not found: %s\n" "$_local_log"
+        fi
+    fi
+
+    if [[ "$_local_only" -eq 0 ]]; then
+        if [[ -n "$_feeder_ip" ]]; then
+            # shellcheck disable=SC2086
+            "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=10 \
+                -o StrictHostKeyChecking=no "${_feeder_user}@${_feeder_ip}" \
+                "tail $_tail_args /run/greenboost/nvtx_events.log 2>/dev/null" \
+                | sed -u 's/^/FEEDER:/' > "$_fifo" &
+        else
+            printf "  ${C_AMBER}⚠${C_RESET}  No feeder in cluster.conf - showing local only\n"
+        fi
+    fi
+
+    python3 -u "$_pyfmt" "$_filter" < "$_fifo"
+}
 
 # ---- show-commands (greenboost help) -----------------------------------
 # Displays GREENBOOST_COMMANDS.md as a styled terminal reference.
@@ -6428,14 +8539,13 @@ cmd_show_commands() {
     done
 
     gb_header
-    echo -e "  ${C_CYAN}${C_BOLD}GreenBoost Command Reference${C_RESET}  ${C_DIM}— run ${C_GRAY}greenboost help${C_DIM} to see this anytime${C_RESET}"
+    echo -e "  ${C_CYAN}${C_BOLD}GreenBoost Command Reference${C_RESET}  ${C_DIM}- run ${C_GRAY}greenboost help${C_DIM} to see this anytime${C_RESET}"
     echo -e ""
 
     if [[ -z "$doc" ]]; then
-        gb_warn_ui "GREENBOOST_COMMANDS.md not found — showing built-in summary"
+        gb_warn_ui "GREENBOOST_COMMANDS.md not found - showing built-in summary"
         echo -e ""
-        printf "  ${C_LIME}%-28s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "greenboost status"          "cuda memory pool + system health"
-        printf "  ${C_LIME}%-28s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "greenboost vulkan"          "Vulkan layer, active games, DMA-BUF fallback activity, shader boost"
+        printf "  ${C_LIME}%-28s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "greenboost vitals"          "live memory tiers + NVTX events + system health"
         printf "  ${C_LIME}%-28s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "greenboost clean memory"    "Force-release T1 VRAM + T2 RAM + T3 now"
         printf "  ${C_LIME}%-28s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "greenboost run <app>"       "Force-activate shim for one app (non-login shells/scripts)"
         printf "  ${C_LIME}%-28s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "sudo greenboost setup"      "Full first-time install"
@@ -6454,7 +8564,7 @@ cmd_show_commands() {
         if [[ "$line" =~ ^\`\`\` ]]; then
             _in_code=$(( 1 - _in_code ))
         elif [[ $_in_code -eq 1 ]]; then
-            # Code block content — full white for contrast
+            # Code block content - full white for contrast
             [[ -n "$line" ]] && echo -e "  ${C_WHITE}${line}${C_RESET}" || echo ""
         elif [[ "$line" =~ ^##[[:space:]]+(.*) ]]; then
             echo -e ""
@@ -6471,7 +8581,7 @@ cmd_show_commands() {
         elif [[ "$line" =~ ^--- ]]; then
             echo -e ""
         else
-            # Normal text — dim gray
+            # Normal text - dim gray
             [[ -n "$line" ]] && echo -e "  ${C_DIM}${line}${C_RESET}" || echo ""
         fi
     done < "$doc"
@@ -6480,136 +8590,265 @@ cmd_show_commands() {
     gb_info "Full document: $doc"
 }
 
-# ── cmd_turboquant — KV cache TurboQuant compression control ────────────
-# Usage: greenboost turboquant [status|enable [2|3|4]|disable]
+# ── cmd_gen_inference_config - optimized inference configuration generator ─
+# Usage: greenboost gen-inference-config [--format ollama|env|both]
+#                                        [--turboquant] [--no-turboquant]
+#                                        [--output /path] [--model <name>]
+cmd_gen_inference_config() {
+    local fmt="ollama" tq_flag="" out_file="" model_name="" virt_type="bare-metal" dry_run=0 llm_mode=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --format)        fmt="${2:-ollama}"; shift 2 ;;
+            --turboquant)    tq_flag="on";       shift ;;
+            --no-turboquant) tq_flag="off";      shift ;;
+            --output)        out_file="${2:-}";   shift 2 ;;
+            --model)         model_name="${2:-}"; shift 2 ;;
+            --dry-run)       dry_run=1;           shift ;;
+            --llm)           llm_mode=1;          shift ;;
+            *)               shift ;;
+        esac
+    done
+
+    # -- Detect virtualization type
+    if [[ -f "/.dockerenv" ]]; then
+        virt_type="container"
+    elif grep -qE 'docker|lxc|kubepods' /proc/1/cgroup 2>/dev/null; then
+        virt_type="container"
+    else
+        local _sdv
+        _sdv=$(systemd-detect-virt 2>/dev/null | head -1 || echo "none")
+        _sdv="${_sdv//[$'\t\r\n']/ }"
+        _sdv="${_sdv%% *}"
+        case "$_sdv" in
+            none|"") virt_type="bare-metal" ;;
+            wsl)     virt_type="wsl2" ;;
+            *)       virt_type="vm:${_sdv}" ;;
+        esac
+    fi
+
+    # -- Read hardware profile (best-effort; detection may be incomplete in VMs)
+    detect_hardware 2>/dev/null || true
+    local phys_gb="${GB_PHYS:-0}"
+    local virt_gb="${GB_VIRT:-0}"
+    local nvme_gb="${GB_NVME_SWAP:-0}"
+    local ctx="${GB_OLLAMA_CTX:-8192}"
+
+    # In VMs/containers cap context conservatively (no NVMe swap, limited DMA)
+    local effective_ctx="$ctx"
+    case "$virt_type" in
+        container|wsl2) effective_ctx=$(( ctx / 2 ))      ;;
+        vm:*)           effective_ctx=$(( ctx * 3 / 4 ))  ;;
+    esac
+
+    # -- Cluster feeder count
+    local cluster_feeders=0
+    if [[ -f "/etc/greenboost/cluster.conf" ]]; then
+        cluster_feeders=$(grep -v '^[[:space:]]*#' /etc/greenboost/cluster.conf 2>/dev/null | grep -c '.' || echo 0)
+    fi
+
+    # -- TurboQuant: if not forced via flag, read the current global flag
+    if [[ -z "$tq_flag" ]]; then
+        [[ -f "/etc/greenboost/turboquant.enabled" ]] && tq_flag="on" || tq_flag="off"
+    fi
+    local kv_type="q8_0"
+    [[ "$tq_flag" == "on" ]] && kv_type="q4_0"
+
+    local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
+    local out=""
+
+    out+="# GreenBoost optimized inference configuration\n"
+    out+="# Generated: ${ts}\n"
+    out+="# Environment: ${virt_type}  GPU T1: ${phys_gb} GB  T2: ${virt_gb} GB  T3: ${nvme_gb} GB\n"
+    [[ $cluster_feeders -gt 0 ]] && out+="# Cluster: ${cluster_feeders} feeder(s) connected\n"
+    out+="# TurboQuant: ${tq_flag}\n"
+    out+="\n"
+
+    if [[ "$fmt" == "ollama" || "$fmt" == "both" ]]; then
+        out+="# ── Ollama environment variables ──────────────────────────────────\n"
+        out+="OLLAMA_NUM_CTX=${effective_ctx}\n"
+        out+="OLLAMA_FLASH_ATTENTION=1\n"
+        out+="OLLAMA_KV_CACHE_TYPE=${kv_type}\n"
+        out+="OLLAMA_NUM_PARALLEL=1\n"
+        out+="OLLAMA_MAX_LOADED_MODELS=1\n"
+        out+="OLLAMA_KEEP_ALIVE=-1\n"
+        out+="OLLAMA_NUM_GPU=999\n"
+        out+="CUDA_VISIBLE_DEVICES=0\n"
+        out+="GREENBOOST_ACTIVE=1\n"
+        [[ "$tq_flag" == "on" ]] && out+="GREENBOOST_TURBOQUANT=1\n"
+        [[ -n "$model_name" ]] && out+="# Suggested model: ${model_name}\n"
+        out+="\n"
+        if [[ "$virt_type" != "bare-metal" ]]; then
+            out+="# NOTE: Running in ${virt_type} - context capped at ${effective_ctx} tokens.\n"
+            out+="# Raise OLLAMA_NUM_CTX if the host dedicates more RAM to this environment.\n"
+            out+="\n"
+        fi
+    fi
+
+    if [[ "$fmt" == "env" || "$fmt" == "hf" || "$fmt" == "both" ]]; then
+        out+="# ── HuggingFace / PyTorch inference (Python) ──────────────────────\n"
+        out+="# Add to your inference script:\n"
+        out+="\n"
+        out+="# import sys\n"
+        out+="# sys.path.insert(0, \"/path/to/greenboost_all/greenboost\")\n"
+        out+="# from gb_attn import turboquant_attention\n"
+        out+="#\n"
+        if [[ "$tq_flag" == "on" ]]; then
+            out+="# with turboquant_attention(k_bits=4, v_bits=3, sparse_v=True):\n"
+            out+="#     output = model(input)  # ~4x KV bandwidth reduction\n"
+        else
+            out+="# TurboQuant is currently OFF.  Enable with: sudo greenboost turboquant on\n"
+            out+="# Then wrap inference: with turboquant_attention(k_bits=4, v_bits=3): ...\n"
+        fi
+        out+="\n"
+        out+="# Environment variables:\n"
+        out+="# export GREENBOOST_ACTIVE=1\n"
+        [[ "$tq_flag" == "on" ]] && out+="# export GREENBOOST_TURBOQUANT=1\n"
+        out+="\n"
+    fi
+
+    if [[ "$llm_mode" -eq 1 ]]; then
+        # Machine-readable: strip ANSI, strip comment lines, emit raw key=value
+        printf '%b' "$out" | sed 's/\x1b\[[0-9;]*[mKHJsu]//g' | grep -v '^#' | grep -v '^[[:space:]]*$'
+    elif [[ "$dry_run" -eq 1 ]]; then
+        local target="${out_file:-/etc/greenboost/inference.env}"
+        echo "[dry-run] would write to ${target}:"
+        echo "────────────────────────────────────────"
+        printf '%b' "$out"
+        echo "────────────────────────────────────────"
+        echo "[dry-run] no files written."
+    elif [[ -n "$out_file" ]]; then
+        printf '%b' "$out" > "$out_file"
+        gb_ok "Config written to: ${out_file}"
+    elif [[ ! -t 1 ]]; then
+        # Audit F-L4-16: stdout is not a terminal (pipe, redirect) - emit raw
+        # config without any ANSI decoration so the output is machine-readable.
+        printf '%b' "$out"
+    else
+        gb_header
+        gb_section "Optimized Inference Configuration  (${virt_type})"
+        echo ""
+        printf '%b' "$out"
+        gb_separator
+        gb_info "Save output: greenboost gen-inference-config --format both --output /etc/greenboost/inference.env"
+        gb_info "TurboQuant:  sudo greenboost turboquant on|off|status"
+    fi
+}
+
+
+# ── cmd_turboquant - global TurboQuant K/V compression toggle ───────────────
+# Usage: greenboost turboquant on|off|status
 #
-# Reads /run/greenboost/turboquant.conf and /dev/greenboost for status.
-# enable/disable write the conf file and issue GB_IOCTL_SET_TURBOQUANT.
+# ON : writes /etc/greenboost/turboquant.enabled, sets OLLAMA_KV_CACHE_TYPE=q4_0,
+#      injects GREENBOOST_TURBOQUANT=1 into the Ollama drop-in and profile.d,
+#      restarts Ollama if it is running.
+# OFF: removes flag, reverts KV type to q8_0, removes TQ env vars.
 cmd_turboquant() {
     local subcmd="${1:-status}"
-
-    local conf_path="/run/greenboost/turboquant.conf"
-    local dev_path="/dev/greenboost"
+    local dropin="/etc/systemd/system/ollama.service.d/99-greenboost.conf"
+    local flag_file="/etc/greenboost/turboquant.enabled"
+    local profiled="/etc/profile.d/greenboost-turboquant.sh"
 
     case "$subcmd" in
-        status|"")
-            gb_section "TurboQuant KV Cache Compression"
+        on)
+            need_root "turboquant on"
+            mkdir -p /etc/greenboost
+            touch "$flag_file"
 
-            # Read conf file
-            local enabled=0 bits=0 head_dim=128 ratio=1.0
-            if [[ -f "$conf_path" ]]; then
-                while IFS='=' read -r key val; do
-                    case "$key" in
-                        enabled)  enabled="$val"  ;;
-                        bits)     bits="$val"      ;;
-                        head_dim) head_dim="$val"  ;;
-                        ratio)    ratio="$val"     ;;
-                    esac
-                done < "$conf_path"
-            fi
-
-            if [[ "$enabled" == "1" && "$bits" -gt 0 ]]; then
-                gb_ok "TurboQuant:   turbo${bits} active (${ratio}× compression, head_dim=${head_dim})"
-            else
-                gb_info "TurboQuant:   disabled (KV cache stored uncompressed)"
-            fi
-
-            # Show sysfs stats if module is loaded
-            local sysfs="/sys/class/greenboost/greenboost/status"
-            if [[ -r "$sysfs" ]]; then
-                local kv_cmp_mb kv_cmp_bits
-                kv_cmp_mb=$(grep -oP 'KV compressed\s*:\s*\K\d+' "$sysfs" 2>/dev/null || echo "0")
-                kv_cmp_bits=$(grep -oP 'compression bits\s*:\s*\K\d+' "$sysfs" 2>/dev/null || echo "0")
-                [[ "$kv_cmp_mb" -gt 0 ]] && gb_info "Saved by TQ:  ${kv_cmp_mb} MB"
-            fi
-
-            gb_info "Daemon:       greenboost-turboquant.service (auto-selects bit width)"
-            gb_info "Manual ctl:   greenboost turboquant enable [2|3|4]"
-            gb_info "Conf file:    ${conf_path}"
-            ;;
-
-        enable)
-            local req_bits="${2:-0}"
-            if [[ "$req_bits" == "0" ]]; then
-                # Auto: let daemon pick; just start/restart it
-                gb_step 1 2 "Enabling TurboQuant (auto bit selection)"
-                if systemctl is-active --quiet greenboost-turboquant.service 2>/dev/null; then
-                    systemctl restart greenboost-turboquant.service
-                    gb_ok "Restarted greenboost-turboquant daemon (auto mode)"
+            # Update Ollama drop-in: q8_0 → q4_0, inject GREENBOOST_TURBOQUANT
+            if [[ -f "$dropin" ]]; then
+                sed -i 's/OLLAMA_KV_CACHE_TYPE=q8_0/OLLAMA_KV_CACHE_TYPE=q4_0/' "$dropin"
+                if ! grep -q 'GREENBOOST_TURBOQUANT' "$dropin"; then
+                    sed -i '/GREENBOOST_ACTIVE=1/a Environment="GREENBOOST_TURBOQUANT=1"' "$dropin"
+                fi
+                systemctl daemon-reload
+                if systemctl is-active --quiet ollama; then
+                    systemctl restart ollama
+                    gb_ok "Ollama restarted - KV cache: q4_0 (TurboQuant)"
                 else
-                    systemctl start greenboost-turboquant.service 2>/dev/null && \
-                        gb_ok "Started greenboost-turboquant daemon" || \
-                        gb_warn_ui "greenboost-turboquant.service not installed — run full-install first"
+                    gb_ok "Ollama drop-in updated (service not running)"
                 fi
             else
-                if [[ "$req_bits" != "2" && "$req_bits" != "3" && "$req_bits" != "4" ]]; then
-                    gb_fail "Invalid bit width: ${req_bits}. Use 2, 3, or 4."
-                    return 1
-                fi
-                gb_step 1 2 "Enabling TurboQuant turbo${req_bits}"
-                local ratio
-                case "$req_bits" in
-                    4) ratio="3.90" ;;
-                    3) ratio="4.60" ;;
-                    2) ratio="6.40" ;;
-                esac
-
-                # Write conf file atomically
-                mkdir -p /run/greenboost
-                {
-                    echo "enabled=1"
-                    echo "bits=${req_bits}"
-                    echo "head_dim=128"
-                    echo "ratio=${ratio}"
-                    echo "seed=42"
-                } > "${conf_path}.tmp" && mv "${conf_path}.tmp" "$conf_path"
-                gb_ok "Wrote ${conf_path} (turbo${req_bits}, ratio ${ratio}×)"
-
-                # Send IOCTL if /dev/greenboost is available
-                if [[ -c "$dev_path" ]]; then
-                    gb_step 2 2 "Sending GB_IOCTL_SET_TURBOQUANT"
-                    python3 -c "
-import fcntl, struct, os
-_IOC_WRITE = 1
-def _iow(m, n, s): return (_IOC_WRITE<<30)|(s<<16)|(m<<8)|n
-GB_IOCTL_SET_TURBOQUANT = _iow(ord('G'), 10, 16)
-req = struct.pack('IIII', 1, ${req_bits}, 128, 42)
-fd = os.open('${dev_path}', os.O_RDWR | os.O_CLOEXEC)
-fcntl.ioctl(fd, GB_IOCTL_SET_TURBOQUANT, req)
-os.close(fd)
-print('[GreenBoost] GB_IOCTL_SET_TURBOQUANT sent: enabled=1 bits=${req_bits}')
-" 2>&1 && gb_ok "IOCTL sent to ${dev_path}" || gb_warn_ui "IOCTL failed — conf file is active, shim will pick up on next refresh"
-                fi
+                gb_warn "Ollama drop-in not found - only flag file written."
+                gb_info "Run: sudo greenboost install-sys-configs  to create the drop-in."
             fi
+
+            # profile.d shim so login-shell Python processes pick up the flag
+            cat > "$profiled" << 'TQPROFEOF'
+# GreenBoost TurboQuant - set when /etc/greenboost/turboquant.enabled exists
+[ -f /etc/greenboost/turboquant.enabled ] && export GREENBOOST_TURBOQUANT=1
+TQPROFEOF
+
+            echo ""
+            gb_ok "TurboQuant ON"
+            gb_info "Ollama:  OLLAMA_KV_CACHE_TYPE=q4_0 (4-bit KV cache)"
+            gb_info "Python:  GREENBOOST_TURBOQUANT=1 exported for login shells"
+            gb_info "         Use turboquant_attention() from gb_attn.py in PyTorch code"
+            gb_info "Synapse: /turboquant status  to confirm inside the CLI"
             ;;
 
-        disable)
-            gb_step 1 2 "Disabling TurboQuant"
-            rm -f "$conf_path"
-            gb_ok "Removed ${conf_path}"
+        off)
+            need_root "turboquant off"
+            rm -f "$flag_file"
 
-            if [[ -c "$dev_path" ]]; then
-                gb_step 2 2 "Sending disable IOCTL"
-                python3 -c "
-import fcntl, struct, os
-_IOC_WRITE = 1
-def _iow(m, n, s): return (_IOC_WRITE<<30)|(s<<16)|(m<<8)|n
-GB_IOCTL_SET_TURBOQUANT = _iow(ord('G'), 10, 16)
-req = struct.pack('IIII', 0, 0, 128, 42)
-fd = os.open('${dev_path}', os.O_RDWR | os.O_CLOEXEC)
-fcntl.ioctl(fd, GB_IOCTL_SET_TURBOQUANT, req)
-os.close(fd)
-" 2>&1 && gb_ok "IOCTL sent: TurboQuant disabled" || gb_warn_ui "IOCTL failed — conf file removed, shim will disable on next refresh"
+            if [[ -f "$dropin" ]]; then
+                sed -i 's/OLLAMA_KV_CACHE_TYPE=q4_0/OLLAMA_KV_CACHE_TYPE=q8_0/' "$dropin"
+                sed -i '/GREENBOOST_TURBOQUANT/d' "$dropin"
+                systemctl daemon-reload
+                if systemctl is-active --quiet ollama; then
+                    systemctl restart ollama
+                    gb_ok "Ollama restarted - KV cache: q8_0 (standard)"
+                else
+                    gb_ok "Ollama drop-in reverted (service not running)"
+                fi
             fi
+
+            rm -f "$profiled"
+
+            echo ""
+            gb_ok "TurboQuant OFF"
+            gb_info "Ollama: OLLAMA_KV_CACHE_TYPE=q8_0 restored"
+            ;;
+
+        status|--llm)
+            local tq_state kv_cur
+            [[ -f "$flag_file" ]] && tq_state="ON" || tq_state="OFF"
+            kv_cur="q8_0 (default)"
+            if [[ -f "$dropin" ]]; then
+                local _kv; _kv=$(grep -oP 'OLLAMA_KV_CACHE_TYPE=\K[^"]+' "$dropin" 2>/dev/null || echo "")
+                [[ -n "$_kv" ]] && kv_cur="$_kv"
+            fi
+            local _tq_py="${GREENBOOST_TURBOQUANT:-0}"
+            # Audit F-L4-15: --llm emits machine-readable key=value pairs.
+            if [[ "$subcmd" == "--llm" ]]; then
+                echo "turboquant_state=${tq_state}"
+                echo "ollama_kv_cache=${kv_cur}"
+                echo "python_env_set=${_tq_py}"
+                return
+            fi
+            echo ""
+            printf "  ${C_BOLD}TurboQuant global state:${C_RESET}  "
+            if [[ "$tq_state" == "ON" ]]; then
+                printf "${C_LIME}${C_BOLD}ON${C_RESET}\n"
+            else
+                printf "${C_DIM}OFF${C_RESET}\n"
+            fi
+            printf "  ${C_GRAY}Flag file:${C_RESET}         ${C_DIM}${flag_file}${C_RESET}  "
+            [[ -f "$flag_file" ]] && printf "${C_LIME}(present)${C_RESET}\n" || printf "${C_DIM}(absent)${C_RESET}\n"
+            printf "  ${C_GRAY}Ollama KV cache:${C_RESET}   ${C_CYAN}%s${C_RESET}\n" "$kv_cur"
+            printf "  ${C_GRAY}Python env:${C_RESET}        "
+            [[ "$_tq_py" == "1" ]] \
+                && printf "${C_LIME}GREENBOOST_TURBOQUANT=1${C_RESET}\n" \
+                || printf "${C_DIM}GREENBOOST_TURBOQUANT not set in this shell${C_RESET}\n"
+            echo ""
+            gb_info "Toggle: sudo greenboost turboquant on|off"
             ;;
 
         *)
-            gb_warn_ui "Unknown sub-command: ${subcmd}"
-            gb_info "Usage: greenboost turboquant [status|enable [2|3|4]|disable]"
-            return 1
+            die "Usage: greenboost turboquant on|off|status|--llm"
             ;;
     esac
 }
+
 
 # ---- wizard (default interactive mode) --------------------------------
 # Shown when no arguments are given and stdin is a TTY.
@@ -6618,37 +8857,42 @@ cmd_wizard() {
     while true; do
         clear
         gb_header
-        echo -e "  ${C_DIM}${C_GRAY}GreenBoost was built to improve local AI inference by orchestrating a CUDA memory pool.${C_RESET}"
-        echo -e "  ${C_DIM}${C_GRAY}The Vulkan/gaming layer is a secondary byproduct.${C_RESET}"
+        echo -e "  ${C_DIM}${C_GRAY}GreenBoost improves local AI inference by orchestrating a CUDA memory pool.${C_RESET}"
         echo ""
 
         gb_section "Core"
-        gb_menu_item  1  "Full install"             "DKMS module + AI libs + sysctl + GRUB + systemd services (hardware-agnostic)"  root
-        gb_menu_item  2  "Light install"            "DKMS module + hardware-tuned build — no system changes (hardware-agnostic)"  root
-        gb_menu_item  3  "Status"                   "Show cuda memory pool + system state"
-        gb_menu_item  4  "Benchmark"                "Measure T1/T2/T3 bandwidth"
+        gb_menu_item  1  "Full install"              "DKMS module + tune runtime + sysctl + GRUB + systemd services"  root
+        gb_menu_item  2  "Light install"             "DKMS module + hardware-tuned build - no system changes"  root
+        gb_menu_item  3  "Status"                    "Show cuda memory pool + system state"
+        gb_menu_item  4  "Benchmark"                 "Measure T1/T2/T3 bandwidth"
+
+        gb_section "Additional install (included in full-install)"
+        gb_menu_item  5  "Install sys configs"       "Ollama drop-in, udev rules, LD_PRELOAD shim, CPU governor, THP"  root
+        gb_menu_item  6  "Tune runtime"              "NVMe scheduler, CPU governor, PCIe, swappiness (live)"  root
+        gb_menu_item  7  "Tune sysctl"               "Persistent kernel tunables - 99-zzz-greenboost.conf"  root
+        gb_menu_item  8  "Tune GRUB"                 "Boot params: hugepages, rcu_nocbs, nohz_full (needs reboot)"  root
+        gb_menu_item  9  "Generate inference config"  "Optimized Ollama/HF config for this hardware & environment"
+
+        gb_section "Restore"
+        gb_menu_item 10  "Restore sys configs"       "Remove Ollama drop-in, udev rules, LD_PRELOAD, governor service"  root
+        gb_menu_item 11  "Restore tune runtime"      "Reset CPU governor, NVMe scheduler, PCIe PM, VM defaults"  root
+        gb_menu_item 12  "Restore tune sysctl"       "Remove 99-zzz-greenboost.conf and reload kernel defaults"  root
+        gb_menu_item 13  "Restore tune GRUB"         "Strip GreenBoost boot params and run update-grub"  root
 
         gb_section "Configuration"
-        gb_menu_item  5  "Profile management"       "Interactive wizard: create, activate, diff profiles"
-
-        gb_section "Gaming"
-        gb_menu_item  6  "Install GB Proton"        "T1+T2 CUDA memory pool for Steam games. Select GreenBoost Proton on Steam"  root
-        gb_menu_item  7  "Remove GB Proton"         "Uninstall GreenBoost Proton from Steam compat tools"
-        gb_menu_item  8  "Clean custom Protons"     "Remove all non-GreenBoost custom Proton builds from Steam compat tools"
-        gb_menu_item  9  "Install MangoHud"         "Build MangoHud from source + GreenBoost overlay for benchmarking"  root
-        gb_menu_item  10 "Remove MangoHud"          "Uninstall MangoHud binaries and MangoHud.conf"  root
+        gb_menu_item 14  "Profile management"        "Interactive wizard: create, activate, diff profiles"
 
         gb_section "Maintenance"
-        gb_menu_item  11 "GreenBoost Commands"     "All commands reference (also: greenboost help)"
-        gb_menu_item  12 "Clear logs"               "Clear dmesg, journal, Proton logs, and Wine coredumps"
-        gb_menu_item  13 "Uninstall"                "Remove GreenBoost (module + all config)"        root
+        gb_menu_item 15  "GreenBoost Commands"       "All commands reference (also: greenboost help)"
+        gb_menu_item 16  "Clear logs"                "Clear dmesg and journal"
+        gb_menu_item 17  "Uninstall"                 "Remove GreenBoost (module + all config)"  root
 
         gb_separator
         echo -e "  ${C_DIM}${C_GRAY}[Q]  Quit${C_RESET}"
         echo -e ""
 
         if [[ "$(id -u)" != "0" ]]; then
-            gb_warn_ui "Not running as root — options marked ${C_RED}⚠ root${C_AMBER} will fail. Use sudo."
+            gb_warn_ui "Not running as root - options marked ${C_RED}⚠ root${C_AMBER} will fail. Use sudo."
             echo -e ""
         fi
 
@@ -6657,26 +8901,30 @@ cmd_wizard() {
         echo -e ""
 
         case "$choice" in
-            1)  cmd_full_install;              gb_press_enter ;;
+            1)  cmd_full_install;                    gb_press_enter ;;
             2)  bash "$MODULE_DIR/install_module.sh"; gb_press_enter ;;
-            3)  cmd_status ;;
-            4)  cmd_benchmark;                 gb_press_enter ;;
-            5)  cmd_profile_wizard ;;
-            6)  cmd_install_proton;             gb_press_enter ;;
-            7)  cmd_uninstall_proton;          gb_press_enter ;;
-            8)  cmd_proton_clean;              gb_press_enter ;;
-            9)  cmd_install_mangohud;          gb_press_enter ;;
-            10) cmd_uninstall_mangohud;        gb_press_enter ;;
-            11) cmd_show_commands;             gb_press_enter ;;
-            12) cmd_clear_logs;                gb_press_enter ;;
-            13) cmd_uninstall;                 gb_press_enter ;;
+            3)  cmd_debug_vitals ;;
+            4)  cmd_benchmark;                       gb_press_enter ;;
+            5)  cmd_install_sys_configs;             gb_press_enter ;;
+            6)  cmd_tune;                            gb_press_enter ;;
+            7)  cmd_tune_sysctl;                     gb_press_enter ;;
+            8)  cmd_tune_grub;                       gb_press_enter ;;
+            9)  cmd_gen_inference_config;            gb_press_enter ;;
+            10) cmd_restore_sys_configs;             gb_press_enter ;;
+            11) cmd_restore_tune_runtime;            gb_press_enter ;;
+            12) cmd_restore_tune_sysctl;             gb_press_enter ;;
+            13) cmd_restore_tune_grub;               gb_press_enter ;;
+            14) cmd_profile_wizard ;;
+            15) cmd_show_commands;                   gb_press_enter ;;
+            16) cmd_clear_logs;                      gb_press_enter ;;
+            17) cmd_uninstall;                       gb_press_enter ;;
             q|Q|"") exit 0 ;;
             *) gb_warn_ui "Unknown option."; sleep 1 ;;
         esac
     done
 }
 
-# ── cmd_benchmark — workstation bandwidth benchmark ──────────────────────
+# ── cmd_benchmark - workstation bandwidth benchmark ──────────────────────
 # Usage: greenboost benchmark [--skip-bandwidth] [--json]
 #
 # cuda memory pool bandwidth test (T1 VRAM / T2 DDR / T3 NVMe)
@@ -6686,7 +8934,8 @@ cmd_benchmark() {
     for arg in "$@"; do
         case "$arg" in
             --skip-bandwidth)  skip_bw=1  ;;
-            --json)            json_out=1 ;;
+            # Audit F-L4-15: accept both --json (legacy) and --llm (canonical).
+            --json|--llm)      json_out=1 ;;
         esac
     done
 
@@ -6720,7 +8969,7 @@ cmd_benchmark() {
         done
 
         if [[ -z "$bench_script" ]]; then
-            gb_warn_ui "Bandwidth benchmark script not found — skipping"
+            gb_warn_ui "Bandwidth benchmark script not found - skipping"
             gb_warn_ui "Expected: $MODULE_DIR/tools/gb_workstation_bench.py"
             _bm_log "phase=bandwidth status=skipped reason=script_not_found"
         else
@@ -6855,7 +9104,7 @@ cmd_help() {
         echo -e ""
         echo -e "  ${C_CYAN}${C_BOLD}COMMON COMMANDS:${C_RESET}"
         echo -e ""
-        printf "  ${C_LIME}%-18s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "setup"       "Full install — deps, module, tune, Python inference tools"
+        printf "  ${C_LIME}%-18s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "setup"       "Full install - deps, module, tune, Python inference tools"
         printf "  ${C_LIME}%-18s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "status"      "Show pool info + system state"
         printf "  ${C_LIME}%-18s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "benchmark"   "cuda memory pool bandwidth benchmark (T1 VRAM / T2 DDR / T3 NVMe)  [--skip-bandwidth] [--json]"
         printf "  ${C_LIME}%-18s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "tune"        "Runtime tuning (CPU governor, NVMe, THP, sysctl)"
@@ -6864,7 +9113,7 @@ cmd_help() {
         printf "  ${C_LIME}%-18s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "uninstall"   "Remove module + all config"
         printf "  ${C_LIME}%-18s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "profile"     "Interactive profile wizard (create / activate / diff)"
         printf "  ${C_LIME}%-18s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "clean memory" "Force-release T1 VRAM + T2 RAM + T3 now (unloads inference models)"
-        printf "  ${C_LIME}%-18s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "logs"         "Snapshot all GreenBoost log sources (kernel, Ollama, Vulkan, Proton)"
+        printf "  ${C_LIME}%-18s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "logs"         "Snapshot all GreenBoost log sources (kernel, Ollama)"
         printf "  ${C_LIME}%-18s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "clear logs"   "Clear all GreenBoost logs for a fresh diagnostic baseline"
         echo -e ""
         echo -e "  ${C_DIM}Run ${C_GRAY}greenboost help${C_DIM} for the full command reference (always available after install).${C_RESET}"
@@ -6885,7 +9134,6 @@ cmd_help() {
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "tune"            "Runtime tuning (governor, NVMe, THP, sysctl)"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "tune-grub"       "Fix GRUB boot params (THP=always, rcu_nocbs, nohz_full…)"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "tune-sysctl"     "Consolidate sysctl + apply compute-optimized knobs"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "tune-libs"       "Install missing AI/compute libraries (OpenBLAS, hwloc…)"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "tune-all"        "Run tune + tune-grub + tune-sysctl + tune-libs"
         echo -e ""
         echo -e "  ${C_CYAN}${C_BOLD}DIAGNOSTICS:${C_RESET}"
@@ -6894,48 +9142,20 @@ cmd_help() {
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "benchmark [flags]" "cuda memory pool bandwidth benchmark (--skip-bandwidth --json)"
         echo -e ""
         echo -e "  ${C_CYAN}${C_BOLD}LOGGING:${C_RESET}"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "logs"                  "Snapshot all GreenBoost log sources (kernel, Ollama, Vulkan, Proton)"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "proton-logs"           "Show Proton/VKD3D game logs"
+        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "logs"                  "Snapshot all GreenBoost log sources (kernel, Ollama)"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "inference-logs"        "Show Ollama/inference logs"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "inference-test"        "Benchmark inference + verify fastest path (A0/A); --llm for LLM report"
+        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "test cluster"          "Live cluster inference test: Qwen3-35B tier routing + throughput (--unload)"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "clear logs"            "Clear all GreenBoost logs"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "clear proton-logs"     "Clear Proton logs"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "clear inference-logs"  "Clear inference logs"
         echo -e ""
-        echo -e "  ${C_CYAN}${C_BOLD}GAMING:${C_RESET}"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "gaming-mode enable|disable" "Suspend/restore Ollama before/after gaming"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-proton" "Install GreenBoost Proton for Steam"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "remove-proton"          "Remove GreenBoost Proton"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "steam-launch-guide"     "Show Steam launch options + Proton setup guide"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-mangohud"       "Build MangoHud from source + install GreenBoost config"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "uninstall-mangohud"     "Remove MangoHud"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "fix-steam"              "Install Steam launch wrapper (GTK2/XIM SIGBUS fix)"
-        echo -e ""
-        echo -e "  ${C_CYAN}${C_BOLD}━━━ Required: select the Proton version in Steam ━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
-        echo -e ""
-        echo -e "  ${C_VIOLET}◈${C_RESET}  Right-click the game → ${C_BOLD}Properties → Compatibility${C_RESET}"
-        echo -e "     Check ${C_BOLD}\"Force the use of a specific Steam Play compatibility tool\"${C_RESET}"
-        echo -e "     and select ${C_LIME}${C_BOLD}GreenBoost Proton${C_RESET}"
-        echo -e ""
-        echo -e "  ${C_CYAN}${C_BOLD}━━━ Enable per game in Steam launch options ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
-        echo -e ""
-        echo -e "  ${C_AMBER}▸ With HDR:${C_RESET}"
-        echo -e "  ${C_LIME}PROTON_ENABLE_HDR=1 %command%${C_RESET}"
-        echo -e ""
-        echo -e "  ${C_AMBER}▸ With DLSS Super Resolution preset override:${C_RESET}"
-        echo -e ""
-        echo -e "    ${C_DIM}  Preset       Quality                   Best for${C_RESET}"
-        echo -e "    ${C_DIM}  ──────────   ────────────────────────  ──────────────────${C_RESET}"
-        echo -e "    ${C_DIM}  M (Heavier)  Highest quality           RTX 40/50 series${C_RESET}"
-        echo -e "    ${C_DIM}  L (Balanced) Good quality/perf balance  Any RTX${C_RESET}"
-        echo -e "    ${C_DIM}  K (Lighter)  Better performance         RTX 20/30 series${C_RESET}"
-        echo -e ""
-        echo -e "  ${C_AMBER}  Example — preset M:${C_RESET}"
-        echo -e "  ${C_LIME}DXVK_NVAPI_DRS_NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION=render_preset_m %command%${C_RESET}"
-        echo -e ""
         echo -e "  ${C_CYAN}${C_BOLD}ADVANCED:${C_RESET}"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-sys-configs"   "Ollama env, NVMe udev, CPU governor, hugepages, LD_AUDIT"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-llama-configs" "LD_AUDIT library → ld.so.preload"
+        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-sys-configs"   "Ollama drop-in, udev, governor, LD_PRELOAD, THP (all-in-one)"
+        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-llama-configs" "LD_AUDIT → ld.so.preload only (also runs inside install-sys-configs)"
+        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "restore-sys-configs"   "Undo install-sys-configs (drop-in, udev, ld.so.preload, governor)"
+        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "restore-tune-runtime"  "Reset CPU governor, NVMe scheduler, PCIe PM, VM tunables"
+        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "restore-tune-sysctl"   "Remove 99-zzz-greenboost.conf and reload kernel defaults"
+        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "restore-tune-grub"     "Strip GreenBoost GRUB params and run update-grub"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "profile [sub]"         "Interactive wizard; or: create / show / list / activate / diff"
         echo -e ""
         echo -e "  ${C_CYAN}${C_BOLD}GLOBAL FLAGS:${C_RESET}"
@@ -6952,7 +9172,7 @@ cmd_help() {
         echo -e "  ${C_DIM}Example: sudo VIRT_VRAM_GB=48 NVME_SWAP_GB=64 ./greenboost_setup.sh load${C_RESET}"
         echo -e ""
         echo -e "  ${C_CYAN}${C_BOLD}MONITORING:${C_RESET}"
-        echo -e "  ${C_DIM}greenboost status${C_RESET}"
+        echo -e "  ${C_DIM}greenboost vitals${C_RESET}"
         echo -e "  ${C_DIM}dmesg | grep greenboost | tail -20${C_RESET}"
         echo -e "  ${C_DIM}watch -n1 free -h   # T2 RAM pressure${C_RESET}"
         echo -e "  ${C_DIM}watch -n1 swapon --show   # T3 NVMe usage${C_RESET}"
@@ -6960,330 +9180,17 @@ cmd_help() {
     echo -e ""
 }
 
-# ---- install-mangohud --------------------------------------------------
-# Clone MangoHud from GitHub and build it with GreenBoost integration.
-# Source: https://github.com/flightlessmango/MangoHud
-# Also installs MangoHud.conf with T1/T2/T3 GreenBoost pool metrics.
-
-MANGOHUD_REPO="https://github.com/flightlessmango/MangoHud"
-MANGOHUD_SRC="/opt/MangoHud"
-MANGOHUD_BUILD_DIR="$MANGOHUD_SRC/build"
-MANGOHUD_PREFIX="/usr/local"
-
-# Detecta PCI bus ID del primer GPU NVIDIA para pci_dev en MangoHud.conf
-_mangohud_pci_dev() {
-    nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader 2>/dev/null \
-        | head -1 \
-        | sed 's/^00000000://'   # strip PCI domain prefix (00000000:)
-}
-
-cmd_install_mangohud() {
-    need_root install-mangohud
-
-    local real_user="${SUDO_USER:-$USER}"
-    local real_home
-    real_home="$(getent passwd "$real_user" | cut -d: -f6)"
-
-    gb_header
-    echo -e "  ${C_GRAY}MangoHud — build from source with GreenBoost integration${C_RESET}"
-    echo ""
-
-    # 0. Pre-clean: uninstall any previous GreenBoost-built MangoHud so that
-    #    stale installed binaries/libraries don't linger if source files change.
-    #    Run before touching the source tree so ninja can still find build.ninja.
-    if [[ -d "$MANGOHUD_BUILD_DIR" ]]; then
-        gb_step "Removing previous MangoHud install..."
-        { ninja -C "$MANGOHUD_BUILD_DIR" uninstall >/dev/null 2>&1; } &
-        gb_spin $! "Uninstalling previous MangoHud binaries..."
-        wait $! || true  # non-fatal: may fail if already partially removed
-        rm -rf "$MANGOHUD_BUILD_DIR"
-        gb_ok "Previous MangoHud build cleaned"
-    fi
-
-    # 1. Clone or update MangoHud from GitHub
-    gb_step "Fetching MangoHud from GitHub..."
-    if [[ -d "$MANGOHUD_SRC/.git" ]]; then
-        { git -C "$MANGOHUD_SRC" pull origin master >/dev/null 2>&1; } &
-        gb_spin $! "Updating repository ($MANGOHUD_SRC)..."
-        wait $! || gb_warn_ui "git pull failed — continuing with local version"
-        gb_ok "Repository updated"
-    else
-        rm -rf "$MANGOHUD_SRC"
-        { git clone --depth=1 "$MANGOHUD_REPO" "$MANGOHUD_SRC" >/dev/null 2>&1; } &
-        gb_spin $! "Cloning $MANGOHUD_REPO..."
-        if ! wait $!; then
-            die "git clone failed — check GitHub connectivity"
-        fi
-        gb_ok "Repository cloned to $MANGOHUD_SRC"
-    fi
-
-    # 2. Remove system-packaged MangoHud if present
-    gb_step "Removing system-packaged MangoHud (if any)..."
-    if dpkg -l mangohud 2>/dev/null | grep -q '^ii'; then
-        { apt-get remove -y mangohud 2>/dev/null; } &
-        gb_spin $! "Uninstalling mangohud (apt)..."
-        wait $! || true
-        gb_ok "System mangohud removed"
-    else
-        gb_info "No system-packaged mangohud found (skip)"
-    fi
-
-    # 3. Build dependencies
-    gb_step "Installing MangoHud build dependencies..."
-    {
-        apt-get install -y -qq \
-            meson ninja-build \
-            glslang-tools glslang-dev \
-            libvulkan-dev \
-            libxnvctrl-dev \
-            libwayland-dev \
-            libx11-dev libxrandr-dev \
-            libdbus-1-dev \
-            pkg-config \
-            python3 python3-mako \
-            cmake 2>/dev/null
-    } &
-    gb_spin $! "Installing dependencies..."
-    wait $! || gb_warn_ui "Some packages failed — continuing anyway"
-    gb_ok "Dependencies installed"
-
-    # Detect whether XNVCtrl dev headers were successfully installed.
-    # libxnvctrl-dev may not exist in newer distro repos; fall back gracefully.
-    local _xnvctrl_flag="-Dwith_xnvctrl=disabled"
-    if find /usr/include -name "NVCtrl.h" 2>/dev/null | grep -q .; then
-        _xnvctrl_flag="-Dwith_xnvctrl=enabled"
-    fi
-
-    # python3-mako is required by meson; apt may silently fail on PEP-668-enforced systems.
-    if ! python3 -c "import mako" 2>/dev/null; then
-        gb_step "python3-mako not available — installing via pip..."
-        { pip3 install --break-system-packages --quiet mako 2>/dev/null \
-            || pip3 install --user --quiet mako 2>/dev/null; } &
-        gb_spin $! "pip install mako..."
-        if ! wait $! || ! python3 -c "import mako" 2>/dev/null; then
-            die "python3 mako is required for MangoHud. Install manually: pip3 install mako"
-        fi
-        gb_ok "mako installed via pip"
-    fi
-
-    # 4. Configure build (always fresh: build dir was wiped in step 0)
-    gb_step "Configuring MangoHud (meson)..."
-    local _meson_log
-    _meson_log=$(mktemp /tmp/gb_meson.XXXXX.log)
-    { meson setup \
-            --prefix="$MANGOHUD_PREFIX" \
-            -Dwith_nvml=enabled \
-            -Dwith_x11=enabled \
-            -Dwith_wayland=enabled \
-            "$_xnvctrl_flag" \
-            "$MANGOHUD_BUILD_DIR" "$MANGOHUD_SRC" >"$_meson_log" 2>&1; } &
-    gb_spin $! "Configuring with meson..."
-    if ! wait $!; then
-        echo "" >&2
-        tail -30 "$_meson_log" >&2
-        rm -f "$_meson_log"
-        die "meson configuration failed — see output above"
-    fi
-    rm -f "$_meson_log"
-    gb_ok "meson configuration OK"
-
-    # 5. Compile
-    gb_step "Compiling MangoHud..."
-    local _ninja_log
-    _ninja_log=$(mktemp /tmp/gb_ninja.XXXXX.log)
-    local _cpus
-    _cpus=$(nproc)
-    { ninja -C "$MANGOHUD_BUILD_DIR" -j"$_cpus" >"$_ninja_log" 2>&1; } &
-    gb_spin $! "Compiling with ninja -j${_cpus}..."
-    if ! wait $!; then
-        echo "" >&2
-        tail -40 "$_ninja_log" >&2
-        rm -f "$_ninja_log"
-        die "ninja build failed — see output above"
-    fi
-    rm -f "$_ninja_log"
-    gb_ok "Build complete"
-
-    # 6. Install
-    gb_step "Installing MangoHud to $MANGOHUD_PREFIX..."
-    { ninja -C "$MANGOHUD_BUILD_DIR" install >/dev/null 2>&1; } &
-    gb_spin $! "Installing..."
-    wait $! || die "MangoHud install failed"
-    { ldconfig 2>/dev/null; } &
-    gb_spin $! "Updating ldconfig..."
-    wait $! || true
-    gb_ok "MangoHud installed to $MANGOHUD_PREFIX"
-
-    # 7. Install MangoHud.conf with GreenBoost integration
-    gb_step "Installing MangoHud.conf with GreenBoost integration..."
-    local _conf_dir="$real_home/.config/MangoHud"
-
-    mkdir -p "$_conf_dir"
-    cat > "$_conf_dir/MangoHud.conf" << CONFEOF
-# MangoHud config — GreenBoost integration
-# Generated by: sudo ./greenboost_setup.sh install-mangohud
-
-# GPU stats (NVML reports GreenBoost virtual pool size when shim is active)
-gpu_stats
-gpu_load_change
-gpu_temp
-gpu_power
-gpu_core_clock
-gpu_mem_clock
-vram
-
-# CPU
-cpu_stats
-cpu_temp
-
-# Framerate
-fps
-frametime
-frame_timing
-
-# Overlay background
-background_alpha=0.5
-
-# GreenBoost: Vulkan layer status, T1/T2 pool config, live T2/T3 usage
-exec=[ "\${GREENBOOST_VULKAN:-0}" = "1" ] && { P=\$(cat /sys/module/greenboost/parameters/physical_vram_gb 2>/dev/null||echo ?); V=\$(cat /sys/module/greenboost/parameters/virtual_vram_gb 2>/dev/null||echo ?); printf "GB Layer ON  T1=%sGB T2=%sGB" "\$P" "\$V"; } || printf "GB Layer OFF"
-exec=awk 'BEGIN{u="?";a="?"} /T2 allocated/{match(\$0,/: *([0-9]+)/,x);u=x[1]} /T2 available/{match(\$0,/: *([0-9]+)/,x);a=x[1]} END{printf "GB T2: %s used / %s MB avail",u,a}' /sys/class/greenboost/greenboost/status 2>/dev/null || printf "GB T2: N/A"
-exec=awk '/T3 allocated/{match(\$0,/: *([0-9]+)/,a); printf "GB T3: %s MB NVMe",a[1]; exit}' /sys/class/greenboost/greenboost/status 2>/dev/null
-CONFEOF
-
-    chown -R "$real_user:$real_user" "$_conf_dir"
-    gb_ok "MangoHud.conf installed to $_conf_dir/"
-
-    # 8. Show Steam launch commands + MangoHud OSD hint
-    cmd_steam_launch_info
-    _mangohud_steam_hint
-}
-
-cmd_uninstall_mangohud() {
-    need_root uninstall-mangohud
-
-    local real_user="${SUDO_USER:-$USER}"
-    local real_home
-    real_home="$(getent passwd "$real_user" | cut -d: -f6)"
-
-    gb_header
-    echo -e "  ${C_CYAN}${C_BOLD}Remove MangoHud${C_RESET}"
-    echo -e "  ${C_DIM}Removes MangoHud binaries, libraries, and GreenBoost MangoHud.conf.${C_RESET}"
-    echo -e ""
-    local choice
-    read -r -p "  Remove MangoHud now? [Y/n] " choice
-    if [[ "$choice" =~ ^[Nn] ]]; then
-        gb_info "Skipping."
-        return
-    fi
-
-    # Uninstall via ninja if the build directory is still present
-    if [[ -d "$MANGOHUD_BUILD_DIR" ]]; then
-        gb_step "Uninstalling MangoHud (ninja uninstall)..."
-        { ninja -C "$MANGOHUD_BUILD_DIR" uninstall >/dev/null 2>&1; } &
-        gb_spin $! "Removing installed files..."
-        wait $! || gb_warn_ui "ninja uninstall reported errors — continuing"
-        gb_ok "MangoHud binaries/libraries removed"
-    else
-        gb_warn_ui "Build directory $MANGOHUD_BUILD_DIR not found — skipping ninja uninstall"
-    fi
-
-    # Remove source tree and build directory
-    if [[ -d "$MANGOHUD_SRC" ]]; then
-        rm -rf "$MANGOHUD_SRC"
-        gb_ok "Removed source tree: $MANGOHUD_SRC"
-    fi
-    if [[ -d "$MANGOHUD_BUILD_DIR" ]]; then
-        rm -rf "$MANGOHUD_BUILD_DIR"
-        gb_ok "Removed build directory: $MANGOHUD_BUILD_DIR"
-    fi
-
-    # Remove MangoHud.conf installed by GreenBoost
-    local _conf="$real_home/.config/MangoHud/MangoHud.conf"
-    if [[ -f "$_conf" ]]; then
-        rm -f "$_conf"
-        gb_ok "Removed MangoHud.conf: $_conf"
-    fi
-
-    ldconfig 2>/dev/null || true
-    gb_ok "MangoHud uninstalled."
-}
-
-cmd_steam_launch_info() {
-    echo ""
-    echo -e "  ${C_CYAN}${C_BOLD}━━━ GreenBoost Proton — install location ━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
-    echo ""
-    local _gpw_path=""
-    for _d in \
-        "$HOME/.local/share/Steam/compatibilitytools.d/greenboost-proton" \
-        "$HOME/.steam/root/compatibilitytools.d/greenboost-proton" \
-        "$HOME/.local/share/Steam/compatibilitytools.d/greenboost-proton-wayland" \
-        "$HOME/.steam/root/compatibilitytools.d/greenboost-proton-wayland"
-    do
-        [[ -d "$_d" ]] && _gpw_path="$_d" && break
-    done
-    if [[ -n "$_gpw_path" ]]; then
-        echo -e "  ${C_LIME}✓${C_RESET}  Installed at:  ${C_LIME}${C_BOLD}$_gpw_path${C_RESET}"
-    else
-        echo -e "  ${C_AMBER}⚠${C_RESET}  Not installed — run: ${C_CYAN}greenboost_proton/install.sh${C_RESET}"
-    fi
-    echo ""
-    echo -e "  ${C_CYAN}${C_BOLD}━━━ Required: select the Proton version in Steam ━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
-    echo ""
-    echo -e "  ${C_VIOLET}◈${C_RESET}  Right-click the game → ${C_BOLD}Properties → Compatibility${C_RESET}"
-    echo -e "     Check ${C_BOLD}\"Force the use of a specific Steam Play compatibility tool\"${C_RESET}"
-    echo -e "     and select ${C_LIME}${C_BOLD}GreenBoost Proton${C_RESET}"
-    echo ""
-    echo -e "  ${C_CYAN}${C_BOLD}━━━ Enable per game in Steam launch options ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
-    echo ""
-    echo -e "  ${C_AMBER}▸ With HDR:${C_RESET}"
-    echo -e "  ${C_LIME}PROTON_ENABLE_HDR=1 %command%${C_RESET}"
-    echo ""
-    echo -e "  ${C_AMBER}▸ With DLSS Super Resolution preset override:${C_RESET}"
-    echo ""
-    echo -e "    ${C_DIM}${C_GRAY}  Preset       Quality                   Best for${C_RESET}"
-    echo -e "    ${C_DIM}${C_GRAY}  ──────────   ────────────────────────  ──────────────────${C_RESET}"
-    echo -e "    ${C_DIM}${C_GRAY}  M (Heavier)  Highest quality           RTX 40/50 series${C_RESET}"
-    echo -e "    ${C_DIM}${C_GRAY}  L (Balanced) Good quality/perf balance  Any RTX${C_RESET}"
-    echo -e "    ${C_DIM}${C_GRAY}  K (Lighter)  Better performance         RTX 20/30 series${C_RESET}"
-    echo ""
-    echo -e "  ${C_AMBER}  Example — preset M:${C_RESET}"
-    echo -e "  ${C_LIME}DXVK_NVAPI_DRS_NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION=render_preset_m %command%${C_RESET}"
-    echo ""
-}
-
-# ---- MangoHud OSD hint -------------------------------------------------
-# Shown after install-mangohud and via steam-launch-guide.
-_mangohud_steam_hint() {
-    echo ""
-    echo -e "  ${C_CYAN}${C_BOLD}━━━ Show MangoHud benchmark OSD in Steam ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
-    echo ""
-    echo -e "  ${C_AMBER}▸ Use this command in Steam launch options to show the MangoHud OSD:${C_RESET}"
-    echo ""
-    echo -e "  ${C_LIME}${C_BOLD}MANGOHUD=1 %command%${C_RESET}"
-    echo ""
-    echo -e "  ${C_DIM}Combined with HDR:${C_RESET}"
-    echo -e "  ${C_LIME}MANGOHUD=1 PROTON_ENABLE_HDR=1 %command%${C_RESET}"
-    echo ""
-    echo -e "  ${C_DIM}Right-click the game → Properties → General → Launch Options${C_RESET}"
-    echo ""
-}
-
 # ---- install-deps ------------------------------------------------------
-# Install all Ubuntu packages needed for GreenBoost v2.8.2 + ExLlamaV3
+# Install all Ubuntu packages needed for GreenBoost v2.9 + ExLlamaV3
 
 cmd_install_build_deps() {
     need_root install-deps
 
-    printf "  ${C_CYAN}❯${C_RESET}  ${C_DIM}Updating package lists...${C_RESET}"
-    apt-get update -qq 2>/dev/null
-    printf "\r%*s\r" "$(tput cols 2>/dev/null || echo 80)" ""
-
     # Minimal packages required to build and DKMS-register the kernel module.
-    # No AI libraries, no Python, no CUDA — those go in cmd_install_optional_pkgs.
+    # No AI libraries, no Python, no CUDA - those go in cmd_install_optional_pkgs.
     local _pkgs=(
         build-essential gcc gcc-multilib make git curl wget
         "linux-headers-$(uname -r)"
-        pkg-config sysfsutils liburing-dev
         kmod dkms
     )
     # CPU vendor-specific microcode (safe to install on any machine)
@@ -7295,33 +9202,51 @@ cmd_install_build_deps() {
         _pkgs+=(amd64-microcode)
     fi
 
-    # Install with live APT progress bar via APT::Status-Fd
-    local _fifo
-    _fifo=$(mktemp -u /tmp/gb_apt_XXXXXX)
-    mkfifo "$_fifo"
-
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        -o "APT::Status-Fd=3" \
-        "${_pkgs[@]}" 2>/dev/null 3>"$_fifo" &
-    local _apt_pid=$!
-
-    local _pct=0 _pkg=""
-    while IFS= read -r _line; do
-        if [[ "$_line" == pmstatus:* ]]; then
-            IFS=: read -r _ _pkg _pct _msg <<< "$_line"
-            _pct=${_pct%%.*}
-            local _filled=$(( _pct * 40 / 100 )) _empty=$(( 40 - _pct * 40 / 100 ))
-            printf "\r  ${C_GRAY}[%3d%%]${C_RESET} ${C_LIME}%s${C_GRAY}%s${C_RESET}  ${C_DIM}%-28s${C_RESET}" \
-                "$_pct" \
-                "$(printf '█%.0s' $(seq 1 "$_filled" 2>/dev/null || true))" \
-                "$(printf '░%.0s' $(seq 1 "$_empty"  2>/dev/null || true))" \
-                "$_pkg"
+    local _missing=()
+    for pkg in "${_pkgs[@]}"; do
+        if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed"; then
+            _missing+=("$pkg")
         fi
-    done < "$_fifo"
+    done
 
-    wait "$_apt_pid" || gb_warn_ui "Some packages failed — check: apt-get install ${_pkgs[*]}"
-    rm -f "$_fifo"
-    printf "\r%*s\r" "$(tput cols 2>/dev/null || echo 80)" ""
+    if [[ ${#_missing[@]} -eq 0 ]]; then
+        gb_ok "Build dependencies already installed"
+    else
+        printf "  ${C_CYAN}❯${C_RESET}  ${C_DIM}Updating package lists...${C_RESET}"
+        apt-get update -qq 2>/dev/null
+        printf "\r%*s\r" "$(tput cols 2>/dev/null || echo 80)" ""
+
+        # Install with live APT progress bar via APT::Status-Fd
+        # Audit F-L4-19: use mktemp -d so the FIFO path is atomically unique;
+        # the old mktemp -u pattern races between name generation and mkfifo.
+        local _fifo_dir _fifo
+        _fifo_dir=$(mktemp -d)
+        _fifo="${_fifo_dir}/apt_progress"
+        mkfifo "$_fifo"
+
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            -o "APT::Status-Fd=3" \
+            "${_missing[@]}" 2>/dev/null 3>"$_fifo" &
+        local _apt_pid=$!
+
+        local _pct=0 _pkg=""
+        while IFS= read -r _line; do
+            if [[ "$_line" == pmstatus:* ]]; then
+                IFS=: read -r _ _pkg _pct _msg <<< "$_line"
+                _pct=${_pct%%.*}
+                local _filled=$(( _pct * 40 / 100 )) _empty=$(( 40 - _pct * 40 / 100 ))
+                printf "\r  ${C_GRAY}[%3d%%]${C_RESET} ${C_LIME}%s${C_GRAY}%s${C_RESET}  ${C_DIM}%-28s${C_RESET}" \
+                    "$_pct" \
+                    "$(printf '█%.0s' $(seq 1 "$_filled" 2>/dev/null || true))" \
+                    "$(printf '░%.0s' $(seq 1 "$_empty"  2>/dev/null || true))" \
+                    "$_pkg"
+            fi
+        done < "$_fifo"
+
+        wait "$_apt_pid" || gb_warn_ui "Some packages failed - check: apt-get install ${_missing[*]}"
+        rm -rf "$_fifo_dir"
+        printf "\r%*s\r" "$(tput cols 2>/dev/null || echo 80)" ""
+    fi
 
     # Ensure cpuid module loads at boot
     if ! grep -q cpuid /etc/modules-load.d/*.conf 2>/dev/null; then
@@ -7331,37 +9256,53 @@ cmd_install_build_deps() {
     gb_ok "Build dependencies installed"
 }
 
+
+# cmd_install_deps - installs all dependencies (build + optional).
+# Called when running 'install-deps' directly; full-install uses
+# cmd_install_build_deps (always) + cmd_install_optional_pkgs (gated).
 cmd_install_optional_pkgs() {
     need_root install-optional-pkgs
+
+    # Restored minimal set of topology/freq tools for GreenBoost profiling
+    local _pkgs=(
+        hwloc libhwloc-dev nvtop
+    )
+    local _os_id
+    _os_id=$(grep -oP '^ID=\K.*' /etc/os-release 2>/dev/null | tr -d '"')
+    if [[ "$_os_id" == "debian" ]]; then
+        _pkgs+=(linux-cpupower linux-perf)
+    else
+        _pkgs+=(cpufrequtils linux-tools-generic "linux-tools-$(uname -r)")
+    fi
+
+    local _missing=()
+    for pkg in "${_pkgs[@]}"; do
+        if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed"; then
+            _missing+=("$pkg")
+        fi
+    done
+
+    if [[ ${#_missing[@]} -eq 0 ]]; then
+        gb_ok "Topology and monitoring tools already installed"
+        return
+    fi
 
     printf "  ${C_CYAN}❯${C_RESET}  ${C_DIM}Updating package lists...${C_RESET}"
     apt-get update -qq 2>/dev/null
     printf "\r%*s\r" "$(tput cols 2>/dev/null || echo 80)" ""
 
-    # Optional AI/compute libraries and tools. Not required to build the kernel
-    # module — only install these for a full AI workstation setup.
-    local _pkgs=(
-        python3 python3-pip python3-dev python3-venv
-        libopenblas-dev libblas-dev liblapack-dev
-        libhwloc-dev hwloc libnuma-dev libomp-dev
-        ocl-icd-opencl-dev
-        nvidia-cuda-toolkit
-    )
-    local _os_id
-    _os_id=$(grep -oP '^ID=\K.*' /etc/os-release 2>/dev/null | tr -d '"')
-    if [[ "$_os_id" == "debian" ]]; then
-        _pkgs+=(linux-cpupower linux-perf nvtop)
-    else
-        _pkgs+=(cpufrequtils linux-tools-generic nvtop "linux-tools-$(uname -r)")
-    fi
-
-    local _fifo
-    _fifo=$(mktemp -u /tmp/gb_apt_XXXXXX)
+    # PR-J/F-L4-19: use mktemp -d so the FIFO path is atomically unique;
+    # the old mktemp -u pattern races between name generation and mkfifo
+    # (an attacker with /tmp write access could pre-create the file).
+    # This call was missed when the same fix landed for cmd_install_build_deps.
+    local _fifo_dir _fifo
+    _fifo_dir=$(mktemp -d)
+    _fifo="${_fifo_dir}/apt_progress"
     mkfifo "$_fifo"
 
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
         -o "APT::Status-Fd=3" \
-        "${_pkgs[@]}" 2>/dev/null 3>"$_fifo" &
+        "${_missing[@]}" 2>/dev/null 3>"$_fifo" &
     local _apt_pid=$!
 
     local _pct=0 _pkg=""
@@ -7378,33 +9319,40 @@ cmd_install_optional_pkgs() {
         fi
     done < "$_fifo"
 
-    wait "$_apt_pid" || gb_warn_ui "Some packages failed — check: apt-get install ${_pkgs[*]}"
+    wait "$_apt_pid" || gb_warn_ui "Some packages failed - check: apt-get install ${_missing[*]}"
+    rm -rf "$_fifo_dir"
     rm -f "$_fifo"
     printf "\r%*s\r" "$(tput cols 2>/dev/null || echo 80)" ""
 
-    gb_ok "Optional AI/compute libraries installed"
-    gb_info "Note: NVIDIA driver 580+ and CUDA 13 must be installed separately"
+    gb_ok "Topology and monitoring tools installed"
 }
 
-# cmd_install_deps — installs all dependencies (build + optional).
-# Called when running 'install-deps' directly; full-install uses
-# cmd_install_build_deps (always) + cmd_install_optional_pkgs (gated).
 cmd_install_deps() {
     cmd_install_build_deps
     cmd_install_optional_pkgs
 }
 
 # ---- full-install ------------------------------------------------------
-# Complete fresh-OS install — run this after a clean Ubuntu install.
+# Complete fresh-OS install - run this after a clean Ubuntu install.
 # Covers: OS deps, kernel module, CUDA shim, all system configs,
 # sysctl tuning, GRUB params, and optional ExLlamaV3 with GreenBoost patches.
-# NVMe swap (T3 tier) is intentionally NOT touched — configure manually before running.
+# NVMe swap (T3 tier) is intentionally NOT touched - configure manually before running.
 
 cmd_full_install() {
     need_root full-install
     GB_STOPPED_SERVICES=""
 
-    # ── Mode selection — cmd_full_install always targets full system setup.
+    # Strip libgreenboost entries from ld.so.preload before spawning any
+    # subprocess.  See cmd_install for rationale.
+    if [[ -f /etc/ld.so.preload ]]; then
+        sed -i '/libgreenboost/d' /etc/ld.so.preload
+        [[ -s /etc/ld.so.preload ]] || rm -f /etc/ld.so.preload
+    fi
+
+    # Capture pre-install system state for potential rollback
+    _gb_backup_create
+
+    # ── Mode selection - cmd_full_install always targets full system setup.
     # Only --module-only overrides this (for scripts / CI / direct invocation).
     GB_INSTALL_MODE="full"
     for _a in "$@"; do
@@ -7415,23 +9363,21 @@ cmd_full_install() {
     local _mode_flag="--module-only"
     [[ "$GB_INSTALL_MODE" == "full" ]] && _mode_flag="--full-install"
 
-    # ── Distro detection: delegate to Rocky/RHEL script on Red Hat-based systems ──
-    if [[ -f /etc/redhat-release ]] || \
-       grep -qiE '^ID_LIKE=.*rhel|^ID_LIKE=.*fedora|^ID=.*rhel|^ID=.*rocky|^ID=.*almalinux|^ID=.*centos|^ID=.*fedora' \
-           /etc/os-release 2>/dev/null; then
+    # ── Distro detection: delegate to per-family scripts ──────────────────
+    local _distro_family
+    _distro_family=$(_detect_distro_family)
+
+    if [[ "$_distro_family" == "fedora" ]]; then
         local rocky_script="$MODULE_DIR/greenboost_setup_rocky.sh"
         [[ -x "$rocky_script" ]] || die "Red Hat-based system detected but $rocky_script not found or not executable."
-        info "Red Hat-based system detected — delegating to greenboost_setup_rocky.sh"
+        info "Red Hat-based system detected (family: fedora) - delegating to greenboost_setup_rocky.sh"
         exec "$rocky_script" full-install "$_mode_flag" "$@"
     fi
 
-    # ── Distro detection: delegate to Arch script on Arch-based systems ──────
-    if [[ -f /etc/arch-release ]] || \
-       grep -qiE '^ID=arch$|^ID=manjaro|^ID=endeavouros|^ID=cachyos|^ID_LIKE=.*arch' \
-           /etc/os-release 2>/dev/null; then
+    if [[ "$_distro_family" == "arch" ]]; then
         local arch_script="$MODULE_DIR/greenboost_setup_arch.sh"
         [[ -x "$arch_script" ]] || die "Arch-based system detected but $arch_script not found or not executable."
-        info "Arch-based system detected — delegating to greenboost_setup_arch.sh"
+        info "Arch-based system detected (family: arch) - delegating to greenboost_setup_arch.sh"
         exec "$arch_script" full-install "$_mode_flag" "$@"
     fi
 
@@ -7453,22 +9399,40 @@ cmd_full_install() {
 
     # ── SHARED PATH: kernel module (runs for both module-only and full) ──────
 
-    # 0 — Purge any previous GreenBoost install to guarantee a clean slate
+    # 0 - Purge any previous GreenBoost install to guarantee a clean slate
     gb_step 0 5 "Purging previous GreenBoost installation (if any)..."
-    do_purge 0
+    if ! do_purge 0; then
+        # Module is stuck in STATE_GOING.  Try to compile + install a fixed .ko
+        # (without rmmod) so the next boot loads correctly and full-install can
+        # proceed.  If compilation fails, fall back to boot cleanup (full wipe).
+        if _try_install_fixed_module; then
+            gb_warn_ui "Fixed module installed as a fallback for this boot."
+        fi
+        # Always schedule boot cleanup regardless of whether the fixed module
+        # compiled.  This ensures the next boot starts with a clean slate:
+        # the cleanup removes any .ko on disk and blocks auto-load so that
+        # full-install can compile a fresh module from scratch.
+        gb_warn_ui "Scheduling boot-time cleanup for a clean start on next boot…"
+        _schedule_boot_cleanup
+        info ""
+        info "  If 'sudo reboot' still hangs (shutdown hook may not have installed), force-reboot:"
+        info "    sync && echo b | sudo tee /proc/sysrq-trigger"
+        info "  (Machine reboots instantly - SSH drops. Wait ~30s then reconnect.)"
+        info "  Or hold the power button 5 seconds."
+        die "Reboot now, then re-run:  sudo ./greenboost_setup.sh full-install"
+    fi
     gb_ok "Previous installation purged"
 
-    # 1 — Build dependencies (minimal — just what's needed to compile the module)
+    # 1 - Build dependencies (minimal - just what's needed to compile the module)
     gb_step 1 5 "Installing build dependencies..."
     cmd_install_build_deps
-    gb_ok "Build dependencies installed"
 
-    # 2 — Build + install kernel module + CUDA shim
+    # 2 - Build + install kernel module + CUDA shim
     gb_step 2 5 "Building and installing kernel module + CUDA shim..."
     GB_SKIP_INSTALL_PURGE=1 cmd_install
     gb_ok "Kernel module + CUDA shim installed"
 
-    # 3 — Load kernel module
+    # 3 - Load kernel module
     gb_step 3 5 "Loading kernel module..."
     cmd_load
     gb_ok "Kernel module loaded"
@@ -7488,27 +9452,25 @@ cmd_full_install() {
 
     # ── FULL ONLY PATH: all system changes applied automatically (user consented by choosing full mode) ───
 
-    # 4 — System configs: Ollama, udev rules, CPU governor service, sysctl, llama.cpp
+    # 4 - System configs: Ollama, udev rules, CPU governor service, sysctl, llama.cpp
     gb_step 4 5 "Installing system configuration files..."
-    gb_info "Applying: Ollama/inference service config (drop-ins, TurboQuant, udev, NVMe, cpu-perf)"
+    gb_info "Applying: Ollama/inference service config (drop-ins, udev, NVMe, cpu-perf)"
     cmd_install_sys_configs
     cmd_install_llama_configs
     gb_ok "System configuration installed"
 
-    # 4b — Optional AI/compute libraries (CUDA toolkit, OpenBLAS, Python, nvtop, etc.)
-    gb_info "Applying: optional packages (cuda-toolkit, openblas, python3-pip, nvtop, cpufrequtils, 32-bit compat)"
     cmd_install_optional_pkgs
     gb_ok "Optional AI/compute libraries installed"
 
 
-    # 5 — System tuning (sysctl + NVMe + CPU governor + THP)
+    # 5 - System tuning (sysctl + NVMe + CPU governor + THP)
     gb_step 5 5 "Applying system tuning..."
     gb_info "Applying: sysctl + NVMe/THP/CPU governor tuning"
     cmd_tune_sysctl
     cmd_tune
     gb_ok "sysctl and runtime tuning applied"
 
-    # 5b — GRUB boot parameters (requires reboot)
+    # 5b - GRUB boot parameters (requires reboot)
     gb_info "Applying: GRUB boot parameters (transparent_hugepage, rcu_nocbs, nohz_full)"
     cmd_tune_grub
     gb_ok "GRUB updated"
@@ -7522,7 +9484,7 @@ cmd_full_install() {
         info "Restarting $svc (was running before install)..."
         systemctl restart "$svc" 2>/dev/null \
             && info "$svc restarted." \
-            || warn "$svc restart failed — run: sudo systemctl restart $svc"
+            || warn "$svc restart failed - run: sudo systemctl restart $svc"
     done
 
     echo ""
@@ -7532,8 +9494,6 @@ cmd_full_install() {
     echo -e ""
     echo -e "  ${C_AMBER}${C_BOLD}⚠  REBOOT REQUIRED${C_RESET} ${C_GRAY}to activate GRUB params + hugepage pre-allocation${C_RESET}"
     echo -e ""
-    gb_info "GreenBoost Proton and MangoHud are gaming tools — not part of full install."
-    gb_info "Install them separately from the interactive menu (options [6]–[9])."
     echo ""
     gb_separator
     echo ""
@@ -7570,7 +9530,42 @@ unset _ARGS _arg _expect_profile
 COMMAND="${1:-}"
 
 # ---------------------------------------------------------------------------
-# cmd_recover — manual crash-recovery entrypoint.
+# cmd_diag - feeder diagnostic tests using gb_feeder_diag.py
+# ---------------------------------------------------------------------------
+cmd_diag() {
+    local subcmd="${1:-all}"
+    local _diag="${MODULE_DIR}/gb_feeder_diag.py"
+    if [[ ! -f "$_diag" ]]; then
+        die "Diagnostic script not found: $_diag (reinstall GreenBoost)"
+    fi
+    if ! command -v python3 &>/dev/null; then
+        die "python3 not found - install Python 3 to run diagnostics"
+    fi
+    case "$subcmd" in
+        feeder|feeder-t1|feeder-t2|feeder-t3|feeder-compute|all|info)
+            ;;  # valid
+        t1|t2|t3|compute)
+            ;;  # also valid (forward directly)
+        *)
+            echo "Usage: greenboost diag [feeder|feeder-t1|feeder-t2|feeder-t3|feeder-compute|all]" >&2
+            echo "       greenboost diag [--ip IP] [--port PORT] [t1|t2|t3|compute|info|all]" >&2
+            exit 1
+            ;;
+    esac
+    # Map feeder-* aliases to bare tier names
+    case "$subcmd" in
+        feeder)         subcmd="all" ;;
+        feeder-t1)      subcmd="t1" ;;
+        feeder-t2)      subcmd="t2" ;;
+        feeder-t3)      subcmd="t3" ;;
+        feeder-compute) subcmd="compute" ;;
+    esac
+    shift
+    python3 "$_diag" "$subcmd" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# cmd_recover - manual crash-recovery entrypoint.
 # Calls /usr/local/sbin/greenboost-recover directly with output on the
 # terminal.  Equivalent to what greenboost-recovery.service runs on boot,
 # but usable after a hard reset without rebooting.
@@ -7589,7 +9584,7 @@ cmd_recover() {
 # Skipped for non-modifying commands (status, unload, help, build).
 # Suppressed when --skip-update-check is passed (offline workstations).
 case "$COMMAND" in
-    install|setup|full-install|install-sys-configs|install-llama-configs|install-mangohud|recover|fix-steam)
+    install|setup|full-install|install-sys-configs|install-llama-configs|recover)
         if [[ $GB_SKIP_UPDATE -eq 0 ]]; then check_update; fi
         echo "" ;;
 esac
@@ -7598,7 +9593,11 @@ case "$COMMAND" in
     # Primary commands
     install)             cmd_install            ;;
     uninstall)           cmd_uninstall          ;;
-    build)               cmd_build              ;;
+    apparmor-uninstall)  cmd_apparmor_uninstall ;;
+    backup)              need_root backup; _gb_backup_create ;;
+    restore)             need_root restore; _gb_backup_restore ;;
+    build|build-info)    cmd_build_info "$@"    ;;
+    compile)             cmd_build              ;;
     load)                cmd_load               ;;
     unload)              cmd_unload             ;;
     setup|full-install)  cmd_full_install "--full-install" "$@"  ;;
@@ -7608,49 +9607,91 @@ case "$COMMAND" in
     tune-sysctl)         cmd_tune_sysctl        ;;
     tune-libs)           cmd_tune_libs          ;;
     tune-all)            cmd_tune_all           ;;
-    status)              cmd_status             ;;
-    vulkan)              cmd_vulkan             ;;
     benchmark)           cmd_benchmark "${@:2}" ;;
     profile)             cmd_profile "${@:2}"   ;;
-    gaming-mode)         cmd_gaming_mode "${@:2}" ;;
+    stop)
+        if [[ "${2:-}" == "feed" ]]; then
+            cmd_feed stop
+        else
+            die "Unknown command: stop ${2:-}"
+        fi
+        ;;
+    feed)                cmd_feed "${@:2}"      ;;
+    connect)             cmd_connect "${@:2}"   ;;
+    disconnect)          cmd_disconnect "${@:2}" ;;
+    cluster)             cmd_cluster            ;;
+    update)
+        case "${2:-}" in
+            feeders) cmd_update_feeders ;;
+            *) die "Usage: greenboost update feeders" ;;
+        esac
+        ;;
+    update-feeders)      cmd_update_feeders     ;;
+    feeders)
+        case "${2:-}" in
+            upgrade-greenboost) cmd_feeders_upgrade_greenboost ;;
+            setup-sudo)         cmd_feeders_setup_sudo ;;
+            diag)               cmd_feeders_diag "${3:-all}" ;;
+            *) die "Usage: greenboost feeders [upgrade-greenboost|setup-sudo|diag]" ;;
+        esac
+        ;;
+    built-stamp)         cmd_built_stamp "${@:2}" ;;
+     
     t3-memory)           cmd_t3_memory "${2:-}" ;;
     clean)
         case "${2:-}" in
-            memory)  cmd_clean_memory ;;
-            *) die "Usage: greenboost clean memory" ;;
+            memory)  gb_warn_ui "'greenboost clean memory' deprecated - use 'greenboost clear memory-pool'"; cmd_clear_memory_pool ;;
+            *) die "Usage: greenboost clear memory-pool" ;;
         esac
         ;;
-    clean-memory)        cmd_clean_memory       ;;
+    clean-memory)        gb_warn_ui "'greenboost clean-memory' deprecated - use 'greenboost clear memory-pool'"; cmd_clear_memory_pool ;;
     logs)                cmd_logs               "${@:2}" ;;
-    proton-logs)         cmd_proton_logs        "${@:2}" ;;
+
     inference-logs)      cmd_inference_logs     "${@:2}" ;;
+    nvtx-logs)           cmd_nvtx_logs          "${@:2}" ;;
+    nvtx)
+        case "${2:-}" in
+            vitals) cmd_nvtx_vitals "${@:3}" ;;
+            *)      die "Usage: greenboost nvtx vitals [--last N] [--filter EV1,EV2] [--feeder-only] [--local-only] [--llm]" ;;
+        esac
+        ;;
     clear)
         case "${2:-}" in
             logs)            cmd_clear_logs ;;
-            proton-logs)     cmd_clear_proton_logs ;;
+
             inference-logs)  cmd_clear_inference_logs ;;
-            *) die "Usage: greenboost clear logs|proton-logs|inference-logs" ;;
+            memory-pool)     cmd_clear_memory_pool ;;
+            nvtx-logs)       cmd_clear_nvtx_logs ;;
+            *) die "Usage: greenboost clear logs|inference-logs|memory-pool|nvtx-logs" ;;
         esac
         ;;
     clean-logs)          cmd_clean_logs         ;;
-    turboquant)          cmd_turboquant "${@:2}" ;;
     show-commands)       cmd_show_commands      ;;
     help|--help|-h)      cmd_help "${@:2}"      ;;
+    turboquant)          cmd_turboquant "${@:2}" ;;
+    gen-inference-config) cmd_gen_inference_config "${@:2}" ;;
+    health-check)        cmd_health_check "${@:2}"  ;;
+    diag)               cmd_diag "${@:2}"    ;;
+    stability)           cmd_stability_monitor "${@:2}" ;;
     # Advanced (kept for compat)
     recover)                cmd_recover               ;;
     install-sys-configs)    cmd_install_sys_configs   ;;
     install-llama-configs)  cmd_install_llama_configs ;;
-    install-vulkan-layer)   cmd_install_vulkan_layer  ;;
-    steam-launch-guide)     cmd_steam_launch_info; _mangohud_steam_hint ;;
-    fix-steam)              cmd_fix_steam             ;;
-    proton-clean)           cmd_proton_clean          ;;
-    install-proton) cmd_install_proton ;;
-    remove-proton)          cmd_uninstall_proton      ;;
-    install-mangohud)       cmd_install_mangohud      ;;
-    uninstall-mangohud)     cmd_uninstall_mangohud    ;;
+    restore-sys-configs)    cmd_restore_sys_configs   ;;
+    restore-tune-runtime)   cmd_restore_tune_runtime  ;;
+    restore-tune-sysctl)    cmd_restore_tune_sysctl   ;;
+    restore-tune-grub)      cmd_restore_tune_grub     ;;
     inference-test)         cmd_inference_test        "${@:2}" ;;
+    test)
+        case "${2:-}" in
+            cluster) exec "$MODULE_DIR/test_cluster_qwen3.sh" "${@:3}" ;;
+            *) die "Usage: greenboost test cluster [--unload]" ;;
+        esac
+        ;;
+    debug)               cmd_debug "${@:2}" ;;
+    vitals)              cmd_debug_vitals "${@:2}" ;;
     # Default: interactive wizard
     "")
         cmd_wizard ;;
-    *) die "Unknown command: '$COMMAND'  — run: $0 help" ;;
+    *) die "Unknown command: '$COMMAND'  - run: $0 help" ;;
 esac

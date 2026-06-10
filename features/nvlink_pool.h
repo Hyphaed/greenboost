@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0
- * GreenBoost v3.0 — NVLink Pooling Feature
+ * GreenBoost v3.0 - NVLink Pooling Feature
  *
  * Aggregates multiple GPU VRAM into a unified T1 pool via NVLink 2.0
  * Used for V100 clusters (cc 7.0) with all-to-all NVLink 2.0 connectivity

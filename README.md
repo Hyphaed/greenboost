@@ -1,8 +1,8 @@
-# GreenBoost : CUDA Memory Orchestrator for NVidia GPUs
+# GreenBoost - CUDA Memory Orchestrator for NVidia GPUs
 
-**Author:** Ferran Duarri  
-**License:** GPL v2 (open-source)  
-**Version:** 2.8.2
+**Author:** Ferran Duarri
+**License:** GPL v2 (open-source) + Commercial (dual licensed)
+**Version:** 2.10
 
 <div align="center">
 
@@ -12,16 +12,51 @@
 
 ---
 
-**Disclaimer:** GreenBoost is an independent open-source project and is not affiliated with, endorsed by, or sponsored by NVIDIA Corporation. NVIDIA, CUDA, GeForce, and RTX are trademarks of NVIDIA Corporation.
+**Disclaimer:** GreenBoost is an independent open-source project and is not
+affiliated with, endorsed by, or sponsored by NVIDIA Corporation. NVIDIA,
+CUDA, GeForce, and RTX are trademarks of NVIDIA Corporation.
 
+**Important:** GreenBoost works alongside your existing NVIDIA drivers - it
+doesn't replace or modify them.
 
-**Important:** GreenBoost works alongside your existing NVIDIA drivers — it doesn't replace or modify them.
-
-Thanks to all the contributors and the open-source community. GreenBoost wouldn't exist without them.
+Thanks to all the contributors and the open-source community. GreenBoost
+wouldn't exist without them.
 
 ---
 
-## 📦 Installation
+## What is GreenBoost?
+
+> Your GPU runs out of VRAM, your model crashes, you buy a bigger GPU.
+> GreenBoost is the third option.
+
+In plain English: GreenBoost tricks CUDA into thinking your **GPU VRAM +
+System RAM + NVMe** are all one giant pool of GPU memory. Your model loads,
+inference runs on the GPU at full speed, and the parts that don't fit in
+VRAM live in your system RAM - fetched on demand over PCIe.
+
+Nothing in your model code changes. No retraining. No quantization (unless
+you want it). It just works with Ollama, llama.cpp, vLLM, PyTorch, and
+anything else that calls `cudaMalloc()`.
+
+### Who is this for?
+
+- **Newcomers to local LLMs:** you have a 12 GB or 16 GB GPU and want to
+  run a 30 B+ model that needs 24 GB. Install GreenBoost, point Ollama at
+  it, done.
+- **Inference engineers:** you want to push context length or batch size
+  past VRAM, without paying a 100× CPU offload penalty. GreenBoost keeps
+  compute on the GPU; only memory crosses PCIe.
+- **Cluster operators:** you have a few workstations with idle VRAM.
+  GreenBoost's cluster mode turns them into "feeders" so one host can
+  borrow VRAM from them over TCP.
+
+If your workload is small enough to fit entirely in VRAM, GreenBoost adds
+no benefit - and adds no overhead either, since the shim only intercepts
+the allocations that overflow.
+
+---
+
+## Quick install
 
 ```bash
 git clone https://gitlab.com/IsolatedOctopi/greenboost.git
@@ -29,92 +64,164 @@ cd greenboost
 sudo ./greenboost_setup.sh
 ```
 
-The installer detects your hardware at runtime and presents a mode choice before making any changes: 
-Full Install; (kernel module + system tuning).
-Light Install; (kernel module only).
+The installer detects your hardware and asks which mode to use:
+
+- **Full Install** - kernel module + system tuning (NVMe scheduler, swap,
+  THP, hugepages). Best on a dedicated AI/ML workstation.
+- **Light Install** - kernel module only. Safer on a daily-driver desktop
+  where you don't want sysctls changed.
+
+If you're inside a container, a VM, or WSL2 (no kernel module possible),
+GreenBoost auto-falls back to **Path B** (no-kmod mode). See
+[CONTAINER_VM_MODE.md](CONTAINER_VM_MODE.md).
 
 ---
 
-## 📚 Documentation
+## Documentation map
 
-| Document | Purpose |
+| Document | When to read it |
 |---|---|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Technical architecture reference |
-| [DOCUMENTATION.md](DOCUMENTATION.md) | Integration guide for AI inference tools |
-| [CONTAINER_VM_MODE.md](CONTAINER_VM_MODE.md) | Docker, VM, WSL2, HPC setup |
-| [GREENBOOST_COMMANDS.md](GREENBOOST_COMMANDS.md) | Full CLI reference |
-| [GREENBOOST_PROTON.md](GREENBOOST_PROTON.md) | Gaming with GreenBoost Proton |
+| [DOCUMENTATION.md](DOCUMENTATION.md) | You want the long-form story - architecture, tiers, cluster, observability, all in one place |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | You're going to modify the code - start here |
+| [CONTAINER_VM_MODE.md](CONTAINER_VM_MODE.md) | Docker, LXC, KVM, WSL2, HPC, Kubernetes |
+| [GREENBOOST_COMMANDS.md](GREENBOOST_COMMANDS.md) | "What does `greenboost cluster` do again?" - full CLI reference |
 | [CHANGELOG.md](CHANGELOG.md) | Version history |
 
 ---
 
-## 🛠️ How It Works
+## How it works
 
-GreenBoost creates a unified memory pool from three physical tiers and presents it to every CUDA application as a single large GPU device, no application changes required.
+GreenBoost stitches three physical storage tiers into one "virtual VRAM"
+that CUDA applications see as a single huge GPU:
 
-GreenBoost intercepts CUDA memory calls so applications see a memory pool with GPU VRAM + System DDR RAM + SSD fallback instead of just GPU VRAM. All computation tensor computation runs on GPU. 
+```
+┌──────────────────────────────────────────────────────────────┐
+│   What your application sees: ONE giant CUDA device          │
+└──────────────────────────────────────────────────────────────┘
+   ▲ cudaMalloc / cuMemAlloc / cuLaunchKernel
+   │
+┌──┴────────────────────────────────────────────────────────────┐
+│ libgreenboost_cuda.so   (LD_PRELOAD shim)                     │
+│  • small allocs → pass through to the NVIDIA driver           │
+│  • large allocs → overflow handler                            │
+└──┬────────────────────────────────────────────────────────────┘
+   │
+   ▼
+ ┌─────────────┐   ┌────────────────────────┐   ┌────────────┐
+ │  T1: VRAM   │ → │  T2: System DDR RAM    │ → │  T3: NVMe  │
+ │  (cudaMalloc│   │ (DMA-BUF pinned pages, │   │ (swap as a │
+ │   real)     │   │  GPU reads over PCIe)  │   │  last fall-│
+ └─────────────┘   └────────────────────────┘   └────────────┘
+```
 
-### Components
+The kernel module (`greenboost.ko`) is the trick: it pins 2 MB hugepages
+of system RAM and hands them to CUDA via `cuImportExternalMemory`
+(zero-copy) or `cuMemHostRegister` (host-mapped). The GPU's PCIe engine
+reads tensors straight from DDR; the CPU never touches the data.
 
-**`greenboost.ko`**, the kernel module. 
-Allocates pinned system DDR pages (2 MB hugepages) and exports them as DMA-BUF file descriptors. The GPU imports these pages as CUDA external memory, zero CPU involvement in data movement. A watchdog thread monitors RAM and NVMe pressure.
-
-**`libgreenboost_cuda.so`**, the CUDA shim. 
-Intercepts CUDA calls. 
-Small allocations pass through to the NVIDIA driver. 
-Large ones that overflow T1 VRAM are redirected to T2 DDR via the kernel module. 
-A phase detector (`INIT → MODEL_LOAD → INFERENCE → STEADY`) automatically classifies large allocations as KV cache during inference and keeps them in T1 at full GPU bandwidth. T3 local NVMe acts as a fallback memory tier, loading there the layers that do not fit on T1+T2, yet is far slower and greenboost avoid its use.
-
-**`libVkLayer_greenboost.so`**, the Vulkan layer. Reports the inflated T1+T2 VRAM total to Vulkan games and routes overflow allocations to T2 DDR via DMA-BUF when T1 is full.
-
----
-
-## 🐳 Using GreenBoost in Containers, VMs, and WSL2
-
-For environments where greenboost kernel module cannot be loaded; Docker, LXC, KVM guests, WSL2, shared HPC clusters, we have the Path B, which pins anonymous system RAM pages directly through the CUDA driver with no kernel module required. 
-
-Jerry Nguyen's contribution (see Contributors), brought the solution for those scenarios.
-
-See **[CONTAINER_VM_MODE.md](CONTAINER_VM_MODE.md)** for setup instructions specific to your environment.
-
----
-
-## 🛡️ GreenBoost Vs CPU Offload
-
-Some AI tools try to speed up by offloading tensor computations to your CPU when the GPU runs out of memory. A beautiful idea, but not a proper solution:
-
-Modern CPUs aren't built for heavy tensor computation. Trying to run tensor computation on them creates a massive bottleneck, your CPU becomes the limiting factor, local AI inference slows down.
-
-GreenBoost takes a different approach: instead of moving computation to the CPU, it orchestrates memory flow between T1+T2+T3 (GPU VRam + System DDR Ram + NVMe or other disk solution) and lets the GPU do all the tensor computation. Since GPUs have specialized cores to perform those tasks. The GPU simply reaches across your PCIe connection to grab data from system RAM as needed, much faster than waiting for the CPU to do the work.
-
----
-
-## 🎮 Gaming with GreenBoost (Alpha/Beta)
-
-This feature was released at alpha/beta stage. I did not plan to release v2.8 that early. However, I needed to make some changes to avoid infringing trademarks, which led me to push a "developer version" as the main version. 
-Greenboost was made to enhance AI local inference, not to boost gaming. Greenboost vulkan layer + Greenboost proton is a byproduct of original greenboost project.
-
-The final goal of GreenBoost vulkan layer + Greenboost Proton is to also be able to use the CUDA pool for games. 
-
-**To enable it for a Steam game:**
-1. Right-click the game → **Properties**
-2. Go to **Compatibility**
-3. Select **"GreenBoost Proton"**
+**Two big things make this practical:**
+1. The shim has a *phase detector* (`INIT → MODEL_LOAD → INFERENCE → STEADY`)
+   that learns when KV cache is being allocated and pins it in T1 so
+   attention runs at full GPU bandwidth.
+2. Computation is **always on the GPU.** GreenBoost moves memory, never
+   compute. CPU offload is what other tools do; CPU offload turns a 50
+   tok/s setup into a 2 tok/s setup. GreenBoost stays at ~95 % of native
+   GPU speed for the parts that fit, and degrades gracefully for the rest.
 
 ---
 
-## 🧠 Contributors
-- **Alan Sill** ([@alansill](https://gitlab.com/alansill)), contributed with setup scripts for Red Hat–based systems (Rocky Linux, AlmaLinux, RHEL)
-- **Jerry Nguyen** ([@phubao](https://gitlab.com/phubao)), contributed with a kernel-module-free path for containers and VMs.
-- **Giuseppe Marco Randazzo** ([@gmrandazzo](https://gitlab.com/gmrandazzo)), contributed with Debian Trixie support and Linux 6.12+ compatibility fixes
-- **Alexey Masolov** ([@alexeymasolov](https://gitlab.com/alexeymasolov)), contributed with fixes for PyTorch and vLLM on modern systems
+## Containers, VMs, WSL2: Path B
+
+Some environments don't let you load kernel modules - Docker without
+`--privileged`, KVM guests, WSL2, shared HPC nodes. In those, GreenBoost
+runs in **Path B** mode: it skips `greenboost.ko` entirely and pins host
+memory through `cuMemHostRegister`. Slightly higher per-allocation cost
+(no zero-copy import) but otherwise the same behaviour.
+
+Jerry Nguyen contributed this path. See
+[CONTAINER_VM_MODE.md](CONTAINER_VM_MODE.md).
 
 ---
 
-## 📜 License
+## Cluster mode - borrow VRAM from other machines
 
-**GPL v2, open-source.** If you fork, modify, or reference this project, please credit Ferran Duarri.
+Got a couple of workstations with idle VRAM?  Each one runs:
+
+```bash
+sudo greenboost feed start
+```
+
+On your "host" (the one doing inference), each remote machine becomes a
+**feeder**:
+
+```bash
+sudo greenboost connect 192.168.1.42
+sudo greenboost connect 192.168.1.43
+greenboost cluster        # interactive TUI showing all feeders + status
+```
+
+The shim treats the local VRAM + every feeder's VRAM + every feeder's DDR
+as **one virtual device.** Layer weights that overflow are placed on the
+fastest tier available - feeder GPU VRAM beats local DDR. Kernel launches
+are dispatched to whichever feeder owns the data ("data-driven dispatch")
+so compute happens close to memory.
+
+The cluster fabric is secured with:
+- Pre-shared key (PSK) auth + HKDF-derived session keys
+- Per-message MAC (proto v4) to prevent tampering
+- LAN-only bind by default; you opt in to WAN explicitly
+- AppArmor profiles for the daemon
+
+Full security model: [DOCUMENTATION.md § Cluster security](DOCUMENTATION.md).
+
+---
+
+## GreenBoost vs CPU offload - why the choice matters
+
+Some tools (llama.cpp `-ngl`, accelerate `device_map="auto"`) handle VRAM
+overflow by running parts of the model on the CPU. That works but it's
+*slow* - typically 20-50× slower than the GPU portion. Inference becomes
+CPU-bound.
+
+GreenBoost goes the other way: **compute stays on the GPU, only memory
+moves.** When a kernel needs a weight that lives in DDR, the GPU reads it
+over PCIe (≈25 GB/s on PCIe 4.0 x16, ≈55 GB/s on PCIe 5.0). The CPU is
+not in the data path.
+
+End-to-end, you get something close to "GPU with 2-4× more VRAM" rather
+than "GPU + CPU painfully sharing the work."
+
+---
+
+## Contributors
+
+- **Alan Sill** ([@alansill](https://gitlab.com/alansill)) - setup scripts
+  for Red Hat–based systems (Rocky Linux, AlmaLinux, RHEL).
+- **Jerry Nguyen** ([@phubao](https://gitlab.com/phubao)) - kernel-
+  module-free path for containers and VMs.
+- **Giuseppe Marco Randazzo** ([@gmrandazzo](https://gitlab.com/gmrandazzo)) -
+  Debian Trixie support and Linux 6.12+ compatibility fixes.
+- **Alexey Masolov** ([@alexeymasolov](https://gitlab.com/alexeymasolov)) -
+  PyTorch and vLLM compatibility fixes on modern systems.
+
+---
+
+## License
+
+**GPL v2** - same licensing model as NVIDIA's official open-source
+kernel modules (`github.com/NVIDIA/open-gpu-kernel-modules`).
+
+Individual source files are MIT-licensed; when linked together into a
+Linux kernel module the resulting binary is dual MIT / GPLv2.  See
+`LICENSE` for the full text.
+
+If you fork, modify, or reference this project, please credit Ferran
+Duarri.
 
 ```
 Copyright (C) 2026 Ferran Duarri
 ```
+
+GreenBoost is an independent open-source project and is not affiliated
+with, endorsed by, or sponsored by NVIDIA Corporation. NVIDIA, CUDA,
+GeForce, and RTX are trademarks of NVIDIA Corporation.

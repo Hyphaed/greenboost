@@ -3,6 +3,9 @@
 *.o
 *.mod
 *.mod.c
+# Go module files must not be caught by *.mod above
+!go.mod
+!go.sum
 *.symvers
 *.order
 .*.cmd
@@ -19,22 +22,25 @@ nano.*.save
 *.swo
 *~
 
-# AI tool residual files
+# Scratch / planning notes (local only)
 *plan.md
 plan*.md
 apply_fixes.sh
 
 # AI assistant local context (never commit)
 .claude/
+.claude-sessions/
 .mcp-cache/
 CLAUDE.md
 MEMORY.md
 memory/
 *.claude.md
 .claude_*
-
-# Continue AI assistant (local config, never commit)
 .continue/
+
+# Internal development notes (kept local, not shipped)
+skills_needed.md
+AUDIT_*.md
 
 # Python
 __pycache__/

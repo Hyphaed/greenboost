@@ -1,4 +1,4 @@
-# GreenBoost Helm Values — 200-node V100 NVLink Cluster
+# GreenBoost Helm Values - 200-node V100 NVLink Cluster
 # 8× V100 SXM2 32 GB per node, 384 GB DDR4 ECC, Lustre T3, InfiniBand 200 Gb/s
 # Apply with: helm upgrade --install greenboost-dra ./deployments/helm/greenboost-dra-driver \
 #               -f values-v100-cluster.yaml
@@ -16,9 +16,9 @@ greenboost:
   # NVLink pool: V100 8-GPU node, all-to-all NVLink 2.0 (no NVSwitch)
   nvlinkPool: true
   nvlinkGpuCount: 8
-  # ECC DDR4 — avoid THP which can be unreliable with ECC
+  # ECC DDR4 - avoid THP which can be unreliable with ECC
   useHugepages: false
-  # V100 cc 7.0 — cuMemAllocAsync requires cc >= 8.0, disabled
+  # V100 cc 7.0 - cuMemAllocAsync requires cc >= 8.0, disabled
   cuMemAllocAsync: false
   pcoresOnly: false
   profileName: v100_cluster_node

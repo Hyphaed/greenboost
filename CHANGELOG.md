@@ -2,18 +2,40 @@
 
 ---
 
-## v2.8.2 : 2026-04-16
+## v2.9 : 2026-06-10
 
-⚠️🔥 Crtitical stability fixes
-Critical fixes to bring back greenboost stability.
-Greenboost v2.8 was a rushed version, was a must to make changes to follow NVidia trademark compliance, hence a developer version was released.
+Lately I've been running GreenBoost every day on my own image generation
+pipelines (diffusers). Using a tool for real is the quickest way to spot the
+small stuff that needs fixing, so a lot of this release is just polish.
 
-🧩  Smarter Installation Process
-Refactored installation process and cleaned code. Old versions included extra tools that are now part of an unreleased developer/test suite. Both the Full Install and new Light Install options are now lighter.
-Enhanced missing software detection for Debian, Ubuntu, Fedora, and Arch.
-Fixed code that pointed to Intel dependencies when users had AMD CPUs.
-Backported lightweight installation option from older version. If you only want the core memory management update without system-wide performance tuning, you can now choose "Light Install."
-Added guards for old kernels.
+🧪 **Polish from daily use**
+Daily driving it on my diffuser pipelines turned up small glitches and slow
+spots. Cleaned them up. Loading and running the big models feels steadier now
+and chokes a lot less.
+
+🎮 **Gaming moved out**
+The gaming side of GreenBoost has been taken out into its own separate project,
+still alpha at the moment... Keeps the core small and focused on the thing it
+does best, stretching GPU memory for AI.
+Do not know when I will release Greenboost Gaming Suite,
+Im taking care of other personal project (code related + away from the screen related);
+
+![GreenBoost Gaming Suite - now its own separate alpha project](greenboost_gaming_suite.png)
+
+🌐 **greenboost cluster (alpha/beta)**
+You can now pool the GPU memory and compute of a few machines together and use
+it like one big GPU. Connect a feeder with `sudo greenboost connect <IP>` and
+the overflow layers get stored and run on that machine on their own, no setup
+needed. Watch it live with `greenboost cluster`. Still under development, alpha/beta
+for now.
+
+🗂️ **Lighter install**
+Tidied up the installer, recovered good old options. Better detection of
+missing packages on Debian, Ubuntu, Fedora and Arch.
+
+🐛 **Stability**
+More crash fixes around very large allocations near the edge of capacity, plus
+the hardware auto-tuning maths.
 
 ---
 
@@ -25,7 +47,7 @@ I really shouldn't be near a keyboard right now.
 
 ---
 
-⚖️ **Trademark compliance — project renamed**
+⚖️ **Trademark compliance - project renamed**
 
 This release was made to comply with a trademark notice concerning the use of the NVIDIA wordmark in the project title. The tool has been renamed:
 
@@ -37,14 +59,10 @@ GreenBoost is an independent open-source project and is not affiliated with, end
 ---
 
 🎮 **GreenBoost now works with games**
-A new Vulkan layer exposes the complete GreenBoost CUDA memory pool (T1 GPU VRAM + T2 System DDR RAM) to Proton and games this is an an early beta feature, greenboost was not created for gaming, this is a byproduct of the project.
 
-GreenBoost reports an inflated VRAM total (T1 GPU VRAM + T2 System DDR) to Vulkan. 
 Games that would otherwise hit a VRAM wall, triggering texture pop-in, reduced quality presets, or crashes, can now use the extra headroom.
 
-Then in Steam: right-click a game → Properties → Compatibility → select **GreenBoost Proton**.
 
-**Enable per game in Steam launch options:**
 
 With DLSS Super Resolution preset override:
 
@@ -61,18 +79,16 @@ DXVK_NVAPI_DRS_NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION=render_preset_m %com
 
 With HDR:
 ```
-PROTON_ENABLE_HDR=1 DXVK_NVAPI_DRS_NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION=render_preset_m %command%
 ```
 
-For benchmarking setup (MangoHud configure for greenboost), go to the installation wizard → Gaming → Install MangoHud.
-                                                                                                               
+
 📚 **Added documentation**
 documentation.md
 greenboost_commands.md
 
 🧹 **Code mantainance + cleanup**
 Internal code refactor, dead code paths removed, and general improvements to the
-shim and setup scripts. 
+shim and setup scripts.
 Updated RedHat based OS installation script.
 Added Arch based OS installation script.
 Model tuning tools had been moved into a separate project, this in development at the moment...
@@ -92,12 +108,12 @@ entirely on its own. Two complementary mechanisms:
 1. **Phase detector**: temporal state machine (INIT → MODEL_LOAD → INFERENCE → STEADY)
    classifies every overflow alloc as weights, KV cache, or activations. During
    INFERENCE/STEADY, large allocs (≥ 64 MB, down from 256 MB) receive
-   `GB_ALLOC_KV_CACHE | GB_ALLOC_T1_PRIORITY` — the kernel auto-freezes them in T2
+   `GB_ALLOC_KV_CACHE | GB_ALLOC_T1_PRIORITY` - the kernel auto-freezes them in T2
    LRU and refuses T3 spill.
 
 2. **Adaptive KV reserve**: the shim reserves T1 VRAM headroom for upcoming KV allocs
    while weights are loading. Once KV has been allocated in T1, the reserve collapses
-   proportionally — eliminating the previous double-counting bug where `cuMemGetInfo`
+   proportionally - eliminating the previous double-counting bug where `cuMemGetInfo`
    already reflected the KV allocation but the full reserve was still subtracted.
 
 Set `GREENBOOST_KV_RESERVE_MB` or `GREENBOOST_KV_SIZE_THRESHOLD_MB` to tune.
@@ -124,7 +140,7 @@ microarchitecture of the machine where GreenBoost is installed:
 AVX2 is detected automatically at build time (`/proc/cpuinfo`) and enabled if present.
 Link-time optimization (`-flto`) and dead-code elimination (`--gc-sections --as-needed`)
 produce leaner, faster shared libraries. The shim is built with `-fvisibility=hidden` so
-only the hooked symbols are exported — nothing internal is exposed to the linker.
+only the hooked symbols are exported - nothing internal is exposed to the linker.
 
 This is not a portable binary. It is compiled for the workstation it runs on, maximising
 throughput on the host CPU during shim bookkeeping (hash table probes, phase-detector
@@ -142,7 +158,7 @@ New benchmark and status tools accesible trough the wizard.
 Status;  Show cuda memory pool + system state
 Benchmark; Measure T1/T2/T3 bandwidth
 
-🐛 **`cuMemHostGetDevicePointer_v2` — primary context fix (MR !5)**
+🐛 **`cuMemHostGetDevicePointer_v2` - primary context fix (MR !5)**
 The CUDA shim was resolving the v1 symbol `cuMemHostGetDevicePointer`, which returns
 `CUDA_ERROR_INVALID_CONTEXT (201)` when the application uses the primary context model
 (`cuDevicePrimaryCtxRetain`). PyTorch, vLLM, and most modern ML frameworks use primary
@@ -161,12 +177,12 @@ absent, which is required for the kernel module to compile on Linux 6.12 and abo
 🧠 **Contributors**
 2 new contributors:
 
-- **Giuseppe Marco Randazzo** ([@gmrandazzo](https://gitlab.com/gmrandazzo)) — Debian Trixie
+- **Giuseppe Marco Randazzo** ([@gmrandazzo](https://gitlab.com/gmrandazzo)) - Debian Trixie
   support in `greenboost_setup.sh`; package dependency mapping for Debian testing/unstable
   (`linux-cpupower`, `linux-perf` in place of Ubuntu-specific equivalents); kernel 6.12+
   `MODULE_IMPORT_NS(DMA_BUF)` build-time patch.
 
-- **Alexey Masolov** ([@alexeymasolov](https://gitlab.com/alexeymasolov)) — fix for
+- **Alexey Masolov** ([@alexeymasolov](https://gitlab.com/alexeymasolov)) - fix for
   `cuMemHostGetDevicePointer_v2` primary context compatibility; ensures Path A/B work
   correctly with PyTorch, vLLM, and all frameworks that use `cuDevicePrimaryCtxRetain`.
   Without this, `CUDA_ERROR_INVALID_CONTEXT (201)` caused silent fallback to UVM (Path C),
@@ -187,12 +203,12 @@ Now greenboost can be installed on RedHat based OS thanks to Alan Sill.
 🧠 Contributors
 First external contributors joined in this version
 
-- **Alan Sill** ([@alansill](https://gitlab.com/alansill)) — contributed
+- **Alan Sill** ([@alansill](https://gitlab.com/alansill)) - contributed
   `greenboost_setup_rocky.sh`, a setup script for Red Hat-based systems (Rocky Linux,
   AlmaLinux, RHEL). The Ubuntu script now delegates automatically to Alan's script when a
   Red Hat-based OS is detected at runtime.
 
-- **Jerry Nguyen** ([@phubao](https://gitlab.com/phubao)) — contributed the
+- **Jerry Nguyen** ([@phubao](https://gitlab.com/phubao)) - contributed the
   kernel-module-free overflow path (MR !3): `cuMemHostRegister(DEVICEMAP)` enables
   GreenBoost VRAM extension inside containers, VMs, WSL2, and HPC clusters without requiring
   `greenboost.ko`. Integrated as Path B of the blended shim.
@@ -201,7 +217,7 @@ First external contributors joined in this version
 
 ## v2.4 : last private release
 v2.4 was the last version developed privately before the project was open-sourced.
-There were no external contributors at this stage — all work was done by the author alone.
+There were no external contributors at this stage - all work was done by the author alone.
 The core cuda memory pool (VRAM + DDR DMA-BUF + NVMe swap), CUDA shim, and Ollama integration
 were functional at this point.
 

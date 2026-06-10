@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""fix_nvidia_hook.py — Fix kmt-apt-hook syntax error and purge stale nvidia-580 packages."""
+"""fix_nvidia_hook.py - Fix kmt-apt-hook syntax error and purge stale nvidia-580 packages."""
 
 import os
 import subprocess
 import sys
+import tempfile
 
 from rich.console import Console
 from rich.rule import Rule
@@ -52,19 +53,30 @@ def fix_apt_hook():
     try:
         content = open(APT_HOOK).read()
     except FileNotFoundError:
-        warn(f"{APT_HOOK} not found — skipping")
+        warn(f"{APT_HOOK} not found - skipping")
         return
 
     if OLD_LINE not in content:
         if NEW_LINE in content:
-            ok("Already patched — no change needed")
+            ok("Already patched - no change needed")
         else:
-            warn("Expected line not found — manual inspection required")
+            warn("Expected line not found - manual inspection required")
             info(f"Look at line 44 of {APT_HOOK}")
         return
 
     patched = content.replace(OLD_LINE, NEW_LINE, 1)
-    open(APT_HOOK, "w").write(patched)
+    hook_dir = os.path.dirname(os.path.abspath(APT_HOOK))
+    fd, tmp_path = tempfile.mkstemp(dir=hook_dir, prefix=".kmt-apt-hook.tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(patched)
+        os.rename(tmp_path, APT_HOOK)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise
     ok(f"Patched {APT_HOOK} line 44")
 
     result = subprocess.run(["bash", "-n", APT_HOOK], capture_output=True, text=True)
@@ -88,7 +100,7 @@ def purge_stale_580():
     ]
 
     if not present:
-        ok("No stale nvidia-580 packages found — nothing to purge")
+        ok("No stale nvidia-580 packages found - nothing to purge")
         return
 
     info(f"Purging {len(present)} package(s): {', '.join(present)}")
@@ -111,35 +123,62 @@ def purge_stale_580():
             ok("Purge complete (with suppressed dependency warnings)")
 
 
+def _nvidia_userspace_version() -> str | None:
+    """Return the installed nvidia-smi / driver userspace version, or None."""
+    # Prefer nvidia-smi (works on any NVIDIA system regardless of package manager)
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5
+        )
+        ver = out.stdout.strip().splitlines()[0].strip()
+        if ver:
+            return ver
+    except Exception:
+        pass
+    # Fallback: scan installed dpkg packages for any nvidia-driver-NNN
+    try:
+        out = subprocess.run(["dpkg", "-l"], capture_output=True, text=True, timeout=5)
+        for line in out.stdout.splitlines():
+            if line.startswith("ii") and "nvidia-driver-" in line:
+                # Package name is like "nvidia-driver-595-open"; extract version field
+                parts = line.split()
+                if len(parts) >= 3:
+                    return parts[2]  # installed version column
+    except Exception:
+        pass
+    return None
+
+
 def check_nvidia_mismatch():
     step(3, 3, "NVIDIA driver/library version check")
 
-    # Loaded kernel module version
+    # Loaded kernel module version (field 8, 0-indexed = [7])
     try:
         kmod_ver = open("/proc/driver/nvidia/version").readline().split()[7]
     except Exception:
-        warn("Could not read /proc/driver/nvidia/version — module may not be loaded")
+        warn("Could not read /proc/driver/nvidia/version - module may not be loaded")
         return
 
-    # Installed library version
-    lib_result = subprocess.run(
-        ["dpkg", "-l", "nvidia-driver-595-open"],
-        capture_output=True, text=True
-    )
-    lib_ok = any(l.startswith("ii") for l in lib_result.stdout.splitlines())
-
-    if kmod_ver == "595.58.03" and lib_ok:
-        ok(f"Kernel module and userspace both at 595.58.03 — no mismatch")
+    # Installed userspace version - resolved dynamically (F-L5-13)
+    uspace_ver = _nvidia_userspace_version()
+    if uspace_ver is None:
+        warn(f"Kernel module loaded at [bold]{kmod_ver}[/] but could not determine installed userspace version")
+        info("Run [bold]nvidia-smi[/] manually to check for mismatch.")
         return
 
-    warn(f"Kernel module loaded: [bold]{kmod_ver}[/]  │  Userspace target: [bold]595.58.03[/]")
-    info("A reboot is required to load the 595 kernel module.")
+    if kmod_ver == uspace_ver:
+        ok(f"Kernel module and userspace both at {kmod_ver} - no mismatch")
+        return
+
+    warn(f"Kernel module: [bold]{kmod_ver}[/]  │  Userspace installed: [bold]{uspace_ver}[/]")
+    info("A reboot may be required to load the updated kernel module.")
     info("After reboot, run: [bold]nvidia-smi[/]")
 
 
 def main():
     console.print()
-    console.print(Rule(f"[bold {VIOLET}]GreenBoost — nvidia fix[/]", style=VIOLET))
+    console.print(Rule(f"[bold {VIOLET}]GreenBoost - nvidia fix[/]", style=VIOLET))
     console.print()
 
     require_root()

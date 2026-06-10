@@ -1,0 +1,39 @@
+#!/usr/bin/env bpftrace
+/*
+ * ddr_pressure.bt - early warning when the page allocator falls into
+ * __alloc_pages_slowpath, indicating host DDR pressure that can OOM-kill
+ * the feeder daemon if it persists.
+ *
+ * Audit reference: AUDIT_2026-05-13.md F-L6-03.
+ *
+ * Usage:
+ *   sudo bpftrace observability/ebpf/ddr_pressure.bt
+ *
+ * Output: once per second, the count of slow-path entries and a histogram
+ * of GFP flag patterns over the previous interval.
+ */
+
+BEGIN {
+    /* __alloc_pages_slowpath was inlined/renamed in kernel 6.3+; use the
+     * stable tracepoint instead.  pfn==-1UL means the allocation failed
+     * (slow-path exhausted).  Filter to GreenBoost processes only so
+     * filesystem writeback doesn't inflate the counter. */
+    printf("greenboost ddr_pressure: counting slow-path alloc failures (kernel 6.3+ portable)\n");
+    @last_print = nsecs;
+}
+
+tracepoint:kmem:mm_page_alloc
+/args->pfn == (uint64)-1 &&
+ (comm == "greenboost-netd" || comm == "ollama")/
+{
+    @slowpath_total = count();
+    @gfp_flags = lhist(args->gfp_flags & 0xffff, 0, 0x1000, 0x100);
+}
+
+interval:s:1 {
+    /* Per-second emit + reset gives Prometheus rate() the source it needs. */
+    print(@slowpath_total);
+    print(@gfp_flags);
+    clear(@slowpath_total);
+    clear(@gfp_flags);
+}

@@ -1,13 +1,13 @@
-# GreenBoost — Library Patches
+# GreenBoost - Library Patches
 
 These are the GreenBoost-specific modifications to third-party libraries.
 Apply them after cloning the upstream library into `libraries/`.
 
-## ExLlamaV3 — GreenBoost KV Cache Layer
+## ExLlamaV3 - GreenBoost KV Cache Layer
 
 **Files:**
-- `exllamav3/exllamav3/cache/greenboost.py` — `CacheLayer_greenboost` and `GreenBoostCache`
-- `exllamav3/exllamav3/cache/__init__.py` — exports `CacheLayer_greenboost`, `GreenBoostCache`
+- `exllamav3/exllamav3/cache/greenboost.py` - `CacheLayer_greenboost` and `GreenBoostCache`
+- `exllamav3/exllamav3/cache/__init__.py` - exports `CacheLayer_greenboost`, `GreenBoostCache`
 
 **Apply:**
 ```bash

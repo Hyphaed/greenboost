@@ -57,9 +57,30 @@ devices:
 	)
 
 	specPath := filepath.Join(cdiRoot, cdiSpecFile)
-	if err := os.WriteFile(specPath, []byte(spec), 0644); err != nil {
-		return fmt.Errorf("write CDI spec %s: %w", specPath, err)
+
+	// Atomic write: write to a temp file in the same directory, then rename.
+	// os.WriteFile uses O_TRUNC and leaves a truncated file on crash mid-write.
+	tmp, err := os.CreateTemp(filepath.Dir(specPath), ".greenboost-cdi-*.yaml")
+	if err != nil {
+		return fmt.Errorf("write CDI spec %s: create temp: %w", specPath, err)
 	}
+	tmpName := tmp.Name()
+	defer func() {
+		if tmpName != "" {
+			os.Remove(tmpName)
+		}
+	}()
+	if _, err = tmp.WriteString(spec); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write CDI spec %s: write temp: %w", specPath, err)
+	}
+	if err = tmp.Close(); err != nil {
+		return fmt.Errorf("write CDI spec %s: close temp: %w", specPath, err)
+	}
+	if err = os.Rename(tmpName, specPath); err != nil {
+		return fmt.Errorf("write CDI spec %s: rename: %w", specPath, err)
+	}
+	tmpName = "" // renamed successfully - don't delete in defer
 	return nil
 }
 

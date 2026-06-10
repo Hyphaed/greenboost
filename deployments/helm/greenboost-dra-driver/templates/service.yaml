@@ -21,8 +21,6 @@ spec:
     port: {{ .Values.metricsExporter.port }}
     targetPort: {{ .Values.metricsExporter.port }}
     protocol: TCP
-  - name: health
-    port: 8081
-    targetPort: 8081
-    protocol: TCP
+  # health port: metrics-exporter exposes /health on the same port as metrics
+  # (8081 was never opened by the binary; removed to avoid connection-refused probes)
 {{- end }}

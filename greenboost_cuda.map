@@ -1,20 +1,26 @@
-/* greenboost_cuda.map — GNU ld version script
+/* greenboost_cuda.map - GNU ld version script
  *
  * Ollama (libggml-cuda.so, ollama binary) uses ELF symbol versioning:
  *
- *   cudaMalloc@libcudart.so.13   — CUDA runtime allocation
- *   cudaFree@libcudart.so.13     — CUDA runtime free
+ *   cudaMalloc@libcudart.so.13   - CUDA runtime allocation
+ *   cudaFree@libcudart.so.13     - CUDA runtime free
  *   cudaMemGetInfo@libcudart.so.13
  *   cudaMallocManaged@libcudart.so.13
  *   cudaMallocAsync@libcudart.so.13
- *   dlopen@GLIBC_2.2.5           — used to load libggml-cuda.so (with RTLD_DEEPBIND!)
- *   dlsym@GLIBC_2.2.5            — used for CUDA/NVML GPU discovery
+ *   dlopen@GLIBC_2.2.5           - used to load libggml-cuda.so (with RTLD_DEEPBIND!)
+ *   dlsym@GLIBC_2.2.5            - used for CUDA/NVML GPU discovery
+ *
+ * PyTorch cu12x (2.x+cu128) uses ELF symbol versioning against libcudart.so.12:
+ *
+ *   cudaMalloc@libcudart.so.12
+ *   cudaGetDriverEntryPointByVersion@libcudart.so.12  (added CUDA 11.3)
+ *   ... and the rest of the runtime API
  *
  * Unversioned exports from LD_PRELOAD do NOT satisfy versioned requirements.
  * We must export our hooks under the exact version strings callers require.
  *
  * Exporting dlopen@@GLIBC_2.2.5 lets us strip RTLD_DEEPBIND before Ollama
- * loads libggml-cuda.so — RTLD_DEEPBIND causes libggml-cuda.so to resolve
+ * loads libggml-cuda.so - RTLD_DEEPBIND causes libggml-cuda.so to resolve
  * cudaMalloc from its bundled libcudart (local scope), bypassing our hooks.
  *
  * Exporting dlsym@@GLIBC_2.2.5 lets us intercept Ollama's GPU memory
@@ -22,12 +28,46 @@
  * to report the inflated virtual VRAM size.
  */
 
+/* libcudart.so.13 - default version for all CUDA runtime hooks. */
 libcudart.so.13 {
     global:
+        cudaGetDeviceCount;
+        cudaSetDevice;
+        cudaDeviceGetAttribute;
         cudaMalloc;
         cudaMallocAsync;
         cudaFree;
         cudaMemGetInfo;
+        cudaMemcpy;
+        cudaMemcpyAsync;
+        cudaLaunchKernel;
+        cudaStreamSynchronize;
+        cudaGetDriverEntryPointByVersion;
+        __cudaRegisterFunction;
+};
+
+/* libcudart.so.12 - version node for CUDA-12-era runtime callers (PyTorch cu128).
+ * Lists the PUBLIC names that .symver renames each __gb_*_v12 trampoline to.
+ * This node must come AFTER libcudart.so.13 so the main hook bodies get
+ * @@libcudart.so.13 (default); the trampolines then get @libcudart.so.12. */
+libcudart.so.12 {
+    global:
+        cudaMalloc;
+        cudaMallocAsync;
+        cudaFree;
+        cudaFreeAsync;   /* PR-CC: PyTorch cu128 imports cudaFreeAsync@libcudart.so.12; without this versioned export, frees bypass our bvmm_ht-aware dispatch and gb_t2_overflow_bytes drifts */
+        cudaMemGetInfo;
+        cudaMemcpy;
+        cudaMemcpyAsync;
+        cudaMemPrefetchAsync;
+        cudaLaunchKernel;
+        cudaStreamSynchronize;
+        cudaGetDeviceCount;
+        cudaSetDevice;
+        cudaGetDeviceProperties;
+        cudaGetDeviceProperties_v2;
+        cudaGetDriverEntryPointByVersion;
+        __cudaRegisterFunction;
 };
 
 GLIBC_2.2.5 {
@@ -37,27 +77,88 @@ GLIBC_2.2.5 {
         sysinfo;
 };
 
-/* GB_HOOKS — unversioned exports for ELF interposition via LD_PRELOAD.
+/* GB_HOOKS - unversioned exports for ELF interposition via LD_PRELOAD.
  * Ensures NVML + CUDA memory hooks resolve even when the caller does NOT
  * go through our dlsym hook (e.g. PLT-linked or purego-style function
  * pointers resolved directly from a dlopen handle).
  * This is the critical path for Ollama's Go NVML bindings.
+ *
+ * __gb_*_v12 trampolines are listed here so they are globally visible.
+ * Because GB_HOOKS does not assign a version, the .symver directives in
+ * greenboost_cuda_shim.c win: each __gb_*_v12 is renamed in the dynamic
+ * symbol table to cudaMalloc@libcudart.so.12 etc., which is exactly what
+ * PyTorch cu128 expects.  Without this global: entry the trampolines would
+ * be hidden by the catch-all local: * below.
  * local: * hides every symbol not explicitly listed as global. */
 GB_HOOKS {
     global:
         nvmlDeviceGetMemoryInfo;
         nvmlDeviceGetMemoryInfo_v2;
         nvmlDeviceGetMemoryInfo_v3;
+        cuDeviceGetCount;
+        cuDeviceGet;
+        cuGetProcAddress;
+        cudaMalloc;
+        cudaMallocAsync;
+        cudaFree;
+        /* PR-Z: cudaFreeAsync was DEFINED in the shim as a hook (see
+         * greenboost_cuda_shim.c) but was missing from this map - calls
+         * to cudaFreeAsync went straight to libcudart, bypassing our
+         * bvmm_ht-aware free dispatch.  Caught by tests/test_exported_symbols. */
+        cudaFreeAsync;
+        cudaMemGetInfo;
+        cudaGetDeviceCount;
+        cudaSetDevice;
+        cudaGetDeviceProperties;
+        cudaGetDeviceProperties_v2;
+        cudaDeviceGetAttribute;
+        cudaMemPrefetchAsync;
         cuDeviceTotalMem;
         cuDeviceTotalMem_v2;
+        cuDeviceGetAttribute;
+        cudaDeviceGetAttribute;
         cuMemGetInfo;
         cuMemGetInfo_v2;
         cuMemAlloc_v2;
         cuMemAllocAsync;
+        cuMemAllocFromPoolAsync;
         cuMemFree_v2;
         cuMemFreeAsync;
         cuMemPrefetchAsync;
         cuMemCreate;
+        cuMemRelease;
+        cuMemAddressReserve;
+        cuMemMap;
+        cuMemUnmap;
+        cuMemSetAccess;
+        cudaMemcpy;
+        cudaMemcpyAsync;
+        cuLaunchKernel;
+        cuLaunchKernelEx;
+        /* PR-Z: cuLaunchCooperativeKernel was DEFINED in the shim but missing
+         * from this map - only its _ptds alias was exported.  Caught by
+         * tests/test_exported_symbols. */
+        cuLaunchCooperativeKernel;
+        cudaLaunchKernel;
+        cudaStreamSynchronize;
+        __cudaRegisterFunction;
+        /* PR-Z: cuStreamSynchronize listed here previously but no function
+         * definition exists in greenboost_cuda_shim.c - the linker silently
+         * dropped the entry.  Removed to keep the map honest; if a future
+         * shim needs to hook stream sync from the driver API, add the
+         * function definition first. */
+        /* PR-R/F-S9: per-thread default-stream variants.  Same code as the
+         * unsuffixed entries via __attribute__((alias)) in the .c file. */
+        cudaMemcpyAsync_ptsz;
+        cudaMemPrefetchAsync_ptsz;
+        cudaLaunchKernel_ptsz;     /* PR-LL */
+        cuMemAllocAsync_ptds;
+        cuMemAllocFromPoolAsync_ptds;
+        cuMemFreeAsync_ptds;
+        cuMemPrefetchAsync_ptds;
+        cuLaunchKernel_ptds;
+        cuLaunchKernelEx_ptds;
+        cuLaunchCooperativeKernel_ptds;
     local:
         *;
 };

@@ -98,9 +98,9 @@ features:
 - **112 TB virtual VRAM** (2.2× physical)
 - 200 GB/s HDR InfiniBand fabric for MNNVL
 
-## NVLink V100 Topology Note (goodv11_plan.md audit — BUG-009)
+## NVLink V100 Topology Note (goodv11_plan.md audit - BUG-009)
 
-**V100 uses NVLink 2.0 direct P2P — NOT NVSwitch fabric:**
+**V100 uses NVLink 2.0 direct P2P - NOT NVSwitch fabric:**
 - `nvmlDeviceGetGpuFabricInfo()` → `GPU_FABRIC_STATE_NOT_SUPPORTED` on all V100s
 - NVLink readiness verified by the kubelet plugin via `nvmlDeviceGetP2PStatus()` across all 28 GPU pairs
 - Plugin writes `1` to `/sys/class/greenboost/greenboost/nvlink_ready` after P2P verification

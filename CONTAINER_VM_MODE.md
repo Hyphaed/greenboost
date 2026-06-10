@@ -8,8 +8,8 @@ allocations through four distinct paths, selected automatically at runtime:
 
 | Path | Name | Requires kernel module | Best for |
 |------|------|----------------------|----------|
-| **A0** | cudaImportExternalMemory | Yes — `greenboost.ko` | Bare-metal Linux, best bandwidth (tried first) |
-| **A** | DMA-BUF + HostReg | Yes — `greenboost.ko` | Bare-metal Linux, fallback from A0 |
+| **A0** | cudaImportExternalMemory | Yes - `greenboost.ko` | Bare-metal Linux, best bandwidth (tried first) |
+| **A** | DMA-BUF + HostReg | Yes - `greenboost.ko` | Bare-metal Linux, fallback from A0 |
 | **B** | HostReg no-kernel | No | Containers, VMs, Docker, LXC, KVM |
 | **C** | UVM / cuMemAllocManaged | No (nvidia_uvm.ko only) | Universal last resort |
 
@@ -32,7 +32,7 @@ VRAM overflow using the standard CUDA driver API:
    pointer the application can use normally.
 
 This is the complete core of Path B.  The v2 variant of
-`cuMemHostGetDevicePointer` is used (switched from v1 in MR !5 — fixes CUDA
+`cuMemHostGetDevicePointer` is used (switched from v1 in MR !5 - fixes CUDA
 error 201 on newer drivers).  No other changes were made to this mechanism;
 it works exactly as Jerry proposed.  The key insight from MR !3 is that the
 CUDA driver itself, via `cuMemHostRegister`, can pin host memory and expose it
@@ -57,7 +57,7 @@ kernels that do not define this flag.
 Every Path B allocation is recorded in the same open-addressed 131 072-slot
 hash map used by Path A and Path C.  This ensures that `cuMemFree_v2` /
 `cudaFree` correctly unregisters the host memory with `cuMemHostUnregister`
-and calls `munmap` — no leak even for apps that free allocations out of order.
+and calls `munmap` - no leak even for apps that free allocations out of order.
 
 ### Transparent fallback ordering (new)
 Path B was inserted *between* Path A and Path C in `gb_overflow_alloc()`.  The
@@ -81,10 +81,10 @@ set `GREENBOOST_NO_HOSTREG=1` to skip Path B entirely.
 ### Debug banner Path A0/A/B/C labels (new)
 `GREENBOOST_DEBUG=1` now prints the status of all four paths at startup:
 ```
-[GreenBoost] Path A0 (cudaImportExtMem) : enabled — cudaImportExternalMemory (best bandwidth)
-[GreenBoost] Path A  (DMA-BUF+kernel)   : enabled — mmap+GB_IOCTL_PIN_USER_PTR+HostReg
-[GreenBoost] Path B  (HostReg/no-kmod)  : available — mmap+cuMemHostRegister (containers/VMs, no greenboost.ko needed)
-[GreenBoost] Path C  (UVM/managed)      : available — cuMemAllocManaged+cuMemAdvise (last resort)
+[GreenBoost] Path A0 (cudaImportExtMem) : enabled - cudaImportExternalMemory (best bandwidth)
+[GreenBoost] Path A  (DMA-BUF+kernel)   : enabled - mmap+GB_IOCTL_PIN_USER_PTR+HostReg
+[GreenBoost] Path B  (HostReg/no-kmod)  : available - mmap+cuMemHostRegister (containers/VMs, no greenboost.ko needed)
+[GreenBoost] Path C  (UVM/managed)      : available - cuMemAllocManaged+cuMemAdvise (last resort)
 ```
 
 ### All v2.7 shim features remain active on Path B
@@ -92,11 +92,11 @@ set `GREENBOOST_NO_HOSTREG=1` to skip Path B entirely.
 - `dlsym` hook intercepting Ollama's `dlopen+dlsym` GPU API lookups
 - `dlopen` hook stripping `RTLD_DEEPBIND`
 - Virtual VRAM inflation hooks (`cuDeviceTotalMem_v2`, `nvmlDeviceGetMemoryInfo`,
-  `nvmlDeviceGetMemoryInfo_v3` — AUD-04)
+  `nvmlDeviceGetMemoryInfo_v3` - AUD-04)
 - `cuMemGetInfo` hook (reports physical VRAM + system RAM pool to CUDA)
-- `cuMemFreeAsync` hook (AUD-03 — ensures async-allocated buffers are correctly
+- `cuMemFreeAsync` hook (AUD-03 - ensures async-allocated buffers are correctly
   released and removed from the hash map)
-- `cuMemAllocAsync` compute-capability gate (AUD-05 — Path B async allocs are
+- `cuMemAllocAsync` compute-capability gate (AUD-05 - Path B async allocs are
   only attempted on cc≥8.0 devices; older GPUs fall back to synchronous paths)
 - `GREENBOOST_ACTIVE` opt-in for lazy-dlopen apps (Ollama, vLLM, PyTorch)
 - Async prefetch worker thread with `MADV_WILLNEED`
@@ -105,7 +105,7 @@ set `GREENBOOST_NO_HOSTREG=1` to skip Path B entirely.
 
 ---
 
-## When to use Path A0/A (DMA-BUF + kernel module) — the standard
+## When to use Path A0/A (DMA-BUF + kernel module) - the standard
 
 **Use Path A0/A (the default) on bare-metal Linux.**
 
@@ -120,11 +120,11 @@ It provides the best possible bandwidth and the most robust integration:
 - **Kernel-controlled memory pressure watchdog.** The kernel module runs a
   kthread that monitors system RAM and NVMe swap pressure.  If the system is
   running low, it signals userspace via eventfd before things become dangerous
-  — something a pure-userspace path cannot do.
+  - something a pure-userspace path cannot do.
 
 - **T3 NVMe tier.** The kernel module manages the Tier 3 NVMe overflow pool
   (`/var/lib/greenboost/t3_store`), which can extend the effective memory to hundreds of
-  gigabytes.  Path B has no T3 equivalent — when System DDR is exhausted it falls
+  gigabytes.  Path B has no T3 equivalent - when System DDR is exhausted it falls
   back to Path C (UVM paging to swap), which is slower and less controlled.
 
 - **`/sys/class/greenboost/greenboost/status` live monitoring.** The sysfs
@@ -143,13 +143,13 @@ Use Path B when you cannot load a custom kernel module:
 
 ### Docker / Podman containers
 Docker containers run in a shared kernel namespace.  You cannot `insmod` a
-custom module inside a container — the host kernel does not allow it (and the
+custom module inside a container - the host kernel does not allow it (and the
 module ABI may differ).  Path B lets GreenBoost work inside CUDA-enabled
 Docker images without any host-side kernel change beyond the NVIDIA Container
 Toolkit being present.
 
 ```bash
-# Inside a Docker container — Path A is impossible, Path B activates automatically
+# Inside a Docker container - Path A is impossible, Path B activates automatically
 docker run --gpus all \
   -e GREENBOOST_ACTIVE=1 \
   -v /usr/local/lib/libgreenboost_cuda.so:/usr/local/lib/libgreenboost_cuda.so \
@@ -158,13 +158,13 @@ docker run --gpus all \
 ```
 
 ### LXC / LXD unprivileged containers
-Same constraint as Docker — custom kernel modules cannot be loaded from within
+Same constraint as Docker - custom kernel modules cannot be loaded from within
 an unprivileged container.
 
 ### KVM / QEMU virtual machines with GPU passthrough
 In a KVM guest with PCI passthrough of an NVIDIA GPU, the guest kernel can
 load `nvidia.ko` and `nvidia-uvm.ko` (the NVIDIA driver), but `greenboost.ko`
-would need to be built against the *guest* kernel — a separate build step that
+would need to be built against the *guest* kernel - a separate build step that
 many users want to avoid.  Path B provides VRAM overflow without needing to
 build and load a guest kernel module.
 
@@ -188,12 +188,12 @@ sysadmin involvement.
 | Feature | Path A0/A (DMA-BUF) | Path B (HostReg) |
 |---------|-----------------|-----------------|
 | Hugepages | Kernel-allocated, guaranteed 2 MB | Best-effort `MAP_HUGETLB` (may fall back to 4 K) |
-| T3 NVMe tier | Yes — kernel watchdog + swap subsystem | No — System DDR only, then UVM paging |
+| T3 NVMe tier | Yes - kernel watchdog + swap subsystem | No - System DDR only, then UVM paging |
 | Live sysfs monitoring | `/sys/class/greenboost/greenboost/status` | Not available |
 | Memory pressure watchdog | Kernel kthread, eventfd signal | Not available |
 | Physical page pinning | Hard-pinned by kernel (cannot be evicted) | Soft-pinned by CUDA driver (may be re-registered) |
 | PCIe bandwidth (typical) | ~50 GB/s (System DDR dual-channel, pinned hugepages) | ~32–45 GB/s (depends on page size and TLB miss rate) |
-| Container detection | N/A | Cached at startup (AUD-08) — no per-alloc overhead |
+| Container detection | N/A | Cached at startup (AUD-08) - no per-alloc overhead |
 | Requires `greenboost.ko` | Yes | No |
 | Works in Docker/VM/WSL2 | No | Yes |
 

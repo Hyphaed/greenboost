@@ -1,15 +1,17 @@
-# GreenBoost v2.8 — Kbuild rules (kernel-internal, not user-facing)
+# GreenBoost v2.8 - Kbuild rules (kernel-internal, not user-facing)
 # Keeping these here prevents kernel Kbuild from auto-generating Makefile.
 
-ccflags-y += -march=native -mtune=native
 ccflags-y += -O2
 ccflags-y += -fno-strict-aliasing
 ccflags-y += -fno-strict-overflow
 ccflags-y += -fno-delete-null-pointer-checks
 ccflags-y += -funroll-loops
 ccflags-y += -fno-common
+ccflags-y += -fprefetch-loop-arrays
+ccflags-y += -Wall
+ccflags-y += -Werror
 
-# greenboost.ko — NVLink pool logic is included directly in greenboost.c
+# greenboost.ko - NVLink pool logic is included directly in greenboost.c
 # via #include "features/nvlink_pool.c" to avoid the Kbuild circular dependency
 # that arises when greenboost.o is both the target and a listed source.
 #

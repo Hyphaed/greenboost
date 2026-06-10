@@ -1,5 +1,5 @@
 #!/bin/bash
-# GreenBoost CUDA shim deploy — rebuilds and reinstalls libgreenboost_cuda.so
+# GreenBoost CUDA shim deploy - rebuilds and reinstalls libgreenboost_cuda.so
 # Run with sudo: sudo ./deploy_fix.sh [--debug] [--no-restart]
 #
 # Options:
@@ -26,7 +26,7 @@ echo "[deploy] Rebuilding CUDA shim..."
 make -C "$MODULE_DIR" shim
 
 echo "[deploy] Installing to $SHIM_DST..."
-cp "$SHIM_SRC" "$SHIM_DST"
+install -m 755 "$SHIM_SRC" "$SHIM_DST"
 ldconfig
 
 if [[ -f "$SVC" ]]; then

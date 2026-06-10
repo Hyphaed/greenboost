@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// GreenBoost DRA driver — implements the real kubeletplugin DRA interface.
+// GreenBoost DRA driver - implements the real kubeletplugin DRA interface.
 // Uses k8s.io/dynamic-resource-allocation/kubeletplugin directly, NOT any
 // NVIDIA wrapper package (which does not exist as a public import).
 
@@ -42,7 +42,7 @@ type GreenBoostDriver struct {
 func NewGreenBoostDriver(cfg DriverConfig) (*GreenBoostDriver, error) {
 	// Validate sysfs path
 	if _, err := os.Stat(cfg.SysfsBase); err != nil {
-		klog.WarningS("GreenBoost sysfs not found — module may not be loaded",
+		klog.WarningS("GreenBoost sysfs not found - module may not be loaded",
 			"path", cfg.SysfsBase, "error", err)
 	}
 
@@ -68,14 +68,22 @@ func (d *GreenBoostDriver) Run(ctx context.Context) error {
 
 	// Write CDI spec so containers can reference greenboost.nvidia.com/vram=pool
 	if err := WriteCDISpec(d.cfg.CDIRoot, d.cfg.SysfsBase); err != nil {
-		klog.WarningS("CDI spec write failed — containers won't get /dev/greenboost",
+		klog.WarningS("CDI spec write failed - containers won't get /dev/greenboost",
 			"error", err)
 	}
 
 	// Start health watcher (NVLink P2P checks, pressure monitoring)
 	hwCtx, hwCancel := context.WithCancel(ctx)
 	defer hwCancel()
-	go d.hwu.Run(hwCtx)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// Log the panic but don't crash the plugin process.
+				klog.ErrorS(nil, "hwu health watcher panicked", "recover", r)
+			}
+		}()
+		d.hwu.Run(hwCtx)
+	}()
 
 	// Publish ResourceSlice every 30s and on state changes
 	ticker := time.NewTicker(30 * time.Second)
@@ -132,12 +140,9 @@ func (d *GreenBoostDriver) publishResourceSlice() error {
 		"virtual.mb", virtualMB,
 	)
 
-	// Update compute_domain_active sysfs if ComputeDomain feature is on
-	if d.cfg.FeatureGates["ComputeDomainAwareTiering"] {
-		if err := d.pool.SetComputeDomainActive(false); err != nil {
-			klog.V(4).InfoS("compute_domain_active write skipped", "error", err)
-		}
-	}
+	// compute_domain_active sysfs management intentionally removed:
+	// hardcoding false here clobbered any workload that enabled compute domains,
+	// overwriting their state every 30 s. Managed by the kernel module directly.
 
 	return nil
 }

@@ -1,0 +1,57 @@
+#!/usr/bin/env bpftrace
+/*
+ * tcp_msg_latency.bt - round-trip latency per GB_MSG_* type on port
+ * GB_NET_PORT (9740), captured from the kernel tcp_sendmsg / tcp_recvmsg
+ * tracepoints.
+ *
+ * Audit reference: AUDIT_2026-05-13.md F-L6-02.
+ *
+ * Usage:
+ *   sudo bpftrace observability/ebpf/tcp_msg_latency.bt
+ *
+ * Output: per-msg-type send-to-recv latency histogram (µs) once Ctrl-C.
+ *
+ * Notes:
+ *   - This is a first-pass approximation: it correlates outbound and
+ *     inbound traffic on port 9740 per-tid, not per-message-id, so
+ *     concurrent in-flight messages on the same tid will report blended
+ *     latencies.  For per-message attribution we'd need a USDT marker
+ *     in netd or libgreenboost_cuda.
+ *   - Filters on dport/sport == 9740.  Adjust if you ran greenboost-netd
+ *     on a non-default port.
+ */
+
+#include <linux/socket.h>
+#include <net/sock.h>
+
+BEGIN {
+    printf("greenboost tcp_msg_latency on :9740 - Ctrl-C to dump\n");
+}
+
+/* skc_dport carries the remote port in network byte order.
+ * On the host (shim side) the feeder's port is the destination: dport==9740.
+ * Key by (remote-addr, remote-port) so dispatcher-thread sends and
+ * recv-thread completions correlate across tids. */
+kprobe:tcp_sendmsg
+/((struct sock *)arg0)->__sk_common.skc_dport == htons(9740)/
+{
+    $sk = (struct sock *)arg0;
+    @send_ns[$sk->__sk_common.skc_daddr, $sk->__sk_common.skc_dport] = nsecs;
+}
+
+/* tcp_cleanup_rbuf fires when data is consumed from the socket buffer -
+ * this measures actual network arrival, not when userspace calls read(). */
+kprobe:tcp_cleanup_rbuf
+/((struct sock *)arg0)->__sk_common.skc_dport == htons(9740)/
+{
+    $sk = (struct sock *)arg0;
+    if (@send_ns[$sk->__sk_common.skc_daddr, $sk->__sk_common.skc_dport]) {
+        @rtt_us = hist((nsecs - @send_ns[$sk->__sk_common.skc_daddr,
+                                          $sk->__sk_common.skc_dport]) / 1000);
+        delete(@send_ns[$sk->__sk_common.skc_daddr, $sk->__sk_common.skc_dport]);
+    }
+}
+
+END {
+    clear(@send_ns);
+}

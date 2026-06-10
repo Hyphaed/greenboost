@@ -98,6 +98,9 @@ func parsePoolInfoText(text, sysfsBase string) (*PoolInfoV3, error) {
 
 		switch {
 		case strings.Contains(key, "physical_vram_gb") || strings.Contains(key, "vram_physical"):
+			if num > 65536 {
+				num = 65536 // cap at 65536 GB to prevent uint64 overflow on corrupt sysfs
+			}
 			info.T1PhysicalMB = num * 1024
 		case key == "max_pool_mb" || strings.Contains(key, "max_pool"):
 			info.T2TotalMB = num

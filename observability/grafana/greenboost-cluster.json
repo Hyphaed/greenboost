@@ -1,0 +1,111 @@
+{
+  "annotations": {"list": []},
+  "description": "GreenBoost cluster overview - T1/T2/T3 usage, feeder health, KV cache hit rate, shim freshness. Generated from AUDIT_2026-05-13.md F-L6-13/15.",
+  "editable": true,
+  "graphTooltip": 0,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Tier usage (MB)",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {"expr": "greenboost_tier_cur_mb{tier=\"T1\"}", "legendFormat": "T1 VRAM"},
+        {"expr": "greenboost_tier_cur_mb{tier=\"T2\"}", "legendFormat": "T2 DDR"},
+        {"expr": "greenboost_tier_cur_mb{tier=\"T3\"}", "legendFormat": "T3 NVMe"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "decmbytes", "custom": {"stacking": {"mode": "normal"}}}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Feeder bandwidth EWMA (MiB/s)",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [
+        {"expr": "greenboost_bw_ewma_mbs", "legendFormat": "{{feeder}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "MBs"}}
+    },
+    {
+      "type": "stat",
+      "title": "Feeder health",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 8},
+      "targets": [{"expr": "greenboost_feeder_health_state", "legendFormat": "{{feeder}}"}],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {"type": "value", "options": {"0": {"text": "HEALTHY",    "color": "green"}}},
+            {"type": "value", "options": {"1": {"text": "DEGRADED",   "color": "yellow"}}},
+            {"type": "value", "options": {"2": {"text": "UNHEALTHY",  "color": "orange"}}},
+            {"type": "value", "options": {"3": {"text": "QUARANTINE", "color": "red"}}},
+            {"type": "value", "options": {"4": {"text": "DISABLED",   "color": "purple"}}}
+          ]
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Shim staleness (seconds)",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 8},
+      "targets": [{"expr": "greenboost_shim_staleness_s"}],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"value": null, "color": "green"},
+              {"value": 30,   "color": "yellow"},
+              {"value": 120,  "color": "red"}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "KV dedup hit rate (hits/s)",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 8},
+      "targets": [
+        {"expr": "rate(greenboost_shim_kv_dedup[5m])", "legendFormat": "dedup hits/s"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "reqps"}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Eviction + cold demotions",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
+      "targets": [
+        {"expr": "rate(greenboost_shim_cold_evicts[1m])", "legendFormat": "cold evicts/s"},
+        {"expr": "greenboost_t2_pressure",                "legendFormat": "T2 pressure"},
+        {"expr": "greenboost_swap_pressure",              "legendFormat": "T3 swap pressure"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Heartbeat misses per feeder",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
+      "targets": [
+        {"expr": "increase(greenboost_heartbeat_miss_total[5m])", "legendFormat": "{{feeder}}"}
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["greenboost", "cluster"],
+  "templating": {
+    "list": [
+      {"name": "DS_PROMETHEUS", "label": "Datasource", "type": "datasource", "query": "prometheus", "current": {}}
+    ]
+  },
+  "time": {"from": "now-1h", "to": "now"},
+  "timezone": "browser",
+  "title": "GreenBoost - Cluster Overview",
+  "uid": "greenboost-cluster",
+  "version": 1
+}

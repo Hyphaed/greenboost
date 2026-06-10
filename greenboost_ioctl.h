@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: GPL-2.0-only
- * Copyright (C) 2026 Ferran Duarri. Dual-licensed: GPL v2 + Commercial.
- * GreenBoost v2.8 — Shared IOCTL definitions (kernel + userspace)
+ * Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
+ * GreenBoost v2.8 - Shared IOCTL definitions (kernel + userspace)
  *
  * Works with both #include <linux/ioctl.h> (kernel) and <sys/ioctl.h> (user).
  *
  * Author  : Ferran Duarri
- * License : GPL v2 (open-source) / Commercial — see LICENSE
+ * License : GPL v2 (open-source) / Commercial - see LICENSE
  */
 #ifndef GREENBOOST_IOCTL_H
 #define GREENBOOST_IOCTL_H
@@ -24,19 +24,17 @@
   typedef int32_t  gb_s32;
 #endif
 
-/* Allocation flags — stored in gb_alloc_req.flags */
+/* Allocation flags - stored in gb_alloc_req.flags */
 #define GB_ALLOC_WEIGHTS     (1u << 0)  /* model weight tensor              */
-#define GB_ALLOC_KV_CACHE    (1u << 1)  /* KV cache — never spills to T3,
+#define GB_ALLOC_KV_CACHE    (1u << 1)  /* KV cache - never spills to T3,
 					 * auto-frozen in T2 LRU             */
 #define GB_ALLOC_ACTIVATIONS (1u << 2)  /* ephemeral activation buffer      */
 #define GB_ALLOC_FROZEN      (1u << 3)  /* never evict from T2              */
 #define GB_ALLOC_NO_HUGEPAGE (1u << 4)  /* force 4K (for T3-spillable)      */
 #define GB_ALLOC_T1_PRIORITY (1u << 5)  /* T1-priority: marks buf as KV-like;
 					 * moves to LRU head, sets t1_priority
-					 * bit — weight bufs evicted first    */
-#define GB_ALLOC_KV_COMPRESSED (1u << 6)  /* TurboQuant-compressed KV cache buffer;
-					 * compressed representation — allows
-					 * 3-7× more KV history in T2/T3       */
+					 * bit - weight bufs evicted first    */
+/* bit 6: reserved (GB_ALLOC_KV_COMPRESSED removed) */
 #define GB_ALLOC_SESSION_PROTECTED (1u << 7) /* session-protected: skipped by
 					 * auto-eviction until all unprotected
 					 * candidates are exhausted             */
@@ -48,12 +46,12 @@ struct gb_alloc_req {
 	gb_u32 flags;   /* GB_ALLOC_* flags           (in)  */
 };
 
-/* Pool statistics — three-tier memory hierarchy */
+/* Pool statistics - three-tier memory hierarchy */
 struct gb_info {
-	/* Tier 1 — GPU VRAM (physical, managed by NVIDIA driver) */
+	/* Tier 1 - GPU VRAM (physical, managed by NVIDIA driver) */
 	gb_u64 vram_physical_mb;   /* RTX 5070 physical VRAM             */
 
-	/* Tier 2 — system RAM pool (pinned pages, DMA-BUF exported) */
+	/* Tier 2 - system RAM pool (pinned pages, DMA-BUF exported) */
 	gb_u64 total_ram_mb;       /* total system RAM                   */
 	gb_u64 free_ram_mb;        /* currently free RAM                 */
 	gb_u64 allocated_mb;       /* bytes pinned by GreenBoost (T2)    */
@@ -63,7 +61,7 @@ struct gb_info {
 	gb_u32 active_buffers;     /* live DMA-BUF objects               */
 	gb_u32 oom_active;         /* 1 if safety guard is triggered     */
 
-	/* Tier 3 — NVMe swap (kernel-managed, model page overflow) */
+	/* Tier 3 - NVMe swap (kernel-managed, model page overflow) */
 	gb_u64 nvme_swap_total_mb; /* configured NVMe swap capacity      */
 	gb_u64 nvme_swap_used_mb;  /* swap currently in use              */
 	gb_u64 nvme_swap_free_mb;  /* swap available for model pages     */
@@ -77,54 +75,50 @@ struct gb_info {
 	gb_u32 kv_t2_mb;           /* KV bytes specifically in T2 DDR (subset of
 				    * kv_used_mb; T3 never allowed for KV)       */
 
-	/* TurboQuant KV cache compression stats */
-	gb_u32 kv_compressed_mb;    /* MB saved by TurboQuant compression           */
-	gb_u32 kv_compression_bits; /* active compression bits (0=off, 2/3/4=active) */
-	gb_u32 kv_compression_sessions; /* number of inference sessions using TQ compression */
 	gb_u32 t2_pressure;         /* 0=ok 1=warn(>75%) 2=critical(>90%) T2 pool   */
 
-	/* Phase reset sequencing — shim polls this to detect model-swap resets.
+	/* Phase reset sequencing - shim polls this to detect model-swap resets.
 	 * Incremented each time GB_IOCTL_RESET_PHASE is called (by Synapse CLI or
 	 * the shim itself).  Shim compares against its cached value on every
 	 * GB_KV_REFRESH_INTERVAL alloc boundary; a change triggers a phase reset. */
 	gb_u32 phase_reset_seq;
-	gb_u32 _pad2;               /* maintain 8-byte alignment for total_combined_mb */
+	gb_u32 gaming_mode;         /* 1 when a game session is active          */
 
 	/* Combined view */
 	gb_u64 total_combined_mb;  /* VRAM + System DDR pool + NVMe swap       */
 };
 
-/* Madvise request — advise the kernel on buffer eviction priority */
+/* Madvise request - advise the kernel on buffer eviction priority */
 struct gb_madvise_req {
 	gb_s32 buf_id;  /* buffer id from gb_alloc_req.fd → IDR lookup */
 	gb_u32 advise;  /* GB_MADVISE_* constant                       */
 };
 #define GB_MADVISE_COLD      0   /* demote in LRU (evict sooner)              */
 #define GB_MADVISE_HOT       1   /* promote to LRU head (evict later)         */
-#define GB_MADVISE_FREEZE    2   /* pin — never evict while frozen            */
+#define GB_MADVISE_FREEZE    2   /* pin - never evict while frozen            */
 #define GB_MADVISE_T1_PREFER 3   /* mark as T1-priority (KV-like); moves to
-				  * LRU head, sets t1_priority — weight bufs
+				  * LRU head, sets t1_priority - weight bufs
 				  * are evicted before T1-priority bufs          */
 #define GB_MADVISE_SESSION_PROTECT 4 /* protect this buffer from auto-eviction
 				  * until all unprotected candidates are gone    */
 #define GB_MADVISE_SESSION_DEMOTE  5 /* remove session-protection from buffer */
 
-/* Evict request — push a T2 buffer to T3 (NVMe swap) immediately */
+/* Evict request - push a T2 buffer to T3 (NVMe swap) immediately */
 struct gb_evict_req {
 	gb_s32 buf_id;
 	gb_u32 _pad;
 };
 
-/* Poll-fd request — register a userspace eventfd to receive pressure events.
+/* Poll-fd request - register a userspace eventfd to receive pressure events.
  * Userspace creates the eventfd: efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)
  * then passes it here.  Kernel signals it whenever swap pressure changes.
  */
 struct gb_poll_req {
-	gb_s32 efd;     /* eventfd fd (in — created by caller)         */
+	gb_s32 efd;     /* eventfd fd (in - created by caller)         */
 	gb_u32 _pad;
 };
 
-/* KV cache reservation — how many MB of T1 VRAM to reserve for the KV cache.
+/* KV cache reservation - how many MB of T1 VRAM to reserve for the KV cache.
  * Weights overflow to T2 sooner, leaving T1 headroom so KV cache (which is
  * read+written on every generation step) stays at ~336 GB/s VRAM bandwidth
  * instead of dropping to ~32 GB/s PCIe (T2) or ~1.8 GB/s NVMe (T3).
@@ -149,15 +143,7 @@ struct gb_pin_req {
 	gb_u32 flags;   /* GB_ALLOC_* flags   (in)    */
 };
 
-/* TurboQuant compression config — set via env var or sysfs before inference */
-struct gb_turboquant_req {
-	gb_u32 enabled;      /* 0=off, 1=on                         */
-	gb_u32 bits;         /* quantization bits: 0=auto, 2, 3, 4  */
-	gb_u32 head_dim;     /* attention head dimension (0=auto)    */
-	gb_u32 seed;         /* rotation matrix seed (0=42)          */
-};
-
-/* Dynamic T2 pool cap — set this at startup to cap the T2 DDR RAM pool based
+/* Dynamic T2 pool cap - set this at startup to cap the T2 DDR RAM pool based
  * on currently available system RAM:
  *   systems with < 64 GB RAM: 70% of total RAM
  *   systems with >= 64 GB RAM: 80% of total RAM
@@ -175,7 +161,7 @@ struct gb_pool_cap_req {
 };
 
 /* IOCTL cmds 12 and 13 are reserved.
- * Intentional gap — do not reuse these numbers to preserve ABI stability. */
+ * Intentional gap - do not reuse these numbers to preserve ABI stability. */
 
 /* Structured pool info for Kubernetes DRA kubelet plugin and Prometheus exporter.
  * Returned by GB_IOCTL_GET_POOL_INFO_V3 (cmd 14). All sizes in MB.
@@ -208,14 +194,14 @@ struct gb_pool_info_v3 {
 #define GB_IOCTL_RESET      _IO(  GB_IOCTL_MAGIC, 3)
 #define GB_IOCTL_MADVISE    _IOW( GB_IOCTL_MAGIC, 4, struct gb_madvise_req)
 #define GB_IOCTL_EVICT      _IOW( GB_IOCTL_MAGIC, 5, struct gb_evict_req)
-/* cmd 6: reserved (ABI gap — never allocated; do not reuse) */
+/* cmd 6: reserved (ABI gap - never allocated; do not reuse) */
 #define GB_IOCTL_POLL_FD    _IOW( GB_IOCTL_MAGIC, 7, struct gb_poll_req)
 #define GB_IOCTL_PIN_USER_PTR   _IOWR(GB_IOCTL_MAGIC, 8, struct gb_pin_req)
 #define GB_IOCTL_SET_KV_RESERVE _IOW( GB_IOCTL_MAGIC, 9, struct gb_kv_reserve_req)
-#define GB_IOCTL_SET_TURBOQUANT _IOW(GB_IOCTL_MAGIC, 10, struct gb_turboquant_req)
+/* cmd 10: reserved (SET_TURBOQUANT removed - ABI gap, do not reuse) */
 #define GB_IOCTL_SET_POOL_CAP   _IOWR(GB_IOCTL_MAGIC, 11, struct gb_pool_cap_req)
-/* cmd 12: reserved (ABI gap — do not reuse) */
-/* cmd 13: reserved (ABI gap — do not reuse) */
+/* cmd 12: reserved (ABI gap - do not reuse) */
+/* cmd 13: reserved (ABI gap - do not reuse) */
 #define GB_IOCTL_GET_POOL_INFO_V3 _IOR(GB_IOCTL_MAGIC, 14, struct gb_pool_info_v3)
 /* Increment phase_reset_seq in the kernel; shim detects the change on next
  * GB_KV_REFRESH_INTERVAL boundary and resets g_alloc_phase + g_kv_allocated_t1_bytes.
@@ -232,7 +218,7 @@ struct gb_release_pid_req {
 };
 #define GB_IOCTL_RELEASE_PID      _IOW( GB_IOCTL_MAGIC, 16, struct gb_release_pid_req)
 
-/* Live T3 pool resize — expand or shrink the NVMe backing store cap.
+/* Live T3 pool resize - expand or shrink the NVMe backing store cap.
  * Opens /var/lib/greenboost/t3_store if not already open (enables T3 on demand).
  * cap_mb == 0 means disk-limited (no cap).
  * Requires CAP_SYS_ADMIN.
@@ -243,7 +229,7 @@ struct gb_t3_cap_req {
 };
 #define GB_IOCTL_SET_T3_CAP       _IOWR(GB_IOCTL_MAGIC, 17, struct gb_t3_cap_req)
 
-/* Session priority management — inspired by dmem cgroup foreground-booster.
+/* Session priority management - inspired by dmem cgroup foreground-booster.
  *
  * GB_IOCTL_SESSION_IDLE:   move all T2 buffers owned by caller's PID to LRU
  *   tail so they become preferred eviction candidates under pressure.  Call
@@ -270,6 +256,16 @@ struct gb_session_req {
 /* T2 pool pressure thresholds (System DDR RAM pool saturation) */
 #define GB_T2_PRESSURE_OK         0
 #define GB_T2_PRESSURE_WARN       1   /* >75% T2 pool used */
-#define GB_T2_PRESSURE_CRITICAL   2   /* >90% T2 pool used — auto-evict cold bufs */
+#define GB_T2_PRESSURE_CRITICAL   2   /* >90% T2 pool used - auto-evict cold bufs */
+
+/* Gaming mode - signal that a game is running so inference T2 memory is deprioritized.
+ * active=1: set gaming mode; active=0: clear.  No capability required.
+ * When gaming_mode is active the safety_reserve is doubled and all non-frozen,
+ * non-session-protected T2 buffers are moved to the LRU tail. */
+struct gb_gaming_req {
+    gb_u32 active;   /* 1=gaming start, 0=gaming stop */
+    gb_u32 reserved;
+};
+#define GB_IOCTL_GAMING_MODE  _IOW(GB_IOCTL_MAGIC, 20, struct gb_gaming_req)
 
 #endif /* GREENBOOST_IOCTL_H */

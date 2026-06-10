@@ -36,6 +36,10 @@ func NewHealthWatcher(sysfsBase string, nvlinkPool bool, nvlinkGPUCount int, nvm
 func (h *HealthWatcher) Run(ctx context.Context) {
 	if h.nvmlEnabled && h.nvlinkPool {
 		h.initNVML()
+		if h.nvmlEnabled {
+			// initNVML succeeded; shut down cleanly when this goroutine exits.
+			defer nvml.Shutdown()
+		}
 	}
 
 	ticker := time.NewTicker(30 * time.Second)
@@ -57,7 +61,7 @@ func (h *HealthWatcher) Run(ctx context.Context) {
 // initNVML initialises NVML library for P2P queries.
 func (h *HealthWatcher) initNVML() {
 	if ret := nvml.Init(); ret != nvml.SUCCESS {
-		klog.WarningS("NVML init failed — NVLink P2P checks disabled",
+		klog.WarningS("NVML init failed - NVLink P2P checks disabled",
 			"error", nvml.ErrorString(ret))
 		h.nvmlEnabled = false
 		return
@@ -92,7 +96,7 @@ func (h *HealthWatcher) checkHealth() {
 }
 
 // checkNVLinkP2P verifies NVLink P2P connectivity across all GPU pairs (V100 approach).
-// V100 has NVLink 2.0 direct P2P — NOT NVSwitch fabric. Use nvmlDeviceGetP2PStatus().
+// V100 has NVLink 2.0 direct P2P - NOT NVSwitch fabric. Use nvmlDeviceGetP2PStatus().
 // Returns true only when ALL expected GPU pairs report NVML_P2P_STATUS_OK.
 func (h *HealthWatcher) checkNVLinkP2P() bool {
 	count, ret := nvml.DeviceGetCount()

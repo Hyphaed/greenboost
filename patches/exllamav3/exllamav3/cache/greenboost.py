@@ -1,6 +1,6 @@
 """
 GreenBoost KV cache layer for ExLlamaV3.
-Copyright (C) 2026 Ferran Duarri. GPL v2 / Commercial — see LICENSE.
+Copyright (C) 2026 Ferran Duarri. GPL v2 / Commercial - see LICENSE.
 
 Routes KV cache allocations through GreenBoost Tier 2 (System DDR DMA-BUF pinned pages)
 instead of GPU VRAM. Enables inference with contexts that exceed VRAM capacity.
@@ -9,7 +9,7 @@ Memory layout:
   - K and V each get their own DMA-BUF from /dev/greenboost
   - DMA-BUF pages are pinned System DDR (alloc_pages GFP_KERNEL|__GFP_COMP in kernel)
   - mmap'd into userspace and wrapped as zero-copy numpy→PyTorch CPU tensors
-  - GPU attention: ExLlamaV3 calls .to(device) per-layer — PCIe 4.0 x16 ~32 GB/s
+  - GPU attention: ExLlamaV3 calls .to(device) per-layer - PCIe 4.0 x16 ~32 GB/s
 
 Bandwidth math for glm-4.7-flash:q8_0 (48 layers, 64 KV heads, 128 dim):
   Per-layer KV at 32K ctx  = 2 × 64 × 128 × 32768 × 2B = 1.07 GB → ~33 ms/layer
@@ -48,10 +48,10 @@ log = logging.getLogger(__name__)
 
 _GB_IOCTL_MAGIC     = ord('G')
 
-# struct gb_alloc_req { uint64 size; uint64 flags; int32 fd; int32 status; }
-# size = 8+8+4+4 = 24 bytes
-_GB_ALLOC_REQ_FMT   = "=QQii"          # native byte order, explicit sizes
-_GB_ALLOC_REQ_SIZE  = struct.calcsize(_GB_ALLOC_REQ_FMT)   # 24
+# struct gb_alloc_req { gb_u64 size; gb_s32 fd; gb_u32 flags; }
+# size = 8+4+4 = 16 bytes
+_GB_ALLOC_REQ_FMT   = "=QiI"           # native byte order, explicit sizes
+_GB_ALLOC_REQ_SIZE  = struct.calcsize(_GB_ALLOC_REQ_FMT)   # 16
 
 # _IOWR('G', 1, 24) = 0xC0000000 | (24<<16) | ('G'<<8) | 1
 _GB_IOCTL_ALLOC     = (
@@ -87,16 +87,16 @@ def _gb_alloc(gb_fd: int, size_bytes: int) -> tuple[int, mmap.mmap | None]:
     if gb_fd < 0 or size_bytes <= 0:
         return -1, None
 
-    req = struct.pack(_GB_ALLOC_REQ_FMT, size_bytes, _GB_ALLOC_KV_CACHE, -1, 0)
+    req = struct.pack(_GB_ALLOC_REQ_FMT, size_bytes, -1, _GB_ALLOC_KV_CACHE)
     try:
         res = fcntl.ioctl(gb_fd, _GB_IOCTL_ALLOC, req)
     except OSError as e:
         log.debug("[GreenBoost cache] IOCTL_ALLOC failed: %s", e)
         return -1, None
 
-    _, _, dma_fd, status = struct.unpack(_GB_ALLOC_REQ_FMT, res)
-    if status != 0 or dma_fd < 0:
-        log.debug("[GreenBoost cache] alloc status=%d dma_fd=%d", status, dma_fd)
+    _, dma_fd, flags = struct.unpack(_GB_ALLOC_REQ_FMT, res)
+    if dma_fd < 0:
+        log.debug("[GreenBoost cache] alloc failed: dma_fd=%d flags=0x%x", dma_fd, flags)
         return -1, None
 
     try:
@@ -115,7 +115,7 @@ def _mm_to_tensor(mm: mmap.mmap, shape: tuple, dtype=np.float16) -> torch.Tensor
     Zero-copy wrap of a mmap object as a PyTorch CPU tensor.
 
     Path: mmap → numpy (shares buffer protocol) → torch.from_numpy (zero-copy).
-    The returned tensor's storage IS the mmap region — no copy made.
+    The returned tensor's storage IS the mmap region - no copy made.
     Lifetime: tensor keeps the numpy array alive; caller keeps mmap alive.
     """
     n = math.prod(shape)
@@ -140,7 +140,7 @@ class CacheLayer_greenboost(CacheLayer):
         cache = Cache(model, max_num_tokens=32768, layer_type=CacheLayer_greenboost)
 
     Environment:
-        GREENBOOST_CACHE_VERBOSE=1   — enable per-layer allocation logging
+        GREENBOOST_CACHE_VERBOSE=1   - enable per-layer allocation logging
     """
 
     _verbose: bool = os.environ.get("GREENBOOST_CACHE_VERBOSE", "0") == "1"
@@ -166,7 +166,7 @@ class CacheLayer_greenboost(CacheLayer):
             if attention else None
         )
 
-        # Shared /dev/greenboost fd — if not supplied, open our own
+        # Shared /dev/greenboost fd - if not supplied, open our own
         self._own_gb_fd: bool = gb_fd < 0
         self._gb_fd: int = gb_fd if gb_fd >= 0 else _gb_open()
 
@@ -200,7 +200,22 @@ class CacheLayer_greenboost(CacheLayer):
         # ── Try GreenBoost DMA-BUF allocation ──────────────────────────────
         if self._gb_fd >= 0:
             self._k_fd, self._k_mm = _gb_alloc(self._gb_fd, size_bytes)
-            self._v_fd, self._v_mm = _gb_alloc(self._gb_fd, size_bytes)
+            try:
+                self._v_fd, self._v_mm = _gb_alloc(self._gb_fd, size_bytes)
+            except Exception:
+                if self._k_fd >= 0:
+                    try:
+                        os.close(self._k_fd)
+                    except Exception:
+                        pass
+                    self._k_fd = -1
+                if self._k_mm is not None:
+                    try:
+                        self._k_mm.close()
+                    except Exception:
+                        pass
+                    self._k_mm = None
+                raise
 
         if self._k_mm is not None and self._v_mm is not None:
             # Zero-copy mmap → numpy → torch (CPU tensor, System DDR-backed)
@@ -223,7 +238,7 @@ class CacheLayer_greenboost(CacheLayer):
             if self._verbose:
                 log.warning(
                     "[GreenBoost cache] layer cache_id=%s  GreenBoost unavailable "
-                    "— falling back to CPU RAM", self.cache_id
+                    "- falling back to CPU RAM", self.cache_id
                 )
 
     @override
@@ -307,7 +322,7 @@ class CacheLayer_greenboost(CacheLayer):
         return self._using_greenboost
 
     def get_dma_fds(self) -> tuple[int, int]:
-        """Return (k_dma_fd, v_dma_fd) — useful for cudaImportExternalMemory."""
+        """Return (k_dma_fd, v_dma_fd) - useful for cudaImportExternalMemory."""
         return self._k_fd, self._v_fd
 
     def prefetch(self):
@@ -317,9 +332,8 @@ class CacheLayer_greenboost(CacheLayer):
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
         for mm in (self._k_mm, self._v_mm):
             if mm is not None:
-                addr = ctypes.c_char_p(mm.read(0))  # get base pointer
-                mm.seek(0)
-                libc.madvise(mm, len(mm), MADV_WILLNEED)
+                addr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+                libc.madvise(ctypes.c_void_p(addr), len(mm), MADV_WILLNEED)
 
     def _cleanup_dma_bufs(self):
         for mm in (self._k_mm, self._v_mm):
@@ -368,14 +382,27 @@ class GreenBoostCache:
     """
 
     def __init__(self, model, max_num_tokens: int, **kwargs):
+        import os
         from .cache import Cache
+
+        # F-L5-05: ExLlamaV3 uses a custom CUDA attention kernel, not
+        # F.scaled_dot_product_attention, so gb_attn.py's SDPA intercept never
+        # fires on this path. TurboQuant K/V quantisation is NOT applied here.
+        if os.environ.get("GREENBOOST_TURBOQUANT", "0") != "0":
+            log.warning(
+                "[GreenBoost cache] GREENBOOST_TURBOQUANT=1 is set but "
+                "ExLlamaV3 bypasses F.scaled_dot_product_attention - "
+                "TurboQuant K/V compression is NOT active on this path. "
+                "T2 DDR bandwidth cost is 3-4x higher than the documented "
+                "architecture predicts. See patches/exllamav3/README."
+            )
 
         # Open one shared gb_fd for all layers
         shared_fd = _gb_open()
         if shared_fd >= 0:
             log.info("[GreenBoost cache] opened /dev/greenboost (fd=%d)", shared_fd)
         else:
-            log.warning("[GreenBoost cache] /dev/greenboost unavailable — using CPU RAM fallback")
+            log.warning("[GreenBoost cache] /dev/greenboost unavailable - using CPU RAM fallback")
 
         # Monkey-patch: inject shared gb_fd into every layer's kwargs
         def _layer_factory(config, attention, cache_id, max_num_tokens, **kw):
@@ -389,6 +416,8 @@ class GreenBoostCache:
         self._shared_fd = shared_fd
 
     def __getattr__(self, name):
+        if name == '_cache':
+            raise AttributeError(name)
         return getattr(self._cache, name)
 
     def __del__(self):

@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""GreenBoost Proton Wayland - thin GreenBoost wrapper around Proton Experimental."""
+import os
+import sys
+
+# Simplified logic for debugging:
+# 1. Remove AppID from _NO_DXR_GAMES to test if it runs.
+# 2. Add logging to see why it fails.
