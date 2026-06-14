@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GreenBoost v2.9 - Setup & installation script for Red Hat / Fedora / Rocky Linux
+# GreenBoost v3.0 - Setup & installation script for Red Hat / Fedora / Rocky Linux
 # Supports: Rocky Linux, AlmaLinux, RHEL, Fedora, CentOS Stream.
 #
 # Hardware-detected at runtime: CPU topology, GPU VRAM, RAM, kernel version.
@@ -38,7 +38,7 @@ VULKAN_IMPLICIT_LAYER_DIR="/etc/vulkan/implicit_layer.d"
 SHIM_DEST="/usr/local/lib"
 MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-GB_VERSION="2.9"
+GB_VERSION="3.0"
 GB_PROFILES_DIR="/etc/greenboost/profiles"
 GB_ACTIVE_PROFILE_LINK="/etc/greenboost/active_profile.md"
 
@@ -813,7 +813,7 @@ cmd_install_sys_configs() {
     need_root install-sys-configs
     detect_hardware
 
-    info "Installing GreenBoost v2.9 system configuration files..."
+    info "Installing GreenBoost v3.0 system configuration files..."
 
     # 1. Ollama service - inject GreenBoost env vars + LD_PRELOAD
     local svc="/etc/systemd/system/ollama.service"
@@ -846,7 +846,7 @@ UDEVEOF
 
     # 2b. NVMe udev rule - scheduler=none, read_ahead=4096, nr_requests=2048
     cat > /etc/udev/rules.d/99-nvme-greenboost.rules << 'UDEVEOF'
-# GreenBoost v2.9 - NVMe tuning for T3 swap performance
+# GreenBoost v3.0 - NVMe tuning for T3 swap performance
 ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/scheduler}="none"
 ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/read_ahead_kb}="4096"
 ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/nr_requests}="2048"
@@ -892,7 +892,7 @@ CPUEOF
     # which triggers the OOM guard and makes T2 unavailable.  Keep nr_hugepages=0.
     mkdir -p /etc/sysfs.d
     cat > /etc/sysfs.d/greenboost-hugepages.conf << 'HPEOF'
-# GreenBoost v2.9 - THP config (no HugeTLB pre-allocation: gb_alloc_buf uses buddy allocator)
+# GreenBoost v3.0 - THP config (no HugeTLB pre-allocation: gb_alloc_buf uses buddy allocator)
 kernel/mm/transparent_hugepage/enabled = always
 HPEOF
     info "THP sysfs conf: /etc/sysfs.d/greenboost-hugepages.conf"
@@ -908,7 +908,7 @@ HPEOF
 
     # 5. VM sysctl - reduce swap pressure, tune write-back
     cat > /etc/sysctl.d/99-greenboost.conf << 'SYSCTLEOF'
-# GreenBoost v2.9 - VM tuning for cuda memory pool
+# GreenBoost v3.0 - VM tuning for cuda memory pool
 vm.swappiness = 5
 vm.dirty_ratio = 20
 vm.dirty_background_ratio = 5
@@ -1050,7 +1050,7 @@ cmd_install_vulkan_layer() {
 
 
 cmd_build() {
-    info "Building GreenBoost v2.9 (cuda memory pool: VRAM + System DDR + NVMe)..."
+    info "Building GreenBoost v3.0 (cuda memory pool: VRAM + System DDR + NVMe)..."
     make -C "$MODULE_DIR" all || die "Build failed - check output above"
     info "Build complete:"
     info "  Kernel module : $MODULE_DIR/greenboost.ko"
@@ -1100,7 +1100,7 @@ MODEOF
 
     # profile.d helper
     cat > /etc/profile.d/greenboost.sh << PROFEOF
-# GreenBoost v2.9 - shell helpers
+# GreenBoost v3.0 - shell helpers
 export GREENBOOST_SHIM="$SHIM_DEST/$SHIM_LIB"
 greenboost-run() { LD_PRELOAD="\$GREENBOOST_SHIM" "\$@"; }
 export -f greenboost-run
@@ -1670,7 +1670,7 @@ cmd_tune_sysctl() {
     echo ""
 
     cat > "$dest" << 'SYSCTL_EOF'
-# GreenBoost v2.9 - Definitive sysctl config
+# GreenBoost v3.0 - Definitive sysctl config
 # Tuned for GreenBoost inference workloads - edit if your hardware differs.
 # Loaded last (99-zzz) - wins all conflicts with earlier sysctl.d files.
 # Do NOT edit other sysctl.d files; make changes here instead.
@@ -2039,7 +2039,7 @@ cmd_help() {
 }
 
 # ---- install-deps ------------------------------------------------------
-# Install all Rocky packages needed for GreenBoost v2.9 + ExLlamaV3
+# Install all Rocky packages needed for GreenBoost v3.0 + ExLlamaV3
 
 cmd_install_build_deps() {
     need_root install-deps

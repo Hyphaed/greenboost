@@ -70,6 +70,10 @@ EXPECTED_HOOKS = {
     "cudaStreamSynchronize",
     # Register
     "__cudaRegisterFunction",
+    # Driver-entry-point lookup (introduced in CUDA 11.3; both @.so.12 and @@.so.13
+    # trampolines must be present - a bug in greenboost_cuda_v12.c's keepalive table
+    # or the LTO compile flags silently drops the @libcudart.so.12 export).
+    "cudaGetDriverEntryPointByVersion",
     # NOTE: cudaMallocManaged and cuStreamSynchronize were intentionally
     # removed from EXPECTED_HOOKS in PR-Z.  Neither has a function definition
     # in greenboost_cuda_shim.c, so listing them in EXPECTED_HOOKS would
@@ -171,6 +175,98 @@ class TestPTDSAliases:
         assert common, (
             f"'{alias}' at {sorted(shim_symbols[alias])} ∩ "
             f"'{base}' at {sorted(shim_symbols[base])} is empty"
+        )
+
+
+class TestSo12Trampolines:
+    """Positive guard: each symbol in this table MUST have a non-default
+    (@libcudart.so.12) trampoline present in the .so.  These are built by
+    greenboost_cuda_v12.c via .symver inline asm; they can silently disappear
+    when that TU is accidentally compiled with -flto (strips .symver) or when
+    its keepalive table loses an entry.
+
+    The test reads `readelf --dyn-syms --wide` and checks for the `@` (not `@@`)
+    form of each name with the libcudart.so.12 version tag.
+    """
+
+    REQUIRED_SO12_TRAMPOLINES = {
+        "cudaGetDriverEntryPointByVersion",
+        "cudaMalloc",
+        "cudaFree",
+        "cudaMemGetInfo",
+    }
+
+    @pytest.fixture(scope="class")
+    def so12_syms(self):
+        if not SHIM_PATH.exists():
+            pytest.skip(f"{SHIM_PATH} not built - run `make shim` first")
+        out = subprocess.check_output(
+            ["readelf", "--dyn-syms", "--wide", str(SHIM_PATH)],
+            stderr=subprocess.DEVNULL,
+        ).decode()
+        present = set()
+        for line in out.splitlines():
+            # Match `name@libcudart.so.12` (single @, non-default)
+            # readelf format: "  N: addr size type bind vis ndx name@version"
+            if "@libcudart.so.12" in line and "@@libcudart.so.12" not in line:
+                parts = line.split()
+                if parts:
+                    name = parts[-1].split("@")[0]
+                    present.add(name)
+        return present
+
+    @pytest.mark.parametrize("symbol", sorted(REQUIRED_SO12_TRAMPOLINES))
+    def test_so12_trampoline_present(self, so12_syms, symbol):
+        assert symbol in so12_syms, (
+            f"@libcudart.so.12 trampoline for '{symbol}' is missing. "
+            f"Check greenboost_cuda_v12.c keepalive table and that the TU "
+            f"is compiled WITHOUT -flto (SHIM_CFLAGS_V12 in Makefile)."
+        )
+
+
+class TestNoSo12DefaultVersion:
+    """Regression guard for the cu128 infinite-recursion hang (2026-06-12).
+
+    greenboost_cuda_v12.c builds a `cudaX@libcudart.so.12` trampoline whose
+    body literally calls the bare name `cudaX(...)`.  If a hook body's DEFAULT
+    (@@) version is ALSO libcudart.so.12 (because the symbol was listed only in
+    the .so.12 node of greenboost_cuda.map), that intra-object call binds to the
+    trampoline's own @.so.12 alias instead of the real body → the function calls
+    itself forever.  PyTorch cu128 hit this on the very first CUDA call
+    (torch.cuda.get_device_properties) and spun at 100 % CPU with the GPU idle.
+
+    Invariant: NO libcudart hook may default to @@libcudart.so.12.  Every
+    .so.12 export must be a NON-default trampoline (@), with the real body
+    defaulting to @@libcudart.so.13 — exactly how cudaMalloc has always worked.
+    """
+
+    @pytest.fixture(scope="class")
+    def versioned_syms(self):
+        if not SHIM_PATH.exists():
+            pytest.skip(f"{SHIM_PATH} not built - run `make shim` first")
+        out = subprocess.check_output(
+            ["readelf", "--dyn-syms", "--wide", str(SHIM_PATH)],
+            stderr=subprocess.DEVNULL,
+        ).decode()
+        defaults_on_so12 = []
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 8 or parts[3] != "FUNC":
+                continue
+            name = parts[7]
+            # `name@@ver` is a DEFAULT versioned definition; `name@ver` is not.
+            if "@@libcudart.so.12" in name:
+                defaults_on_so12.append(name.split("@")[0])
+        return defaults_on_so12
+
+    def test_no_hook_defaults_to_so12(self, versioned_syms):
+        assert versioned_syms == [], (
+            "These hook bodies DEFAULT to @@libcudart.so.12, which makes the "
+            "greenboost_cuda_v12.c trampolines recurse infinitely (100%% CPU "
+            "hang under PyTorch cu128): "
+            f"{sorted(set(versioned_syms))}.  Fix: list them in the "
+            "libcudart.so.13 node of greenboost_cuda.map so the body defaults "
+            "to @@.so.13 while the .so.12 trampoline stays a non-default alias."
         )
 
 

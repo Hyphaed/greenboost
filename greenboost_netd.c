@@ -415,6 +415,9 @@ typedef cudaError_t (*pfn_cudaHostAlloc)(void **, size_t, unsigned int);
 typedef cudaError_t (*pfn_cudaFreeHost)(void *);
 typedef cudaError_t (*pfn_cudaMemcpy)(void *, const void *, size_t, int);
 typedef cudaError_t (*pfn_cudaDeviceSynchronize)(void);
+typedef cudaError_t (*pfn_cudaStreamCreate)(cudaStream_t *);
+typedef cudaError_t (*pfn_cudaStreamSynchronize)(cudaStream_t);
+typedef cudaError_t (*pfn_cudaStreamDestroy)(cudaStream_t);
 
 /* cudaMemcpyKind */
 #define GB_cudaMemcpyHostToDevice   1
@@ -484,6 +487,9 @@ static pfn_cudaGetDeviceCount      f_cudaGetDeviceCount;
 static pfn_cudaSetDevice           f_cudaSetDevice;
 static pfn_cudaMalloc              f_cudaMalloc;
 static pfn_cudaFree                f_cudaFree;
+static pfn_cudaStreamCreate        f_cudaStreamCreate;
+static pfn_cudaStreamSynchronize   f_cudaStreamSynchronize;
+static pfn_cudaStreamDestroy       f_cudaStreamDestroy;
 static pfn_cudaHostAlloc           f_cudaHostAlloc;
 static pfn_cudaFreeHost            f_cudaFreeHost;
 static pfn_cudaMemcpy              f_cudaMemcpy;
@@ -543,6 +549,10 @@ struct client {
      * one message and a payload from another.  The mutex serialises
      * send_msg per client.  Uncontended cost: one atomic load + branch. */
     pthread_mutex_t send_lock;
+    /* Phase 2b: persistent CUDA stream for async exec (GB_MSG_CUDA_EXEC_ASYNC).
+     * Kernels are enqueued here without blocking the TCP handler; host drains
+     * this stream implicitly via GB_MSG_CUDA_SYNC (cudaDeviceSynchronize). */
+    cudaStream_t async_stream;
 #ifdef GREENBOOST_USE_NCCL
     ncclComm_t nccl_comm;
 #endif
@@ -641,7 +651,10 @@ static int probe_gpus(void)
     f_cudaFreeHost            = (pfn_cudaFreeHost)dlsym(libcudart, "cudaFreeHost");
     f_cudaMemcpy              = (pfn_cudaMemcpy)dlsym(libcudart, "cudaMemcpy");
     f_cudaDeviceSynchronize   = (pfn_cudaDeviceSynchronize)dlsym(libcudart, "cudaDeviceSynchronize");
-    
+    f_cudaStreamCreate        = (pfn_cudaStreamCreate)dlsym(libcudart, "cudaStreamCreate");
+    f_cudaStreamSynchronize   = (pfn_cudaStreamSynchronize)dlsym(libcudart, "cudaStreamSynchronize");
+    f_cudaStreamDestroy       = (pfn_cudaStreamDestroy)dlsym(libcudart, "cudaStreamDestroy");
+
 
     if (!f_cudaGetDeviceCount) {
         netd_log("ERROR: cudaGetDeviceCount not found");
@@ -1000,8 +1013,13 @@ static int handle_handshake(struct client *cli, const void *payload, uint32_t le
         }
     }
 
-    return send_msg(cli, GB_MSG_HANDSHAKE_RESP, GB_NET_FLAG_RESPONSE,
-                    &resp, sizeof(resp));
+    int rc = send_msg(cli, GB_MSG_HANDSHAKE_RESP, GB_NET_FLAG_RESPONSE,
+                      &resp, sizeof(resp));
+    /* Phase 2b: create persistent async CUDA stream for this client.
+     * Created after the handshake response so the client is fully initialised. */
+    if (rc == 0 && f_cudaStreamCreate && !cli->async_stream)
+        f_cudaStreamCreate(&cli->async_stream);
+    return rc;
 }
 
 static int handle_heartbeat(struct client *cli, const void *payload, uint32_t len)
@@ -2567,10 +2585,196 @@ static int handle_cuda_exec(struct client *cli, const void *payload, uint32_t le
     return send_msg(cli, GB_MSG_RESPONSE, GB_NET_FLAG_RESPONSE, &resp, sizeof(resp));
 }
 
+/* Phase 2b: GB_MSG_CUDA_EXEC_ASYNC - fire-and-forget kernel dispatch.
+ *
+ * Same wire format as GB_MSG_CUDA_EXEC but n_downloads must be 0 and
+ * n_uploads must be 0.  The feeder enqueues the kernel on its per-client
+ * async_stream, ACKs immediately (before GPU execution completes), and
+ * the host moves on to dispatch the next kernel without waiting.
+ *
+ * Sync happens lazily: the next GB_MSG_CUDA_SYNC (from cudaStreamSynchronize)
+ * drains async_stream via cudaDeviceSynchronize before responding, so all
+ * queued kernels are guaranteed complete before the host reads results.
+ *
+ * T3 relocs (NVMe swap-in): these require a synchronous H2D memcpy, so we
+ * drain async_stream first, execute on it (preserving ordering with any
+ * prior async kernels), free the temp buffer, then ACK.  The ACK still
+ * arrives before the *next* async kernel queues, maintaining protocol
+ * ordering.
+ *
+ * Error handling: if cuLaunchKernel fails the ACK carries ERR_CUDA; on
+ * the host side gb_netc_exec_kernel_async treats this as a failed dispatch. */
+static int handle_cuda_exec_async(struct client *cli, const void *payload, uint32_t len)
+{
+    struct gb_net_response err_resp = {
+        .orig_msg_type = GB_MSG_CUDA_EXEC_ASYNC,
+        .status        = GB_STATUS_ERR_INVALID,
+    };
+#define ASYNC_ERR() return send_msg(cli, GB_MSG_RESPONSE, GB_NET_FLAG_RESPONSE, &err_resp, sizeof(err_resp))
+
+    if (len < sizeof(struct gb_net_cuda_exec)) ASYNC_ERR();
+
+    const struct gb_net_cuda_exec *req = (const struct gb_net_cuda_exec *)payload;
+    const uint8_t *p = (const uint8_t *)payload + sizeof(struct gb_net_cuda_exec);
+    uint32_t left    = len - (uint32_t)sizeof(struct gb_net_cuda_exec);
+
+    gb_u32 req_kernel_name_len = GB_LE_U32(req->kernel_name_len);
+    gb_u32 req_n_arg_vals      = GB_LE_U32(req->n_arg_vals);
+    gb_u32 req_n_relocs        = GB_LE_U32(req->n_relocs);
+    gb_u32 req_n_uploads       = GB_LE_U32(req->n_uploads);
+    gb_u32 req_n_downloads     = GB_LE_U32(req->n_downloads);
+    gb_u32 req_grid_x          = GB_LE_U32(req->grid_x);
+    gb_u32 req_grid_y          = GB_LE_U32(req->grid_y);
+    gb_u32 req_grid_z          = GB_LE_U32(req->grid_z);
+    gb_u32 req_block_x         = GB_LE_U32(req->block_x);
+    gb_u32 req_block_y         = GB_LE_U32(req->block_y);
+    gb_u32 req_block_z         = GB_LE_U32(req->block_z);
+    gb_u32 req_shared_mem_bytes= GB_LE_U32(req->shared_mem_bytes);
+
+    /* Async requires no inline uploads/downloads */
+    if (req_n_uploads > 0 || req_n_downloads > 0) ASYNC_ERR();
+
+    if (req_kernel_name_len == 0 || req_kernel_name_len >= GB_NET_MAX_KERNEL_NAME) ASYNC_ERR();
+    if (req_n_arg_vals > 256 || req_n_relocs > GB_NET_MAX_RELOCS) ASYNC_ERR();
+
+    {
+        uint64_t need = (uint64_t)req_kernel_name_len
+                      + (uint64_t)req_n_arg_vals * sizeof(uint64_t)
+                      + (uint64_t)req_n_relocs   * sizeof(struct gb_net_ptr_reloc);
+        if (need > (uint64_t)left || need > GB_NET_MAX_MSG_SIZE) ASYNC_ERR();
+    }
+
+    if (left < req_kernel_name_len) ASYNC_ERR();
+    char kernel_name[GB_NET_MAX_KERNEL_NAME];
+    memcpy(kernel_name, p, req_kernel_name_len);
+    kernel_name[req_kernel_name_len] = '\0';
+    p += req_kernel_name_len; left -= req_kernel_name_len;
+
+    uint32_t arg_bytes = req_n_arg_vals * (uint32_t)sizeof(uint64_t);
+    if (left < arg_bytes) ASYNC_ERR();
+    uint64_t arg_vals[256] = {0};
+    if (arg_bytes) memcpy(arg_vals, p, arg_bytes);
+    p += arg_bytes; left -= arg_bytes;
+
+    uint32_t reloc_bytes = req_n_relocs * (uint32_t)sizeof(struct gb_net_ptr_reloc);
+    if (left < reloc_bytes) ASYNC_ERR();
+    struct gb_net_ptr_reloc relocs[GB_NET_MAX_RELOCS];
+    if (reloc_bytes) memcpy(relocs, p, reloc_bytes);
+
+    /* Duplicate reloc check */
+    for (uint32_t i = 0; i < req_n_relocs; i++)
+        for (uint32_t j = i + 1; j < req_n_relocs; j++)
+            if (relocs[i].arg_idx == relocs[j].arg_idx) ASYNC_ERR();
+
+    /* Resolve kernel */
+    pthread_mutex_lock(&g_kernel_map_lock);
+    void *host_func = km_lookup(cli->feeder_id, kernel_name);
+    pthread_mutex_unlock(&g_kernel_map_lock);
+    if (!host_func) {
+        if (!gb_kernel_name_allowed(kernel_name)) ASYNC_ERR();
+        host_func = dlsym(RTLD_DEFAULT, kernel_name);
+    }
+    if (!host_func) ASYNC_ERR();
+
+    /* Apply relocs: T1/T2 are GPU-accessible; T3 needs sync swap-in */
+    void *t3_tmp_dev[GB_NET_MAX_RELOCS] = {0};
+    int   n_t3_tmp = 0;
+    int   has_t3   = 0;
+
+    pthread_mutex_lock(&g_alloc_lock);
+    for (uint32_t i = 0; i < req_n_relocs; i++) {
+        uint32_t idx = relocs[i].arg_idx;
+        if (idx >= req_n_arg_vals || idx >= 256) {
+            pthread_mutex_unlock(&g_alloc_lock);
+            for (int j = 0; j < n_t3_tmp; j++) if (t3_tmp_dev[j] && f_cudaFree) f_cudaFree(t3_tmp_dev[j]);
+            ASYNC_ERR();
+        }
+        struct remote_alloc *ra = ra_find(relocs[i].remote_handle);
+        if (!ra) {
+            pthread_mutex_unlock(&g_alloc_lock);
+            for (int j = 0; j < n_t3_tmp; j++) if (t3_tmp_dev[j] && f_cudaFree) f_cudaFree(t3_tmp_dev[j]);
+            ASYNC_ERR();
+        }
+        if (ra->tier == 0) {
+            arg_vals[idx] = (uint64_t)(uintptr_t)ra->dev_ptr;
+        } else if (ra->tier == 1) {
+            arg_vals[idx] = (uint64_t)(uintptr_t)ra->host_ptr;
+        } else {
+            /* T3: sync swap-in required */
+            has_t3 = 1;
+            void *tmp = NULL;
+            if (f_cudaMalloc && f_cudaMalloc(&tmp, (size_t)ra->size) == 0 && f_cudaMemcpy) {
+                f_cudaMemcpy(tmp, ra->host_ptr, (size_t)ra->size, GB_cudaMemcpyHostToDevice);
+                arg_vals[idx] = (uint64_t)(uintptr_t)tmp;
+                if (n_t3_tmp < GB_NET_MAX_RELOCS) t3_tmp_dev[n_t3_tmp++] = tmp;
+            } else {
+                pthread_mutex_unlock(&g_alloc_lock);
+                for (int j = 0; j < n_t3_tmp; j++) if (t3_tmp_dev[j] && f_cudaFree) f_cudaFree(t3_tmp_dev[j]);
+                ASYNC_ERR();
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_alloc_lock);
+
+    /* Get cuLaunchKernel function pointer */
+    typedef int (*pfn_cuLK2)(void *, unsigned, unsigned, unsigned,
+                             unsigned, unsigned, unsigned,
+                             unsigned, void *, void **, void **);
+    static pfn_cuLK2 f_cuLK2 = NULL;
+    if (!f_cuLK2) {
+        void *lc = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
+        if (!lc) lc = dlopen("libcuda.so", RTLD_NOW | RTLD_GLOBAL);
+        if (lc) f_cuLK2 = (pfn_cuLK2)dlsym(lc, "cuLaunchKernel");
+    }
+
+    if (!f_cuLK2) {
+        for (int j = 0; j < n_t3_tmp; j++) if (t3_tmp_dev[j] && f_cudaFree) f_cudaFree(t3_tmp_dev[j]);
+        ASYNC_ERR();
+    }
+
+    void *kp[256];
+    for (uint32_t i = 0; i < req_n_arg_vals; i++) kp[i] = &arg_vals[i];
+
+    /* If T3 swap-in was needed, drain async_stream first (preserves ordering),
+     * then launch and synchronize before freeing tmp bufs. */
+    if (has_t3 && cli->async_stream && f_cudaStreamSynchronize)
+        f_cudaStreamSynchronize(cli->async_stream);
+
+    int launch_err = f_cuLK2(host_func,
+                             req_grid_x, req_grid_y, req_grid_z,
+                             req_block_x, req_block_y, req_block_z,
+                             req_shared_mem_bytes,
+                             cli->async_stream,  /* enqueue on per-client async stream */
+                             req_n_arg_vals ? kp : NULL, NULL);
+
+    if (has_t3) {
+        /* T3 path: sync the stream so tmp bufs are safe to free */
+        if (cli->async_stream && f_cudaStreamSynchronize)
+            f_cudaStreamSynchronize(cli->async_stream);
+        for (int j = 0; j < n_t3_tmp; j++) if (t3_tmp_dev[j] && f_cudaFree) f_cudaFree(t3_tmp_dev[j]);
+    }
+    /* T1/T2 path: kernel is queued; GPU executes while host moves on */
+
+    if (launch_err == 0) g_kernel_dispatch_count++;
+    NETD_EVT("EXEC_KERNEL_ASYNC", "T1_GPU", 0, cli->feeder_id, kernel_name);
+
+#undef ASYNC_ERR
+    struct gb_net_response ack = {
+        .orig_msg_type = GB_MSG_CUDA_EXEC_ASYNC,
+        .status        = (launch_err == 0) ? GB_STATUS_OK : GB_STATUS_ERR_CUDA,
+    };
+    return send_msg(cli, GB_MSG_RESPONSE, GB_NET_FLAG_RESPONSE, &ack, sizeof(ack));
+}
+
 static int handle_cuda_sync(struct client *cli, const void *payload, uint32_t len)
 {
     (void)payload; (void)len;
 
+    /* Phase 2b: drain per-client async stream first, then full device sync.
+     * cudaDeviceSynchronize covers all streams, but explicit stream sync here
+     * lets us later surface stream-level errors separately if needed. */
+    if (cli->async_stream && f_cudaStreamSynchronize)
+        f_cudaStreamSynchronize(cli->async_stream);
     if (f_cudaDeviceSynchronize)
         f_cudaDeviceSynchronize();
 
@@ -2767,6 +2971,37 @@ static int handle_feeder_status(struct client *cli)
         resp.t3_free_bytes = resp.t3_total_bytes;
     }
 
+    /* v3.1 GPU telemetry fields — populated from NVML function pointers that
+     * are already resolved in probe_gpus().  Zero-valued if NVML unavailable. */
+    if (g_nvml_devices[0]) {
+        if (f_nvmlGetTemp) {
+            unsigned int t = 0;
+            if (f_nvmlGetTemp(g_nvml_devices[0], 1 /*NVML_TEMPERATURE_GPU*/, &t) == 0)
+                resp.gpu_temp_c = (gb_u16)t;
+        }
+        if (f_nvmlGetPower) {
+            unsigned int mw = 0;
+            if (f_nvmlGetPower(g_nvml_devices[0], &mw) == 0)
+                resp.gpu_power_w = (gb_u16)(mw / 1000);
+        }
+        if (f_nvmlUtilRates) {
+            nvmlUtilization_t ut = {0, 0};
+            if (f_nvmlUtilRates(g_nvml_devices[0], &ut) == 0)
+                resp.gpu_util_pct = (gb_u32)ut.gpu;
+        }
+        if (f_nvmlGetThrottle) {
+            unsigned long long reasons = 0;
+            if (f_nvmlGetThrottle(g_nvml_devices[0], &reasons) == 0)
+                resp.throttle_reasons = (gb_u32)(reasons & 0xFFFFFFFF);
+        }
+        if (f_nvmlGetEcc) {
+            unsigned long long dbe = 0;
+            /* NVML_MEMORY_ERROR_TYPE_UNCORRECTED=1, NVML_VOLATILE_ECC=0 */
+            if (f_nvmlGetEcc(g_nvml_devices[0], 1, 0, &dbe) == 0)
+                resp.ecc_dbe_count = (gb_u32)(dbe & 0xFFFFFFFF);
+        }
+    }
+
     NETD_EVT("FEEDER_STATUS_SERVED", "NET", 0, cli->feeder_id, "status_query_ok");
     return send_msg(cli, GB_MSG_RESPONSE, GB_NET_FLAG_RESPONSE, &resp, sizeof(resp));
 }
@@ -2804,6 +3039,8 @@ static int dispatch_message(struct client *cli, const struct gb_net_header *hdr,
         return handle_cuda_launch(cli, payload, hdr->payload_len);
     case GB_MSG_CUDA_EXEC:
         return handle_cuda_exec(cli, payload, hdr->payload_len);
+    case GB_MSG_CUDA_EXEC_ASYNC:
+        return handle_cuda_exec_async(cli, payload, hdr->payload_len);
     case GB_MSG_CUDA_SYNC:
         return handle_cuda_sync(cli, payload, hdr->payload_len);
     case GB_MSG_CUDA_REGISTER_FN:
@@ -3023,6 +3260,11 @@ static void client_cleanup(struct client *cli)
     ag_close(cli->feeder_id);
     if (cli->fd >= 0) close(cli->fd);
     free(cli->recv_buf);
+    /* Phase 2b: destroy per-client async stream */
+    if (cli->async_stream && f_cudaStreamDestroy) {
+        f_cudaStreamDestroy(cli->async_stream);
+        cli->async_stream = NULL;
+    }
 #ifdef GREENBOOST_USE_NCCL
     if (cli->nccl_comm) {
         ncclCommDestroy(cli->nccl_comm);

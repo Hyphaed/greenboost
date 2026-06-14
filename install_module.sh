@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-GB_VERSION="2.9"
+GB_VERSION="3.0"
 DRIVER_NAME="greenboost"
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DKMS_SRC="/usr/src/${DRIVER_NAME}-${GB_VERSION}"
@@ -315,6 +315,41 @@ modprobe "$DRIVER_NAME" \
     || gb_die "modprobe failed - check dmesg for errors"
 gb_ok "Module loaded"
 
+# ── Device permissions: udev rule + group membership ─────────────────────────
+# /dev/greenboost defaults to 0600 root:root without a udev rule.
+# Add the udev rule so any member of the 'video' group can open the device
+# (required for gb_quant int4 FLUX inference and DMA-BUF T2 overflow).
+gb_step "Installing /dev/greenboost udev rule..."
+mkdir -p /etc/udev/rules.d
+cat > /etc/udev/rules.d/99-greenboost.rules << 'UDEVEOF'
+# GreenBoost kernel module - allow video group to access /dev/greenboost
+KERNEL=="greenboost", GROUP="video", MODE="0660"
+UDEVEOF
+udevadm control --reload-rules 2>/dev/null || true
+udevadm trigger --name-match=greenboost 2>/dev/null \
+    || udevadm trigger --subsystem-match=greenboost 2>/dev/null \
+    || true
+udevadm settle 2>/dev/null || true
+gb_ok "udev rule installed: /etc/udev/rules.d/99-greenboost.rules"
+
+# Add the invoking user (via SUDO_USER) to the 'video' group.
+# Without this the udev rule's GROUP="video" does nothing for the user.
+if [[ -n "${SUDO_USER:-}" ]]; then
+    if ! id -nG "$SUDO_USER" 2>/dev/null | tr ' ' '\n' | grep -q '^video$'; then
+        usermod -aG video "$SUDO_USER" \
+            && gb_ok "User '$SUDO_USER' added to 'video' group (re-login or: newgrp video)" \
+            || gb_warn "usermod failed — add $SUDO_USER to 'video' group manually"
+    else
+        gb_info "User '$SUDO_USER' already in 'video' group"
+    fi
+    # Immediate ACL so current shell can open /dev/greenboost without re-login
+    if [[ -c /dev/greenboost ]] && command -v setfacl &>/dev/null; then
+        setfacl -m "u:${SUDO_USER}:rw" /dev/greenboost 2>/dev/null \
+            && gb_info "ACL: /dev/greenboost → u:${SUDO_USER}:rw (current session)" \
+            || true
+    fi
+fi
+
 # ── Write build_info stamp ────────────────────────────────────────────────────
 mkdir -p /etc/greenboost
 _git_hash=$(git -C "$SRC_DIR" rev-parse --short HEAD 2>/dev/null || echo "nogit")
@@ -357,6 +392,92 @@ esac
 WRAPEOF
 chmod +x /usr/local/bin/greenboost
 gb_ok "greenboost wrapper installed: /usr/local/bin/greenboost"
+
+# ── Build and install CUDA shim + native libs ────────────────────────────────
+# DKMS only handles the kernel module (.ko).  The LD_PRELOAD shim
+# (libgreenboost_cuda.so) and any other native libs require a separate
+# 'make all install-libs' pass in the source tree.
+# We clean first to avoid root-owned stale artifacts from a prior sudo make,
+# then chown the tree back to the calling developer so rebuilds don't require sudo.
+gb_step "Building and installing GreenBoost CUDA shim + native libs..."
+_shim_log=$(mktemp /tmp/gb_shim_build.XXXXX.log)
+make -C "$SRC_DIR" clean all install-libs >"$_shim_log" 2>&1 \
+    || { echo "" >&2; cat "$_shim_log" >&2; rm -f "$_shim_log"; \
+         gb_die "Shim build failed — see output above"; }
+rm -f "$_shim_log"
+# Restore ownership so the developer can rebuild without sudo.
+if [[ -n "${SUDO_USER:-}" ]]; then
+    chown -R "${SUDO_USER}:$(id -gn "${SUDO_USER}" 2>/dev/null || echo users)" \
+        "$SRC_DIR" 2>/dev/null || true
+fi
+gb_ok "CUDA shim + native libs installed"
+
+# ── Install GreenBoost Python orchestration stack ────────────────────────────
+# The Python stack (gb_telemetry, gb_quant, gb_diffusion_orch, etc.) must be
+# importable system-wide — by the active conda env, any venv, and system Python —
+# without the user sourcing profile.d manually.  We install:
+#   /usr/local/lib/greenboost/   — the package directory
+#   /etc/profile.d/greenboost_pythonpath.sh — PYTHONPATH for login shells
+#   greenboost.pth               — dist-packages + conda pth drop-in
+gb_step "Installing GreenBoost Python orchestration stack..."
+GB_PY_DEST="/usr/local/lib/greenboost"
+mkdir -p "$GB_PY_DEST"
+GB_PY_FILES=(
+    gb_init.py
+    gb_quant.py gb_quant_tq.py gb_attn.py gb_llm.py
+    gb_telemetry.py gb_stream_sched.py gb_model_tier.py
+    gb_mem_pool.py gb_diffusion_orch.py
+    gb_stability_monitor.py gb_feeder_diag.py
+)
+_installed=0
+for _f in "${GB_PY_FILES[@]}"; do
+    if [[ -f "$SRC_DIR/$_f" ]]; then
+        install -m 644 "$SRC_DIR/$_f" "$GB_PY_DEST/$_f"
+        (( _installed++ )) || true
+    fi
+done
+# Package __init__.py
+if [[ ! -f "$GB_PY_DEST/__init__.py" ]]; then
+    printf '# GreenBoost Python orchestration stack — auto-generated\n' \
+        > "$GB_PY_DEST/__init__.py"
+fi
+# profile.d export
+cat > /etc/profile.d/greenboost_pythonpath.sh << 'PROFEOF'
+# GreenBoost Python orchestration stack
+if [[ -d /usr/local/lib/greenboost ]]; then
+    export PYTHONPATH="/usr/local/lib/greenboost${PYTHONPATH:+:$PYTHONPATH}"
+fi
+PROFEOF
+chmod 644 /etc/profile.d/greenboost_pythonpath.sh
+# Drop a .pth + sitecustomize into every system dist-packages.
+# The .pth adds the path AND imports greenboost_sitecustomize so that
+# processes launched with GREENBOOST_ACTIVE=1 get gb_init auto-imported.
+_GB_SC_CONTENT='# GreenBoost auto-bootstrap — generated by install_module.sh
+import os as _os
+if _os.environ.get("GREENBOOST_ACTIVE") == "1":
+    try:
+        import gb_init  # noqa: F401
+    except Exception:
+        pass
+'
+for _dp in /usr/local/lib/python3*/dist-packages; do
+    if [[ -d "$_dp" ]]; then
+        printf '%s' "$_GB_SC_CONTENT" > "$_dp/greenboost_sitecustomize.py"
+        printf '/usr/local/lib/greenboost\nimport greenboost_sitecustomize\n' \
+            > "$_dp/greenboost.pth"
+    fi
+done
+# Drop into active conda env if present
+if [[ -n "${CONDA_PREFIX:-}" && -d "$CONDA_PREFIX/lib" ]]; then
+    for _dp in "$CONDA_PREFIX"/lib/python3*/site-packages; do
+        if [[ -d "$_dp" ]]; then
+            printf '%s' "$_GB_SC_CONTENT" > "$_dp/greenboost_sitecustomize.py"
+            printf '/usr/local/lib/greenboost\nimport greenboost_sitecustomize\n' \
+                > "$_dp/greenboost.pth"
+        fi
+    done
+fi
+gb_ok "Python stack installed: $_installed files → $GB_PY_DEST"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""

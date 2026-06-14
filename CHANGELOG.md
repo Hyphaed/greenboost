@@ -2,25 +2,152 @@
 
 ---
 
+## v3.0 : 2026-06-13
+v3.0 : 2026-06-13
+
+v3.0 Includes the work not commited on v2.9 + bugfixes due issues reported by other users
+
+
+## 🤝 A unified runtime for diffusion pipelines
+
+Modern diffusion systems are composed of multiple independent components—typically CLIP, VAE, and UNet or DiT—that must share GPU resources while executing in the correct order.
+
+`gb_diffusion_orch.py` acts as the coordinator for those components, using the singletons created by `gb_init.py` instead of constructing duplicate runtime objects.
+
+This allows multiple diffusion pipelines to be nested or composed together.
+
+
+
+## 🔬 Embedded DCGM telemetry (no daemon required)
+
+GPU telemetry is usually provided by a separate background service (`dcgmd`) that has to be installed, configured, and kept running. That works for managed clusters, but it is unnecessary complexity for local workstations and portable deployments.
+
+GreenBoost now embeds the telemetry engine directly into the runtime.
+
+As soon as GreenBoost starts, it can query the GPU without relying on an external daemon, making deployment identical on both bare-metal machines and multi-GPU clusters.
+
+More importantly, the telemetry is designed to catch hardware problems before they become corrupted model outputs.
+
+If the GPU reports an ECC double-bit error—a condition that indicates uncorrectable memory corruption, GreenBoost immediately emits a warning to `stderr` so the workload can be inspected before invalid results propagate through an entire inference or training run.
+
+Single-bit ECC errors are also tracked over time, providing an early indicator of hardware aging instead of waiting for catastrophic failures.
+
+Beyond memory health, the telemetry continuously monitors instantaneous GPU power consumption together with PCIe connectivity, memory status, thermal conditions, and power delivery. These health checks run every 30 seconds and are lightweight enough that they do not interfere with Triton kernel execution.
+
+For critical workloads, applications can also trigger the diagnostic engine manually before starting a long inference or training session.
+
+NVLink bandwidth reporting is included as well. On GPUs that do not support NVLink, such as the RTX 5070, the reported bandwidth is simply zero instead of producing an error.
+
+For multi-GPU deployments, `ClusterTelemetryManager` creates one telemetry instance per device while sharing a single health-check engine across the entire system, reducing duplicated work while preserving per-GPU visibility.
+
+
+## 🗜️ Compression layer
+
+There is no single quantization method that is optimal for every model, every tensor shape, or every compression level. Greenboost combines three complementary technologies.
+
+**GemLite provides the execution engine.**
+GemLite is a collection of highly optimized Triton kernels that know how to perform matrix multiplication directly on quantized weights. Instead of first decompressing weights into bf16 and then computing, GemLite operates on compressed representations, reducing memory traffic. 
+
+**HQQ provides high-quality 4-bit quantization.**
+HQQ (Half-Quadratic Quantization) focuses on preserving model accuracy while reducing weights to 4 bits. It computes quantization parameters that minimize reconstruction error, making it an excellent default choice for layers where quality is more important than achieving the smallest possible representation. HQQ consistently provides the best balance between accuracy, compatibility, and performance at 4 bits.
+
+**TurboQuant pushes compression below 4 bits.**
+Traditional 4-bit quantizers begin to lose quality rapidly when forced into 3-bit or 2-bit representations. TurboQuant is specifically designed for these ultra-low-bit regimes, using specialized encoding and execution strategies that preserve significantly more information than standard approaches. This makes it the preferred choice when VRAM is extremely limited and maximum compression is required.
+
+### How they work together
+
+GreenBoost combines these technologies into a single runtime pipeline.
+
+1. **The runtime first determines how much VRAM is available.**
+2. **Each layer is assigned the highest precision that still allows the complete model to fit in memory.**
+3. **GemLite executes the selected quantized kernels regardless of whether the weights came from HQQ or TurboQuant.**
+
+The selection strategy is:
+
+* **bf16:** Use native floating-point weights whenever memory allows.
+* **int8:** Reduce memory with minimal quality loss.
+* **int4 (HQQ):** Default low-bit format, optimized for quality.
+* **TurboQuant 3-bit / 2-bit:** Used only when more aggressive compression is needed.
+
+If a tensor shape is incompatible with TurboQuant (for example, `K % 128 != 0`), GreenBoost automatically falls back to **int4-HQQ**. If the backend cannot process the tensor at all, execution safely falls back to **bf16**.
+
+In other words:
+
+* **HQQ decides *how to represent* high-quality 4-bit weights.**
+* **TurboQuant decides *how to represent* extremely compressed 3-bit and 2-bit weights.**
+* **GemLite provides the Triton kernels that execute all of those representations efficiently on the GPU.**
+
+By combining the strengths of all three, GreenBoost maximizes model quality while minimizing VRAM usage, instead of forcing a single quantization method onto every workload.
+
+> **Current limitation:** NVFP4 quantization support is already integrated into GreenBoost, but a known upstream Triton compiler issue currently causes compilation failures. Once that issue is resolved in a future Triton release, NVFP4 support will become available without requiring architectural changes.
+
+
+
+
+
+🐛 **Regression guards and crash fixes**
+
+This release adds several regression tests and runtime improvements that make the project much more resilient across different CUDA versions, compilers, and AI frameworks.
+
+### Preventing old bugs from returning
+
+One issue involved `cudaGetDriverEntryPointByVersion`, which was originally fixed in **v2.9**. The problem wasn't the implementation anymore—it was making sure future compiler optimizations (especially Link Time Optimization, or LTO) didn't accidentally remove or break the hook.
+
+To prevent that, the function is now part of `EXPECTED_HOOKS`, and a new `TestSo12Trampolines` test performs a positive `readelf` check during CI. If a future build silently drops the symbol, the test fails immediately instead of allowing a broken release.
+
+### Making CUDA 13 initialization behave like older versions
+
+Many AI projects—including **llama.cpp**, **ComfyUI**, and **ggml**—call `cudaMemGetInfo()` before ever calling `cudaSetDevice()`. Earlier CUDA versions tolerated this pattern, but CUDA 13 returns `cudaErrorDeviceUninitialized (998)` instead.
+
+Rather than requiring every application to change its code, the shim now adapts automatically.
+
+If `cudaMemGetInfo()` is called too early, it lazily resolves itself and initializes when needed. At the driver level, `cuMemGetInfo_v2()` and `cuDeviceTotalMem_v2()` now detect an invalid CUDA context and safely fall back to the runtime API. `cuDeviceGetAttribute()` also no longer reports an unnecessary error and simply passes the request through transparently.
+
+The result is that applications written for older CUDA behavior continue to run correctly on CUDA 13 without modification.
+
+### Better support for Clang-built kernels
+
+Most NVIDIA kernel modules are built with GCC, but distributions such as **CachyOS** and some **Arch Linux** configurations build their kernels with Clang instead.
+
+Previously this required manual configuration. The Makefile now detects `CONFIG_CC_IS_CLANG=y` automatically and adds `LLVM=1` to the build flags. This also means DKMS rebuilds after kernel updates continue working without any extra user intervention.
+
+### Automatically selecting the newest CUDA installation
+
+Many development machines have multiple CUDA versions installed side by side—for example CUDA 12 and CUDA 13.
+
+Older build scripts could accidentally select the older toolkit, creating confusing version mismatches. The build system now searches `/usr/local/cuda-[0-9]*`, sorts every installation by version number, and automatically chooses the newest one.
+
+The same version-selection logic is implemented consistently in `greenboost_builder.py` and `greenboost_setup.sh`. If the selected build toolkit differs from the CUDA version reported by `nvidia-smi`, the user receives a warning instead of discovering the mismatch later through runtime failures.
+
+## F-ABI1 `cudart` rebind: fixing shim stacking
+
+One of the most significant stability improvements addresses how the CUDA shim interacts with different versions of `libcudart`.
+
+Previously, the shim assumed applications would load the same CUDA runtime version that it expected. In reality, different AI frameworks may map different `libcudart` versions into memory, causing symbol layout mismatches and unpredictable crashes.
+
+The shim now waits until its first CUDA call and dynamically discovers the application's actual `libcudart` by scanning `/proc/self/maps`. Instead of binding to a hardcoded runtime, it rebinds itself to whatever version the application already loaded.
+
+This eliminates crashes caused by mixing CUDA 12 and CUDA 13 runtimes, including divide-by-zero failures observed in PyTorch grid computations.
+
+The constructor also now uses `RTLD_LOCAL`, ensuring the fallback CUDA runtime remains private instead of polluting the global symbol namespace. This prevents duplicate registration hangs that could occur during library initialization.
+
+Finally, symbol resolution no longer relies on `dlsym()`. Instead, the shim walks the target library's own ELF hash tables directly, avoiding the 15-million-call self-recursion loop that previously occurred during `import torch`.
+
+The same redesign also fixes the infinite-recursion hang seen with `cu128`'s `libcudart.so.12`, making mixed-runtime environments substantially more reliable.
+
+
+---
+
 ## v2.9 : 2026-06-10
 
 Lately I've been running GreenBoost every day on my own image generation
-pipelines (diffusers). Using a tool for real is the quickest way to spot the
-small stuff that needs fixing, so a lot of this release is just polish.
+pipelines (diffusers). That's where the new stuff comes from.
 
 🧪 **Polish from daily use**
 Daily driving it on my diffuser pipelines turned up small glitches and slow
 spots. Cleaned them up. Loading and running the big models feels steadier now
 and chokes a lot less.
 
-🎮 **Gaming moved out**
-The gaming side of GreenBoost has been taken out into its own separate project,
-still alpha at the moment... Keeps the core small and focused on the thing it
-does best, stretching GPU memory for AI.
-Do not know when I will release Greenboost Gaming Suite,
-Im taking care of other personal project (code related + away from the screen related);
-
-![GreenBoost Gaming Suite - now its own separate alpha project](greenboost_gaming_suite.png)
 
 🌐 **greenboost cluster (alpha/beta)**
 You can now pool the GPU memory and compute of a few machines together and use
@@ -36,6 +163,14 @@ missing packages on Debian, Ubuntu, Fedora and Arch.
 🐛 **Stability**
 More crash fixes around very large allocations near the edge of capacity, plus
 the hardware auto-tuning maths.
+
+
+🎮 **Gaming moved out**
+The gaming side of GreenBoost has been stripped out and moved into its own project,
+still in alpha stage at the moment... 
+Do not know when I will release Greenboost Gaming Suite.
+
+![GreenBoost Gaming Suite](greenboost_gaming_suite.png)
 
 ---
 

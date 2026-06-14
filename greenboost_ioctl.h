@@ -268,4 +268,38 @@ struct gb_gaming_req {
 };
 #define GB_IOCTL_GAMING_MODE  _IOW(GB_IOCTL_MAGIC, 20, struct gb_gaming_req)
 
+/* Diffusion pipeline stage hints — allow the kernel to tune T2 eviction
+ * pressure for the active pipeline stage:
+ *   GB_STAGE_IDLE    0   no inference running
+ *   GB_STAGE_ENCODE  1   text encoders active; small tensors, high turnover
+ *   GB_STAGE_DENOISE 2   denoiser active; large latents, keep in T1
+ *   GB_STAGE_DECODE  3   VAE active; denoiser can be cold-hinted in T2
+ *
+ * The kernel uses this to adjust T2 LRU weights: DENOISE keeps weight
+ * buffers HOT; ENCODE marks denoiser buffers COLD for early eviction.
+ * This is advisory only — the kernel never forcibly moves tensors, only
+ * adjusts LRU priority based on the hint.
+ */
+#define GB_STAGE_IDLE    0
+#define GB_STAGE_ENCODE  1
+#define GB_STAGE_DENOISE 2
+#define GB_STAGE_DECODE  3
+
+struct gb_diffusion_stage_req {
+    gb_u32 stage;    /* GB_STAGE_* constant */
+    gb_u32 reserved;
+};
+#define GB_IOCTL_DIFFUSION_STAGE _IOW(GB_IOCTL_MAGIC, 21, struct gb_diffusion_stage_req)
+
+/* Latent buffer registration — hint to the kernel that a given DMA-BUF
+ * fd contains a diffusion latent (not a weight or KV entry).  The kernel
+ * sets GB_ALLOC_ACTIVATIONS semantics internally: never spills to T3,
+ * released at end of phase.  pid=0 means the caller's own PID. */
+struct gb_latent_reg_req {
+    gb_s32 buf_fd;   /* DMA-BUF fd of the latent buffer */
+    gb_u32 stage;    /* GB_STAGE_* hint at registration time */
+};
+#define GB_IOCTL_LATENT_REGISTER  _IOW(GB_IOCTL_MAGIC, 22, struct gb_latent_reg_req)
+#define GB_IOCTL_LATENT_RELEASE   _IOW(GB_IOCTL_MAGIC, 23, struct gb_latent_reg_req)
+
 #endif /* GREENBOOST_IOCTL_H */

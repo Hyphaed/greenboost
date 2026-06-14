@@ -3222,6 +3222,26 @@ static struct notifier_block gb_panic_nb = {
 /*  Module init / exit                                                  */
 /* ------------------------------------------------------------------ */
 
+/* Audit F-L2-07: /dev/greenboost group access — created 0600 root:root by
+ * default when no devnode callback is set.  The udev rule (99-greenboost.rules,
+ * GROUP="video" MODE="0660") relaxes this in userspace, but only after
+ * udevadm runs.  Setting the mode here in the kernel ensures the node is
+ * group-accessible the instant insmod returns, regardless of udev ordering
+ * or whether install-sys-configs has been run.  Any non-root user who is in
+ * the 'video' group (added by install-sys-configs / cmd_load) can then open
+ * /dev/greenboost without root, which is required for gb_quant int4 FLUX
+ * CUDA inference and the DMA-BUF T2 overflow path. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0)
+static char *gb_devnode(const struct device *dev, umode_t *mode)
+#else
+static char *gb_devnode(struct device *dev, umode_t *mode)
+#endif
+{
+	if (mode)
+		*mode = 0660;
+	return NULL;
+}
+
 static int __init gb_init(void)
 {
 	int ret;
@@ -3346,6 +3366,9 @@ static int __init gb_init(void)
 		pr_err(DRIVER_NAME ": class_create failed: %d\n", ret);
 		goto err_cdev;
 	}
+	/* Set devnode mode so /dev/greenboost is created 0660 (group-accessible)
+	 * regardless of udev rule timing.  See gb_devnode() above. */
+	gb_dev.cls->devnode = gb_devnode;
 
 	gb_dev.dev = device_create_with_groups(gb_dev.cls, NULL,
 					       gb_dev.devt, NULL,

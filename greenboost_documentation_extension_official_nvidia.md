@@ -735,6 +735,117 @@ For the load-bearing claim about `cudaMemPrefetchAsync` overriding
 sentence is the formal NVIDIA documentation that justifies GreenBoost's
 prefetch-interception design.
 
+| CUDA 13 context fallback | Not in Programming Guide | §G.13.2 |
+| Python quantization layer | Not in CUDA PG (PyTorch / GemLite) | §G.13.1 |
+| Clang-built kernel module | Not in CUDA PG (Linux build system) | §G.13.3 |
+
+---
+
+## G.13. v3.0 Additions (Python Layers and Compatibility Fixes)
+
+### G.13.1. Python optimization layers (`gb_init`, `gb_telemetry`, `gb_quant`, `gb_llm`, `gb_diffusion_orch`)
+
+GreenBoost v3.0 adds five Python-level layers that complement the CUDA shim
+without touching any CUDA-documented primitive. These are GreenBoost-specific
+designs, not combinations of NVIDIA-documented APIs:
+
+**`gb_init.py`** — single-import bootstrap. On import it:
+- Monkey-patches `torch.cuda.empty_cache → lambda: None`. Rationale: the
+  PyTorch CUDA caching allocator's `cudaFree` calls conflict with the
+  `DynamicVRAM` allocator's ownership of the pool. NVIDIA documents
+  `cudaFree` / `cuMemFree_v2` as releasing memory from the *calling
+  process's* allocator. When the caching allocator and the shim co-own
+  the same addresses, `cudaFree` from PyTorch's side produces
+  `CUDA_ERROR_INVALID_VALUE`. The monkey-patch prevents the conflict.
+  **This is not a documented NVIDIA pattern.** It is GreenBoost's
+  practical workaround for a co-existence problem.
+- Installs an ECC DBE callback via `gb_telemetry.DCGMProvider`. This
+  does not alter any NVIDIA-documented behaviour; it reads DCGM fields
+  that are documented as part of the DCGM API surface (FI 311, FI 313).
+
+**`gb_telemetry.py`** — embedded DCGM mode. Uses `dcgmStartEmbedded` instead
+of connecting to a `dcgmd` daemon. NVIDIA's DCGM documentation lists
+`dcgmStartEmbedded` as supported. The combination of embedded DCGM +
+NVML + GreenBoost ioctl in a single telemetry poll loop is not described
+in any NVIDIA document; it is a GreenBoost composition.
+
+**`gb_quant.py`** — weight quantization. Uses PyTorch / HQQ (Half-Quadratic
+Quantization, MIT-licensed) and GemLite (Apache-2.0 Triton GEMM kernels).
+None of this touches CUDA-documented APIs at the shim level; the quantized
+weights are plain PyTorch tensors. The *result* is that fewer bytes are
+transferred over PCIe per token, which multiplies the throughput gain from
+Path A/B allocation. GreenBoost provides the VRAM budget information
+(from `gb_telemetry.GreenBoostProvider` ioctl) so the planner knows what
+precision level fits without trial-and-error.
+
+**`gb_llm.py`** and **`gb_diffusion_orch.py`** — application-level wrappers.
+No new CUDA primitives. They coordinate model loading and quantization
+using the layers above. The NVTX ranges emitted (`gb:llm_load:<model>`,
+`gb:quantize:<bits>`) are standard NVTX markers (documented by NVIDIA).
+
+### G.13.2. CUDA 13 invalid-context fallback in `cuMemGetInfo_v2` and `cuDeviceTotalMem_v2`
+
+**The CUDA 13 change.** CUDA 13 (`cu130`) enforces that `cuMemGetInfo_v2`
+and `cuDeviceTotalMem_v2` require an active primary context on the target
+device before the call. CUDA 12 permitted calling these functions before
+`cudaSetDevice` with a best-effort result. CUDA 13 returns
+`CUDA_ERROR_INVALID_CONTEXT` (201) instead.
+
+**The Programming Guide's position.** Programming Guide §3.2.3 states that
+`cuCtxCreate` or `cuDevicePrimaryCtxRetain` must be called to establish a
+context before issuing driver-API calls that need one. Programming Guide
+§5.3.1 (Implicit Context) notes that the *runtime* API (`cudaSetDevice`,
+`cudaMemGetInfo`) retains the primary context automatically. The guide does
+not discuss what happens when frameworks call the driver API without first
+establishing a context — the documented expectation is that they do so.
+
+**GreenBoost's behaviour.** When `cuMemGetInfo_v2` or `cuDeviceTotalMem_v2`
+returns `CUDA_ERROR_INVALID_CONTEXT` (201) or `CUDA_ERROR_DEINITIALIZED`
+(4), the shim:
+
+1. Calls the runtime-API `cudaMemGetInfo` instead (which calls
+   `cuDevicePrimaryCtxRetain` internally, establishing the context).
+2. Uses the values returned by the runtime call as `real_free` /
+   `real_total`.
+3. Continues to apply virtual-pool inflation (T2 + T3 + cluster) as normal.
+
+The result is that the caller receives the correct inflated values without
+needing to have called `cudaSetDevice` first. This is **not documented by
+NVIDIA** — specifically, the fallback from a failing driver-API call to the
+corresponding runtime-API call, and the mixing of driver-API output with
+GreenBoost-applied inflation, is a GreenBoost-specific design.
+
+**`DISABLE` passthrough fix.** When `GREENBOOST_DISABLE=1` is set or the
+shim is not yet initialized, `cuDeviceTotalMem_v2` and
+`cuDeviceGetAttribute` previously returned `CUDA_ERROR_NOT_SUPPORTED`.
+v3.0 changes this to a transparent `dlsym(RTLD_NEXT)` forward so the
+caller receives the real physical value. This matches the documented
+NVIDIA behaviour where a function that is "not supported" vs. "not
+intercepted" should be transparent to the caller.
+
+### G.13.3. Clang-built Linux kernel module (CachyOS, Arch/clang, Gentoo/clang)
+
+**Context.** GreenBoost's kernel module is compiled with the same toolchain
+that compiled the running kernel. On distributions that ship a Clang-built
+kernel (CachyOS, some Arch configurations, Gentoo with `CC=clang`), the
+kernel `.config` contains `CONFIG_CC_IS_CLANG=y`. Building the module with
+GCC on such a kernel produces `-Werror` failures on Clang-specific flags
+embedded in the kernel's `Makefile.include` (e.g. `-mretpoline-external-thunk`,
+`-mstack-alignment=8`).
+
+**GreenBoost's fix.** The `Makefile` reads `$(KDIR)/.config` and, if
+`CONFIG_CC_IS_CLANG=y` is present, appends `LLVM=1` to the kernel sub-make
+command. This selects the full LLVM toolchain (`CC=clang`, `LD=ld.lld`,
+`AR=llvm-ar`, `NM=llvm-nm`) that the kernel's own build system documents
+as the correct way to build modules for a Clang kernel.
+
+`dkms.conf` additionally sets explicit `MAKE[0]` and `CLEAN` directives
+with the same detection so that DKMS auto-rebuilds on kernel updates also
+use the correct toolchain. The DKMS documentation specifies that if
+`MAKE[0]` is omitted the default is `make -C ${kernel_source_dir}
+M=${build_dir} modules`; we override it here solely to inject `LLVM=1`
+when required.
+
 ---
 
 *End of Chapter G.*

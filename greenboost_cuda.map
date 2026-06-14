@@ -44,6 +44,21 @@ libcudart.so.13 {
         cudaStreamSynchronize;
         cudaGetDriverEntryPointByVersion;
         __cudaRegisterFunction;
+        /* RECURSION FIX: these four hooks must ALSO have their default (@@)
+         * version here on .so.13.  greenboost_cuda_v12.c builds a
+         * cudaX@libcudart.so.12 trampoline whose body calls the bare name
+         * `cudaX(...)`.  If the hook body's DEFAULT version is .so.12 (i.e. the
+         * symbol is listed ONLY in the .so.12 node below), that intra-object
+         * call binds to the trampoline's own @.so.12 alias instead of the hook
+         * body — infinite self-recursion, observed as a 100% CPU hang in the
+         * PyTorch cu128 path (torch.cuda.get_device_properties → spin).
+         * Listing them here (processed first) makes the body default to
+         * @@.so.13 — exactly how cudaMalloc already avoids the trap — while the
+         * .so.12 trampoline below still satisfies PyTorch's versioned import. */
+        cudaGetDeviceProperties;
+        cudaGetDeviceProperties_v2;
+        cudaFreeAsync;
+        cudaMemPrefetchAsync;
 };
 
 /* libcudart.so.12 - version node for CUDA-12-era runtime callers (PyTorch cu128).

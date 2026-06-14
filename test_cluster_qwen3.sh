@@ -12,7 +12,7 @@ set -euo pipefail
 
 MODEL="qwen3.6:latest"
 OLLAMA_URL="http://localhost:11434"
-FEEDER_IP="192.168.50.246"
+FEEDER_IP="${FEEDER_IP:-192.168.1.100}"  # override: export FEEDER_IP=<your-feeder-ip>
 FEEDER_PORT="9740"
 # Override OLLAMA_CTX_SIZE env var to change context window (default 4096).
 # OLLAMA_NUM_CTX=131072 in the systemd service would require ~17 GB KV cache,

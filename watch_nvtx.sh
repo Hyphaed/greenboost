@@ -16,7 +16,8 @@
 set -euo pipefail
 
 LOCAL_LOG="/run/greenboost/nvtx_events.log"
-FEEDER_IP="192.168.50.246"
+FEEDER_IP="${FEEDER_IP:-192.168.1.100}"   # override: export FEEDER_IP=<your-feeder-ip>
+FEEDER_USER="${FEEDER_USER:-$(whoami)}"   # override: export FEEDER_USER=<ssh-user>
 FEEDER_LOG="/run/greenboost/nvtx_events.log"
 
 FOLLOW=1
@@ -227,15 +228,15 @@ fi
 # ── Feeder log tail ───────────────────────────────────────────────────────────
 if [[ "$LOCAL_ONLY" -eq 0 ]]; then
     if ssh -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=no \
-            "ferran@$FEEDER_IP" "test -f '$FEEDER_LOG'" 2>/dev/null; then
+            "${FEEDER_USER}@${FEEDER_IP}" "test -f '$FEEDER_LOG'" 2>/dev/null; then
         if [[ "$FOLLOW" -eq 1 ]]; then
             ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
-                "ferran@$FEEDER_IP" \
+                "${FEEDER_USER}@${FEEDER_IP}" \
                 "tail -n 0 -F '$FEEDER_LOG' 2>/dev/null" \
                 | sed 's/^/FEEDER:/' > "$FEEDER_PIPE" &
         else
             ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
-                "ferran@$FEEDER_IP" \
+                "${FEEDER_USER}@${FEEDER_IP}" \
                 "tail -n '$LAST' '$FEEDER_LOG' 2>/dev/null" \
                 | sed 's/^/FEEDER:/' > "$FEEDER_PIPE" &
         fi

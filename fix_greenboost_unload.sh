@@ -17,7 +17,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DRIVER="greenboost"
-GB_VERSION="2.9"
+GB_VERSION="3.0"
 KVER=$(uname -r)
 DKMS_ROOT="/usr/src/greenboost-${GB_VERSION}"
 

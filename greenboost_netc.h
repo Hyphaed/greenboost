@@ -205,6 +205,18 @@ int  gb_netc_exec_kernel(int feeder_idx,
                          struct gb_exec_upload *uploads, int n_uploads,
                          int n_downloads);
 
+/* Phase 2b: async fire-and-forget kernel dispatch (GREENBOOST_ASYNC_DISPATCH=1).
+ * Sends GB_MSG_CUDA_EXEC_ASYNC and returns as soon as the feeder ACKs.
+ * n_uploads and n_downloads are always 0 (weights must already reside in feeder
+ * VRAM via prior gb_netc_malloc; results stay there until next stream sync). */
+int  gb_netc_exec_kernel_async(int feeder_idx,
+                               const char *kernel_name,
+                               unsigned int gx, unsigned int gy, unsigned int gz,
+                               unsigned int bx, unsigned int by, unsigned int bz,
+                               uint32_t shared_mem,
+                               const uint64_t *arg_vals, uint32_t n_arg_vals,
+                               const struct gb_exec_reloc *relocs, int n_relocs);
+
 /* ------------------------------------------------------------------ */
 /*  D1/D2/D3: Feeder health and PCIe link queries                      */
 /* ------------------------------------------------------------------ */
@@ -254,6 +266,12 @@ uint32_t gb_netc_heartbeat_miss_count(int remote_idx);
 
 /* Return GPU utilization (0-100%) cached from the last heartbeat for a remote device. */
 uint32_t gb_netc_feeder_gpu_util_pct(int remote_idx);
+/* Return memory controller utilization (0-100%) from the last heartbeat. */
+uint32_t gb_netc_feeder_gpu_mem_util_pct(int remote_idx);
+/* Return GPU temperature (°C) cached from the last heartbeat; 0 = no data yet. */
+uint16_t gb_netc_feeder_gpu_temp_c(int remote_idx);
+/* Return GPU power draw (Watts) cached from the last heartbeat; 0 = no data yet. */
+uint16_t gb_netc_feeder_gpu_power_w(int remote_idx);
 
 /* N7: Query live feeder stats (T1/T2/T3 free/total, kernel count, MPS SM%).
  * Returns 0 on success, -1 if feeder is disconnected or the query failed. */

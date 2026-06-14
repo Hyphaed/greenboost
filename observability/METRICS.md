@@ -106,6 +106,78 @@ Note: `kv_used_mb` has no machine-readable sysfs source and is **not** emitted.
 
 ---
 
+## Python telemetry layer (`gb_telemetry.py`)
+
+`gb_telemetry.TelemetryManager` is the live in-process telemetry layer used by
+`gb_init`, `gb_quant`, `gb_diffusion_orch`, and `gb_llm`. It is separate from
+the Prometheus exporters above and produces `GpuMetrics` snapshots read by the
+Python optimization modules.
+
+### Provider architecture
+
+Four providers are tried in order; each fills fields it can supply:
+
+| Provider | Requires | Fields |
+|---|---|---|
+| `NVMLProvider` | pynvml | `power_w`, `temp_c`, `fb_total_mb`, `fb_free_mb`, `fb_used_mb`, `gpu_util_pct` |
+| `DCGMProvider` | dcgm Python bindings, embedded host engine | `power_w` (FI 157), `ecc_sbe_volatile` (FI 310), `ecc_dbe_volatile` (FI 311), `ecc_dbe_aggregate` (FI 313), `nvlink_bw_tx_mbs` (FI 449), `health_ok`, `health_summary` |
+| `GreenBoostProvider` | `/dev/greenboost` + `gb_telemetry.GB_IOCTL_GET_INFO` | `t1_used_mb`, `t2_used_mb`, `t3_used_mb`, `fb_free_mb` override |
+| `TorchFallbackProvider` | torch.cuda | `fb_total_mb`, `fb_free_mb` (last resort) |
+
+### DCGM embedded mode
+
+`DCGMProvider` uses `dcgmStartEmbedded(DCGM_OPERATION_MODE_AUTO)` — no dcgmd
+daemon required. This works on bare-metal workstations and cluster nodes alike.
+
+**Field watch intervals**: DCGM fields are added via `dcgmWatchFields` with a
+1-second update interval. The Python polling loop runs at 500 ms; DCGM
+values are sampled at each poll.
+
+**Health check**: `dcgmHealthSet_v2` configures the following systems:
+
+| System | Mask bit | RTX 5070 |
+|---|---|---|
+| PCIe | 0x01 | Active |
+| PMU (power management unit) | 0x04 | Active |
+| Memory | 0x10 | Active |
+| SM (streaming multiprocessor) | 0x20 | Active |
+| InfoROM | 0x40 | Active |
+| Thermal | 0x80 | Active |
+| Power | 0x100 | Active |
+| Driver | 0x200 | Active |
+| NVLink / NVSwitch / ConnectX | — | **Omitted** — RTX 5070 has no NVLink hardware; fields return 0 |
+
+Health check runs every 60 telemetry polls (~30 s) to avoid interfering with
+Triton kernel launches.
+
+**ECC fields**: FI 310 (`ecc_sbe_volatile`) tracks single-bit errors
+(correctable, counted for wear monitoring). FI 311 (`ecc_dbe_volatile`) and
+FI 313 (`ecc_dbe_aggregate`) track double-bit errors (uncorrectable, hardware
+memory corruption). Any `ecc_dbe_volatile > 0` triggers the ECC DBE callback
+registered by `gb_init` (loud stderr warning before inference starts).
+
+**Cluster mode**: `ClusterTelemetryManager` creates one `TelemetryManager` per
+GPU, using `dcgmGroupCreate` / `dcgmGroupAddDevice` so a single DCGM session
+covers all devices. Health checks span the full group.
+
+**NVLink BW (FI 449)**: queried but returns 0 on RTX 5070 (no NVLink hardware).
+On V100 NVLink clusters this field reflects aggregate NVLink bandwidth.
+
+### `GpuMetrics` fields relevant to optimization modules
+
+| Field | Type | Source | Used by |
+|---|---|---|---|
+| `fb_free_mb` | int | NVML / GB / Torch | `quantize_to_fit` budget tightening |
+| `should_demote` | bool | NVML (fb_free_mb < headroom) | `ModelTierManager.auto_evict` |
+| `ecc_dbe_volatile` | int | DCGM FI 311 | `pre_inference_check` — blocks generation |
+| `ecc_critical` | bool | `dbe_volatile > 0` | ECC guard callback |
+| `health_ok` | bool | DCGM health check | `pre_inference_check` — warns |
+| `health_summary` | str | DCGM health check | Logged to stderr |
+| `power_w` | float | NVML / DCGM FI 157 | Telemetry log, cluster monitoring |
+| `temp_c` | float | NVML | Telemetry log |
+
+---
+
 ## Go sysfs exporter metrics (`cmd/greenboost-metrics-exporter/`)
 
 All memory sizes are in **bytes** - standard Prometheus convention.

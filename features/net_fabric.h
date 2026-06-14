@@ -161,6 +161,11 @@ enum gb_net_msg_type {
     GB_MSG_CUDA_REGISTER_FN = 0x22,
     /* Single-GPU cluster: kernel exec with pointer relocation + inline data xfer */
     GB_MSG_CUDA_EXEC        = 0x23,
+    /* 0x24 = GB_MSG_CUDA_MEMCPY_D2D (defined as #define below) */
+    /* Async fire-and-forget exec: same wire format as GB_MSG_CUDA_EXEC but
+     * n_downloads must be 0.  Feeder ACKs immediately (before kernel completes);
+     * results stay resident in feeder VRAM until the next GB_MSG_CUDA_SYNC. */
+    GB_MSG_CUDA_EXEC_ASYNC  = 0x25,
 
     /* Query operations */
     GB_MSG_GPU_QUERY        = 0x30,
@@ -501,6 +506,7 @@ struct gb_net_mps_set {
 /* Host → feeder: no payload (just the header with msg_type=GB_MSG_FEEDER_STATUS).
  * Feeder responds via GB_MSG_RESPONSE with this struct as payload. */
 struct gb_feeder_status_resp {
+    /* v3.0 fields — always present */
     gb_u32 status;               /* GB_STATUS_OK or error                  */
     gb_u32 mps_sm_pct;           /* current MPS SM% (0 = not active)       */
     gb_u64 t1_free_bytes;        /* GPU VRAM free                          */
@@ -509,9 +515,22 @@ struct gb_feeder_status_resp {
     gb_u64 t2_total_bytes;       /* System RAM total                       */
     gb_u64 t3_free_bytes;        /* NVMe swap free (0 if not configured)   */
     gb_u64 t3_total_bytes;       /* NVMe swap total                        */
-    gb_u32 kernel_dispatch_count; /* total kernel dispatches since start    */
+    gb_u32 kernel_dispatch_count; /* total kernel dispatches since start   */
     gb_u32 _pad;
+    /* v3.1 GPU telemetry — host checks payload_len >= GB_FEEDER_STATUS_V31_SIZE
+     * before reading; older netd versions send the shorter v3.0 struct only.  */
+    gb_u16 gpu_temp_c;           /* GPU temperature °C (GPU 0)             */
+    gb_u16 gpu_power_w;          /* current power draw Watts (GPU 0)       */
+    gb_u32 gpu_util_pct;         /* SM compute utilization 0-100 (GPU 0)   */
+    gb_u32 ecc_dbe_count;        /* cumulative double-bit ECC errors        */
+    gb_u32 throttle_reasons;     /* NVML clock-throttle bitmask             */
+    gb_u32 _pad2;
 } __attribute__((packed));
+
+/* Minimum payload size that includes the v3.1 GPU telemetry extension.
+ * Host should check: hdr.payload_len >= GB_FEEDER_STATUS_V31_SIZE */
+#define GB_FEEDER_STATUS_V31_SIZE  \
+    (offsetof(struct gb_feeder_status_resp, _pad2) + sizeof(gb_u32))
 
 #endif /* GREENBOOST_NET_FABRIC_H */
 

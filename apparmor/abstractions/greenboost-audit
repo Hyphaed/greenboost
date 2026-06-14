@@ -43,3 +43,10 @@
   # this abstraction is injected into ALL confined processes via abstractions/base.
   # Only CUDA processes (ollama, python3, etc.) need execute-mmap on the shim -
   # add `mr /usr/local/lib/libgreenboost_cuda.so,` directly to those profiles.
+
+  # Allow CUDA inference processes (python3, ollama, vllm) to open /dev/greenboost
+  # for DMA-BUF T2 DDR overflow (Path A in gb_open_device).  Without this,
+  # AppArmor-confined processes get EACCES even if the DAC group permission is
+  # correct, surfacing as "[GreenBoost] Cannot open /dev/greenboost: Permission
+  # denied" and silent fallback to Path C (no T2 overflow) for large FLUX/LLM loads.
+  rw /dev/greenboost,

@@ -1,7 +1,6 @@
-# GreenBoost v2.10 - integration guide for inference tools
+# GreenBoost v3.0 - integration guide for inference tools
 
 Check [GREENBOOST_COMMANDS.md](GREENBOOST_COMMANDS.md) for all the available commands
-Check [ARCHITECTURE.md](ARCHITECTURE.md) to know about greenboost architecture
 Check [CHANGELOG.md](CHANGELOG.md) for what changed in each version
 
 ---
@@ -28,11 +27,12 @@ existing Python script does not change.
 
 ---
 
-## What's new in v2.10
+## What's new in v3.0
 
-The 2.10 cycle was a multi-month hardening campaign on the cluster
-fabric and the LD_PRELOAD shim. No new user-visible APIs to learn, but
-plenty of fixes you'll notice in production:
+The 3.0 cycle brought a multi-month hardening campaign on the cluster
+fabric and the LD_PRELOAD shim, a full Python quantization stack (gb-quant),
+and embedded DCGM telemetry. No new user-visible APIs to learn for existing
+workflows, but plenty of fixes you'll notice in production:
 
 **Security**
 - Cluster fabric upgraded from proto v3 to **proto v4** with mutual
@@ -57,6 +57,16 @@ plenty of fixes you'll notice in production:
 - The hot allocation path is fully big-endian-safe - every wire field
   is read via `GB_LE_U16/U32/U64` accessors. The full BE port still
   requires opt-in (`-DGREENBOOST_BE_INCOMPLETE=1`).
+- **CUDA 13 / cu130 compatibility**: the shim no longer fails with
+  `cudaErrorDeviceUninitialized` (998) when frameworks call
+  `cuMemGetInfo_v2` or `cuDeviceTotalMem_v2` before the first
+  `cudaSetDevice`. On `INVALID_CONTEXT` (201) the shim falls back to
+  the runtime API which retains the primary context transparently.
+- **Clang-built kernel support**: the Makefile auto-detects
+  `CONFIG_CC_IS_CLANG=y` and passes `LLVM=1` to the kernel sub-make,
+  fixing build failures on CachyOS, Arch/clang, and Gentoo/clang
+  kernels. `dkms.conf` now sets explicit `MAKE`/`CLEAN` so DKMS
+  auto-rebuilds on kernel updates also use the correct toolchain.
 
 **New tools**
 - `greenboost stability` - a Python long-running monitor that watches
@@ -75,6 +85,23 @@ plenty of fixes you'll notice in production:
   Suite**. The CUDA-inference path stays small and auditable; gamers
   get a GTK4 GUI instead of CLI. See [§ Sister project: GreenBoost
   Gaming Suite](#sister-project-greenboost-gaming-suite).
+
+---
+
+## Build compatibility
+
+GreenBoost builds without manual flags on all supported configurations.
+The build system auto-detects the environment:
+
+| Environment | Detection | Behaviour |
+|---|---|---|
+| CUDA 12 and 13 side-by-side | `ls /usr/local/cuda-[0-9]* | sort -V` | Picks the highest versioned install; warns if nvcc major ≠ driver CUDA version |
+| Clang-built kernels (CachyOS, Arch/clang, Gentoo/clang) | `CONFIG_CC_IS_CLANG=y` in `$(KDIR)/.config` | Appends `LLVM=1` to all kernel sub-make targets (Makefile + DKMS) |
+| GCC-built kernels | no `CONFIG_CC_IS_CLANG` | Standard GCC path, unchanged |
+| No versioned CUDA dirs | fallback | `/usr/local/cuda` → `/usr/cuda` → `/opt/cuda` |
+
+If you have both CUDA 12 and CUDA 13 installed and want to force a specific
+version, set `CUDA_DIR=/usr/local/cuda-12 make` before building.
 
 ---
 
@@ -106,6 +133,185 @@ GREENBOOST_ACTIVE=1 LD_PRELOAD=/usr/local/lib/libgreenboost_cuda.so python your_
 Environment="GREENBOOST_ACTIVE=1"
 Environment="LD_PRELOAD=/usr/local/lib/libgreenboost_cuda.so"
 ```
+
+---
+
+## The five GreenBoost layers
+
+GreenBoost is **not** a single library — it is five composable layers, each solving
+one specific problem in the memory-limited GPU inference stack. A beginner AI engineer
+can adopt them one at a time:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Layer 5 · gb_diffusion_orch.py — diffusion pipeline orchestrator │
+│  (multi-component management: VAE, CLIP, UNet/DiT)               │
+├─────────────────────────────────────────────────────────────────┤
+│  Layer 4 · gb_llm.py — LLM inference quantization               │
+│  (HuggingFace Transformers + vLLM, apply gb-quant at load time)  │
+├─────────────────────────────────────────────────────────────────┤
+│  Layer 3 · gb_quant.py — weight quantize-to-fit                  │
+│  (shrink weights to fit VRAM: bf16 → int8 → int4 → tq3 → tq2)   │
+├─────────────────────────────────────────────────────────────────┤
+│  Layer 2 · gb_init.py + gb_telemetry.py — bootstrap + telemetry  │
+│  (single import wires all layers; ECC guard; GPU metrics)         │
+├─────────────────────────────────────────────────────────────────┤
+│  Layer 1 · CUDA shim + kernel module — memory tier extension      │
+│  (transparent cudaMalloc overflow to DDR/NVMe/cluster)            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Layer 1 — CUDA shim + kernel module
+
+**What it solves:** Your model is 33 GB, your VRAM is 12 GB. `cudaMalloc` would
+fail and the framework falls back to slow CPU math.
+
+**How it works:** `libgreenboost_cuda.so` is loaded via `LD_PRELOAD` before your
+Python process starts. It intercepts `cudaMalloc` and, when the allocation would
+exceed VRAM, routes it to one of three hardware paths (in order of speed):
+
+- **Path A — DMA-BUF pinned DDR** (requires `greenboost.ko`): the kernel module
+  exports hugepages as a DMA-BUF, which CUDA imports as a device pointer via
+  `cuImportExternalMemory`. The GPU reads DDR at PCIe speeds (~25 GB/s). The CPU
+  executes zero tensor math.
+- **Path B — `cuMemHostRegister`** (no kernel module): works inside Docker, VMs,
+  WSL2. Slightly higher latency than Path A but portable.
+- **Path C was removed.** UVM/managed memory caused GPU page-fault stalls.
+
+The framework (Ollama, vLLM, PyTorch) sees a single GPU with inflated total
+memory: `VRAM + T2_DDR_pool + T3_NVMe_pool`. It schedules the full model onto
+that virtual device. No code changes required in your Python script.
+
+> **Under the hood:** The shim uses `.symver` trampolines (`greenboost_cuda_v12.c`)
+> to export both the `@@libcudart.so.12` default and `@libcudart.so.12` non-default
+> symbols, so frameworks linked against CUDA 12 or CUDA 13 both resolve correctly.
+> See [greenboost_documentation_extension_official_nvidia.md](greenboost_documentation_extension_official_nvidia.md)
+> for the full technical explanation of where GreenBoost departs from NVIDIA's
+> documented behaviour (inflated `cuDeviceTotalMem`, DMA-BUF interop details,
+> data-driven feeder dispatch).
+
+### Layer 2 — `gb_init.py` + `gb_telemetry.py` (bootstrap + telemetry)
+
+**What it solves:** Starting a Python inference session requires wiring together
+GPU metrics, an ECC error guard, and the memory-tier singletons. Without a
+single entry point each project re-invents this boilerplate.
+
+**`gb_init.py`** is a one-import bootstrap:
+
+```python
+import gb_init  # that's it
+
+# What happens automatically:
+# • torch.cuda.empty_cache → no-op (prevents conflict with the DynamicVRAM allocator)
+# • TelemetryManager started (500 ms poll)
+# • ECC DBE callback installed (stderr warning on uncorrectable memory error,
+#   before inference silently corrupts outputs)
+# • gb_stream_sched / gb_model_tier / gb_mem_pool singletons exposed
+```
+
+**`gb_telemetry.py`** uses a provider chain:
+
+| Provider | Requires | What it reports |
+|---|---|---|
+| `NVMLProvider` | pynvml | power, temp, VRAM free/total, GPU utilisation |
+| `DCGMProvider` | dcgm Python bindings | ECC single/double-bit errors (FI 310/311/313), NVLink BW (FI 449), health check (PCIe / SM / Memory / Thermal / …) |
+| `GreenBoostProvider` | `/dev/greenboost` | T1/T2/T3 usage via ioctl |
+| `TorchFallbackProvider` | torch.cuda | last-resort VRAM numbers |
+
+The embedded DCGM mode (`dcgmStartEmbedded`) means no dcgmd daemon is needed on
+bare-metal workstations or cluster nodes.
+
+`gb_init.pre_inference_check()` blocks inference if an ECC double-bit error has
+occurred since last boot — GPU memory is corrupted, output is wrong, better to
+know before wasting 10 minutes of generation.
+
+### Layer 3 — `gb_quant.py` (weight quantize-to-fit)
+
+**What it solves:** Even with T2 DDR overflow, streaming large weights over PCIe
+each token costs bandwidth. If the weights fit entirely in VRAM at a lower
+precision, every token is fast.
+
+**How it works:** `quantize_module` shrinks model weights using a quality-first
+planner — each component gets the highest precision that still fits the VRAM
+budget:
+
+```
+bf16  (16 bits) → highest quality, largest
+int8  ( 8 bits)
+int4  ( 4 bits) ← default sweet spot, HQQ backend
+tq3   ( 3 bits) ← TurboQuant: Triton LUT-GEMM, rotated activations
+tq2   ( 2 bits) ← TurboQuant: most compact, useful for huge models
+```
+
+The low-bit GEMM backend (GemLite + HQQ) ships inside GreenBoost
+(`third_party/`, Apache-2.0). Your venv needs nothing extra.
+
+```python
+from gb_quant import quantize_module
+
+model = load_your_model()
+model = quantize_module(model)   # planner picks the right precision for each layer
+```
+
+`GB_QUANT_BUDGET_GB` overrides the VRAM budget. A warm-kernel autotune cache
+(`~/.cache/greenboost/`) means Triton compilation only happens once.
+
+### Layer 4 — `gb_llm.py` (LLM inference)
+
+**What it solves:** Wiring gb-quant into HuggingFace Transformers or vLLM with
+the right hooks and profiler annotations.
+
+```python
+from gb_llm import load_model_gb
+
+# Loads a HF model, auto-selects quantization, pins KV cache to the right tier
+model, tokenizer = load_model_gb("mistralai/Mistral-7B-v0.3")
+```
+
+NVTX range `gb:llm_load:<model>` is emitted around the load phase so Nsight
+Systems traces show exactly how long quantization + tier placement took.
+
+### Layer 5 — `gb_diffusion_orch.py` (diffusion pipeline orchestrator)
+
+**What it solves:** Diffusion models (Stable Diffusion, FLUX, LTX-Video) have
+three or four sub-models that each allocate GPU memory: a VAE, a text encoder
+(CLIP / T5), and the main denoiser (UNet or DiT). Managing them as separate
+`quantize_module` calls leaves memory fragmentation gaps and misses the chance
+to tune per-component budgets.
+
+`gb_diffusion_orch.py` treats the whole pipeline as one budget:
+
+```python
+from gb_diffusion_orch import DiffusionOrchestrator
+
+orch = DiffusionOrchestrator(pipeline)
+orch.fit()      # quantizes each component to the right precision
+orch.run(prompt="a cat", steps=20)
+```
+
+Uses the `gb_init` singletons for telemetry and only stops the telemetry thread
+if it was the one that created it (`_tel_owned` flag), so stacking multiple
+orchestrators in one session works correctly.
+
+---
+
+## The official CUDA extension document
+
+[`greenboost_documentation_extension_official_nvidia.md`](greenboost_documentation_extension_official_nvidia.md)
+is GreenBoost's technical companion to the CUDA Programming Guide.
+It is written in the same register as NVIDIA's Programming Guide chapters 3
+and 4, and explicitly calls out every place where GreenBoost combines
+documented NVIDIA primitives in ways NVIDIA never described:
+
+- Inflating `cuDeviceTotalMem` / `nvmlDeviceGetMemoryInfo` to include DDR + NVMe pools
+- `cuImportExternalMemory(OpaqueFd)` + DMA-BUF zero-copy pinned DDR (Path A)
+- `cuMemHostRegister(DEVICEMAP)` over `GB_IOCTL_PIN_USER_PTR` (Path A pinned sub-method)
+- Virtual device aggregation across TCP-connected feeder machines
+- `cuLaunchKernel` data-driven remote dispatch via fake pointer scanning
+- CUDA 13 invalid-context runtime fallback in `cuMemGetInfo_v2` / `cuDeviceTotalMem_v2`
+
+Read it if you are integrating GreenBoost into a new framework and need to
+understand precisely what the shim reports vs. what the NVIDIA driver would report.
 
 ---
 
@@ -988,6 +1194,57 @@ with ctx:
 
 ---
 
+## gb-quant - weight quantize-to-fit (v3.0+)
+
+The fastest tier is the one you fit in. `gb_quant.py` shrinks model weights
+so the working set lives in T1 VRAM at full GPU bandwidth instead of
+streaming over PCIe from T2. The planner is quality-first: every component
+gets the HIGHEST precision that still fits the budget
+(bf16 > int8 > int4 > tq3 > tq2); T3 is never used for weights. The low-bit
+Triton GEMM backend ships inside GreenBoost (`third_party/`, Apache-2.0) -
+nothing to install in your venv.
+
+Sub-4-bit modes `"tq3"` / `"tq2"` (3.1 / 2.1 bits per weight effective) are
+TurboQuant weight quantization (`gb_quant_tq.py`: random rotation +
+Lloyd-Max codebook + a Triton LUT-GEMM kernel). Below 4 bits TurboQuant
+beats HQQ on quality, so the sub-int4 ladder rungs are TQ; int4-HQQ stays
+the default floor. Select per call (`quantize_module(m, bits="tq3")`,
+`quantize_to_fit(pipe, prefer_bits="tq3")`) or via env (`GB_QUANT_BITS=tq3`
+next to `GB_QUANT_BUDGET_GB`) - the env value is a precision FLOOR, the
+planner still gives every component the highest precision that fits.
+
+```python
+import sys; sys.path.insert(0, "/path/to/greenboost")
+import gb_quant
+
+# any diffusers pipeline or nn.Module:
+report = gb_quant.quantize_to_fit(pipe, budget_gb=11.0)
+
+# text-conditioned pipelines, two-phase (encoder freed before denoiser):
+embeds = gb_quant.encode_then_quantize(pipe, prompts)
+
+# pipelines you don't own - env hook, zero code:
+#   GB_QUANT_BUDGET_GB=11   (or "fit")   then call:
+gb_quant.maybe_quantize_from_env(model)
+```
+
+LLMs go through `gb_llm.py` (`load_causal_lm` for transformers; vLLM via
+the bundled plugin: `vllm serve <model> --quantization gemlite`). Ollama
+runs pre-quantized GGUF - there the lever is the shim plus the quant level
+you pull.
+
+gb-quant and the tiers are complementary: quantize to fit FIRST, then let
+T2 absorb only what genuinely exceeds the quantized footprint. Measured on
+an RTX 5070 12 GB: FLUX.2-klein-9B went from ~7 min/image (BF16 via T2
+overflow) to ~5 s/image steady state (int4 in T1, peak 8.2 GiB, quality
+preserved); gemma-3-12b (22.7 GiB bf16) fits in 6.2 GiB int4.
+
+Note: gb-quant currently runs WITHOUT the LD_PRELOAD shim (its backend
+cannot initialise under it yet); for fits-after-quantization models the
+shim is unnecessary anyway.
+
+---
+
 ## Optimized inference configuration generator (v2.9+)
 
 `greenboost gen-inference-config` emits a configuration block tuned for the current machine and environment. Useful when setting up Ollama or a Python inference service on a machine that may be a VM, container, or WSL2 instance.
@@ -1143,12 +1400,13 @@ FLUX.1-dev and FLUX.2-klein (image generation) have different memory and perform
 
 | Model | Mode | VRAM | Est. speed | GreenBoost required |
 |---|---|---|---|---|
-| FLUX.2-klein | FP8 + TurboQuant | ~16 GB T1+T2 | **4–6 s/image** ★ | Optional |
+| FLUX.2-klein | gb-quant int4 | ~8 GB T1 only | **~5 s/image** ★ | No (shimless) |
+| FLUX.2-klein | FP8 + TurboQuant | ~16 GB T1+T2 | 4–6 s/image | Optional |
 | FLUX.2-klein | BF16 + TurboQuant | ~22 GB T1+T2 | 5–8 s/image | Required |
 | FLUX.1-dev | NF4 + TurboQuant | ~8 GB T1 | ~2 min/image | Optional |
 | FLUX.1-dev | BF16 + TurboQuant | ~23 GB T1+T2 | ~4 min/image | Required |
 
-★ **Recommended default**  art pipeline;
+★ **Recommended default** (gb-quant) — zero overflow, fits a 12 GB card alone; first image adds ~28 s Triton autotune.
 
 ### Environment variables for diffusion pipelines
 
@@ -1273,7 +1531,7 @@ Scripts and wizards automatically show the extended vitals panel when the flag f
 
 ---
 
-## Long-running stability monitor (v2.10+)
+## Long-running stability monitor (v3.0+)
 
 Once you have a workload running for hours or days, you want a sanity
 check that nothing is drifting. That's what `greenboost stability` does.
@@ -1338,7 +1596,7 @@ invariant trail.
 
 ---
 
-## Worker pool (v2.10+, opt-in)
+## Worker pool (v3.0+, opt-in)
 
 `greenboost-netd` is single-threaded by default. A slow CUDA op on one
 client (a big `cudaMalloc`, a large `cudaMemcpy`) blocks the reactor
@@ -1355,7 +1613,7 @@ That spawns up to 32 worker threads behind a FIFO queue of 256 jobs.
 When the queue is full, `gb_workpool_submit()` returns `-1` and the
 caller falls back to inline execution - no work is dropped silently.
 
-At the time of v2.10 the scaffold is in place but only diagnostic
+At the time of v3.0 the scaffold is in place but only diagnostic
 handlers use it. Migration of `handle_cuda_memcpy_h2d/d2h` and
 `handle_cuda_exec` onto the pool is gated on a lock-discipline audit
 (several globals - `g_alloc_lock`, `g_inflight_ops`, `ra_count` -
@@ -1375,7 +1633,7 @@ Proton see the GreenBoost memory pool. That layer touched a different
 graphics API stack (Vulkan, not CUDA), required different testing, and
 attracted a different audience (gamers vs. ML engineers).
 
-In v2.10 the Vulkan layer was **extracted** into its own repository:
+In v3.0 the Vulkan layer was **extracted** into its own repository:
 
 > **[GreenBoost Gaming Suite](../greenboost_gaming/)**
 

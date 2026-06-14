@@ -1,5 +1,5 @@
 /*
- * GreenBoost v2.9 - CUDA LD_PRELOAD memory shim
+ * GreenBoost v3.0 - CUDA LD_PRELOAD memory shim
  *
  * Routes CUDA VRAM overflow to system RAM via GPU-compute paths (tried in order):
  *
@@ -74,6 +74,7 @@
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <link.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -454,6 +455,12 @@ static int prefetch_initialized = 0;
 
 /* U18/A4: Double-buffer and BW-aware prefetch configuration */
 static int g_double_buffer_enabled = 0;  /* set from GREENBOOST_DOUBLE_BUFFER=1 */
+
+/* Phase 2b: async feeder kernel dispatch.  Set from GREENBOOST_ASYNC_DISPATCH=1.
+ * When enabled, cuLaunchKernel for pure reloc kernels (no inline data) uses
+ * GB_MSG_CUDA_EXEC_ASYNC so the host does not block per kernel launch.
+ * Sync happens at cudaStreamSynchronize / cudaDeviceSynchronize boundaries. */
+static int g_async_dispatch = 0;
 
 /* A4: Compute BW-aware prefetch tile size: clamp to [64MB, 256MB] targeting ~100ms
  * of link time using the EWMA-measured feeder bandwidth (U20). Falls back to 64MB
@@ -974,6 +981,7 @@ typedef cudaError_t (*pfn_cudaExternalMemoryGetMappedBuffer)(void **, cudaExtern
                                                              const struct cudaExternalMemoryBufferDesc *);
 typedef cudaError_t (*pfn_cudaDestroyExternalMemory)(cudaExternalMemory_t);
 typedef cudaError_t (*pfn_cudaGetLastError)(void);
+typedef cudaError_t (*pfn_cudaDeviceSynchronize)(void);
 typedef cudaError_t (*pfn_cudaMemGetInfo)(size_t *, size_t *);
 typedef CUresult    (*pfn_cuDeviceTotalMem_v2)(size_t *, CUdevice);
 typedef CUresult    (*pfn_cuDeviceGetCount)(int *);
@@ -1115,6 +1123,7 @@ static pfn_cudaImportExternalMemory        real_cudaImportExternalMemory;
 static pfn_cudaExternalMemoryGetMappedBuffer real_cudaExternalMemoryGetMappedBuffer;
 static pfn_cudaDestroyExternalMemory       real_cudaDestroyExternalMemory;
 static pfn_cudaGetLastError                real_cudaGetLastError;
+static pfn_cudaDeviceSynchronize           real_cudaDeviceSynchronize;
 static pfn_cudaMemGetInfo                  real_cudaMemGetInfo;
 static pfn_cuDeviceTotalMem_v2             real_cuDeviceTotalMem_v2;
 static pfn_cuDeviceGetCount                real_cuDeviceGetCount;
@@ -1426,10 +1435,19 @@ static CUresult gb_vmm_t2_alloc_blackwell_zerocopy(CUdeviceptr *out_ptr, size_t 
     if (real_cuMemAdvise) {
         real_cuMemAdvise(d_ptr, size, CU_MEM_ADVISE_SET_READ_MOSTLY, 0);
         real_cuMemAdvise(d_ptr, size, CU_MEM_ADVISE_SET_ACCESSED_BY, 0);
-        /* Drain the INVALID_VALUE from the CUDA runtime error queue now,
-         * before it can propagate to any caller. */
-        if (real_cudaGetLastError)
-            real_cudaGetLastError();
+        /* cu130 (Blackwell): cuMemAdvise on pinned non-managed memory launches
+         * an async GPU IOMMU-setup command.  On CUDA 12.x (cu128) the error
+         * (INVALID_VALUE) comes back synchronously; on CUDA 13.x (cu130) the
+         * command is async and the error (cudaErrorInvalidResourceHandle)
+         * arrives in the runtime queue AFTER cuMemAdvise() returns.
+         * Synchronize the device first so the async failure materialises, then
+         * drain in a loop to clear all queued errors. */
+        if (real_cudaDeviceSynchronize)
+            real_cudaDeviceSynchronize();
+        if (real_cudaGetLastError) {
+            cudaError_t _e;
+            do { _e = real_cudaGetLastError(); } while (_e != 0 /*cudaSuccess*/);
+        }
     }
 
     GB_NVTX_EVENT("ALLOC_T2_ZC", "T2_DDR", size >> 20, d_ptr, "blackwell_zerocopy_ok");
@@ -1914,6 +1932,7 @@ static size_t g_cluster_remote_total_bytes      = 0; /* sum of all feeder T1+T2+
 static size_t g_cluster_remote_free_bytes       = 0; /* feeder free memory (T1+T2+T3), cached at shim init */
 static size_t g_cluster_remote_t1t2_total_bytes = 0; /* feeder T1+T2 only - used in NVML total to prevent T3 inflating default_num_ctx */
 static size_t g_cluster_remote_t1t2_free_bytes  = 0; /* feeder T1+T2 free only - excludes T3 NVMe for context-length sizing */
+static size_t g_cluster_remote_vram_bytes       = 0; /* feeder GPU VRAM (T1) only - for display as "virtual VRAM = local + feeder" */
 
 /* T1-saturation tracker: bytes successfully placed via real_cudaMalloc/cuMemAlloc_v2.
  * When this reaches gb_physical_vram_bytes, physical T1 is full → route to feeder T1
@@ -3135,8 +3154,11 @@ static void gb_write_stats(void)
     fprintf(f, "path_b_count=%u\n",           b);
     fprintf(f, "initialized=%d\n",            initialized);
     fprintf(f, "vllm_compat=%d\n",            getenv("GREENBOOST_VLLM_COMPAT") ? 1 : 0);
-    fprintf(f, "virtual_vram_mb=%zu\n",       gb_virtual_vram_bytes >> 20);
-    fprintf(f, "active_path=%s\n",            active);
+    fprintf(f, "virtual_vram_mb=%zu\n",           gb_virtual_vram_bytes >> 20);
+    fprintf(f, "physical_vram_mb=%zu\n",          gb_physical_vram_bytes >> 20);
+    fprintf(f, "cluster_remote_vram_mb=%zu\n",    g_cluster_remote_vram_bytes >> 20);
+    fprintf(f, "cluster_virtual_vram_mb=%zu\n",   (gb_physical_vram_bytes + g_cluster_remote_vram_bytes) >> 20);
+    fprintf(f, "active_path=%s\n",                active);
     fprintf(f, "phase=%s\n",                  _phase_names[_phase_idx]);
     fprintf(f, "kv_reserve_nominal_mb=%zu\n", _kv_rsv >> 20);
     fprintf(f, "kv_reserve_effective_mb=%zu\n", _kv_eff >> 20);
@@ -3186,6 +3208,10 @@ static void gb_write_stats(void)
             fprintf(jf, "  \"pid\": %d,\n", (int)getpid());
             fprintf(jf, "  \"timestamp\": %ld,\n", (long)time(NULL));
             fprintf(jf, "  \"phase\": \"%s\",\n", _phase_names[_phase_idx]);
+            fprintf(jf, "  \"physical_vram_mb\": %zu,\n", gb_physical_vram_bytes >> 20);
+            fprintf(jf, "  \"cluster_remote_vram_mb\": %zu,\n", g_cluster_remote_vram_bytes >> 20);
+            fprintf(jf, "  \"cluster_virtual_vram_mb\": %zu,\n",
+                    (gb_physical_vram_bytes + g_cluster_remote_vram_bytes) >> 20);
             fprintf(jf, "  \"local_t1_alloc_mb\": %zu,\n",
                     atomic_load_explicit(&g_local_t1_alloc_bytes, memory_order_relaxed) >> 20);
             fprintf(jf, "  \"remote_alloc_count\": %zu,\n",
@@ -3224,7 +3250,10 @@ static void gb_write_stats(void)
                             " \"health_state\": %d,"
                             " \"throttled\": %d,"
                             " \"t1_quarantined\": %d,"
-                            " \"gpu_util_pct\": %u}%s\n",
+                            " \"gpu_util_pct\": %u,"
+                            " \"gpu_mem_util_pct\": %u,"
+                            " \"gpu_temp_c\": %u,"
+                            " \"gpu_power_w\": %u}%s\n",
                             _fname ? _fname : "unknown",
                             gb_netc_feeder_pcie_bw_mbs(_fi),
                             gb_netc_heartbeat_miss_count(_fi),
@@ -3232,6 +3261,9 @@ static void gb_write_stats(void)
                             gb_netc_feeder_throttled(_fi),
                             gb_netc_feeder_t1_quarantined(_fi),
                             gb_netc_feeder_gpu_util_pct(_fi),
+                            gb_netc_feeder_gpu_mem_util_pct(_fi),
+                            (unsigned)gb_netc_feeder_gpu_temp_c(_fi),
+                            (unsigned)gb_netc_feeder_gpu_power_w(_fi),
                             (_fi < _nr - 1) ? "," : "");
                 }
                 fprintf(jf, "  ]\n}\n");
@@ -3525,6 +3557,225 @@ static void gb_atfork_child(void)
 /* PR-TT: forward decl - definition lives near the kernel signature table. */
 static void gb_kernel_sigs_load_file(const char *path);
 
+/* ------------------------------------------------------------------ */
+/*  F-ABI1: runtime-API (cuda*) symbol resolution                       */
+/*                                                                      */
+/*  The cudart "real" pointers MUST come from the same libcudart the    */
+/*  application links, not from whichever library a global search finds */
+/*  first.  cudaDeviceProp changed layout in CUDA 13.0 (deprecated      */
+/*  fields removed → every field after totalGlobalMem shifted); kernel  */
+/*  registration handles (__cudaRegisterFunction / cudaLaunchKernel)    */
+/*  are private to one libcudart instance.  Forwarding a cu13 app into  */
+/*  a cu12 libcudart produced SIGFPE in PyTorch's grid-size division    */
+/*  (multiProcessorCount read as 0) and cudaErrorInvalidResourceHandle  */
+/*  on launches.                                                        */
+/*                                                                      */
+/*  At constructor time the app's libcudart is usually NOT loaded yet   */
+/*  (python loads torch much later), so init resolves a best-effort     */
+/*  fallback and every cudart hook calls GB_CUDART_ENSURE() — a         */
+/*  one-shot lazy rebind that scans /proc/self/maps for the libcudart   */
+/*  the app actually mapped and re-resolves all pointers from it.       */
+/*  GREENBOOST_CUDART_PATH (explicit override) disables the rebind.     */
+/* ------------------------------------------------------------------ */
+static char g_cudart_init_path[512];        /* resolved path init loaded   */
+static int  g_cudart_override;              /* GREENBOOST_CUDART_PATH used */
+static _Atomic int g_cudart_rebound;        /* one-shot latch              */
+
+/* F-ABI1: resolve a symbol from ONE specific loaded library by walking its
+ * ELF dynamic symbol table directly (DT_GNU_HASH / DT_HASH).  dlsym(handle)
+ * is NOT equivalent: for a library that is already resident as a dependency
+ * of the application (torch's bundled libcudart), glibc searches the map's
+ * scope - which begins with the global scope, where THIS shim's interposing
+ * exports win.  That made real___cudaRegisterFunction point back at our own
+ * hook: the forward became a tail-call self-loop and `import torch` spun
+ * forever re-registering the first kernel. */
+static void *gb_lm_sym(struct link_map *lm, const char *name)
+{
+    const ElfW(Sym) *symtab = NULL;
+    const char *strtab = NULL;
+    const uint32_t *gnu_hash = NULL;
+    const ElfW(Word) *elf_hash = NULL;
+
+    for (const ElfW(Dyn) *d = lm->l_ld; d->d_tag != DT_NULL; d++) {
+        switch (d->d_tag) {
+        case DT_SYMTAB:   symtab   = (const ElfW(Sym) *)d->d_un.d_ptr;  break;
+        case DT_STRTAB:   strtab   = (const char *)d->d_un.d_ptr;       break;
+        case DT_GNU_HASH: gnu_hash = (const uint32_t *)d->d_un.d_ptr;   break;
+        case DT_HASH:     elf_hash = (const ElfW(Word) *)d->d_un.d_ptr; break;
+        }
+    }
+    if (!symtab || !strtab)
+        return NULL;
+
+    if (gnu_hash) {
+        uint32_t nbuckets    = gnu_hash[0];
+        uint32_t symoffset   = gnu_hash[1];
+        uint32_t bloom_size  = gnu_hash[2];
+        const ElfW(Addr) *bloom   = (const ElfW(Addr) *)&gnu_hash[4];
+        const uint32_t   *buckets = (const uint32_t *)&bloom[bloom_size];
+        const uint32_t   *chain   = &buckets[nbuckets];
+
+        uint32_t h = 5381;
+        for (const unsigned char *c = (const unsigned char *)name; *c; c++)
+            h = h * 33 + *c;
+
+        uint32_t sym = buckets[h % nbuckets];
+        if (sym < symoffset)
+            return NULL;
+        for (;; sym++) {
+            uint32_t ch = chain[sym - symoffset];
+            if ((ch | 1u) == (h | 1u)) {
+                const ElfW(Sym) *s = &symtab[sym];
+                if (s->st_shndx != SHN_UNDEF &&
+                    strcmp(strtab + s->st_name, name) == 0)
+                    return (void *)(lm->l_addr + s->st_value);
+            }
+            if (ch & 1u)
+                break;
+        }
+        return NULL;
+    }
+
+    if (elf_hash) {
+        ElfW(Word) nchain = elf_hash[1];
+        for (ElfW(Word) i = 0; i < nchain; i++) {
+            const ElfW(Sym) *s = &symtab[i];
+            if (s->st_shndx != SHN_UNDEF && s->st_name &&
+                strcmp(strtab + s->st_name, name) == 0)
+                return (void *)(lm->l_addr + s->st_value);
+        }
+    }
+    return NULL;
+}
+
+/* Resolve `name` from the library behind `h`, never from this shim. */
+static void *gb_cudart_sym(void *h, const char *name)
+{
+    struct link_map *lm = NULL;
+    void *p = NULL;
+
+    if (dlinfo(h, RTLD_DI_LINKMAP, &lm) == 0 && lm)
+        p = gb_lm_sym(lm, name);
+    if (!p) {
+        /* Fallback: scope-based lookup, but REJECT our own interposing
+         * exports (see gb_lm_sym comment). */
+        p = dlsym(h, name);
+        if (p) {
+            static void *shim_base;
+            Dl_info di;
+            if (!shim_base && dladdr((void *)&gb_lm_sym, &di))
+                shim_base = di.dli_fbase;
+            if (dladdr(p, &di) && di.dli_fbase == shim_base)
+                p = NULL;
+        }
+    }
+    return p;
+}
+
+static void gb_cudart_resolve_syms(void *libcudart)
+{
+    real_cudaMalloc           = (pfn_cudaMalloc)           gb_cudart_sym(libcudart, "cudaMalloc");
+    real_cudaFree             = (pfn_cudaFree)             gb_cudart_sym(libcudart, "cudaFree");
+    real_cudaMallocManaged    = (pfn_cudaMallocManaged)    gb_cudart_sym(libcudart, "cudaMallocManaged");
+    real_cudaMallocAsync      = (pfn_cudaMallocAsync)      gb_cudart_sym(libcudart, "cudaMallocAsync");
+    real_cudaGetDeviceCount   = (pfn_cudaGetDeviceCount)   gb_cudart_sym(libcudart, "cudaGetDeviceCount");
+    real_cudaSetDevice        = (pfn_cudaSetDevice)        gb_cudart_sym(libcudart, "cudaSetDevice");
+
+    real_cudaImportExternalMemory        = (pfn_cudaImportExternalMemory)
+        gb_cudart_sym(libcudart, "cudaImportExternalMemory");
+    real_cudaExternalMemoryGetMappedBuffer = (pfn_cudaExternalMemoryGetMappedBuffer)
+        gb_cudart_sym(libcudart, "cudaExternalMemoryGetMappedBuffer");
+    real_cudaDestroyExternalMemory       = (pfn_cudaDestroyExternalMemory)
+        gb_cudart_sym(libcudart, "cudaDestroyExternalMemory");
+    real_cudaGetLastError                = (pfn_cudaGetLastError)
+        gb_cudart_sym(libcudart, "cudaGetLastError");
+    real_cudaDeviceSynchronize           = (pfn_cudaDeviceSynchronize)
+        gb_cudart_sym(libcudart, "cudaDeviceSynchronize");
+    real_cudaMemGetInfo                  = (pfn_cudaMemGetInfo)
+        gb_cudart_sym(libcudart, "cudaMemGetInfo");
+    real_cudaMemPrefetchAsync            = (pfn_cudaMemPrefetchAsync)
+        gb_cudart_sym(libcudart, "cudaMemPrefetchAsync");
+    real_cudaGetDeviceProperties         = (pfn_cudaGetDeviceProperties)
+        gb_cudart_sym(libcudart, "cudaGetDeviceProperties_v2");
+    if (!real_cudaGetDeviceProperties)
+        real_cudaGetDeviceProperties     = (pfn_cudaGetDeviceProperties)
+            gb_cudart_sym(libcudart, "cudaGetDeviceProperties");
+    real_cudaGetDriverEntryPointByVersion = (pfn_cudaGetDriverEntryPointByVersion)
+        gb_cudart_sym(libcudart, "cudaGetDriverEntryPointByVersion");
+    real_cudaLaunchKernel     = (pfn_cudaLaunchKernel)     gb_cudart_sym(libcudart, "cudaLaunchKernel");
+    real_cudaStreamSynchronize = (pfn_cudaStreamSynchronize) gb_cudart_sym(libcudart, "cudaStreamSynchronize");
+    /* CUDA doc: cudaStreamCreateWithPriority - resolve for stream priority
+     * elevation hook; optional (silently skipped if unavailable). */
+    real_cudaStreamCreateWithPriority = (pfn_cudaStreamCreateWithPriority)
+        gb_cudart_sym(libcudart, "cudaStreamCreateWithPriority");
+    real_cudaDeviceGetAttribute = (pfn_cudaDeviceGetAttribute)
+        gb_cudart_sym(libcudart, "cudaDeviceGetAttribute");
+    real_cudaDeviceGetStreamPriorityRange = (pfn_cudaDeviceGetStreamPriorityRange)
+        gb_cudart_sym(libcudart, "cudaDeviceGetStreamPriorityRange");
+    real___cudaRegisterFunction = (pfn___cudaRegisterFunction)
+        gb_cudart_sym(libcudart, "__cudaRegisterFunction");
+}
+
+static void gb_cudart_rebind(void)
+{
+    static pthread_mutex_t rebind_mu = PTHREAD_MUTEX_INITIALIZER;
+    char found[512] = "";
+    FILE *m;
+
+    pthread_mutex_lock(&rebind_mu);
+    if (atomic_load_explicit(&g_cudart_rebound, memory_order_acquire)) {
+        pthread_mutex_unlock(&rebind_mu);
+        return;
+    }
+    if (g_cudart_override) {
+        /* Explicit GREENBOOST_CUDART_PATH always wins - no auto-rebind. */
+        atomic_store_explicit(&g_cudart_rebound, 1, memory_order_release);
+        pthread_mutex_unlock(&rebind_mu);
+        return;
+    }
+
+    /* A cudart hook is executing, so the caller's libcudart is mapped NOW.
+     * Pick the first libcudart in maps that is not the one init loaded. */
+    m = fopen("/proc/self/maps", "r");
+    if (m) {
+        char line[1024];
+        while (fgets(line, sizeof(line), m)) {
+            char *p = strchr(line, '/');
+            if (!p || !strstr(p, "libcudart.so"))
+                continue;
+            p[strcspn(p, "\n")] = '\0';
+            if (g_cudart_init_path[0] && strcmp(p, g_cudart_init_path) == 0)
+                continue;               /* the fallback WE dlopened - skip */
+            snprintf(found, sizeof(found), "%s", p);
+            break;
+        }
+        fclose(m);
+    }
+
+    if (found[0]) {
+        /* Already mapped: dlopen is a refcount bump, no new load.  LOCAL -
+         * the app resolves its own symbols; we only need function pointers. */
+        void *h = dlopen(found, RTLD_NOW | RTLD_LOCAL);
+        if (h) {
+            gb_cudart_resolve_syms(h);
+            gb_log("cudart rebind -> %s (init fallback was %s)",
+                   found, g_cudart_init_path[0] ? g_cudart_init_path : "none");
+        }
+    }
+    /* Latch even when nothing was found: a hook reached via dynamic
+     * interposition implies the caller's libcudart is the one in maps -
+     * if only init's path is there, init already picked the right one. */
+    atomic_store_explicit(&g_cudart_rebound, 1, memory_order_release);
+    pthread_mutex_unlock(&rebind_mu);
+}
+
+/* Fast-path gate for every exported cudart hook. */
+#define GB_CUDART_ENSURE() \
+    do { \
+        if (!atomic_load_explicit(&g_cudart_rebound, memory_order_acquire)) \
+            gb_cudart_rebind(); \
+    } while (0)
+
 __attribute__((constructor))
 static void gb_shim_init(void)
 {
@@ -3689,6 +3940,14 @@ static void gb_shim_init(void)
                 "double-buffer prefetch lookahead enabled (A4 BW-aware tile sizing)\n");
     }
 
+    /* Phase 2b: async feeder kernel dispatch */
+    env = getenv("GREENBOOST_ASYNC_DISPATCH");
+    if (env && env[0] == '1') {
+        g_async_dispatch = 1;
+        GB_INIT_LOG_ONCE("[GreenBoost] GREENBOOST_ASYNC_DISPATCH=1: "
+                "feeder kernels dispatched fire-and-forget (sync at stream boundaries)\n");
+    }
+
     /* Phase 3: GPUDirect Storage - direct GPU↔NVMe without CPU bounce */
     {
         int gds_requested = 0;
@@ -3794,12 +4053,21 @@ static void gb_shim_init(void)
      *   4. Ollama-bundled paths - Ollama ships its own libcudart under /usr/local/lib/ollama/
      */
     {
+        /* F-ABI1: RTLD_LOCAL, NOT GLOBAL.  A GLOBAL fallback cudart hijacks
+         * every cudart symbol of later-loaded libraries: torch's own
+         * __cudaRegisterFatBinary would resolve to OUR fallback (possibly a
+         * different CUDA major) instead of the libcudart it bundles, while
+         * the hooked calls forward to the rebound one - split-brain fatbin
+         * handles hang the import.  LOCAL keeps the fallback private to the
+         * shim's dlsym lookups; apps resolve cudart inside their own group. */
         const char *cudart_override = getenv("GREENBOOST_CUDART_PATH");
         if (cudart_override) {
-            libcudart = dlopen(cudart_override, RTLD_NOW | RTLD_GLOBAL);
+            libcudart = dlopen(cudart_override, RTLD_NOW | RTLD_LOCAL);
             if (!libcudart)
                 fprintf(stderr, "[GreenBoost] WARNING: GREENBOOST_CUDART_PATH=%s failed: %s\n",
                         cudart_override, dlerror());
+            else
+                g_cudart_override = 1;  /* F-ABI1: explicit path - no auto-rebind */
         }
 
         if (!libcudart) {
@@ -3821,12 +4089,18 @@ static void gb_shim_init(void)
             };
             const char **p;
             for (p = cudart_paths; *p && !libcudart; p++)
-                libcudart = dlopen(*p, RTLD_NOW | RTLD_GLOBAL);
+                libcudart = dlopen(*p, RTLD_NOW | RTLD_LOCAL);  /* F-ABI1 */
         }
 
         if (libcudart) {
+            /* F-ABI1: remember the RESOLVED path of the fallback we loaded so
+             * the lazy rebind can tell it apart from the app's own libcudart. */
+            struct link_map *lm = NULL;
+            if (dlinfo(libcudart, RTLD_DI_LINKMAP, &lm) == 0 && lm && lm->l_name[0])
+                snprintf(g_cudart_init_path, sizeof(g_cudart_init_path), "%s", lm->l_name);
             if (gb_debug)
-                fprintf(stderr, "[GreenBoost] libcudart loaded\n");
+                fprintf(stderr, "[GreenBoost] libcudart loaded (%s)\n",
+                        g_cudart_init_path[0] ? g_cudart_init_path : "?");
         } else {
             if (gb_debug)
                 fprintf(stderr, "[GreenBoost] WARNING: libcudart not found - runtime API resolved lazily\n");
@@ -4067,47 +4341,11 @@ static void gb_shim_init(void)
     GB_NVTX_EVENT("SHIM_INIT", "SYSTEM", 0, 0,
         "greenboost shim initialised - T1_headroom=2pct Path_C_UVM_removed");
 
-    /* Runtime API (cuda*) - live in libcudart, not libcuda */
-    if (libcudart) {
-        real_cudaMalloc           = (pfn_cudaMalloc)           dlsym(libcudart, "cudaMalloc");
-        real_cudaFree             = (pfn_cudaFree)             dlsym(libcudart, "cudaFree");
-        real_cudaMallocManaged    = (pfn_cudaMallocManaged)    dlsym(libcudart, "cudaMallocManaged");
-        real_cudaMallocAsync      = (pfn_cudaMallocAsync)      dlsym(libcudart, "cudaMallocAsync");
-        real_cudaGetDeviceCount   = (pfn_cudaGetDeviceCount)   dlsym(libcudart, "cudaGetDeviceCount");
-        real_cudaSetDevice        = (pfn_cudaSetDevice)        dlsym(libcudart, "cudaSetDevice");
-
-        real_cudaImportExternalMemory        = (pfn_cudaImportExternalMemory)
-            dlsym(libcudart, "cudaImportExternalMemory");
-        real_cudaExternalMemoryGetMappedBuffer = (pfn_cudaExternalMemoryGetMappedBuffer)
-            dlsym(libcudart, "cudaExternalMemoryGetMappedBuffer");
-        real_cudaDestroyExternalMemory       = (pfn_cudaDestroyExternalMemory)
-            dlsym(libcudart, "cudaDestroyExternalMemory");
-        real_cudaGetLastError                = (pfn_cudaGetLastError)
-            dlsym(libcudart, "cudaGetLastError");
-        real_cudaMemGetInfo                  = (pfn_cudaMemGetInfo)
-            dlsym(libcudart, "cudaMemGetInfo");
-        real_cudaMemPrefetchAsync            = (pfn_cudaMemPrefetchAsync)
-            dlsym(libcudart, "cudaMemPrefetchAsync");
-        real_cudaGetDeviceProperties         = (pfn_cudaGetDeviceProperties)
-            dlsym(libcudart, "cudaGetDeviceProperties_v2");
-        if (!real_cudaGetDeviceProperties)
-            real_cudaGetDeviceProperties     = (pfn_cudaGetDeviceProperties)
-                dlsym(libcudart, "cudaGetDeviceProperties");
-        real_cudaGetDriverEntryPointByVersion = (pfn_cudaGetDriverEntryPointByVersion)
-            dlsym(libcudart, "cudaGetDriverEntryPointByVersion");
-        real_cudaLaunchKernel     = (pfn_cudaLaunchKernel)     dlsym(libcudart, "cudaLaunchKernel");
-        real_cudaStreamSynchronize = (pfn_cudaStreamSynchronize) dlsym(libcudart, "cudaStreamSynchronize");
-        /* CUDA doc: cudaStreamCreateWithPriority - resolve for stream priority
-         * elevation hook; optional (silently skipped if unavailable). */
-        real_cudaStreamCreateWithPriority = (pfn_cudaStreamCreateWithPriority)
-            dlsym(libcudart, "cudaStreamCreateWithPriority");
-        real_cudaDeviceGetAttribute = (pfn_cudaDeviceGetAttribute)
-            dlsym(libcudart, "cudaDeviceGetAttribute");
-        real_cudaDeviceGetStreamPriorityRange = (pfn_cudaDeviceGetStreamPriorityRange)
-            dlsym(libcudart, "cudaDeviceGetStreamPriorityRange");
-        real___cudaRegisterFunction = (pfn___cudaRegisterFunction)
-            dlsym(libcudart, "__cudaRegisterFunction");
-    }
+    /* Runtime API (cuda*) - live in libcudart, not libcuda.  F-ABI1: this is
+     * a best-effort fallback only; the first cudart hook call re-resolves
+     * from the app's own libcudart via gb_cudart_rebind(). */
+    if (libcudart)
+        gb_cudart_resolve_syms(libcudart);
     /* Fallback: some CUDA versions export runtime wrappers from libcuda.so.1 */
     if (!real_cudaMalloc)        real_cudaMalloc        = (pfn_cudaMalloc)        dlsym(libcuda, "cudaMalloc");
     if (!real_cudaFree)          real_cudaFree          = (pfn_cudaFree)           dlsym(libcuda, "cudaFree");
@@ -4188,7 +4426,7 @@ static void gb_shim_init(void)
      * libcuda.so.1 is in ldconfig (NVIDIA driver installs it), so the shim
      * activates for ls, bash, systemd, etc.  Silent by default. */
     if (gb_debug) {
-        fprintf(stderr, "[GreenBoost] v2.9 patched - vram_headroom=%zuMB kv_reserve=%zuMB(adaptive) kv_threshold=%zuMB virtual_vram=%zuMB use_dmabuf=%d debug=%d report_phys=%d\n",
+        fprintf(stderr, "[GreenBoost] v3.0 patched - vram_headroom=%zuMB kv_reserve=%zuMB(adaptive) kv_threshold=%zuMB virtual_vram=%zuMB use_dmabuf=%d debug=%d report_phys=%d\n",
                 vram_headroom_bytes >> 20, g_kv_reserve_bytes >> 20,
                 g_kv_size_threshold_bytes >> 20,
                 gb_virtual_vram_bytes >> 20, gb_use_dmabuf, gb_debug, g_report_physical_vram);
@@ -4261,13 +4499,22 @@ static void gb_shim_init(void)
                     ? (size_t)(_total - _t3_total) : (size_t)_total;
                 g_cluster_remote_t1t2_free_bytes  += (_free  >= _t3_free)
                     ? (size_t)(_free  - _t3_free)  : (size_t)_free;
+                /* Track feeder GPU VRAM (T1 only) separately for the clean
+                 * "virtual VRAM = local + feeder" display figure. */
+                uint64_t _t1_free = 0, _t1_total = 0;
+                if (gb_netc_t1_mem_info(_ri, &_t1_free, &_t1_total) == 0)
+                    g_cluster_remote_vram_bytes += (size_t)_t1_total;
             }
         }
-        if (n > 0)
-            fprintf(stderr, "[GreenBoost] Cluster: %d feeder(s) - +%zu GB remote memory "
-                    "aggregated into device 0 (total virtual: %zu GB)\n",
-                    n, g_cluster_remote_total_bytes >> 30,
-                    (gb_virtual_vram_bytes + g_cluster_remote_total_bytes) >> 30);
+        if (n > 0) {
+            size_t _virt_vram_gb = (gb_physical_vram_bytes + g_cluster_remote_vram_bytes) >> 30;
+            size_t _local_gb    = gb_physical_vram_bytes >> 30;
+            size_t _feeder_gb   = g_cluster_remote_vram_bytes >> 30;
+            fprintf(stderr, "[GreenBoost] Cluster: %d feeder(s) — virtual GPU: %zu GB VRAM "
+                    "(%zu local + %zu feeder) total pool: +%zu GB remote\n",
+                    n, _virt_vram_gb, _local_gb, _feeder_gb,
+                    g_cluster_remote_total_bytes >> 30);
+        }
     }
 }
 
@@ -6584,6 +6831,7 @@ CUresult cuMemAllocFromPoolAsync(CUdeviceptr *dptr, size_t bytesize,
 
 cudaError_t cudaMalloc(void **devPtr, size_t size)
 {
+    GB_CUDART_ENSURE();
     cudaError_t ret;
     CUdeviceptr dptr = 0;
 
@@ -6701,6 +6949,7 @@ cudaError_t cudaMalloc(void **devPtr, size_t size)
 
 cudaError_t cudaMallocAsync(void **devPtr, size_t size, cudaStream_t stream)
 {
+    GB_CUDART_ENSURE();
     cudaError_t ret;
     CUdeviceptr dptr = 0;
 
@@ -6760,6 +7009,7 @@ cudaError_t cudaMallocAsync(void **devPtr, size_t size, cudaStream_t stream)
 
 cudaError_t cudaFreeAsync(void *devPtr, cudaStream_t stream)
 {
+    GB_CUDART_ENSURE();
     CUdeviceptr dptr = (CUdeviceptr)(uintptr_t)devPtr;
     size_t sz = 0;
     int managed = 0;
@@ -6813,6 +7063,7 @@ cudaError_t cudaFreeAsync(void *devPtr, cudaStream_t stream)
 
 cudaError_t cudaFree(void *devPtr)
 {
+    GB_CUDART_ENSURE();
     void *mapped_ptr = NULL;
     int fd = -1;
     size_t sz = 0;
@@ -6933,6 +7184,7 @@ CUresult cuMemPrefetchAsync(CUdeviceptr dptr, size_t count, CUdevice dstDevice, 
 
 cudaError_t cudaMemPrefetchAsync(const void *devPtr, size_t count, int dstDevice, cudaStream_t stream)
 {
+    GB_CUDART_ENSURE();
     void *mapped_ptr = NULL;
     size_t sz = 0;
     int managed = 0, fd = -1;
@@ -6995,8 +7247,32 @@ CUresult cuMemGetInfo_v2(size_t *free_out, size_t *total_out)
     }
 
     ret = real_cuMemGetInfo(&real_free, &real_total);
-    if (ret != CUDA_SUCCESS)
-        return ret;
+    if (ret != CUDA_SUCCESS) {
+        /* CUDA 13 / cu130: the driver API requires a current CUDA context.
+         * llama.cpp / ComfyUI / ggml call cudaMemGetInfo before the first
+         * cudaSetDevice, so no primary context has been created yet, and the
+         * driver returns CUDA_ERROR_INVALID_CONTEXT (201).
+         * Fall back to the runtime API, which calls cuDevicePrimaryCtxRetain
+         * internally and establishes the context transparently.  We still
+         * apply all virtual-pool inflation below so the reported numbers are
+         * identical to the normal path. */
+        if (ret == (CUresult)201 /* CUDA_ERROR_INVALID_CONTEXT */ ||
+            ret == (CUresult)4   /* CUDA_ERROR_DEINITIALIZED */) {
+            pfn_cudaMemGetInfo rt_fn = real_cudaMemGetInfo;
+            if (!rt_fn)
+                rt_fn = (pfn_cudaMemGetInfo)dlsym(RTLD_NEXT, "cudaMemGetInfo");
+            if (rt_fn) {
+                cudaError_t rt_err = rt_fn(&real_free, &real_total);
+                if (rt_err != 0 /* cudaSuccess */)
+                    return (CUresult)rt_err;
+                /* Obtained real values via runtime fallback — apply inflation below */
+            } else {
+                return ret;
+            }
+        } else {
+            return ret;
+        }
+    }
 
     /* total = real VRAM + local virtual pool (T2+T3) + all feeder memory.
      * free  = real VRAM free + T2 DDR available + feeder free.
@@ -7035,6 +7311,14 @@ CUresult cuMemGetInfo(size_t *free_out, size_t *total_out)
 
 cudaError_t cudaMemGetInfo(size_t *free_out, size_t *total_out)
 {
+    GB_CUDART_ENSURE();
+    /* Ensure we have a real runtime function pointer.  GB_CUDART_ENSURE() runs
+     * the lazy rebind, but the app's libcudart may not be mapped yet at the
+     * moment of the first call (e.g. ComfyUI / llama.cpp call this very early),
+     * leaving real_cudaMemGetInfo NULL.  Resolve on the spot as a last resort
+     * so we can use it for context initialisation below. */
+    if (!real_cudaMemGetInfo)
+        real_cudaMemGetInfo = (pfn_cudaMemGetInfo)dlsym(RTLD_NEXT, "cudaMemGetInfo");
     /* Call the real runtime first so it can perform lazy CUDA context
      * initialisation if one does not exist yet (the driver-level
      * cuMemGetInfo_v2 below requires a current context and will return
@@ -7064,8 +7348,14 @@ CUresult cuDeviceTotalMem_v2(size_t *bytes, CUdevice dev)
 {
     CUresult ret;
 
-    if (!initialized || !real_cuDeviceTotalMem_v2)
-        return CUDA_ERROR_NOT_SUPPORTED;
+    if (!initialized || !real_cuDeviceTotalMem_v2) {
+        /* Shim not yet active (GREENBOOST_DISABLE=1 or deferred init): transparent
+         * pass-through so the caller sees the real physical VRAM without inflation. */
+        pfn_cuDeviceTotalMem_v2 fn = real_cuDeviceTotalMem_v2;
+        if (!fn) fn = (pfn_cuDeviceTotalMem_v2)dlsym(RTLD_NEXT, "cuDeviceTotalMem_v2");
+        if (!fn) fn = (pfn_cuDeviceTotalMem_v2)dlsym(RTLD_NEXT, "cuDeviceTotalMem");
+        return fn ? fn(bytes, dev) : CUDA_ERROR_NOT_SUPPORTED;
+    }
 
     int local = 1;
     if (real_cuDeviceGetCount)
@@ -7079,7 +7369,32 @@ CUresult cuDeviceTotalMem_v2(size_t *bytes, CUdevice dev)
     }
 
     ret = real_cuDeviceTotalMem_v2(bytes, dev);
-    if (ret == CUDA_SUCCESS && bytes) {
+    if (ret != CUDA_SUCCESS) {
+        /* Invalid-context fallback (same as cuMemGetInfo_v2): derive total
+         * from the runtime cudaMemGetInfo which performs cuDevicePrimaryCtxRetain
+         * internally.  The inflation below then adds virtual pool bytes as usual. */
+        if ((ret == (CUresult)201 /* CUDA_ERROR_INVALID_CONTEXT */ ||
+             ret == (CUresult)4   /* CUDA_ERROR_DEINITIALIZED */) && bytes) {
+            pfn_cudaMemGetInfo rt_fn = real_cudaMemGetInfo;
+            if (!rt_fn)
+                rt_fn = (pfn_cudaMemGetInfo)dlsym(RTLD_NEXT, "cudaMemGetInfo");
+            if (rt_fn) {
+                size_t rt_free = 0, rt_total = 0;
+                if (rt_fn(&rt_free, &rt_total) == 0 /* cudaSuccess */) {
+                    *bytes = rt_total;
+                    ret = CUDA_SUCCESS;
+                    /* fall through to apply inflation */
+                } else {
+                    return ret;
+                }
+            } else {
+                return ret;
+            }
+        } else {
+            return ret;
+        }
+    }
+    if (bytes) {
         if (g_report_physical_vram) {
             gb_log("cuDeviceTotalMem_v2: reporting physical %zuMB (inflation disabled by GREENBOOST_REPORT_PHYSICAL_VRAM=1)",
                    *bytes >> 20);
@@ -7104,8 +7419,12 @@ CUresult cuDeviceTotalMem(size_t *bytes, CUdevice dev)
 
 CUresult cuDeviceGetAttribute(int *value, int attrib, CUdevice dev)
 {
-    if (!initialized || !real_cuDeviceGetAttribute)
-        return CUDA_ERROR_NOT_SUPPORTED;
+    if (!initialized || !real_cuDeviceGetAttribute) {
+        /* Shim not yet active: transparent pass-through. */
+        pfn_cuDeviceGetAttribute fn = real_cuDeviceGetAttribute;
+        if (!fn) fn = (pfn_cuDeviceGetAttribute)dlsym(RTLD_NEXT, "cuDeviceGetAttribute");
+        return fn ? fn(value, attrib, dev) : CUDA_ERROR_NOT_SUPPORTED;
+    }
 
     int local = 1;
     if (real_cuDeviceGetCount)
@@ -7160,6 +7479,7 @@ CUresult cuDeviceGetAttribute(int *value, int attrib, CUdevice dev)
  * path too - same Blackwell VMM=0 override applies. */
 cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device)
 {
+    GB_CUDART_ENSURE();
     pfn_cudaDeviceGetAttribute fn = real_cudaDeviceGetAttribute;
     if (!fn) fn = (pfn_cudaDeviceGetAttribute)dlsym(RTLD_NEXT, "cudaDeviceGetAttribute");
     if (!fn) return (cudaError_t)CUDA_ERROR_NOT_SUPPORTED;
@@ -7206,6 +7526,7 @@ cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device)
 
 cudaError_t cudaGetDeviceProperties_v2(void *prop, int device)
 {
+    GB_CUDART_ENSURE();
     if (!real_cudaGetDeviceProperties)
         return (cudaError_t)CUDA_ERROR_NOT_SUPPORTED;
 
@@ -7267,6 +7588,7 @@ cudaError_t cudaGetDeviceProperties(void *prop, int device)
 
 cudaError_t cudaGetDeviceCount(int *count)
 {
+    GB_CUDART_ENSURE();
     int local = 1;
     if (real_cudaGetDeviceCount)
         real_cudaGetDeviceCount(&local);
@@ -7322,11 +7644,22 @@ CUresult cuGetProcAddress(const char *symbol, void **pfn, int driverVersion,
                           unsigned long long flags, void *symbolStatus)
 {
     CUresult res;
-    if (!real_cuGetProcAddress) {
-        if (pfn) *pfn = NULL;
-        return 1; /* CUDA_ERROR_NOT_SUPPORTED */
+    pfn_cuGetProcAddress fn = real_cuGetProcAddress;
+    if (!fn) {
+        /* VCM-02: deferred init pending (GREENBOOST_VLLM_COMPAT=1) — resolve via
+         * RTLD_NEXT so PyTorch cu130+ gets valid driver function pointers during
+         * its own CUDA initialization (which happens before the first cuMemGetInfo
+         * or cudaMalloc that triggers gb_try_resume_deferred).  Without this,
+         * cuGetProcAddress returns CUDA_ERROR_NOT_SUPPORTED and PyTorch stores
+         * NULL for cuLaunchKernel / cuMemAlloc_v2 / etc., causing
+         * cudaErrorInvalidResourceHandle on the first kernel launch. */
+        fn = (pfn_cuGetProcAddress)dlsym(RTLD_NEXT, "cuGetProcAddress");
+        if (!fn) {
+            if (pfn) *pfn = NULL;
+            return 1; /* CUDA_ERROR_NOT_SUPPORTED */
+        }
     }
-    res = real_cuGetProcAddress(symbol, pfn, driverVersion, flags, symbolStatus);
+    res = fn(symbol, pfn, driverVersion, flags, symbolStatus);
     if (res == CUDA_SUCCESS && symbol && pfn && *pfn) {
         void *hook = gb_get_hook(symbol);
         if (hook) *pfn = hook;
@@ -7336,6 +7669,7 @@ CUresult cuGetProcAddress(const char *symbol, void **pfn, int driverVersion,
 
 cudaError_t cudaSetDevice(int device)
 {
+    GB_CUDART_ENSURE();
     if (!initialized)
         return real_cudaSetDevice ? real_cudaSetDevice(device) : CUDA_SUCCESS;
 
@@ -7640,17 +7974,30 @@ static int gb_try_kernel_feeder_dispatch(CUfunction f,
         return 0;
     }
 
-    gb_log("%s: data-driven dispatch '%s' → feeder %d (%d remote args)",
-           hook_tag, name, dispatch_feeder, n_relocs);
+    gb_log("%s: data-driven dispatch '%s' → feeder %d (%d remote args)%s",
+           hook_tag, name, dispatch_feeder, n_relocs,
+           g_async_dispatch ? " [async]" : "");
     GB_NVTX_EVENT("KERNEL_FEEDER", "T1_FEEDER", 0, 0, name ? name : "unknown");
 
-    int rc = gb_netc_exec_kernel(dispatch_feeder, name,
+    int rc;
+    if (g_async_dispatch) {
+        /* Phase 2b: fire-and-forget — n_uploads=0 and n_downloads=0 are always
+         * true here (the call site passes NULL/0/0 for those args). */
+        rc = gb_netc_exec_kernel_async(dispatch_feeder, name,
+                                       gridX, gridY, gridZ,
+                                       blockX, blockY, blockZ,
+                                       sharedMem,
+                                       arg_vals, n_vals,
+                                       relocs, n_relocs);
+    } else {
+        rc = gb_netc_exec_kernel(dispatch_feeder, name,
                                  gridX, gridY, gridZ,
                                  blockX, blockY, blockZ,
                                  sharedMem,
                                  arg_vals, n_vals,
                                  relocs, n_relocs,
                                  NULL, 0, 0);
+    }
     /* F-L3-12: release the alloc refs taken in gb_netc_get_alloc_info. */
     for (int _ri = 0; _ri < n_relocs; _ri++)
         gb_netc_alloc_release_ref(arg_vals[relocs[_ri].arg_idx]);
@@ -8222,6 +8569,7 @@ typedef int (*pfn_cudaMemcpyAsync_t)(void *, const void *, size_t, int, void *);
 
 cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind)
 {
+    GB_CUDART_ENSURE();
     static pfn_cudaMemcpy_t real_fn = NULL;
     if (!real_fn)
         real_fn = (pfn_cudaMemcpy_t)dlsym(RTLD_NEXT, "cudaMemcpy");
@@ -8284,6 +8632,7 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind)
 cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count,
                              int kind, cudaStream_t stream)
 {
+    GB_CUDART_ENSURE();
     static pfn_cudaMemcpyAsync_t real_fn = NULL;
     if (!real_fn)
         real_fn = (pfn_cudaMemcpyAsync_t)dlsym(RTLD_NEXT, "cudaMemcpyAsync");
@@ -8340,6 +8689,7 @@ cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count,
 cudaError_t cudaLaunchKernel(const void *func, gb_dim3 gridDim, gb_dim3 blockDim,
                               void **args, size_t sharedMem, cudaStream_t stream)
 {
+    GB_CUDART_ENSURE();
     if (initialized && gb_netc_is_active() && func && args) {
         const char *kname = gb_netc_lookup_kernel(func);
         if (kname) {
@@ -8395,13 +8745,15 @@ cudaError_t cudaLaunchKernel(const void *func, gb_dim3 gridDim, gb_dim3 blockDim
 /* ------------------------------------------------------------------ */
 /*  cudaStreamSynchronize - sync local + remote streams                 */
 /*                                                                      */
-/*  After data-driven remote kernel dispatch, the feeder executes the   */
-/*  kernel synchronously (GB_MSG_CUDA_EXEC waits for completion).       */
-/*  cudaStreamSynchronize on the local stream is still needed to flush  */
-/*  any local work queued before the remote dispatch.                   */
+/*  After data-driven remote kernel dispatch (sync or async), this hook */
+/*  sends GB_MSG_CUDA_SYNC to feeders that dispatched work since the    */
+/*  last sync.  The feeder drains its async_stream (cudaStreamSync) and */
+/*  its device (cudaDeviceSync) before responding, so all queued async  */
+/*  kernels are complete before this call returns to the caller.        */
 /* ------------------------------------------------------------------ */
 cudaError_t cudaStreamSynchronize(cudaStream_t stream)
 {
+    GB_CUDART_ENSURE();
     /* F-L1-31: only contact feeders that dispatched a kernel since the last
      * sync; feeder execution is synchronous so completed kernels need no
      * extra round-trip, avoiding unnecessary latency for idle feeders. */
@@ -8426,6 +8778,7 @@ cudaError_t cudaStreamSynchronize(cudaStream_t stream)
  * cudaStreamNonBlocking (0x01) flag is forwarded unchanged. */
 cudaError_t cudaStreamCreate(cudaStream_t *pStream, unsigned int flags)
 {
+    GB_CUDART_ENSURE();
     static pfn_cudaStreamCreate real_create = NULL;
     if (!real_create)
         real_create = (pfn_cudaStreamCreate)dlsym(RTLD_NEXT, "cudaStreamCreate");
@@ -8461,6 +8814,7 @@ void __cudaRegisterFunction(void **fatCubinHandle, const char *hostFun,
                             int thread_limit, gb_uint3 *tid, gb_uint3 *bid,
                             gb_dim3 *bDim, gb_dim3 *gDim, int *wSize)
 {
+    GB_CUDART_ENSURE();
     if (deviceName && hostFun)
         gb_netc_register_kernel((const void *)hostFun, deviceName);
 
@@ -8502,6 +8856,7 @@ cudaError_t cudaGetDriverEntryPointByVersion(const char *symbol, void **funcPtr,
                                               unsigned long long flags,
                                               void *driverStatus)
 {
+    GB_CUDART_ENSURE();
     if (!real_cudaGetDriverEntryPointByVersion) {
         /* libcudart.so.13 is loaded by PyTorch before this function is called;
          * use RTLD_NOLOAD so we don't redundantly load a second copy. */

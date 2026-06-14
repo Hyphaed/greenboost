@@ -15,6 +15,12 @@ KDIR    := $(firstword $(wildcard $(KDIR_CANDIDATES)))
 ifeq ($(KDIR),)
 $(error Cannot find kernel headers for $(KVER). Install linux-headers-$(KVER) or kernel-devel-$(KVER))
 endif
+# Detect Clang-built kernels: CachyOS, Arch/clang, Gentoo/clang kernels set
+# CONFIG_CC_IS_CLANG=y.  Passing LLVM=1 selects the full LLVM toolchain
+# (CC=clang HOSTCC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm) to match the
+# kernel's own build toolchain.  GCC rejects clang-specific flags like
+# -mretpoline-external-thunk and -mstack-alignment=8, causing -Werror failures.
+KERNEL_LLVM := $(shell grep -qs '^CONFIG_CC_IS_CLANG=y' $(KDIR)/.config 2>/dev/null && echo LLVM=1)
 PWD     := $(shell pwd)
 CC      := gcc
 SHIM    := libgreenboost_cuda.so
@@ -23,7 +29,7 @@ AUDIT32 := libgreenboost_audit32.so
 VMM_OVERRIDE := libgreenboost_vmm_override.so
 MODULE  := greenboost.ko
 NETD    := greenboost-netd
-GB_VERSION := 2.9
+GB_VERSION := 3.0
 
 PHYS_GB    ?= 0
 VIRT_GB    ?= 0
@@ -85,9 +91,21 @@ SHIM_LDFLAGS  := -Wl,--gc-sections -Wl,--as-needed $(NCCL_LDFLAGS)
 # strips .symver directives, and per-function sections risk gc without them.
 SHIM_CFLAGS_V12 := $(filter-out -flto -ffunction-sections -fdata-sections,$(SHIM_CFLAGS))
 
-# CUDA header probe - adds -I<cuda>/include when a CUDA installation is found
-CUDA_CANDIDATES := /usr/local/cuda /usr/cuda /opt/cuda
-CUDA_DIR        := $(firstword $(wildcard $(CUDA_CANDIDATES)))
+# CUDA header probe - prefers the newest side-by-side versioned install
+# (/usr/local/cuda-13 over /usr/local/cuda-12 over the unversioned symlink).
+# This matters when the user has both CUDA 12 and CUDA 13 installed via the
+# NVIDIA repo and the /usr/local/cuda symlink still points to 12.
+CUDA_DIR := $(shell \
+    latest=$$(ls -d /usr/local/cuda-[0-9]* 2>/dev/null | sort -V | tail -1); \
+    if [ -n "$$latest" ] && [ -f "$$latest/include/cuda.h" ]; then \
+        echo "$$latest"; \
+    elif [ -d /usr/local/cuda ] && [ -f /usr/local/cuda/include/cuda.h ]; then \
+        echo "/usr/local/cuda"; \
+    elif [ -d /usr/cuda ] && [ -f /usr/cuda/include/cuda.h ]; then \
+        echo "/usr/cuda"; \
+    elif [ -d /opt/cuda ] && [ -f /opt/cuda/include/cuda.h ]; then \
+        echo "/opt/cuda"; \
+    fi)
 ifneq ($(CUDA_DIR),)
 SHIM_CFLAGS    += -I$(CUDA_DIR)/include
 endif
@@ -98,7 +116,7 @@ DKMS_ROOT := /usr/src/greenboost-$(GB_VERSION)
         install install-legacy install-libs build-info dkms-install dkms-uninstall \
         uninstall load unload reload status help
 
-all: module shim audit audit32 netd
+all: module shim audit audit32 netd vmm_override
 
 # PR-W: pytest regression suite covering wire-protocol layout, PSK file
 # loading, LAN filter, and payload-size validation.  Pure-Python - no
@@ -108,7 +126,7 @@ test:
 	@echo "[GreenBoost] regression suite passed"
 
 module:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
+	$(MAKE) -C $(KDIR) M=$(PWD) $(KERNEL_LLVM) modules
 
 shim: greenboost_cuda_shim.c greenboost_cuda_v12.c greenboost_netc.c greenboost_cuda.map
 	$(CC) -c -fPIC $(SHIM_CFLAGS_V12) -o greenboost_cuda_v12.o greenboost_cuda_v12.c
@@ -155,14 +173,14 @@ netd: greenboost_netd.c features/net_fabric.h
 	@echo "[GreenBoost] Built $(NETD)"
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm -f $(SHIM) $(AUDIT) $(AUDIT32) $(NETD) greenboost_cuda_v12.o
+	$(MAKE) -C $(KDIR) M=$(PWD) $(KERNEL_LLVM) clean
+	rm -f $(SHIM) $(AUDIT) $(AUDIT32) $(VMM_OVERRIDE) $(NETD) greenboost_cuda_v12.o
 
 install: all dkms-install install-libs
 	@echo "[GreenBoost] Install complete. Load with: sudo modprobe greenboost"
 
 install-legacy: all
-	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
+	$(MAKE) -C $(KDIR) M=$(PWD) $(KERNEL_LLVM) modules_install
 	depmod -a
 	$(MAKE) install-libs
 
@@ -176,6 +194,13 @@ install-libs: build-info
 	pkill -9 -x $(NETD) 2>/dev/null || true
 	cp $(SHIM)  /usr/local/lib/$(SHIM).new  && mv /usr/local/lib/$(SHIM).new  /usr/local/lib/$(SHIM)
 	cp $(AUDIT) /usr/local/lib/$(AUDIT).new && mv /usr/local/lib/$(AUDIT).new /usr/local/lib/$(AUDIT)
+	@if [ -f "$(VMM_OVERRIDE)" ]; then \
+		cp $(VMM_OVERRIDE) /usr/local/lib/$(VMM_OVERRIDE).new && \
+		mv /usr/local/lib/$(VMM_OVERRIDE).new /usr/local/lib/$(VMM_OVERRIDE); \
+		echo "[GreenBoost] Installed $(VMM_OVERRIDE)"; \
+	else \
+		echo "[GreenBoost] NOTICE: $(VMM_OVERRIDE) not built — skipping (expected if CUDA headers absent)"; \
+	fi
 	rm -f /usr/local/lib/i386-linux-gnu/$(AUDIT) /usr/local/bin/$(NETD)
 	cp $(NETD) /usr/local/bin/
 	mkdir -p /usr/local/lib/i386-linux-gnu

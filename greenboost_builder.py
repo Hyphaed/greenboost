@@ -153,6 +153,26 @@ def find_kernel_headers(kver: KernelVersion) -> Path | None:
 
 
 def find_cuda_dir() -> Path | None:
+    """Return the best available CUDA installation directory.
+
+    Prefers the newest side-by-side versioned install (/usr/local/cuda-13
+    over /usr/local/cuda-12) before falling back to the unversioned symlink
+    or other standard paths.  This matters on systems where the user installs
+    CUDA 13 via the NVIDIA repo but the /usr/local/cuda symlink still points
+    to a CUDA 12 left over from an ubuntu-repo nvidia-cuda-toolkit package.
+    """
+    import glob
+
+    # Collect all /usr/local/cuda-N.M style dirs that have cuda.h
+    versioned = sorted(
+        (p for p in (Path(g) for g in glob.glob("/usr/local/cuda-[0-9]*"))
+         if p.is_dir() and (p / "include" / "cuda.h").exists()),
+        key=lambda p: [int(x) for x in p.name.lstrip("cuda-").split(".") if x.isdigit()],
+    )
+    if versioned:
+        return versioned[-1]  # highest version
+
+    # Fall back to the original candidate list (unversioned symlink / other paths)
     for cand in CUDA_CANDIDATES:
         p = Path(cand)
         if p.is_dir() and (p / "include" / "cuda.h").exists():

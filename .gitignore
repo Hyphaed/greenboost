@@ -54,3 +54,27 @@ venv/
 
 # GitLab push helper (local-only, never commit credentials or remote config)
 push_to_gitlab.sh
+
+# Claude working folder (session plans, agent docs) — never committed
+workflow/
+
+# Runtime cache (index.db etc) — never expose
+.cache/
+
+# Local dev/test/deploy scripts — may carry tokens & local paths, never commit
+deploy_and_test.py
+deploy_shim.sh
+run_test.sh
+test_qwen_vllm.sh
+
+# All compiled shared libraries (libgreenboost_cuda.so already covered above)
+*.so
+
+# Compiler intermediates and manual editor backups
+*.ii
+proton.bak
+proton_copy
+
+# Stray / generated files that must not be committed
+sudo
+build_info

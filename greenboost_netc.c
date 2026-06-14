@@ -388,8 +388,11 @@ struct netc_feeder {
     /* D3: ECC health per GPU */
     int      t1_ecc_quarantine;     /* 1 = skip T1 feeder alloc (elevated SBE rate) */
     uint32_t ecc_dbe_count;         /* cumulative DBE - if > 0, feeder flagged degraded */
-    /* GPU utilization cached from last heartbeat (gpu_load[0].gpu_util_pct) */
+    /* GPU utilization + thermal + power cached from last heartbeat (gpu_load[0]) */
     uint32_t gpu_util_pct;          /* 0-100; 0 until first heartbeat */
+    uint32_t gpu_mem_util_pct;      /* 0-100 memory controller utilization */
+    uint16_t gpu_temp_c;            /* GPU temperature °C; 0 until first heartbeat */
+    uint16_t gpu_power_draw_w;      /* current power draw Watts; 0 until first heartbeat */
     /* U4: unified health state machine */
     gb_feeder_health_state_t health_state;
     uint64_t health_state_since_ms;  /* mono_ms() when current state was entered */
@@ -414,6 +417,9 @@ struct netc_feeder {
      * gb_netc_selective_stream_sync() so cudaStreamSynchronize only contacts
      * feeders that actually have pending work. */
     _Atomic int kernel_dispatched;
+    /* Phase 2b: count of async kernels queued since last stream sync.
+     * Non-zero means the feeder has unfinished async work in its async_stream. */
+    _Atomic int pending_async_kernels;
     /* N8: exponential backoff for feeder reconnection after socket drop.
      * reconnect_delay_ms doubles on each failure (500ms → 30s).
      * next_reconnect_ms is the mono_ms() at which next attempt is allowed. */
@@ -2345,6 +2351,97 @@ int gb_netc_exec_kernel(int feeder_idx,
     return 0;
 }
 
+/* Phase 2b: Fire-and-forget async kernel dispatch (GB_MSG_CUDA_EXEC_ASYNC).
+ *
+ * Sends the kernel request and returns as soon as the feeder ACKs receipt
+ * (before GPU execution completes).  The feeder enqueues the kernel on its
+ * per-client async CUDA stream and ACKs immediately; outstanding work is
+ * drained the next time gb_netc_selective_stream_sync() sends GB_MSG_CUDA_SYNC.
+ *
+ * Constraints enforced here (mirrors feeder validation):
+ *   - n_uploads must be 0 (no inline tensor upload; weights must already be
+ *     in feeder VRAM as remote allocations addressed via relocs)
+ *   - n_downloads must be 0 (caller does not need data back immediately)
+ *
+ * Returns 0 on success (kernel queued on feeder), -1 on error. */
+int gb_netc_exec_kernel_async(int feeder_idx,
+                              const char *kernel_name,
+                              unsigned int gx, unsigned int gy, unsigned int gz,
+                              unsigned int bx, unsigned int by, unsigned int bz,
+                              uint32_t shared_mem,
+                              const uint64_t *arg_vals, uint32_t n_arg_vals,
+                              const struct gb_exec_reloc *relocs, int n_relocs)
+{
+    NETC_NVTX_PUSH("GB:net_exec_async", NETC_NVTX_COLOR_KERN);
+    if (feeder_idx < 0 || feeder_idx >= g_feeder_count) {
+        NETC_NVTX_POP(); return -1;
+    }
+    struct netc_feeder *nf = &g_feeders[feeder_idx];
+    if (!nf->connected) { NETC_NVTX_POP(); return -1; }
+
+    uint32_t name_len    = (uint32_t)strlen(kernel_name);
+    uint32_t arg_bytes   = n_arg_vals * (uint32_t)sizeof(uint64_t);
+    uint32_t reloc_bytes = (uint32_t)n_relocs * (uint32_t)sizeof(struct gb_net_ptr_reloc);
+
+    uint32_t total = (uint32_t)sizeof(struct gb_net_cuda_exec)
+                   + name_len + arg_bytes + reloc_bytes;
+
+    uint8_t *payload = (uint8_t *)malloc(total);
+    if (!payload) { NETC_NVTX_POP(); return -1; }
+
+    struct gb_net_cuda_exec hdr = {
+        .grid_x = gx, .grid_y = gy, .grid_z = gz,
+        .block_x = bx, .block_y = by, .block_z = bz,
+        .shared_mem_bytes = shared_mem,
+        .kernel_name_len  = name_len,
+        .n_arg_vals       = n_arg_vals,
+        .n_relocs         = (gb_u32)n_relocs,
+        .n_uploads        = 0,
+        .n_downloads      = 0,
+    };
+
+    uint8_t *p = payload;
+    memcpy(p, &hdr, sizeof(hdr)); p += sizeof(hdr);
+    memcpy(p, kernel_name, name_len); p += name_len;
+    if (arg_bytes) { memcpy(p, arg_vals, arg_bytes); p += arg_bytes; }
+    for (int i = 0; i < n_relocs; i++) {
+        struct gb_net_ptr_reloc r;
+        r.arg_idx       = (gb_u32)relocs[i].arg_idx;
+        r.t2_speed_mts  = 0;
+        r.remote_handle = relocs[i].remote_handle;
+        memcpy(p, &r, sizeof(r)); p += sizeof(r);
+    }
+
+    pthread_mutex_lock(&nf->per_lock);
+    int ret = netc_send_msg(nf, GB_MSG_CUDA_EXEC_ASYNC, 0, payload, total);
+    free(payload);
+
+    if (ret < 0) { pthread_mutex_unlock(&nf->per_lock); NETC_NVTX_POP(); return -1; }
+
+    /* Receive the lightweight ACK (just gb_net_response, no download data) */
+    struct gb_net_header resp_hdr;
+    void *resp_payload = NULL;
+    ret = netc_recv_response(nf, &resp_hdr, &resp_payload);
+    pthread_mutex_unlock(&nf->per_lock);
+
+    if (ret < 0 || !resp_payload) { free(resp_payload); NETC_NVTX_POP(); return -1; }
+    const struct gb_net_response *resp = (const struct gb_net_response *)resp_payload;
+    int ok = (resp->status == GB_STATUS_OK);
+    free(resp_payload);
+
+    if (ok) {
+        atomic_store_explicit(&nf->kernel_dispatched, 1, memory_order_release);
+        atomic_fetch_add_explicit(&nf->pending_async_kernels, 1, memory_order_relaxed);
+        netc_log("exec_kernel_async '%s' on feeder %d: queued", kernel_name, feeder_idx);
+        NETC_NVTX_EVENT("EXEC_KERNEL_ASYNC_NET", "NET", 0, feeder_idx, kernel_name);
+    } else {
+        netc_log("exec_kernel_async '%s' on feeder %d: ERR status=%u",
+                 kernel_name, feeder_idx, resp ? resp->status : 99);
+    }
+    NETC_NVTX_POP();
+    return ok ? 0 : -1;
+}
+
 /* F-L1-31: selective stream sync - only contacts feeders that have had a
  * kernel dispatched since the last sync, avoiding unnecessary round-trips
  * to idle feeders. */
@@ -2355,6 +2452,7 @@ void gb_netc_selective_stream_sync(void)
         if (!nf->connected) continue;
         if (!atomic_load_explicit(&nf->kernel_dispatched, memory_order_acquire)) continue;
         atomic_store_explicit(&nf->kernel_dispatched, 0, memory_order_relaxed);
+        atomic_store_explicit(&nf->pending_async_kernels, 0, memory_order_relaxed);
 
         struct gb_net_cuda_sync req = { .stream_id = 0 };
         pthread_mutex_lock(&nf->per_lock);
@@ -2488,7 +2586,10 @@ void gb_netc_poll_health(void)
                 if (hb->gpu_load[g].ecc_sbe_delta > 8)
                     sbe_elevated = 1;
             }
-            nf->gpu_util_pct = hb->gpu_load[0].gpu_util_pct;
+            nf->gpu_util_pct     = hb->gpu_load[0].gpu_util_pct;
+            nf->gpu_mem_util_pct = hb->gpu_load[0].mem_util_pct;
+            nf->gpu_temp_c       = hb->gpu_load[0].gpu_temp_c;
+            nf->gpu_power_draw_w = hb->gpu_load[0].power_draw_w;
         }
         nf->throttle_reasons  = throttle_any;
         nf->ecc_dbe_count     = dbe_total;
@@ -2738,4 +2839,25 @@ uint32_t gb_netc_feeder_gpu_util_pct(int remote_idx)
     if (remote_idx < 0 || remote_idx >= g_remote_gpu_count) return 0;
     int fi = g_remote_gpus[remote_idx].feeder_idx;
     return g_feeders[fi].gpu_util_pct;
+}
+
+uint32_t gb_netc_feeder_gpu_mem_util_pct(int remote_idx)
+{
+    if (remote_idx < 0 || remote_idx >= g_remote_gpu_count) return 0;
+    int fi = g_remote_gpus[remote_idx].feeder_idx;
+    return g_feeders[fi].gpu_mem_util_pct;
+}
+
+uint16_t gb_netc_feeder_gpu_temp_c(int remote_idx)
+{
+    if (remote_idx < 0 || remote_idx >= g_remote_gpu_count) return 0;
+    int fi = g_remote_gpus[remote_idx].feeder_idx;
+    return g_feeders[fi].gpu_temp_c;
+}
+
+uint16_t gb_netc_feeder_gpu_power_w(int remote_idx)
+{
+    if (remote_idx < 0 || remote_idx >= g_remote_gpu_count) return 0;
+    int fi = g_remote_gpus[remote_idx].feeder_idx;
+    return g_feeders[fi].gpu_power_draw_w;
 }
