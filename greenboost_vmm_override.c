@@ -213,26 +213,73 @@ void *dlsym(void *handle, const char *name)
      * __libc_dlsym lives in ld.so and is immune to PLT interception. */
     static void *(*real_dlsym)(void *, const char *) = NULL;
     if (!real_dlsym) {
-        if (__libc_dlsym)
+        /* Use dlvsym with an explicit glibc version to find the real dlsym.
+         * __libc_dlsym(map, name) is a glibc-private function that expects a
+         * real link-map pointer — passing RTLD_NEXT (a pseudo-handle) to it
+         * returns a broken wrapper that cannot perform handle-scoped lookups.
+         * Ollama 0.30.8 registers ggml backends dynamically via
+         * dlsym(real_handle, entrypoint) — if real_dlsym is broken those
+         * lookups return NULL and ggml registers zero backends, crashing every
+         * model load with "no backends are loaded".
+         * dlvsym with a versioned glibc symbol safely resolves the correct
+         * implementation regardless of our unversioned dlsym export. */
+        real_dlsym = (void *(*)(void *, const char *))
+            dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");
+        if (!real_dlsym)
+            real_dlsym = (void *(*)(void *, const char *))
+                dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
+        if (!real_dlsym)
+            real_dlsym = (void *(*)(void *, const char *))
+                dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.17");
+        if (!real_dlsym && __libc_dlsym)
+            /* musl / non-glibc last resort — RTLD_NEXT is accepted here on
+             * some implementations even though it is not a link-map. */
             real_dlsym = (void *(*)(void *, const char *))
                 __libc_dlsym(RTLD_NEXT, "dlsym");
-        if (!real_dlsym) {
-            /* Non-glibc path or first call before ld.so is ready.
-             * Returning NULL would break the caller; best effort: return the
-             * real libcuda symbol (no VMM fix on this path). */
+        if (!real_dlsym)
             return NULL;
-        }
     }
 
-    /* Intercept requests for the two CUDA symbols we need to override.
-     * Return our hook regardless of which handle was passed — the caller
-     * only cares about the function behaviour, not the address source.
-     * (Both hooks forward to the real function for non-Blackwell / allowed.) */
+    /* Intercept requests for the CUDA symbols we need to override. */
     if (name) {
+        /* VMM suppression: return our hooks for all handles (including RTLD_NEXT).
+         * Our cuDeviceGetAttribute / cuMemAddressReserve use __libc_dlsym internally
+         * to reach the real libcuda version, so there is no recursion risk. */
         if (strcmp(name, "cuDeviceGetAttribute") == 0)
             return (void *)cuDeviceGetAttribute;
         if (strcmp(name, "cuMemAddressReserve") == 0)
             return (void *)cuMemAddressReserve;
+
+        /* Memory-inflation fix: redirect cuDeviceTotalMem_v2 / cuDeviceTotalMem to
+         * the GreenBoost CUDA shim's hooked version, which reports phys+virtual VRAM.
+         *
+         * Why: Ollama's gpu-discover subprocess does dlopen("libcuda.so.1")+dlsym to
+         * look up cuDeviceTotalMem_v2 by name, then calls the returned function pointer.
+         * The PLT preemption used by the full shim (LD_PRELOAD) does NOT intercept
+         * runtime dlsym(specific_handle, name) calls — only PLT references at load
+         * time.  Without this redirect, gpu-discover calls libcuda's real function and
+         * sees only physical VRAM (12 GB), making Ollama place the model on CPU.
+         *
+         * Only redirect for library-specific handles (not RTLD_NEXT or RTLD_DEFAULT):
+         *   - RTLD_NEXT calls originate from the shim's own init code that populates
+         *     real_cuDeviceTotalMem_v2; redirecting those would make the shim store
+         *     its own hook as the "real" function → infinite recursion.
+         *   - RTLD_DEFAULT calls already find the shim's hook first (it's first in the
+         *     LD_PRELOAD load order), so no interception needed.
+         *
+         * RTLD_DEFAULT == (void*)0, RTLD_NEXT == (void*)-1 on Linux/glibc. */
+        if (handle != RTLD_NEXT && handle != RTLD_DEFAULT) {
+            if (strcmp(name, "cuDeviceTotalMem_v2") == 0 ||
+                strcmp(name, "cuDeviceTotalMem") == 0) {
+                /* Look up the shim's inflating hook from the global symbol table.
+                 * The shim is preloaded before libcuda.so.1, so RTLD_DEFAULT finds
+                 * the shim's cuDeviceTotalMem_v2@@GB_HOOKS before libcuda's version. */
+                void *shim_fn = real_dlsym(RTLD_DEFAULT, name);
+                /* Return the shim hook if found; fall through to the real handle
+                 * lookup only if the shim is absent (edge case: shim not yet loaded). */
+                if (shim_fn) return shim_fn;
+            }
+        }
     }
 
     return real_dlsym(handle, name);

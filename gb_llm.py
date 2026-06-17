@@ -48,8 +48,14 @@ except ImportError:
 
 
 def _auto_budget_gb() -> float:
-    free_b, _total = torch.cuda.mem_get_info()
-    return free_b / 2**30 * 0.92
+    """Use gb_init unified budget (telemetry-first, torch fallback)."""
+    if _gb_init is not None:
+        return _gb_init.auto_budget_gb()
+    try:
+        free_b, _ = torch.cuda.mem_get_info()
+        return free_b / 2**30 * 0.92
+    except Exception:
+        return 0.0
 
 
 def load_causal_lm(model_id: str, budget_gb: "float | None" = None,

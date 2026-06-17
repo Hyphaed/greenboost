@@ -2,7 +2,7 @@
 
 **Author:** Ferran Duarri
 **License:** GPL v2 (open-source) + Commercial (dual licensed)
-**Version:** 2.10
+**Version:** 3.1
 
 <div align="center">
 

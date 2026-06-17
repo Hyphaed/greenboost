@@ -2,20 +2,24 @@
 
 ---
 
+
+## v3.1 : 2026-06-16
+- Telemetry layer stitched directly into the CUDA shim , live ECC/power/PCIe signals now available in-process at 500 ms resolution.
+- New unified runtime stack: `gb_supervisor` (one daemon replaces 4 inert systemd units), `gb_orchestrator` (closes 3 reactive feedback loops), `gb_control` (single actuator layer), `gb_nvml`/`gb_reactive`/`gb_vitals_helper` library.
+- `vitals`/`cluster` commands now use in-process pynvml instead of nvidia-smi subprocess forks.
+- `vmm_override` PLT fix, `greenboost_setup.sh`.
+- Bugfixes
+
 ## v3.0 : 2026-06-13
-v3.0 : 2026-06-13
-
 v3.0 Includes the work not commited on v2.9 + bugfixes due issues reported by other users
-
 
 ## 🤝 A unified runtime for diffusion pipelines
 
-Modern diffusion systems are composed of multiple independent components—typically CLIP, VAE, and UNet or DiT—that must share GPU resources while executing in the correct order.
+Modern diffusion systems are composed of multiple independent components, typically CLIP, VAE, and UNet or DiT, that must share GPU resources while executing in the correct order.
 
 `gb_diffusion_orch.py` acts as the coordinator for those components, using the singletons created by `gb_init.py` instead of constructing duplicate runtime objects.
 
 This allows multiple diffusion pipelines to be nested or composed together.
-
 
 
 ## 🔬 Embedded DCGM telemetry (no daemon required)
@@ -28,7 +32,7 @@ As soon as GreenBoost starts, it can query the GPU without relying on an externa
 
 More importantly, the telemetry is designed to catch hardware problems before they become corrupted model outputs.
 
-If the GPU reports an ECC double-bit error—a condition that indicates uncorrectable memory corruption, GreenBoost immediately emits a warning to `stderr` so the workload can be inspected before invalid results propagate through an entire inference or training run.
+If the GPU reports an ECC double-bit error,a condition that indicates uncorrectable memory corruption, GreenBoost immediately emits a warning to `stderr` so the workload can be inspected before invalid results propagate through an entire inference or training run.
 
 Single-bit ECC errors are also tracked over time, providing an early indicator of hardware aging instead of waiting for catastrophic failures.
 
@@ -91,13 +95,13 @@ This release adds several regression tests and runtime improvements that make th
 
 ### Preventing old bugs from returning
 
-One issue involved `cudaGetDriverEntryPointByVersion`, which was originally fixed in **v2.9**. The problem wasn't the implementation anymore—it was making sure future compiler optimizations (especially Link Time Optimization, or LTO) didn't accidentally remove or break the hook.
+One issue involved `cudaGetDriverEntryPointByVersion`, which was originally fixed in **v2.9**. The problem wasn't the implementation anymore,it was making sure future compiler optimizations (especially Link Time Optimization, or LTO) didn't accidentally remove or break the hook.
 
 To prevent that, the function is now part of `EXPECTED_HOOKS`, and a new `TestSo12Trampolines` test performs a positive `readelf` check during CI. If a future build silently drops the symbol, the test fails immediately instead of allowing a broken release.
 
 ### Making CUDA 13 initialization behave like older versions
 
-Many AI projects—including **llama.cpp**, **ComfyUI**, and **ggml**—call `cudaMemGetInfo()` before ever calling `cudaSetDevice()`. Earlier CUDA versions tolerated this pattern, but CUDA 13 returns `cudaErrorDeviceUninitialized (998)` instead.
+Many AI projects,including **llama.cpp**, **ComfyUI**, and **ggml**,call `cudaMemGetInfo()` before ever calling `cudaSetDevice()`. Earlier CUDA versions tolerated this pattern, but CUDA 13 returns `cudaErrorDeviceUninitialized (998)` instead.
 
 Rather than requiring every application to change its code, the shim now adapts automatically.
 
@@ -113,7 +117,7 @@ Previously this required manual configuration. The Makefile now detects `CONFIG_
 
 ### Automatically selecting the newest CUDA installation
 
-Many development machines have multiple CUDA versions installed side by side—for example CUDA 12 and CUDA 13.
+Many development machines have multiple CUDA versions installed side by side,for example CUDA 12 and CUDA 13.
 
 Older build scripts could accidentally select the older toolkit, creating confusing version mismatches. The build system now searches `/usr/local/cuda-[0-9]*`, sorts every installation by version number, and automatically chooses the newest one.
 

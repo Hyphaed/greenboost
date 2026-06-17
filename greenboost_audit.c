@@ -23,6 +23,7 @@
 #include <dlfcn.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #ifndef SHIM_PATH
 #define SHIM_PATH "/usr/local/lib/libgreenboost_cuda.so"
@@ -92,6 +93,12 @@ static int should_skip_shim(void)
 __attribute__((visibility("default")))
 unsigned int la_version(unsigned int version)
 {
+    /* PID-1 guard: returning 0 makes glibc silently disable this LD_AUDIT
+     * library for the current process.  Never activate the audit hooks inside
+     * systemd or any other init process — per-process injection via systemd
+     * drop-ins and greenboost-run* wrappers is the only supported path. */
+    if (getpid() == 1) return 0;
+
     (void)version;
     return LAV_CURRENT;
 }

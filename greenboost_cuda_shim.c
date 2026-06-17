@@ -32,9 +32,15 @@
  * ENVIRONMENT VARIABLES:
  *   GREENBOOST_USE_DMA_BUF       1 = attempt Path A (default), 0 = skip to B
  *   GREENBOOST_NO_HOSTREG        1 = skip Path B (returns OOM when T2 exhausted)
- *   GREENBOOST_VRAM_HEADROOM_MB  keep ≥ this many MB free in VRAM (default 512)
- *   GREENBOOST_KV_RESERVE_MB     MB of T1 VRAM reserved for KV cache (default: from
- *                                kernel module kv_reserve_mb param, typically 2048).
+ *   GREENBOOST_VRAM_HEADROOM_MB        keep ≥ this many MB free in VRAM (default 512)
+ *   GREENBOOST_WORKSTATION_RESERVE_MB  MB of physical VRAM kept free for the desktop/
+ *                                      display/other GPU processes (default 1024 MB).
+ *                                      Subtracted from reported free VRAM so llama.cpp
+ *                                      --fit doesn't fill T1 completely. Set to 0 on
+ *                                      dedicated inference nodes. Doubled automatically
+ *                                      when gaming_mode=1 (Proton game running).
+ *   GREENBOOST_KV_RESERVE_MB           MB of T1 VRAM reserved for KV cache (default: from
+ *                                      kernel module kv_reserve_mb param, typically 128).
  *                                Weights overflow to T2 sooner; KV cache stays in T1.
  *                                Adaptive: reserve collapses as KV fills T1 -
  *                                no double-counting with cuMemGetInfo free_vram.
@@ -1232,6 +1238,9 @@ static _Atomic size_t gb_t2_pending_uvm_bytes;
 #define BVMM_HT_BITS 9
 #define BVMM_HT_SIZE (1u << BVMM_HT_BITS)
 #define BVMM_HT_MASK (BVMM_HT_SIZE - 1u)
+/* Tombstone sentinel: a slot that was deleted but must not stop a probe chain.
+ * Never a real VA (CUDA device pointers are in the low 48-bit range). */
+#define BVMM_HT_TOMBSTONE ((CUdeviceptr)(UINT64_MAX))
 
 #define BVMM_TYPE_MANAGED  0  /* cuMemAllocManaged → cudaFree on device ptr */
 #define BVMM_TYPE_VMM      1  /* cuMemCreate HOST → cuMemUnmap/AddrFree/Release */
@@ -1254,7 +1263,11 @@ static inline uint32_t bvmm_ht_hash(CUdeviceptr va)
 
 /* Returns 1 on success, 0 if the table is full.  Callers MUST handle the
  * failure path - silently dropping an entry would leak the underlying alloc
- * and corrupt gb_t2_overflow_bytes accounting. */
+ * and corrupt gb_t2_overflow_bytes accounting.
+ *
+ * S-C1/S-H4: free slot = (va == 0) || (va == BVMM_HT_TOMBSTONE).
+ * If va already exists (dup insert), update in-place and return 1 so the
+ * caller's accounting doesn't double-count. */
 static int bvmm_ht_insert(CUdeviceptr va, CUmemGenericAllocationHandle h, size_t sz, uint8_t type)
 {
     uint32_t i, slot;
@@ -1263,7 +1276,14 @@ static int bvmm_ht_insert(CUdeviceptr va, CUmemGenericAllocationHandle h, size_t
     slot = bvmm_ht_hash(va) & BVMM_HT_MASK;
     for (i = 0; i < BVMM_HT_SIZE; i++) {
         bvmm_ht_entry_t *e = &gb_bvmm_ht[(slot + i) & BVMM_HT_MASK];
-        if (e->va == 0) { e->va = va; e->handle = h; e->va_size = sz; e->type = type; ok = 1; break; }
+        if (e->va == va) {
+            /* Duplicate key — update in-place (shouldn't happen normally). */
+            e->handle = h; e->va_size = sz; e->type = type;
+            ok = 1; break;
+        }
+        if (e->va == 0 || e->va == BVMM_HT_TOMBSTONE) {
+            e->va = va; e->handle = h; e->va_size = sz; e->type = type; ok = 1; break;
+        }
     }
     pthread_mutex_unlock(&gb_bvmm_ht_lock);
     return ok;
@@ -1286,7 +1306,9 @@ static int bvmm_ht_remove(CUdeviceptr va,
             if (out_handle)  *out_handle  = e->handle;
             if (out_va_size) *out_va_size = e->va_size;
             if (out_type)    *out_type    = e->type;
-            e->va = 0; e->handle = 0; e->va_size = 0; e->type = 0;
+            /* S-C1: tombstone (not zero) so probe chains for keys that
+             * hashed past this slot remain intact. */
+            e->va = BVMM_HT_TOMBSTONE; e->handle = 0; e->va_size = 0; e->type = 0;
             pthread_mutex_unlock(&gb_bvmm_ht_lock);
             return 1;
         }
@@ -1915,6 +1937,11 @@ static int gb_pool_contains(CUdeviceptr dptr)
 /* ------------------------------------------------------------------ */
 
 static size_t vram_headroom_bytes    = 512ULL * 1024 * 1024;  /* 512 MB default - scaled to 5% of VRAM after NVML probe; override with GREENBOOST_VRAM_HEADROOM_MB */
+/* Workstation GPU headroom: subtracted from reported free VRAM so --fit leaves
+ * this many MB of physical GPU VRAM for the desktop/display/other apps.
+ * 1024 MB default; override with GREENBOOST_WORKSTATION_RESERVE_MB.
+ * gaming_mode=1 automatically doubles this to keep the GPU responsive. */
+static size_t g_workstation_reserve_bytes = 1024ULL * 1024 * 1024;
 /* ENH-05: Stats write interval in ms. Default 250 ms; override with
  * GREENBOOST_STATS_INTERVAL_MS env var for finer resolution during debugging. */
 static uint64_t g_stats_interval_ms = 250ULL;
@@ -2526,10 +2553,14 @@ static uint32_t gb_phase_classify(size_t bytesize)
         atomic_store_explicit(&g_overflow_avg_bytes, avg, memory_order_relaxed);
 
         /* Transition to INFERENCE when either:
-         *   (a) quiet gap: no overflow for >= GB_PHASE_QUIET_GAP_MS, OR
-         *   (b) this alloc is >= 4x the rolling average (KV is 1-2 huge blocks)
+         *   (a) quiet gap: no overflow for >= GB_PHASE_QUIET_GAP_MS AND at least
+         *       8 weight allocs seen — prevents GGUF mmap I/O pauses (>400 ms)
+         *       during the first few tensor reads from flipping the phase early,
+         *       which would apply the full KV reserve to weight allocs and strand
+         *       ~2 GB of T1 VRAM without any KV actually allocated yet.
+         *   (b) this alloc is >= 4x the rolling average (KV signature)
          *   (c) forced after GB_PHASE_LOAD_COUNT_MAX weight allocs             */
-        if (gap_ms >= GB_PHASE_QUIET_GAP_MS ||
+        if ((gap_ms >= GB_PHASE_QUIET_GAP_MS && load_count >= 8) ||
             (avg > 0 && bytesize >= 4 * avg) ||
             load_count >= GB_PHASE_LOAD_COUNT_MAX) {
 
@@ -3164,6 +3195,22 @@ static void gb_write_stats(void)
     fprintf(f, "kv_reserve_effective_mb=%zu\n", _kv_eff >> 20);
     fprintf(f, "kv_t1_tracked_mb=%zu\n",      _kv_t1 >> 20);
     fprintf(f, "vram_headroom_mb=%zu\n",       vram_headroom_bytes >> 20);
+    /* P1b: publish workstation reserve so gb_vitals_helper + greenboost vitals
+     * can show how much VRAM headroom the shim is holding back.
+     * Effective = base × 2 when gaming_mode is active.
+     * Inline the sysfs read (read_sysfs_bool is static, defined later). */
+    {
+        int _gm = 0;
+        FILE *_gmf = fopen("/sys/module/greenboost/parameters/gaming_mode", "r");
+        if (_gmf) {
+            char _buf[8] = {0};
+            if (fread(_buf, 1, 7, _gmf) > 0) _gm = (_buf[0] == '1');
+            fclose(_gmf);
+        }
+        size_t _ws_base = g_workstation_reserve_bytes;
+        fprintf(f, "workstation_reserve_mb=%zu\n",     _ws_base >> 20);
+        fprintf(f, "workstation_reserve_eff_mb=%zu\n", (_gm ? _ws_base * 2 : _ws_base) >> 20);
+    }
     fprintf(f, "local_t1_alloc_mb=%zu\n",     atomic_load_explicit(&g_local_t1_alloc_bytes, memory_order_relaxed) >> 20);
     fprintf(f, "remote_alloc_count=%zu\n",    atomic_load_explicit(&g_remote_alloc_count, memory_order_relaxed));
     fprintf(f, "remote_alloc_mb=%zu\n",       atomic_load_explicit(&g_remote_alloc_mb, memory_order_relaxed));
@@ -3276,6 +3323,81 @@ static void gb_write_stats(void)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/*  gb_read_control() — runtime control-file reader                    */
+/*                                                                      */
+/*  Reads {gb_stats_dir}/control (default /run/greenboost/control)     */
+/*  every ~2 s on the already-CAS-won health sub-cadence.  A static    */
+/*  mtime gate keeps steady-state cost to one stat(2) per 2 s; parse   */
+/*  only runs when the supervisor has written a new version.            */
+/*                                                                      */
+/*  Ships dark: absent file → stat(2) returns ENOENT → return.  No     */
+/*  cost until the supervisor actually starts writing.  The supervisor  */
+/*  writes via temp-file + rename() (atomic), pairing with this gate.  */
+/*                                                                      */
+/*  Key → global mapping (all values clamped before store):            */
+/*    workstation_reserve_mb → g_workstation_reserve_bytes  [0,8192]   */
+/*    stats_interval_ms      → g_stats_interval_ms          [50,5000]  */
+/*    kv_size_threshold_mb   → g_kv_size_threshold_bytes    [1,4096]   */
+/*    swa_window_mb          → g_swa_window_bytes            [0,65536]  */
+/*    phase_detect           → g_phase_detect                {0,1}     */
+/*    kv_reserve_mb          → g_kv_reserve_bytes (_Atomic) [0,65536]  */
+/*                             only when g_kv_reserve_from_env == 0    */
+/* ------------------------------------------------------------------ */
+static void gb_read_control(void)
+{
+    static time_t s_ctrl_mtime = 0;
+    char path[256];
+    struct stat st;
+    FILE *f;
+    char line[256];
+
+    /* gb_stats_dir is always resolved before this is called because
+     * gb_write_stats() runs first in the same outer CAS-won block. */
+    const char *dir = gb_stats_dir ? gb_stats_dir : GB_STATS_DIR;
+    snprintf(path, sizeof(path), "%s/control", dir);
+
+    /* mtime gate: skip parse when file is unchanged */
+    if (stat(path, &st) != 0)
+        return;
+    if (st.st_mtime == s_ctrl_mtime)
+        return;
+    s_ctrl_mtime = st.st_mtime;
+
+    f = fopen(path, "r");
+    if (!f) return;
+
+    while (fgets(line, sizeof(line), f)) {
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        const char *key = line;
+        long long val   = gb_atoll(eq + 1);
+
+        if (strcmp(key, "workstation_reserve_mb") == 0) {
+            long long c = val < 0 ? 0LL : val > 8192LL ? 8192LL : val;
+            g_workstation_reserve_bytes = (size_t)c << 20;
+        } else if (strcmp(key, "stats_interval_ms") == 0) {
+            long long c = val < 50LL ? 50LL : val > 5000LL ? 5000LL : val;
+            g_stats_interval_ms = (uint64_t)c;
+        } else if (strcmp(key, "kv_size_threshold_mb") == 0) {
+            long long c = val < 1LL ? 1LL : val > 4096LL ? 4096LL : val;
+            g_kv_size_threshold_bytes = (size_t)c << 20;
+        } else if (strcmp(key, "swa_window_mb") == 0) {
+            long long c = val < 0LL ? 0LL : val > 65536LL ? 65536LL : val;
+            g_swa_window_bytes = (size_t)c << 20;
+        } else if (strcmp(key, "phase_detect") == 0) {
+            g_phase_detect = (val != 0) ? 1 : 0;
+        } else if (strcmp(key, "kv_reserve_mb") == 0 && !g_kv_reserve_from_env) {
+            long long c = val < 0LL ? 0LL : val > 65536LL ? 65536LL : val;
+            atomic_store_explicit(&g_kv_reserve_bytes,
+                                  (size_t)c << 20,
+                                  memory_order_relaxed);
+        }
+    }
+    fclose(f);
+}
+
 static void gb_maybe_write_stats(void)
 {
     /* CRIT-05: Use _Atomic + CAS so exactly one thread wins the write slot
@@ -3305,6 +3427,7 @@ static void gb_maybe_write_stats(void)
                                                             memory_order_relaxed,
                                                             memory_order_relaxed)) {
                     gb_netc_poll_health();
+                    gb_read_control();   /* apply supervisor hints without restart */
                 }
             }
 
@@ -3779,6 +3902,14 @@ static void gb_cudart_rebind(void)
 __attribute__((constructor))
 static void gb_shim_init(void)
 {
+    /* PID-1 guard: never activate the CUDA interposer inside systemd or any
+     * other init process.  If this library is ever loaded globally via
+     * /etc/ld.so.preload the loader calls this constructor for every process,
+     * including PID 1 — the CUDA hooks must not run there or they freeze boot.
+     * Per-process injection (systemd drop-ins, greenboost-run* wrappers) is the
+     * correct and only supported injection path. */
+    if (getpid() == 1) return;
+
     void *libcuda, *libcudart = NULL;
     const char *env;
     uint32_t i;
@@ -3860,6 +3991,15 @@ static void gb_shim_init(void)
     env = getenv("GREENBOOST_VRAM_HEADROOM_MB");
     int headroom_from_env = 0;
     if (env) { vram_headroom_bytes = (size_t)gb_atoll(env) * 1024ULL * 1024ULL; headroom_from_env = 1; }
+
+    /* Workstation GPU headroom: how much physical VRAM to keep free for the
+     * desktop, compositor, and other GPU processes.  Subtracts from the free
+     * VRAM reported by cuMemGetInfo_v2 / cudaMemGetInfo so llama-server's
+     * --fit algorithm does not fill T1 to 100%, keeping the workstation
+     * responsive during inference.  Default 1024 MB; override with
+     * GREENBOOST_WORKSTATION_RESERVE_MB=0 on dedicated inference nodes. */
+    env = getenv("GREENBOOST_WORKSTATION_RESERVE_MB");
+    if (env) g_workstation_reserve_bytes = (size_t)gb_atoll(env) * 1024ULL * 1024ULL;
 
     /* ENH-05: Configurable stats write interval (ms); 0 or negative → reset to default */
     env = getenv("GREENBOOST_STATS_INTERVAL_MS");
@@ -7130,12 +7270,25 @@ cudaError_t cudaFree(void *devPtr)
         if (!mapped_ptr) {
             if (!managed)
                 atomic_fetch_sub_explicit(&g_local_t1_alloc_bytes, sz, memory_order_relaxed);
-            return real_cudaFree(devPtr);
+            cudaError_t _r = real_cudaFree(devPtr);
+            /* PR-FREE-1: CUDA context teardown can race with model unload
+             * (DEEP_IDLE reclaim).  cudaErrorInvalidValue (=1) on a T1 alloc
+             * we own means the driver already freed it as part of context
+             * cleanup — treat it as success so callers don't surface spurious
+             * errors.  Any other non-zero code propagates unchanged. */
+            return (_r == (cudaError_t)1) ? CUDA_SUCCESS : _r;
         }
         return CUDA_SUCCESS;
     }
 
-    return real_cudaFree(devPtr);
+    /* Fallthrough: pointer not tracked by GreenBoost.  Tolerate
+     * cudaErrorInvalidValue (=1) for the same race reason as above — the
+     * allocation may have already been cleaned up by the CUDA context
+     * teardown path.  Other errors propagate to surface real bugs. */
+    {
+        cudaError_t _r = real_cudaFree(devPtr);
+        return (_r == (cudaError_t)1) ? CUDA_SUCCESS : _r;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -7295,12 +7448,35 @@ CUresult cuMemGetInfo_v2(size_t *free_out, size_t *total_out)
         }
     }
 
+    /* Workstation GPU headroom: subtract from physical VRAM free so --fit
+     * leaves that much GPU memory for the desktop, compositor, and other
+     * GPU-using processes.  When gaming_mode=1 (Proton wrapper active)
+     * double the reserve so games can take VRAM back without inference
+     * preempting them.  T2/T3 and remote memory are NOT reduced — they are
+     * DDR/NVMe and do not affect GPU rendering. */
+    {
+        size_t ws = g_workstation_reserve_bytes;
+        /* Read gaming_mode from sysfs; cached, so only a cheap stat on hot path */
+        static int _gaming_mode_cached = 0;
+        static uint64_t _gaming_mode_ms = 0;
+        uint64_t _now = gb_now_ms();
+        if (_now - _gaming_mode_ms > 2000ULL) {
+            _gaming_mode_cached = read_sysfs_bool(
+                "/sys/module/greenboost/parameters/gaming_mode");
+            _gaming_mode_ms = _now;
+        }
+        if (_gaming_mode_cached) ws *= 2;  /* double reserve when game is running */
+        if (real_free > ws) real_free -= ws;
+        else                real_free  = 0;
+    }
+
     if (free_out)  *free_out  = real_free  + t2_free + remote_free;
     if (total_out) *total_out = real_total + gb_virtual_vram_bytes + g_cluster_remote_total_bytes;
 
-    gb_log("cuMemGetInfo_v2: real_free=%zuMB local_virt=%zuMB remote_free=%zuMB total=%zuMB (phase %d)",
+    gb_log("cuMemGetInfo_v2: real_free=%zuMB local_virt=%zuMB remote_free=%zuMB total=%zuMB (phase %d, ws_reserve=%zuMB)",
            real_free >> 20, t2_free >> 20, remote_free >> 20,
-           (real_total + gb_virtual_vram_bytes + g_cluster_remote_total_bytes) >> 20, phase);
+           (real_total + gb_virtual_vram_bytes + g_cluster_remote_total_bytes) >> 20, phase,
+           g_workstation_reserve_bytes >> 20);
     return CUDA_SUCCESS;
 }
 
@@ -7401,11 +7577,18 @@ CUresult cuDeviceTotalMem_v2(size_t *bytes, CUdevice dev)
             return ret;
         }
         /* Single-virtual-GPU: report phys + local T2/T3 + all feeder T1+T2+T3 */
-        size_t total_virtual = *bytes + gb_virtual_vram_bytes + g_cluster_remote_total_bytes;
+        size_t phys = *bytes;
+        size_t total_virtual = phys + gb_virtual_vram_bytes + g_cluster_remote_total_bytes;
         if (gb_nvlink_aggregated_bytes > 0)
             total_virtual += gb_nvlink_aggregated_bytes;
+        /* Safety: if inflation produced 0 (virtual pool not yet init) but the
+         * physical probe succeeded, return the real physical value.  Returning
+         * 0 to Ollama's gpu-discover causes it to report total_vram=0 and place
+         * the entire model on CPU — the worst possible failure mode. */
+        if (total_virtual == 0 && phys > 0)
+            total_virtual = phys;
         gb_log("cuDeviceTotalMem_v2: phys=%zuMB + local_virt=%zuMB + remote=%zuMB = %zuMB",
-               *bytes >> 20, gb_virtual_vram_bytes >> 20,
+               phys >> 20, gb_virtual_vram_bytes >> 20,
                g_cluster_remote_total_bytes >> 20, total_virtual >> 20);
         *bytes = total_virtual;
     }
@@ -8311,7 +8494,8 @@ static pfn_dlopen_t real_dlopen_fn = NULL;
 __attribute__((constructor(101)))
 static void gb_dlsym_bootstrap(void)
 {
-    
+    /* PID-1 guard: same rationale as gb_shim_init — never run inside init. */
+    if (getpid() == 1) return;
 
     /* dlsym - try newest version first */
     real_dlsym_fn = (pfn_dlsym_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");

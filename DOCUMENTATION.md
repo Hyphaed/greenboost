@@ -1,4 +1,4 @@
-# GreenBoost v3.0 - integration guide for inference tools
+# GreenBoost v3.1 - integration guide for inference tools
 
 Check [GREENBOOST_COMMANDS.md](GREENBOOST_COMMANDS.md) for all the available commands
 Check [CHANGELOG.md](CHANGELOG.md) for what changed in each version
@@ -24,6 +24,37 @@ Two audiences read this file:
 If you only want to *use* GreenBoost with one inference tool, you can
 skip the architecture sections entirely. The shim is transparent - your
 existing Python script does not change.
+
+---
+
+## What's new in v3.1
+
+The 3.1 cycle stitches a reactive telemetry layer into the CUDA shim and replaces
+four installed-but-inert systemd daemons with a single unified Python runtime:
+
+**Runtime stack (new modules)**
+- `gb_supervisor` — one long-running daemon that subsumes `greenboost-recovery`,
+  `greenboost-sentinel`, `greenboost-vram-watchdog`, and `greenboost-idle-reclaim`.
+  One process, one log stream, zero redundant pynvml connections.
+- `gb_orchestrator` — signal-driven actuator that closes three feedback loops
+  previously left open: ECC responder, VRAM pressure ratchet, idle-reclaim gate.
+- `gb_control` — the single place that mutates GreenBoost runtime state, backed by
+  sysfs → ioctl → `/run/greenboost/control` in that priority order.
+- `gb_nvml` — unified pynvml singleton shared by all of the above (was duplicated
+  across four modules with divergent query sets).
+- `gb_reactive` — stdlib-only Signal/Computed primitives (debounce, EWMA, hysteresis)
+  used by the orchestrator; no external dependencies.
+- `gb_vitals_helper` — in-process pynvml for the `vitals`/`cluster` commands,
+  removing the nvidia-smi subprocess fork that previously ran on every refresh tick.
+
+**Shim**
+- `greenboost_cuda_shim.c` extended to publish live ECC, power, and PCIe health
+  signals at 500 ms resolution — previously these were logged only, never acted on.
+
+**Fixes**
+- `vmm_override` PLT symbol resolution fixed for Blackwell (cc 12.x) targets.
+- `greenboost_setup.sh` refactored: duplicate code consolidated, TUI refresh loop
+  de-spammed, `feeders upgrade-greenboost` atomic install path hardened.
 
 ---
 
@@ -109,10 +140,20 @@ version, set `CUDA_DIR=/usr/local/cuda-12 make` before building.
 
 GreenBoost works by intercepting `cudaMalloc` and related CUDA symbols via `LD_PRELOAD`, plus intercepting `dlsym` so that the virtual VRAM total (T1 VRAM + T2 DDR pool, computed from detected hardware) is returned to any app that queries VRAM size at runtime through `dlopen`+`dlsym`.
 
-The shim loads system-wide via `/etc/ld.so.preload` but stays **inert** until
-`GREENBOOST_ACTIVE=1` is set. In **interactive login shells** (terminal, SSH),
-`/etc/profile.d/greenboost.sh` exports `GREENBOOST_ACTIVE=1` automatically - no wrapper
-needed. Just run your script directly:
+The shim is injected **per-process** — never system-wide via `/etc/ld.so.preload`.
+Using `/etc/ld.so.preload` forces the CUDA interposer into every process on the
+system including **systemd PID 1**, which freezes early boot. Injection happens
+via two safe mechanisms instead:
+
+* **systemd service drop-ins** — `Environment="LD_PRELOAD=…"` in
+  `/etc/systemd/system/<service>.d/99-greenboost.conf`
+* **Wrapper scripts** — `greenboost-run`, `greenboost-run-tgi`, etc. export
+  `LD_PRELOAD` only for the target command.
+
+`GREENBOOST_ACTIVE=1` still gates whether the shim does any work. In
+**interactive login shells** (terminal, SSH), `/etc/profile.d/greenboost.sh`
+exports `GREENBOOST_ACTIVE=1` automatically — no wrapper needed. Just run your
+script directly:
 
 ```bash
 python your_script.py               # shim already active in login shells

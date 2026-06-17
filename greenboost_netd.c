@@ -1893,8 +1893,8 @@ static int handle_cuda_memcpy_h2d(struct client *cli, const void *payload, uint3
     if (!ra) {
         pthread_mutex_unlock(&g_alloc_lock);
         resp.status = GB_STATUS_ERR_INVALID;
-    } else if (req_offset > ra->size ||
-               req_offset + req_size > (uint64_t)ra->size) {
+    } else if (req_offset > (uint64_t)ra->size ||
+               req_size > (uint64_t)ra->size - req_offset) {  /* N-M3: no wrap */
         /* Audit F-L3-10: bound-check offset + size against the allocation. */
         netd_log("WARN H2D: out-of-bounds offset=%llu size=%llu vs alloc=%zu",
                  (unsigned long long)req_offset,
@@ -2389,11 +2389,17 @@ static int handle_cuda_exec(struct client *cli, const void *payload, uint32_t le
     if (up_desc_bytes) memcpy(up_descs, p, up_desc_bytes);
     p += up_desc_bytes; left -= up_desc_bytes;
 
+    /* N-H3: bound each descriptor individually before summing so an attacker
+     * cannot craft up to GB_NET_MAX_XFERS entries that each underflow-wrap
+     * upload_total past the aggregate cap check. */
     uint64_t upload_total = 0;
-    for (uint32_t i = 0; i < req_n_uploads; i++) upload_total += up_descs[i].size;  /* PR-UU */
-    if (upload_total > 256ULL * 1024 * 1024 || left < (uint32_t)upload_total) EXEC_ERR();
+    for (uint32_t i = 0; i < req_n_uploads; i++) {
+        if (up_descs[i].size > GB_NET_MAX_EXEC_UPLOAD_BYTES) EXEC_ERR();
+        upload_total += up_descs[i].size;
+    }
+    if (upload_total > GB_NET_MAX_EXEC_UPLOAD_BYTES || left < upload_total) EXEC_ERR();
     const uint8_t *upload_data = p;
-    p += upload_total; left -= (uint32_t)upload_total;
+    p += upload_total; left -= upload_total;
 
     /* download descs */
     uint32_t dn_desc_bytes = req_n_downloads * (uint32_t)sizeof(struct gb_net_xfer_desc);  /* PR-UU */
@@ -2542,8 +2548,14 @@ static int handle_cuda_exec(struct client *cli, const void *payload, uint32_t le
 
     /* build response: header + download data */
     if (resp.status == GB_STATUS_OK && req_n_downloads > 0 && f_cudaMemcpy) {  /* PR-UU */
+        /* N-H3: same per-descriptor cap for downloads. */
         uint64_t dl_total = 0;
-        for (uint32_t i = 0; i < req_n_downloads; i++) dl_total += dn_descs[i].size;
+        for (uint32_t i = 0; i < req_n_downloads; i++) {
+            if (dn_descs[i].size > GB_NET_MAX_EXEC_UPLOAD_BYTES) {
+                resp.status = GB_STATUS_ERR_CUDA; break;
+            }
+            dl_total += dn_descs[i].size;
+        }
         uint8_t *resp_buf = (uint8_t *)malloc(sizeof(resp) + (size_t)dl_total);
         if (resp_buf) {
             memcpy(resp_buf, &resp, sizeof(resp));

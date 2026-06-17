@@ -1139,8 +1139,8 @@ def maybe_quantize_from_env(obj, default_budget_gb: "float | None" = None,
             # compact routes back to the footprint-greedy plan_fit path.
             pass  # fall through to BUDGET_GB logic below
         else:
-            t1_budget = 11.0
-            if torch.cuda.is_available():
+            t1_budget = _gb_init.auto_budget_gb() if _gb_init else 11.0
+            if t1_budget <= 0.0 and torch.cuda.is_available():
                 free_b, _ = torch.cuda.mem_get_info()
                 t1_budget = free_b / 2**30 * 0.92
             t2_budget = float(os.environ.get("GB_T2_BUDGET_GB", "8.0"))
@@ -1182,7 +1182,9 @@ def maybe_quantize_from_env(obj, default_budget_gb: "float | None" = None,
                   flush=True)
     if raw == "fit":
         budget = default_budget_gb
-        if budget is None and torch.cuda.is_available():
+        if budget is None:
+            budget = _gb_init.auto_budget_gb() if _gb_init else 0.0
+        if (budget is None or budget <= 0.0) and torch.cuda.is_available():
             free_b, _total_b = torch.cuda.mem_get_info()
             budget = free_b / 2**30 * 0.92
         if budget is None:

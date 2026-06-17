@@ -160,6 +160,16 @@ class GbPoolInfo:
     oom_active: bool     = False
     active_buffers: int  = 0
     phase_reset_seq: int = 0
+    # Extended fields — previously discarded from GB_IOCTL_GET_INFO
+    gaming_mode: bool    = False
+    kv_reserve_mb: int   = 0
+    kv_used_mb: int      = 0
+    kv_t2_mb: int        = 0   # KV bytes spilled to T2 DDR
+    safety_reserve_mb: int = 0
+    total_combined_mb: int = 0
+    total_ram_mb: int    = 0
+    free_ram_mb: int     = 0
+    nvme_t3_allocated_mb: int = 0
 
 
 @dataclass
@@ -225,6 +235,18 @@ class GpuMetrics:
     def ecc_critical(self) -> bool:
         """Double-bit ECC error detected — hardware-level memory corruption risk."""
         return self.ecc_dbe_volatile > 0
+
+    @property
+    def kv_pressure(self) -> float:
+        """KV cache pressure: used / reserve ratio (0..1+).  Signal source for Loop C."""
+        if not self.gb or self.gb.kv_reserve_mb <= 0:
+            return 0.0
+        return self.gb.kv_used_mb / self.gb.kv_reserve_mb
+
+    @property
+    def kv_spilled(self) -> bool:
+        """True when KV cache has overflowed T1 VRAM into T2 DDR.  Immediate Loop C trigger."""
+        return bool(self.gb and self.gb.kv_t2_mb > 0)
 
     def __repr__(self) -> str:
         ecc = f" ECC_DBE={self.ecc_dbe_volatile}!" if self.ecc_dbe_volatile else ""
@@ -625,17 +647,27 @@ class GreenBoostProvider(_Provider):
                 info = _GbInfo()
                 fcntl.ioctl(f.fileno(), _GB_IOCTL_GET_INFO_CMD, info)
                 m.gb = GbPoolInfo(
-                    t1_vram_mb      = info.vram_physical_mb,
-                    t2_allocated_mb = info.allocated_mb,
-                    t2_available_mb = info.available_mb,
-                    t2_max_mb       = info.max_pool_mb,
-                    t3_used_mb      = info.nvme_swap_used_mb,
-                    t3_free_mb      = info.nvme_swap_free_mb,
-                    t2_pressure     = info.t2_pressure,
-                    t3_pressure     = info.swap_pressure,
-                    oom_active      = bool(info.oom_active),
-                    active_buffers  = info.active_buffers,
-                    phase_reset_seq = info.phase_reset_seq,
+                    t1_vram_mb          = info.vram_physical_mb,
+                    t2_allocated_mb     = info.allocated_mb,
+                    t2_available_mb     = info.available_mb,
+                    t2_max_mb           = info.max_pool_mb,
+                    t3_used_mb          = info.nvme_swap_used_mb,
+                    t3_free_mb          = info.nvme_swap_free_mb,
+                    t2_pressure         = info.t2_pressure,
+                    t3_pressure         = info.swap_pressure,
+                    oom_active          = bool(info.oom_active),
+                    active_buffers      = info.active_buffers,
+                    phase_reset_seq     = info.phase_reset_seq,
+                    # Extended — previously discarded
+                    gaming_mode         = bool(info.gaming_mode),
+                    kv_reserve_mb       = info.kv_reserve_mb,
+                    kv_used_mb          = info.kv_used_mb,
+                    kv_t2_mb            = info.kv_t2_mb,
+                    safety_reserve_mb   = info.safety_reserve_mb,
+                    total_combined_mb   = info.total_combined_mb,
+                    total_ram_mb        = info.total_ram_mb,
+                    free_ram_mb         = info.free_ram_mb,
+                    nvme_t3_allocated_mb= info.nvme_t3_allocated_mb,
                 )
         except Exception:
             pass

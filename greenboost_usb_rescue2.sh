@@ -263,9 +263,10 @@ run_cleanup() {
 set -euo pipefail
 
 echo "  [1/10] Disabling GreenBoost services..."
-for svc in greenboost-recovery greenboost-sentinel greenboost-vram-watchdog \
-           greenboost-boot-cleanup cpu-perf greenboost-turboquant \
-           greenboost-idle-reclaim greenboost-netd greenboost-shader-boost; do
+for svc in greenboost-supervisor greenboost-recovery greenboost-sentinel \
+           greenboost-vram-watchdog greenboost-boot-cleanup cpu-perf \
+           greenboost-turboquant greenboost-idle-reclaim greenboost-netd \
+           greenboost-shader-boost; do
     systemctl disable "${svc}.service" 2>/dev/null || true
 done
 rm -f /etc/systemd/system/greenboost*.service

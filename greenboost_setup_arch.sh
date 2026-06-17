@@ -862,10 +862,14 @@ DROPIN
     gb_ok "Ollama drop-in written: $dropin_dir/99-greenboost.conf"
     gb_ok "Ollama context cap set to ${GB_OLLAMA_CTX} tokens (T1: ${GB_PHYS} GB, T2: ${GB_VIRT} GB)"
 
-    # ld.so.preload - LD_AUDIT gatekeeper
-    if ! grep -qF "libgreenboost_audit.so" /etc/ld.so.preload 2>/dev/null; then
-        echo "/usr/local/lib/libgreenboost_audit.so" >> /etc/ld.so.preload
-        gb_ok "LD_AUDIT entry added to /etc/ld.so.preload"
+    # GreenBoost no longer writes to /etc/ld.so.preload — doing so loads the
+    # CUDA/audit interposers into every process including systemd PID 1 and
+    # freezes boot ("Failed to load libmount.so").  Injection is per-process
+    # via the systemd drop-in written above and the greenboost-run* wrappers.
+    # Scrub any stale entry left by an older install.
+    if [[ -f /etc/ld.so.preload ]]; then
+        sed -i '/libgreenboost/d;/greenboost/d' /etc/ld.so.preload
+        [[ -s /etc/ld.so.preload ]] || rm -f /etc/ld.so.preload
     fi
 
     # udev rules

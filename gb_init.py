@@ -54,6 +54,7 @@ cluster_tel     = None   # ClusterTelemetryManager (multi-GPU, or None)
 gs              = None   # gb_stream_sched module
 _tier_manager   = None
 _mem_pools      = None
+_orchestrator   = None   # ReactiveOrchestrator (process mode)
 
 _initialized    = False
 _torch_patched  = False
@@ -61,7 +62,7 @@ _torch_patched  = False
 
 def _bootstrap():
     """Run once on first import when GREENBOOST_ACTIVE=1."""
-    global telemetry, cluster_tel, gs, _tier_manager, _mem_pools
+    global telemetry, cluster_tel, gs, _tier_manager, _mem_pools, _orchestrator
     global _initialized, _torch_patched
 
     if _initialized:
@@ -78,11 +79,15 @@ def _bootstrap():
         )
 
     # 2. Patch torch.cuda.empty_cache → no-op.
-    # Under GreenBoost DynamicVRAM, calling empty_cache raises
-    # "CUDA error: invalid argument" because the allocator is controlled by
-    # the kernel module, not by the PyTorch caching allocator.  We replace it
-    # globally so every call site (gemlite, hqq, diffusers callbacks, user
-    # scripts) is covered without per-callsite changes.
+    # Primary fix: PR-FREE-1 in greenboost_cuda_shim.c tolerates
+    # cudaErrorInvalidValue (=1) in cudaFree fallthrough paths (CUDA context
+    # teardown race during DEEP_IDLE reclaim), so the error no longer surfaces
+    # to Python callers in most cases.
+    # Defense-in-depth: keep the no-op for call sites that still reach
+    # empty_cache from gemlite, hqq, diffusers callbacks, or user scripts
+    # that expect it to be a reliable flushing mechanism.  Removing this
+    # patch would restore the original behavior if the shim fix proves
+    # sufficient in practice — test before removing.
     try:
         import torch
         if not _torch_patched:
@@ -161,6 +166,17 @@ def _bootstrap():
     # 8. Clean atexit shutdown.
     atexit.register(_shutdown)
 
+    # 9. Reactive orchestrator (process mode — only writes control-file hints;
+    #    kernel/sysfs levers belong to gb_supervisor in supervisor mode).
+    #    Feeds on the same telemetry add_callback bus used by _ecc_guard above.
+    try:
+        from gb_orchestrator import ReactiveOrchestrator
+        _orchestrator = ReactiveOrchestrator(mode="process")
+        if telemetry is not None:
+            telemetry.add_callback(_orchestrator.on_metrics)
+    except Exception as exc:
+        print(f"[gb_init] orchestrator unavailable: {exc}", file=sys.stderr)
+
     print("[gb_init] GreenBoost Python layers active", flush=True)
 
 
@@ -168,6 +184,8 @@ def _shutdown():
     """Stop background threads on process exit."""
     global telemetry, cluster_tel
     try:
+        if _orchestrator is not None:
+            _orchestrator.stop()
         if telemetry is not None:
             telemetry.stop()
         if cluster_tel is not None:
@@ -201,6 +219,89 @@ def get_tier_manager():
 def get_mem_pools():
     """Return the MemPoolManager singleton, or None if unavailable."""
     return _mem_pools
+
+
+def get_orchestrator():
+    """Return the ReactiveOrchestrator singleton (process mode), or None."""
+    return _orchestrator
+
+
+def auto_budget_gb(headroom: float = 0.92) -> float:
+    """
+    Unified free-VRAM budget estimate in GB.
+
+    Telemetry first: fb_free_mb reflects GreenBoost virtual memory (T1+T2+T3)
+    so it correctly accounts for the expanded address space.
+    Torch fallback: raw cuMemGetInfo — real VRAM only, misses T2/T3 overflow.
+
+    Downstream callers (gb_quant, gb_llm) should call this instead of querying
+    torch.cuda.mem_get_info() directly so all budget decisions use the same view.
+    """
+    m = snapshot()
+    if m is not None and m.fb_free_mb > 0:
+        return m.fb_free_mb / 1024.0 * headroom
+    try:
+        import torch
+        free_b, _ = torch.cuda.mem_get_info()
+        return free_b / (1 << 30) * headroom
+    except Exception:
+        return 0.0
+
+
+def debug_dump() -> dict:
+    """
+    Full state snapshot for LLM diagnostics and `vitals --json`.
+    Merges telemetry snapshot, enriched pool info, shim_stats file,
+    and orchestrator decisions (per-signal raw/value/state/last_decision).
+    """
+    from pathlib import Path
+    result: dict = {
+        "active":      ACTIVE,
+        "initialized": _initialized,
+        "auto_budget_gb": auto_budget_gb(),
+    }
+    m = snapshot()
+    if m is not None:
+        result["metrics"] = {
+            "fb_used_mb":       m.fb_used_mb,
+            "fb_free_mb":       m.fb_free_mb,
+            "fb_total_mb":      m.fb_total_mb,
+            "fb_used_pct":      round(m.fb_used_pct, 1),
+            "temp_c":           round(m.temp_c, 1),
+            "power_w":          round(m.power_w, 1),
+            "gpu_util_pct":     round(m.gpu_util_pct, 1),
+            "ecc_dbe_volatile": m.ecc_dbe_volatile,
+            "kv_pressure":      round(m.kv_pressure, 3),
+            "kv_spilled":       m.kv_spilled,
+            "health_ok":        m.health_ok,
+        }
+        if m.gb is not None:
+            result["pool"] = {
+                "t1_vram_mb":        m.gb.t1_vram_mb,
+                "t2_allocated_mb":   m.gb.t2_allocated_mb,
+                "t2_available_mb":   m.gb.t2_available_mb,
+                "kv_reserve_mb":     m.gb.kv_reserve_mb,
+                "kv_used_mb":        m.gb.kv_used_mb,
+                "kv_t2_mb":          m.gb.kv_t2_mb,
+                "safety_reserve_mb": m.gb.safety_reserve_mb,
+                "gaming_mode":       m.gb.gaming_mode,
+                "t2_pressure":       m.gb.t2_pressure,
+                "t3_pressure":       m.gb.t3_pressure,
+                "oom_active":        m.gb.oom_active,
+                "phase_reset_seq":   m.gb.phase_reset_seq,
+            }
+    try:
+        stats_path = Path("/run/greenboost/shim_stats")
+        if stats_path.exists():
+            result["shim_stats"] = dict(
+                line.split("=", 1) for line in stats_path.read_text().splitlines()
+                if "=" in line
+            )
+    except Exception:
+        pass
+    if _orchestrator is not None:
+        result["orchestrator"] = _orchestrator.dump()
+    return result
 
 
 def snapshot():
