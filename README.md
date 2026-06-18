@@ -29,7 +29,7 @@ wouldn't exist without them.
 > Your GPU runs out of VRAM, your model crashes, you buy a bigger GPU.
 > GreenBoost is the third option.
 
-In plain English: GreenBoost tricks CUDA into thinking your **GPU VRAM +
+GreenBoost tricks CUDA into thinking your **GPU VRAM +
 System RAM + NVMe** are all one giant pool of GPU memory. Your model loads,
 inference runs on the GPU at full speed, and the parts that don't fit in
 VRAM live in your system RAM - fetched on demand over PCIe.
