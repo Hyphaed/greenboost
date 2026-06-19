@@ -47,6 +47,8 @@ For multi-GPU deployments, `ClusterTelemetryManager` creates one telemetry insta
 
 ## 🗜️ Compression layer
 
+thanks to https://github.com/dropbox/gemlite , gran part of gb-quant is based on it (not everything)
+
 There is no single quantization method that is optimal for every model, every tensor shape, or every compression level. Greenboost combines three complementary technologies.
 
 **GemLite provides the execution engine.**
