@@ -199,6 +199,8 @@ than "GPU + CPU painfully sharing the work."
 
 ## gb-quant - quantize-to-fit (the fastest tier is the one you fit in)
 
+thanks to https://github.com/dropbox/gemlite
+
 Memory overflow gives you *capacity*, not *bandwidth*: a weight living in
 system RAM is read at PCIe speed, ~12× slower than VRAM. For models that
 are 1.5-3× your VRAM, GreenBoost's **gb-quant** layer is usually the better
@@ -241,6 +243,12 @@ let T2 DDR absorb only what genuinely exceeds the quantized footprint.
   PyTorch and vLLM compatibility fixes on modern systems.
 
 ---
+
+## Non direct contributors
+
+thanks to https://github.com/dropbox/gemlite , big part of gb-quant is based on it (not everything)
+
+
 
 ## License
 
