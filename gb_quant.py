@@ -151,6 +151,7 @@ _BYTES_PER_PARAM = {
     "fp8": 1.05,   # FP8 e4m3fn, channel-wise — same storage as INT8
     "e4m3": 1.05,  # alias
     8: 1.05,       # INT8
+    "nvfp4": 0.50, # Blackwell NVFP4: 4-bit weights + FP8 scale per group-16
     4: 0.55,
     "tq3": 0.40,
     "tq2": 0.27,
@@ -616,6 +617,10 @@ def plan_fit(obj, budget_gb: float,
     def _gb(n_params: int, bits: int) -> float:
         return n_params * _BYTES_PER_PARAM[bits] / 2**30
 
+    # Validate prefer_bits before using it in _gb (KeyError otherwise).
+    if prefer_bits not in _PRECISION_LADDER:
+        raise ValueError(f"prefer_bits={prefer_bits!r} not in "
+                         f"{_PRECISION_LADDER}")
     # Largest first: decide the big tensors' precision before the budget is
     # nibbled away by small ones (best GB-per-quality allocation).
     comps.sort(key=lambda t: t[1], reverse=True)
@@ -623,9 +628,6 @@ def plan_fit(obj, budget_gb: float,
     # the rest at the floor precision) — the headroom reserve for "the rest".
     floor_total = sum(_gb(n, 16 if keep else prefer_bits)
                       for _, n, keep in comps)
-    if prefer_bits not in _PRECISION_LADDER:
-        raise ValueError(f"prefer_bits={prefer_bits!r} not in "
-                         f"{_PRECISION_LADDER}")
     ladder = list(
         _PRECISION_LADDER[:_PRECISION_LADDER.index(prefer_bits) + 1])
     running = 0.0

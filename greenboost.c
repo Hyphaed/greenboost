@@ -23,6 +23,8 @@
 #include <linux/sysinfo.h>
 #include <linux/idr.h>
 #include <linux/swap.h>           /* legacy path - kept for symbols only  */
+#include <linux/debugfs.h>        /* residency export for `greenboost top`  */
+#include <linux/seq_file.h>
 #include <linux/falloc.h>         /* FALLOC_FL_PUNCH_HOLE              */
 #include <linux/cpumask.h>        /* cpumask_var_t, set_cpus_allowed  */
 #include <linux/topology.h>       /* num_online_cpus()                */
@@ -111,6 +113,20 @@ static int ecores_only       =  0;  /* Pin watchdog to E-cores (0=any CPU; auto-
 static int debug_mode        =  0;
 static int gaming_mode       =  0;  /* 1 when a game is active - deprioritises inference T2 */
 static int use_hugepages     =  1;  /* 2 MB compound pages (T2 only)    */
+
+/* Expert VMM pool registry — shim registers pools so vitals/Synapse can
+ * discover them cross-process.  Residency is NOT tracked here; read it
+ * directly from the shim via gb_expert_pool_residency() or /proc maps. */
+#define GB_VPAGE_REGISTRY_MAX 64
+struct gb_vpage_entry {
+	u64   va_base;
+	u64   stride_bytes;
+	u32   num_experts;
+	u32   pid;
+};
+static struct gb_vpage_entry gb_vpage_registry[GB_VPAGE_REGISTRY_MAX];
+static int                   gb_vpage_count;
+static DEFINE_SPINLOCK(gb_vpage_lock);
 
 /* KV cache T1 reservation - MB of VRAM kept free so KV cache is not
  * displaced into T2/T3 by weight allocation.  KV cache is read+written
@@ -252,6 +268,14 @@ struct gb_buf {
 	u8                session_priority; /* 1 = session-protected;
 					 * skipped by auto-evict until
 					 * all unprotected candidates gone */
+	u32               heat;         /* access-frequency score, pushed by the
+					 * shim via GB_IOCTL_SET_HEAT from
+					 * gb_ht_entry_t.access_count.  Halved on
+					 * every cold-sweep tick (ARC-style decay)
+					 * so eviction prefers recency+reuse over
+					 * pure LRU recency alone.  0 = never
+					 * re-touched since last decay - first
+					 * eviction candidates. */
 	pid_t             owner_pid;    /* PID that allocated this buffer */
 	/* T3 file-backing (v2.8) - pages written to t3_store, RAM freed */
 	u64               t3_file_offset; /* byte offset in t3 backing file */
@@ -325,6 +349,8 @@ struct gb_device {
 	atomic_t            shutting_down; /* 1 when exit/reboot started - evict work aborts early */
 	/* Async T3 eviction workqueue - prevents ioctl threads from blocking on NVMe I/O */
 	struct workqueue_struct *evict_wq;
+
+	struct dentry       *debugfs_dir;  /* /sys/kernel/debug/greenboost - residency */
 };
 
 static struct gb_device gb_dev;
@@ -1127,26 +1153,37 @@ static u64 gb_try_evict_for_alloc(u64 need_bytes)
 	 * kmalloc-failure rollback below).  get_dma_buf is just file_ref_inc
 	 * and is safe under the spinlock. */
 	spin_lock(&gb_dev.lru_lock);
-	list_for_each_entry_safe_reverse(buf, tmp, &gb_dev.lru_list, lru_node) {
-		if (freed >= need_bytes)
-			break;
-		if (buf->alloc_flags & GB_ALLOC_KV_CACHE)
-			continue;
-		if (buf->frozen || buf->t1_priority)
-			continue;
-		if (buf->session_priority >= 1)
-			continue;
-		if (buf->tier != GB_TIER2_SDDR || buf->hugepages)
-			continue;
+	{
+		/* Heat-threshold sweep (ARC-style) - see gb_auto_evict_cold for
+		 * the rationale; same tiers, same skip-rule semantics. */
+		static const u32 heat_thresholds[] = { 0, 2, U32_MAX };
+		int ti;
 
-		get_dma_buf(buf->dmabuf);
-		atomic64_sub(buf->size, &gb_dev.pool_allocated);
-		atomic64_add(buf->size, &gb_dev.nvme_allocated);
-		buf->tier = GB_TIER3_NVME;
-		list_del_init(&buf->lru_node);
-		list_add_tail(&buf->lru_node, &evict_list);
-		freed += buf->size;
-		staged++;
+		for (ti = 0; ti < ARRAY_SIZE(heat_thresholds) && freed < need_bytes; ti++) {
+			list_for_each_entry_safe_reverse(buf, tmp, &gb_dev.lru_list, lru_node) {
+				if (freed >= need_bytes)
+					break;
+				if (buf->heat > heat_thresholds[ti])
+					continue;
+				if (buf->alloc_flags & GB_ALLOC_KV_CACHE)
+					continue;
+				if (buf->frozen || buf->t1_priority)
+					continue;
+				if (buf->session_priority >= 1)
+					continue;
+				if (buf->tier != GB_TIER2_SDDR || buf->hugepages)
+					continue;
+
+				get_dma_buf(buf->dmabuf);
+				atomic64_sub(buf->size, &gb_dev.pool_allocated);
+				atomic64_add(buf->size, &gb_dev.nvme_allocated);
+				buf->tier = GB_TIER3_NVME;
+				list_del_init(&buf->lru_node);
+				list_add_tail(&buf->lru_node, &evict_list);
+				freed += buf->size;
+				staged++;
+			}
+		}
 	}
 
 	/* Second pass: if still not enough, consider session-protected buffers */
@@ -1453,6 +1490,51 @@ static int gb_dmabuf_idr_and_install_fd(struct gb_buf *buf, struct dma_buf *dmab
 	}
 	return fd;
 }
+
+/* ------------------------------------------------------------------ */
+/*  debugfs residency export - drives `greenboost top` / `residency`     */
+/*                                                                      */
+/*  Read-only dump of every live gb_buf: id, tier, size, heat (ARC-style */
+/*  access-frequency score from GB_IOCTL_SET_HEAT), alloc_flags, owner   */
+/*  PID.  One line per buffer, stable key=value pairs so the shell      */
+/*  command (`greenboost_setup.sh`) can parse without awk gymnastics.   */
+/* ------------------------------------------------------------------ */
+
+static int gb_residency_show(struct seq_file *m, void *v)
+{
+	struct gb_buf *buf;
+	int id;
+
+	mutex_lock(&gb_dev.lock);
+	idr_for_each_entry(&gb_dev.idr, buf, id) {
+		seq_printf(m,
+			   "id=%d tier=%s size_mb=%llu heat=%u flags=0x%x pid=%d frozen=%u t1_priority=%u session_priority=%u\n",
+			   buf->id,
+			   buf->tier == GB_TIER3_NVME ? "T3" : "T2",
+			   (u64)buf->size >> 20,
+			   buf->heat,
+			   buf->alloc_flags,
+			   buf->owner_pid,
+			   buf->frozen,
+			   buf->t1_priority,
+			   buf->session_priority);
+	}
+	mutex_unlock(&gb_dev.lock);
+	return 0;
+}
+
+static int gb_residency_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, gb_residency_show, NULL);
+}
+
+static const struct file_operations gb_residency_fops = {
+	.owner   = THIS_MODULE,
+	.open    = gb_residency_open,
+	.read    = seq_read,
+	.llseek  = seq_lseek,
+	.release = single_release,
+};
 
 /* ------------------------------------------------------------------ */
 /*  IOCTL                                                               */
@@ -2195,6 +2277,97 @@ static long gb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return 0;
 	}
 
+	case GB_IOCTL_VPAGE_REGISTER: {
+		struct gb_vpage_register_req req;
+		int i;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+			return -EFAULT;
+
+		spin_lock(&gb_vpage_lock);
+		/* Update existing entry for the same va_base (re-register). */
+		for (i = 0; i < gb_vpage_count; i++) {
+			if (gb_vpage_registry[i].va_base == req.va_base &&
+			    gb_vpage_registry[i].pid == (u32)current->pid) {
+				gb_vpage_registry[i].stride_bytes = req.stride_bytes;
+				gb_vpage_registry[i].num_experts  = req.num_experts;
+				spin_unlock(&gb_vpage_lock);
+				return 0;
+			}
+		}
+		/* Evict oldest entry when full. */
+		if (gb_vpage_count >= GB_VPAGE_REGISTRY_MAX) {
+			memmove(&gb_vpage_registry[0], &gb_vpage_registry[1],
+				sizeof(gb_vpage_registry[0]) * (GB_VPAGE_REGISTRY_MAX - 1));
+			gb_vpage_count = GB_VPAGE_REGISTRY_MAX - 1;
+		}
+		gb_vpage_registry[gb_vpage_count].va_base      = req.va_base;
+		gb_vpage_registry[gb_vpage_count].stride_bytes = req.stride_bytes;
+		gb_vpage_registry[gb_vpage_count].num_experts  = req.num_experts;
+		gb_vpage_registry[gb_vpage_count].pid          = (u32)current->pid;
+		gb_vpage_count++;
+		spin_unlock(&gb_vpage_lock);
+		return 0;
+	}
+
+	case GB_IOCTL_VPAGE_QUERY: {
+		struct gb_vpage_query_req req;
+		int i, found = 0;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+			return -EFAULT;
+
+		spin_lock(&gb_vpage_lock);
+		for (i = 0; i < gb_vpage_count; i++) {
+			if (gb_vpage_registry[i].va_base == req.va_base) {
+				req.out_stride_bytes = gb_vpage_registry[i].stride_bytes;
+				req.out_num_experts  = gb_vpage_registry[i].num_experts;
+				req.out_pid          = gb_vpage_registry[i].pid;
+				found = 1;
+				break;
+			}
+		}
+		spin_unlock(&gb_vpage_lock);
+
+		if (!found)
+			return -ENOENT;
+		if (copy_to_user((void __user *)arg, &req, sizeof(req)))
+			return -EFAULT;
+		return 0;
+	}
+
+	case GB_IOCTL_SET_HEAT: {
+		struct gb_heat_req req;
+		struct gb_buf *buf;
+		u32 i;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+			return -EFAULT;
+		if (req.count > GB_HEAT_BATCH_MAX)
+			return -EINVAL;
+
+		/* Same ownership rule as GB_IOCTL_MADVISE/EVICT: only the
+		 * allocating process (or CAP_SYS_ADMIN) may steer eviction
+		 * priority for a buffer it does not own. */
+		mutex_lock(&gb_dev.lock);
+		spin_lock(&gb_dev.lru_lock);
+		for (i = 0; i < req.count; i++) {
+			buf = idr_find(&gb_dev.idr, req.ent[i].buf_id);
+			if (!buf)
+				continue;
+			if (buf->owner_pid != task_pid_vnr(current) &&
+			    !capable(CAP_SYS_ADMIN))
+				continue;
+			/* Additive: the shim's access_count only grows between
+			 * pushes, so OR-ing in the new sample never loses heat
+			 * to a stale/out-of-order batch entry. */
+			buf->heat |= req.ent[i].heat;
+		}
+		spin_unlock(&gb_dev.lru_lock);
+		mutex_unlock(&gb_dev.lock);
+		return 0;
+	}
+
 	default:
 		return -ENOTTY;
 	}
@@ -2725,34 +2898,51 @@ static int gb_auto_evict_cold(u64 target_free_bytes)
 	 * against Phase 2's read of buf->pages / buf->size / buf->t3_file_offset.
 	 * The matching dma_buf_put() runs at every Phase 2 exit. */
 	spin_lock(&gb_dev.lru_lock);
-	list_for_each_entry_safe_reverse(buf, tmp, &gb_dev.lru_list, lru_node) {
-		if (freed >= target_free_bytes)
-			break;
+	{
+		/* Heat-threshold sweep (ARC-style): prefer the coldest eligible
+		 * candidates first instead of pure LRU recency.  buf->heat is
+		 * pushed by the shim via GB_IOCTL_SET_HEAT from its per-buffer
+		 * access_count and decays on every watchdog tick.  Walking the
+		 * same threshold tiers across the whole LRU list (rather than
+		 * sorting under the spinlock) keeps this O(n) per tier and
+		 * preserves all existing skip-rule semantics - it only
+		 * re-orders which already-eligible buffers get picked first. */
+		static const u32 heat_thresholds[] = { 0, 2, U32_MAX };
+		int ti;
 
-		/* Never touch KV cache - stays in T2 to preserve tok/s */
-		if (buf->alloc_flags & GB_ALLOC_KV_CACHE)
-			continue;
-		/* Never touch frozen or T1-priority buffers */
-		if (buf->frozen || buf->t1_priority)
-			continue;
-		/* Skip session-protected buffers on first pass (evict unprotected first) */
-		if (buf->session_priority >= 1)
-			continue;
-		/* Only evict T2 4K-page buffers (hugepages are pinned) */
-		if (buf->tier != GB_TIER2_SDDR || buf->hugepages)
-			continue;
+		for (ti = 0; ti < ARRAY_SIZE(heat_thresholds) && freed < target_free_bytes; ti++) {
+			list_for_each_entry_safe_reverse(buf, tmp, &gb_dev.lru_list, lru_node) {
+				if (freed >= target_free_bytes)
+					break;
+				if (buf->heat > heat_thresholds[ti])
+					continue;
 
-		get_dma_buf(buf->dmabuf);
-		/* Move accounting T2 → T3 */
-		atomic64_sub(buf->size, &gb_dev.pool_allocated);
-		atomic64_add(buf->size, &gb_dev.nvme_allocated);
-		buf->tier = GB_TIER3_NVME;
-		list_del_init(&buf->lru_node);
-		/* Stage on local list for Phase 2 (lru_node is free now) */
-		list_add_tail(&buf->lru_node, &evict_list);
+				/* Never touch KV cache - stays in T2 to preserve tok/s */
+				if (buf->alloc_flags & GB_ALLOC_KV_CACHE)
+					continue;
+				/* Never touch frozen or T1-priority buffers */
+				if (buf->frozen || buf->t1_priority)
+					continue;
+				/* Skip session-protected buffers on first pass (evict unprotected first) */
+				if (buf->session_priority >= 1)
+					continue;
+				/* Only evict T2 4K-page buffers (hugepages are pinned) */
+				if (buf->tier != GB_TIER2_SDDR || buf->hugepages)
+					continue;
 
-		freed += buf->size;
-		staged++;
+				get_dma_buf(buf->dmabuf);
+				/* Move accounting T2 → T3 */
+				atomic64_sub(buf->size, &gb_dev.pool_allocated);
+				atomic64_add(buf->size, &gb_dev.nvme_allocated);
+				buf->tier = GB_TIER3_NVME;
+				list_del_init(&buf->lru_node);
+				/* Stage on local list for Phase 2 (lru_node is free now) */
+				list_add_tail(&buf->lru_node, &evict_list);
+
+				freed += buf->size;
+				staged++;
+			}
+		}
 	}
 	/* Second pass: if target not yet met, allow session-protected buffers */
 	if (freed < target_free_bytes) {
@@ -2952,6 +3142,22 @@ static int gb_watchdog(void *unused)
 			watchdog_cycle = 0;
 			if (atomic_read(&gb_dev.active_bufs) > 0)
 				gb_reap_dead_pids();
+		}
+
+		/* ── Heat decay (ARC-style aging) ───────────────────── */
+		/* Every 2s (4 watchdog ticks): halve buf->heat for all T2 buffers
+		 * so stale frequency from a previous hot phase ages out and the
+		 * eviction sweep in gb_try_evict_for_alloc/gb_auto_evict_cold
+		 * keeps tracking *current* access patterns, not lifetime totals.
+		 * 4 ticks (not every tick) gives the shim's GB_IOCTL_SET_HEAT
+		 * pusher (prefetch_worker loop) room to land between decays. */
+		if ((watchdog_cycle & 0x3) == 0) {
+			struct gb_buf *hb;
+
+			spin_lock(&gb_dev.lru_lock);
+			list_for_each_entry(hb, &gb_dev.lru_list, lru_node)
+				hb->heat >>= 1;
+			spin_unlock(&gb_dev.lru_lock);
 		}
 
 		/* ── Tier 2: RAM safety reserve ─────────────────────── */
@@ -3432,6 +3638,19 @@ static int __init gb_init(void)
 	atomic_notifier_chain_register(&panic_notifier_list, &gb_panic_nb);
 	pr_info(DRIVER_NAME ": reboot + panic notifiers registered\n");
 
+	/* debugfs residency export - best-effort, never fails module load.
+	 * debugfs may be disabled (CONFIG_DEBUG_FS=n) or unmounted in some
+	 * containers; `greenboost top`/`residency` just fall back to
+	 * shim_stats-only reporting when this dentry is absent. */
+	gb_dev.debugfs_dir = debugfs_create_dir(DRIVER_NAME, NULL);
+	if (IS_ERR_OR_NULL(gb_dev.debugfs_dir)) {
+		pr_info(DRIVER_NAME ": debugfs unavailable - residency export skipped\n");
+		gb_dev.debugfs_dir = NULL;
+	} else {
+		debugfs_create_file("residency", 0444, gb_dev.debugfs_dir,
+				     NULL, &gb_residency_fops);
+	}
+
 	pr_info(DRIVER_NAME ": ready - /dev/%s\n", DEVICE_NAME);
 	pr_info(DRIVER_NAME ": pool info: cat /sys/class/%s/%s/status\n",
 		CLASS_NAME, DEVICE_NAME);
@@ -3455,6 +3674,8 @@ err_chrdev:
 static void __exit gb_exit(void)
 {
 	pr_info(DRIVER_NAME ": unloading GreenBoost\n");
+
+	debugfs_remove_recursive(gb_dev.debugfs_dir);
 
 	/* Signal all async eviction work to abort NVMe I/O immediately so
 	 * flush_workqueue returns quickly and we do not hang in Unloading state. */

@@ -297,9 +297,9 @@ static void netd_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)))
  * Returns 0 on success, -1 if key file absent or malformed.
  *
  * PR-G hardening:
- *   - Reject world-readable / group-readable keyfile (mode bits other than 600
- *     or 400 are refused with an explicit warning).  Prevents accidental
- *     leakage of the cluster master secret to other local users.
+ *   - Accept mode 0600/0400 (root-only) or 0640 root:greenboost (group read).
+ *     Group read allows non-root cluster members (greenboost group) to read the
+ *     key; group write/exec and any world access are still rejected.
  *   - Validate exactly 64 hex chars (32 bytes).  The previous loop would happily
  *     accept a partial keyfile and silently read leading-zero garbage from the
  *     zero-initialised hex[] buffer, yielding a low-entropy PSK that both
@@ -315,9 +315,9 @@ static int gb_load_psk(uint8_t key[32])
         netd_log("AUTH: %s is not a regular file - refusing to load PSK", path);
         return -1;
     }
-    if (st.st_mode & (S_IRWXG | S_IRWXO)) {
-        netd_log("AUTH: %s has insecure mode 0%o (group/world bits set) - "
-                 "refusing to load PSK; chmod 0600 the key file", path, st.st_mode & 07777);
+    if (gb_check_keyfile_mode(&st, path) != 0) {
+        netd_log("AUTH: %s has insecure mode 0%o - must be 0600 (root-only) "
+                 "or 0640 root:%s", path, st.st_mode & 07777, GB_KEYFILE_GRP);
         return -1;
     }
     FILE *f = fopen(path, "r");
@@ -3203,7 +3203,7 @@ static int dispatch_message(struct client *cli, const struct gb_net_header *hdr,
 /*  Client recv + framing                                              */
 /* ------------------------------------------------------------------ */
 
-static void client_init(struct client *cli, int fd, const char *addr)
+static void client_init(struct client *cli, int fd, const char *addr, uint64_t now_ms)
 {
     memset(cli, 0, sizeof(*cli));
     cli->fd       = fd;
@@ -3211,9 +3211,22 @@ static void client_init(struct client *cli, int fd, const char *addr)
     cli->recv_buf = (uint8_t *)malloc(RECV_BUF_SIZE);
     cli->recv_len = 0;
     cli->recv_cap = RECV_BUF_SIZE;
-    cli->last_heartbeat_ms = mono_ms();
+    /* Bug fix: must use the epoll loop's already-captured `now_ms`, not a
+     * fresh mono_ms() call. The accept-handling block does blocking PSK
+     * auth I/O (server sends a nonce, waits up to 2s for the client's MAC)
+     * before reaching here, so a fresh mono_ms() here is always >= the
+     * loop's now_ms by however long that auth round-trip took. The
+     * heartbeat-timeout sweep at the bottom of this same iteration then
+     * computes `now_ms - last_heartbeat_ms` as unsigned - last_heartbeat_ms
+     * being greater than now_ms underflows to near UINT64_MAX, instantly
+     * exceeding GB_NET_HEARTBEAT_TIMEOUT_MS and disconnecting every fresh
+     * connection before it can complete its handshake. Confirmed via
+     * /var/log/greenboost/netd.log: every real connection attempt showed
+     * "AUTH: PSK verified" + "Connection from ..." + "heartbeat timeout -
+     * disconnecting" all logged within the same second. */
+    cli->last_heartbeat_ms = now_ms;
     cli->alloc_tokens  = 200;        /* N9: start with full bucket */
-    cli->last_refill_ms = mono_ms();
+    cli->last_refill_ms = now_ms;
     pthread_mutex_init(&cli->send_lock, NULL);  /* PR-QQ */
     strncpy(cli->remote_addr, addr, sizeof(cli->remote_addr) - 1);
 }
@@ -3886,7 +3899,7 @@ static int run_server(void)
                 }
                 set_nonblock(cfd);
 
-                client_init(&g_clients[slot], cfd, addr_str);
+                client_init(&g_clients[slot], cfd, addr_str, now_ms);
                 /* PR-FF: install v4 session key into the client struct.
                  * client_init zero-initialised both fields; copy the key
                  * IFF v4 auth succeeded.  After this point the auth_*

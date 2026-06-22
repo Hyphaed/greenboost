@@ -17,6 +17,10 @@ Provider stack (in priority order):
                        cluster-aware: one provider watches ALL GPUs in a group
   GreenBoostProvider — GB_IOCTL_GET_INFO; T2/T3 pool stats, pressure levels,
                        phase sequence, buffer counts — nothing NVML/DCGM exposes
+  EbpfProvider       — /run/greenboost/ebpf_stats; T2↔T3 migration rates,
+                       cold-evict/alloc/pin rates, UVM fault rates from the
+                       greenboost-ebpf-trace daemon (ebpf/gb_trace.c).
+                       Zero-cost when tracer absent (fields stay 0.0)
   TorchFallbackProvider — torch.cuda.memory_allocated(); last resort
   NVTXAnnotator      — pushes "gb:telemetry" ranges into the NVTX event log
                        (~/Dev/nvidia_dcgm/NVTX/python/src/) for Nsight capture
@@ -72,11 +76,13 @@ import contextlib
 import ctypes
 import fcntl
 import os
+import re
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 
 # ── NVTX integration ──────────────────────────────────────────────────────────
@@ -172,6 +178,265 @@ class GbPoolInfo:
     nvme_t3_allocated_mb: int = 0
 
 
+# PCIe encoding efficiency per generation (GB/s per lane, one direction).
+_PCIE_BW_GBPS_PER_LANE: Dict[int, float] = {3: 1.0, 4: 2.0, 5: 4.0, 6: 8.0}
+
+# Maximum NVLink ports to probe (NVML_NVLINK_MAX_LINKS = 18 as of vR595).
+_NVLINK_MAX_LINKS = 18
+
+
+@dataclass(frozen=True)
+class GpuTopology:
+    """
+    Static hardware topology for one GPU — probed once at NVML init.
+
+    Fields survive for the lifetime of the process; never re-probed unless
+    the TelemetryManager is torn down and rebuilt.  Attached to every
+    GpuMetrics snapshot so orchestrators can make bandwidth-aware decisions
+    without repeating sysfs/NVML calls on the hot path.
+    """
+    device: int               = 0
+
+    # PCIe BDF ("0000:01:00.0") — used to look up sysfs NUMA node.
+    bdf: str                  = ""
+
+    # NUMA node that the GPU PCIe root port hangs off (-1 = unknown/UMA).
+    numa_node: int            = -1
+
+    # CUDA compute capability (major, minor).
+    compute_capability: Tuple[int, int] = (0, 0)
+
+    # Negotiated PCIe link (what the slot actually runs at).
+    pcie_gen_current: int     = 4
+    pcie_width_current: int   = 16
+
+    # Device-maximum PCIe link (what the GPU silicon supports).
+    pcie_gen_max: int         = 4
+    pcie_width_max: int       = 16
+
+    # Active NVLink connections.
+    nvlink_count: int         = 0
+    # Device indices of NVLink peers (GPU-to-GPU direct links only).
+    nvlink_peer_ids: Tuple[int, ...] = ()
+
+    # Device indices with P2P read access (NVML_P2P_CAPS_INDEX_READ).
+    p2p_device_ids: Tuple[int, ...] = ()
+
+    # ── derived properties ────────────────────────────────────────────────────
+
+    @property
+    def pcie_bw_mb_s(self) -> float:
+        """One-direction theoretical bandwidth (MB/s) at current link speed."""
+        return (
+            self.pcie_width_current
+            * _PCIE_BW_GBPS_PER_LANE.get(self.pcie_gen_current, 2.0)
+            * 1024.0
+        )
+
+    @property
+    def pcie_bw_max_mb_s(self) -> float:
+        """One-direction theoretical bandwidth at device-max link speed."""
+        return (
+            self.pcie_width_max
+            * _PCIE_BW_GBPS_PER_LANE.get(self.pcie_gen_max, 2.0)
+            * 1024.0
+        )
+
+    @property
+    def pcie_saturation_mb_s(self) -> float:
+        """75% of current one-direction peak — TX+RX combined threshold.
+
+        When pcie_tx_mb_s + pcie_rx_mb_s exceeds this the PCIe bus is the
+        dominant bottleneck for T2→T1 DMA prefetch (B2 gate).
+        """
+        return self.pcie_bw_mb_s * 0.75
+
+    @property
+    def pcie_degraded(self) -> bool:
+        """True when the slot is running below device maximum.
+
+        Common causes: x8 slot, PCIe gen mismatch, or bifurcation.
+        Logged as a one-time advisory; does not block inference.
+        """
+        return (
+            self.pcie_gen_current < self.pcie_gen_max
+            or self.pcie_width_current < self.pcie_width_max
+        )
+
+    @property
+    def has_nvlink(self) -> bool:
+        return self.nvlink_count > 0
+
+
+def _sysfs_bdf(bdf: str) -> str:
+    """Normalise NVML busId to the 4-digit-domain format sysfs uses.
+
+    NVML returns "00000000:01:00.0" (8-char domain); sysfs expects
+    "0000:01:00.0" (4-char domain) on most x86 systems.
+    """
+    bdf = bdf.strip().lower()
+    m = re.match(r'([0-9a-f]{8}):([0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f])', bdf)
+    if m:
+        # Strip leading 4 hex chars from the 8-char domain
+        return m.group(1)[4:] + ":" + m.group(2)
+    return bdf
+
+
+def _probe_gpu_topology(pynvml_mod: object, handle: object, device: int) -> Optional[GpuTopology]:
+    """Probe static GPU topology via NVML.  Called once at NVMLProvider init.
+
+    Every call is guarded individually so a missing capability (consumer GPU
+    has no NVLink, container has no sysfs) never prevents the rest from
+    populating.
+    """
+    nv = pynvml_mod
+
+    # ── BDF ──────────────────────────────────────────────────────────────────
+    bdf = ""
+    try:
+        pci = nv.nvmlDeviceGetPciInfo_v3(handle)
+        raw = pci.busId
+        bdf = raw.decode("ascii", errors="ignore").strip("\x00") if isinstance(raw, bytes) else str(raw)
+    except Exception:
+        try:
+            pci = nv.nvmlDeviceGetPciInfo(handle)
+            raw = pci.busId
+            bdf = raw.decode("ascii", errors="ignore").strip("\x00") if isinstance(raw, bytes) else str(raw)
+        except Exception:
+            pass
+
+    # ── NUMA node ─────────────────────────────────────────────────────────────
+    numa_node = -1
+    if bdf:
+        for candidate in (_sysfs_bdf(bdf), bdf.lower()):
+            p = Path(f"/sys/bus/pci/devices/{candidate}/numa_node")
+            try:
+                numa_node = int(p.read_text().strip())
+                break
+            except Exception:
+                pass
+
+    # ── Compute capability ────────────────────────────────────────────────────
+    cc: Tuple[int, int] = (0, 0)
+    try:
+        r = nv.nvmlDeviceGetCudaComputeCapability(handle)
+        cc = (int(r.major), int(r.minor))
+    except AttributeError:
+        try:
+            cc = tuple(nv.nvmlDeviceGetCudaComputeCapability(handle))[:2]  # type: ignore[assignment]
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # ── PCIe link ─────────────────────────────────────────────────────────────
+    gen_cur, gen_max, width_cur, width_max = 4, 4, 16, 16
+    try:
+        gen_cur = int(nv.nvmlDeviceGetCurrPcieLinkGeneration(handle))
+    except Exception:
+        pass
+    try:
+        gen_max = int(nv.nvmlDeviceGetMaxPcieLinkGeneration(handle))
+    except Exception:
+        gen_max = gen_cur
+    try:
+        width_cur = int(nv.nvmlDeviceGetCurrPcieLinkWidth(handle))
+    except Exception:
+        pass
+    try:
+        width_max = int(nv.nvmlDeviceGetMaxPcieLinkWidth(handle))
+    except Exception:
+        width_max = width_cur
+
+    # ── NVLink ───────────────────────────────────────────────────────────────
+    nvlink_count = 0
+    nvlink_peer_ids: List[int] = []
+    try:
+        enabled = getattr(nv, "NVML_FEATURE_ENABLED", 1)
+        gpu_type = getattr(nv, "NVML_NVLINK_DEVICE_TYPE_GPU", 0)
+        for link in range(_NVLINK_MAX_LINKS):
+            try:
+                state = nv.nvmlDeviceGetNvLinkState(handle, link)
+                if state != enabled:
+                    continue
+                nvlink_count += 1
+                try:
+                    rtype = nv.nvmlDeviceGetNvLinkRemoteDeviceType(handle, link)
+                    if rtype != gpu_type:
+                        continue
+                    try:
+                        rinfo = nv.nvmlDeviceGetNvLinkRemotePciInfo_v2(handle, link)
+                        peer_h = nv.nvmlDeviceGetHandleByPciBusId(rinfo.busId)
+                        peer_idx = int(nv.nvmlDeviceGetIndex(peer_h))
+                        if peer_idx not in nvlink_peer_ids:
+                            nvlink_peer_ids.append(peer_idx)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            except Exception:
+                break  # link index out of range — stop scanning
+    except Exception:
+        pass
+
+    # ── P2P access ───────────────────────────────────────────────────────────
+    p2p_device_ids: List[int] = []
+    try:
+        p2p_ok = getattr(nv, "NVML_P2P_STATUS_OK", 0)
+        read_idx = getattr(nv, "NVML_P2P_CAPS_INDEX_READ", 0)
+        n_devs = int(nv.nvmlDeviceGetCount())
+        for peer_idx in range(n_devs):
+            if peer_idx == device:
+                continue
+            try:
+                peer_h = nv.nvmlDeviceGetHandleByIndex(peer_idx)
+                status = nv.nvmlDeviceGetP2PStatus(handle, peer_h, read_idx)
+                if int(status) == p2p_ok:
+                    p2p_device_ids.append(peer_idx)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return GpuTopology(
+        device=device,
+        bdf=bdf,
+        numa_node=numa_node,
+        compute_capability=cc,
+        pcie_gen_current=gen_cur,
+        pcie_gen_max=gen_max,
+        pcie_width_current=width_cur,
+        pcie_width_max=width_max,
+        nvlink_count=nvlink_count,
+        nvlink_peer_ids=tuple(nvlink_peer_ids),
+        p2p_device_ids=tuple(p2p_device_ids),
+    )
+
+
+@dataclass
+class SystemMetrics:
+    """
+    Host-level OS pressure snapshot — SystemProvider only (no NVML/DCGM
+    equivalent).  These are the signals a continuous OS tuner needs that pure
+    GPU telemetry cannot see: CPU saturation, memory reclaim stalls, IO waits.
+    All fields read from /proc; PSI fields are 0.0 on kernels without
+    CONFIG_PSI (pre-4.20) or when /proc/pressure is absent (containers).
+    """
+    cpu_util_pct: float       = 0.0   # 1 - idle delta over the poll interval
+    loadavg_1: float          = 0.0
+    loadavg_5: float          = 0.0
+    loadavg_15: float         = 0.0
+    nr_running: int           = 0     # runnable tasks (from /proc/loadavg "r/n")
+    # PSI "some" = at least one task stalled; "full" = ALL tasks stalled.
+    # avg10 = 10s trailing average % of time stalled.
+    psi_cpu_some_avg10: float = 0.0
+    psi_mem_some_avg10: float = 0.0
+    psi_mem_full_avg10: float = 0.0
+    psi_io_some_avg10: float  = 0.0
+    mem_available_mb: int     = 0     # /proc/meminfo MemAvailable
+    swap_used_mb: int         = 0
+
+
 @dataclass
 class GpuMetrics:
     """
@@ -193,6 +458,7 @@ class GpuMetrics:
     # Thermal / power (DCGM FI 150/155/157)
     temp_c: float          = 0.0
     power_w: float         = 0.0
+    power_limit_w: float   = 0.0   # TDP / power management limit from NVML
     power_instant_w: float = 0.0
     # PCIe (DCGM FI 200/201), KB/s → MB/s
     pcie_tx_mb_s: float    = 0.0
@@ -208,6 +474,29 @@ class GpuMetrics:
     health_summary: str    = ""  # human-readable DCGM health status
     # GreenBoost T2/T3 pool (GreenBoostProvider — not in NVML/DCGM)
     gb: Optional[GbPoolInfo] = None
+    # Shim inference phase (from /run/greenboost/phase; empty when shim absent)
+    shim_phase: str          = ""
+
+    # Static hardware topology — probed once at NVMLProvider init, attached
+    # to every snapshot.  None in TorchFallback / container environments.
+    topology: Optional[GpuTopology] = None
+
+    # Host OS pressure (SystemProvider — CPU/mem/IO; not exposed by NVML/DCGM)
+    sys: Optional[SystemMetrics] = None
+
+    # eBPF tier-migration telemetry (EbpfProvider — /run/greenboost/ebpf_stats)
+    # All rates are per-second averages over a 5-second sliding window.
+    # Fields stay at 0.0 / 0 when the eBPF tracer is not running.
+    t3_evict_rate:    float = 0.0   # T2 → T3 evictions / s
+    t3_promote_rate:  float = 0.0   # T3 → T2 promotions / s
+    cold_evict_rate:  float = 0.0   # cold-sweep trigger events / s
+    t3_bytes_out_s:   float = 0.0   # bytes evicted to T3 per second
+    t3_bytes_in_s:    float = 0.0   # bytes promoted from T3 per second
+    alloc_rate:       float = 0.0   # T2 DDR page-pool alloc / s
+    pin_rate:         float = 0.0   # DMA-BUF / pinned alloc / s
+    uvm_fault_rate:   float = 0.0   # UVM GPU faults / s (0 when no managed memory)
+    uvm_pages_in:     int   = 0     # cumulative UVM pages migrated to GPU
+    uvm_pages_out:    int   = 0     # cumulative UVM pages migrated from GPU
 
     # ── decision helpers ──────────────────────────────────────────────────────
 
@@ -248,16 +537,94 @@ class GpuMetrics:
         """True when KV cache has overflowed T1 VRAM into T2 DDR.  Immediate Loop C trigger."""
         return bool(self.gb and self.gb.kv_t2_mb > 0)
 
+    @property
+    def power_near_limit(self) -> bool:
+        """True when GPU is drawing >93% of its TDP — power-limit throttle imminent.
+
+        Used as an additional Loop C gate: growing the KV reserve when near the
+        power limit increases memory bandwidth consumption, which raises power draw
+        further, which triggers clock throttling and hurts inference latency.
+        Returns False when power_limit_w is unknown (0) to avoid false gates.
+        """
+        return (
+            self.power_limit_w > 0
+            and self.power_w > 0
+            and (self.power_w / self.power_limit_w) > 0.93
+        )
+
+    @property
+    def pcie_saturated(self) -> bool:
+        """True when combined TX+RX throughput exceeds 75% of current link bandwidth.
+
+        Uses live GpuTopology (actual negotiated gen×width) rather than the
+        config-file profile, so slot degradation (x8 slot, gen mismatch) is
+        automatically accounted for.  Returns False when topology is unavailable
+        to avoid false blocking in container / TorchFallback environments.
+        """
+        if self.topology is None or self.topology.pcie_bw_mb_s <= 0:
+            return False
+        return (self.pcie_tx_mb_s + self.pcie_rx_mb_s) > self.topology.pcie_saturation_mb_s
+
+    @property
+    def numa_node(self) -> int:
+        """NUMA node the GPU is attached to (-1 = unknown/UMA).
+
+        Convenience accessor — delegates to topology so callers don't need
+        to guard `topology is not None`.
+        """
+        return self.topology.numa_node if self.topology else -1
+
+    @property
+    def cpu_saturated(self) -> bool:
+        """True when CPU PSI "some" pressure exceeds 20% over 10s.
+
+        Signals the host CPU is the bottleneck (scheduling delay), not the
+        GPU — Loop R uses this to assert governor=performance even when GPU
+        util alone wouldn't justify it (e.g. heavy tokenization/dispatch).
+        """
+        return bool(self.sys and self.sys.psi_cpu_some_avg10 > 20.0)
+
+    @property
+    def mem_pressure_high(self) -> bool:
+        """True when memory reclaim is stalling tasks (PSI mem "some" > 10%).
+
+        Distinct from gb.t2_pressure (GreenBoost's own T2 pool accounting) —
+        this reflects whole-system reclaim stalls, including non-GreenBoost
+        memory users.  Loop Q uses this to tighten vm.* tunables.
+        """
+        return bool(self.sys and self.sys.psi_mem_some_avg10 > 10.0)
+
+    @property
+    def io_pressure_high(self) -> bool:
+        """True when IO is stalling tasks (PSI io "some" > 20% over 10s).
+
+        Loop R uses this during T3 NVMe spill to justify reactive NVMe
+        read_ahead/nr_requests adjustment.
+        """
+        return bool(self.sys and self.sys.psi_io_some_avg10 > 20.0)
+
+    @property
+    def migration_active(self) -> bool:
+        """True when T3 tier-migration is occurring (evictions or promotions above noise).
+
+        Used by downstream consumers (e.g. Loop S prefetch throttle, vitals) to
+        detect active T2↔T3 I/O pressure.  Threshold of 0.1 events/s filters
+        out isolated single evictions that would otherwise trigger false positives.
+        Requires the eBPF tracer to be running; returns False when tracer absent.
+        """
+        return self.t3_evict_rate > 0.1 or self.t3_promote_rate > 0.1
+
     def __repr__(self) -> str:
         ecc = f" ECC_DBE={self.ecc_dbe_volatile}!" if self.ecc_dbe_volatile else ""
         health = "" if self.health_ok else f" HEALTH_FAIL={self.health_summary!r}"
+        mig = f" mig_evict={self.t3_evict_rate:.1f}/s" if self.t3_evict_rate > 0 else ""
         return (
             f"GpuMetrics(dev={self.device} "
             f"fb={self.fb_used_mb}/{self.fb_total_mb}MB {self.fb_used_pct:.0f}% "
             f"sm={self.sm_clock_mhz}MHz pwr={self.power_w:.0f}W "
             f"temp={self.temp_c:.0f}°C "
             f"t2_press={self.gb.t2_pressure if self.gb else '?'}"
-            f"{ecc}{health})"
+            f"{mig}{ecc}{health})"
         )
 
 
@@ -277,6 +644,23 @@ class _Provider:
         pass
 
 
+def _log_topology(t: GpuTopology) -> None:
+    """One-shot startup log — summarises the probed topology."""
+    degraded = " DEGRADED(slot)" if t.pcie_degraded else ""
+    nvlink = f" NVLink×{t.nvlink_count}(peers={list(t.nvlink_peer_ids)})" if t.has_nvlink else ""
+    p2p = f" P2P→{list(t.p2p_device_ids)}" if t.p2p_device_ids else ""
+    numa = f" NUMA={t.numa_node}" if t.numa_node >= 0 else ""
+    print(
+        f"[gb_telemetry] GPU{t.device} topology:"
+        f" PCIe gen{t.pcie_gen_current}x{t.pcie_width_current}"
+        f"(max gen{t.pcie_gen_max}x{t.pcie_width_max})"
+        f" {t.pcie_bw_mb_s/1024:.1f}GB/s{degraded}"
+        f" CC={t.compute_capability[0]}.{t.compute_capability[1]}"
+        f" BDF={t.bdf}{numa}{nvlink}{p2p}",
+        flush=True,
+    )
+
+
 class NVMLProvider(_Provider):
     """
     pynvml — VRAM, clocks, utilization, power, temperature, PCIe.
@@ -288,12 +672,16 @@ class NVMLProvider(_Provider):
         self._device = device
         self._handle = None
         self._ok = False
+        self._topology: Optional[GpuTopology] = None
         try:
             import pynvml
             self._pynvml = pynvml
             pynvml.nvmlInit()
             self._handle = pynvml.nvmlDeviceGetHandleByIndex(device)
             self._ok = True
+            self._topology = _probe_gpu_topology(pynvml, self._handle, device)
+            if self._topology:
+                _log_topology(self._topology)
         except Exception:
             pass
 
@@ -305,6 +693,8 @@ class NVMLProvider(_Provider):
             return
         pynvml = self._pynvml
         h = self._handle
+        if self._topology is not None:
+            m.topology = self._topology
         try:
             mem = pynvml.nvmlDeviceGetMemoryInfo(h)
             m.fb_total_mb = mem.total // (1024 * 1024)
@@ -329,6 +719,10 @@ class NVMLProvider(_Provider):
             pass
         try:
             m.power_w = pynvml.nvmlDeviceGetPowerUsage(h) / 1000.0
+        except Exception:
+            pass
+        try:
+            m.power_limit_w = pynvml.nvmlDeviceGetPowerManagementLimit(h) / 1000.0
         except Exception:
             pass
         try:
@@ -671,6 +1065,160 @@ class GreenBoostProvider(_Provider):
                 )
         except Exception:
             pass
+        # Read inference phase from /run/greenboost/phase (written by shim on
+        # every phase transition; absent when shim is not loaded → leave empty)
+        try:
+            phase_path = "/run/greenboost/phase"
+            if os.path.exists(phase_path):
+                for _line in open(phase_path):
+                    if _line.startswith("phase="):
+                        m.shim_phase = _line.split("=", 1)[1].strip()
+                        break
+        except Exception:
+            pass
+
+
+class EbpfProvider(_Provider):
+    """
+    eBPF tier-migration telemetry provider.
+
+    Reads /run/greenboost/ebpf_stats written every 500 ms by the
+    greenboost-ebpf-trace daemon (ebpf/gb_trace.c).  Fills the eBPF
+    migration fields of GpuMetrics (t3_evict_rate, t3_promote_rate, etc.).
+
+    When the tracer is not running all fields stay at their default 0.0 /
+    0 values — callers must not treat absence as an error.
+
+    Format of ebpf_stats: one "key=value\\n" pair per line.  Same
+    convention as /run/greenboost/shim_stats written by the CUDA shim.
+    """
+    name = "ebpf"
+    _STATS_PATH = "/run/greenboost/ebpf_stats"
+
+    def available(self) -> bool:
+        return os.path.exists(self._STATS_PATH)
+
+    def fill(self, m: GpuMetrics) -> None:
+        try:
+            kv: dict[str, str] = {}
+            with open(self._STATS_PATH) as _f:
+                for _line in _f:
+                    if "=" in _line:
+                        _k, _, _v = _line.strip().partition("=")
+                        kv[_k.strip()] = _v.strip()
+
+            def _f32(key: str) -> float:
+                try:
+                    return float(kv.get(key, "0"))
+                except ValueError:
+                    return 0.0
+
+            def _int(key: str) -> int:
+                try:
+                    return int(kv.get(key, "0"))
+                except ValueError:
+                    return 0
+
+            m.t3_evict_rate   = _f32("t3_evict_rate")
+            m.t3_promote_rate = _f32("t3_promote_rate")
+            m.cold_evict_rate = _f32("cold_evict_rate")
+            m.t3_bytes_out_s  = _f32("t3_bytes_out_s")
+            m.t3_bytes_in_s   = _f32("t3_bytes_in_s")
+            m.alloc_rate      = _f32("alloc_rate")
+            m.pin_rate        = _f32("pin_rate")
+            m.uvm_fault_rate  = _f32("uvm_fault_rate")
+            m.uvm_pages_in    = _int("uvm_pages_in")
+            m.uvm_pages_out   = _int("uvm_pages_out")
+        except Exception:
+            pass
+
+
+class SystemProvider(_Provider):
+    """
+    Host OS pressure provider — /proc only, no NVML/DCGM equivalent.
+
+    Fills GpuMetrics.sys with CPU/memory/IO pressure signals the continuous
+    OS tuner (gb_orchestrator Loops O-S) needs to decide when to flip
+    governor/clocks/vm.* tunables.  Stdlib-only, cheap (a few small file
+    reads per poll); never blocks the inference path.
+
+    PSI (/proc/pressure/*) requires CONFIG_PSI (kernel >= 4.20, most distros
+    since ~2019) and is absent in some containers — guarded individually so
+    a missing file never breaks the rest of the snapshot.
+    """
+    name = "system"
+
+    def __init__(self):
+        self._prev_idle: Optional[float] = None
+        self._prev_total: Optional[float] = None
+
+    def available(self) -> bool:
+        return os.path.exists("/proc/stat")
+
+    def fill(self, m: GpuMetrics) -> None:
+        sys_m = SystemMetrics()
+
+        # ── CPU utilization (delta of aggregate /proc/stat "cpu" line) ──────
+        try:
+            with open("/proc/stat") as f:
+                first = f.readline()
+            fields = [float(x) for x in first.split()[1:]]
+            idle = fields[3] + (fields[4] if len(fields) > 4 else 0.0)  # idle + iowait
+            total = sum(fields)
+            if self._prev_total is not None and total > self._prev_total:
+                d_total = total - self._prev_total
+                d_idle = idle - self._prev_idle
+                sys_m.cpu_util_pct = max(0.0, min(100.0, 100.0 * (1.0 - d_idle / d_total)))
+            self._prev_idle, self._prev_total = idle, total
+        except Exception:
+            pass
+
+        # ── load average + runnable-task count ───────────────────────────────
+        try:
+            with open("/proc/loadavg") as f:
+                parts = f.read().split()
+            sys_m.loadavg_1, sys_m.loadavg_5, sys_m.loadavg_15 = (
+                float(parts[0]), float(parts[1]), float(parts[2])
+            )
+            sys_m.nr_running = int(parts[3].split("/")[0])
+        except Exception:
+            pass
+
+        # ── PSI pressure (avg10 field of each /proc/pressure/* file) ─────────
+        def _psi_avg10(path: str, line_prefix: str) -> float:
+            try:
+                with open(path) as f:
+                    for line in f:
+                        if line.startswith(line_prefix):
+                            for tok in line.split():
+                                if tok.startswith("avg10="):
+                                    return float(tok.split("=", 1)[1])
+            except Exception:
+                pass
+            return 0.0
+
+        sys_m.psi_cpu_some_avg10 = _psi_avg10("/proc/pressure/cpu", "some")
+        sys_m.psi_mem_some_avg10 = _psi_avg10("/proc/pressure/memory", "some")
+        sys_m.psi_mem_full_avg10 = _psi_avg10("/proc/pressure/memory", "full")
+        sys_m.psi_io_some_avg10  = _psi_avg10("/proc/pressure/io", "some")
+
+        # ── MemAvailable / swap used ──────────────────────────────────────────
+        try:
+            mem_total_kb = mem_avail_kb = swap_total_kb = swap_free_kb = 0
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        mem_avail_kb = int(line.split()[1])
+                    elif line.startswith("SwapTotal:"):
+                        swap_total_kb = int(line.split()[1])
+                    elif line.startswith("SwapFree:"):
+                        swap_free_kb = int(line.split()[1])
+            sys_m.mem_available_mb = mem_avail_kb // 1024
+            sys_m.swap_used_mb = max(0, swap_total_kb - swap_free_kb) // 1024
+        except Exception:
+            pass
+
+        m.sys = sys_m
 
 
 class TorchFallbackProvider(_Provider):
@@ -807,6 +1355,14 @@ class TelemetryManager:
         if gb.available():
             self._providers.append(gb)
 
+        ebpf = EbpfProvider()
+        if ebpf.available():
+            self._providers.append(ebpf)
+
+        sysp = SystemProvider()
+        if sysp.available():
+            self._providers.append(sysp)
+
         active = [p.name for p in self._providers]
         print(f"[gb_telemetry] device={device} providers={active}", flush=True)
 
@@ -862,9 +1418,30 @@ class TelemetryManager:
 
     # ── internals ─────────────────────────────────────────────────────────────
 
+    def set_poll_interval_ms(self, ms: int) -> None:
+        """
+        Adjust the background poll interval at runtime (clamped 50–2000 ms).
+        The change takes effect on the next sleep expiry — at most one old
+        interval passes before the new rate is active.
+
+        Used by the orchestrator to speed up polling during INFERENCE (250 ms)
+        and slow it during IDLE/DEEP_IDLE (1000 ms), saving CPU between tokens.
+        """
+        self.poll_ms = max(50, min(2000, int(ms)))
+
     def _poll_loop(self):
-        interval = self.poll_ms / 1000.0
-        while not self._stop.wait(timeout=interval):
+        # Pin this background thread to E-cores, keeping P/golden cores free for
+        # tensor compute. sched_setaffinity(0, ...) targets the calling thread.
+        try:
+            from gb_topology import get_topology
+            e_cpus = get_topology().e_core_cpus
+            if e_cpus:
+                os.sched_setaffinity(0, set(e_cpus))
+        except Exception:
+            pass
+        # Read poll_ms on each iteration so set_poll_interval_ms() takes effect
+        # within one cycle (no restart needed).
+        while not self._stop.wait(timeout=self.poll_ms / 1000.0):
             try:
                 self._do_poll()
             except Exception:
@@ -1054,7 +1631,7 @@ def _detect_feeder_count() -> int:
 def sample_once(device: int = 0) -> GpuMetrics:
     """Take a single synchronous telemetry snapshot. Lightweight — no thread."""
     m = GpuMetrics(device=device)
-    for Cls in (NVMLProvider, TorchFallbackProvider, GreenBoostProvider):
+    for Cls in (NVMLProvider, TorchFallbackProvider, GreenBoostProvider, SystemProvider):
         p = Cls(device) if Cls is NVMLProvider else Cls()
         if p.available():
             p.fill(m)

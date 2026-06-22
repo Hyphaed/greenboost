@@ -302,4 +302,54 @@ struct gb_latent_reg_req {
 #define GB_IOCTL_LATENT_REGISTER  _IOW(GB_IOCTL_MAGIC, 22, struct gb_latent_reg_req)
 #define GB_IOCTL_LATENT_RELEASE   _IOW(GB_IOCTL_MAGIC, 23, struct gb_latent_reg_req)
 
+/* Expert VMM pool registration — shim calls once per GbExpertPool so the
+ * kernel can expose pool metadata (va_base, stride, num_experts, pid) for
+ * cross-process consumers (greenboost vitals, Synapse CLI, cluster fabric).
+ * Residency state is NOT stored in the kernel; it is read directly from the
+ * shim process via the exported gb_expert_pool_residency() symbol or via
+ * /proc/PID/maps (VA range mapped = resident, absent = cold). */
+struct gb_vpage_register_req {
+    gb_u64 va_base;       /* CUdeviceptr base of the VMM VA range */
+    gb_u32 num_experts;
+    gb_u32 reserved;
+    gb_u64 stride_bytes;  /* granularity-aligned per-expert stride */
+};
+
+/* Query pool metadata registered by another process.  Returns the registration
+ * info for the pool whose va_base matches the input.  The caller is expected
+ * to read residency from gb_expert_pool_residency() (same process) or infer
+ * it from /proc maps for cross-process observation. */
+struct gb_vpage_query_req {
+    gb_u64 va_base;            /* in:  pool VA base to query */
+    gb_u64 out_stride_bytes;   /* out: per-expert stride */
+    gb_u32 out_num_experts;    /* out: num_experts */
+    gb_u32 out_pid;            /* out: PID of the registering process */
+};
+
+#define GB_IOCTL_VPAGE_REGISTER  _IOW( GB_IOCTL_MAGIC, 24, struct gb_vpage_register_req)
+#define GB_IOCTL_VPAGE_QUERY     _IOWR(GB_IOCTL_MAGIC, 25, struct gb_vpage_query_req)
+
+/* Heat push — shim reports per-buffer access frequency (gb_ht_entry_t.access_count,
+ * the "U1 ARC tracking" counter) so the kernel evictor can prefer recency+reuse
+ * (ARC-like) over pure LRU.  Batched: one ioctl call per shim heat-pusher tick
+ * (prefetch_worker loop) instead of one syscall per buffer.
+ *
+ * heat is additive: the kernel ORs in caller-reported access_count deltas and
+ * decays the stored value on its own cold-sweep timer, so a missed tick just
+ * means slightly stale heat, never a wrong eviction (skip rules are unchanged -
+ * this only re-orders candidates that are already eviction-eligible). */
+#define GB_HEAT_BATCH_MAX 64
+
+struct gb_heat_entry {
+	gb_s32 buf_id;
+	gb_u32 heat;     /* access_count snapshot at push time */
+};
+
+struct gb_heat_req {
+	gb_u32 count;    /* number of valid entries in ent[], <= GB_HEAT_BATCH_MAX */
+	gb_u32 _pad;
+	struct gb_heat_entry ent[GB_HEAT_BATCH_MAX];
+};
+#define GB_IOCTL_SET_HEAT        _IOW( GB_IOCTL_MAGIC, 26, struct gb_heat_req)
+
 #endif /* GREENBOOST_IOCTL_H */

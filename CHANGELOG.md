@@ -2,6 +2,68 @@
 
 ---
 
+## v3.2 : 2026-06-22
+
+### Hot/cold residency engine — the kernel evictor is no longer pure LRU
+
+The CUDA shim has tracked per-allocation access frequency since v2.x
+(`gb_ht_entry_t.access_count`, the "U1 ARC tracking" counter) but never used
+it for anything — the kernel evictor (`gb_try_evict_for_alloc`,
+`gb_auto_evict_cold` in `greenboost.c`) only ever walked the T2 LRU tail,
+so a weight buffer hit thousands of times in the last second could still be
+evicted before a buffer touched once and never again.
+
+- New `GB_IOCTL_SET_HEAT` ioctl (`greenboost_ioctl.h` cmd 26): the shim's
+  `prefetch_worker` thread now pushes a batched snapshot of live
+  `access_count` deltas every ~2s. The kernel ORs the delta into a new
+  `struct gb_buf.heat` field and halves it every ~2s on the watchdog
+  (ARC-style aging).
+- Both eviction sweeps now prefer the coldest eligible candidates first
+  (heat==0, then heat≤2, then unbounded) before falling back to pure LRU
+  order within each tier — same skip-rule semantics (`frozen`,
+  `t1_priority`, `session_priority`, `GB_ALLOC_KV_CACHE` exemptions
+  unchanged), just better-ordered eviction among already-eligible buffers.
+- New kernel debugfs export, `/sys/kernel/debug/greenboost/residency`
+  (per-buffer id/tier/size/heat/flags/pid), and two new commands:
+  `greenboost top` (live per-buffer residency, sorted hottest-first) and
+  `greenboost residency` (aggregate hot/warm/cold byte breakdown + churn).
+
+### Path C (managed UVM) — considered for reintroduction, not reintroduced
+
+Evaluated reintroducing UVM demand-paging as an oversubscription fallback
+below T3 NVMe (motivated by an external review suggesting GreenBoost adopt
+UVM fault telemetry, e.g. `bpf_uvm`-style tracing). Decision: **not
+reintroduced as a spill tier.**
+
+- The explicit T3 NVMe tier already provides graceful oversubscription
+  without UVM's fault-driven demand-paging stalls — that stall behavior is
+  exactly why managed UVM was removed from the T2/T3 spill path in the
+  first place (see the v2.x note in `DOCUMENTATION.md` and
+  `CONTAINER_VM_MODE.md`'s Path C description). Reintroducing it would
+  re-break the Immutable Design Rule (GPU compute always; no CPU
+  page-fault-driven stalling on the inference critical path).
+- Managed UVM (`cuMemAllocManaged` + `cuMemAdvise`) remains exactly where
+  it already was: the pinned Blackwell-PCIe T2 backing method
+  (`gb_vmm_t2_alloc_blackwell_managed` in `greenboost_cuda_shim.c`), hinted
+  to stay in host RAM so it does **not** demand-page. This is unchanged.
+- No third-party attribution applies to Path C itself — it is built from
+  stock NVIDIA UVM primitives (CUDA Programming Guide §K, `cuMemAdvise`),
+  not adapted from any external project.
+
+### eBPF observability layer (`ebpf/gb_trace.bpf.c`)
+
+A CO-RE eBPF tracer attaches kprobes to GreenBoost's own tier-migration
+functions (`gb_t3_evict_buf`, `gb_t3_promote_buf`, `gb_auto_evict_cold`,
+`gb_alloc_buf`, `gb_pin_user_buf` — not `nvidia_uvm`, which sees no faults
+under GreenBoost's pinned-DDR design) and emits structured events to a
+ringbuf, consumed by `gb_telemetry.py`'s `EbpfProvider` and surfaced in
+`greenboost faults`. The kprobe→ringbuf→telemetry pattern is adapted from
+**[bpf_uvm](https://github.com/vchuravy/bpf_uvm)** (Valentin Churavy, MIT
+license) — repointed from `nvidia_uvm` fault events onto GreenBoost's own
+kernel paths, since that is where the actual migration signal lives for
+this architecture. See `THIRD_PARTY_NOTICES.md`. Builds only when
+`clang`/`bpftool`/`libbpf-dev` are present (`make BPF=1 ebpf`); degrades
+gracefully to procfs/shim_stats-only reporting otherwise.
 
 ## v3.1 : 2026-06-16
 - Telemetry layer stitched directly into the CUDA shim , live ECC/power/PCIe signals now available in-process at 500 ms resolution.

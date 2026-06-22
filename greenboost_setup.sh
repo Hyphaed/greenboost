@@ -599,7 +599,10 @@ parse_shim_stats() {
 #       SHIM_PHASE SHIM_ACTIVE_PATH SHIM_T1_LOCAL_MB SHIM_T2_LOCAL_MB SHIM_T3_LOCAL_MB
 #       SHIM_WS_RESERVE_MB SHIM_WS_RESERVE_EFF_MB SHIM_KV_RESERVE_MB
 #       SHIM_VIRTUAL_VRAM_MB SHIM_CLUSTER_REMOTE_MB
-#       ORCH_ECC_DEGRADED ORCH_WS_ABOVE ORCH_WS_RESERVE_MB ORCH_ACTUATE
+#       ORCH_ECC_DEGRADED ORCH_WS_ABOVE ORCH_WS_RESERVE_MB ORCH_ACTUATE ORCH_VRAM_PRESSURE
+#       ORCH_CLUSTER_PRESSURE ORCH_HEALTH_OK ORCH_HEALTH_EVICT_ARMED
+#       TOPO_INFERENCE_CPUS TOPO_INFERENCE_THREADS TOPO_BACKGROUND_THREADS
+#       TOPO_PCIE_SAT_MB_S TOPO_IS_BLACKWELL
 #       GPU_HEALTH_OK GPU_HEALTH_SUMMARY GPU_POWER_INSTANT_W GPU_NVLINK_BW_MB_S
 _gb_vitals_init_vars() {
     GPU_NAME=""; GPU_VRAM_USED_MB=0; GPU_VRAM_TOTAL_MB=0; GPU_VRAM_FREE_MB=0; GPU_VRAM_PCT=0
@@ -610,7 +613,14 @@ _gb_vitals_init_vars() {
     SHIM_PHASE=""; SHIM_ACTIVE_PATH=""; SHIM_T1_LOCAL_MB=""; SHIM_T2_LOCAL_MB=""; SHIM_T3_LOCAL_MB=""
     SHIM_WS_RESERVE_MB=""; SHIM_WS_RESERVE_EFF_MB=""; SHIM_KV_RESERVE_MB=""
     SHIM_VIRTUAL_VRAM_MB=""; SHIM_CLUSTER_REMOTE_MB=""
-    ORCH_ECC_DEGRADED=0; ORCH_WS_ABOVE=0; ORCH_WS_RESERVE_MB=""; ORCH_ACTUATE=0
+    ORCH_ECC_DEGRADED=0; ORCH_THERMAL_STRESS=0; ORCH_MEM_BW_STRESS=0; ORCH_SBE_ELEVATED=0; ORCH_SBE_SEEN=0
+    ORCH_CLOCK_THROTTLED=0; ORCH_SM_CLOCK_MAX_MHZ=0
+    ORCH_WS_ABOVE=0; ORCH_WS_RESERVE_MB=""; ORCH_ACTUATE=0; ORCH_VRAM_PRESSURE=0
+    ORCH_CLUSTER_PRESSURE=0; ORCH_HEALTH_OK=1; ORCH_HEALTH_EVICT_ARMED=0
+    ORCH_OS_TUNE_ENABLED=0; ORCH_GAMING_MODE=0; ORCH_CPU_GOVERNOR=""; ORCH_GPU_PERSISTENCE=0
+    ORCH_GPU_POWER_LIMIT_W=""; ORCH_GPU_CLOCKS_LOCKED=""; ORCH_SWAPPINESS=""
+    TOPO_INFERENCE_CPUS=""; TOPO_INFERENCE_THREADS=""; TOPO_BACKGROUND_THREADS=""
+    TOPO_PCIE_SAT_MB_S=""; TOPO_IS_BLACKWELL=0
     GPU_HEALTH_OK=""; GPU_HEALTH_SUMMARY=""; GPU_POWER_INSTANT_W=""; GPU_NVLINK_BW_MB_S=0
 }
 
@@ -660,10 +670,32 @@ query_gpu_vram() {
             SHIM_VIRTUAL_VRAM_MB)   SHIM_VIRTUAL_VRAM_MB="$_v" ;;
             SHIM_CLUSTER_REMOTE_MB) SHIM_CLUSTER_REMOTE_MB="$_v" ;;
             ORCH_ECC_DEGRADED)      ORCH_ECC_DEGRADED="$_v" ;;
+            ORCH_THERMAL_STRESS)    ORCH_THERMAL_STRESS="$_v" ;;
+            ORCH_MEM_BW_STRESS)     ORCH_MEM_BW_STRESS="$_v" ;;
+            ORCH_SBE_ELEVATED)      ORCH_SBE_ELEVATED="$_v" ;;
+            ORCH_SBE_SEEN)          ORCH_SBE_SEEN="$_v" ;;
+            ORCH_CLOCK_THROTTLED)   ORCH_CLOCK_THROTTLED="$_v" ;;
+            ORCH_SM_CLOCK_MAX_MHZ)  ORCH_SM_CLOCK_MAX_MHZ="$_v" ;;
             ORCH_WS_ABOVE)          ORCH_WS_ABOVE="$_v" ;;
             ORCH_WS_RESERVE_MB)     ORCH_WS_RESERVE_MB="$_v" ;;
             ORCH_ACTUATE)           ORCH_ACTUATE="$_v" ;;
-            GPU_HEALTH_OK)          GPU_HEALTH_OK="$_v" ;;
+            ORCH_VRAM_PRESSURE)     ORCH_VRAM_PRESSURE="$_v" ;;
+            ORCH_CLUSTER_PRESSURE)  ORCH_CLUSTER_PRESSURE="$_v" ;;
+            ORCH_HEALTH_OK)         ORCH_HEALTH_OK="$_v" ;;
+            ORCH_HEALTH_EVICT_ARMED)  ORCH_HEALTH_EVICT_ARMED="$_v" ;;
+            ORCH_OS_TUNE_ENABLED)     ORCH_OS_TUNE_ENABLED="$_v" ;;
+            ORCH_GAMING_MODE)         ORCH_GAMING_MODE="$_v" ;;
+            ORCH_CPU_GOVERNOR)        ORCH_CPU_GOVERNOR="$_v" ;;
+            ORCH_GPU_PERSISTENCE)     ORCH_GPU_PERSISTENCE="$_v" ;;
+            ORCH_GPU_POWER_LIMIT_W)   ORCH_GPU_POWER_LIMIT_W="$_v" ;;
+            ORCH_GPU_CLOCKS_LOCKED)   ORCH_GPU_CLOCKS_LOCKED="$_v" ;;
+            ORCH_SWAPPINESS)          ORCH_SWAPPINESS="$_v" ;;
+            TOPO_INFERENCE_CPUS)      TOPO_INFERENCE_CPUS="$_v" ;;
+            TOPO_INFERENCE_THREADS)   TOPO_INFERENCE_THREADS="$_v" ;;
+            TOPO_BACKGROUND_THREADS)  TOPO_BACKGROUND_THREADS="$_v" ;;
+            TOPO_PCIE_SAT_MB_S)       TOPO_PCIE_SAT_MB_S="$_v" ;;
+            TOPO_IS_BLACKWELL)        TOPO_IS_BLACKWELL="$_v" ;;
+            GPU_HEALTH_OK)            GPU_HEALTH_OK="$_v" ;;
             GPU_HEALTH_SUMMARY)     GPU_HEALTH_SUMMARY="$_v" ;;
             GPU_POWER_INSTANT_W)    GPU_POWER_INSTANT_W="$_v" ;;
             GPU_NVLINK_BW_MB_S)     GPU_NVLINK_BW_MB_S="$_v" ;;
@@ -1372,7 +1404,7 @@ detect_hardware() {
     DET_DRIVER=$(timeout 10 nvidia-smi --query-gpu=driver_version --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs || echo "")
     DET_CUDA_VER=$(nvcc --version 2>/dev/null | grep "release" | grep -oP '[0-9]+\.[0-9]+' | head -1 || echo "")
     DET_NVLINK=false
-    timeout 10 nvidia-smi topo -m 2>/dev/null | grep -q "NV[0-9]" && DET_NVLINK=true
+    grep -q "NV[0-9]" <<< "$(timeout 10 nvidia-smi topo -m 2>/dev/null)" && DET_NVLINK=true
     DET_RAM_ECC=false
     dmidecode -t memory 2>/dev/null | grep -qi "Error Correction.*Multi" && DET_RAM_ECC=true
     DET_RAM_CHANNELS=$(dmidecode -t memory 2>/dev/null | grep -c "^\s*Size:.*GB" || echo 2)
@@ -1794,7 +1826,7 @@ cmd_profile_activate() {
 
     # S3: Live-reload - if the module is loaded and profile changes a kernel
     # parameter (nvme_pool_gb or t2_pool_gb), offer to reload the module.
-    if lsmod 2>/dev/null | grep -q "^greenboost "; then
+    if grep -q "^greenboost " <<< "$(lsmod 2>/dev/null)"; then
         local sysfs_nvme="/sys/module/greenboost/parameters/nvme_pool_gb"
         local sysfs_t2="/sys/module/greenboost/parameters/t2_pool_gb"
         load_profile_values "$abs" 2>/dev/null || true
@@ -2093,7 +2125,7 @@ check_deps() {
     Install with: sudo ${_hdr_hint}"
     info "Kernel headers : $kdir  ✓"
 
-    if lsmod 2>/dev/null | grep -qE "^nvidia[[:space:]]" \
+    if grep -qE "^nvidia[[:space:]]" <<< "$(lsmod 2>/dev/null)" \
             || [[ -c /dev/nvidia0 ]] \
             || [[ -f /proc/driver/nvidia/version ]]; then
         info "NVIDIA driver  : loaded  ✓"
@@ -2179,12 +2211,20 @@ TimeoutStopSec=30
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=gb-supervisor
+# Continuous reactive control: actuate ReactiveOrchestrator levers (Loops A-S),
+# including the continuous OS tuner (Loops O-S: CPU governor/EPP, GPU
+# clocks/power, vm.* tunables). Disable with override.conf if you want
+# observe-only (dry-run) mode instead.
+Environment=GB_ORCH_ACTUATE=1
+Environment=GB_OS_TUNE=1
 # Optional tuning (set in /etc/systemd/system/greenboost-supervisor.service.d/override.conf):
 #   Environment=GB_SUPERVISOR_POLL_SECS=10
 #   Environment=GB_SUPERVISOR_VRAM_WARN_PCT=10
 #   Environment=GB_SUPERVISOR_VRAM_CRIT_FREE_PCT=8
 #   Environment=GB_SUPERVISOR_OLLAMA_URL=http://127.0.0.1:11434
 #   Environment=GB_SUPERVISOR_AGGRESSIVE_RECLAIM=0
+#   Environment=GB_ORCH_ACTUATE=0   # observe-only / dry-run
+#   Environment=GB_OS_TUNE=0        # disable continuous OS tuning
 
 [Install]
 WantedBy=multi-user.target
@@ -2207,6 +2247,9 @@ cmd_install_sys_configs() {
     need_root install-sys-configs
     detect_hardware
     gb_ensure_shim_libs
+    gb_ensure_greenboost_group
+    # Repair existing cluster.key permissions on upgrade (idempotent).
+    [[ -f "$GB_CLUSTER_KEY" ]] && _gb_set_keyfile_perms "$GB_CLUSTER_KEY"
 
     info "Installing GreenBoost v3.0 system configuration files..."
 
@@ -2217,13 +2260,14 @@ cmd_install_sys_configs() {
         sed -i '/OLLAMA_FLASH_ATTENTION/d
 /OLLAMA_KV_CACHE_TYPE/d
 /OLLAMA_NUM_CTX/d
+/OLLAMA_CONTEXT_LENGTH/d
 /OLLAMA_MAX_LOADED_MODELS/d
 /OLLAMA_KEEP_ALIVE/d
 /OLLAMA_NUM_GPU/d
 /GREENBOOST_/d
 /libgreenboost/d' "$svc"
         # Inject fresh v2.7 env vars
-        sed -i "/^\[Service\]/a Environment=\"OLLAMA_FLASH_ATTENTION=1\"\nEnvironment=\"OLLAMA_KV_CACHE_TYPE=q8_0\"\nEnvironment=\"OLLAMA_NUM_CTX=${GB_OLLAMA_CTX}\"\nEnvironment=\"OLLAMA_MAX_LOADED_MODELS=1\"\nEnvironment=\"OLLAMA_KEEP_ALIVE=-1\"\nEnvironment=\"GREENBOOST_VIRTUAL_VRAM_MB=$((GB_VIRT * 1024))\"\nEnvironment=\"GREENBOOST_DEBUG=0\"\nEnvironment=\"GREENBOOST_ACTIVE=1\"\nEnvironment=\"LD_PRELOAD=/usr/local/lib/libgreenboost_vmm_override.so:/usr/local/lib/libgreenboost_cuda.so\"" "$svc"
+        sed -i "/^\[Service\]/a Environment=\"OLLAMA_FLASH_ATTENTION=1\"\nEnvironment=\"OLLAMA_KV_CACHE_TYPE=q8_0\"\nEnvironment=\"OLLAMA_NUM_CTX=${GB_OLLAMA_CTX}\"\nEnvironment=\"OLLAMA_CONTEXT_LENGTH=${GB_OLLAMA_CTX}\"\nEnvironment=\"OLLAMA_MAX_LOADED_MODELS=1\"\nEnvironment=\"OLLAMA_KEEP_ALIVE=-1\"\nEnvironment=\"GREENBOOST_VIRTUAL_VRAM_MB=$((GB_VIRT * 1024))\"\nEnvironment=\"GREENBOOST_DEBUG=0\"\nEnvironment=\"GREENBOOST_ACTIVE=1\"\nEnvironment=\"LD_PRELOAD=/usr/local/lib/libgreenboost_vmm_override.so:/usr/local/lib/libgreenboost_cuda.so\"" "$svc"
         systemctl daemon-reload
         info "Ollama service: GreenBoost v3.0 env vars injected (refreshed)"
         gb_ok "Ollama context cap set to ${GB_OLLAMA_CTX} tokens (T1: ${GB_PHYS} GB, T2: ${GB_VIRT} GB)"
@@ -2238,10 +2282,12 @@ cmd_install_sys_configs() {
     mkdir -p "$dropin_dir"
 
     # Remove conflicting entries from other drop-in files before writing 99-greenboost.conf
-    local gb_vars=(OLLAMA_NUM_CTX LD_PRELOAD OLLAMA_GPU_OVERHEAD OLLAMA_FLASH_ATTENTION
+    local gb_vars=(OLLAMA_NUM_CTX OLLAMA_CONTEXT_LENGTH LD_PRELOAD OLLAMA_GPU_OVERHEAD OLLAMA_FLASH_ATTENTION
                    OLLAMA_KV_CACHE_TYPE OLLAMA_MAX_LOADED_MODELS OLLAMA_KEEP_ALIVE OLLAMA_NUM_GPU
                    GREENBOOST_KV_RESERVE_MB GREENBOOST_VIRTUAL_VRAM_MB GREENBOOST_DEBUG
-                   GREENBOOST_ACTIVE GREENBOOST_WORKSTATION_RESERVE_MB GREENBOOST_FORCE_CC_MAJOR)
+                   GREENBOOST_ACTIVE GREENBOOST_WORKSTATION_RESERVE_MB GREENBOOST_FORCE_CC_MAJOR
+                   GOMP_CPU_AFFINITY OMP_NUM_THREADS
+                   GREENBOOST_INFERENCE_CPUS GREENBOOST_INFERENCE_THREADS)
     local _conflict_found=0
     for _f in "$dropin_dir"/*.conf; do
         [[ -f "$_f" ]] || continue
@@ -2282,6 +2328,16 @@ cmd_install_sys_configs() {
     _dropin_cc_major=$(echo "${DET_CC:-0.0}" | cut -d. -f1 | tr -d '[:space:]')
     _dropin_cc_major="${_dropin_cc_major:-0}"
 
+    # Compute golden-core (or P-core) affinity for inference thread pinning.
+    # Golden cores have the lowest latency and dedicated L2 slices on hybrid CPUs
+    # (i9-14900KF: CPUs 4-7). Pinning llamacpp CPU threads here reduces context-
+    # switch pressure on the cores handling CUDA stream scheduling.
+    local _golden_min="${PROF_GOLDEN_MIN:-${GB_GOLDEN_MIN:-0}}"
+    local _golden_max="${PROF_GOLDEN_MAX:-${GB_GOLDEN_MAX:-7}}"
+    local _golden_threads=$(( _golden_max - _golden_min + 1 ))
+    [[ $_golden_threads -lt 1 ]] && _golden_threads=4
+    local _gomp_affinity="${_golden_min}-${_golden_max}"
+
     # Write 99-greenboost.conf - alphabetically last, so it always wins
     {
         cat << DROPINEOF
@@ -2295,14 +2351,22 @@ Wants=greenboost-supervisor.service
 Environment="OLLAMA_FLASH_ATTENTION=1"
 Environment="OLLAMA_KV_CACHE_TYPE=q8_0"
 Environment="OLLAMA_NUM_CTX=${GB_OLLAMA_CTX}"
+Environment="OLLAMA_CONTEXT_LENGTH=${GB_OLLAMA_CTX}"
 Environment="OLLAMA_MAX_LOADED_MODELS=1"
 Environment="OLLAMA_KEEP_ALIVE=-1"
 Environment="GREENBOOST_VIRTUAL_VRAM_MB=$((GB_VIRT * 1024))"
 Environment="GREENBOOST_DEBUG=0"
 Environment="GREENBOOST_KV_RESERVE_MB=${GB_KV_RESERVE_MB}"
 Environment="GREENBOOST_ACTIVE=1"
-Environment="GREENBOOST_WORKSTATION_RESERVE_MB=1024"
+# GREENBOOST_WORKSTATION_RESERVE_MB intentionally unset: the shim now sizes
+# this dynamically from live desktop/compositor GPU usage (see
+# gb_effective_workstation_reserve_bytes in greenboost_cuda_shim.c) instead of
+# a flat tax, so inference gets whatever VRAM the desktop isn't using.
 Environment="LD_PRELOAD=/usr/local/lib/libgreenboost_vmm_override.so:/usr/local/lib/libgreenboost_cuda.so"
+Environment="GOMP_CPU_AFFINITY=${_gomp_affinity}"
+Environment="OMP_NUM_THREADS=${_golden_threads}"
+Environment="GREENBOOST_INFERENCE_CPUS=${_gomp_affinity}"
+Environment="GREENBOOST_INFERENCE_THREADS=${_golden_threads}"
 DROPINEOF
         # Blackwell (cc >= 12): bypass the lazy CC probe race in vmm_override so
         # VMM_SUPPORTED=0 fires even on the very first cuDeviceGetAttribute call.
@@ -2632,6 +2696,25 @@ HPEOF
     systemd-tmpfiles --create /etc/tmpfiles.d/greenboost.conf 2>/dev/null
     gb_ok "tmpfiles.d/greenboost.conf installed - /run/greenboost mode 0775 root:${_tmpfiles_group}"
 
+    # 12. gb-diag-read - narrow read-only diagnostic helper (dmesg, /proc/<pid>/{maps,environ})
+    # plus a NOPASSWD sudoers rule scoped to ONLY this binary (no argument wildcards,
+    # which sudo's parser rejects - the script itself validates its own arguments).
+    # Lets an AI assistant or any unprivileged tool self-diagnose shim/kernel-module
+    # issues (LD_PRELOAD propagation, mapped libraries, dmesg) without a full sudo session.
+    if [[ -f "${MODULE_DIR}/gb_diag_read.sh" ]]; then
+        install -m 755 "${MODULE_DIR}/gb_diag_read.sh" /usr/local/sbin/gb-diag-read
+        local _diag_user="${SUDO_USER:-${USER:-root}}"
+        printf '%s ALL=(root) NOPASSWD: /usr/local/sbin/gb-diag-read\n' "$_diag_user" \
+            > /etc/sudoers.d/greenboost-diag-read
+        chmod 440 /etc/sudoers.d/greenboost-diag-read
+        if visudo -c -f /etc/sudoers.d/greenboost-diag-read >/dev/null 2>&1; then
+            gb_ok "gb-diag-read installed - NOPASSWD diagnostics enabled for ${_diag_user}"
+        else
+            rm -f /etc/sudoers.d/greenboost-diag-read
+            warn "gb-diag-read sudoers rule failed validation - removed, diagnostics need manual sudo"
+        fi
+    fi
+
     echo ""
     info "System config installation complete."
     if systemctl is-active --quiet ollama.service 2>/dev/null; then
@@ -2721,6 +2804,43 @@ PYEOF
         echo ""
         grep -E "T3|NVMe|t3|nvme" /sys/class/greenboost/greenboost/status 2>/dev/null | \
             sed "s/^/  ${C_CYAN}◈${C_RESET}  /" || true
+    fi
+}
+
+# gb_ensure_greenboost_group — create the "greenboost" system group if absent and
+# add the invoking user (SUDO_USER) to it so non-root processes (greenboost-cli,
+# llama-server, vLLM) can read cluster.key at mode 0640 root:greenboost without
+# requiring sudo.  Idempotent: safe to call on every install.
+gb_ensure_greenboost_group() {
+    if ! getent group greenboost >/dev/null 2>&1; then
+        groupadd --system greenboost 2>/dev/null \
+            || groupadd greenboost 2>/dev/null \
+            || { gb_warn "Could not create 'greenboost' group — cluster.key will stay 0600 (root-only)"; return 0; }
+        gb_ok "Created system group 'greenboost'"
+    fi
+    # Add the invoking user to the group when running via sudo.
+    local _user="${SUDO_USER:-}"
+    if [[ -n "$_user" ]] && id "$_user" &>/dev/null; then
+        if ! id -nG "$_user" 2>/dev/null | grep -qw greenboost; then
+            usermod -aG greenboost "$_user" 2>/dev/null \
+                || gpasswd -a "$_user" greenboost 2>/dev/null \
+                || gb_warn "Could not add '$_user' to group 'greenboost' — run: sudo usermod -aG greenboost $_user"
+            gb_ok "Added '$_user' to group 'greenboost'"
+            gb_warn "Log out and back in (or run: newgrp greenboost) for the new group membership to take effect in existing shells"
+        fi
+    fi
+}
+
+# _gb_set_keyfile_perms <path> — apply correct ownership + mode to cluster.key.
+# Uses 0640 root:greenboost when the group exists; falls back to 0600 root:root.
+_gb_set_keyfile_perms() {
+    local _kf="$1"
+    if getent group greenboost >/dev/null 2>&1; then
+        chown root:greenboost "$_kf"
+        chmod 0640 "$_kf"
+    else
+        chown root:root "$_kf"
+        chmod 0600 "$_kf"
     fi
 }
 
@@ -2848,7 +2968,7 @@ cmd_restore_sys_configs() {
     # Remove inline GreenBoost injections from ollama.service (legacy direct edit)
     local _svc="/etc/systemd/system/ollama.service"
     if [[ -f "$_svc" ]] && grep -q "GREENBOOST\|libgreenboost" "$_svc"; then
-        sed -i '/OLLAMA_FLASH_ATTENTION/d;/OLLAMA_KV_CACHE_TYPE/d;/OLLAMA_NUM_CTX/d
+        sed -i '/OLLAMA_FLASH_ATTENTION/d;/OLLAMA_KV_CACHE_TYPE/d;/OLLAMA_NUM_CTX/d;/OLLAMA_CONTEXT_LENGTH/d
 /OLLAMA_MAX_LOADED_MODELS/d;/OLLAMA_KEEP_ALIVE/d;/OLLAMA_NUM_GPU/d
 /GREENBOOST_/d;/libgreenboost/d' "$_svc"
         gb_ok "Removed GreenBoost vars from ollama.service"
@@ -3033,7 +3153,7 @@ _rmmod_with_retry() {
         fi
     }
 
-    lsmod | grep -q "^${DRIVER_NAME} " || return 0   # not loaded - nothing to do
+    grep -q "^${DRIVER_NAME} " <<< "$(lsmod)" || return 0   # not loaded - nothing to do
 
     # Check if the module is already stuck in Unloading state (MODULE_STATE_GOING).
     # This happens when a previous rmmod process was killed before the exit function
@@ -3535,6 +3655,7 @@ do_purge() {
         sed -i '/OLLAMA_FLASH_ATTENTION/d
 /OLLAMA_KV_CACHE_TYPE/d
 /OLLAMA_NUM_CTX/d
+/OLLAMA_CONTEXT_LENGTH/d
 /OLLAMA_MAX_LOADED_MODELS/d
 /OLLAMA_KEEP_ALIVE/d
 /GREENBOOST_/d
@@ -3769,6 +3890,47 @@ if _os.environ.get("GREENBOOST_ACTIVE") == "1":
     gb_info "  auto-init: GREENBOOST_ACTIVE=1 triggers gb_init on Python startup"
 }
 
+# _gb_install_ebpf_tracer — install greenboost-ebpf-trace if built, (re)start it.
+# Called from cmd_install (Full Install).  Non-fatal when binary absent.
+_gb_install_ebpf_tracer() {
+    local _src="${MODULE_DIR}/greenboost-ebpf-trace"
+    local _dst="/usr/local/bin/greenboost-ebpf-trace"
+    local _pid_f="/run/greenboost/ebpf_trace.pid"
+
+    if [[ ! -x "$_src" ]]; then
+        gb_info "eBPF tracer not built (clang/bpftool/libbpf required) — skipping"
+        gb_info "  Build: cd ${MODULE_DIR} && make BPF=1 ebpf"
+        return 0
+    fi
+
+    # Stop running instance (best-effort)
+    if [[ -f "$_pid_f" ]]; then
+        local _old_pid; _old_pid=$(cat "$_pid_f" 2>/dev/null || true)
+        [[ -n "$_old_pid" ]] && kill "$_old_pid" 2>/dev/null || true
+        sleep 0.3
+    fi
+
+    install -m 755 "$_src" "$_dst"
+    gb_ok "Installed ${_dst}"
+
+    # Only start when greenboost.ko is already loaded (kprobes need the symbols)
+    if lsmod | grep -q '^greenboost '; then
+        mkdir -p /run/greenboost /var/log/greenboost
+        nohup "$_dst" >>/var/log/greenboost/ebpf-trace.log 2>&1 &
+        local _bpf_bg_pid=$!
+        sleep 0.5
+        if kill -0 "$_bpf_bg_pid" 2>/dev/null; then
+            gb_ok "eBPF tracer started (pid ${_bpf_bg_pid})"
+        else
+            gb_warn "eBPF tracer exited immediately — check /var/log/greenboost/ebpf-trace.log"
+            gb_info "  Hint: requires CAP_BPF (root) and CONFIG_KALLSYMS_ALL=y"
+        fi
+    else
+        gb_info "eBPF tracer installed — will auto-start after: sudo modprobe greenboost"
+        gb_info "  Manual start: sudo ${_dst}"
+    fi
+}
+
 cmd_install() {
     need_root install
 
@@ -3859,10 +4021,16 @@ MODEOF
 # GreenBoost v3.0 - auto-activation for CUDA inference tools
 export GREENBOOST_ACTIVE=1
 export GREENBOOST_SHIM="$SHIM_DEST/$SHIM_LIB"
+export GREENBOOST_VMM_OVERRIDE="$SHIM_DEST/libgreenboost_vmm_override.so"
 # 'greenboost run' is a fallback for non-login contexts (cron, Docker entrypoints)
 greenboost() {
     case "\$1" in
-        run) shift; GREENBOOST_ACTIVE=1 LD_PRELOAD="\$GREENBOOST_SHIM" "\$@" ;;
+        run) shift
+            _gb_preload="\${GREENBOOST_VMM_OVERRIDE}:\${GREENBOOST_SHIM}"
+            [[ ! -f "\${GREENBOOST_VMM_OVERRIDE}" ]] && _gb_preload="\${GREENBOOST_SHIM}"
+            GREENBOOST_ACTIVE=1 LD_PRELOAD="\${_gb_preload}" "\$@"
+            unset _gb_preload
+            ;;
         *) echo "Usage: greenboost run <app> [args...]" >&2; return 1 ;;
     esac
 }
@@ -3900,6 +4068,9 @@ case "\$1" in
     tune-all)     exec "\$GB_SETUP" tune-all ;;
     turboquant)   exec "\$GB_SETUP" turboquant "\${@:2}" ;;
     vitals)       exec "\$GB_SETUP" vitals "\${@:2}" ;;
+    faults)       exec "\$GB_SETUP" faults "\${@:2}" ;;
+    top)          exec "\$GB_SETUP" top "\${@:2}" ;;
+    residency)    exec "\$GB_SETUP" residency "\${@:2}" ;;
     debug)        exec "\$GB_SETUP" debug "\${@:2}" ;;
     gen-inference-config) exec "\$GB_SETUP" gen-inference-config "\${@:2}" ;;
     setup|install|full-install) exec "\$GB_SETUP" "\$@" ;;
@@ -3913,7 +4084,12 @@ case "\$1" in
     clear)           exec "\$GB_SETUP" clear "\${@:2}" ;;
     clean-logs)      exec "\$GB_SETUP" clean-logs ;;
     test)            exec "\$GB_SETUP" test "\${@:2}" ;;
-    run)          shift; GREENBOOST_ACTIVE=1 LD_PRELOAD="$SHIM_DEST/$SHIM_LIB" "\$@" ;;
+    run)          shift
+        _gb_vmm="$SHIM_DEST/libgreenboost_vmm_override.so"
+        _gb_preload="\${_gb_vmm}:$SHIM_DEST/$SHIM_LIB"
+        [[ ! -f "\${_gb_vmm}" ]] && _gb_preload="$SHIM_DEST/$SHIM_LIB"
+        GREENBOOST_ACTIVE=1 LD_PRELOAD="\${_gb_preload}" "\$@"
+        ;;
     help|--help|-h|"") exec "\$GB_SETUP" show-commands ;;
     *)            echo "Unknown command: '\$1'  - run: greenboost help" >&2; exit 1 ;;
 esac
@@ -3945,6 +4121,12 @@ WRAPEOF
     # importable from any CUDA env on PYTHONPATH=/usr/local/lib/greenboost.
     cmd_install_python_files
 
+    # Ensure 'greenboost' group exists and the invoking user is a member so
+    # non-root processes can read cluster.key (mode 0640 root:greenboost).
+    gb_ensure_greenboost_group
+    # Repair existing cluster.key permissions on upgrade.
+    [[ -f "$GB_CLUSTER_KEY" ]] && _gb_set_keyfile_perms "$GB_CLUSTER_KEY"
+
     # Write build_info stamp (readable by 'greenboost build')
     mkdir -p /etc/greenboost
     local _git_hash
@@ -3959,9 +4141,15 @@ WRAPEOF
     gb_info "Generating hardware profile..."
     cmd_profile_create || gb_warn "profile create failed - DDR speed will default to 2400 MT/s"
 
+    # Install and (re)start eBPF tracer if the binary was built
+    _gb_install_ebpf_tracer
+
     gb_ok "Installation complete"
     gb_info "Load:    sudo modprobe greenboost"
     gb_info "Status:  greenboost vitals"
+    gb_info "Faults:  greenboost faults"
+    gb_info "Top:     greenboost top"
+    gb_info "Residency: greenboost residency"
 
     # Push update to all connected feeders (unattended, best-effort)
     _gb_update_all_feeders
@@ -4009,7 +4197,7 @@ cmd_load() {
         info "KV reserve auto-set to ${GB_KV_RESERVE_MB} MB (OLLAMA_NUM_CTX=${_ctx})"
     fi
 
-    if lsmod | grep -q "^${DRIVER_NAME} "; then
+    if grep -q "^${DRIVER_NAME} " <<< "$(lsmod)"; then
         warn "Module already loaded - reloading..."
         # Stop consumers before rmmod to avoid EBUSY
         for svc in ollama llama-server; do
@@ -4080,7 +4268,7 @@ cmd_load() {
 
 cmd_unload() {
     need_root unload
-    if lsmod | grep -q "^${DRIVER_NAME} "; then
+    if grep -q "^${DRIVER_NAME} " <<< "$(lsmod)"; then
         _rmmod_with_retry || die "rmmod failed - check: dmesg | tail -5"
     else
         info "GreenBoost is not loaded"
@@ -4299,6 +4487,35 @@ USB_UDEV
 kernel/mm/transparent_hugepage/enabled = always
 SYSFS
     gb_ok "sysfs.d: wrote $sysfs_conf (THP=always on boot)"
+}
+
+# ---- tune-revert --------------------------------------------------------
+# Restore the continuous OS tuner's levers (CPU governor/EPP, GPU clocks/
+# power limit, vm.* tunables) to the pre-tune baseline GbControl captured
+# the first time each lever was touched. Does NOT undo the static
+# install-time `tune`/`tune-sysctl`/`tune-grub` floor — only the dynamic
+# Loop O-S levers in gb_control.py's os_tune_baseline.json.
+cmd_tune_revert() {
+    need_root tune-revert
+    info "Reverting continuous OS-tune levers to captured baseline..."
+    python3 - << 'PYEOF'
+import sys
+sys.path.insert(0, "/usr/local/lib/greenboost")
+try:
+    from gb_control import GbControl
+    ctrl = GbControl()
+    results = ctrl.restore_baseline()
+    if not results:
+        print("[tune-revert] no baseline captured — nothing to revert")
+    else:
+        for key, ok in results.items():
+            print(f"[tune-revert] {key}: {'restored' if ok else 'FAILED'}")
+except Exception as exc:
+    print(f"[tune-revert] error: {exc}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+    rm -f /etc/sysctl.d/99-zzz-greenboost-dynamic.conf 2>/dev/null
+    gb_ok "OS-tune baseline restore complete"
 }
 
 # ---- tune-grub ---------------------------------------------------------
@@ -4676,7 +4893,7 @@ cmd_tune_libs() {
 
     # cpuid - lets userspace read CPUID leaves directly. Used by turbostat,
     # CUDA diagnostics, and intel-microcode update verification.
-    if lsmod | grep -q "^cpuid "; then
+    if grep -q "^cpuid " <<< "$(lsmod)"; then
         info "  [ok]      cpuid  (loaded)"
     else
         modprobe cpuid && info "  [loaded]  cpuid" || warn "  cpuid: modprobe failed"
@@ -4793,6 +5010,364 @@ cmd_clear_nvtx_logs() {
         cleared=1
     fi
     [[ $cleared -eq 0 ]] && gb_info "No NVTX log files found (nothing to clear)"
+}
+
+# ── cmd_faults — eBPF tier-migration and UVM fault observability ─────────────
+# Usage: greenboost faults [--llm]
+#
+# Shows live T2↔T3 migration rates, cold-evict and alloc rates, and UVM
+# page-fault counters sourced from /run/greenboost/ebpf_stats (written by
+# greenboost-ebpf-trace).  When the tracer is absent, falls back to reading
+# /proc/driver/nvidia-uvm/.../fault_stats and the kernel module's GET_INFO
+# counters, and prints a one-line hint to start the tracer.
+#
+# Interactive TUI: alternate-screen buffer, 5 s refresh, Ctrl+S / Ctrl+C.
+# --llm: machine-readable plain text (ANSI stripped, one section per key).
+
+_cmd_faults_read_ebpf_stats() {
+    # Reads /run/greenboost/ebpf_stats into EBPF_* variables.
+    # Sets EBPF_TRACER_ACTIVE=1 when file is fresh (written in last 3 s).
+    EBPF_TRACER_ACTIVE=0
+    EBPF_T3_EVICT_RATE=0; EBPF_T3_PROMOTE_RATE=0; EBPF_COLD_EVICT_RATE=0
+    EBPF_T3_BYTES_OUT=0;  EBPF_T3_BYTES_IN=0
+    EBPF_ALLOC_RATE=0;    EBPF_PIN_RATE=0
+    EBPF_UVM_FAULT_RATE=0; EBPF_UVM_PAGES_IN=0; EBPF_UVM_PAGES_OUT=0
+    EBPF_EVENTS_TOTAL=0
+
+    local _sf="/run/greenboost/ebpf_stats"
+    [[ -f "$_sf" ]] || return
+    # Stale check: mtime within 3 s
+    local _mtime _now
+    _mtime=$(stat -c %Y "$_sf" 2>/dev/null || echo 0)
+    _now=$(date +%s)
+    (( _now - _mtime > 3 )) && return
+    EBPF_TRACER_ACTIVE=1
+
+    local key val
+    while IFS='=' read -r key val; do
+        case "$key" in
+            t3_evict_rate)   EBPF_T3_EVICT_RATE="$val"   ;;
+            t3_promote_rate) EBPF_T3_PROMOTE_RATE="$val"  ;;
+            cold_evict_rate) EBPF_COLD_EVICT_RATE="$val"  ;;
+            t3_bytes_out_s)  EBPF_T3_BYTES_OUT="$val"     ;;
+            t3_bytes_in_s)   EBPF_T3_BYTES_IN="$val"      ;;
+            alloc_rate)      EBPF_ALLOC_RATE="$val"        ;;
+            pin_rate)        EBPF_PIN_RATE="$val"          ;;
+            uvm_fault_rate)  EBPF_UVM_FAULT_RATE="$val"   ;;
+            uvm_pages_in)    EBPF_UVM_PAGES_IN="$val"      ;;
+            uvm_pages_out)   EBPF_UVM_PAGES_OUT="$val"     ;;
+            events_total)    EBPF_EVENTS_TOTAL="$val"      ;;
+        esac
+    done < "$_sf"
+}
+
+_cmd_faults_read_uvm_procfs() {
+    # Fallback: read UVM fault counts from /proc/driver/nvidia-uvm
+    UVM_PROCFS_FAULTS=0; UVM_PROCFS_PAGES_IN=0; UVM_PROCFS_PAGES_OUT=0
+    local _base="/proc/driver/nvidia-uvm/gpus"
+    [[ -d "$_base" ]] || return
+    local _gpu _line _val
+    for _gpu in "$_base"/*/; do
+        [[ -f "${_gpu}fault_stats" ]] || continue
+        while read -r _line; do
+            case "$_line" in
+                "replayable_faults"*)
+                    _val="${_line##* }"; UVM_PROCFS_FAULTS=$(( UVM_PROCFS_FAULTS + _val )) ;;
+                *"num_pages_in"*)
+                    _val=$(echo "$_line" | awk '{print $2}')
+                    UVM_PROCFS_PAGES_IN=$(( UVM_PROCFS_PAGES_IN + _val )) ;;
+                *"num_pages_out"*)
+                    _val=$(echo "$_line" | awk '{print $2}')
+                    UVM_PROCFS_PAGES_OUT=$(( UVM_PROCFS_PAGES_OUT + _val )) ;;
+            esac
+        done < "${_gpu}fault_stats"
+    done
+}
+
+_cmd_faults_snapshot() {
+    local _ts; _ts=$(date '+%Y-%m-%dT%H:%M:%S')
+
+    _cmd_faults_read_ebpf_stats
+    _cmd_faults_read_uvm_procfs
+
+    local _pid_f="/run/greenboost/ebpf_trace.pid"
+    local _tracer_pid=""
+    [[ -f "$_pid_f" ]] && _tracer_pid=$(cat "$_pid_f" 2>/dev/null)
+
+    # ── Title ─────────────────────────────────────────────────────────────
+    echo -e "  ${C_VIOLET}${C_BOLD}GreenBoost Faults${C_RESET}  ${C_DIM}eBPF tier-migration · ${_ts}${C_RESET}"
+    echo -e "${C_DIM}$(printf '─%.0s' $(seq 1 72))${C_RESET}"
+
+    # ── Tracer status ──────────────────────────────────────────────────────
+    if [[ "$EBPF_TRACER_ACTIVE" == "1" ]]; then
+        local _pid_hint=""
+        [[ -n "$_tracer_pid" ]] && _pid_hint=" (pid ${_tracer_pid})"
+        echo -e "  ${C_LIME}${C_BOLD}●${C_RESET}  ${C_GRAY}eBPF tracer active${_pid_hint}  ${C_DIM}events: ${EBPF_EVENTS_TOTAL}${C_RESET}"
+    else
+        echo -e "  ${C_AMBER}${C_BOLD}○${C_RESET}  ${C_AMBER}eBPF tracer not running${C_RESET}  ${C_DIM}start: sudo greenboost-ebpf-trace${C_RESET}"
+        echo -e "  ${C_DIM}(UVM procfs counters shown below — rates not available without tracer)${C_RESET}"
+    fi
+    echo ""
+
+    # ── T2 ↔ T3 migration rates ───────────────────────────────────────────
+    echo -e "  ${C_CYAN}${C_BOLD}T2 ↔ T3 Migration${C_RESET}  ${C_DIM}(5 s avg)${C_RESET}"
+    echo -e "${C_DIM}$(printf '─%.0s' $(seq 1 72))${C_RESET}"
+
+    if [[ "$EBPF_TRACER_ACTIVE" == "1" ]]; then
+        # Human-readable byte rate helper
+        _fmt_brate() {
+            local _b="${1:-0}"; local _bi="${_b%.*}"
+            if (( _bi >= 1073741824 )); then
+                printf "%.1f GB/s" "$(echo "scale=1; $_b / 1073741824" | bc -l 2>/dev/null || echo 0)"
+            elif (( _bi >= 1048576 )); then
+                printf "%.1f MB/s" "$(echo "scale=1; $_b / 1048576" | bc -l 2>/dev/null || echo 0)"
+            elif (( _bi >= 1024 )); then
+                printf "%.0f KB/s" "$(echo "scale=0; $_b / 1024" | bc -l 2>/dev/null || echo 0)"
+            else
+                printf "%.0f B/s" "$_b"
+            fi
+        }
+
+        local _out_rate; _out_rate=$(_fmt_brate "$EBPF_T3_BYTES_OUT")
+        local _in_rate;  _in_rate=$(_fmt_brate "$EBPF_T3_BYTES_IN")
+
+        printf "  %-30s %s/s   %s\n" \
+            "T2 → T3 evictions" \
+            "${EBPF_T3_EVICT_RATE}" \
+            "(${_out_rate})"
+        printf "  %-30s %s/s   %s\n" \
+            "T3 → T2 promotions" \
+            "${EBPF_T3_PROMOTE_RATE}" \
+            "(${_in_rate})"
+        printf "  %-30s %s/s\n"  "Cold-evict sweeps"  "${EBPF_COLD_EVICT_RATE}"
+        printf "  %-30s %s/s\n"  "T2 alloc rate"       "${EBPF_ALLOC_RATE}"
+        printf "  %-30s %s/s\n"  "DMA-BUF pin rate"    "${EBPF_PIN_RATE}"
+    else
+        echo -e "  ${C_DIM}Migration rates unavailable — tracer not running${C_RESET}"
+    fi
+    echo ""
+
+    # ── UVM page faults ───────────────────────────────────────────────────
+    echo -e "  ${C_CYAN}${C_BOLD}NVIDIA UVM Page Faults${C_RESET}"
+    echo -e "${C_DIM}$(printf '─%.0s' $(seq 1 72))${C_RESET}"
+
+    if [[ "$EBPF_TRACER_ACTIVE" == "1" ]]; then
+        printf "  %-30s %s/s\n"  "UVM GPU fault rate"   "${EBPF_UVM_FAULT_RATE}"
+        printf "  %-30s %s\n"    "Pages migrated to GPU" "${EBPF_UVM_PAGES_IN}"
+        printf "  %-30s %s\n"    "Pages migrated from GPU" "${EBPF_UVM_PAGES_OUT}"
+    fi
+
+    # Procfs always shown as reference
+    if [[ "$UVM_PROCFS_FAULTS" -gt 0 || "$UVM_PROCFS_PAGES_IN" -gt 0 ]]; then
+        echo -e "  ${C_DIM}procfs (cumulative since load):${C_RESET}"
+        printf "  ${C_DIM}  %-28s %s${C_RESET}\n" "replayable faults" "${UVM_PROCFS_FAULTS}"
+        printf "  ${C_DIM}  %-28s %s pages${C_RESET}\n" "pages in (→ GPU)" "${UVM_PROCFS_PAGES_IN}"
+        printf "  ${C_DIM}  %-28s %s pages${C_RESET}\n" "pages out (← GPU)" "${UVM_PROCFS_PAGES_OUT}"
+    else
+        echo -e "  ${C_DIM}No managed memory (cudaMallocManaged) detected${C_RESET}"
+        echo -e "  ${C_DIM}GreenBoost uses pinned DDR (DMA-BUF) — no UVM page faults expected${C_RESET}"
+    fi
+    echo ""
+
+    # ── Recent events tail ────────────────────────────────────────────────
+    local _evf="/run/greenboost/ebpf_events"
+    if [[ -f "$_evf" && "$EBPF_TRACER_ACTIVE" == "1" ]]; then
+        echo -e "  ${C_CYAN}${C_BOLD}Recent Migration Events${C_RESET}  ${C_DIM}(last 10)${C_RESET}"
+        echo -e "${C_DIM}$(printf '─%.0s' $(seq 1 72))${C_RESET}"
+        tail -10 "$_evf" | while IFS= read -r _ev; do
+            # Convert ns timestamp to relative "Ns ago"
+            local _ts_ns; _ts_ns=$(echo "$_ev" | cut -d' ' -f1)
+            local _rest;  _rest=$(echo   "$_ev" | cut -d' ' -f2-)
+            local _now_ns; _now_ns=$(date +%s%N 2>/dev/null || echo 0)
+            local _age_ms=$(( (_now_ns - _ts_ns) / 1000000 ))
+            if (( _age_ms < 2000 )); then
+                local _rel="${_age_ms}ms ago"
+            else
+                local _rel="$(( _age_ms / 1000 ))s ago"
+            fi
+            echo -e "  ${C_DIM}${_rel}${C_RESET}  ${_rest}"
+        done
+        echo ""
+    fi
+}
+
+cmd_faults() {
+    local _llm=0
+    [[ "${1:-}" == "--llm" ]] && _llm=1
+
+    if [[ "$_llm" == "1" ]]; then
+        _cmd_faults_snapshot | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^[[:space:]]*//'
+        return 0
+    fi
+
+    if [[ ! -t 0 ]]; then
+        # Non-interactive: single snapshot to stdout
+        _cmd_faults_snapshot
+        return 0
+    fi
+
+    # Interactive TUI
+    _gb_run_tui_loop "_cmd_faults_snapshot" 5 \
+        "  ${C_DIM}Updating every 5s  ${C_GRAY}Ctrl+S${C_DIM}: refresh  ${C_GRAY}Ctrl+C${C_DIM}: exit${C_RESET}" \
+        "/run/greenboost/ebpf_events"
+}
+
+# ── cmd_top / cmd_residency - per-buffer hot/cold residency observability ──
+#
+# Source: /sys/kernel/debug/greenboost/residency (kernel debugfs export,
+# greenboost.c gb_residency_show), one line per live T2/T3 buffer with
+# id/tier/size_mb/heat/flags/pid.  `heat` is the ARC-style access-frequency
+# score pushed by the shim via GB_IOCTL_SET_HEAT - this is the "nvidia-smi
+# for memory migration" gap: which allocations are actually hot vs. just
+# recently touched.
+
+_GB_RESIDENCY_FILE="/sys/kernel/debug/greenboost/residency"
+
+# Reads $_GB_RESIDENCY_FILE into the global array _GB_RES_LINES (one
+# key=value string per buffer).  Sets _GB_RES_AVAILABLE=1/0.
+_gb_residency_read() {
+    _GB_RES_AVAILABLE=0
+    _GB_RES_LINES=()
+    if [[ -r "$_GB_RESIDENCY_FILE" ]]; then
+        mapfile -t _GB_RES_LINES < "$_GB_RESIDENCY_FILE" 2>/dev/null
+        _GB_RES_AVAILABLE=1
+    elif [[ -e "$_GB_RESIDENCY_FILE" ]] && command -v sudo >/dev/null 2>&1; then
+        mapfile -t _GB_RES_LINES < <(sudo cat "$_GB_RESIDENCY_FILE" 2>/dev/null)
+        [[ ${#_GB_RES_LINES[@]} -gt 0 ]] && _GB_RES_AVAILABLE=1
+    fi
+}
+
+# Extracts "key=value" field $2 from a residency line $1.
+_gb_res_field() {
+    local _line="$1" _key="$2"
+    [[ "$_line" =~ ${_key}=([^[:space:]]+) ]] && echo "${BASH_REMATCH[1]}"
+}
+
+_cmd_top_snapshot() {
+    local _ts; _ts=$(date '+%Y-%m-%dT%H:%M:%S')
+
+    echo -e "  ${C_VIOLET}${C_BOLD}GreenBoost Top${C_RESET}  ${C_DIM}per-buffer residency · ${_ts}${C_RESET}"
+    echo -e "${C_DIM}$(printf '─%.0s' $(seq 1 88))${C_RESET}"
+
+    _gb_residency_read
+    if [[ "$_GB_RES_AVAILABLE" != "1" ]]; then
+        echo -e "  ${C_AMBER}residency export unavailable${C_RESET}  ${C_DIM}(debugfs not mounted, kernel module not loaded, or run with sudo)${C_RESET}"
+        return 0
+    fi
+    if [[ ${#_GB_RES_LINES[@]} -eq 0 ]]; then
+        echo -e "  ${C_DIM}No live T2/T3 buffers${C_RESET}"
+        return 0
+    fi
+
+    printf "  %-8s %-5s %10s %8s %-22s %-8s %s\n" \
+        "ID" "TIER" "SIZE_MB" "HEAT" "FLAGS" "PID" "STATE"
+    echo -e "${C_DIM}$(printf '─%.0s' $(seq 1 88))${C_RESET}"
+
+    # Sort by heat descending (hottest first) - the whole point of this view.
+    local _line _id _tier _size _heat _flags _pid _frozen _t1p _state
+    while IFS= read -r _line; do
+        [[ -z "$_line" ]] && continue
+        _id=$(_gb_res_field   "$_line" id)
+        _tier=$(_gb_res_field "$_line" tier)
+        _size=$(_gb_res_field "$_line" size_mb)
+        _heat=$(_gb_res_field "$_line" heat)
+        _flags=$(_gb_res_field "$_line" flags)
+        _pid=$(_gb_res_field  "$_line" pid)
+        _frozen=$(_gb_res_field "$_line" frozen)
+        _t1p=$(_gb_res_field    "$_line" t1_priority)
+        _state="cold"
+        [[ "$_heat" -ge 8 ]] 2>/dev/null && _state="hot"
+        [[ "${_heat:-0}" -gt 0 && "${_heat:-0}" -lt 8 ]] 2>/dev/null && _state="warm"
+        [[ "$_frozen" == "1" ]] && _state="frozen"
+        [[ "$_t1p" == "1" ]] && _state="t1-priority"
+        printf "  %-8s %-5s %10s %8s %-22s %-8s %s\n" \
+            "$_id" "$_tier" "$_size" "${_heat:-0}" "$_flags" "$_pid" "$_state"
+    done < <(printf '%s\n' "${_GB_RES_LINES[@]}" | sort -t= -k4 -rn 2>/dev/null || printf '%s\n' "${_GB_RES_LINES[@]}")
+}
+
+cmd_top() {
+    local _llm=0
+    [[ "${1:-}" == "--llm" ]] && _llm=1
+
+    if [[ "$_llm" == "1" ]]; then
+        _cmd_top_snapshot | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^[[:space:]]*//'
+        return 0
+    fi
+
+    if [[ ! -t 0 ]]; then
+        _cmd_top_snapshot
+        return 0
+    fi
+
+    _gb_run_tui_loop "_cmd_top_snapshot" 5 \
+        "  ${C_DIM}Updating every 5s  ${C_GRAY}Ctrl+S${C_DIM}: refresh  ${C_GRAY}Ctrl+C${C_DIM}: exit${C_RESET}"
+}
+
+_cmd_residency_snapshot() {
+    local _ts; _ts=$(date '+%Y-%m-%dT%H:%M:%S')
+
+    echo -e "  ${C_VIOLET}${C_BOLD}GreenBoost Residency${C_RESET}  ${C_DIM}hot/warm/cold breakdown · ${_ts}${C_RESET}"
+    echo -e "${C_DIM}$(printf '─%.0s' $(seq 1 72))${C_RESET}"
+
+    _gb_residency_read
+    if [[ "$_GB_RES_AVAILABLE" != "1" ]]; then
+        echo -e "  ${C_AMBER}residency export unavailable${C_RESET}  ${C_DIM}(debugfs not mounted, kernel module not loaded, or run with sudo)${C_RESET}"
+        return 0
+    fi
+
+    local _hot_mb=0 _warm_mb=0 _cold_mb=0 _t2_mb=0 _t3_mb=0
+    local _line _tier _size _heat
+    for _line in "${_GB_RES_LINES[@]}"; do
+        [[ -z "$_line" ]] && continue
+        _tier=$(_gb_res_field "$_line" tier)
+        _size=$(_gb_res_field "$_line" size_mb); _size="${_size:-0}"
+        _heat=$(_gb_res_field "$_line" heat);    _heat="${_heat:-0}"
+        [[ "$_tier" == "T2" ]] && _t2_mb=$(( _t2_mb + _size ))
+        [[ "$_tier" == "T3" ]] && _t3_mb=$(( _t3_mb + _size ))
+        if   (( _heat >= 8 )); then _hot_mb=$(( _hot_mb + _size ))
+        elif (( _heat > 0  )); then _warm_mb=$(( _warm_mb + _size ))
+        else                        _cold_mb=$(( _cold_mb + _size ))
+        fi
+    done
+
+    echo -e "  ${C_CYAN}${C_BOLD}By tier${C_RESET}"
+    printf "  %-20s %10s MB\n" "T2 (DDR)"  "$_t2_mb"
+    printf "  %-20s %10s MB\n" "T3 (NVMe)" "$_t3_mb"
+    echo ""
+    echo -e "  ${C_CYAN}${C_BOLD}By heat${C_RESET}  ${C_DIM}(hot: heat≥8, warm: 1-7, cold: 0 - never re-touched since last decay)${C_RESET}"
+    printf "  %-20s %10s MB\n" "Hot"  "$_hot_mb"
+    printf "  %-20s %10s MB\n" "Warm" "$_warm_mb"
+    printf "  %-20s %10s MB\n" "Cold" "$_cold_mb"
+    echo ""
+
+    # Churn: reuse the eBPF migration rates if the tracer is running -
+    # same source _cmd_faults_snapshot uses, avoids a second counting path.
+    _cmd_faults_read_ebpf_stats 2>/dev/null
+    if [[ "${EBPF_TRACER_ACTIVE:-0}" == "1" ]]; then
+        echo -e "  ${C_CYAN}${C_BOLD}Churn${C_RESET}  ${C_DIM}(5 s avg, from eBPF tracer)${C_RESET}"
+        printf "  %-20s %s/s\n" "T2 → T3 evictions"  "${EBPF_T3_EVICT_RATE:-0}"
+        printf "  %-20s %s/s\n" "T3 → T2 promotions" "${EBPF_T3_PROMOTE_RATE:-0}"
+    else
+        echo -e "  ${C_DIM}Churn rates unavailable - start: sudo greenboost-ebpf-trace${C_RESET}"
+    fi
+}
+
+cmd_residency() {
+    local _llm=0
+    [[ "${1:-}" == "--llm" ]] && _llm=1
+
+    if [[ "$_llm" == "1" ]]; then
+        _cmd_residency_snapshot | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^[[:space:]]*//'
+        return 0
+    fi
+
+    if [[ ! -t 0 ]]; then
+        _cmd_residency_snapshot
+        return 0
+    fi
+
+    _gb_run_tui_loop "_cmd_residency_snapshot" 5 \
+        "  ${C_DIM}Updating every 5s  ${C_GRAY}Ctrl+S${C_DIM}: refresh  ${C_GRAY}Ctrl+C${C_DIM}: exit${C_RESET}"
 }
 
 # ── cmd_debug / cmd_debug_vitals - toggleable deep diagnostics ──────────────
@@ -5188,7 +5763,7 @@ _logs_llm() {
 
     # Header
     local _mod="MISSING"
-    lsmod 2>/dev/null | grep -q '^greenboost' && _mod="loaded"
+    grep -q '^greenboost' <<< "$(lsmod 2>/dev/null)" && _mod="loaded"
     local _vram="?"
     _vram=$(journalctl -u ollama --no-pager -q -n 50 2>/dev/null \
         | grep -oP 'total="\K[^"]+' | tail -1)
@@ -5240,7 +5815,7 @@ _logs_llm() {
 
 _cmd_logs_snapshot() {
     local _mod_status="MISSING"
-    lsmod 2>/dev/null | grep -q '^greenboost' && _mod_status="loaded"
+    grep -q '^greenboost' <<< "$(lsmod 2>/dev/null)" && _mod_status="loaded"
     local _vram_str="?"
     _vram_str=$(journalctl -u ollama --no-pager -q -n 50 2>/dev/null \
         | grep -oP 'total="\K[^"]+' | tail -1)
@@ -5486,7 +6061,7 @@ _cmd_inference_logs_llm() {
         [[ -n "$_filtered" ]] && printf '%s\n' "$_filtered" | sed 's/^/  /'
     }
     local _mod="MISSING"
-    lsmod 2>/dev/null | grep -q '^greenboost' && _mod="loaded"
+    grep -q '^greenboost' <<< "$(lsmod 2>/dev/null)" && _mod="loaded"
     echo "gb_inference_logs v=${GB_VERSION} ts=$(date '+%Y-%m-%dT%H:%M') mod=${_mod}"
     _il_section "kernel" "$(gather_flow_events 50 2>/dev/null)"
     _il_section "services" "$(journalctl --since '1 hour ago' --no-pager -q \
@@ -5501,7 +6076,7 @@ _cmd_inference_logs_snapshot() {
 
     local _diag_errors=() _diag_warns=() _diag_ok=()
     local _mod_status="MISSING"
-    lsmod 2>/dev/null | grep -q '^greenboost' && _mod_status="loaded"
+    grep -q '^greenboost' <<< "$(lsmod 2>/dev/null)" && _mod_status="loaded"
     [[ "$_mod_status" == "loaded" ]] \
         && _diag_ok+=("kernel module loaded") \
         || _diag_errors+=("kernel module NOT loaded - no T2/T3 memory available")
@@ -5817,7 +6392,7 @@ cmd_inference_test() {
 
     local _pf_errors=() _pf_warns=()
 
-    if ! lsmod 2>/dev/null | grep -q "^${DRIVER_NAME} "; then
+    if ! grep -q "^${DRIVER_NAME} " <<< "$(lsmod 2>/dev/null)"; then
         _pf_warns+=("GreenBoost kernel module not loaded - paths B/C only")
     fi
     if ! command -v ollama &>/dev/null && ! curl -sf --max-time 2 http://localhost:11434/api/tags &>/dev/null; then
@@ -5999,7 +6574,7 @@ _cmd_vitals_snapshot() {
 
     # Left: System
     _sys_lines+=("  ${C_BOLD}System${C_RESET}")
-    if lsmod | grep -q "^${DRIVER_NAME} "; then
+    if grep -q "^${DRIVER_NAME} " <<< "$(lsmod)"; then
         _sys_lines+=("  ${C_LIME}✓${C_RESET}  ${C_GRAY}Module ${C_LIME}v${GB_VERSION}${C_RESET}")
         _diag_ok+=("kernel module loaded")
     else
@@ -6429,13 +7004,59 @@ _cmd_vitals_snapshot() {
         (( ${ORCH_ACTUATE:-0} == 1 )) && _orch_act_col="${C_AMBER}"
         local _orch_ecc_col="${C_DIM}"
         (( ${ORCH_ECC_DEGRADED:-0} == 1 )) && _orch_ecc_col="${C_RED}"
+        local _orch_therm_col="${C_DIM}"
+        (( ${ORCH_THERMAL_STRESS:-0} == 1 )) && _orch_therm_col="${C_AMBER}"
+        local _orch_membw_col="${C_DIM}"
+        (( ${ORCH_MEM_BW_STRESS:-0} == 1 )) && _orch_membw_col="${C_AMBER}"
         local _orch_ws_col="${C_DIM}"
         (( ${ORCH_WS_ABOVE:-0} == 1 )) && _orch_ws_col="${C_AMBER}"
-        printf "  ${C_DIM}ws_reserve: ${C_RESET}${C_CYAN}%s MB${C_RESET}  ${C_DIM}actuate: ${C_RESET}${_orch_act_col}%s${C_RESET}  ${C_DIM}ecc_degraded: ${C_RESET}${_orch_ecc_col}%s${C_RESET}  ${C_DIM}ws_above: ${C_RESET}${_orch_ws_col}%s${C_RESET}\n" \
+        local _orch_vp_col="${C_DIM}"
+        (( ${ORCH_VRAM_PRESSURE:-0} == 1 )) && _orch_vp_col="${C_RED}"
+        local _orch_cp_col="${C_DIM}"
+        (( ${ORCH_CLUSTER_PRESSURE:-0} == 1 )) && _orch_cp_col="${C_AMBER}"
+        printf "  ${C_DIM}ws_reserve: ${C_RESET}${C_CYAN}%s MB${C_RESET}  ${C_DIM}actuate: ${C_RESET}${_orch_act_col}%s${C_RESET}  ${C_DIM}ecc_degraded: ${C_RESET}${_orch_ecc_col}%s${C_RESET}  ${C_DIM}thermal_stress: ${C_RESET}${_orch_therm_col}%s${C_RESET}  ${C_DIM}mem_bw_stress: ${C_RESET}${_orch_membw_col}%s${C_RESET}  ${C_DIM}ws_above: ${C_RESET}${_orch_ws_col}%s${C_RESET}  ${C_DIM}vram_pressure: ${C_RESET}${_orch_vp_col}%s${C_RESET}  ${C_DIM}cluster_pressure: ${C_RESET}${_orch_cp_col}%s${C_RESET}\n" \
             "${ORCH_WS_RESERVE_MB:-?}" \
             "$( (( ${ORCH_ACTUATE:-0} == 1 )) && echo YES || echo no )" \
             "$( (( ${ORCH_ECC_DEGRADED:-0} == 1 )) && echo YES || echo no )" \
-            "$( (( ${ORCH_WS_ABOVE:-0} == 1 )) && echo YES || echo no )"
+            "$( (( ${ORCH_THERMAL_STRESS:-0} == 1 )) && echo YES || echo no )" \
+            "$( (( ${ORCH_MEM_BW_STRESS:-0} == 1 )) && echo YES || echo no )" \
+            "$( (( ${ORCH_WS_ABOVE:-0} == 1 )) && echo YES || echo no )" \
+            "$( (( ${ORCH_VRAM_PRESSURE:-0} == 1 )) && echo YES || echo no )" \
+            "$( (( ${ORCH_CLUSTER_PRESSURE:-0} == 1 )) && echo YES || echo no )"
+        local _orch_health_col="${C_DIM}"
+        (( ${ORCH_HEALTH_OK:-1} == 0 )) && _orch_health_col="${C_RED}"
+        local _orch_armed_col="${C_DIM}"
+        (( ${ORCH_HEALTH_EVICT_ARMED:-0} == 1 )) && _orch_armed_col="${C_AMBER}"
+        local _orch_sbe_col="${C_DIM}"
+        (( ${ORCH_SBE_ELEVATED:-0} == 1 )) && _orch_sbe_col="${C_AMBER}"
+        local _orch_clk_col="${C_DIM}"
+        (( ${ORCH_CLOCK_THROTTLED:-0} == 1 )) && _orch_clk_col="${C_AMBER}"
+        printf "  ${C_DIM}health_ok: ${C_RESET}${_orch_health_col}%s${C_RESET}  ${C_DIM}health_evict_armed: ${C_RESET}${_orch_armed_col}%s${C_RESET}  ${C_DIM}sbe_elevated: ${C_RESET}${_orch_sbe_col}%s${C_RESET}  ${C_DIM}sbe_count: ${C_RESET}${_orch_sbe_col}%s${C_RESET}  ${C_DIM}clock_throttled: ${C_RESET}${_orch_clk_col}%s${C_RESET}  ${C_DIM}sm_clk_max: ${C_RESET}${C_DIM}%s MHz${C_RESET}\n" \
+            "$( (( ${ORCH_HEALTH_OK:-1} == 1 )) && echo yes || echo NO )" \
+            "$( (( ${ORCH_HEALTH_EVICT_ARMED:-0} == 1 )) && echo YES || echo no )" \
+            "$( (( ${ORCH_SBE_ELEVATED:-0} == 1 )) && echo YES || echo no )" \
+            "${ORCH_SBE_SEEN:-0}" \
+            "$( (( ${ORCH_CLOCK_THROTTLED:-0} == 1 )) && echo YES || echo no )" \
+            "${ORCH_SM_CLOCK_MAX_MHZ:-0}"
+        if [[ "${ORCH_OS_TUNE_ENABLED:-0}" == "1" ]]; then
+            local _orch_gaming_col="${C_DIM}"
+            (( ${ORCH_GAMING_MODE:-0} == 1 )) && _orch_gaming_col="${C_AMBER}"
+            printf "  ${C_DIM}os_tune: ${C_RESET}${C_LIME}active${C_RESET}  ${C_DIM}gaming_mode: ${C_RESET}${_orch_gaming_col}%s${C_RESET}  ${C_DIM}governor: ${C_RESET}${C_CYAN}%s${C_RESET}  ${C_DIM}gpu_persistence: ${C_RESET}${C_CYAN}%s${C_RESET}  ${C_DIM}power_limit: ${C_RESET}${C_CYAN}%s W${C_RESET}  ${C_DIM}swappiness: ${C_RESET}${C_CYAN}%s${C_RESET}\n" \
+                "$( (( ${ORCH_GAMING_MODE:-0} == 1 )) && echo YES || echo no )" \
+                "${ORCH_CPU_GOVERNOR:-?}" \
+                "$( (( ${ORCH_GPU_PERSISTENCE:-0} == 1 )) && echo on || echo off )" \
+                "${ORCH_GPU_POWER_LIMIT_W:-?}" \
+                "${ORCH_SWAPPINESS:-?}"
+        fi
+        if [[ -n "$TOPO_INFERENCE_CPUS" ]]; then
+            local _topo_bw_col="${C_DIM}"
+            printf "  ${C_DIM}infer_cpus: ${C_RESET}${C_CYAN}%-10s${C_RESET}  ${C_DIM}infer_threads: ${C_RESET}${C_CYAN}%s${C_RESET}  ${C_DIM}bg_threads: ${C_RESET}${C_CYAN}%s${C_RESET}  ${C_DIM}pcie_sat: ${C_RESET}${_topo_bw_col}%s MB/s${C_RESET}  ${C_DIM}blackwell: ${C_RESET}${C_CYAN}%s${C_RESET}\n" \
+                "${TOPO_INFERENCE_CPUS}" \
+                "${TOPO_INFERENCE_THREADS:-?}" \
+                "${TOPO_BACKGROUND_THREADS:-?}" \
+                "${TOPO_PCIE_SAT_MB_S:-?}" \
+                "$( (( ${TOPO_IS_BLACKWELL:-0} == 1 )) && echo yes || echo no )"
+        fi
         if [[ -n "$SHIM_VIRTUAL_VRAM_MB" ]]; then
             printf "  ${C_DIM}virtual_vram: ${C_RESET}${C_CYAN}%s MB${C_RESET}  ${C_DIM}cluster_remote: ${C_RESET}${C_CYAN}%s MB${C_RESET}  ${C_DIM}kv_reserve: ${C_RESET}${C_CYAN}%s MB${C_RESET}\n" \
                 "${SHIM_VIRTUAL_VRAM_MB:-?}" "${SHIM_CLUSTER_REMOTE_MB:-0}" "${SHIM_KV_RESERVE_MB:-?}"
@@ -6516,6 +7137,7 @@ GB_NET_PORT=9740
 GB_NETD_BIN="/usr/local/bin/greenboost-netd"
 GB_NETD_PID="/run/greenboost/netd.pid"
 GB_CLUSTER_CONF="/etc/greenboost/cluster.conf"
+GB_CLUSTER_KEY="/etc/greenboost/cluster.key"
 # Audit F-L4-02: cluster-scoped known_hosts so feeder SSH calls can pin the
 # host key instead of using `StrictHostKeyChecking=no`.  cmd_connect adds an
 # entry on first contact; later calls can opt into strict checking by passing
@@ -6573,12 +7195,12 @@ _gb_run_tui_loop() {
     stty -ixon 2>/dev/null || true
     printf '\033[?1049h'
     printf '\033[?25l'
-    trap 'printf "\033[?25h\033[?1049l"; [[ -n "$_saved_stty" ]] && stty "${_saved_stty:-}" 2>/dev/null || true; exit 0' INT TERM EXIT
+    trap 'printf "\033[?25h\033[?1049l"; stty "${_saved_stty-}" 2>/dev/null || true; exit 0' INT TERM EXIT
     local _key=""
     while true; do
         printf '\033[H'
         [[ -n "$_header_hint" ]] && echo -e "$_header_hint"
-        "$_snapshot_fn"
+        "$_snapshot_fn" || true
         printf '\033[J'
         if read -t "$_refresh" -s -n 1 _key 2>/dev/null; then
             case "$_key" in
@@ -7027,7 +7649,7 @@ cmd_connect() {
     # enough to deny world read.  Default umask (022) leaves the file
     # mode 0644 = world-readable.  Tighten to 0640 (root:root, group can
     # read for monitoring/observability scripts).
-    chmod 0640 "$GB_CLUSTER_CONF" 2>/dev/null || true
+    chmod 0644 "$GB_CLUSTER_CONF" 2>/dev/null || true
     gb_info "SSH user: ${ssh_user}"
     _gb_write_cluster_extra_mem
 
@@ -7069,7 +7691,7 @@ cmd_health_check() {
     [[ $llm_mode -eq 0 ]] && { gb_header; gb_section "GreenBoost Health Check  $(date '+%Y-%m-%d %H:%M:%S')"; echo ""; }
 
     # 1. Kernel module
-    if lsmod 2>/dev/null | grep -q "^greenboost "; then
+    if grep -q "^greenboost " <<< "$(lsmod 2>/dev/null)"; then
         _hc_pass "Kernel module: greenboost loaded"
     else
         _hc_fail "Kernel module: greenboost NOT loaded (run: sudo greenboost load)"
@@ -7428,6 +8050,162 @@ cmd_feeders_diag() {
     [[ $_rc -eq 124 ]] && die "Diagnostic timed out after 120s - feeder may be unresponsive"
     [[ $_rc -ne 0  ]] && die "Diagnostic script failed (rc=${_rc}) - see output above"
     return 0
+}
+
+# cmd_feeders_genkey - generate a fresh random 32-byte cluster PSK and write
+# it to /etc/greenboost/cluster.key on THIS machine. Run once on whichever
+# side doesn't have a key yet, then export-key/import-key it to every other
+# machine in the cluster. Refuses to overwrite an existing key (use
+# import-key with --force semantics manually if you really mean to rotate -
+# rotating silently would desync every other machine's copy).
+# Usage: sudo greenboost feeders genkey
+cmd_feeders_genkey() {
+    need_root "feeders genkey"
+    if [[ -f "$GB_CLUSTER_KEY" ]]; then
+        die "A key already exists at $GB_CLUSTER_KEY - refusing to overwrite. Delete it first if you really mean to rotate (this will desync every other machine in the cluster)."
+    fi
+    gb_ensure_greenboost_group
+    mkdir -p "$(dirname "$GB_CLUSTER_KEY")"
+    local _hex
+    _hex=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+    printf '%s' "$_hex" > "$GB_CLUSTER_KEY"
+    _gb_set_keyfile_perms "$GB_CLUSTER_KEY"
+    local _mode; _mode=$(stat -c '%a' "$GB_CLUSTER_KEY")
+    gb_ok "Generated ${GB_CLUSTER_KEY} (mode ${_mode})"
+    gb_info "Share it with other machines: sudo greenboost feeders export-key"
+}
+
+# cmd_feeders_export_key - print this machine's cluster PSK for manual
+# copy-paste onto another machine. Run this ON THE FEEDER (or on whichever
+# side already has a working cluster.key) when there is no SSH/network path
+# to transfer the file directly - the operator reads the hex string off this
+# terminal and pastes it into `greenboost feeders import-key` on the other
+# machine. No network connection is required for this command itself.
+# Usage: sudo greenboost feeders export-key
+cmd_feeders_export_key() {
+    need_root "feeders export-key"
+    if [[ ! -f "$GB_CLUSTER_KEY" ]]; then
+        die "No cluster key at $GB_CLUSTER_KEY - generate one with: sudo greenboost feeders genkey"
+    fi
+    local _hex
+    _hex=$(tr -d '\n' < "$GB_CLUSTER_KEY")
+    if [[ ! "$_hex" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        die "$GB_CLUSTER_KEY does not contain exactly 64 hex characters - refusing to print a malformed key"
+    fi
+    gb_section "GreenBoost Cluster Key Export"
+    printf "  %b\n" "${C_AMBER}This is the cluster PSK - treat it like a password.${C_RESET}"
+    printf "  Copy the line below and run on the OTHER machine:\n\n"
+    printf "    %b\n\n" "${C_LIME}sudo greenboost feeders import-key ${_hex}${C_RESET}"
+}
+
+# cmd_feeders_import_key - write a cluster PSK (from export-key on another
+# machine) to this machine's /etc/greenboost/cluster.key. Prompts for the
+# key interactively (masked) if not passed as an argument.
+# Usage: sudo greenboost feeders import-key [HEX64]
+cmd_feeders_import_key() {
+    need_root "feeders import-key"
+    local _hex="${1:-}"
+    if [[ -z "$_hex" ]]; then
+        gb_section "GreenBoost Cluster Key Import"
+        local _char
+        printf "  Paste the 64-char hex key from 'feeders export-key': " > /dev/tty
+        while IFS= read -r -s -n1 _char < /dev/tty; do
+            case "$_char" in
+                '')            break ;;
+                $'\x7f'|$'\b') if [[ -n "$_hex" ]]; then
+                                   _hex="${_hex%?}"; printf '\b \b' > /dev/tty
+                               fi ;;
+                *)             _hex+="$_char"; printf '*' > /dev/tty ;;
+            esac
+        done
+        printf '\n' > /dev/tty
+    fi
+    if [[ ! "$_hex" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        die "Key must be exactly 64 hex characters (32 bytes) - got ${#_hex} chars"
+    fi
+    gb_ensure_greenboost_group
+    mkdir -p "$(dirname "$GB_CLUSTER_KEY")"
+    printf '%s' "$_hex" > "$GB_CLUSTER_KEY"
+    _gb_set_keyfile_perms "$GB_CLUSTER_KEY"
+    local _mode; _mode=$(stat -c '%a' "$GB_CLUSTER_KEY")
+    gb_ok "Wrote ${GB_CLUSTER_KEY} (mode ${_mode})"
+    gb_info "Retry: sudo greenboost connect <feeder-ip>"
+}
+
+# cmd_feeders_redeploy_netd - rebuild greenboost-netd from the local source tree
+# and atomically swap /usr/local/bin/greenboost-netd WITHOUT touching cluster.key
+# or any other /etc/greenboost/ file.  Use this instead of a Full Install when
+# you only need to deliver a daemon fix; it avoids the install path that wipes
+# cluster.key and re-installs stale cached binaries.
+# Usage: sudo greenboost feeders redeploy-netd
+cmd_feeders_redeploy_netd() {
+    need_root "feeders redeploy-netd"
+
+    gb_section "GreenBoost netd Redeploy"
+    gb_info "Source dir: ${MODULE_DIR}"
+    gb_info "Target:     ${GB_NETD_BIN}"
+
+    # 1. Build
+    gb_info "Building greenboost-netd (make netd)..."
+    if ! make -C "$MODULE_DIR" netd 2>&1 | tail -5; then
+        die "Build failed - check compiler output above"
+    fi
+    local _src="${MODULE_DIR}/greenboost-netd"
+    if [[ ! -f "$_src" ]]; then
+        die "Build succeeded but artifact not found at ${_src}"
+    fi
+
+    # 2. Stop running daemon (mirror feed stop inline - no subshell dispatch needed)
+    if [[ -f "$GB_NETD_PID" ]]; then
+        local _pid
+        _pid=$(cat "$GB_NETD_PID" 2>/dev/null)
+        if [[ -n "$_pid" ]] && kill -0 "$_pid" 2>/dev/null; then
+            kill "$_pid"
+            sleep 0.8
+            gb_ok "Feeder daemon stopped (pid ${_pid})"
+        fi
+        rm -f "$GB_NETD_PID"
+    else
+        gb_info "Feeder daemon not running (will start fresh)"
+    fi
+
+    # 3. Atomic install - does NOT touch cluster.key or any other /etc/greenboost/ file
+    install -m 755 "$_src" "$GB_NETD_BIN"
+    gb_ok "Installed ${GB_NETD_BIN}"
+
+    # 4. Confirm the fix is in the installed binary (source-level check)
+    local _fix_check
+    _fix_check=$(grep -c "client_init(struct client" "$MODULE_DIR/greenboost_netd.c" 2>/dev/null || echo 0)
+    if [[ "$_fix_check" -ge 1 ]]; then
+        gb_ok "Heartbeat-underflow fix confirmed in source (client_init takes now_ms)"
+    else
+        gb_warn_ui "Could not verify fix in source - verify greenboost_netd.c manually"
+    fi
+
+    # 5. Restart daemon
+    gb_info "Starting feeder daemon on port ${GB_NET_PORT}..."
+    mkdir -p /run/greenboost /var/log/greenboost
+    local _netd_stderr_tmp
+    _netd_stderr_tmp=$(mktemp /tmp/gb-netd-XXXXXX)
+    "$GB_NETD_BIN" -d -p "$GB_NET_PORT" 2>"$_netd_stderr_tmp"
+    sleep 1
+    if [[ -f "$GB_NETD_PID" ]] && kill -0 "$(cat "$GB_NETD_PID" 2>/dev/null)" 2>/dev/null; then
+        rm -f "$_netd_stderr_tmp"
+        gb_ok "Feeder daemon started (pid $(cat "$GB_NETD_PID"))"
+    else
+        [[ -s "$_netd_stderr_tmp" ]] && tail -5 "$_netd_stderr_tmp" | while IFS= read -r _el; do gb_info "  $_el"; done
+        rm -f "$_netd_stderr_tmp"
+        die "Feeder daemon failed to start - run: sudo ${GB_NETD_BIN} -p ${GB_NET_PORT}"
+    fi
+
+    # 6. Tail the log to confirm clean startup and show PSK/key state
+    gb_info "Recent netd log:"
+    tail -6 /var/log/greenboost/netd.log 2>/dev/null | while IFS= read -r _l; do
+        printf "    %b\n" "${C_DIM}${_l}${C_RESET}"
+    done
+    echo
+    gb_info "Cluster key: $( [[ -f "$GB_CLUSTER_KEY" ]] && echo "present ($(wc -c < "$GB_CLUSTER_KEY") bytes)" || echo "${C_RED}MISSING${C_RESET} - run: sudo greenboost feeders genkey" )"
+    gb_info "Next step on workstation: sudo greenboost connect <feeder-ip>"
 }
 
 # PR-WW: cmd_stability_monitor - long-running invariant watcher.
@@ -7833,7 +8611,7 @@ _cmd_cluster_snapshot() {
 
     # Remote feeders from cluster.conf
     local total_gpus=1 total_t1=$local_vram total_t2=$local_t2 total_t3=$local_t3
-    if [[ -f "$GB_CLUSTER_CONF" ]]; then
+    if [[ -f "$GB_CLUSTER_CONF" ]] && [[ -r "$GB_CLUSTER_CONF" ]]; then
         while IFS= read -r line; do
             [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
             local addr nickname
@@ -7845,7 +8623,7 @@ _cmd_cluster_snapshot() {
             [[ -z "$port" ]] && port=$GB_NET_PORT
 
             local probe_out
-            probe_out=$(_gb_net_handshake "$ip" "$port" 2>/dev/null)
+            probe_out=$(_gb_net_handshake "$ip" "$port" 2>/dev/null) || true
             local fstatus="offline"
             local fgpu="-" fvram="-" fddr="-" fnvme="-"
 
@@ -7943,7 +8721,7 @@ _cmd_cluster_snapshot() {
         printf "  ${C_CYAN}%-12s${C_RESET}  ${C_DIM}no build_info${C_RESET}\n" "$(hostname -s)"
     fi
 
-    if [[ -f "$GB_CLUSTER_CONF" ]]; then
+    if [[ -f "$GB_CLUSTER_CONF" ]] && [[ -r "$GB_CLUSTER_CONF" ]]; then
         while IFS= read -r _bline; do
             [[ "$_bline" =~ ^#.*$ || -z "$_bline" ]] && continue
             local _baddr _bnick _bssh
@@ -7956,7 +8734,7 @@ _cmd_cluster_snapshot() {
             local _rbi
             _rbi=$(ssh -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=no \
                 "${_bssh}@${_bip}" \
-                "cat /etc/greenboost/build_info 2>/dev/null" 2>/dev/null)
+                "cat /etc/greenboost/build_info 2>/dev/null" 2>/dev/null) || true
 
             local _rid _repoch _rdate
             _rid=$(echo "$_rbi" | grep BUILD_ID | cut -d= -f2)
@@ -8770,6 +9548,7 @@ cmd_gen_inference_config() {
     if [[ "$fmt" == "ollama" || "$fmt" == "both" ]]; then
         out+="# ── Ollama environment variables ──────────────────────────────────\n"
         out+="OLLAMA_NUM_CTX=${effective_ctx}\n"
+        out+="OLLAMA_CONTEXT_LENGTH=${effective_ctx}\n"
         out+="OLLAMA_FLASH_ATTENTION=1\n"
         out+="OLLAMA_KV_CACHE_TYPE=${kv_type}\n"
         out+="OLLAMA_NUM_PARALLEL=1\n"
@@ -9241,6 +10020,7 @@ cmd_help() {
         echo -e ""
         echo -e "  ${C_CYAN}${C_BOLD}TUNING:${C_RESET}"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "tune"            "Runtime tuning (governor, NVMe, THP, sysctl)"
+        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "tune-revert"     "Restore continuous OS-tuner levers to pre-tune baseline"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "tune-grub"       "Fix GRUB boot params (THP=always, rcu_nocbs, nohz_full…)"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "tune-sysctl"     "Consolidate sysctl + apply compute-optimized knobs"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "tune-all"        "Run tune + tune-grub + tune-sysctl + tune-libs"
@@ -9720,6 +10500,7 @@ case "$COMMAND" in
     setup|full-install)  cmd_full_install "--full-install" "$@"  ;;
     module-only)         GB_INSTALL_MODE="module" cmd_full_install "--module-only" "$@" ;;
     tune)                cmd_tune               ;;
+    tune-revert)         cmd_tune_revert        ;;
     tune-grub)           cmd_tune_grub          ;;
     tune-sysctl)         cmd_tune_sysctl        ;;
     tune-libs)           cmd_tune_libs          ;;
@@ -9749,7 +10530,11 @@ case "$COMMAND" in
             upgrade-greenboost) cmd_feeders_upgrade_greenboost ;;
             setup-sudo)         cmd_feeders_setup_sudo ;;
             diag)               cmd_feeders_diag "${3:-all}" ;;
-            *) die "Usage: greenboost feeders [upgrade-greenboost|setup-sudo|diag]" ;;
+            export-key)         cmd_feeders_export_key ;;
+            import-key)         cmd_feeders_import_key "${3:-}" ;;
+            genkey)             cmd_feeders_genkey ;;
+            redeploy-netd)      cmd_feeders_redeploy_netd ;;
+            *) die "Usage: greenboost feeders [upgrade-greenboost|setup-sudo|diag|export-key|import-key|genkey|redeploy-netd]" ;;
         esac
         ;;
     built-stamp)         cmd_built_stamp "${@:2}" ;;
@@ -9808,6 +10593,9 @@ case "$COMMAND" in
         ;;
     debug)               cmd_debug "${@:2}" ;;
     vitals)              cmd_debug_vitals "${@:2}" ;;
+    faults)              cmd_faults "${@:2}" ;;
+    top)                 cmd_top "${@:2}" ;;
+    residency)           cmd_residency "${@:2}" ;;
     # Default: interactive wizard
     "")
         cmd_wizard ;;

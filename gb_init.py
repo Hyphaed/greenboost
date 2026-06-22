@@ -171,7 +171,12 @@ def _bootstrap():
     #    Feeds on the same telemetry add_callback bus used by _ecc_guard above.
     try:
         from gb_orchestrator import ReactiveOrchestrator
-        _orchestrator = ReactiveOrchestrator(mode="process")
+        _orchestrator = ReactiveOrchestrator(
+            mode="process",
+            tier_manager=_tier_manager,
+            cluster_tel=cluster_tel,   # B3: cluster-aware Loop E
+            tel_manager=telemetry,     # N: adaptive poll rate
+        )
         if telemetry is not None:
             telemetry.add_callback(_orchestrator.on_metrics)
     except Exception as exc:
@@ -224,6 +229,22 @@ def get_mem_pools():
 def get_orchestrator():
     """Return the ReactiveOrchestrator singleton (process mode), or None."""
     return _orchestrator
+
+
+def make_layer_prefetcher(model, keep_resident: int = 2, lookahead: int = 1):
+    """Construct a gb_prefetch.LayerPrefetcher for `model`, reusing the
+    shared ModelTierManager singleton (get_tier_manager()) instead of each
+    caller creating its own. One LayerPrefetcher per loaded model - not a
+    singleton itself, unlike the other accessors here, since a process may
+    load more than one dense model. Returns None if gb_prefetch or the
+    shared tier manager is unavailable."""
+    try:
+        from gb_prefetch import LayerPrefetcher
+    except Exception as exc:
+        print(f"[gb_init] layer prefetcher unavailable: {exc}", file=sys.stderr)
+        return None
+    return LayerPrefetcher(model, tm=_tier_manager,
+                            keep_resident=keep_resident, lookahead=lookahead)
 
 
 def auto_budget_gb(headroom: float = 0.92) -> float:

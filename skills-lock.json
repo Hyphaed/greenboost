@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "cuda": {
+      "source": "technillogue/ptx-isa-markdown",
+      "sourceType": "github",
+      "skillPath": "cuda_skill/SKILL.md",
+      "computedHash": "b615fcd919d1f5f041527905d71fc14694b4c58c83a78d286a4a2d98ad2a47c2"
+    }
+  }
+}

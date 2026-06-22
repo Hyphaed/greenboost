@@ -174,6 +174,21 @@ GB_HOOKS {
         cuLaunchKernel_ptds;
         cuLaunchKernelEx_ptds;
         cuLaunchCooperativeKernel_ptds;
+        /* gb_expert_pool_* - plain C API, no CUDA/NVML interposition role.
+         * Resolved via ctypes by gb_moe_vmm.py (Python-side VMM expert
+         * promotion), not by any LD_PRELOAD caller, but -fvisibility=hidden
+         * plus this script's catch-all `local: *;` hid them from the dynamic
+         * symbol table same as any other unlisted symbol - _load_shim()'s
+         * getattr() silently failed and GbMoEVMMManager always fell back to
+         * copy-tiering. Listing them here exports them like every other
+         * GB_HOOKS entry. */
+        gb_expert_pool_create;
+        gb_expert_pool_destroy;
+        gb_expert_pool_promote;
+        gb_expert_pool_demote;
+        gb_expert_pool_residency;
+        gb_expert_pool_va_base;
+        gb_expert_pool_stride;
     local:
         *;
 };

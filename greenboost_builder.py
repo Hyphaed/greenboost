@@ -204,6 +204,38 @@ class GreenBoostBuilder:
         self.cuda   = find_cuda_dir()
         self.src    = Path(__file__).parent
 
+    # ── BPF prereq packages per distro ──────────────────────────────────────
+    _BPF_PKGS: dict[str, str] = {
+        "debian":  "clang bpftool libbpf-dev",
+        "fedora":  "clang bpftool libbpf-devel",
+        "arch":    "clang bpf bpftool libbpf",
+        "suse":    "clang bpftool libbpf-devel",
+        "alpine":  "clang bpftool libbpf-dev",
+    }
+
+    def _bpf_prereqs(self) -> list[str]:
+        """Return missing BPF-tracer prereqs as install hints (not blocking)."""
+        missing = []
+        # Accept clang-N (e.g. clang-21) if 'clang' symlink is absent
+        _clang = (shutil.which("clang") or
+                  next((shutil.which(f"clang-{v}") for v in range(21, 12, -1)
+                        if shutil.which(f"clang-{v}")), None))
+        if not _clang:
+            missing.append("clang")
+        if not shutil.which("bpftool"):
+            missing.append("bpftool")
+        try:
+            r = subprocess.run(
+                ["pkg-config", "--exists", "libbpf"],
+                capture_output=True,
+                timeout=_QUERY_TIMEOUT_S,
+            )
+            if r.returncode != 0:
+                missing.append("libbpf-dev")
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            missing.append("libbpf-dev")
+        return missing
+
     def preflight(self) -> list[str]:
         """Return list of blocking issues; empty list means ready to build."""
         issues: list[str] = []
@@ -218,6 +250,24 @@ class GreenBoostBuilder:
             issues.append("gcc not found - install build-essential or gcc package")
         if not shutil.which("make"):
             issues.append("make not found - install build-essential or make package")
+
+        # BPF prereqs: non-blocking, reported as warnings
+        bpf_missing = self._bpf_prereqs()
+        if bpf_missing:
+            pkg_hint = self._BPF_PKGS.get(self.family, "clang bpftool libbpf-dev")
+            print(
+                f"[greenboost_builder] INFO: eBPF tracer not built "
+                f"(missing: {', '.join(bpf_missing)}). "
+                f"Enable: install {pkg_hint}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "[greenboost_builder] INFO: eBPF prereqs OK "
+                "(clang, bpftool, libbpf) — tracer will be built",
+                file=sys.stderr,
+            )
+
         return issues
 
     def _build_env(self) -> dict[str, str]:

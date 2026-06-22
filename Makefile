@@ -112,11 +112,78 @@ endif
 
 DKMS_ROOT := /usr/src/greenboost-$(GB_VERSION)
 
-.PHONY: all module shim audit audit32 netd clean test \
-        install install-legacy install-libs build-info dkms-install dkms-uninstall \
-        uninstall load unload reload status help
+# ── Optional eBPF observability tracer ────────────────────────────────────
+# Requires: clang, bpftool, libbpf-dev (or libbpf-devel / libbpf).
+# The BPF build is fully optional: if any prereq is missing the main build
+# continues without the tracer and greenboost_builder.py reports a warning.
+# Override: make BPF=0 to force-disable even when prereqs are present.
+BPF ?= auto
+EBPF_TRACE := greenboost-ebpf-trace
 
+ifeq ($(BPF),auto)
+  # Accept plain 'clang' or versioned 'clang-N' (Ubuntu ships clang-21, not clang)
+  _CLANG_PLAIN := $(shell command -v clang 2>/dev/null)
+  _CLANG_VER   := $(shell command -v clang-21 clang-20 clang-19 clang-18 clang-17 clang-16 2>/dev/null | head -1)
+  CLANG        := $(or $(_CLANG_PLAIN),$(_CLANG_VER))
+  _HAS_CLANG   := $(if $(CLANG),1,0)
+  _HAS_BPFTOOL := $(shell command -v bpftool >/dev/null 2>&1 && echo 1 || echo 0)
+  _HAS_LIBBPF  := $(shell pkg-config --exists libbpf 2>/dev/null && echo 1 || echo 0)
+  ifeq ($(_HAS_CLANG)$(_HAS_BPFTOOL)$(_HAS_LIBBPF),111)
+    BPF := 1
+  else
+    BPF := 0
+  endif
+else
+  CLANG ?= clang
+endif
+
+ifeq ($(BPF),1)
+EBPF_CFLAGS := -O2 -Wall -I ebpf/
+EBPF_LDLIBS := $(shell pkg-config --libs libbpf) -lelf -lz
+endif
+
+.PHONY: all module shim audit audit32 netd ebpf clean test \
+        install install-legacy install-libs build-info dkms-install dkms-uninstall \
+        uninstall load unload reload status help ebpf-clean
+
+ifeq ($(BPF),1)
+all: module shim audit audit32 netd vmm_override $(EBPF_TRACE)
+else
 all: module shim audit audit32 netd vmm_override
+	@echo "[GreenBoost] eBPF tracer skipped (clang/bpftool/libbpf not found); install them to enable observability"
+endif
+
+# ── eBPF tracer build rules ───────────────────────────────────────────────
+ifeq ($(BPF),1)
+ebpf/vmlinux.h:
+	@echo "[GreenBoost] Generating vmlinux.h from kernel BTF..."
+	bpftool btf dump file /sys/kernel/btf/vmlinux format c > $@
+
+ebpf/gb_trace.bpf.o: ebpf/gb_trace.bpf.c ebpf/gb_offsets.h ebpf/vmlinux.h
+	@echo "[GreenBoost] Compiling BPF program..."
+	$(CLANG) -target bpf -g -O2 $(EBPF_CFLAGS) -D__TARGET_ARCH_x86 \
+	    -Wno-missing-declarations -c $< -o $@
+
+ebpf/gb_trace.skel.h: ebpf/gb_trace.bpf.o
+	@echo "[GreenBoost] Generating BPF skeleton..."
+	bpftool gen skeleton $< > $@
+
+$(EBPF_TRACE): ebpf/gb_trace.c ebpf/gb_trace.skel.h ebpf/gb_offsets.h
+	@echo "[GreenBoost] Building eBPF tracer userspace..."
+	$(CC) $(EBPF_CFLAGS) -o $@ $< $(EBPF_LDLIBS)
+	@echo "[GreenBoost] Built $(EBPF_TRACE)"
+
+.PHONY: ebpf
+ebpf: $(EBPF_TRACE)
+
+ebpf-clean:
+	rm -f ebpf/vmlinux.h ebpf/gb_trace.bpf.o ebpf/gb_trace.skel.h $(EBPF_TRACE)
+else
+ebpf:
+	@echo "[GreenBoost] BPF=0 — eBPF tracer not built (install clang bpftool libbpf-dev)"
+
+ebpf-clean: ;
+endif
 
 # PR-W: pytest regression suite covering wire-protocol layout, PSK file
 # loading, LAN filter, and payload-size validation.  Pure-Python - no
@@ -172,7 +239,7 @@ netd: greenboost_netd.c features/net_fabric.h
 	    -o $(NETD) greenboost_netd.c -ldl -lpthread $(NCCL_LDFLAGS)
 	@echo "[GreenBoost] Built $(NETD)"
 
-clean:
+clean: ebpf-clean
 	$(MAKE) -C $(KDIR) M=$(PWD) $(KERNEL_LLVM) clean
 	rm -f $(SHIM) $(AUDIT) $(AUDIT32) $(VMM_OVERRIDE) $(NETD) greenboost_cuda_v12.o
 

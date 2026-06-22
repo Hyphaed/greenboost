@@ -197,9 +197,9 @@ class ModelTierManager:
 
         t3_path = os.path.join(self.t3_dir, f"{name}.pt")
         torch.save(e.module.state_dict(), t3_path)
-        # Free CPU parameters after save
-        for p in e.module.parameters():
-            p.data = torch.empty(0)
+        # Move to meta device: frees all parameter memory while preserving shapes
+        # so _load_from_t3 can use to_empty()+load_state_dict(assign=True) later.
+        e.module.to("meta")
         e.tier = Tier.T3
         e.t3_path = t3_path
         print(f"[gb_tier] evicted '{name}' → T3 (NVMe) at {t3_path}", flush=True)
@@ -207,8 +207,11 @@ class ModelTierManager:
     def _load_from_t3(self, e: _ModelEntry):
         if not e.t3_path or not os.path.exists(e.t3_path):
             raise FileNotFoundError(f"T3 checkpoint for '{e.name}' not found: {e.t3_path}")
-        state = torch.load(e.t3_path, map_location="cpu")
-        e.module.load_state_dict(state)
+        state = torch.load(e.t3_path, map_location="cpu", weights_only=True)
+        # Re-allocate parameter storage (evict moved module to meta device) then
+        # fill from saved state.  assign=True avoids in-place copy size checks.
+        e.module.to_empty(device="cpu")
+        e.module.load_state_dict(state, assign=True)
         e.tier = Tier.T2
         print(f"[gb_tier] restored '{e.name}' from T3 → T2", flush=True)
 

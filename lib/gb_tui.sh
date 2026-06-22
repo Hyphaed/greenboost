@@ -24,27 +24,37 @@
 _gb_run_tui_loop() {
     local _snapshot_fn="$1"
     local _refresh="${2:-5}"
+    local _header_hint="${3:-}"
+    local _log_path="${4:-}"
     local _saved_stty; _saved_stty=$(stty -g 2>/dev/null || true)
     stty -ixon 2>/dev/null || true
     printf '\033[?1049h'   # enter alternate-screen buffer
     printf '\033[?25l'     # hide cursor
-    trap 'printf "\033[?25h\033[?1049l"; [[ -n "$_saved_stty" ]] && stty "$_saved_stty" 2>/dev/null || true; exit 0' INT TERM EXIT
+    # ${_saved_stty-} is safe with set -u whether or not the local is in scope
+    trap 'printf "\033[?25h\033[?1049l"; stty "${_saved_stty-}" 2>/dev/null || true; exit 0' INT TERM EXIT
 
     local _key=""
     while true; do
         printf '\033[H'             # home cursor
-        "$_snapshot_fn"             # call the per-command snapshot renderer
+        [[ -n "$_header_hint" ]] && echo -e "$_header_hint"
+        "$_snapshot_fn" || true     # snapshot failures must not propagate set -e
         printf '\033[J'             # clear to end of screen
         if read -t "$_refresh" -s -n 1 _key 2>/dev/null; then
             case "$_key" in
                 $'\x03') break ;;   # Ctrl+C
                 $'\x13') ;;         # Ctrl+S (refresh): just loop
+                $'\x0c')            # Ctrl+L: log view
+                    if [[ -n "$_log_path" ]]; then
+                        _show_log_view "$_log_path" 2>/dev/null || true
+                        printf '\033[2J\033[H'
+                    fi
+                    ;;
                 *) ;;
             esac
         fi
     done
 
     printf '\033[?25h\033[?1049l'
-    [[ -n "$_saved_stty" ]] && stty "$_saved_stty" 2>/dev/null || true
+    stty "${_saved_stty-}" 2>/dev/null || true
     trap - INT TERM EXIT
 }

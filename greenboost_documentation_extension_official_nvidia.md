@@ -848,4 +848,74 @@ when required.
 
 ---
 
+## G.14. LMCache Coexistence (vLLM Path Only)
+
+`greenboost-cli`'s `/lmcache` toggle (`backend_cmds.py`, `greenboost_cmds.py`)
+launches `vllm serve` with `--kv-transfer-config
+{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}` and
+`LMCACHE_LOCAL_CPU`/`LMCACHE_LOCAL_DISK` env. LMCache (Apache-2.0,
+`pip install lmcache`) is a third-party KV-cache reuse layer that ships
+connectors for vLLM, SGLang, and TensorRT-LLM only — it is **not** a
+GreenBoost-authored primitive and does not touch the CUDA shim.
+
+**Why it composes safely with GreenBoost:**
+- LMCache reuses *prefill KV blocks* across requests (avoids recompute).
+  GreenBoost virtualizes *where tensors live* (T1 VRAM / T2 DDR / T3 NVMe).
+  These are orthogonal: LMCache decides whether to recompute a KV block;
+  GreenBoost decides which physical tier backs whatever vLLM allocates.
+- LMCache's CPU offload buffer (`LMCACHE_MAX_LOCAL_CPU_SIZE`, default 8 GB)
+  is sized from host RAM headroom, deliberately **not** from
+  `GREENBOOST_VIRTUAL_VRAM_MB` — this keeps LMCache's own DDR claim disjoint
+  from the GreenBoost T2 pool rather than double-counting the same bytes.
+- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` (already required by
+  the shim, G.13.1) is left untouched; LMCache does not require
+  `expandable_segments` and does not conflict with the shim's `cudaMalloc`/
+  `cuMemGetInfo` interception.
+
+**Scope boundary — what LMCache does *not* cover:**
+- **Ollama / llama.cpp (GGUF).** No LMCache connector exists for llama.cpp.
+  KV-side acceleration for the Ollama backend remains GreenBoost's own
+  **TurboQuant** (`q4_0` KV compression, G.6/G.8). To get LMCache's
+  cross-request KV reuse, the model must run on the CLI's `vllm/` backend.
+- **Diffusion pipelines (ComfyUI, FLUX 2 Klein + LoRAs, etc.).** Diffusion
+  models have no autoregressive KV cache — there is nothing for LMCache to
+  reuse. These pipelines already benefit from GreenBoost's T2/T3 VRAM
+  tiering (G.4); a genuine diffusion-side speedup would require activation
+  caching (DeepCache / TeaCache / first-block-cache–style techniques), which
+  is unrelated to LMCache and is tracked as separate future work, not part
+  of this integration.
+
+---
+
+## G.15. Heat-Augmented Eviction and eBPF Observability (v3.2)
+
+**Deviation:** GreenBoost's T2 eviction (`gb_try_evict_for_alloc`,
+`gb_auto_evict_cold` in the kernel module) historically ordered candidates
+by pure LRU recency. As of v3.2, the CUDA shim pushes a per-allocation
+access-frequency score (`gb_ht_entry_t.access_count`, tracked since v2.x
+but previously unused) to the kernel via a new ioctl, `GB_IOCTL_SET_HEAT`.
+The kernel stores it as `struct gb_buf.heat`, decays it every watchdog tick
+(~2s), and the eviction sweeps now prefer `heat == 0` candidates before
+falling back to LRU order. This is GreenBoost-specific bookkeeping layered
+on top of standard CUDA/driver primitives — no NVIDIA API is used in a
+non-standard way here, only GreenBoost's own kernel-module accounting.
+
+**Deviation:** A CO-RE eBPF tracer (`ebpf/gb_trace.bpf.c`) attaches kprobes
+to GreenBoost's own kernel-module functions (not NVIDIA driver symbols)
+to observe tier-migration events. It optionally attaches to
+`uvm_perf_event_notify` (NVIDIA's UVM driver) when present, for systems
+that also use managed/UVM memory outside GreenBoost's own allocation
+paths — but GreenBoost's primary tensor-memory path (pinned DDR / DMA-BUF
+over PCIe) generates no `nvidia_uvm` page faults by design, so this probe
+is supplementary, not GreenBoost's primary signal source. See
+`THIRD_PARTY_NOTICES.md` for the `bpf_uvm` pattern attribution.
+
+**Confirmed not reintroduced:** managed UVM (`cuMemAllocManaged` +
+`cuMemAdvise`, §G.4/G.7) remains used only as the pinned Blackwell-PCIe T2
+backing method, hinted to stay in host RAM. It is not used as a
+demand-paged oversubscription tier — see `CHANGELOG.md` v3.2 for the full
+reasoning.
+
+---
+
 *End of Chapter G.*

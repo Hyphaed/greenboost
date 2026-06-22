@@ -143,10 +143,31 @@ static int gb_blackwell_disable_vmm(int dev)
  */
 int cuDeviceGetAttribute(int *value, int attrib, int dev)
 {
+    /*
+     * Recursion guard: when libggml-cuda.so is dlopen'd at runtime (via
+     * ggml_backend_load_all() CWD scan) with vmm_override first in LD_PRELOAD,
+     * our dlsym() wrapper returns vmm_override.cuDeviceGetAttribute for the
+     * "cuDeviceGetAttribute" lookup.  gb_real_cuDGA() then caches our own
+     * function pointer and real(value, attrib, dev) recurses infinitely.
+     *
+     * Guard: if we re-enter on the same thread, gb_real_cuDGA() returned
+     * our own pointer.  Return VMM_SUPPORTED=0 (the correct answer for
+     * Blackwell desktop PCIe, and harmless on non-Blackwell since vmm_override
+     * should not be deployed there).
+     */
+    static _Thread_local int gb_cuDGA_depth = 0;
+    if (gb_cuDGA_depth > 0) {
+        if (value) *value = 0;
+        return CUDA_SUCCESS;
+    }
+
     pfn_cuDGA_t real = gb_real_cuDGA();
     if (!real) return CUDA_ERROR_NOT_SUPPORTED;
 
+    gb_cuDGA_depth++;
     int ret = real(value, attrib, dev);
+    gb_cuDGA_depth--;
+
     if (ret != CUDA_SUCCESS) return ret;
 
     if (attrib == GB_ATTR_VMM_SUPPORTED && value && *value != 0

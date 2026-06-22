@@ -568,6 +568,25 @@ class GreenBoostSupervisor:
             log.warning("ReactiveOrchestrator unavailable (%s) — signals disabled", exc)
             self._orch = None
 
+        # Supplemental telemetry providers — fill the GpuMetrics passed to the
+        # orchestrator each tick with the fields Loops O-S need (shim_phase,
+        # T2/T3 pool, host PSI pressure, power_limit_w/sm_clock for GPU clock
+        # locks) that the hand-built metrics above don't carry. Constructed
+        # once here (not per-tick) to avoid repeated NVML init churn.
+        self._gb_provider = None
+        self._sys_provider = None
+        self._nvml_provider = None
+        try:
+            from gb_telemetry import GreenBoostProvider, SystemProvider, NVMLProvider
+            gbp = GreenBoostProvider()
+            self._gb_provider = gbp if gbp.available() else None
+            sysp = SystemProvider()
+            self._sys_provider = sysp if sysp.available() else None
+            nvp = NVMLProvider(device=0)
+            self._nvml_provider = nvp if nvp.available() else None
+        except Exception as exc:
+            log.debug("Supplemental telemetry providers unavailable: %s", exc)
+
     def run(self) -> None:
         # Phase 0: ensure state directories exist
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -635,8 +654,16 @@ class GreenBoostSupervisor:
                     ecc_dbe_volatile = ecc_dbe,
                     temp_c           = self._nvml.temp_c(),
                     gpu_util_pct     = _gpu_util,
-                    gb               = None,   # pool info not fetched in supervisor tick
+                    gb               = None,
                 )
+                # Enrich with T2/T3 pool + shim_phase, host PSI pressure, and
+                # power/clock/PCIe/topology fields — feeds Loops J/O-S.
+                if self._gb_provider is not None:
+                    self._gb_provider.fill(m)
+                if self._sys_provider is not None:
+                    self._sys_provider.fill(m)
+                if self._nvml_provider is not None:
+                    self._nvml_provider.fill(m)
                 self._orch.on_metrics(m)
                 self._orch.feed_vram_state(_non_gb_mb, self._vram_mon._total_mb)
             except Exception as exc:
@@ -678,6 +705,8 @@ class GreenBoostSupervisor:
             log.warning("Sentinel rename failed: %s", exc)
         if self._orch is not None:
             self._orch.stop()
+        if self._nvml_provider is not None:
+            self._nvml_provider.close()
         self._nvml.close()
         log.info("GreenBoost supervisor stopped")
 

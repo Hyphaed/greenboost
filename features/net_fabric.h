@@ -532,5 +532,44 @@ struct gb_feeder_status_resp {
 #define GB_FEEDER_STATUS_V31_SIZE  \
     (offsetof(struct gb_feeder_status_resp, _pad2) + sizeof(gb_u32))
 
+/* ------------------------------------------------------------------ */
+/*  Keyfile permission check (shared by netc and netd)                 */
+/* ------------------------------------------------------------------ */
+#ifndef __KERNEL__
+# include <sys/stat.h>
+# include <grp.h>
+
+/* GB_KEYFILE_GRP — group name that may read cluster.key at mode 0640.
+ * Members of this group can run inference tools that need cluster access
+ * (greenboost-cli, vLLM, llama-server) without requiring root.  The key
+ * file MUST be owned by this group; any other group GID is rejected even
+ * if the mode bits are 0640.  World access (S_IRWXO) and group
+ * write/exec (S_IWGRP | S_IXGRP) are always rejected. */
+# define GB_KEYFILE_GRP "greenboost"
+
+/* gb_check_keyfile_mode — validate that a key file's permission bits are
+ * acceptable.  Accepted modes:
+ *   0600 / 0400  root-only (always accepted)
+ *   0640         root:greenboost group-readable (accepted when GID matches)
+ * Everything else returns -1.
+ *
+ * NOTE: grp.h's getgrnam() is not thread-safe on all platforms but is
+ * called only once at connection setup before any threads are spawned. */
+static inline int gb_check_keyfile_mode(const struct stat *st, const char *path)
+{
+    (void)path;  /* reserved for future diagnostic logging */
+    /* Reject world access or group write/exec unconditionally. */
+    if (st->st_mode & (S_IRWXO | S_IWGRP | S_IXGRP))
+        return -1;
+    /* If group-read bit is set, only the designated greenboost group is allowed. */
+    if (st->st_mode & S_IRGRP) {
+        struct group *grp = getgrnam(GB_KEYFILE_GRP);
+        if (!grp || grp->gr_gid != st->st_gid)
+            return -1;
+    }
+    return 0;
+}
+#endif /* !__KERNEL__ */
+
 #endif /* GREENBOOST_NET_FABRIC_H */
 

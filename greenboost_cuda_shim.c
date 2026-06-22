@@ -141,7 +141,14 @@
 #define GB_NVTX_LOG_FILE      "/run/greenboost/nvtx_events.log"
 #define GB_NVTX_LOG_ROTATE    "/run/greenboost/nvtx_events.log.1"
 #define GB_NVTX_LOG_FALLBACK  "/tmp/greenboost_nvtx_events.log"
-#define GB_NVTX_LOG_MAX_BYTES (32ULL * 1024ULL * 1024ULL)
+#define GB_NVTX_LOG_MAX_BYTES (6ULL * 1024ULL * 1024ULL)  /* auto-clean at 6 MB - keeps the LLM-facing signal log small and fast to read */
+
+/* Decision-log hot-path gate: gb_needs_overflow() runs on EVERY cudaMalloc,
+ * including per-token activation buffers - logging all of those would add a
+ * write() per allocation during steady-state generation. Only allocations at
+ * or above this size (weight tensors, KV cache, the model-load buffer) are
+ * worth a permanent record for diagnosing tier-placement bugs. */
+#define GB_DECISION_LOG_MIN_BYTES (16ULL * 1024 * 1024)
 
 /* PR-DD: g_nvtx_log_fd is _Atomic so the unsynchronised read in the
  * GB_NVTX_EVENT macro gate (PR-Q) sees a consistent value, and so writers
@@ -499,10 +506,30 @@ static void gb_kv_cache_release(uint64_t dev_ptr);
 static void gb_block_evt_emit(uint8_t type, uint64_t hash,
                                uint64_t parent_hash, uint32_t num_tokens);
 
+/* U-HEAT: defined later (after the hashtable section it walks: gb_htable,
+ * ht_hash, ht_lock, HT_TOMBSTONE) and after gb_open_device. Forward-declared
+ * here so prefetch_worker - defined ahead of all of that in the file - can
+ * call it. */
+static void gb_push_heat_batch(void);
+
 static void* prefetch_worker(void* arg) {
+    /* U-HEAT: independent 2s cadence for the heat pusher above, checked on
+     * every loop wakeup (real request or the 5s idle timeout) so it runs
+     * whether the prefetch queue is busy or empty. */
+    struct timespec last_heat_push = {0};
+
     while (!prefetch_stop) {
         prefetch_req_t req;
         struct timespec ts;
+
+        {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (now.tv_sec - last_heat_push.tv_sec >= 2) {
+                gb_push_heat_batch();
+                last_heat_push = now;
+            }
+        }
 
         pthread_mutex_lock(&prefetch_mutex);
 
@@ -893,6 +920,56 @@ static int ht_lookup(CUdeviceptr ptr, size_t *out_size, int *out_managed,
     return 0;
 }
 
+/* Forward-declared: defined later in the "/dev/greenboost helper" section. */
+static int gb_open_device(void);
+
+/* U-HEAT: push the live ARC-tracking heat (gb_ht_entry_t.access_count) to
+ * the kernel evictor via GB_IOCTL_SET_HEAT so gb_try_evict_for_alloc /
+ * gb_auto_evict_cold in greenboost.c can prefer recency+reuse over pure
+ * LRU.  Reports the *delta* since the last push (resets access_count to 0
+ * under the same per-slot ht_lock that ht_lookup uses to increment it - the
+ * slot index itself is the lock key, matching ht_lookup's
+ * ht_lock((h+i) & HT_MASK) - so this never races a concurrent touch).  The
+ * kernel side ORs the delta into its own buf->heat and ages it
+ * independently on the watchdog. */
+static void gb_push_heat_batch(void)
+{
+    int fd = gb_open_device();
+    struct gb_heat_req req;
+    uint32_t i;
+
+    if (fd < 0)
+        return;
+
+    req.count = 0;
+    req._pad  = 0;
+
+    for (i = 0; i < HT_SIZE; i++) {
+        gb_ht_entry_t   *e  = &gb_htable[i];
+        pthread_mutex_t *lk = ht_lock(i);
+
+        if (e->ptr == 0 || e->ptr == HT_TOMBSTONE || e->gb_buf_id < 0)
+            continue;
+
+        pthread_mutex_lock(lk);
+        if (e->ptr != 0 && e->ptr != HT_TOMBSTONE && e->gb_buf_id >= 0 &&
+            e->access_count > 0) {
+            req.ent[req.count].buf_id = e->gb_buf_id;
+            req.ent[req.count].heat   = e->access_count;
+            e->access_count = 0;
+            req.count++;
+        }
+        pthread_mutex_unlock(lk);
+
+        if (req.count == GB_HEAT_BATCH_MAX) {
+            ioctl(fd, GB_IOCTL_SET_HEAT, &req);
+            req.count = 0;
+        }
+    }
+    if (req.count > 0)
+        ioctl(fd, GB_IOCTL_SET_HEAT, &req);
+}
+
 /* Set alloc_flags on an already-inserted entry (used by overflow path to tag
  * KV/weights/activations after the alloc succeeds). Non-racy: called immediately
  * after ht_insert in the same thread, before the pointer escapes. */
@@ -1077,6 +1154,8 @@ typedef CUresult    (*pfn_cuMemRelease)(CUmemGenericAllocationHandle);
 typedef CUresult    (*pfn_cuMemMap)(CUdeviceptr, size_t, size_t,
                                     CUmemGenericAllocationHandle, unsigned long long);
 typedef CUresult    (*pfn_cuMemUnmap)(CUdeviceptr, size_t);
+typedef CUresult    (*pfn_cuMemcpyHtoD)(CUdeviceptr, const void *, size_t);
+typedef CUresult    (*pfn_cuMemcpyDtoH)(void *, CUdeviceptr, size_t);
 typedef CUresult    (*pfn_cuMemSetAccess)(CUdeviceptr, size_t,
                                           const CUmemAccessDesc *, size_t);
 typedef CUresult    (*pfn_cuMemAddressReserve)(CUdeviceptr *, size_t, size_t,
@@ -1168,6 +1247,8 @@ static pfn_cuMemCreate                     real_cuMemCreate;
 static pfn_cuMemRelease                    real_cuMemRelease;
 static pfn_cuMemMap                        real_cuMemMap;
 static pfn_cuMemUnmap                      real_cuMemUnmap;
+static pfn_cuMemcpyHtoD                    real_cuMemcpyHtoD;
+static pfn_cuMemcpyDtoH                    real_cuMemcpyDtoH;
 static pfn_cuMemSetAccess                  real_cuMemSetAccess;
 static pfn_cuMemAddressReserve             real_cuMemAddressReserve;
 static pfn_cuMemAddressFree                real_cuMemAddressFree;
@@ -1332,6 +1413,34 @@ static int bvmm_ht_peek_type(CUdeviceptr va, uint8_t *out_type)
         if (e->va == 0) break;
         if (e->va == va) {
             if (out_type) *out_type = e->type;
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&gb_bvmm_ht_lock);
+    return found;
+}
+
+/* Range-containment lookup over bvmm_ht: unlike bvmm_ht_insert/remove/peek_type
+ * (exact-key hash probe, only matches a buffer's exact base address), this
+ * answers "does this pointer fall ANYWHERE inside a registered zero-copy
+ * buffer" - needed because per-tensor H2D copies during model load land at
+ * base+offset, never at the exact base itself (only the first tensor would
+ * ever match an exact-key lookup). BVMM_HT_SIZE is small (512 slots) and this
+ * is only called during GB_PHASE_MODEL_LOAD, so a linear scan is fine - this
+ * must never run on the per-token inference hot path. */
+static int gb_bvmm_zerocopy_range_lookup(uint64_t ptr, CUdeviceptr *out_base, size_t *out_size)
+{
+    int found = 0;
+    pthread_mutex_lock(&gb_bvmm_ht_lock);
+    for (uint32_t i = 0; i < BVMM_HT_SIZE; i++) {
+        bvmm_ht_entry_t *e = &gb_bvmm_ht[i];
+        if (e->va == 0 || e->va == BVMM_HT_TOMBSTONE) continue;
+        if (e->type != BVMM_TYPE_ZEROCOPY) continue;
+        uint64_t base = (uint64_t)e->va;
+        if (ptr >= base && ptr < base + e->va_size) {
+            if (out_base) *out_base = e->va;
+            if (out_size) *out_size = e->va_size;
             found = 1;
             break;
         }
@@ -1613,6 +1722,255 @@ static CUresult gb_vmm_t2_alloc_blackwell_hostnuma(CUdeviceptr *out_ptr, size_t 
     GB_NVTX_EVENT("ALLOC_BVMM_T2", "T2_DDR", size >> 20, va, "blackwell_hostnuma_ok");
     *out_ptr = va;
     return CUDA_SUCCESS;
+}
+
+/* ── GbExpertPool — per-expert VMM physical chunk management ─────────────────
+ *
+ * Structural solution to the batched-*Experts tiering gap (Track 4):
+ * current transformers stores all expert weights as a single 3D parameter
+ * [num_experts, out, in].  GreenBoost's whole-buffer T2 tiering can't tier
+ * individual expert rows within that allocation.
+ *
+ * GbExpertPool replaces the monolithic cudaMalloc backing with a cuMem VMM
+ * virtual address range of equal size, where each expert occupies one
+ * independently-mappable physical chunk.  Hot experts use DEVICE-resident
+ * physical memory (VRAM); cold experts have their chunk unmapped and released
+ * (zero VRAM footprint) with data preserved in caller-managed CPU pinned buf.
+ *
+ * VA layout (all VAs within the reserved range):
+ *   [expert_0 | expert_1 | ... | expert_N-1]
+ *    va_base   +stride    +2*stride    (N-1)*stride
+ *
+ * The Python layer (gb_moe_vmm.py) wraps the VA range with
+ * __cuda_array_interface__ to create a non-owning PyTorch tensor view whose
+ * data_ptr() == va_base.  param.data stays at va_base forever; only the
+ * physical backing behind each expert's sub-range comes and goes.
+ *
+ * Invariant: accessing an unmapped sub-range generates CUDA_ERROR_ILLEGAL_ADDRESS
+ * (caught by the gate-hook correctness gate before the GEMM can read it).
+ */
+
+typedef struct {
+    CUdeviceptr                   va_base;
+    size_t                        va_total;
+    size_t                        stride;       /* granularity-aligned per-expert size */
+    int                           num_experts;
+    CUmemGenericAllocationHandle *handles;      /* malloc'd [num_experts], 0 = unmapped */
+    uint8_t                      *resident;     /* malloc'd [num_experts] */
+    size_t                        gran;
+} GbExpertPool;
+
+/* Resolve per-expert allocation granularity using the same HOST_NUMA_CURRENT
+ * preference path as gb_vmm_t2_alloc_blackwell_hostnuma. */
+static size_t gb_expert_pool_granularity(void)
+{
+    int loc = gb_vmm_host_loc_type ? gb_vmm_host_loc_type : CU_MEM_LOCATION_TYPE_DEVICE;
+    CUmemAllocationProp gp;
+    memset(&gp, 0, sizeof(gp));
+    gp.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+    gp.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    gp.location.id   = 0;
+    size_t g = 0;
+    if (real_cuMemGetAllocationGranularity &&
+        real_cuMemGetAllocationGranularity(&g, &gp, 0) == CUDA_SUCCESS && g > 0)
+        return g;
+    /* Also try HOST_NUMA_CURRENT for the stride granularity */
+    gp.location.type = loc;
+    if (real_cuMemGetAllocationGranularity &&
+        real_cuMemGetAllocationGranularity(&g, &gp, 0) == CUDA_SUCCESS && g > 0)
+        return g;
+    (void)loc;
+    return 2ULL * 1024 * 1024; /* 2 MB safe fallback */
+}
+
+/* Helper: map a DEVICE-resident physical chunk into pool slot idx. */
+static CUresult gb_expert_slot_map(GbExpertPool *pool, int idx)
+{
+    if (!real_cuMemCreate || !real_cuMemMap || !real_cuMemSetAccess)
+        return CUDA_ERROR_NOT_SUPPORTED;
+
+    CUdeviceptr slot_va = pool->va_base + (size_t)idx * pool->stride;
+    CUmemAllocationProp prop;
+    memset(&prop, 0, sizeof(prop));
+    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id   = 0;
+
+    CUmemGenericAllocationHandle h;
+    CUresult ret = real_cuMemCreate(&h, pool->stride, &prop, 0);
+    if (ret != CUDA_SUCCESS)
+        return ret;
+
+    ret = real_cuMemMap(slot_va, pool->stride, 0, h, 0);
+    if (ret != CUDA_SUCCESS) { real_cuMemRelease(h); return ret; }
+
+    CUmemAccessDesc desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    desc.location.id   = 0;
+    desc.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    ret = real_cuMemSetAccess(slot_va, pool->stride, &desc, 1);
+    if (ret != CUDA_SUCCESS) {
+        real_cuMemUnmap(slot_va, pool->stride);
+        real_cuMemRelease(h);
+        return ret;
+    }
+
+    pool->handles[idx] = h;
+    pool->resident[idx] = 1;
+    return CUDA_SUCCESS;
+}
+
+/* Helper: unmap and release a slot's DEVICE physical chunk. */
+static void gb_expert_slot_unmap(GbExpertPool *pool, int idx)
+{
+    if (!pool->resident[idx])
+        return;
+    CUdeviceptr slot_va = pool->va_base + (size_t)idx * pool->stride;
+    if (real_cuMemUnmap)   real_cuMemUnmap(slot_va, pool->stride);
+    if (real_cuMemRelease) real_cuMemRelease(pool->handles[idx]);
+    pool->handles[idx] = 0;
+    pool->resident[idx] = 0;
+}
+
+__attribute__((visibility("default")))
+GbExpertPool *gb_expert_pool_create(int num_experts, size_t expert_bytes)
+{
+    if (!real_cuMemAddressReserve || !real_cuMemCreate || !real_cuMemMap ||
+        !real_cuMemSetAccess || !real_cuMemAddressFree)
+        return NULL;
+
+    size_t gran   = gb_expert_pool_granularity();
+    size_t stride = (expert_bytes + gran - 1) & ~(gran - 1);
+    size_t total  = (size_t)num_experts * stride;
+
+    CUdeviceptr va = 0;
+    if (real_cuMemAddressReserve(&va, total, 0, 0, 0) != CUDA_SUCCESS)
+        return NULL;
+
+    GbExpertPool *pool = malloc(sizeof(*pool));
+    if (!pool) { real_cuMemAddressFree(va, total); return NULL; }
+
+    pool->handles  = calloc(num_experts, sizeof(*pool->handles));
+    pool->resident = calloc(num_experts, sizeof(*pool->resident));
+    if (!pool->handles || !pool->resident) {
+        free(pool->handles); free(pool->resident); free(pool);
+        real_cuMemAddressFree(va, total);
+        return NULL;
+    }
+
+    pool->va_base      = va;
+    pool->va_total     = total;
+    pool->stride       = stride;
+    pool->num_experts  = num_experts;
+    pool->gran         = gran;
+
+    /* Optionally register with kernel for cross-process diagnostics. */
+    if (gb_dev_fd >= 0) {
+        struct gb_vpage_register_req reg;
+        memset(&reg, 0, sizeof(reg));
+        reg.va_base      = (uint64_t)va;
+        reg.num_experts  = (uint32_t)num_experts;
+        reg.stride_bytes = (uint64_t)stride;
+        ioctl(gb_dev_fd, GB_IOCTL_VPAGE_REGISTER, &reg);
+        /* Non-fatal if ioctl fails (old kernel without VPAGE support). */
+    }
+
+    gb_log("GbExpertPool: created  experts=%d  stride=%zu MB  va=0x%llx",
+           num_experts, stride >> 20, (unsigned long long)va);
+    return pool;
+}
+
+__attribute__((visibility("default")))
+void gb_expert_pool_destroy(GbExpertPool *pool)
+{
+    if (!pool) return;
+    for (int i = 0; i < pool->num_experts; i++)
+        gb_expert_slot_unmap(pool, i);
+    if (real_cuMemAddressFree)
+        real_cuMemAddressFree(pool->va_base, pool->va_total);
+    free(pool->handles);
+    free(pool->resident);
+    free(pool);
+}
+
+__attribute__((visibility("default")))
+int gb_expert_pool_promote(GbExpertPool *pool, int idx, const void *src_cpu, size_t bytes)
+{
+    if (!pool || idx < 0 || idx >= pool->num_experts)
+        return (int)CUDA_ERROR_INVALID_VALUE;
+    if (pool->resident[idx])
+        return (int)CUDA_SUCCESS;
+
+    CUresult ret = gb_expert_slot_map(pool, idx);
+    if (ret != CUDA_SUCCESS) return (int)ret;
+
+    if (src_cpu && bytes > 0) {
+        /* real_cuMemcpyHtoD is resolved unconditionally in gb_shim_init
+         * against the same libcuda handle real_cuMemCreate etc. use - NOT
+         * dlsym(RTLD_NEXT, ...), which only searches objects loaded AFTER
+         * this one in the link map. gb_moe_vmm.py loads this shim via plain
+         * ctypes.CDLL() *after* libcuda.so is already resident (torch.cuda
+         * .init() loads it first), so libcuda.so sits BEFORE us in the link
+         * order and RTLD_NEXT could never find it there - confirmed live:
+         * the old RTLD_NEXT lookup silently returned NULL and every
+         * promoted expert was left as zeroed VMM memory. */
+        if (real_cuMemcpyHtoD) {
+            size_t cp = bytes < pool->stride ? bytes : pool->stride;
+            CUresult cp_ret = real_cuMemcpyHtoD(pool->va_base + (size_t)idx * pool->stride, src_cpu, cp);
+            if (cp_ret != CUDA_SUCCESS)
+                fprintf(stderr, "[GreenBoost] gb_expert_pool_promote: H2D copy failed ret=%d expert=%d\n",
+                        cp_ret, idx);
+        } else {
+            fprintf(stderr, "[GreenBoost] gb_expert_pool_promote: cuMemcpyHtoD not resolved — expert %d left zeroed\n", idx);
+        }
+    }
+    return (int)CUDA_SUCCESS;
+}
+
+__attribute__((visibility("default")))
+int gb_expert_pool_demote(GbExpertPool *pool, int idx, void *dst_cpu, size_t bytes)
+{
+    if (!pool || idx < 0 || idx >= pool->num_experts)
+        return (int)CUDA_ERROR_INVALID_VALUE;
+    if (!pool->resident[idx])
+        return (int)CUDA_SUCCESS;
+
+    if (dst_cpu && bytes > 0) {
+        /* See gb_expert_pool_promote above: real_cuMemcpyDtoH, resolved
+         * unconditionally in gb_shim_init, not an ad-hoc RTLD_NEXT lookup. */
+        if (real_cuMemcpyDtoH) {
+            /* Synchronous — data must be safe in dst_cpu before we unmap. */
+            size_t cp = bytes < pool->stride ? bytes : pool->stride;
+            real_cuMemcpyDtoH(dst_cpu, pool->va_base + (size_t)idx * pool->stride, cp);
+        }
+    }
+
+    gb_expert_slot_unmap(pool, idx);
+    return (int)CUDA_SUCCESS;
+}
+
+__attribute__((visibility("default")))
+uint64_t gb_expert_pool_residency(GbExpertPool *pool)
+{
+    if (!pool) return 0;
+    uint64_t mask = 0;
+    int n = pool->num_experts < 64 ? pool->num_experts : 64;
+    for (int i = 0; i < n; i++)
+        if (pool->resident[i]) mask |= (1ULL << i);
+    return mask;
+}
+
+__attribute__((visibility("default")))
+uint64_t gb_expert_pool_va_base(GbExpertPool *pool)
+{
+    return pool ? (uint64_t)pool->va_base : 0;
+}
+
+__attribute__((visibility("default")))
+size_t gb_expert_pool_stride(GbExpertPool *pool)
+{
+    return pool ? pool->stride : 0;
 }
 
 /* Allocate T2 DDR for Blackwell PCIe via managed UVM, hinted to stay in host RAM.
@@ -1939,9 +2297,17 @@ static int gb_pool_contains(CUdeviceptr dptr)
 static size_t vram_headroom_bytes    = 512ULL * 1024 * 1024;  /* 512 MB default - scaled to 5% of VRAM after NVML probe; override with GREENBOOST_VRAM_HEADROOM_MB */
 /* Workstation GPU headroom: subtracted from reported free VRAM so --fit leaves
  * this many MB of physical GPU VRAM for the desktop/display/other apps.
- * 1024 MB default; override with GREENBOOST_WORKSTATION_RESERVE_MB.
- * gaming_mode=1 automatically doubles this to keep the GPU responsive. */
-static size_t g_workstation_reserve_bytes = 1024ULL * 1024 * 1024;
+ * Dynamic by default (see gb_effective_workstation_reserve_bytes): sized to
+ * whatever GNOME/compositor/other GPU clients are actually using right now,
+ * plus a small safety margin - not a flat tax on every GPU regardless of
+ * desktop load. Set GREENBOOST_WORKSTATION_RESERVE_MB to force a fixed value
+ * instead (e.g. 0 on a dedicated headless inference node).
+ * gaming_mode=1 automatically doubles the effective reserve. */
+static size_t g_workstation_reserve_bytes = 1024ULL * 1024 * 1024; /* fallback only; used verbatim when env override is set */
+static int    g_workstation_reserve_from_env = 0;
+#define GB_WS_RESERVE_MIN_BYTES   (256ULL * 1024 * 1024)   /* floor: always leave a small cushion */
+#define GB_WS_RESERVE_MAX_BYTES   (2048ULL * 1024 * 1024)  /* ceiling: avoid over-reserving if some other GPU client spikes */
+#define GB_WS_RESERVE_MARGIN_BYTES (256ULL * 1024 * 1024)  /* burst margin added on top of measured desktop usage */
 /* ENH-05: Stats write interval in ms. Default 250 ms; override with
  * GREENBOOST_STATS_INTERVAL_MS env var for finer resolution during debugging. */
 static uint64_t g_stats_interval_ms = 250ULL;
@@ -1966,6 +2332,27 @@ static size_t g_cluster_remote_vram_bytes       = 0; /* feeder GPU VRAM (T1) onl
  * (GPU VRAM on feeder, faster than any DDR) before kernel module silently uses local T2.
  * Priority rule: T1_local → T1_feeder → T2_by_speed → T3_local → T3_feeder */
 static _Atomic size_t g_local_t1_alloc_bytes = 0;
+
+/* Dynamic workstation reserve: real_total/real_free are the *physical* values
+ * from real_cuMemGetInfo (not GreenBoost-inflated). Desktop/compositor usage
+ * = whatever physical VRAM is used that isn't ours (g_local_t1_alloc_bytes).
+ * Reserve = that usage + a burst margin, clamped to [MIN, MAX] so a sudden
+ * compositor allocation doesn't starve inference, and a one-off competing app
+ * doesn't permanently lock up multiple GB GreenBoost will never use. */
+static size_t gb_effective_workstation_reserve_bytes(size_t real_free, size_t real_total)
+{
+    if (g_workstation_reserve_from_env)
+        return g_workstation_reserve_bytes;
+
+    size_t other_used = (real_total > real_free) ? (real_total - real_free) : 0;
+    size_t our_used   = atomic_load_explicit(&g_local_t1_alloc_bytes, memory_order_relaxed);
+    size_t desktop_used = (other_used > our_used) ? (other_used - our_used) : 0;
+
+    size_t reserve = desktop_used + GB_WS_RESERVE_MARGIN_BYTES;
+    if (reserve < GB_WS_RESERVE_MIN_BYTES) reserve = GB_WS_RESERVE_MIN_BYTES;
+    if (reserve > GB_WS_RESERVE_MAX_BYTES) reserve = GB_WS_RESERVE_MAX_BYTES;
+    return reserve;
+}
 
 /* Remote cluster live counters - written to shim_stats for greenboost status */
 static _Atomic size_t g_remote_alloc_count    = 0; /* allocations routed to feeder T1 */
@@ -3207,7 +3594,9 @@ static void gb_write_stats(void)
             if (fread(_buf, 1, 7, _gmf) > 0) _gm = (_buf[0] == '1');
             fclose(_gmf);
         }
-        size_t _ws_base = g_workstation_reserve_bytes;
+        size_t _cached_free  = atomic_load_explicit(&g_cached_free_vram,  memory_order_relaxed);
+        size_t _cached_total = atomic_load_explicit(&g_cached_total_vram, memory_order_relaxed);
+        size_t _ws_base = gb_effective_workstation_reserve_bytes(_cached_free, _cached_total);
         fprintf(f, "workstation_reserve_mb=%zu\n",     _ws_base >> 20);
         fprintf(f, "workstation_reserve_eff_mb=%zu\n", (_gm ? _ws_base * 2 : _ws_base) >> 20);
     }
@@ -3377,6 +3766,7 @@ static void gb_read_control(void)
         if (strcmp(key, "workstation_reserve_mb") == 0) {
             long long c = val < 0 ? 0LL : val > 8192LL ? 8192LL : val;
             g_workstation_reserve_bytes = (size_t)c << 20;
+            g_workstation_reserve_from_env = 1;  /* explicit operator override */
         } else if (strcmp(key, "stats_interval_ms") == 0) {
             long long c = val < 50LL ? 50LL : val > 5000LL ? 5000LL : val;
             g_stats_interval_ms = (uint64_t)c;
@@ -3996,10 +4386,16 @@ static void gb_shim_init(void)
      * desktop, compositor, and other GPU processes.  Subtracts from the free
      * VRAM reported by cuMemGetInfo_v2 / cudaMemGetInfo so llama-server's
      * --fit algorithm does not fill T1 to 100%, keeping the workstation
-     * responsive during inference.  Default 1024 MB; override with
-     * GREENBOOST_WORKSTATION_RESERVE_MB=0 on dedicated inference nodes. */
+     * responsive during inference.  By default this is now DYNAMIC (see
+     * gb_effective_workstation_reserve_bytes): sized to whatever the desktop
+     * is actually using right now, not a flat tax.  Set
+     * GREENBOOST_WORKSTATION_RESERVE_MB to force a fixed value instead
+     * (e.g. =0 on a dedicated headless inference node). */
     env = getenv("GREENBOOST_WORKSTATION_RESERVE_MB");
-    if (env) g_workstation_reserve_bytes = (size_t)gb_atoll(env) * 1024ULL * 1024ULL;
+    if (env) {
+        g_workstation_reserve_bytes = (size_t)gb_atoll(env) * 1024ULL * 1024ULL;
+        g_workstation_reserve_from_env = 1;
+    }
 
     /* ENH-05: Configurable stats write interval (ms); 0 or negative → reset to default */
     env = getenv("GREENBOOST_STATS_INTERVAL_MS");
@@ -4292,6 +4688,13 @@ static void gb_shim_init(void)
     real_cuMemSetAccess = (pfn_cuMemSetAccess) dlsym(libcuda, "cuMemSetAccess");
     real_cuMemAddressReserve = (pfn_cuMemAddressReserve) dlsym(libcuda, "cuMemAddressReserve");
     real_cuMemAddressFree    = (pfn_cuMemAddressFree)    dlsym(libcuda, "cuMemAddressFree");
+    /* gb_expert_pool_promote/demote (VMM expert pool, gb_moe_vmm.py's H2D/D2H
+     * path) need these resolved unconditionally here - g_saved_libcuda is
+     * NOT a substitute, it's only set when g_kv_compress_enabled is true. */
+    real_cuMemcpyHtoD   = (pfn_cuMemcpyHtoD)   dlsym(libcuda, "cuMemcpyHtoD_v2");
+    if (!real_cuMemcpyHtoD) real_cuMemcpyHtoD = (pfn_cuMemcpyHtoD) dlsym(libcuda, "cuMemcpyHtoD");
+    real_cuMemcpyDtoH   = (pfn_cuMemcpyDtoH)   dlsym(libcuda, "cuMemcpyDtoH_v2");
+    if (!real_cuMemcpyDtoH) real_cuMemcpyDtoH = (pfn_cuMemcpyDtoH) dlsym(libcuda, "cuMemcpyDtoH");
     real_cuMemGetAllocationGranularity = (pfn_cuMemGetAllocationGranularity) dlsym(libcuda, "cuMemGetAllocationGranularity");
 
     /* Probe compute capability - required to gate cuMemAllocAsync (cc >= 8.0).
@@ -5048,10 +5451,26 @@ static int gb_needs_overflow(size_t bytesize)
                    bytesize >> 20, free_vram >> 20, vram_headroom_bytes >> 20,
                    kv_reserve >> 20, cur_phase,
                    (gb_physical_vram_bytes > 0 && bytesize > gb_physical_vram_bytes));
+            if (bytesize >= GB_DECISION_LOG_MIN_BYTES) {
+                char _dbuf[160];
+                snprintf(_dbuf, sizeof(_dbuf),
+                    "free=%zuMB headroom=%zuMB kv_rsv=%zuMB phys=%zuMB phase=%d",
+                    free_vram >> 20, vram_headroom_bytes >> 20, kv_reserve >> 20,
+                    gb_physical_vram_bytes >> 20, cur_phase);
+                GB_NVTX_EVENT("ALLOC_DECISION", "OVERFLOW", bytesize >> 20, 0, _dbuf);
+            }
             return 1;
         }
         gb_log("VRAM: req=%zuMB free=%zuMB phase=%d → fits in T1",
                bytesize >> 20, free_vram >> 20, cur_phase);
+        if (bytesize >= GB_DECISION_LOG_MIN_BYTES) {
+            char _dbuf[160];
+            snprintf(_dbuf, sizeof(_dbuf),
+                "free=%zuMB headroom=%zuMB kv_rsv=%zuMB phys=%zuMB phase=%d",
+                free_vram >> 20, vram_headroom_bytes >> 20, kv_reserve >> 20,
+                gb_physical_vram_bytes >> 20, cur_phase);
+            GB_NVTX_EVENT("ALLOC_DECISION", "T1_FITS", bytesize >> 20, 0, _dbuf);
+        }
     }
     return 0;
 }
@@ -6163,26 +6582,52 @@ static int gb_try_feeder_alloc_tier(CUdeviceptr *dptr, size_t bytesize, uint8_t 
         if (gb_netc_feeder_disabled(_ri)) continue;
         uint64_t _free = 0, _total = 0;
         int ok = 0;
-        if (tier == GB_ALLOC_TIER_T1)
-            ok = (gb_netc_t1_mem_info(_ri, &_free, &_total) == 0 && _free >= (uint64_t)bytesize);
-        else if (tier == GB_ALLOC_TIER_T2)
-            ok = (gb_netc_t2_mem_info(_ri, &_free, &_total) == 0 && _free >= (uint64_t)bytesize);
-        else if (tier == GB_ALLOC_TIER_T3)
+        if (tier == GB_ALLOC_TIER_T1) {
+            int mi_ret = gb_netc_t1_mem_info(_ri, &_free, &_total);
+            ok = (mi_ret == 0 && _free >= (uint64_t)bytesize);
+            if (!ok)
+                fprintf(stderr, "[GreenBoost] feeder_alloc_tier T1[%d]: mem_info=%d"
+                        " free=%llu MB total=%llu MB req=%llu MB → skip\n",
+                        _ri, mi_ret, (unsigned long long)(_free >> 20),
+                        (unsigned long long)(_total >> 20),
+                        (unsigned long long)(bytesize >> 20));
+        } else if (tier == GB_ALLOC_TIER_T2) {
+            int mi_ret = gb_netc_t2_mem_info(_ri, &_free, &_total);
+            ok = (mi_ret == 0 && _free >= (uint64_t)bytesize);
+            if (!ok)
+                fprintf(stderr, "[GreenBoost] feeder_alloc_tier T2[%d]: mem_info=%d"
+                        " free=%llu MB total=%llu MB req=%llu MB → skip\n",
+                        _ri, mi_ret, (unsigned long long)(_free >> 20),
+                        (unsigned long long)(_total >> 20),
+                        (unsigned long long)(bytesize >> 20));
+        } else if (tier == GB_ALLOC_TIER_T3)
             ok = (gb_netc_t3_mem_info(_ri, &_free, &_total) == 0 && _total > 0);
         if (ok) {
             uint64_t _fake = 0;
             if (gb_netc_malloc_tier(_ri, (uint64_t)bytesize, tier, &_fake) == 0) {
                 *dptr = (CUdeviceptr)_fake;
+                fprintf(stderr, "[GreenBoost] cudaMalloc feeder T%u[%d]: %llu MB → fake=0x%llx\n",
+                        tier, _ri, (unsigned long long)(bytesize >> 20),
+                        (unsigned long long)_fake);
                 return 0;
             }
+            fprintf(stderr, "[GreenBoost] feeder_alloc_tier T%u[%d]: malloc_tier failed"
+                    " (free=%llu MB, req=%llu MB)\n",
+                    tier, _ri, (unsigned long long)(_free >> 20),
+                    (unsigned long long)(bytesize >> 20));
         }
     }
     return -1;
 }
 
 static CUresult gb_smart_overflow_alloc(CUdeviceptr *dptr, size_t bytesize) {
-    /* U3: count this overflow event and update rolling eviction rate */
-    gb_evict_rate_tick();
+    int cur_phase = atomic_load_explicit(&g_alloc_phase, memory_order_relaxed);
+
+    /* U3: count this overflow event and update rolling eviction rate.
+     * Skip during MODEL_LOAD/INIT: sequential weight placement is not thrashing;
+     * counting it saturates the rate counter instantly and blocks feeder T1. */
+    if (cur_phase >= GB_PHASE_INFERENCE)
+        gb_evict_rate_tick();
     uint32_t evict_rate = atomic_load_explicit(&g_t1_evict_rate, memory_order_relaxed);
 
     /* U6: mid-pressure gate - when T2 > 82% and request > 1 MB, skip T2 tiers entirely
@@ -6192,11 +6637,13 @@ static CUresult gb_smart_overflow_alloc(CUdeviceptr *dptr, size_t bytesize) {
                    >= gb_effective_t2_mid());
 
     /* ── TIER 1: Feeder T1 (GPU VRAM) - fastest remote tier ── */
-    /* U3: if T1 is thrashing (>20 evictions/s), skip T1 this call and go to T2 */
+    /* U3: if T1 is thrashing (>20 evictions/s), skip T1 this call and go to T2.
+     * Only relevant during INFERENCE/STEADY - during MODEL_LOAD evict_rate is 0. */
     /* D3: skip quarantined feeders; D2/U4: de-prioritize throttled/degraded feeders */
     if (evict_rate < GB_T1_THRASH_THRESHOLD) {
         if (gb_try_feeder_alloc_tier(dptr, bytesize, GB_ALLOC_TIER_T1) == 0) {
-            gb_log("smart_alloc: feeder T1 (%zu MB, evict_rate=%u)", bytesize >> 20, evict_rate);
+            gb_log("smart_alloc: feeder T1 (%zu MB, evict_rate=%u phase=%d)",
+                   bytesize >> 20, evict_rate, cur_phase);
             gb_tier_record_alloc(GB_TIER_T1_FEEDER, bytesize);
             return CUDA_SUCCESS;
         }
@@ -6205,27 +6652,30 @@ static CUresult gb_smart_overflow_alloc(CUdeviceptr *dptr, size_t bytesize) {
     }
 
     /* ── TIER 2: DDR - route based on speed comparison ── */
-    /* D1: weight feeder speed by PCIe link BW when PCIe is the bottleneck */
+    /* D1: weight feeder speed by PCIe link BW when PCIe is the bottleneck.
+     * NOTE: pcie_bw is in MB/s; compare directly as effective throughput cap. */
     uint32_t local_t2  = get_local_ddr_speed();
     uint32_t feeder_t2 = 0;
     if (gb_netc_is_active()) {
         int _n = gb_netc_remote_gpu_count();
         for (int i = 0; i < _n; i++) {
             uint32_t s = (uint32_t)gb_netc_t2_speed_mts(i);
-            uint32_t pcie_bw = gb_netc_feeder_pcie_bw_mbs(i);
-            /* Effective feeder T2 speed is min(DDR speed, PCIe BW×8) */
-            if (pcie_bw > 0) {
-                uint32_t pcie_equiv = pcie_bw * 8 / 1000;  /* MB/s → approx MT/s */
-                if (pcie_equiv < s) s = pcie_equiv;
-            }
             if (s > feeder_t2) feeder_t2 = s;
         }
     }
 
+    /* During GB_PHASE_MODEL_LOAD with an active cluster, prefer feeder T2 to place
+     * model weights on the feeder. The fake pointer from feeder T2 enables
+     * cuLaunchKernel data-driven dispatch: all tensor ops route to feeder GPU.
+     * During INFERENCE/STEADY the normal speed comparison restores local priority. */
+    int prefer_feeder_t2 = (!skip_t2 && cur_phase <= GB_PHASE_MODEL_LOAD
+                            && gb_netc_is_active());
+
     if (!skip_t2) {
-        if (feeder_t2 > local_t2) {
+        if (prefer_feeder_t2 || feeder_t2 > local_t2) {
             if (gb_try_feeder_alloc_tier(dptr, bytesize, GB_ALLOC_TIER_T2) == 0) {
-                gb_log("smart_alloc: feeder T2 faster (%u > %u MT/s, %zu MB)",
+                gb_log("smart_alloc: feeder T2 %s(%u vs %u MT/s, %zu MB)",
+                       prefer_feeder_t2 ? "[cluster-load] " : "[faster] ",
                        feeder_t2, local_t2, bytesize >> 20);
                 gb_tier_record_alloc(GB_TIER_T2_FEEDER, bytesize);
                 return CUDA_SUCCESS;
@@ -7454,8 +7904,9 @@ CUresult cuMemGetInfo_v2(size_t *free_out, size_t *total_out)
      * double the reserve so games can take VRAM back without inference
      * preempting them.  T2/T3 and remote memory are NOT reduced — they are
      * DDR/NVMe and do not affect GPU rendering. */
+    size_t _ws_applied = gb_effective_workstation_reserve_bytes(real_free, real_total);
     {
-        size_t ws = g_workstation_reserve_bytes;
+        size_t ws = _ws_applied;
         /* Read gaming_mode from sysfs; cached, so only a cheap stat on hot path */
         static int _gaming_mode_cached = 0;
         static uint64_t _gaming_mode_ms = 0;
@@ -7466,6 +7917,7 @@ CUresult cuMemGetInfo_v2(size_t *free_out, size_t *total_out)
             _gaming_mode_ms = _now;
         }
         if (_gaming_mode_cached) ws *= 2;  /* double reserve when game is running */
+        _ws_applied = ws;
         if (real_free > ws) real_free -= ws;
         else                real_free  = 0;
     }
@@ -7476,7 +7928,7 @@ CUresult cuMemGetInfo_v2(size_t *free_out, size_t *total_out)
     gb_log("cuMemGetInfo_v2: real_free=%zuMB local_virt=%zuMB remote_free=%zuMB total=%zuMB (phase %d, ws_reserve=%zuMB)",
            real_free >> 20, t2_free >> 20, remote_free >> 20,
            (real_total + gb_virtual_vram_bytes + g_cluster_remote_total_bytes) >> 20, phase,
-           g_workstation_reserve_bytes >> 20);
+           _ws_applied >> 20);
     return CUDA_SUCCESS;
 }
 
@@ -8751,6 +9203,30 @@ typedef enum {
 typedef int (*pfn_cudaMemcpy_t)(void *, const void *, size_t, int);
 typedef int (*pfn_cudaMemcpyAsync_t)(void *, const void *, size_t, int, void *);
 
+/* Phase 1 of the hot-expert VRAM caching investigation (see
+ * workflow/known-issues.md): record (offset, size) for every H2D copy that
+ * lands inside a Blackwell zero-copy T2 buffer during model load, so an
+ * offline script can cross-check this ordered sequence against the model's
+ * GGUF tensor table (gb_gguf_tensor_map.py) and confirm tensor identity by
+ * load order. Purely observational - never changes the copy itself. Gated to
+ * GB_PHASE_MODEL_LOAD only so it can never run on the per-token hot path. */
+static _Atomic uint64_t g_tensor_load_copy_seq = 0;
+
+static void gb_track_tensor_load_copy(uint64_t dstp, size_t count)
+{
+    if (atomic_load_explicit(&g_alloc_phase, memory_order_relaxed) != (int)GB_PHASE_MODEL_LOAD)
+        return;
+    CUdeviceptr base = 0; size_t buf_size = 0;
+    if (!gb_bvmm_zerocopy_range_lookup(dstp, &base, &buf_size))
+        return;
+    uint64_t seq = atomic_fetch_add_explicit(&g_tensor_load_copy_seq, 1, memory_order_relaxed);
+    uint64_t offset = dstp - (uint64_t)base;
+    char _dbuf[96];
+    snprintf(_dbuf, sizeof(_dbuf), "offset=%llu seq=%llu",
+             (unsigned long long)offset, (unsigned long long)seq);
+    GB_NVTX_EVENT("TENSOR_LOAD_COPY", "T2_DDR", count >> 20, dstp, _dbuf);
+}
+
 cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind)
 {
     GB_CUDART_ENSURE();
@@ -8808,6 +9284,11 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind)
                 GB_NVTX_EVENT("MEMCPY_D2H_T2", "T2_DDR", count >> 20, srcp, "local_t2_d2h");
             }
         }
+        /* Phase 1 tensor-identity tracking - deliberately NOT gated by the
+         * 1 MB threshold above: small tensors (norms, biases, a few hundred
+         * bytes) must appear in the sequence too for an exact GGUF match. */
+        if (kind == 1 /* cudaMemcpyHostToDevice */)
+            gb_track_tensor_load_copy(dstp, count);
     }
 
     return real_fn(dst, src, count, kind);
@@ -8854,6 +9335,13 @@ cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count,
             return rc == 0 ? CUDA_SUCCESS : (cudaError_t)1;
         }
     }
+
+    /* Phase 1 tensor-identity tracking - see gb_track_tensor_load_copy comment
+     * above cudaMemcpy. ggml/llama.cpp's CUDA backend loads weights via async
+     * copies on a stream, not the synchronous cudaMemcpy above, so this hook
+     * needs the same instrumentation. */
+    if (kind == 1 /* cudaMemcpyHostToDevice */)
+        gb_track_tensor_load_copy((uint64_t)(uintptr_t)dst, count);
 
     return real_fn(dst, src, count, kind, stream);
 }

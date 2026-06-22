@@ -281,10 +281,43 @@ def main() -> None:
         f"SHIM_CLUSTER_REMOTE_MB={flow.get('cluster_remote_vram_mb', '')}",
         # Orchestrator state (when daemon is running)
         f"ORCH_ECC_DEGRADED={int(orch.get('ecc_degraded', False))}",
+        f"ORCH_THERMAL_STRESS={int(orch.get('thermal_stress', False))}",        # Loop D→C gate
+        f"ORCH_MEM_BW_STRESS={int(orch.get('mem_bw_stress', False))}",         # Loop G→C gate
+        f"ORCH_SBE_ELEVATED={int(orch.get('sbe_elevated', False))}",          # Loop H advisory
+        f"ORCH_SBE_SEEN={orch.get('sbe_seen', 0)}",                           # Loop H count
+        f"ORCH_CLOCK_THROTTLED={int(orch.get('clock_throttled', False))}",    # Loop I SM clock
+        f"ORCH_SM_CLOCK_MAX_MHZ={orch.get('sm_clock_max_mhz', 0)}",          # Loop I reference
+        f"ORCH_SHIM_PHASE={orch.get('shim_phase', '')}",                      # current shim phase
         f"ORCH_WS_ABOVE={int(orch.get('ws_above', False))}",
         f"ORCH_WS_RESERVE_MB={orch.get('ws_reserve_mb', '')}",
         f"ORCH_ACTUATE={int(orch.get('actuate', False))}",
+        f"ORCH_VRAM_PRESSURE={int(orch.get('vram_pressure', False))}",
+        f"ORCH_CLUSTER_PRESSURE={int(orch.get('cluster_pressure', False))}",   # B3
+        f"ORCH_HEALTH_OK={int(bool(orch.get('health_ok', True)))}",            # B4
+        f"ORCH_HEALTH_EVICT_ARMED={int(orch.get('health_evict_armed', False))}", # B4
+        # Continuous OS tuner (Loops O-S)
+        f"ORCH_OS_TUNE_ENABLED={int(orch.get('os_tune_enabled', False))}",
+        f"ORCH_GAMING_MODE={int(orch.get('gaming_mode', False))}",
+        f"ORCH_CPU_GOVERNOR={orch.get('control', {}).get('cpu_governor', {}).get('value', '')}",
+        f"ORCH_GPU_PERSISTENCE={int(bool(orch.get('control', {}).get('gpu_persistence', {}).get('value', False)))}",
+        f"ORCH_GPU_POWER_LIMIT_W={orch.get('control', {}).get('gpu_power_limit_w', {}).get('value', '')}",
+        f"ORCH_GPU_CLOCKS_LOCKED={orch.get('control', {}).get('gpu_clocks_locked', {}).get('value', '')}",
+        f"ORCH_SWAPPINESS={orch.get('control', {}).get('swappiness', {}).get('value', '')}",
     ]
+    # Topology constants (C0) — inference CPU pinning hints for the shell layer
+    try:
+        from gb_topology import get_topology
+        _topo = get_topology()
+        _inf_cpus = ",".join(str(c) for c in _topo.inference_cpus)
+        lines += [
+            f"TOPO_INFERENCE_CPUS={_inf_cpus}",
+            f"TOPO_INFERENCE_THREADS={_topo.inference_threads}",
+            f"TOPO_BACKGROUND_THREADS={_topo.background_threads}",
+            f"TOPO_PCIE_SAT_MB_S={_topo.pcie_saturation_mb_s:.0f}",
+            f"TOPO_IS_BLACKWELL={int(_topo.is_blackwell)}",
+        ]
+    except Exception:
+        pass
     # DCGM health block — only probed when --dcgm flag passed (30s cache)
     if want_dcgm:
         dcgm = _probe_dcgm(0)

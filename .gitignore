@@ -27,6 +27,9 @@ nano.*.save
 plan*.md
 apply_fixes.sh
 
+# Bench harness output (generated, machine-local results)
+tests/bench/results.jsonl
+
 # AI assistant local context (never commit)
 .claude/
 .claude-sessions/

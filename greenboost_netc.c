@@ -222,7 +222,8 @@ static void gb_derive_session_key(const uint8_t psk[32],
  * Returns 0 on success, -1 if key file absent or malformed.
  *
  * PR-G hardening (mirrors netd):
- *   - Refuse if keyfile mode bits include group/world (insecure).
+ *   - Accept mode 0600/0400 (root-only) or 0640 root:greenboost (group read).
+ *   - Refuse world access, group write/execute, or wrong group on 0640.
  *   - Require exactly 64 hex chars (no silent leading-zero padding).
  *   - explicit_bzero the on-stack hex buffer before return.
  *   - File must be a regular file. */
@@ -232,10 +233,11 @@ static int gb_load_psk(uint8_t key[32])
     struct stat st;
     if (stat(path, &st) != 0) return -1;
     if (!S_ISREG(st.st_mode)) return -1;
-    if (st.st_mode & (S_IRWXG | S_IRWXO)) {
+    if (gb_check_keyfile_mode(&st, path) != 0) {
         /* netc_log macro is defined later in this TU; use stderr directly. */
         fprintf(stderr, "[GreenBoost netc] AUTH: %s has insecure mode 0%o - "
-                "refusing to load PSK\n", path, st.st_mode & 07777);
+                "must be 0600 (root-only) or 0640 root:%s\n",
+                path, st.st_mode & 07777, GB_KEYFILE_GRP);
         return -1;
     }
     FILE *f = fopen(path, "r");
@@ -930,7 +932,10 @@ static int connect_feeder(struct netc_feeder *f)
         return -1;
     }
 
-    f->connected  = 1;
+    /* connected is set LAST, after all initial sends complete (MEM_INFO at line ~992).
+     * Any caller that checks nf->connected before sending (e.g. gb_netc_mem_info)
+     * must not see connected=1 until connect_feeder's own unprotected sends are done,
+     * otherwise they race on send_seq with connect_feeder (no per_lock held here). */
     f->feeder_id  = resp->feeder_id;
     f->gpu_count  = (int)resp->gpu_count;
     if (f->gpu_count > GB_NET_MAX_GPUS) f->gpu_count = GB_NET_MAX_GPUS;
@@ -1041,6 +1046,12 @@ static int connect_feeder(struct netc_feeder *f)
                      ? (float)f->pcie_effective_bw_mbs : 0.0f;
 
     free(resp_payload);
+    /* Now that all initial sends (HANDSHAKE + MEM_INFO) are done, mark connected.
+     * Setting this earlier (before the MEM_INFO send) creates a window where a
+     * concurrent CUDA thread calling gb_netc_mem_info can see connected=1 and send
+     * without per_lock, racing with connect_feeder's own unprotected send and
+     * producing a duplicate seq_num on the feeder side. */
+    f->connected = 1;
     return 0;
 }
 
@@ -1386,24 +1397,38 @@ int gb_netc_t1_mem_info(int remote_idx, uint64_t *t1_free, uint64_t *t1_total)
     int fi = g_remote_gpus[remote_idx].feeder_idx;
     int gi = g_remote_gpus[remote_idx].feeder_gpu_id;
     struct netc_feeder *nf = &g_feeders[fi];
-    if (!nf->connected) return -1;
+    if (!nf->connected) {
+        fprintf(stderr, "[GreenBoost-netc] t1_mem_info[%d]: feeder not connected\n", remote_idx);
+        return -1;
+    }
 
     struct gb_net_mem_info req = { .device_id = (gb_u32)gi };
 
     pthread_mutex_lock(&nf->per_lock);
     int ret = netc_send_msg(nf, GB_MSG_MEM_INFO, 0, &req, sizeof(req));
-    if (ret < 0) { pthread_mutex_unlock(&nf->per_lock); return -1; }
+    if (ret < 0) {
+        pthread_mutex_unlock(&nf->per_lock);
+        fprintf(stderr, "[GreenBoost-netc] t1_mem_info[%d]: send failed (errno=%d)\n",
+                remote_idx, errno);
+        return -1;
+    }
 
     struct gb_net_header resp_hdr;
     void *resp_payload = NULL;
     ret = netc_recv_response(nf, &resp_hdr, &resp_payload);
     pthread_mutex_unlock(&nf->per_lock);
 
-    if (ret < 0 || !resp_payload) return -1;
+    if (ret < 0 || !resp_payload) {
+        fprintf(stderr, "[GreenBoost-netc] t1_mem_info[%d]: recv failed ret=%d payload=%p (errno=%d)\n",
+                remote_idx, ret, resp_payload, errno);
+        return -1;
+    }
 
     const struct gb_net_mem_info_resp *resp =
         (const struct gb_net_mem_info_resp *)resp_payload;
     if (resp->status != GB_STATUS_OK && resp->t1_total == 0) {
+        fprintf(stderr, "[GreenBoost-netc] t1_mem_info[%d]: feeder returned status=%u t1_total=0\n",
+                remote_idx, (unsigned)resp->status);
         free(resp_payload); return -1;
     }
 
@@ -1931,8 +1956,13 @@ void gb_netc_register_kernel(const void *host_func, const char *device_name)
     for (int fi = 0; fi < g_feeder_count; fi++) {
         struct netc_feeder *nf = &g_feeders[fi];
         if (!nf->connected) continue;
-        /* Fire-and-forget: don't wait for response to avoid stalling the caller */
+        /* Must hold per_lock while sending: heartbeat thread (gb_netc_poll_health)
+         * also writes to this socket under per_lock. g_netc_lock alone does not
+         * prevent the race — they are independent locks. Concurrent writes corrupt
+         * the TCP framing, causing the feeder to close the connection on seq mismatch. */
+        pthread_mutex_lock(&nf->per_lock);
         netc_send_msg(nf, GB_MSG_CUDA_REGISTER_FN, 0, buf, msg_size);
+        pthread_mutex_unlock(&nf->per_lock);
     }
 
     pthread_mutex_unlock(&g_netc_lock);

@@ -178,12 +178,18 @@ class DiffusionOrchestrator:
         self.pools.trim("activations")
 
     @contextlib.contextmanager
-    def denoise_phase(self, prefetch_vae: bool = True, total_steps: int = 0):
+    def denoise_phase(self, prefetch_vae: bool = True, total_steps: int = 0,
+                       diffcache_threshold: Optional[float] = None,
+                       diffcache_max_skip: int = 2):
         """
         Prepare for denoising loop:
           - Denoiser on GPU (T1)
           - VAE on CPU (T2)
           - Optionally prefetch VAE on transfer stream during last step
+          - Optionally enable activation caching (gb_diffcache) on the
+            denoiser for this phase, skipping recompute on near-identical
+            consecutive timesteps. Pass diffcache_threshold to enable
+            (e.g. 0.1); None (default) leaves the denoiser unpatched.
         """
         print("[gb_orch] denoise_phase: promoting denoiser → T1", flush=True)
 
@@ -197,10 +203,38 @@ class DiffusionOrchestrator:
         self._prefetch_vae_done = False
         self._total_steps = total_steps
 
-        with self.pools.use("latents"):
-            yield self
+        self._diffcache_modules: list = []
+        if diffcache_threshold is not None:
+            import gb_diffcache
+            for attr in self.denoiser_attrs:
+                mod = getattr(self.pipe, attr, None)
+                if mod is not None:
+                    gb_diffcache.patch(mod, threshold=diffcache_threshold,
+                                        max_skip=diffcache_max_skip)
+                    gb_diffcache.reset(mod)
+                    self._diffcache_modules.append(mod)
+
+        try:
+            with self.pools.use("latents"):
+                yield self
+        finally:
+            if self._diffcache_modules:
+                import gb_diffcache
+                for mod in self._diffcache_modules:
+                    print(f"[gb_orch] diffcache: {gb_diffcache.status(mod)}", flush=True)
+                    gb_diffcache.unpatch(mod)
 
         self.pools.trim("latents")
+
+    def diffcache_reset(self):
+        """Clear diffcache state for all patched denoiser modules. Call at
+        the start of each new image/video generation within a batch so the
+        first timestep never reuses the previous generation's last step."""
+        if not getattr(self, "_diffcache_modules", None):
+            return
+        import gb_diffcache
+        for mod in self._diffcache_modules:
+            gb_diffcache.reset(mod)
 
     def step(self, step_idx: int):
         """
@@ -256,12 +290,18 @@ class DiffusionOrchestrator:
         steps: int = 4,
         guidance: float = 1.0,
         seeds: Optional[List[int]] = None,
+        diffcache_threshold: Optional[float] = None,
+        diffcache_max_skip: int = 2,
     ):
         """
         Run the full gb_quant int4 batch pipeline in one call.
         Returns list of PIL images.
 
         Requires gb_quant to be importable (i.e. running inside _gen_gb.sh env).
+
+        diffcache_threshold: pass e.g. 0.1 to enable gb_diffcache activation
+        caching on the denoiser for this batch (skip recompute on near-
+        identical consecutive timesteps). None (default) disables it.
         """
         import gb_quant
 
@@ -274,8 +314,11 @@ class DiffusionOrchestrator:
         gb_quant.quantize_denoiser(self.pipe, bits=4)
 
         images = []
-        with self.denoise_phase(prefetch_vae=True, total_steps=steps) as phase:
+        with self.denoise_phase(prefetch_vae=True, total_steps=steps,
+                                 diffcache_threshold=diffcache_threshold,
+                                 diffcache_max_skip=diffcache_max_skip) as phase:
             for i, (emb, seed) in enumerate(zip(all_embeds, seeds)):
+                phase.diffcache_reset()
                 gen = torch.Generator(device="cpu").manual_seed(seed)
                 with self.pools.use("latents"):
                     with self.gs.on("gemm"):
