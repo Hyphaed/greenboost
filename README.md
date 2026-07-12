@@ -9,12 +9,18 @@
 ![Platform](https://img.shields.io/badge/platform-Linux-333333?style=flat-square&logo=linux&logoColor=white)
 ![Status](https://img.shields.io/badge/status-active%20daily%20use-success?style=flat-square)
 
-**Run bigger models on the GPU you already have.**
 
-> GreenBoost does it three ways, together:
->> lends your GPU system RAM + NVMe (memory tiering) <<
->> compresses models to fit real VRAM (gb-quant weights + TurboQuant K/V cache) <<
->> pools idle machines on your LAN (cluster mode) <<
+## Run bigger models on the GPU you already have.
+
+Any laptop sitting around collecting dust? start using greenboost cluster + dataflux mcp.
+
+> GreenBoost combines three technologies to push past VRAM limits:
+>
+> 📦 **Memory Tiering** — extend GPU memory with system RAM and NVMe.
+>
+> 🗜️ **GB-Quant + TurboQuant** — compress model weights and the KV cache to fit larger models in available VRAM.
+>
+> 🌐 **Cluster Mode** — pool idle GPUs across your LAN into a single inference cluster.
 
 [Quick install](#-quick-install) ·
 [How it works](#-how-it-works) ·
