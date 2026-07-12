@@ -29,13 +29,13 @@ No retraining. No code changes. Just install GreenBoost and keep using Ollama, l
 
 </div>
 
-[Quick install](#-quick-install) ·
-[How it works](#-how-it-works) ·
-[gb-quant](#-gb-quant---quantize-to-fit-the-fastest-tier-is-the-one-you-fit-in) ·
-[Cluster mode](#cluster-mode---put-a-second-machines-gpu-to-work) ·
-[gb-synapse](#-gb-synapse--greenboosts-own-model-server-spread-across-the-cluster) ·
-[dataflux](#-dataflux--a-flight-recorder-for-your-inference) ·
-[Full docs](#-documentation-map) ·
+[Quick Start](#-quick-install) ·
+[Documentation](#-documentation-map) ·
+[Architecture](#-how-it-works) ·
+[GB-Quant](#-gb-quant---quantize-to-fit-the-fastest-tier-is-the-one-you-fit-in) ·
+[Cluster](#cluster-mode---put-a-second-machines-gpu-to-work) ·
+[Synapse](#-gb-synapse--greenboosts-own-model-server-spread-across-the-cluster) ·
+[Dataflux](#-dataflux--a-flight-recorder-for-your-inference) ·
 [Changelog](CHANGELOG.md)
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/greenboost)
@@ -58,20 +58,19 @@ wouldn't exist without them.
 
 ## What is GreenBoost?
 
-> Your GPU runs out of VRAM, your model crashes, you buy a bigger GPU.
-> GreenBoost is the third option.
+**Your GPU ran out of VRAM.**
+**Most tools tell you to buy a bigger GPU.**
+**GreenBoost is the third option.**
 
-GreenBoost tricks CUDA into thinking your **GPU VRAM +
-System RAM + NVMe** are all one giant pool of GPU memory. Your model loads,
-inference runs on the GPU at full speed, and the parts that don't fit in
-VRAM live in your system RAM - fetched on demand over PCIe. That's strategy
-one, memory tiering. Strategy two is compression, and it's actually two
-independent knobs: **gb-quant** quantizes the model's *weights* once at load
-so the working set fits real VRAM, and **TurboQuant** quantizes the *KV
-cache* continuously during attention so the bandwidth doesn't reopen every
-decode step. Strategy three, **cluster mode**, pools a second machine's idle
-GPU and RAM over your LAN into the same virtual device. Mix and match all
-three, all while compute stays on the GPU.
+It extends CUDA memory with system RAM, NVMe, model compression, and even
+idle GPUs on your local network - allowing models much larger than your
+card's VRAM to keep running, while computation stays on the GPU.
+
+Under the hood that's three strategies, mix and match: **memory tiering**
+(VRAM → DDR → NVMe, one virtual pool), **compression** (**gb-quant** shrinks
+model *weights* once at load, **TurboQuant** shrinks the *KV cache* on every
+decode step), and **cluster mode** (borrow a second machine's idle GPU and
+RAM over LAN).
 
 Nothing in your model code changes. No retraining required. It just works
 with Ollama, llama.cpp, vLLM, PyTorch, and anything else that calls
@@ -110,7 +109,7 @@ the allocations that overflow.
 
 ---
 
-## 🚀 Quick install
+## ⚡ Quick install
 
 Works on **CUDA 12 and 13** (side-by-side installs are handled automatically)
 and on both GCC- and Clang-built kernels (CachyOS, Arch/clang , no manual
@@ -203,14 +202,20 @@ Jerry Nguyen contributed this path. See
 
 ## 🌐 Cluster mode , put a second machine's GPU to work
 
+💻 Got a laptop lying around collecting dust with an idle NVIDIA GPU inside?
+Put it to work: start `greenboost cluster` and watch it in `greenboost
+dataflux-ui` +  `greenboost dataflux MCP` (direct dataflux connection for your inference pipelines).
+
 Cluster mode has existed since v2.9, but **v3.2 is the first release where
-it's genuinely working**, not just alpha-stage. This is the one we're proudest
-of: it brings local AI inference to the next level, because now you can
+it's genuinely working**, not just alpha-stage. 
+"Greenboost Cluster", brings local AI inference to the next level, because now you can
 orchestrate the hardware you already have on your own network, instead of an
 idle laptop GPU just sitting there. It's also been polished through real daily
 use, mostly Hugging Face diffusion pipelines, not just synthetic benchmarks.
 
-Got a laptop with a GPU sitting idle? Start a feeder on the idle machine:
+Got an idle gaming laptop? GreenBoost can turn its GPU and RAM into extra
+memory and compute for your desktop over your local network. Start a feeder
+on the idle machine:
 
 ```bash
 sudo greenboost feed start
