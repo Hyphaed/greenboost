@@ -88,6 +88,8 @@ for what this actually delivers today.
 | `greenboost nvtx-logs [--llm]` | Live NVTX event log , allocation events, phase transitions, OOM events |
 | `greenboost nvtx vitals [--last N] [--filter EV] [--feeder-only] [--local-only] [--llm]` | NVTX event timeline view |
 | `greenboost health-check [--llm]` | One-shot comprehensive cluster health audit (module, shim, NVML, feeder handshakes) |
+| `greenboost capabilities [--llm]` | Print the installed/running shim's feature manifest (`gb_monitor.py`), also written to `/run/greenboost/capabilities.json` |
+| `greenboost pilot [--llm]` | Read-only dataflux advisor (`gb_pilot.py`): evidence-backed advice naming the exact `gb_control` lever to pull next, never actuates anything itself |
 | `greenboost build-info [--llm]` | Show build metadata (version, git hash, build date, CUDA version) |
 | `sudo greenboost clear logs` | Clear all GreenBoost log sources for a fresh diagnostic baseline (dmesg, journal, log files) |
 | `sudo greenboost clear inference-logs` | Clear inference service logs only |

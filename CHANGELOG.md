@@ -4,7 +4,7 @@
 <details>
 <summary><strong>Jump to a version</strong></summary>
 
-- [v3.2 , 2026-07-06](#v32--2026-07-06)
+- [v3.2 , 2026-07-12](#v32--2026-07-12)
 - [v3.1 , 2026-06-16](#v31--2026-06-16)
 - [v3.0 , 2026-06-13](#v30--2026-06-13)
 - [v2.9 , 2026-06-10](#v29--2026-06-10)
@@ -18,32 +18,7 @@
 
 ---
 
-## Unreleased , efficiency quick wins (2026-07-11)
-
-Four default-safe optimizations toward the "AI memory OS" roadmap
-(`greenboost_next.md`), none changing default behavior:
-
-- **Version-scoped gb-quant autotune cache.** The persisted GemLite Triton
-  autotune file is now keyed on GPU **+ CUDA + gemlite version**, so a toolchain
-  upgrade never silently reuses stale kernel configs. Opt-out
-  `GB_QUANT_NO_AUTOTUNE_CACHE=1`.
-- **Transparent zstd for T3 checkpoints.** Models evicted to NVMe compress
-  automatically (python-zstandard → `zstd` CLI → plain fallback); legacy plain
-  `.pt` still loads; ratio/timing recorded in the dataflux `tier_move` event.
-  Opt-out `GB_T3_COMPRESS=0`.
-- **Phase-aware T1 workspace reserve** (`GREENBOOST_T1_WORKSPACE_MB`, default
-  off). Holds VRAM back during model load so per-step compute workspace stays
-  in T1 instead of spilling to T2, released at inference — generalizes the
-  validated diffusion trick (denoise steps 37 s → 10 s) into the shim for every
-  workload.
-- **Opt-in tiered precision** (`GB_QUANT_TIERED_PRECISION=1`). Hot (fitting)
-  weights stay at fp8; the cold overflow tail drops to nvfp4 on Blackwell (else
-  int4), trading precision for bandwidth only where weights don't fit. fp8
-  stays the default; nvfp4/int4 never become the blanket default.
-
-Full test suite: 680 passed.
-
-## v3.2 : Big changes
+## v3.2 : 2026-07-12
 
 I want to explain the thinking behind this release before listing what's in
 it, because it's the reason GreenBoost exists at all. I don't like accepting
@@ -276,6 +251,81 @@ gracefully to procfs/shim_stats-only reporting otherwise.
   that skips recomputing a step when barely anything changed since the last
   one, with guards so it doesn't go stale when a LoRA changes mid-run.
 
+### Efficiency quick wins
+
+Four default-safe optimizations toward the AI memory OS roadmap, none
+changing default behavior:
+
+- **Version-scoped gb-quant autotune cache.** The persisted GemLite Triton
+  autotune file is now keyed on GPU **+ CUDA + gemlite version**, so a toolchain
+  upgrade never silently reuses stale kernel configs. Opt-out
+  `GB_QUANT_NO_AUTOTUNE_CACHE=1`.
+- **Transparent zstd for T3 checkpoints.** Models evicted to NVMe compress
+  automatically (python-zstandard → `zstd` CLI → plain fallback); legacy plain
+  `.pt` still loads; ratio/timing recorded in the dataflux `tier_move` event.
+  Opt-out `GB_T3_COMPRESS=0`.
+- **Phase-aware T1 workspace reserve** (`GREENBOOST_T1_WORKSPACE_MB`, default
+  off). Holds VRAM back during model load so per-step compute workspace stays
+  in T1 instead of spilling to T2, released at inference , generalizes the
+  validated diffusion trick (denoise steps 37 s → 10 s) into the shim for every
+  workload.
+- **Opt-in tiered precision** (`GB_QUANT_TIERED_PRECISION=1`). Hot (fitting)
+  weights stay at fp8; the cold overflow tail drops to nvfp4 on Blackwell (else
+  int4), trading precision for bandwidth only where weights don't fit. fp8
+  stays the default; nvfp4/int4 never become the blanket default.
+
+### AI memory OS tranche + polish roundup
+
+- **`gb_monitor.py`** , canonical read-only telemetry/capability client that
+  unifies the four separate `shim_stats` parsers and ioctl mirrors that had
+  grown independently across the codebase into one shared source of truth.
+  Backs the new `greenboost capabilities` command, which prints the
+  installed/running shim's feature manifest (also written to
+  `/run/greenboost/capabilities.json` at install time and refreshed at
+  runtime).
+- **`greenboost pilot`** (`gb_pilot.py`) , a read-only "instrument panel" over
+  the dataflux log. It turns the trends already being recorded into
+  evidence-backed advice that names the exact `gb_control` lever to pull, but
+  never actuates anything itself.
+- **Dataflux MCP additions** , `gb_dataflux_mcp.py` gained
+  `greenboost_status`, `greenboost_capabilities`, and `greenboost_pilot`
+  tools, so an MCP-connected AI assistant can query live capability state and
+  pilot advice, not just historical events.
+- **`gb_synapse_tools.py`** , text-based tool-call injection for GGUF models
+  that don't emit native OpenAI-style `tool_calls`, lifted out of
+  greenboost-cli into the shared layer so gb-synapse serving benefits too.
+- **`gb_llm_server.py`** , a minimal OpenAI-compatible server built on
+  `gb_llm.py`; it's the "gbquant" engine fallback gb-synapse uses when vLLM
+  isn't installed.
+- **`gb_placement.py`** , an fp8-floor cluster-fit planner
+  (`GB_PLACEMENT=1`). It prefers placing overflow on a connected cluster feeder
+  over silently dropping below fp8 precision, and arbitrates between GGUF
+  (llama.cpp RPC tensor-split) and PyTorch (`offload_tail_blocks`) placement
+  depending on what the model actually is.
+- **`gb_kernel_backends.py`** , a pluggable low-bit GEMM backend selector for
+  gb-quant, chosen via `GB_KERNEL_BACKEND` (GemLite default, `scaled_mm` for
+  fp8, bf16 passthrough, CUTLASS reserved for future use).
+- **`gb_nvml_ctypes.py`** , a pynvml-compatible NVML binding written directly
+  over `ctypes`, so GPU telemetry (`gb_telemetry.py`, dataflux) works even in
+  environments where `nvidia-ml-py` isn't pip-installed.
+- **Fabric zstd compression** , the cluster wire protocol
+  (`features/net_fabric.h`) now compresses host-to-device payloads with zstd
+  when both ends negotiate it during the handshake (`feature_flags`, protocol
+  v3, backward compatible with v2 feeders).
+- **Phase-aware KV prefetch stats mode** (`GREENBOOST_KV_PREFETCH`), exposing
+  `kv_prefetch_*` counters so KV-cache prefetch behavior is visible in
+  telemetry instead of only inferred indirectly.
+- **CUTLASS sm_120a NVFP4 scaffold** (`third_party/gb_cutlass`,
+  `GB_CUTLASS_ENABLE` gate) , groundwork for a native NVFP4 GEMM kernel on
+  Blackwell; not wired into the default kernel-selection path yet.
+- **TurboQuant Triton autotune persistence** and
+  `turboquant_attention_from_env`, so `gb_attn.py`'s attention compression can
+  be configured entirely from environment variables in serving contexts.
+- **Proxy-owned tok/s measurement** on the Ollama-surface streaming paths in
+  `gb_synapse_api.py`, closing the loop between orchestration decisions and
+  real, client-observed throughput for gb-synapse-served models too.
+
+821 tests green (723 baseline + 98).
 
 ---
 

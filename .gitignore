@@ -72,6 +72,8 @@ deploy_and_test.py
 deploy_shim.sh
 run_test.sh
 test_qwen_vllm.sh
+test_cluster_qwen3.sh
+watch_nvtx.sh
 
 # All compiled shared libraries (libgreenboost_cuda.so already covered above)
 *.so
@@ -92,6 +94,8 @@ proton_copy
 # Stray / generated files that must not be committed
 sudo
 build_info
+greenboost-ebpf-trace
+*.deb
 
 # Claude agent skills/working files , never committed
 .agents/

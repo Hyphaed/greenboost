@@ -218,10 +218,24 @@ own RAM.
 
 Where this pays off *today*, measurably: `gb_cluster.py` gives any PyTorch
 pipeline a simple API to hand off a whole stage (e.g. text encoding) or the
-tail of a model to a feeder's GPU. On a real diffusion pipeline at home,
-combining that with a few related fixes took a generation from ~5.5 minutes
-down to ~42 seconds - about **7.8× faster**, from putting a second consumer
-GPU to work instead of leaving it idle.
+tail of a model to a feeder's GPU (`offload_tail_blocks`, backed by
+`gb_remote_blocks.py` - a persistent, model-agnostic tensor-RPC worker that
+holds the tail transformer blocks in feeder VRAM so only activations cross
+the wire on every step). On a real diffusion pipeline at home, combining
+that with a few related fixes took a generation from ~5.5 minutes down to
+~42 seconds - about **7.8× faster**, from putting a second consumer GPU to
+work instead of leaving it idle. For GGUF models, `gb_placement.py` picks
+between that split and llama.cpp's own RPC tensor-split automatically,
+always preferring a cluster feeder over silently dropping below fp8
+precision (`GB_PLACEMENT=1`).
+
+Check what's actually installed and running at any time with:
+
+```bash
+greenboost capabilities   # installed/running shim feature manifest
+greenboost pilot          # dataflux-driven advice on what lever to pull next
+greenboost health-check   # one-shot PASS/FAIL/WARN across module/VRAM/T2/T3/cluster
+```
 
 The cluster fabric is secured with:
 - Pre-shared key (PSK) auth + HKDF-derived session keys (`feeders genkey`,
@@ -254,6 +268,12 @@ Once running, it speaks Ollama's API, OpenAI's API, and HuggingFace's TGI API
 on the same port, so existing tools don't need to know anything changed. Full
 reference: [GREENBOOST_COMMANDS.md § gb-synapse](GREENBOOST_COMMANDS.md#-gb-synapse-huggingface-native-cluster-distributed-gguf-serving).
 
+When vLLM isn't installed, gb-synapse falls back to `gb_llm_server.py`, a
+minimal OpenAI-compatible server built directly on `gb_llm.py` - same API
+surface, no extra dependency. The low-bit GEMM kernel gb-quant uses
+underneath (GemLite, `scaled_mm` fp8, bf16 passthrough) is itself pluggable
+via `gb_kernel_backends.py` and `GB_KERNEL_BACKEND`.
+
 ---
 
 ## 📊 dataflux , a flight recorder for your inference
@@ -272,6 +292,12 @@ greenboost dataflux-ui        # opens a live web page at :8799
 
 It works standalone on a single machine, no feeder required, and auto-refreshes
 every 5 seconds. Full reference: [DOCUMENTATION.md § dataflux](DOCUMENTATION.md).
+
+`gb_dataflux_mcp.py` exposes the same log read-only over MCP
+(`dataflux_summary`, `dataflux_events`, `dataflux_errors`,
+`greenboost_status`/`capabilities`/`pilot`), so any MCP-compatible AI
+assistant can query live capability state and dataflux history directly
+instead of you opening the web UI.
 
 ---
 

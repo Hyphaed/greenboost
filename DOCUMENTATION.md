@@ -172,6 +172,45 @@ to 8**
 - Full Install no longer reinstalls Ollama on every run - it checks the
   latest release first and only updates when actually behind.
 
+**AI memory OS tranche + polish roundup**
+- `gb_monitor.py` - canonical read-only telemetry/capability client unifying
+  the shim_stats parsers and ioctl mirrors that had grown independently.
+  Backs `greenboost capabilities` (§ below), which prints the installed/
+  running shim's feature manifest.
+- `gb_pilot.py` - a read-only "instrument panel" over the dataflux log;
+  turns recorded trends into evidence-backed advice naming the exact
+  `gb_control` lever to pull, never actuates anything itself. New
+  `greenboost pilot` command and MCP tool.
+- `gb_dataflux_mcp.py` gained `greenboost_status`, `greenboost_capabilities`,
+  and `greenboost_pilot` tools alongside the existing dataflux-log tools.
+- `gb_synapse_tools.py` - text-based tool-call injection for GGUFs that
+  don't emit native OpenAI `tool_calls`, shared by gb-synapse serving.
+- `gb_llm_server.py` - minimal OpenAI-compatible server on `gb_llm.py`;
+  the "gbquant" engine fallback gb-synapse uses when vLLM isn't installed.
+- `gb_placement.py` - fp8-floor cluster-fit planner (`GB_PLACEMENT=1`);
+  prefers a connected feeder over dropping below fp8, and arbitrates
+  between GGUF RPC tensor-split and PyTorch `offload_tail_blocks`.
+- `gb_kernel_backends.py` - pluggable low-bit GEMM backend selector for
+  gb-quant (`GB_KERNEL_BACKEND`: GemLite default, `scaled_mm` fp8, bf16
+  passthrough, CUTLASS reserved).
+- `gb_nvml_ctypes.py` - pynvml-compatible NVML binding over `ctypes`, so
+  telemetry works without `nvidia-ml-py` pip-installed.
+- Cluster fabric zstd compression on host-to-device payloads, negotiated at
+  handshake (protocol v3, backward compatible with v2 feeders).
+- Phase-aware KV prefetch stats mode (`GREENBOOST_KV_PREFETCH`), exposing
+  `kv_prefetch_*` telemetry counters.
+- CUTLASS sm_120a NVFP4 scaffold (`third_party/gb_cutlass`,
+  `GB_CUTLASS_ENABLE`) - groundwork only, not in the default kernel path.
+- TurboQuant Triton autotune persistence + `turboquant_attention_from_env`.
+- Proxy-owned tok/s measurement on gb-synapse's Ollama-surface streaming.
+- Four default-safe efficiency wins: version-scoped gb-quant autotune cache
+  (opt-out `GB_QUANT_NO_AUTOTUNE_CACHE=1`), transparent zstd for T3
+  checkpoints (opt-out `GB_T3_COMPRESS=0`), phase-aware T1 workspace
+  reserve (`GREENBOOST_T1_WORKSPACE_MB`, default off), opt-in tiered
+  precision (`GB_QUANT_TIERED_PRECISION=1` - fp8 stays the default).
+
+821 tests green.
+
 ---
 
 ## What's new in v3.1
@@ -1177,6 +1216,31 @@ grep greenboost /proc/$(pgrep ollama)/maps | head -3
 
 ---
 
+## Capabilities, pilot & health-check
+
+Three read-only commands for "what's actually running right now, and what
+should I do about it":
+
+```bash
+greenboost capabilities   # installed/running shim feature manifest
+greenboost pilot           # dataflux-driven advice on the next tuning step
+greenboost health-check    # one-shot PASS/FAIL/WARN across module/VRAM/T2/T3/cluster
+```
+
+- **`greenboost capabilities`** is backed by `gb_monitor.py`, the canonical
+  telemetry/capability client that replaced four independently-grown
+  `shim_stats` parsers. It reads the shim's feature manifest, written at
+  install time and refreshed at runtime to `/run/greenboost/capabilities.json`.
+- **`greenboost pilot`** is backed by `gb_pilot.py`. It reads the dataflux
+  log (§ dataflux below) and turns recorded trends into concrete,
+  evidence-backed suggestions - each one names the exact `gb_control` lever
+  to pull. It never actuates anything itself; you decide whether to act.
+- Both are also exposed as MCP tools (`greenboost_capabilities`,
+  `greenboost_pilot`) by `gb_dataflux_mcp.py`, alongside `greenboost_status`,
+  so an MCP-connected AI assistant can query the same state directly.
+
+---
+
 ## Live debug signals - real-time telemetry during inference
 
 GreenBoost exposes three layers of live telemetry readable at any time, even mid-inference.
@@ -1353,9 +1417,9 @@ ls -la /run/greenboost/shim_stats
 rm -f /run/greenboost/shim_stats /run/greenboost/metrics.json
 
 # 2. Check feeder daemon is actually running on the feeder
-ssh ferran@<feeder-ip> 'ss -tlnp | grep 9740'
+ssh <user>@<feeder-ip> 'ss -tlnp | grep 9740'
 # If not listening → start it:
-ssh ferran@<feeder-ip> 'sudo systemctl start greenboost-netd || sudo nohup /usr/local/bin/greenboost-netd -d -p 9740 &'
+ssh <user>@<feeder-ip> 'sudo systemctl start greenboost-netd || sudo nohup /usr/local/bin/greenboost-netd -d -p 9740 &'
 # Then re-register:
 sudo greenboost connect <feeder-ip>
 
@@ -1472,6 +1536,21 @@ preserved); gemma-3-12b (22.7 GiB bf16) fits in 6.2 GiB int4.
 Note: gb-quant currently runs WITHOUT the LD_PRELOAD shim (its backend
 cannot initialise under it yet); for fits-after-quantization models the
 shim is unnecessary anyway.
+
+### New tuning knobs (v3.2 AI memory OS tranche)
+
+All default-safe (off, or the previous behavior, unless set):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GB_PLACEMENT` | `0` | Enable the `gb_placement.py` fp8-floor cluster-fit planner: prefer a connected feeder over dropping model precision below fp8. |
+| `GB_KERNEL_BACKEND` | `gemlite` | Low-bit GEMM backend gb-quant uses: `gemlite`, `scaled_mm` (fp8), `bf16` (passthrough). CUTLASS reserved for future use. |
+| `GB_QUANT_NO_AUTOTUNE_CACHE` | `0` | Disable the version-scoped (GPU+CUDA+gemlite) persisted Triton autotune cache. |
+| `GB_T3_COMPRESS` | `1` | Transparent zstd compression for models evicted to T3 NVMe. Set `0` to store plain. |
+| `GB_QUANT_TIERED_PRECISION` | `0` | Hot (fitting) weights stay fp8; cold overflow tail drops to nvfp4 (Blackwell) or int4. fp8 remains the default when unset. |
+| `GREENBOOST_T1_WORKSPACE_MB` | unset (off) | Reserve T1 VRAM for per-step compute workspace during model load, released at inference. |
+| `GREENBOOST_KV_PREFETCH` | `0` | Enable phase-aware KV prefetch stats mode, exposing `kv_prefetch_*` telemetry counters. |
+| `GB_CUTLASS_ENABLE` | `0` | Build/enable the CUTLASS sm_120a NVFP4 GEMM scaffold (`third_party/gb_cutlass`). Groundwork only. |
 
 ---
 
