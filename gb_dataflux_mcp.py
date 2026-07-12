@@ -236,5 +236,20 @@ def synapse_status() -> dict:
     return out
 
 
+@mcp.tool()
+def tiering_status() -> dict:
+    """GB-Tiering live state via gb_tiering (the T1/T2/T3 memory tier layer):
+    per-tier pool occupancy (MB) + combined GB, pressure labels, shim phase +
+    active allocation path, KV reserve, and OOM/gaming flags. This is the
+    subsystem-named view of the same shim/kmod state `greenboost_status`
+    exposes — use it to see whether VRAM (T1) is filled toward the ~90% target
+    (Rule #1) or spilling to T2 DDR / T3 NVMe."""
+    try:
+        import gb_tiering
+        return gb_tiering.tiering_status()
+    except Exception as e:
+        return {"error": f"gb_tiering unavailable: {e}"}
+
+
 if __name__ == "__main__":
     mcp.run()
