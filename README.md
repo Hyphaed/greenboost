@@ -22,9 +22,13 @@ No retraining. No code changes. Just install GreenBoost and keep using Ollama, l
 <div align="center">
 
 | 📦 **Memory Tiering** | Extend GPU memory with system RAM and NVMe |
+
 | 🗜️ **GB-Quant** | Compress weights and KV cache so models fit in VRAM |
+
 | 📡 **Gb-Dataflux** | Live data telemtry exposed at greenboost dataflux mcp and also visually trough web UI when running commad; $ greenboost dataflux-ui |
+
 | 🌐 **Gb-Cluster** | Borrow idle GPUs and RAM from machines on your LAN |
+
 | 🔗 **Gb-Synapse** | Translation proxy exposing Ollama endpoints (/api/generate, /api/chat, /api/tags, /api/ps) + OpenAI /v1/* on :11434 in front of gb-synapse (llama-server + --rpc), and it even emits proxy-side dataflux tok/s. So it's a genuine drop-in for ollama with cross-GPU RPC split + gb-quant + telemetry|
 
 </div>

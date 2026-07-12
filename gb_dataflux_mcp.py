@@ -200,5 +200,41 @@ def greenboost_status() -> dict:
         return {"error": f"gb_monitor unavailable: {e}"}
 
 
+@mcp.tool()
+def synapse_status() -> dict:
+    """Gb-Synapse status: whether the llama.cpp `--rpc` engine is BUILT
+    (llama-server + rpc-server present in ENGINE_DIR), its version, and whether
+    a gb-synapse llama-server and/or the :11434 Ollama-compatible proxy are
+    running now. Check this before routing pipeline inference through
+    gb-synapse (preferred over raw ollama per CLAUDE.md): if `engine_built` is
+    false the fallback is raw ollama and the fix is `gb_synapse build` (host +
+    each feeder). Read-only."""
+    import subprocess
+    out = {"engine_built": False, "engine_version": None,
+           "server_running": False, "proxy_running": False, "engine_dir": None}
+    try:
+        import gb_synapse
+        ed = gb_synapse.ENGINE_DIR
+        out["engine_dir"] = str(ed)
+        out["engine_built"] = (ed / "llama-server").exists() and (ed / "rpc-server").exists()
+        if out["engine_built"]:
+            try:
+                out["engine_version"] = gb_synapse.engine_version()
+            except Exception:
+                pass
+    except Exception as e:
+        out["error"] = f"gb_synapse unavailable: {e}"
+        return out
+    # Match gb-synapse's OWN engine path (not ollama's internal llama-server).
+    for key, pat in (("server_running", f"{out['engine_dir']}/llama-server"),
+                     ("proxy_running", "gb_synapse_api")):
+        try:
+            r = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True, timeout=5)
+            out[key] = bool(r.stdout.strip())
+        except Exception:
+            pass
+    return out
+
+
 if __name__ == "__main__":
     mcp.run()
