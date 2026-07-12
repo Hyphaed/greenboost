@@ -1,26 +1,33 @@
 <div align="center">
 
-# 🚀 GreenBoost
+# 🧪 GreenBoost
+
 ### CUDA Memory & Compute Orchestrator for NVIDIA GPUs
 
 ![Version](https://img.shields.io/badge/version-3.2-6C4FF6?style=flat-square)
 ![License](https://img.shields.io/badge/license-GPLv2%20%2B%20Commercial-blue?style=flat-square)
 ![CUDA](https://img.shields.io/badge/CUDA-12%20%7C%2013-76B900?style=flat-square&logo=nvidia&logoColor=white)
-![Platform](https://img.shields.io/badge/platform-Linux-333333?style=flat-square&logo=linux&logoColor=white)
-![Status](https://img.shields.io/badge/status-active%20daily%20use-success?style=flat-square)
+![Linux](https://img.shields.io/badge/Linux-supported-333333?style=flat-square&logo=linux)
+![Status](https://img.shields.io/badge/status-daily%20driver-success?style=flat-square)
+
+## Run bigger models on the GPU you already own.
+
+**Turn GPU VRAM + System RAM + NVMe + idle LAN GPUs into one larger CUDA device.**
+
+No retraining. No code changes. Just install GreenBoost and keep using Ollama, llama.cpp, vLLM, PyTorch, and Diffusers.
+
+</div>
 
 
-## Run bigger models on the GPU you already have.
+<div align="center">
 
-Any laptop sitting around collecting dust? start using greenboost cluster + dataflux mcp.
+| | |
+|:--|:--|
+| 📦 **Memory Tiering** | Extend GPU memory with system RAM and NVMe |
+| 🗜️ **GB-Quant + TurboQuant** | Compress weights and KV cache so models fit in VRAM |
+| 🌐 **Cluster Mode** | Borrow idle GPUs and RAM from machines on your LAN |
 
-> GreenBoost combines three technologies to push past VRAM limits:
->
-> 📦 **Memory Tiering** — extend GPU memory with system RAM and NVMe.
->
-> 🗜️ **GB-Quant + TurboQuant** — compress model weights and the KV cache to fit larger models in available VRAM.
->
-> 🌐 **Cluster Mode** — pool idle GPUs across your LAN into a single inference cluster.
+</div>
 
 [Quick install](#-quick-install) ·
 [How it works](#-how-it-works) ·
