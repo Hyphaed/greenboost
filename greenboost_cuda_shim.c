@@ -6803,6 +6803,9 @@ typedef struct {
 
 static gb_fl_entry_t   gb_fl_ht[GB_FL_HT_SIZE];
 static pthread_mutex_t gb_fl_ht_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Live front-load entries. Lets the free hot-path skip the lock entirely when
+ * the feature is disabled / no split is outstanding (the common case). */
+static _Atomic uint32_t gb_fl_live = 0;
 
 static inline uint32_t gb_fl_hash(CUdeviceptr va)
 {
@@ -6825,6 +6828,7 @@ static int gb_fl_ht_insert(CUdeviceptr va, size_t va_size, size_t device_bytes,
             ok = 1; break;
         }
     }
+    if (ok) atomic_fetch_add_explicit(&gb_fl_live, 1, memory_order_relaxed);
     pthread_mutex_unlock(&gb_fl_ht_lock);
     return ok;
 }
@@ -6846,6 +6850,7 @@ static int gb_fl_ht_remove(CUdeviceptr va, gb_fl_entry_t *out)
             found = 1; break;
         }
     }
+    if (found) atomic_fetch_sub_explicit(&gb_fl_live, 1, memory_order_relaxed);
     pthread_mutex_unlock(&gb_fl_ht_lock);
     return found;
 }
@@ -7051,6 +7056,9 @@ fl_unwind:
  * dptr was a front-load VA (caller returns success), 0 otherwise. */
 static int gb_frontload_free_dispatch(CUdeviceptr dptr)
 {
+    /* Fast path: nothing front-loaded → no lock, no work (disabled = no-op). */
+    if (atomic_load_explicit(&gb_fl_live, memory_order_relaxed) == 0)
+        return 0;
     gb_fl_entry_t e;
     if (!gb_fl_ht_remove(dptr, &e))
         return 0;
