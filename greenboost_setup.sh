@@ -3771,14 +3771,20 @@ do_purge() {
         gb_ok "Removed from /etc/ld.so.preload"
     fi
 
-    # 4. Remove CUDA shim and LD_AUDIT library
+    # 4. Remove CUDA shim, VMM override, LD_AUDIT library + install-time
+    #    capability manifest.  vmm_override (cmd_install) and
+    #    greenboost_capabilities.json (cmd_install_llama_configs) are shim
+    #    companions and must be removed symmetrically, not just the two core libs.
     local _libs_removed=0
-    for lib in "$SHIM_DEST/$SHIM_LIB" "$SHIM_DEST/$AUDIT_LIB"; do
+    for lib in "$SHIM_DEST/$SHIM_LIB" \
+               "$SHIM_DEST/$AUDIT_LIB" \
+               "$SHIM_DEST/libgreenboost_vmm_override.so" \
+               "$SHIM_DEST/greenboost_capabilities.json"; do
         [[ -f "$lib" ]] && rm -f "$lib" && (( _libs_removed++ )) || true
     done
     { ldconfig 2>/dev/null || true; } &
     gb_spin $! "Refreshing dynamic linker cache..."
-    [[ $_libs_removed -gt 0 ]] && gb_ok "CUDA shim + audit library removed"
+    [[ $_libs_removed -gt 0 ]] && gb_ok "CUDA shim + VMM override + audit library removed"
 
     # 4b. Remove AppArmor abstraction + all injected includes + snap-confine
     #     modifications.  Calls the shared helper so the standalone
@@ -3794,6 +3800,8 @@ do_purge() {
         /etc/modprobe.d/99-greenboost-blacklist.conf \
         /etc/profile.d/greenboost.sh \
         /usr/local/bin/greenboost \
+        /usr/local/bin/gb \
+        /usr/local/bin/greenboost-cli \
         /etc/modules-load.d/greenboost.conf \
         /etc/udev/rules.d/99-greenboost.rules \
         /etc/udev/rules.d/99-nvme-greenboost.rules \
@@ -3880,12 +3888,34 @@ do_purge() {
           /usr/local/bin/greenboost-run-tgi \
           /usr/local/bin/greenboost-run-unsloth \
           /usr/local/bin/greenboost-run-vllm
+    # greenboost-cli wrappers (the venv itself lives under /usr/local/lib/greenboost/)
+    rm -f /usr/local/bin/gb /usr/local/bin/greenboost-cli
     # Documentation directory and stray Python hooks
     rm -rf /usr/local/share/greenboost/
     rm -f /usr/local/lib/greenboost_*.py
     rm -rf /usr/local/lib/greenboost/
     rm -f /etc/profile.d/greenboost_pythonpath.sh
     rm -f /usr/local/lib/python3*/dist-packages/greenboost.pth 2>/dev/null || true
+    # Claude CLI MCP registrations (per-user) , symmetric with cmd_register_mcp.
+    # The gb_*_mcp.py targets live under /usr/local/lib/greenboost (removed just
+    # above), so their registrations are now dangling. Remove only on a TRUE
+    # uninstall (preserve_cluster=0); a reinstall keeps them and cmd_register_mcp
+    # refreshes them. Best-effort, run as the invoking user, never fatal.
+    if [[ "$preserve_cluster" -eq 0 ]]; then
+        local _mcp_u="${SUDO_USER:-$USER}"
+        local -a _mcp_run=()
+        if [[ $EUID -eq 0 && -n "$_mcp_u" && "$_mcp_u" != "root" ]]; then
+            _mcp_run=(sudo -u "$_mcp_u")
+        fi
+        if "${_mcp_run[@]}" bash -lc 'command -v claude' &>/dev/null; then
+            local _mcp_name
+            for _mcp_name in greenboost-dataflux greenboost-cluster \
+                             greenboost-orchestrator greenboost-synapse; do
+                "${_mcp_run[@]}" bash -lc "claude mcp remove '$_mcp_name'" &>/dev/null || true
+            done
+            gb_ok "Claude MCP registrations removed"
+        fi
+    fi
     # State files
     rm -f /var/lib/greenboost/sentinel \
           /var/lib/greenboost/running \
@@ -4049,12 +4079,26 @@ cmd_install_python_files() {
         gb_control.py
         gb_orchestrator.py
         gb_dataflux.py
+        # Monitoring / serving / cluster stack (the installed greenboost-cli
+        # resolves these from /usr/local/lib/greenboost via GB_PY_ROOT)
+        gb_monitor.py
+        gb_pilot.py
+        gb_tiering.py
+        gb_synapse.py
+        gb_synapse_api.py
+        gb_cluster.py
+        gb_mcp.py
+        gb_synapse_mcp.py gb_synapse_tools.py
+        gb_dataflux_mcp.py
+        gb_cluster_mcp.py
     )
     local _installed=0
     for _f in "${_py_files[@]}"; do
         if [[ -f "$MODULE_DIR/$_f" ]]; then
             install -m 644 "$MODULE_DIR/$_f" "$_dest/$_f"
             (( _installed++ )) || true
+        else
+            gb_warn "$_f not found in $MODULE_DIR — skipped"
         fi
     done
 
@@ -4138,6 +4182,174 @@ if _os.environ.get("GREENBOOST_ACTIVE") == "1":
     gb_info "  import: from gb_telemetry import TelemetryManager"
     gb_info "  import: from gb_diffusion_orch import DiffusionOrchestrator"
     gb_info "  auto-init: GREENBOOST_ACTIVE=1 triggers gb_init on Python startup"
+}
+
+# Install greenboost-cli (the `gb` terminal agent) into a dedicated venv at
+# $GB_PY_DEST/cli-venv and expose /usr/local/bin/gb + greenboost-cli wrappers.
+# Best-effort: a missing source checkout, offline mode, or a pip failure only
+# warns — Full Install must never abort on the CLI step.
+# Called from: cmd_install (full-install) and the install-cli verb.
+cmd_install_cli() {
+    local _src="${GB_CLI_SRC:-$MODULE_DIR/../greenboost-cli}"
+    if [[ ! -f "$_src/pyproject.toml" ]]; then
+        gb_warn "greenboost-cli source not found (set GB_CLI_SRC) — skipping CLI install"
+        return 0
+    fi
+
+    if [[ "${GB_OFFLINE:-0}" == "1" ]]; then
+        gb_warn "GB_OFFLINE=1 — skipping greenboost-cli install (needs pip network access)"
+        return 0
+    fi
+
+    if ! python3 -m venv --help >/dev/null 2>&1; then
+        gb_warn "python3 venv module unavailable — skipping CLI install (apt install python3-venv)"
+        return 0
+    fi
+
+    local _venv="$GB_PY_DEST/cli-venv"
+    if [[ ! -d "$_venv" ]]; then
+        if ! python3 -m venv "$_venv" &>/tmp/gb_cli_venv.log; then
+            gb_warn "cli-venv creation failed (see /tmp/gb_cli_venv.log) — skipping CLI install"
+            return 0
+        fi
+    fi
+
+    gb_info "Installing greenboost-cli from $_src into $_venv ..."
+    "$_venv/bin/pip" install --upgrade pip -q &>/tmp/gb_cli_pip.log || true
+    if ! "$_venv/bin/pip" install -q "$_src[mcp]" &>/tmp/gb_cli_pip.log; then
+        gb_warn "greenboost-cli pip install failed (see /tmp/gb_cli_pip.log) — skipping CLI install"
+        return 0
+    fi
+
+    # Make the gb_*.py orchestration modules ($GB_PY_DEST) importable inside
+    # the venv , same .pth mechanism cmd_install_python_files uses system-wide.
+    local _sp
+    for _sp in "$_venv"/lib/python3.*/site-packages; do
+        [[ -d "$_sp" ]] && echo "$GB_PY_DEST" > "$_sp/greenboost.pth"
+    done
+
+    # Wrappers (idempotent overwrite). GB_PY_ROOT points the CLI's gb_paths
+    # resolver at the installed python root instead of a dev checkout.
+    local _entry _wrapper
+    for _entry in gb greenboost-cli; do
+        _wrapper="/usr/local/bin/$_entry"
+        cat > "$_wrapper" << WRAPEOF
+#!/usr/bin/env bash
+# GreenBoost CLI wrapper - generated by greenboost_setup.sh (install-cli)
+export GB_PY_ROOT=/usr/local/lib/greenboost
+exec "$GB_PY_DEST/cli-venv/bin/$_entry" "\$@"
+WRAPEOF
+        chmod 755 "$_wrapper"
+    done
+
+    gb_ok "greenboost-cli installed  (gb / greenboost-cli → $_venv)"
+}
+
+# cmd_install_pipelines , provision the ai-forge pipeline dependencies that
+# GreenBoost's pipelines rely on (e.g. PaddleOCR for conduir art jobs).
+#
+# DELIBERATE UNINSTALL ASYMMETRY: these deps are installed INTO the ai-forge
+# environment (user-owned, shared with ai-forge itself), NOT under
+# /usr/local/lib/greenboost.  GreenBoost only *triggers* their install here, so
+# Full Uninstall does NOT rip them out (that would break ai-forge). do_purge /
+# cmd_uninstall print a note pointing this out; remove them manually if desired.
+#
+# Best-effort: a missing ai-forge checkout, offline mode, or a failing setup
+# script only warns , Full Install must never abort on this step.
+# Called from: cmd_install (full-install) and the install-pipelines verb.
+cmd_install_pipelines() {
+    local _af="${GB_AIFORGE_SRC:-$MODULE_DIR/../ai-forge}"
+    if [[ ! -d "$_af" ]]; then
+        gb_warn "ai-forge not found (set GB_AIFORGE_SRC) — skipping pipeline deps"
+        return 0
+    fi
+
+    if [[ "${GB_OFFLINE:-0}" == "1" ]]; then
+        gb_warn "GB_OFFLINE=1 — skipping ai-forge pipeline deps (setup scripts need network access)"
+        return 0
+    fi
+
+    local _jobs_dir="$_af/tools/conduir_art_jobs"
+    if [[ ! -d "$_jobs_dir" ]]; then
+        gb_info "No conduir_art_jobs dir in ai-forge ($_jobs_dir) — no pipeline deps to install"
+        return 0
+    fi
+
+    # GLOB HOOK: run every setup_*.sh present.  Auto-picks-up setup_paddleocr.sh
+    # and any future setup_*.sh with zero changes here.  Each script is expected
+    # to be idempotent and is run non-fatally: a failure warns and continues so
+    # one broken setup script never aborts Full Install.
+    local _ran=0 _script _name
+    shopt -s nullglob
+    for _script in "$_jobs_dir"/setup_*.sh; do
+        _name=$(basename "$_script")
+        gb_info "Running pipeline dep setup: $_name"
+        if bash "$_script"; then
+            gb_ok "pipeline dep setup ok: $_name"
+            (( _ran++ )) || true
+        else
+            gb_warn "pipeline dep setup failed: $_name — continuing"
+        fi
+    done
+    shopt -u nullglob
+
+    if [[ $_ran -eq 0 ]]; then
+        gb_info "No setup_*.sh pipeline scripts found in $_jobs_dir"
+    else
+        gb_ok "ai-forge pipeline deps provisioned ($_ran setup script(s) ran)"
+    fi
+}
+
+# cmd_register_mcp , register this repo's 4 MCP servers with the Claude CLI so
+# an LLM assistant can query GreenBoost dataflux / cluster / orchestrator /
+# synapse state directly.  Registered under the invoking (non-root) user's
+# Claude config (--scope user), since Claude CLI config is per-user.
+#
+# Best-effort: if the Claude CLI isn't on PATH we warn and return , Full Install
+# must never abort on this step.  Idempotent: each server is removed first, then
+# re-added, so re-running never duplicates entries.
+# Called from: cmd_install (full-install) and the register-mcp verb.
+# Uninstall symmetry: do_purge removes the same 4 servers on a true uninstall.
+cmd_register_mcp() {
+    local _u="${SUDO_USER:-$USER}"
+    # Run the Claude CLI as the target (non-root) user; -lc loads that user's
+    # login PATH so claude is found even under ~/.local/bin, nvm, etc.
+    local -a _run=()
+    if [[ $EUID -eq 0 && -n "$_u" && "$_u" != "root" ]]; then
+        _run=(sudo -u "$_u")
+    fi
+
+    if ! "${_run[@]}" bash -lc 'command -v claude' &>/dev/null; then
+        gb_warn "Claude CLI not found — skipping MCP registration; run 'greenboost register-mcp' later"
+        return 0
+    fi
+
+    local _py="$GB_PY_DEST"
+    # name:module (all under $GB_PY_DEST after cmd_install_python_files)
+    local -a _servers=(
+        "greenboost-dataflux:$_py/gb_dataflux_mcp.py"
+        "greenboost-cluster:$_py/gb_cluster_mcp.py"
+        "greenboost-orchestrator:$_py/gb_mcp.py"
+        "greenboost-synapse:$_py/gb_synapse_mcp.py"
+    )
+    local _entry _name _path _ok=0
+    for _entry in "${_servers[@]}"; do
+        _name="${_entry%%:*}"
+        _path="${_entry#*:}"
+        if [[ ! -f "$_path" ]]; then
+            gb_warn "MCP module missing: $_path — skipping $_name"
+            continue
+        fi
+        # Idempotent: drop any prior registration, then add fresh.
+        "${_run[@]}" bash -lc "claude mcp remove '$_name'" &>/dev/null || true
+        if "${_run[@]}" bash -lc "claude mcp add --scope user '$_name' -- python3 '$_path'" &>/dev/null; then
+            (( _ok++ )) || true
+        else
+            gb_warn "MCP registration failed: $_name — continuing"
+        fi
+    done
+    [[ $_ok -gt 0 ]] && gb_ok "Registered $_ok MCP server(s) with Claude CLI (user: $_u)"
+    return 0
 }
 
 # _gb_ensure_ollama , install ollama on the host during Full Install if missing,
@@ -4423,6 +4635,8 @@ case "\$1" in
     pull)            exec "\$GB_SETUP" pull "\${@:2}" ;;
     synapse)         exec "\$GB_SETUP" synapse "\${@:2}" ;;
     setup|install|full-install) exec "\$GB_SETUP" "\$@" ;;
+    install-pipelines)  exec "\$GB_SETUP" install-pipelines ;;
+    register-mcp)       exec "\$GB_SETUP" register-mcp ;;
     uninstall)          exec "\$GB_SETUP" uninstall ;;
     apparmor-uninstall) exec "\$GB_SETUP" apparmor-uninstall ;;
     logs)            exec "\$GB_SETUP" logs "\${@:2}" ;;
@@ -4469,6 +4683,11 @@ WRAPEOF
     # Install GreenBoost Python orchestration files (gb_*.py) so they are
     # importable from any CUDA env on PYTHONPATH=/usr/local/lib/greenboost.
     cmd_install_python_files
+    # Install greenboost-cli (`gb`) into its venv , best-effort, never aborts.
+    cmd_install_cli
+    # Provision ai-forge pipeline deps (PaddleOCR etc.) , best-effort, never aborts.
+    # Deliberately NOT reversed by Full Uninstall (see cmd_install_pipelines).
+    cmd_install_pipelines
 
     # Ensure 'greenboost' group exists and the invoking user is a member so
     # non-root processes can read cluster.key (mode 0640 root:greenboost).
@@ -4498,6 +4717,11 @@ WRAPEOF
     # compute).  Best-effort; never fails the install.  Skip with
     # GB_SKIP_OLLAMA_UPDATE=1.
     _gb_ensure_ollama
+
+    # Register GreenBoost MCP servers with the Claude CLI (per-user) so an LLM
+    # assistant can query cluster/dataflux/orchestrator/synapse state. The
+    # gb_*_mcp.py modules were just deployed to $GB_PY_DEST above. Best-effort.
+    cmd_register_mcp
 
     gb_ok "Installation complete"
     gb_info "Load:    sudo modprobe greenboost"
@@ -4652,6 +4876,7 @@ cmd_uninstall() {
     info "  - GreenBoost env lines from ollama.service / llama-server.service"
     info "  - AppArmor abstractions for GreenBoost audit library"
     info "  - /usr/local/bin/greenboost (CLI wrapper)"
+    info "  - Claude CLI MCP registrations (greenboost-dataflux/cluster/orchestrator/synapse)"
     info ""
     info "What will NOT be touched:"
     info "  - Ollama itself (not uninstalled - only GreenBoost env vars removed)"
@@ -4661,6 +4886,7 @@ cmd_uninstall() {
     info "  - Any user data, models, or application configs"
     info "  - System swap (/swap.img, swap partitions) - system swap is never touched"
     info "  - /swap_nvme.img (old GreenBoost swap) - removed if present"
+    info "  - ai-forge pipeline deps (PaddleOCR etc.) - left intact in the forge env; remove manually if desired"
     info ""
     info "Starting purge..."
     info ""
@@ -11076,6 +11302,9 @@ cmd_help() {
         echo -e ""
         echo -e "  ${C_CYAN}${C_BOLD}ADVANCED:${C_RESET}"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-python"        "Copy gb_*.py orchestration stack to /usr/local/lib/greenboost/"
+        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-cli"           "Install greenboost-cli (gb) into /usr/local/lib/greenboost/cli-venv"
+        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-pipelines"     "Provision ai-forge pipeline deps (PaddleOCR etc.) via setup_*.sh"
+        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "register-mcp"          "Register GreenBoost MCP servers with the Claude CLI (per-user)"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-sys-configs"   "Ollama drop-in, udev, governor, LD_PRELOAD, THP (all-in-one)"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-llama-configs" "LD_AUDIT → ld.so.preload only (also runs inside install-sys-configs)"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "restore-sys-configs"   "Undo install-sys-configs (drop-in, udev, ld.so.preload, governor)"
@@ -11396,6 +11625,8 @@ cmd_full_install() {
     cmd_install_python_files
     gb_ok "GreenBoost Python orchestration stack installed"
 
+    cmd_install_cli
+
     cmd_install_optional_pkgs
     gb_ok "Optional AI/compute libraries installed"
 
@@ -11650,6 +11881,9 @@ case "$COMMAND" in
     # Advanced (kept for compat)
     recover)                cmd_recover               ;;
     install-python|install_python) cmd_install_python_files ;;
+    install-cli|install_cli)       cmd_install_cli           ;;
+    install-pipelines|install_pipelines) cmd_install_pipelines ;;
+    register-mcp|register_mcp)     cmd_register_mcp          ;;
     install-sys-configs)    cmd_install_sys_configs   ;;
     install-llama-configs)  cmd_install_llama_configs ;;
     restore-sys-configs)    cmd_restore_sys_configs   ;;

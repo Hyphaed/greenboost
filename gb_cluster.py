@@ -199,6 +199,82 @@ def _ewma_update(store: dict[str, float], key: str, value: float,
         return new
 
 
+# ── Shared SSH transport options (every ssh/rsync/scp in this module) ────────
+# One ControlMaster socket per (user, host, port), multiplexed by every
+# subsequent ssh/rsync/scp this module spawns: the many small staging calls
+# (mkdir, dep probes, manifest pushes, telemetry fallback) stop paying a full
+# TCP+KEX+auth handshake each (~400 ms measured to a 2.5GbE feeder) and ride
+# the warm connection instead. ControlPersist keeps the master alive 120 s
+# after the last client exits, so a dispatch loop's back-to-back calls always
+# hit a reused socket.
+
+# Below this size a push is "small" (manifests, JSON, worker scripts): one
+# round-trip dominates, so ssh-level Compression=yes is worth it. At or above
+# it (model weights, tensors) the payload is high-entropy , zlib just burns
+# CPU below the 2.5GbE line rate, so bulk stays Compression=no.
+_SMALL_PUSH_BYTES = 4 * 1024 * 1024
+
+
+def _cm_dir() -> str:
+    """Directory for ControlMaster sockets: /run/user/$UID (per-user tmpfs)
+    when present, else ~/.ssh. Kept short , AF_UNIX sun_path caps at ~104
+    bytes and the %r@%h:%p expansion has to fit."""
+    run_dir = f"/run/user/{os.getuid()}"
+    return run_dir if os.path.isdir(run_dir) else os.path.expanduser("~/.ssh")
+
+
+def _ssh_opts(connect_timeout: int = 10, compress: bool = False) -> list[str]:
+    """Shared SSH options for EVERY ssh/rsync/scp invocation in this module
+    (one owner , call sites must not hand-roll their own list).
+
+    aes128-gcm: AES-NI wire-speed bulk transfers (~2× the chacha20 default).
+    """
+    return ["-o", "BatchMode=yes", "-o", f"ConnectTimeout={connect_timeout}",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ControlMaster=auto",
+            "-o", f"ControlPath={_cm_dir()}/gb-cm-%r@%h:%p",
+            "-o", "ControlPersist=120s",
+            "-c", "aes128-gcm@openssh.com",
+            "-o", f"Compression={'yes' if compress else 'no'}"]
+
+
+def _rsync_sent_bytes(stdout: str) -> int | None:
+    """Bytes actually sent over the wire, from `rsync --stats` output ,
+    delta transfers (repeat model/code pushes) send far less than the file
+    sizes, and the link EWMA must reflect real wire traffic."""
+    import re
+    m = re.search(r"Total bytes sent:\s*([\d,.]+)", stdout or "")
+    return int(re.sub(r"[,.]", "", m.group(1))) if m else None
+
+
+def _emit_link_transfer(feeder: "Feeder", op: str, nbytes: int, seconds: float,
+                        status: str = "ok", error: str | None = None) -> None:
+    """Record one real host⇄feeder transfer: a dataflux kind="link_transfer"
+    event {peer, bytes, seconds, mbps, op} + fold the measured speed into the
+    per-node link_mbps_ewma placement input. Best-effort , never raises, so a
+    transfer never fails because its measurement couldn't be recorded."""
+    try:
+        seconds = max(seconds, 1e-6)
+        mbps = (nbytes / (1024 * 1024)) / seconds
+        # Only bandwidth-meaningful transfers feed the placement EWMA , a
+        # tiny manifest push is latency-dominated and would "measure" ~0 MB/s,
+        # falsely tripping the _MIN_USEFUL_LINK_MBPS dispatch gate. The
+        # dataflux event below still records every transfer regardless.
+        if status == "ok" and nbytes >= _SMALL_PUSH_BYTES:
+            _ewma_update(_link_mbps_ewma, f"{feeder.ip}:{feeder.port}", mbps)
+        import gb_dataflux
+        ev = {"node": feeder.hostname or feeder.ip, "label": "gb_cluster",
+              "kind": "link_transfer", "peer": f"{feeder.ip}:{feeder.port}",
+              "op": op, "bytes": nbytes, "seconds": round(seconds, 3),
+              "mbps": round(mbps, 2), "n_items": 1, "items": [op],
+              "duration_s": round(seconds, 3), "status": status}
+        if error:
+            ev["error"] = error[:300]
+        gb_dataflux.emit(ev)
+    except Exception:
+        pass
+
+
 def _ssh_gpu_telemetry(feeder: Feeder, timeout_s: float = 3.0) -> dict | None:
     """SSH `nvidia-smi` fallback for GPU util/temp/power.
 
@@ -212,8 +288,7 @@ def _ssh_gpu_telemetry(feeder: Feeder, timeout_s: float = 3.0) -> dict | None:
     tgt = f"{user}@{feeder.ip}"
     try:
         out = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={int(timeout_s)}",
-             "-o", "StrictHostKeyChecking=accept-new", tgt,
+            ["ssh", *_ssh_opts(connect_timeout=int(timeout_s)), tgt,
              "nvidia-smi --query-gpu=utilization.gpu,temperature.gpu,power.draw "
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=timeout_s + 2)
@@ -385,10 +460,7 @@ def run_stage_on_feeder(argv: list[str],
             f"(env deps missing at {python}; see dataflux feeder_provision)")
     user = feeder.ssh_user or os.environ.get("USER", "root")
     tgt = f"{user}@{feeder.ip}"
-    # aes128-gcm: AES-NI wire-speed transfers (~2× the chacha20 default).
-    ssh_opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                "-o", "StrictHostKeyChecking=accept-new",
-                "-c", "aes128-gcm@openssh.com", "-o", "Compression=no"]
+    ssh_opts = _ssh_opts()
 
     if inputs:
         dirs = sorted({str(Path(p).parent) for p in inputs})
@@ -399,11 +471,21 @@ def run_stage_on_feeder(argv: list[str],
             raise RuntimeError(f"feeder mkdir failed: {mkdir.stderr.strip()}")
         # rsync -R preserves the absolute path on the feeder side; -rltO (not
         # -a) because -a tries to set times/perms on shared parents like /tmp.
-        push = subprocess.run(["rsync", "-rltO", "-e", "ssh " + " ".join(ssh_opts),
+        in_bytes = sum(Path(p).stat().st_size for p in inputs if Path(p).exists())
+        push_opts = _ssh_opts(compress=in_bytes < _SMALL_PUSH_BYTES)
+        t_push = time.monotonic()
+        push = subprocess.run(["rsync", "-rltO", "--stats",
+                               "-e", "ssh " + " ".join(push_opts),
                                "-R", *inputs, f"{tgt}:/"],
                               capture_output=True, text=True)
         if push.returncode != 0:
+            _emit_link_transfer(feeder, "rsync_push", in_bytes,
+                                time.monotonic() - t_push, status="error",
+                                error=push.stderr.strip())
             raise RuntimeError(f"feeder input push failed: {push.stderr.strip()}")
+        _emit_link_transfer(feeder, "rsync_push",
+                            _rsync_sent_bytes(push.stdout) or in_bytes,
+                            time.monotonic() - t_push)
 
     env_prefix = ""
     if extra_env:
@@ -416,10 +498,18 @@ def run_stage_on_feeder(argv: list[str],
         return run.returncode
 
     for out in outputs:
+        t_pull = time.monotonic()
         pull = subprocess.run(["scp", "-q", *ssh_opts, f"{tgt}:{out}", out],
                               capture_output=True, text=True)
         if pull.returncode != 0:
+            _emit_link_transfer(feeder, "scp_pull", 0, time.monotonic() - t_pull,
+                                status="error", error=pull.stderr.strip())
             raise RuntimeError(f"feeder output pull failed ({out}): {pull.stderr.strip()}")
+        try:
+            out_bytes = Path(out).stat().st_size
+        except OSError:
+            out_bytes = 0
+        _emit_link_transfer(feeder, "scp_pull", out_bytes, time.monotonic() - t_pull)
     return 0
 
 
@@ -447,8 +537,7 @@ def feeder_has_model(feeder: Feeder, repo_id: str,
     cmd = (f"find {remote_hub}/{dirname}/snapshots -mindepth 1 -maxdepth 1 "
           f"-type d 2>/dev/null | head -1")
     try:
-        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                           "-o", "StrictHostKeyChecking=accept-new", tgt, cmd],
+        r = subprocess.run(["ssh", *_ssh_opts(), tgt, cmd],
                           capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired:
         return False
@@ -484,9 +573,7 @@ def ensure_feeder_model(feeder: Feeder, repo_id: str, hf_home: str | None = None
     node = feeder.hostname or feeder.ip
     user = feeder.ssh_user or os.environ.get("USER", "root")
     tgt = f"{user}@{feeder.ip}"
-    ssh_opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                "-o", "StrictHostKeyChecking=accept-new",
-                "-c", "aes128-gcm@openssh.com", "-o", "Compression=no"]
+    ssh_opts = _ssh_opts()
     remote_hub = f"{feeder_hf_home}/hub" if feeder_hf_home else "~/.cache/huggingface/hub"
     dirname = _hf_repo_dirname(repo_id)
     print(f"  [feeder-model] {repo_id} missing on {node} , "
@@ -499,16 +586,29 @@ def ensure_feeder_model(feeder: Feeder, repo_id: str, hf_home: str | None = None
         _df_emit(_new_run_id(), node, "ensure_feeder_model", "model_push", [repo_id],
                  time.monotonic() - t0, status="error", error=mkdir.stderr.strip())
         return False
-    push = subprocess.run(["rsync", "-az", "-e", "ssh " + " ".join(ssh_opts),
+    # -rlt (not -az): safetensors are high-entropy , rsync-level zlib (-z)
+    # caps throughput on one CPU core well below the 2.5GbE line rate.
+    push = subprocess.run(["rsync", "-rlt", "--stats",
+                          "-e", "ssh " + " ".join(ssh_opts),
                           f"{local_dir}/", f"{tgt}:{remote_hub}/{dirname}/"],
                          capture_output=True, text=True, timeout=timeout_s)
     if push.returncode != 0:
         print(f"  [feeder-model] push failed: {push.stderr.strip()}", flush=True)
         _df_emit(_new_run_id(), node, "ensure_feeder_model", "model_push", [repo_id],
                  time.monotonic() - t0, status="error", error=push.stderr.strip())
+        _emit_link_transfer(feeder, "model_push", 0, time.monotonic() - t0,
+                            status="error", error=push.stderr.strip())
         return False
+    elapsed = time.monotonic() - t0
     _df_emit(_new_run_id(), node, "ensure_feeder_model", "model_push", [repo_id],
-             time.monotonic() - t0)
+             elapsed)
+    sent = _rsync_sent_bytes(push.stdout)
+    if sent is None:
+        try:
+            sent = sum(f.stat().st_size for f in local_dir.rglob("*") if f.is_file())
+        except OSError:
+            sent = 0
+    _emit_link_transfer(feeder, "model_push", sent, elapsed)
     print(f"  [feeder-model] {repo_id} pushed to {node}", flush=True)
     return True
 
@@ -551,9 +651,7 @@ def ensure_feeder_ready(feeder: Feeder,
         return True
     user = feeder.ssh_user or os.environ.get("USER", "root")
     tgt = f"{user}@{feeder.ip}"
-    ssh_opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                "-o", "StrictHostKeyChecking=accept-new",
-                "-c", "aes128-gcm@openssh.com", "-o", "Compression=no"]
+    ssh_opts = _ssh_opts()
     t0 = time.monotonic()
 
     # 1 · sync pipeline code tree(s) to the same absolute path on the feeder.
@@ -565,14 +663,20 @@ def ensure_feeder_ready(feeder: Feeder,
         mk = subprocess.run(["ssh", *ssh_opts, tgt, f"mkdir -p {shlex.quote(parent)}"],
                             capture_output=True, text=True)
         push = None
+        t_push = time.monotonic()
         if mk.returncode == 0:
             push = subprocess.run(
-                ["rsync", "-rltO", "-e", "ssh " + " ".join(ssh_opts),
+                ["rsync", "-rltO", "--stats",
+                 "-e", "ssh " + " ".join(_ssh_opts(compress=True)),
                  "--exclude", ".git", "--exclude", ".venv",
                  "--exclude", "__pycache__", "--exclude", "*.pyc",
                  "--exclude", "outputs", "--exclude", "generated",
                  f"{root}/", f"{tgt}:{root}/"],
                 capture_output=True, text=True, timeout=timeout_s)
+            if push.returncode == 0:
+                _emit_link_transfer(feeder, "rsync_push",
+                                    _rsync_sent_bytes(push.stdout) or 0,
+                                    time.monotonic() - t_push)
         if mk.returncode != 0 or push is None or push.returncode != 0:
             err = (mk.stderr or (push.stderr if push else "") or "").strip()
             _df_emit(_new_run_id(), node, "ensure_feeder_ready", "feeder_provision",
@@ -862,9 +966,7 @@ def stage_bundle(paths: list[str], feeder: Feeder,
         return
     user = feeder.ssh_user or os.environ.get("USER", "root")
     tgt = f"{user}@{feeder.ip}"
-    ssh_opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                "-o", "StrictHostKeyChecking=accept-new",
-                "-c", "aes128-gcm@openssh.com", "-o", "Compression=no"]
+    ssh_opts = _ssh_opts()
     dirs = sorted({str(Path(p).parent) for p in paths})
     mkdir = subprocess.run(["ssh", *ssh_opts, tgt,
                             "mkdir -p " + " ".join(shlex.quote(d) for d in dirs)],
@@ -874,15 +976,18 @@ def stage_bundle(paths: list[str], feeder: Feeder,
 
     t0 = time.monotonic()
     total_bytes = sum(Path(p).stat().st_size for p in paths if Path(p).exists())
-    push = subprocess.run(["rsync", "-rltO", "-e", "ssh " + " ".join(ssh_opts),
+    push_opts = _ssh_opts(compress=total_bytes < _SMALL_PUSH_BYTES)
+    push = subprocess.run(["rsync", "-rltO", "--stats",
+                           "-e", "ssh " + " ".join(push_opts),
                            "-R", *paths, f"{tgt}:/"],
                           capture_output=True, text=True)
-    if push.returncode != 0:
-        raise RuntimeError(f"stage_bundle push failed: {push.stderr.strip()}")
     elapsed = max(time.monotonic() - t0, 1e-6)
-    if total_bytes > 0:
-        mbps = (total_bytes / (1024 * 1024)) / elapsed
-        _ewma_update(_link_mbps_ewma, f"{feeder.ip}:{feeder.port}", mbps)
+    if push.returncode != 0:
+        _emit_link_transfer(feeder, "rsync_push", total_bytes, elapsed,
+                            status="error", error=push.stderr.strip())
+        raise RuntimeError(f"stage_bundle push failed: {push.stderr.strip()}")
+    _emit_link_transfer(feeder, "rsync_push",
+                        _rsync_sent_bytes(push.stdout) or total_bytes, elapsed)
     _df_emit(_new_run_id(), feeder.hostname or feeder.ip, "stage_bundle",
              "stage", paths, elapsed)
 

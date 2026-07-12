@@ -347,3 +347,22 @@ also available directly:
 |---|---|
 | `sudo greenboost install-sys-configs` | (Re-)install the Ollama env, NVMe udev rules, CPU governor, hugepages, LD_AUDIT, and idle-reclaim daemon |
 | `sudo greenboost recover` | Attempt automatic recovery after a failed install or module load error |
+
+## GB-CLI (greenboost-cli, installed by Full Install)
+
+| Command | Description |
+|---|---|
+| `gb` (or `greenboost-cli`) | Open the agentic terminal client — gb-synapse-only backend on `:11434` |
+| `gb -p "<prompt>" [-m model]` | One-shot prompt through gb-synapse (cross-GPU split when serving with `--rpc`) |
+| `gb <headless-subcommand>` | Script-friendly JSON subcommands: `rag-search`, `rag-status`, `tokens`, `skill-list`, `plan-list`, `convert`, `compress`, … |
+| `sudo greenboost install-cli` | (Re-)install just the CLI (venv under `/usr/local/lib/greenboost/cli-venv` + `/usr/local/bin/gb`) |
+| `python3 gb_synapse.py status` | GB-Synapse engine/proxy status (also `synapse_status` in the MCPs) |
+| `python3 gb_rotator.py run <queue.json>` | Overnight multi-model rotation (serve → run work → stop, resumable) |
+
+### GB-CLI workflow (offline, whole cluster)
+
+1. `greenboost_overview()` / `flux_health()` (greenboost-orchestrator MCP) — know the system, confirm the loop is closed.
+2. Pick model + precision: `quant_advisor()` or `greenboost synapse recommend` — fp8 quality floor; below-fp8 only with the surfaced tradeoff.
+3. Serve on the cluster: `greenboost synapse serve <model>` (llama.cpp `--rpc` tensor-split: host GPU + feeder GPU, feeder share backed by feeder VRAM→DDR via the feeder shim).
+4. Query from the host, fully offline: `gb -p "…"`, any ollama client, or ai-forge pipelines via `FORGE_OLLAMA_URL=http://127.0.0.1:11434`.
+5. Watch the dataflux: `greenboost dataflux-ui` or the `greenboost-dataflux` MCP (`dataflux_tok_s`, `dataflux_models`).

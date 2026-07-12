@@ -219,6 +219,30 @@ def engine_version() -> str:
         return ""
 
 
+def status() -> dict:
+    """Gb-Synapse status in one dict: engine built (llama-server + rpc-server
+    present in ENGINE_DIR) + version, and whether a gb-synapse llama-server
+    and/or the :11434 Ollama/OpenAI proxy (gb_synapse_api) are running now.
+
+    Single source of truth for the `synapse_status` MCP tools (gb_dataflux_mcp,
+    gb_synapse_mcp, gb_mcp) and the `status` CLI verb. Matches gb-synapse's OWN
+    engine path — not ollama's internal llama-server."""
+    import subprocess
+    out = {"engine_built": engine_installed(),
+           "engine_version": engine_version() or None,
+           "server_running": False, "proxy_running": False,
+           "engine_dir": str(ENGINE_DIR)}
+    for key, pat in (("server_running", f"{ENGINE_DIR}/llama-server"),
+                     ("proxy_running", "gb_synapse_api")):
+        try:
+            r = subprocess.run(["pgrep", "-f", pat],
+                               capture_output=True, text=True, timeout=5)
+            out[key] = bool(r.stdout.strip())
+        except Exception:
+            pass
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 2. Model sourcing + local store/manifest
 # ---------------------------------------------------------------------------
@@ -1520,6 +1544,13 @@ def _cli_main(argv: list[str]) -> int:
     elif verb == "doctor":
         d = doctor()
         print(json.dumps(d) if llm else _format_doctor(d))
+    elif verb == "status":
+        s = status()
+        print(json.dumps(s) if llm else
+              f"engine: {'built ' + (s['engine_version'] or '') if s['engine_built'] else 'NOT built'}"
+              f"  server: {'running' if s['server_running'] else 'stopped'}"
+              f"  proxy: {'running' if s['proxy_running'] else 'stopped'}"
+              f"  ({s['engine_dir']})")
     elif verb == "recommend":
         ctx = int(rest[0]) if rest else 65536
         reports = recommend(ctx=ctx)

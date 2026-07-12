@@ -128,3 +128,11 @@ def tmp_psk_file(tmp_path):
     p.write_text("0123456789abcdef" * 4)
     os.chmod(str(p), 0o600)
     return p
+
+
+@pytest.fixture(autouse=True)
+def _skip_feeder_ready_gate(monkeypatch):
+    """ensure_feeder_ready (dispatch self-provisioning gate) does real SSH —
+    tests must never depend on a live feeder. GB_SKIP_FEEDER_READY=1 restores
+    the pre-gate dispatch behavior under test."""
+    monkeypatch.setenv("GB_SKIP_FEEDER_READY", "1")

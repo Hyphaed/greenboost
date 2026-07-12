@@ -28,6 +28,13 @@
 | 📡 **GB-Dataflux** | Live telemetry exposed through the GreenBoost Dataflux MCP server and a web dashboard. Launch the UI with `greenboost dataflux-ui`. |
 | 🌐 **GB-Cluster** | Borrow idle GPU and RAM resources from other machines on your local network. |
 | 🔗 **GB-Synapse** | Translation proxy exposing Ollama-compatible endpoints (`/api/generate`, `/api/chat`, `/api/tags`, `/api/ps`) and the OpenAI-compatible `/v1/*` API on port `11434`. It sits in front of `gb-synapse` (`llama-server --rpc`), enabling cross-GPU RPC execution, GB-Quant, and proxy-side Dataflux telemetry (including tokens/sec). A genuine drop-in replacement for Ollama. |
+| 🖥️ **GB-CLI** | Agentic terminal client, installed by Full Install — no separate setup. Open it with `gb` (or `greenboost-cli`); one-shot prompts with `gb -p "…"`; headless JSON subcommands for scripts (`gb rag-search …`). Always talks to GB-Synapse on `:11434` (Ollama **and** HuggingFace models via `greenboost synapse pull` / `index-ollama`). |
+</div>
+
+<div align="center">
+
+**MCP servers** (LLM-facing): `greenboost-orchestrator` (central — full awareness via `greenboost_overview`, `optimize_inference`, `quant_advisor`, `flux_health`) · `greenboost-dataflux` (event log) · `greenboost-cluster` (live cluster state) · `greenboost-synapse` (serving control + CLI bridge) · `greenboost` (GB-CLI: rag/goals/factory)
+
 </div>
 
 

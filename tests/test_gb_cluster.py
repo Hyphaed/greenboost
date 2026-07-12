@@ -315,6 +315,7 @@ def test_stage_bundle_pushes_and_updates_link_ewma(monkeypatch, tmp_path):
     class _Result:
         returncode = 0
         stderr = ""
+        stdout = ""   # capture_output=True always yields stdout
 
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
@@ -400,6 +401,7 @@ def test_ensure_feeder_model_pushes_when_missing(monkeypatch, tmp_path):
     class _Result:
         returncode = 0
         stderr = ""
+        stdout = ""   # capture_output=True always yields stdout
 
     def fake_run(cmd, **kwargs):
         calls.append(cmd)

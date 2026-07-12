@@ -19,6 +19,7 @@ history must never break a real dispatch.
 CLI:
     python3 gb_dataflux.py serve [--port 8799] [--days 5]   # web UI
     python3 gb_dataflux.py summary [--days 5] [--llm]        # text/JSON summary
+    python3 gb_dataflux.py critic [--days 1] [--llm]         # incident diagnosis
 """
 from __future__ import annotations
 
@@ -323,6 +324,254 @@ def summarize(events: list[dict]) -> dict:
         "tok_s": tok_s,
         "stages": stages,
     }
+
+
+# ── Critic reports , snapshot-correlated incident diagnosis ──────────────────
+# "What was happening at that moment": every error/warn event gets the nearest
+# flight-recorder snapshots (±60s before/after) attached, plus the cluster
+# activity in that window, plus rule-based diagnosis hints , so a human or an
+# LLM can diagnose cluster inference from evidence instead of guessing.
+
+_CRITIC_WINDOW_S = 60.0
+_SNAP_VIEW_KEYS = ("node", "fb_used_mb", "fb_free_mb", "fb_total_mb",
+                   "fb_used_pct", "gpu_util_pct", "cpu_util_pct", "shim_phase",
+                   "kv_used_mb", "kv_reserve_mb", "t2_allocated_mb",
+                   "t2_available_mb", "t2_pressure", "t3_used_mb", "t3_pressure")
+_DISPATCH_KINDS = ("chunk_remote", "chunk_local", "job_remote", "job_local")
+
+
+def _snap_view(snap: dict | None, incident_ts: float) -> dict | None:
+    """Compact view of one snapshot event, with its offset from the incident."""
+    if snap is None:
+        return None
+    d = {k: snap.get(k) for k in _SNAP_VIEW_KEYS}
+    d["ts"] = snap.get("ts", 0)
+    d["offset_s"] = round(snap.get("ts", 0) - incident_ts, 1)
+    return d
+
+
+def _bits_below_fp8(bits) -> bool:
+    """gb-quant quality floor is fp8 , any 4-bit plan (int4/nf4/fp4/q4) is
+    below it. int8/fp8/bf16 are at or above the floor."""
+    s = str(bits).lower()
+    return (any(t in s for t in ("int4", "nf4", "fp4", "4bit", "q4"))
+            or s.strip() == "4")
+
+
+def _is_incident(ev: dict) -> bool:
+    if ev.get("status") == "error":
+        return True
+    return ev.get("kind") == "shim_transition" and ev.get("status") == "warn"
+
+
+def _diagnosis_hints(ev: dict, before: dict | None, after: dict | None,
+                     ctx: dict, window: list[dict]) -> list[str]:
+    """Rule-based diagnosis strings for one incident. Pure; each rule reads
+    the correlated snapshots/context, never the wall clock."""
+    hints: list[str] = []
+    snap = after or before   # "after" reflects the incident's consequences
+    # shim_transition events carry their own t2/t3/VRAM numbers , usable as
+    # the metric source when no snapshot landed within the window.
+    if snap is None and ev.get("kind") == "shim_transition":
+        snap = ev
+    err_text = " ".join(str(ev.get(k, "")) for k in
+                        ("error", "stage", "label", "kind")).lower()
+
+    if snap:
+        t3 = snap.get("t3_used_mb") or 0
+        if t3 > 0:
+            hints.append(
+                f"placement-floor breach: T3 NVMe held {t3} MB at incident time "
+                f", NVMe-tier reads are orders slower than T1/T2; re-run "
+                f"quantize_to_fit with a tighter budget (never below fp8) or "
+                f"enable TurboQuant KV so the working set fits T1/T2")
+        fb = snap.get("fb_used_pct")
+        t2 = snap.get("t2_allocated_mb") or 0
+        if fb is not None and fb < 70 and t2 > 0:
+            hints.append(
+                f"Rule#1 underfill: T1 VRAM only {fb:.0f}% full while T2 DDR "
+                f"held {t2} MB , weights that could live in VRAM are crossing "
+                f"PCIe every access; front-load real VRAM chunks or use the "
+                f"llama.cpp --rpc split so T1 fills first")
+        util = snap.get("gpu_util_pct") or 0
+        remote_items = ctx.get("chunk_remote", 0) + ctx.get("job_remote", 0)
+        if remote_items == 0 and util > 90:
+            hints.append(
+                f"cluster rule: 0 feeder-side work items in ±{int(_CRITIC_WINDOW_S)}s "
+                f"while the host GPU ran at {util:.0f}% , a connected feeder sat "
+                f"idle; route multi-item batches through cluster_map/"
+                f"ClusterJobQueue when a feeder is online")
+
+    phase = str((before or {}).get("shim_phase")
+                or (snap or {}).get("shim_phase") or "")
+    is_oom = "oom" in err_text or "out of memory" in err_text
+    if phase.upper().startswith("INIT") and ev.get("status") == "error":
+        # Fires for explicit OOM text AND for stage errors whose event carries
+        # no error string (e.g. forge StagedOOMError stage_profile rows) , the
+        # INIT-phase correlation is the diagnostic signal either way.
+        hints.append(
+            ("OOM" if is_oom else "stage error") + " while shim_phase=INIT: "
+            "the run failed before the shim reached steady state , likely a "
+            "reinstall/restart collision (kernel module or netd not settled: "
+            "`lsmod | grep greenboost`) or per-asset model reload pressure; "
+            "stagger loads and confirm the kmod is loaded after any reinstall")
+    elif is_oom:
+        hints.append(
+            "OOM in steady state: working set exceeds the planned budget , "
+            "re-run quantize_to_fit with a tighter GB_QUANT_BUDGET_GB, "
+            "keeping every component at or above the fp8 quality floor")
+
+    low_q = [e for e in window
+             if e.get("kind") in ("quantize", "quantize_to_fit")
+             and _bits_below_fp8(e.get("bits", ""))]
+    if low_q:
+        bits = sorted({str(e.get("bits")) for e in low_q})
+        hints.append(
+            f"quality floor: {len(low_q)} quantize event(s) below fp8 in the "
+            f"incident window (bits={bits}) , fp8 is the gb-quant floor for "
+            f"cluster inference; a below-fp8 plan means the VRAM budget is too "
+            f"tight, fix placement (feeder T1, front-load) instead of dropping "
+            f"precision")
+
+    if ev.get("kind") == "shim_transition":
+        hints.append(
+            f"shim transition {ev.get('stage')}: {ev.get('from')} → "
+            f"{ev.get('to')} (t2_pressure={ev.get('t2_pressure')}, "
+            f"t3_used_mb={ev.get('t3_used_mb')})")
+
+    if any(t in err_text for t in ("broken pipe", "connection closed",
+                                   "connection reset", "remotedisconnected")):
+        hints.append(
+            "feeder/link drop: the peer closed mid-operation , check "
+            "greenboost-netd on the feeder (`greenboost feeders diag`), the "
+            "SSH link, and whether an upgrade/restart raced the transfer")
+
+    if not hints:
+        hints.append("no rule matched , compare snapshot_before/after deltas "
+                     "(VRAM, t2/t3, phase) manually")
+    return hints
+
+
+def critic_report(days: float = 1.0) -> dict:
+    """Snapshot-correlated critic report over the dataflux log.
+
+    For every incident (status=error anywhere; shim_transition warns) in the
+    last `days` days, attach the nearest snapshot within ±60s before and
+    after (VRAM/util/phase/T2/T3/KV = what was happening at that moment), the
+    cluster activity in that window (was the feeder working?), and rule-based
+    diagnosis_hints. Ends with merged recommendations (incident hints +
+    gb_pilot.advise when importable) toward best cluster inference at ≥fp8
+    quality. Pure stdlib; every section is best-effort."""
+    events = read_events(since_hours=days * 24)
+    snaps = [e for e in events if e.get("kind") == "snapshot"]
+    snap_ts = [s.get("ts", 0) for s in snaps]   # events are ts-sorted
+
+    import bisect
+    incidents: list[dict] = []
+    for ev in events:
+        if not _is_incident(ev) or ev.get("kind") == "snapshot":
+            continue
+        ts = ev.get("ts", 0)
+        i = bisect.bisect_right(snap_ts, ts)
+        before = snaps[i - 1] if i > 0 and ts - snap_ts[i - 1] <= _CRITIC_WINDOW_S else None
+        after = snaps[i] if i < len(snaps) and snap_ts[i] - ts <= _CRITIC_WINDOW_S else None
+
+        window = [e for e in events
+                  if abs(e.get("ts", 0) - ts) <= _CRITIC_WINDOW_S
+                  and e.get("kind") != "snapshot"]
+        ctx: dict = {k: 0 for k in _DISPATCH_KINDS}
+        ctx["feeder_nodes"] = set()
+        for w in window:
+            k = w.get("kind")
+            if k in _DISPATCH_KINDS:
+                ctx[k] += 1
+                if k in ("chunk_remote", "job_remote"):
+                    ctx["feeder_nodes"].add(w.get("node", "?"))
+        ctx["feeder_nodes"] = sorted(ctx["feeder_nodes"])
+        ctx["feeder_active"] = bool(ctx["chunk_remote"] + ctx["job_remote"])
+
+        incidents.append({
+            "event": {k: ev.get(k) for k in
+                      ("ts", "kind", "node", "label", "stage", "status",
+                       "error", "items", "duration_s", "run_id")
+                      if ev.get(k) is not None},
+            "snapshot_before": _snap_view(before, ts),
+            "snapshot_after": _snap_view(after, ts),
+            "cluster_context": ctx,
+            "diagnosis_hints": _diagnosis_hints(ev, before, after, ctx, window),
+        })
+
+    incidents = incidents[-50:]
+    recommendations: list[str] = []
+    seen: set[str] = set()
+    for inc in incidents:
+        for h in inc["diagnosis_hints"]:
+            key = h.split(":", 1)[0]
+            if key not in seen and not h.startswith("no rule matched"):
+                seen.add(key)
+                recommendations.append(h)
+    try:
+        import gb_pilot
+        analysis = gb_pilot.analyze(events)
+        for item in gb_pilot.advise(analysis):
+            if item.get("severity") == "ok":
+                continue
+            rec = f"[pilot:{item['severity']}] {item['action']} (evidence: {item['evidence']})"
+            if item.get("lever"):
+                rec += f" [lever: {item['lever']}]"
+            recommendations.append(rec)
+    except Exception:
+        pass
+    if not recommendations:
+        recommendations.append(
+            "no incidents or pressure flags in the window , cluster inference "
+            "nominal; keep quantization at or above the fp8 quality floor")
+
+    return {
+        "window_days": days,
+        "events_scanned": len(events),
+        "snapshots": len(snaps),
+        "incident_count": len(incidents),
+        "incidents": incidents,
+        "recommendations": recommendations,
+    }
+
+
+def _print_critic_text(rep: dict) -> None:
+    print(f"GreenBoost dataflux critic , last {rep['window_days']:g} day(s)  "
+          f"({rep['events_scanned']} events, {rep['snapshots']} snapshots, "
+          f"{rep['incident_count']} incidents)")
+    for inc in rep["incidents"]:
+        ev = inc["event"]
+        print(f"\n  ── {_fmt_ts(ev.get('ts', 0))}  {ev.get('kind')}  "
+              f"node={ev.get('node')}  label={ev.get('label', '')}"
+              f"{'  stage=' + str(ev['stage']) if ev.get('stage') else ''}")
+        if ev.get("error"):
+            print(f"     error: {str(ev['error'])[:160]}")
+        if ev.get("items"):
+            print(f"     items: {', '.join(str(x) for x in ev['items'][:5])}")
+        for tag in ("snapshot_before", "snapshot_after"):
+            s = inc[tag]
+            if s:
+                print(f"     {tag} ({s['offset_s']:+.0f}s): "
+                      f"VRAM {s.get('fb_used_pct', 0)}% "
+                      f"({s.get('fb_used_mb', 0)}/{s.get('fb_total_mb', 0)} MB)  "
+                      f"util {s.get('gpu_util_pct', 0)}%  "
+                      f"phase={s.get('shim_phase', '')}  "
+                      f"T2 {s.get('t2_allocated_mb', 0)} MB (P{s.get('t2_pressure', 0)})  "
+                      f"T3 {s.get('t3_used_mb', 0)} MB  "
+                      f"KV {s.get('kv_used_mb', 0)} MB")
+            else:
+                print(f"     {tag}: none within ±{int(_CRITIC_WINDOW_S)}s")
+        ctx = inc["cluster_context"]
+        print(f"     cluster: remote={ctx['chunk_remote'] + ctx['job_remote']} "
+              f"local={ctx['chunk_local'] + ctx['job_local']} "
+              f"feeders={ctx['feeder_nodes'] or '-'}")
+        for h in inc["diagnosis_hints"]:
+            print(f"     hint: {h}")
+    print("\nRECOMMENDATIONS")
+    for r in rep["recommendations"]:
+        print(f"  * {r}")
 
 
 # ── HTML rendering ───────────────────────────────────────────────────────────
@@ -683,9 +932,21 @@ def main() -> int:
     p.add_argument("--days", type=float, default=DEFAULT_DAYS)
     p.add_argument("--llm", action="store_true", help="JSON output")
 
+    p = sub.add_parser("critic", help="snapshot-correlated incident diagnosis")
+    p.add_argument("--days", type=float, default=1.0)
+    p.add_argument("--llm", action="store_true", help="JSON output")
+
     args = ap.parse_args()
     if args.cmd == "serve":
         serve(port=args.port, days=args.days)
+        return 0
+
+    if args.cmd == "critic":
+        rep = critic_report(days=args.days)
+        if args.llm:
+            print(json.dumps(rep))
+        else:
+            _print_critic_text(rep)
         return 0
 
     events = read_events(since_hours=args.days * 24)

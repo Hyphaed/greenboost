@@ -12,10 +12,13 @@ Tools:
     dataflux_summary       , cheap aggregate overview (nodes/labels/runs/tok_s)
     dataflux_events         , raw events, filterable by node/label/kind/status
     dataflux_errors         , failed dispatches only
+    dataflux_critic         , snapshot-correlated incident diagnosis + recommendations
     dataflux_kinds          , event-kind breakdown (what actually happened)
     dataflux_tier_moves     , T1/T2/T3 promote/demote/evict events
     dataflux_quantization   , quantize / quantize_to_fit decisions
     dataflux_tok_s          , measured (not predicted) tokens/sec, per model
+    dataflux_candidates     , best-of-N candidate_selected rollup, per slug
+    dataflux_models         , per-model call/rotation rollup + tok_s merged
     greenboost_capabilities , installed/running shim feature manifest (gb_monitor)
     greenboost_status       , live tier/phase/KV-prefetch snapshot (gb_monitor)
     greenboost_pilot        , stage/tok_s trends + evidence-backed advice (gb_pilot)
@@ -152,6 +155,96 @@ def dataflux_tok_s(days: float = 5.0, model: str | None = None) -> dict:
 
 
 @mcp.tool()
+def dataflux_models(days: float = 5.0) -> dict:
+    """Per-model usage rollup over the last `days` days, from the
+    kind="model_call" events forge pipelines emit (forge/gb_models.py) and
+    the kind="model_rotation" phase events gb_rotator.py emits: call count,
+    error count, mean duration and last-seen timestamp per model, with the
+    measured tok/s rollup (same as `dataflux_tok_s`) merged in per model.
+    The overnight-autonomy view: which models actually got used, which
+    failed, and how fast they really decoded."""
+    events = gdf.read_events(since_hours=days * 24)
+    models: dict[str, dict] = {}
+    for ev in events:
+        if ev.get("kind") not in ("model_call", "model_rotation"):
+            continue
+        m = ev.get("model", "?")
+        d = models.setdefault(m, {"calls": 0, "errors": 0,
+                                  "total_duration_s": 0.0, "last_ts": 0.0})
+        d["calls"] += 1
+        if ev.get("status") == "error":
+            d["errors"] += 1
+        d["total_duration_s"] += ev.get("duration_s", 0.0) or 0.0
+        d["last_ts"] = max(d["last_ts"], ev.get("ts", 0.0))
+    tok_s = gdf.summarize(events)["tok_s"]
+    for m, d in models.items():
+        d["mean_duration_s"] = round(d["total_duration_s"] / d["calls"], 2)
+        del d["total_duration_s"]
+        if m in tok_s:
+            d["tok_s"] = tok_s[m]
+    return dict(sorted(models.items(), key=lambda kv: -kv[1]["calls"]))
+
+
+@mcp.tool()
+def dataflux_critic(days: float = 1.0) -> dict:
+    """Critic report: snapshot-correlated diagnosis of what was happening
+    during cluster inference. Every incident (error events, shim_transition
+    warns) in the last `days` days is returned with the nearest flight-recorder
+    snapshots within ±60s before/after (VRAM used/free %, GPU util, shim
+    phase, T2/T3 pool state, KV), the cluster activity in that window
+    (chunk_remote/chunk_local counts , was the feeder working?), and
+    rule-based diagnosis_hints (T3 placement-floor breach, Rule#1 T1
+    underfill, idle-feeder cluster rule, INIT-phase OOM collisions, below-fp8
+    quality-floor breaches). Ends with merged `recommendations` (incident
+    hints + gb_pilot advice) toward best cluster inference at ≥fp8 gb-quant
+    quality. Use after any failed/slow run before tuning anything."""
+    return gdf.critic_report(days=days)
+
+
+@mcp.tool()
+def dataflux_candidates(days: float = 5.0) -> dict:
+    """Rollup of best-of-N `candidate_selected` events emitted by ai-forge's
+    run_pilot best-of reroll (FORGE_BEST_OF). One row per slug over the last
+    `days` days: how many best-of runs it took (attempts), total seed
+    candidates tried, mean winner score, how many runs fully passed QC, total
+    unresolved-text lines left for the repair/human pass, and the breakdown of
+    chosen_reason (incl. "skipped_systemic_repeat" for slugs whose repeated
+    failures were systemic and skipped). Use to see which slugs keep costing
+    candidates and which are systemically stuck. Returns {} when no best-of
+    events exist yet."""
+    events = gdf.read_events(since_hours=days * 24)
+    cs = [e for e in events if e.get("kind") == "candidate_selected"]
+    if not cs:
+        return {}
+    per_slug: dict[str, dict] = {}
+    for e in cs:
+        slug = e.get("slug", "?")
+        d = per_slug.setdefault(slug, {
+            "attempts": 0, "candidates_tried": 0, "_score_sum": 0.0,
+            "_scored": 0, "passed": 0, "unresolved_total": 0,
+            "reasons": {}, "last_ts": 0.0})
+        d["attempts"] += 1
+        d["candidates_tried"] += e.get("n_tried", 0) or 0
+        ws = e.get("winner_score")
+        if ws is not None:
+            d["_score_sum"] += ws
+            d["_scored"] += 1
+        if e.get("passed"):
+            d["passed"] += 1
+        d["unresolved_total"] += e.get("texts_unresolved_count", 0) or 0
+        reason = e.get("chosen_reason", "?")
+        d["reasons"][reason] = d["reasons"].get(reason, 0) + 1
+        d["last_ts"] = max(d["last_ts"], e.get("ts", 0.0))
+    for d in per_slug.values():
+        d["mean_winner_score"] = (round(d.pop("_score_sum") / d["_scored"], 1)
+                                  if d["_scored"] else None)
+        del d["_scored"]
+    return {"event_count": len(cs),
+            "slugs": dict(sorted(per_slug.items(),
+                                 key=lambda kv: -kv[1]["last_ts"]))}
+
+
+@mcp.tool()
 def greenboost_pilot(days: float = 5.0) -> dict:
     """The pilot's instrument panel (gb_pilot): per-stage wall-time trends
     (stage_profile events from ai-forge's jobqueue/seedlog), measured tok/s
@@ -209,31 +302,11 @@ def synapse_status() -> dict:
     gb-synapse (preferred over raw ollama per CLAUDE.md): if `engine_built` is
     false the fallback is raw ollama and the fix is `gb_synapse build` (host +
     each feeder). Read-only."""
-    import subprocess
-    out = {"engine_built": False, "engine_version": None,
-           "server_running": False, "proxy_running": False, "engine_dir": None}
     try:
         import gb_synapse
-        ed = gb_synapse.ENGINE_DIR
-        out["engine_dir"] = str(ed)
-        out["engine_built"] = (ed / "llama-server").exists() and (ed / "rpc-server").exists()
-        if out["engine_built"]:
-            try:
-                out["engine_version"] = gb_synapse.engine_version()
-            except Exception:
-                pass
+        return gb_synapse.status()   # single source of truth (gb_synapse.status)
     except Exception as e:
-        out["error"] = f"gb_synapse unavailable: {e}"
-        return out
-    # Match gb-synapse's OWN engine path (not ollama's internal llama-server).
-    for key, pat in (("server_running", f"{out['engine_dir']}/llama-server"),
-                     ("proxy_running", "gb_synapse_api")):
-        try:
-            r = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True, timeout=5)
-            out[key] = bool(r.stdout.strip())
-        except Exception:
-            pass
-    return out
+        return {"error": f"gb_synapse unavailable: {e}", "engine_built": False}
 
 
 @mcp.tool()
