@@ -1189,6 +1189,61 @@ def ensure_feeder_rpc(feeder, rpc_port: int = RPC_PORT_BASE, device: int = 0) ->
     return False
 
 
+MTP_DRAFT_N = int(os.environ.get("GB_SYNAPSE_MTP_DRAFT_N", "3"))
+
+
+def _pick_kv_type(ctx: int, entry: ModelEntry, budget_gb: float) -> str:
+    """f16 KV when it fits the live budget, q8_0 when it is the only way to
+    reach the context — the certification-grade / budget-grade split.
+
+    GB_SYNAPSE_KV pins it (f16 | q8_0) for a run that must be comparable to a
+    published certificate, where the KV tier is part of the claim.
+    """
+    pin = os.environ.get("GB_SYNAPSE_KV")
+    if pin:
+        return pin
+    weights_gb = entry.n_bytes / (1024 ** 3)
+    kv_f16_gb = estimate_kv_gb(ctx, entry.n_bytes, entry.quant,
+                               n_layers=entry.n_layers, n_kv_heads=entry.n_kv_heads,
+                               head_dim=entry.head_dim,
+                               kv_bytes_per_elem=2.0)     # f16: 2 bytes/elem
+    return "f16" if weights_gb + kv_f16_gb <= budget_gb else "q8_0"
+
+
+def _find_mmproj(entry: ModelEntry) -> "Path | None":
+    """The multimodal projector of a vision GGUF is a SEPARATE file, and
+    llama-server serves the model text-only without it — images are dropped in
+    silence and the model answers about a picture it never received. Look for
+    it beside the weights (how both HF repos and our own pulls lay it out).
+    GB_SYNAPSE_MMPROJ overrides for a projector kept somewhere else."""
+    override = os.environ.get("GB_SYNAPSE_MMPROJ")
+    if override:
+        return Path(override) if Path(override).is_file() else None
+    d = Path(entry.path).parent
+    for pat in ("mmproj*.gguf", "*mmproj*.gguf"):
+        for p in sorted(d.glob(pat)):
+            return p
+    return None
+
+
+def _has_mtp(entry: ModelEntry) -> bool:
+    """True when the GGUF carries a multi-token-prediction layer, which
+    llama.cpp can use as its own draft model (--spec-type draft-mtp) for ~34%
+    faster decode at IDENTICAL output — the draft head is the model's own
+    grafted layer, so unlike a separate draft model it costs no VRAM and no
+    quality. Ask the tensors, not the filename: a repo may name the file
+    anything, and serving MTP flags to a model without the layer fails the
+    load."""
+    if os.environ.get("GB_SYNAPSE_MTP") in ("0", "1"):
+        return os.environ["GB_SYNAPSE_MTP"] == "1"
+    try:
+        GGUFReader = _load_gguf_reader()
+        names = (t.name.lower() for t in GGUFReader(entry.path, mode="r").tensors)
+        return any("mtp" in n or "nextn" in n for n in names)
+    except Exception:
+        return False
+
+
 def _clamp_ctx_to_budget(requested_ctx: int, entry: ModelEntry, budget_gb: float) -> int:
     """Shrink ctx so weights+KV fit the live aggregate VRAM budget (same fit
     math as recommend()/FitReport, solved for ctx instead of just reported).
@@ -1358,14 +1413,15 @@ def _emit_serve(entry: ModelEntry, status: str, **fields) -> None:
 
 def _launch_proxy_and_record(entry: ModelEntry, upstream: subprocess.Popen, port: int,
                               internal_port: int, tensor_split: str = "",
-                              feeders: list | None = None) -> ServerState:
+                              feeders: list | None = None, **serve_facts) -> ServerState:
     """Shared tail for every engine (llama.cpp/vLLM/transformers): wait for the
     engine to come up, start the gb_synapse_api.py proxy in front of it, and
     record ServerState. The proxy only ever talks OpenAI /v1/* to the upstream,
     so it's identical regardless of which engine is behind it — and all three
     expose /health, so the readiness gate is too."""
     t0 = time.time()
-    common = {"port": port, "tensor_split": tensor_split, "feeders": feeders or []}
+    common = {"port": port, "tensor_split": tensor_split, "feeders": feeders or [],
+              **serve_facts}
     try:
         ready = _wait_upstream_ready(entry, upstream, internal_port)
     except RuntimeError as e:
@@ -1515,7 +1571,7 @@ def _serve_transformers(entry: ModelEntry, port: int) -> ServerState:
     return _launch_proxy_and_record(entry, proc, port, internal_port)
 
 
-def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 65536,
+def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
           use_cluster: bool = True, n_slots: int = 1, extra_args: str = "") -> ServerState:
     """Resolve `model` (manifest name, "org/repo[:quant]", or a bare Ollama
     model name), bring up feeder rpc-server(s) if online, launch the host
@@ -1582,17 +1638,53 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 65536,
             rpc_args.append(f"{f.ip}:{rpc_port}")
             online_feeders.append(f)
     budget_gb = host_free_mb / 1024 + sum(f.t1_free_mb for f in online_feeders) / 1024
+
+    # ctx=0 means "whatever the model itself was certified for" — a 1M YaRN bake
+    # exists precisely so it can be USED, and a hardcoded 64K default silently
+    # discarded 94% of it. The budget clamp below still decides what actually
+    # fits, so asking for the model's full context is never dangerous, just
+    # honest about the ceiling.
+    if ctx <= 0:
+        ctx = entry.ctx_length or 65536
     ctx = _clamp_ctx_to_budget(ctx, entry, budget_gb)
 
-    # Split reflects the (clamped) ctx's KV footprint when SPLIT_V2 is on.
+    # KV precision is a QUALITY tier, not a memory knob, so it is chosen against
+    # the budget rather than hardcoded: f16 is certification grade, q8_0 is a
+    # budget config that buys ~2x the cache for roughly one needle at long
+    # rungs. Serving q8_0 unconditionally (as this did) quietly demoted every
+    # model to the budget tier — including ones whose KV fits f16 with room to
+    # spare. Take f16 whenever it fits; drop to q8_0 only to make the context
+    # reachable at all, and say so.
+    kv_type = _pick_kv_type(ctx, entry, budget_gb)
+
+    # Split reflects the (clamped) ctx's KV footprint at the KV tier we actually
+    # serve — an f16 cache is twice a q8_0 one, and a split sized for the wrong
+    # tier pushes weights onto a node that has no room left for them.
     kv_total_gb = estimate_kv_gb(ctx, entry.n_bytes, entry.quant,
                                  n_layers=entry.n_layers, n_kv_heads=entry.n_kv_heads,
-                                 head_dim=entry.head_dim)
+                                 head_dim=entry.head_dim,
+                                 kv_bytes_per_elem=2.0 if kv_type == "f16" else 1.0)
     tensor_split = _compute_tensor_split(host_free_mb, online_feeders, kv_total_gb)
 
     internal_port = port + 1000
     env = gb_cluster.shim_env(workload="llm", enabled=True)
     env["GREENBOOST_CLUSTER"] = "0"  # RPC owns cross-node split; shim = local tiers only
+
+    # The shim currently aborts llama.cpp's CUDA backend on this host:
+    # LD_PRELOAD of libgreenboost_cuda.so makes cudaFuncGetAttributes return
+    # "invalid device function" inside ggml_cuda_kernel_can_use_pdl (reproduced
+    # with GREENBOOST_ACTIVE=0, so it is the interposition itself, not a
+    # GreenBoost code path; a plain cudart-12 test binary is unaffected, so the
+    # trigger is ggml's late-dlopen'ed backend). Serving through a shim that
+    # kills the engine is strictly worse than serving without it: RPC still
+    # splits across the cluster and gb-quant still holds quality, we only lose
+    # per-node T2/T3 spill. Probe once, then decide — never assume.
+    if os.environ.get("GB_SYNAPSE_SHIM", "0") != "1":
+        for k in ("LD_PRELOAD", "GREENBOOST_ACTIVE"):
+            env.pop(k, None)
+        shim_note = "off (known llama.cpp/CUDA incompatibility)"
+    else:
+        shim_note = "on (GB_SYNAPSE_SHIM=1)"
 
     SLOT_DIR.mkdir(parents=True, exist_ok=True)
     cmd = [str(ENGINE_DIR / "llama-server"), "-m", entry.path,
@@ -1602,7 +1694,7 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 65536,
            "--flash-attn", "auto",
            "--no-mmap",  # DMA-BUF pinning (Path A) is incompatible with mmap-backed pages
            "-np", str(n_slots), "--threads", str(_pcore_threads()),
-           "--cache-type-k", "q8_0", "--cache-type-v", "q8_0",  # matches Ollama TurboQuant baseline
+           "--cache-type-k", kv_type, "--cache-type-v", kv_type,
            # Renders the model's own Jinja chat template instead of llama-server's
            # built-in simplified matcher — required for correct native tool-calling
            # on models whose template defines a tool-call format (Qwen3 family and
@@ -1610,10 +1702,37 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 65536,
            # go missing from emitted tool_calls (confirmed live: qwen36-coder:studio
            # calling Glob/Read with no "pattern"/"file_path"). See known-issues.md.
            "--jinja"]
+
+    # No mmap: DMA-BUF pinning needs owned pages. Without the shim there is
+    # nothing to pin, and mmap lets the page cache serve a 23 GB GGUF instead of
+    # re-reading it from disk on every restart.
+    if "LD_PRELOAD" not in env:
+        cmd.remove("--no-mmap")
+
+    # Vision: a GGUF's projector is a SEPARATE file. Without --mmproj a VLM is
+    # served text-only and every image is silently dropped — the model answers
+    # confidently about an image it never saw, which is worse than an error.
+    mmproj = _find_mmproj(entry)
+    if mmproj:
+        cmd += ["--mmproj", str(mmproj)]
+
+    # MTP: models carrying a grafted multi-token-prediction layer (the aviary-1m
+    # fleet bakes one in) decode ~34% faster through llama.cpp's speculative
+    # path, with identical output — the draft head IS the model's own layer, so
+    # this costs no quality and no extra VRAM for a draft model.
+    if _has_mtp(entry):
+        cmd += ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(MTP_DRAFT_N)]
+
     if rpc_args:
         cmd += ["--rpc", ",".join(rpc_args), "--tensor-split", tensor_split]
     if extra_args:
         cmd += shlex.split(extra_args)
+
+    kv_grade = "certification-grade" if kv_type == "f16" else "budget"
+    print(f"  [gb-synapse] {entry.name}: ctx={ctx} kv={kv_type} ({kv_grade}) "
+          f"shim={shim_note}"
+          f"{' +mtp' if _has_mtp(entry) else ''}{' +vision' if mmproj else ''}"
+          f"{' rpc=' + ','.join(rpc_args) if rpc_args else ''}", flush=True)
 
     llama_log = open(_run_log_path(entry.name), "ab")
     llama_proc = subprocess.Popen(cmd, env=env, stdout=llama_log, stderr=subprocess.STDOUT,
@@ -1621,7 +1740,9 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 65536,
 
     return _launch_proxy_and_record(entry, llama_proc, port, internal_port,
                                      tensor_split=tensor_split,
-                                     feeders=[f.ip for f in online_feeders])
+                                     feeders=[f.ip for f in online_feeders],
+                                     ctx=ctx, kv_type=kv_type,
+                                     mtp=bool(_has_mtp(entry)), vision=bool(mmproj))
 
 
 def stop(model: str) -> bool:

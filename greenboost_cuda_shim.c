@@ -4252,13 +4252,19 @@ static void gb_cudart_rebind(void)
     if (m) {
         char line[1024];
         while (fgets(line, sizeof(line), m)) {
-            char real[512];
             char *p = strchr(line, '/');
+            int mine = 0;
             if (!p || !strstr(p, "libcudart.so"))
                 continue;
             p[strcspn(p, "\n")] = '\0';
-            if (g_cudart_init_real[0] && realpath(p, real) &&
-                strcmp(real, g_cudart_init_real) == 0)
+            if (g_cudart_init_real[0]) {
+                char *rp = realpath(p, NULL);   /* NULL: glibc allocates PATH_MAX */
+                if (rp) {
+                    mine = (strcmp(rp, g_cudart_init_real) == 0);
+                    free(rp);
+                }
+            }
+            if (mine)
                 continue;               /* the fallback WE dlopened - skip */
             snprintf(found, sizeof(found), "%s", p);
             break;
@@ -4672,10 +4678,17 @@ static void gb_shim_init(void)
             if (dlinfo(libcudart, RTLD_DI_LINKMAP, &lm) == 0 && lm && lm->l_name[0])
                 snprintf(g_cudart_init_path, sizeof(g_cudart_init_path), "%s", lm->l_name);
             /* Canonical form is what /proc/self/maps shows; the rebind compares
-             * against THIS, never the (possibly symlinked) dlopen name. */
-            if (!g_cudart_init_path[0] ||
-                !realpath(g_cudart_init_path, g_cudart_init_real))
-                g_cudart_init_real[0] = '\0';
+             * against THIS, never the (possibly symlinked) dlopen name.
+             * realpath(NULL) allocates a PATH_MAX buffer for us — passing our
+             * own smaller array is an overflow glibc's fortify check aborts on. */
+            g_cudart_init_real[0] = '\0';
+            if (g_cudart_init_path[0]) {
+                char *rp = realpath(g_cudart_init_path, NULL);
+                if (rp) {
+                    snprintf(g_cudart_init_real, sizeof(g_cudart_init_real), "%s", rp);
+                    free(rp);
+                }
+            }
             if (gb_debug)
                 fprintf(stderr, "[GreenBoost] libcudart loaded (%s)\n",
                         g_cudart_init_path[0] ? g_cudart_init_path : "?");
