@@ -114,20 +114,6 @@ static int debug_mode        =  0;
 static int gaming_mode       =  0;  /* 1 when a game is active - deprioritises inference T2 */
 static int use_hugepages     =  1;  /* 2 MB compound pages (T2 only)    */
 
-/* Expert VMM pool registry , shim registers pools so vitals/Synapse can
- * discover them cross-process.  Residency is NOT tracked here; read it
- * directly from the shim via gb_expert_pool_residency() or /proc maps. */
-#define GB_VPAGE_REGISTRY_MAX 64
-struct gb_vpage_entry {
-	u64   va_base;
-	u64   stride_bytes;
-	u32   num_experts;
-	u32   pid;
-};
-static struct gb_vpage_entry gb_vpage_registry[GB_VPAGE_REGISTRY_MAX];
-static int                   gb_vpage_count;
-static DEFINE_SPINLOCK(gb_vpage_lock);
-
 /* KV cache T1 reservation - MB of VRAM kept free so KV cache is not
  * displaced into T2/T3 by weight allocation.  KV cache is read+written
  * on every generation step; if it lands in T2 (PCIe-limited) or T3
@@ -2278,73 +2264,6 @@ static long gb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		for (i = 0; i < n; i++)
 			dma_buf_put(refs[i]);
 		kvfree(refs);
-		return 0;
-	}
-
-	case GB_IOCTL_VPAGE_REGISTER: {
-		struct gb_vpage_register_req req;
-		int i;
-
-		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
-			return -EFAULT;
-
-		spin_lock(&gb_vpage_lock);
-		/* Update existing entry for the same va_base (re-register). */
-		for (i = 0; i < gb_vpage_count; i++) {
-			if (gb_vpage_registry[i].va_base == req.va_base &&
-			    gb_vpage_registry[i].pid == (u32)current->pid) {
-				gb_vpage_registry[i].stride_bytes = req.stride_bytes;
-				gb_vpage_registry[i].num_experts  = req.num_experts;
-				spin_unlock(&gb_vpage_lock);
-				return 0;
-			}
-		}
-		/* Evict oldest entry when full. */
-		if (gb_vpage_count >= GB_VPAGE_REGISTRY_MAX) {
-			memmove(&gb_vpage_registry[0], &gb_vpage_registry[1],
-				sizeof(gb_vpage_registry[0]) * (GB_VPAGE_REGISTRY_MAX - 1));
-			gb_vpage_count = GB_VPAGE_REGISTRY_MAX - 1;
-		}
-		gb_vpage_registry[gb_vpage_count].va_base      = req.va_base;
-		gb_vpage_registry[gb_vpage_count].stride_bytes = req.stride_bytes;
-		gb_vpage_registry[gb_vpage_count].num_experts  = req.num_experts;
-		gb_vpage_registry[gb_vpage_count].pid          = (u32)current->pid;
-		gb_vpage_count++;
-		spin_unlock(&gb_vpage_lock);
-		return 0;
-	}
-
-	case GB_IOCTL_VPAGE_QUERY: {
-		struct gb_vpage_query_req req;
-		int i, found = 0;
-
-		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
-			return -EFAULT;
-
-		spin_lock(&gb_vpage_lock);
-		for (i = 0; i < gb_vpage_count; i++) {
-			if (gb_vpage_registry[i].va_base == req.va_base) {
-				/* SEC: only the registering process (or CAP_SYS_ADMIN) may
-				 * query a vpage entry - it leaks another tenant's MoE buffer
-				 * layout (stride/expert count) and owning pid otherwise. */
-				if (gb_vpage_registry[i].pid != (u32)current->pid &&
-				    !capable(CAP_SYS_ADMIN)) {
-					spin_unlock(&gb_vpage_lock);
-					return -EPERM;
-				}
-				req.out_stride_bytes = gb_vpage_registry[i].stride_bytes;
-				req.out_num_experts  = gb_vpage_registry[i].num_experts;
-				req.out_pid          = gb_vpage_registry[i].pid;
-				found = 1;
-				break;
-			}
-		}
-		spin_unlock(&gb_vpage_lock);
-
-		if (!found)
-			return -ENOENT;
-		if (copy_to_user((void __user *)arg, &req, sizeof(req)))
-			return -EFAULT;
 		return 0;
 	}
 

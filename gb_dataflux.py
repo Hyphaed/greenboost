@@ -63,14 +63,66 @@ class SnapshotRecorder:
         self._interval_s = interval_s
         self._last_emit = 0.0
         self._node = node
+        # Discrete-transition state , greenboost's own orchestration decisions
+        # (shim phase, T2 pressure, T3 spill) must be followable as EVENTS in the
+        # dataflux MCP, not just inferred from the 5s snapshot time-series. See
+        # CLAUDE.md "Observability Must-Rule" pt 4 (greenboost itself emits).
+        self._prev_phase = None
+        self._prev_t3_active = None
+        self._prev_t2_bucket = None
         telemetry_manager.add_callback(self._on_metrics)
+
+    def _bucket(self, pressure) -> str:
+        try:
+            p = float(pressure)
+        except (TypeError, ValueError):
+            return "ok"
+        return "critical" if p >= 0.9 else "warn" if p >= 0.6 else "ok"
+
+    def _detect_transitions(self, m, gb, node: str) -> None:
+        """Emit a `shim_transition` event whenever an orchestration-relevant
+        shim decision changes state. Runs every poll (not throttled) so fast
+        transitions aren't lost; best-effort, never raises."""
+        phase = (getattr(m, "shim_phase", "") or "").strip()
+        t3_active = bool(gb.t3_used_mb) if gb else False
+        t2_bucket = self._bucket(gb.t2_pressure if gb else 0)
+        for field, prev_attr, frm, to, status in (
+            ("shim_phase", "_prev_phase", self._prev_phase, phase, "ok"),
+            ("t3_spill", "_prev_t3_active",
+             self._prev_t3_active, t3_active,
+             "warn" if t3_active else "ok"),
+            ("t2_pressure", "_prev_t2_bucket", self._prev_t2_bucket, t2_bucket,
+             "error" if t2_bucket == "critical" else
+             "warn" if t2_bucket == "warn" else "ok"),
+        ):
+            if to == "" or to is None:
+                continue
+            if frm is None:                      # first observation , seed, no event
+                setattr(self, prev_attr, to)
+                continue
+            if to != frm:
+                setattr(self, prev_attr, to)
+                emit({
+                    "node": node, "label": "shim", "kind": "shim_transition",
+                    "stage": field, "from": frm, "to": to,
+                    "n_items": 0, "items": [], "duration_s": 0.0,
+                    "status": status,
+                    "t2_pressure": (gb.t2_pressure if gb else 0),
+                    "t3_used_mb": (gb.t3_used_mb if gb else 0),
+                    "fb_used_pct": round(getattr(m, "fb_used_pct", 0.0), 1),
+                })
 
     def _on_metrics(self, m) -> None:
         now = time.time()
+        gb = getattr(m, "gb", None)
+        node = self._node if self._node is not None else (
+            "host" if getattr(m, "device", 0) == 0 else f"gpu{m.device}")
+        # Discrete orchestration transitions , every poll, unthrottled.
+        self._detect_transitions(m, gb, node)
+        # Continuous flight-recorder snapshot , throttled to interval_s.
         if now - self._last_emit < self._interval_s:
             return
         self._last_emit = now
-        gb = getattr(m, "gb", None)
         sys_m = getattr(m, "sys", None)
         node = self._node if self._node is not None else (
             "host" if getattr(m, "device", 0) == 0 else f"gpu{m.device}")

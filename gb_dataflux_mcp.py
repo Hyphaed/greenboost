@@ -50,7 +50,8 @@ def dataflux_summary(days: float = 5.0) -> dict:
 @mcp.tool()
 def dataflux_events(days: float = 5.0, node: str | None = None,
                     label: str | None = None, kind: str | None = None,
-                    status: str | None = None, limit: int = 200) -> list[dict]:
+                    status: str | None = None, stage: str | None = None,
+                    limit: int = 200) -> list[dict]:
     """Raw dataflux events over the last `days` days, most recent first.
 
     Filter by node (e.g. "host" or a feeder's hostname/ip), label (the
@@ -59,8 +60,11 @@ def dataflux_events(days: float = 5.0, node: str | None = None,
     "quantize", "quantize_to_fit", "turboquant_activate", "tok_s_measured",
     "chunk_local", "chunk_remote", "job_local", "job_remote", "model_push",
     "stage_bundle", "snapshot" , see `dataflux_kinds` for what's actually
-    present), and/or status ("ok" or "error"). `limit` caps the number of
-    events returned (default 200, most recent first).
+    present), status ("ok" or "error"), and/or stage — the stage_profile
+    stage name, substring match (e.g. "forge:image", "conduir:batch",
+    "artloop"), the fast path to one pipeline stage's timing series.
+    `limit` caps the number of events returned (default 200, most recent
+    first).
     """
     events = gdf.read_events(since_hours=days * 24)
     if node:
@@ -71,6 +75,8 @@ def dataflux_events(days: float = 5.0, node: str | None = None,
         events = [e for e in events if e.get("kind") == kind]
     if status:
         events = [e for e in events if e.get("status") == status]
+    if stage:
+        events = [e for e in events if stage in str(e.get("stage", ""))]
     return list(reversed(events))[:limit]
 
 

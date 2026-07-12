@@ -686,7 +686,7 @@ def _field_str(reader, key: str) -> str:
 def gguf_summary(path: str) -> dict:
     """Parse layer count, quant type, MoE expert config, context length, and
     total weight bytes from a GGUF file. Reuses the vendored llama.cpp
-    GGUFReader via gb_gguf_tensor_map, same as the hot-expert cache tooling."""
+    GGUFReader via gb_gguf_tensor_map."""
     GGUFReader = _load_gguf_reader()
     reader = GGUFReader(path, mode="r")
     n_bytes = sum(int(t.n_bytes) for t in reader.tensors)

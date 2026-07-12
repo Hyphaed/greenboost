@@ -2482,7 +2482,7 @@ cmd_install_sys_configs() {
     # having run first, so the auto-scale must be replicated here.
     # Right-size using estimate_kv_mb() with a VRAM-based worst-case model param count
     # (2x safety buffer, floor 128 MB). Ceiling is VRAM-proportional: reserving >1/16 of
-    # physical VRAM for KV strands expert-cache budget on MoE models where the actual KV
+    # physical VRAM for KV strands on MoE models where the actual KV
     # is typically 4-8× smaller than a dense model of the same nominal size.
     if [[ -z "${GB_KV_RESERVE_MB:-}" ]]; then
         local _ctx_for_kv="${GB_OLLAMA_CTX:-32768}"

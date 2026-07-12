@@ -5,7 +5,7 @@
 tests/bench/run_real_model.py , Phase 0 measurement harness (roadmap Track A/C/D
 prerequisite).
 
-WHY: gb_prefetch.py / gb_moe.py / gb_moe_vmm.py are unit-tested against CPU
+WHY: gb_prefetch.py / gb_moe.py are unit-tested against CPU
 synthetic models only. Their keep_resident / lookahead / prefetch_topn /
 hot_threshold defaults are explicitly unvalidated against a real checkpoint
 under the shim. This script loads a real HF causal LM (dense or MoE) through
@@ -109,7 +109,6 @@ def main() -> int:
                           "overflows into T2 (default: gb_llm's auto budget, ~92%% free VRAM, "
                           "which may let small models fit entirely in T1 and never overflow)")
     ap.add_argument("--moe", action="store_true", help="attach gb_moe.GbMoEManager")
-    ap.add_argument("--moe-vmm", action="store_true", help="use gb_moe_vmm.GbMoEVMMManager instead of gb_moe")
     ap.add_argument("--prefetch", action="store_true", help="attach gb_prefetch.LayerPrefetcher (dense)")
     ap.add_argument("--keep-resident", type=int, default=2)
     ap.add_argument("--lookahead", type=int, default=1)
@@ -127,7 +126,6 @@ def main() -> int:
         "model": args.model,
         "budget_gb": args.budget_gb,
         "moe": args.moe,
-        "moe_vmm": args.moe_vmm,
         "prefetch": args.prefetch,
         "keep_resident": args.keep_resident,
         "lookahead": args.lookahead,
@@ -154,11 +152,8 @@ def main() -> int:
             model, keep_resident=args.keep_resident, lookahead=args.lookahead)
         if prefetcher is not None:
             prefetcher.attach()
-    if args.moe or args.moe_vmm:
-        if args.moe_vmm:
-            from gb_moe_vmm import GbMoEVMMManager as _Mgr
-        else:
-            from gb_moe import GbMoEManager as _Mgr
+    if args.moe:
+        from gb_moe import GbMoEManager as _Mgr
         moe_mgr = _Mgr(model, hot_threshold=args.hot_threshold,
                         prefetch_topn=args.prefetch_topn)
         record["moe_blocks_found"] = moe_mgr.attach()
