@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GreenBoost v3.0 - Setup & installation script (Ubuntu / Debian and derivatives)
+# GreenBoost v3.2 - Setup & installation script (Ubuntu / Debian and derivatives)
 # Supports: Ubuntu, Debian, Pop!_OS, Mint, and other apt-based distros.
 # Delegates to greenboost_setup_rocky.sh on RHEL/Fedora and
 # greenboost_setup_arch.sh on Arch-based systems.
@@ -100,7 +100,7 @@ GB_SWAP_FILE="/var/lib/greenboost/swapfile"
 GB_SWAP_MIN_GB=8      # minimum existing swap to consider adequate (skip provisioning)
 GB_SWAP_MAX_GB=120    # cap for auto-provisioned swapfile
 
-GB_VERSION="3.1"
+GB_VERSION="3.2"
 GB_REPO_API="https://gitlab.com/api/v4/projects/IsolatedOctopi%2Fgreenboost/repository/tags"
 
 # Colours
@@ -148,6 +148,161 @@ _detect_distro_family() {
         *suse*)             echo "suse"    ; return ;;
     esac
     echo "unknown"
+}
+
+# _gb_cuda_installed_version - print "MAJOR.MINOR" from whichever nvcc is
+# actually the current one (prefers /usr/local/cuda, the update-alternatives
+# path NVIDIA's own installers manage, over a possibly-stale distro-packaged
+# nvcc on PATH - same reasoning as gb_synapse.py's _find_nvcc()). Empty
+# string if no nvcc is found anywhere.
+_gb_cuda_installed_version() {
+    local nvcc_bin="/usr/local/cuda/bin/nvcc"
+    [[ -x "$nvcc_bin" ]] || nvcc_bin=$(command -v nvcc 2>/dev/null) || { echo ""; return; }
+    "$nvcc_bin" --version 2>/dev/null | grep -oP 'release \K[0-9]+\.[0-9]+' | head -1
+}
+
+# _gb_cuda_needs_install - true (rc 0) unless a CUDA toolkit new enough for
+# this project's target GPUs (Blackwell, sm_120 - added in CUDA 12.8) is
+# already the active one.
+_gb_cuda_needs_install() {
+    local ver major minor
+    ver=$(_gb_cuda_installed_version)
+    [[ -z "$ver" ]] && return 0
+    major="${ver%%.*}"; minor="${ver#*.}"
+    (( major > 12 )) && return 1
+    (( major == 12 && minor >= 8 )) && return 1
+    return 0
+}
+
+# _gb_is_wsl - true if running under WSL (same systemd-detect-virt check
+# cmd_gen_inference_config already uses for virt_type detection).
+_gb_is_wsl() {
+    [[ "$(systemd-detect-virt 2>/dev/null)" == "wsl" ]]
+}
+
+# _gb_install_cuda_toolkit - install the latest CUDA toolkit from NVIDIA's
+# official per-distro repo (Arch: from Arch's own `extra` repo instead -
+# NVIDIA doesn't publish an Arch repo). Full-install only; light install
+# never touches this. Idempotent: no-ops if already >= 12.8 (Blackwell
+# support) unless FORCE=1 is passed.
+#
+# Uses the version-less `cuda-toolkit` meta-package (not a pinned
+# `cuda-toolkit-MAJOR-MINOR`) so this keeps tracking "latest" as NVIDIA ships
+# new releases, without needing a code update here every time.
+_gb_install_cuda_toolkit() {
+    local force="${1:-0}"
+    if [[ "$force" != "1" ]] && ! _gb_cuda_needs_install; then
+        gb_ok "CUDA toolkit $(_gb_cuda_installed_version) already supports Blackwell (>= 12.8) - skipping"
+        return 0
+    fi
+
+    local id version_id
+    id=$(. /etc/os-release 2>/dev/null && echo "${ID:-}" | tr '[:upper:]' '[:lower:]')
+    version_id=$(. /etc/os-release 2>/dev/null && echo "${VERSION_ID:-}")
+    local family; family=$(_detect_distro_family)
+
+    gb_info "Installing latest CUDA toolkit (distro: ${id:-unknown} ${version_id:-}$(_gb_is_wsl && echo " [WSL]"))..."
+
+    if [[ "$family" == "arch" ]]; then
+        # No NVIDIA-hosted repo for Arch - the `extra` repo already ships a
+        # current `cuda` package directly.
+        pacman -S --needed --noconfirm cuda \
+            || { gb_warn_ui "pacman install of 'cuda' failed - install manually: sudo pacman -S cuda"; return 1; }
+        gb_ok "CUDA toolkit installed via pacman"
+        return 0
+    fi
+
+    local repo_os="" pkg_mgr=""
+    if _gb_is_wsl; then
+        repo_os="wsl-ubuntu"; pkg_mgr="apt"
+    else
+        case "$id" in
+            ubuntu)
+                case "$version_id" in
+                    22.04) repo_os="ubuntu2204" ;;
+                    24.04) repo_os="ubuntu2404" ;;
+                    26.04) repo_os="ubuntu2604" ;;
+                    *)     repo_os="ubuntu2404"; gb_warn_ui "Unrecognized Ubuntu ${version_id} - assuming ubuntu2404 repo" ;;
+                esac
+                pkg_mgr="apt"
+                ;;
+            debian)
+                case "${version_id%%.*}" in
+                    12) repo_os="debian12" ;;
+                    13) repo_os="debian13" ;;
+                    *)  repo_os="debian12"; gb_warn_ui "Unrecognized Debian ${version_id} - assuming debian12 repo" ;;
+                esac
+                pkg_mgr="apt"
+                ;;
+            rhel|centos|rocky|almalinux|ol)
+                case "${version_id%%.*}" in
+                    8)  repo_os="rhel8" ;;
+                    9)  repo_os="rhel9" ;;
+                    10) repo_os="rhel10" ;;
+                    *)  repo_os="rhel9"; gb_warn_ui "Unrecognized RHEL-family ${version_id} - assuming rhel9 repo" ;;
+                esac
+                pkg_mgr="dnf"
+                ;;
+            fedora)
+                repo_os="fedora${version_id%%.*}"
+                pkg_mgr="dnf5"   # Fedora ships DNF5 - different addrepo syntax than RHEL's DNF4
+                ;;
+            sles)
+                case "${version_id%%.*}" in
+                    15) repo_os="sles15" ;;
+                    16) repo_os="suse16" ;;
+                    *)  repo_os="sles15"; gb_warn_ui "Unrecognized SLES ${version_id} - assuming sles15 repo" ;;
+                esac
+                pkg_mgr="zypper"
+                ;;
+            opensuse*|opensuse-leap|opensuse-tumbleweed)
+                case "${version_id%%.*}" in
+                    15) repo_os="opensuse15" ;;
+                    16) repo_os="suse16" ;;
+                    *)  repo_os="opensuse15"; gb_warn_ui "Unrecognized openSUSE ${version_id} - assuming opensuse15 repo" ;;
+                esac
+                pkg_mgr="zypper"
+                ;;
+            *)
+                gb_warn_ui "Unrecognized distro '${id}' for CUDA toolkit install - skipping. Install manually: https://developer.nvidia.com/cuda-downloads"
+                return 1
+                ;;
+        esac
+    fi
+
+    local base_url="https://developer.download.nvidia.com/compute/cuda/repos/${repo_os}/x86_64"
+    case "$pkg_mgr" in
+        apt)
+            local tmp_deb; tmp_deb=$(mktemp --suffix=.deb)
+            wget -qO "$tmp_deb" "${base_url}/cuda-keyring_1.1-1_all.deb" \
+                || { gb_warn_ui "Could not download cuda-keyring from ${base_url}"; rm -f "$tmp_deb"; return 1; }
+            dpkg -i "$tmp_deb" && rm -f "$tmp_deb"
+            apt-get update -qq
+            apt-get -y install cuda-toolkit
+            ;;
+        dnf)
+            dnf config-manager --add-repo "${base_url}/cuda-${repo_os}.repo"
+            dnf clean all
+            dnf -y install cuda-toolkit
+            ;;
+        dnf5)
+            dnf config-manager addrepo --from-repofile "${base_url}/cuda-${repo_os}.repo"
+            dnf clean all
+            dnf -y install cuda-toolkit
+            ;;
+        zypper)
+            zypper --non-interactive addrepo "${base_url}/cuda-${repo_os}.repo"
+            zypper --non-interactive refresh
+            zypper --non-interactive install cuda-toolkit
+            ;;
+    esac
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then
+        gb_ok "CUDA toolkit installed ($(_gb_cuda_installed_version))"
+    else
+        gb_warn_ui "CUDA toolkit install failed (rc=${rc}) - install manually: https://developer.nvidia.com/cuda-downloads"
+    fi
+    return $rc
 }
 
 # Idempotent kernel header install - uses the appropriate package manager
@@ -226,7 +381,7 @@ gb_header() {
     [[ -n "$_bi_date" ]] && _build_str="  built ${_bi_date}"
     [[ -n "$_bi_git"  ]] && _build_str+=" (${_bi_git})"
     local cols; cols=$(tput cols 2>/dev/null || echo 64)
-    local title=" GreenBoost v${GB_VERSION}${_build_str} - CUDA Memory Orchestrator for NVidia GPUs"
+    local title=" GreenBoost v${GB_VERSION}${_build_str} - CUDA Memory & Compute Orchestrator for NVIDIA GPUs"
     echo -e ""
     echo -e "${C_VIOLET}${C_BOLD}  ╔$(printf '═%.0s' $(seq 1 $((cols - 4))))╗${C_RESET}"
     echo -e "${C_VIOLET}${C_BOLD}  ║${C_RESET} ${C_GRAY}${C_BOLD}${title}$(printf ' %.0s' $(seq 1 $((cols - 4 - ${#title} - 1))))${C_VIOLET}${C_BOLD}║${C_RESET}"
@@ -503,13 +658,13 @@ parse_pool_info() {
     PI_T2_AVAIL_MB=$(echo "$info"   | grep -oP 'T2 available\s*:\s*\K[0-9]+'           | head -1 || echo 0)
     PI_ACTIVE_BUFS=$(echo "$info"   | grep -oP 'Active DMA-BUF objects\s*:\s*\K[0-9]+' | head -1 || echo 0)
     PI_OOM_GUARD=$(echo "$info"     | grep -oP 'OOM guard\s*:\s*\K\S+'                || echo "no")
-    PI_PAGE_MODE=$(echo "$info"     | grep -oP 'Page mode\s*:\s*\K[^\n]+'  | head -1 | sed 's/[[:space:]]*$//')
+    PI_PAGE_MODE=$(echo "$info"     | grep -oP 'Page mode\s*:\s*\K[^\n]+'  | head -1 | sed 's/[[:space:]]*$//' || echo "")
     PI_PAGE_MODE="${PI_PAGE_MODE:--}"
     PI_KV_T1_RSV_MB=$(echo "$info"  | grep -oP 'KV in T1.*reserve:\s*\K[0-9]+'        | head -1 || echo 0)
     PI_KV_T2_MB=$(echo "$info"      | grep -oP 'KV in T2[^:]*:\s*\K[0-9]+'            | head -1 || echo 0)
     PI_KV_T3_MB=$(echo "$info"      | grep -oP 'KV in T3[^:]*:\s*\K[0-9]+'            | head -1 || echo 0)
     PI_KV_TOTAL_MB=$(echo "$info"   | grep -oP 'KV tagged total[^:]*:\s*\K[0-9]+'      | head -1 || echo 0)
-    PI_KV_PLACEMENT=$(echo "$info"  | grep -oP 'KV cache placement\s*:\s*\K[^\n]+' | head -1 | sed 's/[[:space:]]*$//')
+    PI_KV_PLACEMENT=$(echo "$info"  | grep -oP 'KV cache placement\s*:\s*\K[^\n]+' | head -1 | sed 's/[[:space:]]*$//' || echo "")
     PI_KV_PLACEMENT="${PI_KV_PLACEMENT:--}"
     PI_SWAP_TOTAL_MB=$(echo "$info" | grep -oP 'Swap total\s*:\s*\K[0-9]+'             | head -1 || echo 0)
     PI_SWAP_USED_MB=$(echo "$info"  | grep -oP 'Swap used\s*:\s*\K[0-9]+'              | head -1 || echo 0)
@@ -587,6 +742,17 @@ parse_shim_stats() {
     SS_TIER_PATH_B_COUNT=$(echo "$_tc"     | grep -oP 'tier_path_b_alloc_count=\K-?[0-9]+'     | head -1 || echo 0)
     SS_TIER_PATH_B_MB=$(echo "$_tc"        | grep -oP 'tier_path_b_lifetime_mb=\K-?[0-9]+'     | head -1 || echo 0)
     SS_TIER_PATH_B_PEAK=$(echo "$_tc"      | grep -oP 'tier_path_b_peak_mb=\K-?[0-9]+'         | head -1 || echo 0)
+    # Per-tier LIVE residency (tier_<name>_cur_mb) - what's actually resident
+    # right now, not lifetime/peak. This is the number that shows the
+    # local-VRAM-vs-feeder-VRAM split for the 2-device (ggml-2dev) path.
+    SS_TIER_T1_LOCAL_CUR=$(echo "$_tc"   | grep -oP 'tier_t1_local_cur_mb=\K-?[0-9]+'   | head -1 || echo 0)
+    SS_TIER_T1_FEEDER_CUR=$(echo "$_tc"  | grep -oP 'tier_t1_feeder_cur_mb=\K-?[0-9]+'  | head -1 || echo 0)
+    SS_TIER_T2_LOCAL_CUR=$(echo "$_tc"   | grep -oP 'tier_t2_local_cur_mb=\K-?[0-9]+'   | head -1 || echo 0)
+    SS_TIER_T2_FEEDER_CUR=$(echo "$_tc"  | grep -oP 'tier_t2_feeder_cur_mb=\K-?[0-9]+'  | head -1 || echo 0)
+    SS_TIER_T3_LOCAL_CUR=$(echo "$_tc"   | grep -oP 'tier_t3_local_cur_mb=\K-?[0-9]+'   | head -1 || echo 0)
+    SS_TIER_T3_FEEDER_CUR=$(echo "$_tc"  | grep -oP 'tier_t3_feeder_cur_mb=\K-?[0-9]+'  | head -1 || echo 0)
+    SS_TIER_VMM_CUR=$(echo "$_tc"        | grep -oP 'tier_vmm_cur_mb=\K-?[0-9]+'        | head -1 || echo 0)
+    SS_TIER_PATH_B_CUR=$(echo "$_tc"     | grep -oP 'tier_path_b_cur_mb=\K-?[0-9]+'     | head -1 || echo 0)
 }
 
 # ---- Live GPU metrics query (used by cmd_vitals) ----------------------
@@ -2137,7 +2303,7 @@ check_deps() {
 # ---- Commands ----------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# cmd_install_supervisor — unified GreenBoost supervisor (v3.1+).
+# cmd_install_supervisor , unified GreenBoost supervisor (v3.1+).
 #
 # Replaces four separate units (greenboost-recovery, greenboost-sentinel,
 # greenboost-vram-watchdog, greenboost-idle-reclaim) with a single
@@ -2161,7 +2327,7 @@ cmd_install_supervisor() {
 
     # 1. Install the Python supervisor script + vitals helper
     if [[ ! -f "$SCRIPT_SRC" ]]; then
-        gb_warn "gb_supervisor.py not found at $SCRIPT_SRC — skipping supervisor install"
+        gb_warn "gb_supervisor.py not found at $SCRIPT_SRC , skipping supervisor install"
         return 1
     fi
     install -m 755 "$SCRIPT_SRC" "$LIB_DIR/gb_supervisor.py"
@@ -2170,6 +2336,16 @@ cmd_install_supervisor() {
     if [[ -f "$_vh_src" ]]; then
         install -m 755 "$_vh_src" "$LIB_DIR/gb_vitals_helper.py"
         gb_ok "gb_vitals_helper.py installed to $LIB_DIR/"
+    fi
+    local _mon_src; _mon_src="$(dirname "$(realpath "${BASH_SOURCE[0]}")")/gb_monitor.py"
+    if [[ -f "$_mon_src" ]]; then
+        install -m 755 "$_mon_src" "$LIB_DIR/gb_monitor.py"
+        gb_ok "gb_monitor.py installed to $LIB_DIR/"
+    fi
+    local _pilot_src; _pilot_src="$(dirname "$(realpath "${BASH_SOURCE[0]}")")/gb_pilot.py"
+    if [[ -f "$_pilot_src" ]]; then
+        install -m 755 "$_pilot_src" "$LIB_DIR/gb_pilot.py"
+        gb_ok "gb_pilot.py installed to $LIB_DIR/"
     fi
 
     # 2. Remove old separate units (idempotent upgrade from ≤v3.0)
@@ -2234,7 +2410,7 @@ SUPEOF
     systemctl daemon-reload
     systemctl enable --now greenboost-supervisor.service 2>/dev/null \
         && gb_ok "greenboost-supervisor.service enabled and started (auto-enabled)" \
-        || gb_warn "supervisor enable failed — run: sudo systemctl enable --now greenboost-supervisor.service"
+        || gb_warn "supervisor enable failed , run: sudo systemctl enable --now greenboost-supervisor.service"
 }
 
 # Legacy entry-point kept so any external scripts that call cmd_install_recovery
@@ -2251,7 +2427,7 @@ cmd_install_sys_configs() {
     # Repair existing cluster.key permissions on upgrade (idempotent).
     [[ -f "$GB_CLUSTER_KEY" ]] && _gb_set_keyfile_perms "$GB_CLUSTER_KEY"
 
-    info "Installing GreenBoost v3.0 system configuration files..."
+    info "Installing GreenBoost v3.2 system configuration files..."
 
     # 1. Ollama service - inject GreenBoost env vars + LD_PRELOAD (always refresh)
     local svc="/etc/systemd/system/ollama.service"
@@ -2269,7 +2445,7 @@ cmd_install_sys_configs() {
         # Inject fresh v2.7 env vars
         sed -i "/^\[Service\]/a Environment=\"OLLAMA_FLASH_ATTENTION=1\"\nEnvironment=\"OLLAMA_KV_CACHE_TYPE=q8_0\"\nEnvironment=\"OLLAMA_NUM_CTX=${GB_OLLAMA_CTX}\"\nEnvironment=\"OLLAMA_CONTEXT_LENGTH=${GB_OLLAMA_CTX}\"\nEnvironment=\"OLLAMA_MAX_LOADED_MODELS=1\"\nEnvironment=\"OLLAMA_KEEP_ALIVE=-1\"\nEnvironment=\"GREENBOOST_VIRTUAL_VRAM_MB=$((GB_VIRT * 1024))\"\nEnvironment=\"GREENBOOST_DEBUG=0\"\nEnvironment=\"GREENBOOST_ACTIVE=1\"\nEnvironment=\"LD_PRELOAD=/usr/local/lib/libgreenboost_vmm_override.so:/usr/local/lib/libgreenboost_cuda.so\"" "$svc"
         systemctl daemon-reload
-        info "Ollama service: GreenBoost v3.0 env vars injected (refreshed)"
+        info "Ollama service: GreenBoost v3.2 env vars injected (refreshed)"
         gb_ok "Ollama context cap set to ${GB_OLLAMA_CTX} tokens (T1: ${GB_PHYS} GB, T2: ${GB_VIRT} GB)"
     else
         warn "Ollama service not found at $svc - skipping"
@@ -2305,8 +2481,9 @@ cmd_install_sys_configs() {
     # install-sys-configs may be called standalone without cmd_kmod_install
     # having run first, so the auto-scale must be replicated here.
     # Right-size using estimate_kv_mb() with a VRAM-based worst-case model param count
-    # (2x safety buffer, floor 128 MB, ceiling 2048 MB). This avoids stranding
-    # 2+ GB of T1 VRAM for a KV that is actually ~20-50 MB.
+    # (2x safety buffer, floor 128 MB). Ceiling is VRAM-proportional: reserving >1/16 of
+    # physical VRAM for KV strands expert-cache budget on MoE models where the actual KV
+    # is typically 4-8× smaller than a dense model of the same nominal size.
     if [[ -z "${GB_KV_RESERVE_MB:-}" ]]; then
         local _ctx_for_kv="${GB_OLLAMA_CTX:-32768}"
         local _kv_param_guess
@@ -2320,7 +2497,16 @@ cmd_install_sys_configs() {
         _raw_kv_mb=$(estimate_kv_mb "$_ctx_for_kv" "$_kv_param_guess")
         GB_KV_RESERVE_MB=$(( _raw_kv_mb * 2 ))
         (( GB_KV_RESERVE_MB < 128  )) && GB_KV_RESERVE_MB=128
-        (( GB_KV_RESERVE_MB > 2048 )) && GB_KV_RESERVE_MB=2048
+    fi
+    # VRAM-proportional cap: never strand more than 1/16 of physical VRAM as KV reserve.
+    # A 12 GB card caps at 768 MB; a 24 GB card caps at 1536 MB; a 80 GB card caps at 2048 MB.
+    # This prevents a pre-set GB_KV_RESERVE_MB=2048 from wasting T1 VRAM on small-VRAM cards.
+    local _kv_vram_cap=$(( ${GB_PHYS:-12} * 1024 / 16 ))
+    (( _kv_vram_cap < 128  )) && _kv_vram_cap=128
+    (( _kv_vram_cap > 2048 )) && _kv_vram_cap=2048
+    if (( GB_KV_RESERVE_MB > _kv_vram_cap )); then
+        gb_info "GB_KV_RESERVE_MB clamped ${GB_KV_RESERVE_MB} → ${_kv_vram_cap} MB (1/16 of ${GB_PHYS} GB VRAM)"
+        GB_KV_RESERVE_MB=$_kv_vram_cap
     fi
 
     # Compute CC major for Blackwell-specific tweaks in the drop-in.
@@ -2338,10 +2524,14 @@ cmd_install_sys_configs() {
     [[ $_golden_threads -lt 1 ]] && _golden_threads=4
     local _gomp_affinity="${_golden_min}-${_golden_max}"
 
+    # cluster.key is 0640 root:greenboost , the service needs the group so the
+    # shim (gb_netc_init) can authenticate to feeders without running as root.
+    gb_ensure_greenboost_group
+
     # Write 99-greenboost.conf - alphabetically last, so it always wins
     {
         cat << DROPINEOF
-# GreenBoost v3.0 - managed file, do not edit manually
+# GreenBoost v3.2 - managed file, do not edit manually
 # Re-generated by: sudo ./greenboost_setup.sh install-sys-configs
 [Unit]
 After=greenboost-supervisor.service
@@ -2368,6 +2558,9 @@ Environment="OMP_NUM_THREADS=${_golden_threads}"
 Environment="GREENBOOST_INFERENCE_CPUS=${_gomp_affinity}"
 Environment="GREENBOOST_INFERENCE_THREADS=${_golden_threads}"
 DROPINEOF
+        # Grant read access to /etc/greenboost/cluster.key (0640 root:greenboost)
+        # so the shim inside ollama can HMAC-authenticate to feeders.
+        getent group greenboost >/dev/null 2>&1 && echo "SupplementaryGroups=greenboost"
         # Blackwell (cc >= 12): bypass the lazy CC probe race in vmm_override so
         # VMM_SUPPORTED=0 fires even on the very first cuDeviceGetAttribute call.
         if (( _dropin_cc_major >= 12 )); then
@@ -2416,7 +2609,7 @@ UDEVEOF
         if ! id -nG "$SUDO_USER" 2>/dev/null | tr ' ' '\n' | grep -q '^video$'; then
             usermod -aG video "$SUDO_USER" \
                 && info "User '$SUDO_USER' added to 'video' group (re-login or: newgrp video)" \
-                || warn "usermod failed — add $SUDO_USER to 'video' group manually"
+                || warn "usermod failed , add $SUDO_USER to 'video' group manually"
         else
             gb_info "User '$SUDO_USER' already in 'video' group"
         fi
@@ -2433,7 +2626,7 @@ UDEVEOF
     # excluding partition nodes (nvme0n1p1 …) which have no queue/ sysfs directory.
     # nr_requests capped at 1023 - Samsung 990 EVO Plus hardware limit (max_hw_sectors_kb=512).
     cat > /etc/udev/rules.d/99-nvme-greenboost.rules << 'UDEVEOF'
-# GreenBoost v3.0 - NVMe tuning for T3 swap performance
+# GreenBoost v3.2 - NVMe tuning for T3 swap performance
 ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ENV{DEVTYPE}=="disk", ATTR{queue/scheduler}="none"
 ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ENV{DEVTYPE}=="disk", ATTR{queue/read_ahead_kb}="4096"
 ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ENV{DEVTYPE}=="disk", ATTR{queue/nr_requests}="1023"
@@ -2477,7 +2670,7 @@ CPUEOF
     # which triggers the OOM guard and makes T2 unavailable.  Keep nr_hugepages=0.
     mkdir -p /etc/sysfs.d
     cat > /etc/sysfs.d/greenboost-hugepages.conf << 'HPEOF'
-# GreenBoost v3.0 - THP config (no HugeTLB pre-allocation: gb_alloc_buf uses buddy allocator)
+# GreenBoost v3.2 - THP config (no HugeTLB pre-allocation: gb_alloc_buf uses buddy allocator)
 kernel/mm/transparent_hugepage/enabled = always
 HPEOF
     info "THP sysfs conf: /etc/sysfs.d/greenboost-hugepages.conf"
@@ -2540,7 +2733,7 @@ HPEOF
         cp "$aa_src" "$aa_dest"
         gb_ok "AppArmor abstraction installed: $aa_dest"
     else
-        gb_info "AppArmor abstraction dir not found — skipping (non-AppArmor system)"
+        gb_info "AppArmor abstraction dir not found , skipping (non-AppArmor system)"
     fi
 
     # Step 2: Targeted local override for unix-chkpwd.
@@ -2559,7 +2752,7 @@ HPEOF
             } >> "$_aa_chkpwd_local"
             apparmor_parser -r /etc/apparmor.d/usr.sbin.unix-chkpwd 2>/dev/null && \
                 gb_ok "unix-chkpwd local override: audit stub mr granted (denials cleared)" || \
-                gb_warn "unix-chkpwd profile reload failed — will apply on next apparmor restart"
+                gb_warn "unix-chkpwd profile reload failed , will apply on next apparmor restart"
         else
             gb_info "unix-chkpwd local override: already set (skip)"
         fi
@@ -2568,9 +2761,9 @@ HPEOF
     # GB_APPARMOR_FULL_INSTALL=1: aggressive global injection (opt-in, snap-risk).
     if [[ "${GB_APPARMOR_FULL_INSTALL:-0}" != "1" ]]; then
         echo -e "  ${C_DIM}  Full AppArmor injection skipped (default). Set GB_APPARMOR_FULL_INSTALL=1${C_RESET}"
-        echo -e "  ${C_DIM}  to inject into abstractions/base — WARNING: breaks snap apps.${C_RESET}"
+        echo -e "  ${C_DIM}  to inject into abstractions/base , WARNING: breaks snap apps.${C_RESET}"
     elif [[ -d "$aa_dir" && -f "$aa_src" ]]; then
-        echo -e "  ${C_AMBER}  WARNING: GB_APPARMOR_FULL_INSTALL=1 — this WILL break snap apps.${C_RESET}"
+        echo -e "  ${C_AMBER}  WARNING: GB_APPARMOR_FULL_INSTALL=1 , this WILL break snap apps.${C_RESET}"
         echo -e "  ${C_AMBER}  Run \`sudo greenboost apparmor-uninstall\` to revert.${C_RESET}"
         echo -e ""
 
@@ -2725,7 +2918,7 @@ HPEOF
 }
 
 
-# cmd_install_idle_reclaim — removed; logic now in gb_supervisor.py via cmd_install_supervisor
+# cmd_install_idle_reclaim , removed; logic now in gb_supervisor.py via cmd_install_supervisor
 # ── clean-memory ──────────────────────────────────────────────────────────────
 # Force-release T1 VRAM + T2 RAM + T3 NVMe immediately.
 # Framework-agnostic: finds every process with /dev/greenboost open via fuser,
@@ -2807,7 +3000,7 @@ PYEOF
     fi
 }
 
-# gb_ensure_greenboost_group — create the "greenboost" system group if absent and
+# gb_ensure_greenboost_group , create the "greenboost" system group if absent and
 # add the invoking user (SUDO_USER) to it so non-root processes (greenboost-cli,
 # llama-server, vLLM) can read cluster.key at mode 0640 root:greenboost without
 # requiring sudo.  Idempotent: safe to call on every install.
@@ -2815,7 +3008,7 @@ gb_ensure_greenboost_group() {
     if ! getent group greenboost >/dev/null 2>&1; then
         groupadd --system greenboost 2>/dev/null \
             || groupadd greenboost 2>/dev/null \
-            || { gb_warn "Could not create 'greenboost' group — cluster.key will stay 0600 (root-only)"; return 0; }
+            || { gb_warn "Could not create 'greenboost' group , cluster.key will stay 0600 (root-only)"; return 0; }
         gb_ok "Created system group 'greenboost'"
     fi
     # Add the invoking user to the group when running via sudo.
@@ -2824,14 +3017,14 @@ gb_ensure_greenboost_group() {
         if ! id -nG "$_user" 2>/dev/null | grep -qw greenboost; then
             usermod -aG greenboost "$_user" 2>/dev/null \
                 || gpasswd -a "$_user" greenboost 2>/dev/null \
-                || gb_warn "Could not add '$_user' to group 'greenboost' — run: sudo usermod -aG greenboost $_user"
+                || gb_warn "Could not add '$_user' to group 'greenboost' , run: sudo usermod -aG greenboost $_user"
             gb_ok "Added '$_user' to group 'greenboost'"
             gb_warn "Log out and back in (or run: newgrp greenboost) for the new group membership to take effect in existing shells"
         fi
     fi
 }
 
-# _gb_set_keyfile_perms <path> — apply correct ownership + mode to cluster.key.
+# _gb_set_keyfile_perms <path> , apply correct ownership + mode to cluster.key.
 # Uses 0640 root:greenboost when the group exists; falls back to 0600 root:root.
 _gb_set_keyfile_perms() {
     local _kf="$1"
@@ -2844,7 +3037,7 @@ _gb_set_keyfile_perms() {
     fi
 }
 
-# gb_ensure_shim_libs — build shim + vmm_override + audit and install-libs if any
+# gb_ensure_shim_libs , build shim + vmm_override + audit and install-libs if any
 # installed lib is missing or any source file is newer than the installed shim.
 # Called at the top of every config-install command so the correct workflow
 # (build → install) is always followed, even for standalone CLI invocations.
@@ -2856,9 +3049,9 @@ gb_ensure_shim_libs() {
     local need_build=0
 
     # Trigger rebuild if any lib is absent
-    [[ ! -f "$shim_installed"  ]] && { warn "Shim not installed at $shim_installed — will build"; need_build=1; }
-    [[ ! -f "$vmm_installed"   ]] && { warn "VMM override not installed at $vmm_installed — will build"; need_build=1; }
-    [[ ! -f "$audit_installed" ]] && { warn "Audit lib not installed at $audit_installed — will build"; need_build=1; }
+    [[ ! -f "$shim_installed"  ]] && { warn "Shim not installed at $shim_installed , will build"; need_build=1; }
+    [[ ! -f "$vmm_installed"   ]] && { warn "VMM override not installed at $vmm_installed , will build"; need_build=1; }
+    [[ ! -f "$audit_installed" ]] && { warn "Audit lib not installed at $audit_installed , will build"; need_build=1; }
 
     # Also trigger if any source file is newer than the installed shim
     if (( ! need_build )) && [[ -f "$shim_installed" ]]; then
@@ -2874,15 +3067,15 @@ gb_ensure_shim_libs() {
 
     (( ! need_build )) && return 0
 
-    gb_step "Building GreenBoost shim + vmm_override + audit (source newer than install)..."
+    gb_step 0 1 "Building GreenBoost shim + vmm_override + audit (source newer than install)..."
     local _log; _log=$(mktemp /tmp/gb_shim_ensure.XXXXX.log)
     if ! make -C "$MODULE_DIR" shim vmm_override audit >"$_log" 2>&1; then
         echo "" >&2; cat "$_log" >&2; rm -f "$_log"
-        gb_die "Shim build failed — fix compiler errors and retry"
+        gb_die "Shim build failed , fix compiler errors and retry"
     fi
     if ! make -C "$MODULE_DIR" install-libs >>"$_log" 2>&1; then
         echo "" >&2; cat "$_log" >&2; rm -f "$_log"
-        gb_die "install-libs failed — check Makefile and retry"
+        gb_die "install-libs failed , check Makefile and retry"
     fi
     rm -f "$_log"
     # Restore ownership so the developer can rebuild without sudo
@@ -2929,9 +3122,32 @@ cmd_install_llama_configs() {
         return 1
     fi
 
+    # Install-time capability manifest: answers "what does the INSTALLED shim
+    # support" before any shim process runs (the shim also writes a per-launch
+    # /run/greenboost/capabilities.json that supersedes this at runtime). Only
+    # static build features are known here; env-gated runtime features are left
+    # false — consumers that need those read the runtime manifest.
+    # Keep the feature set in sync with gb_write_capabilities_file() in the shim.
+    cat > "$SHIM_DEST/greenboost_capabilities.json" << 'CAPEOF'
+{
+  "shim_version": "3.2",
+  "abi": 1,
+  "source": "install",
+  "features": {
+    "gb_quant_cudart_rebind": true,
+    "expert_pool": true,
+    "cluster_fabric": true,
+    "gds": false,
+    "kv_compress": false,
+    "report_physical_vram": false
+  }
+}
+CAPEOF
+    chmod 0644 "$SHIM_DEST/greenboost_capabilities.json" 2>/dev/null || true
+
     # GreenBoost no longer registers shims in /etc/ld.so.preload.  Writing paths
     # to our CUDA/audit interposers there loads them into EVERY process on the
-    # system — including systemd PID 1 — which freezes early boot (manifests as
+    # system , including systemd PID 1 , which freezes early boot (manifests as
     # "Failed to load libmount.so" / "systemd[1]: Freezing execution").
     #
     # Injection is scoped per-process via:
@@ -2947,7 +3163,7 @@ cmd_install_llama_configs() {
     fi
 
     echo ""
-    info "Injection configured — shims activate per-process via systemd drop-ins and greenboost-run* wrappers."
+    info "Injection configured , shims activate per-process via systemd drop-ins and greenboost-run* wrappers."
     info "  CUDA shim : $shim_path_full"
     info "  Audit lib : $audit_path"
 }
@@ -3491,7 +3707,11 @@ cmd_apparmor_uninstall() {
 do_purge() {
     # restart_after=1 → restart stopped services at the end (cmd_uninstall).
     # restart_after=0 → leave them stopped (cmd_full_install handles restart after fresh install).
+    # preserve_cluster=1 → keep cluster identity/state files across the
+    #   /etc/greenboost wipe (install/reinstall paths). A true uninstall
+    #   passes 0 so secrets don't outlive the product.
     local restart_after="${1:-0}"
+    local preserve_cluster="${2:-0}"
 
     # 0. Remove any legacy boot-cleanup artifacts from previous failed install attempts.
     #    These services caused more problems than they solved (kernel oops during boot).
@@ -3593,7 +3813,31 @@ do_purge() {
     fi
     udevadm control --reload-rules 2>/dev/null || true
     [[ $_cfg_removed -gt 0 ]] && gb_ok "Config files removed ($_cfg_removed files)"
-    rm -rf /etc/greenboost
+    if [[ "$preserve_cluster" -eq 1 ]]; then
+        # Reinstall path: /etc/greenboost holds cluster identity , losing
+        # cluster.key desyncs every feeder (they keep their copy) and losing
+        # cluster.conf silently drops all connected feeders (this broke the
+        # omen feeder on 2026-07-06). Preserve state files across the wipe;
+        # everything else in /etc/greenboost is regenerated by the install.
+        local _keep_dir _kf
+        _keep_dir=$(mktemp -d /run/greenboost-keep.XXXXXX)
+        for _kf in cluster.key cluster.conf known_hosts turboquant.enabled ggml_2dev.enabled; do
+            [[ -f "/etc/greenboost/$_kf" ]] && cp -a "/etc/greenboost/$_kf" "$_keep_dir/" || true
+        done
+        rm -rf /etc/greenboost
+        if compgen -G "$_keep_dir/*" >/dev/null; then
+            mkdir -p /etc/greenboost
+            # Copy entries, NOT "$_keep_dir/." , cp -a of "dir/." also stamps
+            # the mktemp dir's 0700 mode onto /etc/greenboost, locking every
+            # non-root reader (cluster display, shim, gb_cluster.py) out.
+            cp -a "$_keep_dir"/* /etc/greenboost/
+            chmod 0755 /etc/greenboost
+            gb_ok "Cluster state preserved:$(cd "$_keep_dir" && printf ' %s' *)"
+        fi
+        rm -rf "$_keep_dir"
+    else
+        rm -rf /etc/greenboost
+    fi
 
     # 6. Disable + remove ALL GreenBoost systemd services - generic glob catches any
     #    service file installed by any version of full-install, regardless of name.
@@ -3610,6 +3854,8 @@ do_purge() {
     [[ $_svcs_removed -gt 0 ]] && gb_ok "$_svcs_removed GreenBoost service(s) removed"
     # Ollama drop-in override
     rm -f /etc/systemd/system/ollama.service.d/99-greenboost.conf
+    # Speculative decoding drop-in (feature removed - always purge any leftover)
+    rm -f /etc/systemd/system/ollama.service.d/zz-speculative.conf
     rmdir --ignore-fail-on-non-empty /etc/systemd/system/ollama.service.d/ 2>/dev/null || true
     # TurboQuant daemon (optional install - clean up if present)
     systemctl disable --now greenboost-turboquant.service 2>/dev/null || true
@@ -3781,11 +4027,12 @@ cmd_install_python_files() {
     local _dest="$GB_PY_DEST"
     mkdir -p "$_dest"
 
-    # Core orchestration stack — gb_init.py is the bootstrap wiring module that
+    # Core orchestration stack , gb_init.py is the bootstrap wiring module that
     # must be listed first so downstream modules find it on import.
     local _py_files=(
         gb_init.py
         gb_quant.py gb_quant_tq.py gb_quant_calib.py
+        gb_kernel_backends.py gb_placement.py
         gb_attn.py  gb_llm.py
         gb_telemetry.py
         gb_stream_sched.py
@@ -3794,11 +4041,14 @@ cmd_install_python_files() {
         gb_diffusion_orch.py
         gb_stability_monitor.py
         gb_feeder_diag.py
+        gb_gguf_tensor_map.py
         # Reactive signal-driven orchestration (v3.3+)
         gb_nvml.py
+        gb_nvml_ctypes.py
         gb_reactive.py
         gb_control.py
         gb_orchestrator.py
+        gb_dataflux.py
     )
     local _installed=0
     for _f in "${_py_files[@]}"; do
@@ -3809,7 +4059,7 @@ cmd_install_python_files() {
     done
 
     # Install an empty __init__.py so the directory is importable as a package.
-    # Init-M5: "from . import *" was removed — it eager-loaded torch/gemlite at
+    # Init-M5: "from . import *" was removed , it eager-loaded torch/gemlite at
     # import time and conflicted with absolute imports (PYTHONPATH exposes all
     # modules top-level; no relative-import indirection needed).
     if [[ ! -f "$_dest/__init__.py" ]]; then
@@ -3850,7 +4100,7 @@ PYPATHEOF
     # greenboost run) get gb_init auto-imported even without sourcing profile.d.
     # We use a unique filename (greenboost_sitecustomize.py) to avoid clobbering
     # an existing sitecustomize.py written by other tools.
-    local _sc_content='# GreenBoost auto-bootstrap — generated by install-python
+    local _sc_content='# GreenBoost auto-bootstrap , generated by install-python
 import os as _os
 if _os.environ.get("GREENBOOST_ACTIVE") == "1":
     try:
@@ -3890,7 +4140,52 @@ if _os.environ.get("GREENBOOST_ACTIVE") == "1":
     gb_info "  auto-init: GREENBOOST_ACTIVE=1 triggers gb_init on Python startup"
 }
 
-# _gb_install_ebpf_tracer — install greenboost-ebpf-trace if built, (re)start it.
+# _gb_ensure_ollama , install ollama on the host during Full Install if missing,
+# or update it if a newer release exists. Feeders then match it via
+# `greenboost feeders sync-ollama` (kernel-name parity is what lets feeder-GPU
+# compute resolve host-dispatched kernels). Best-effort: logs progress, never
+# aborts the install. Set GB_SKIP_OLLAMA_UPDATE=1 to skip entirely.
+_gb_ensure_ollama() {
+    [[ "${GB_SKIP_OLLAMA_UPDATE:-0}" == "1" ]] && { gb_info "ollama update skipped (GB_SKIP_OLLAMA_UPDATE=1)"; return 0; }
+    command -v curl &>/dev/null || { gb_warn "curl not found , skipping ollama update"; return 0; }
+
+    local _before; _before=$(ollama --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+
+    if [[ -n "$_before" ]]; then
+        # Already installed - only reinstall when a newer release actually
+        # exists. The official installer restarts the ollama service, so
+        # running it on every Full Install would needlessly bounce a healthy
+        # daemon. If the latest release can't be determined, leave it alone.
+        local _latest
+        _latest=$(curl -fsSL --max-time 5 "https://api.github.com/repos/ollama/ollama/releases/latest" 2>/dev/null \
+            | grep -oP '"tag_name"\s*:\s*"v?\K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        if [[ -z "$_latest" ]]; then
+            gb_info "ollama ${_before} installed - couldn't check for a newer release, leaving it as-is"
+            return 0
+        fi
+        local _newer; _newer=$(printf '%s\n%s\n' "$_before" "$_latest" | sort -V | tail -1)
+        if [[ "$_newer" == "$_before" ]]; then
+            gb_ok "ollama ${_before} is already the latest release - skipping reinstall"
+            return 0
+        fi
+        gb_info "Updating ollama (current: ${_before}, latest: ${_latest}) via official installer…"
+    else
+        gb_info "Installing ollama via official installer…"
+    fi
+    # Official installer updates the ollama binary + systemd unit in place.
+    if curl -fsSL https://ollama.com/install.sh -o /tmp/gb_ollama_install.sh 2>/dev/null \
+       && sh /tmp/gb_ollama_install.sh >/tmp/gb_ollama_install.log 2>&1; then
+        local _after; _after=$(ollama --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        gb_ok "ollama ${_after:-installed}${_before:+ (was ${_before})}"
+        [[ -n "$_after" && -f "$GB_CLUSTER_CONF" ]] && \
+            gb_info "Match feeders to it:  sudo greenboost feeders sync-ollama"
+    else
+        gb_warn "ollama install/update failed (see /tmp/gb_ollama_install.log) , continuing"
+    fi
+    rm -f /tmp/gb_ollama_install.sh
+}
+
+# _gb_install_ebpf_tracer , install greenboost-ebpf-trace if built, (re)start it.
 # Called from cmd_install (Full Install).  Non-fatal when binary absent.
 _gb_install_ebpf_tracer() {
     local _src="${MODULE_DIR}/greenboost-ebpf-trace"
@@ -3898,7 +4193,7 @@ _gb_install_ebpf_tracer() {
     local _pid_f="/run/greenboost/ebpf_trace.pid"
 
     if [[ ! -x "$_src" ]]; then
-        gb_info "eBPF tracer not built (clang/bpftool/libbpf required) — skipping"
+        gb_info "eBPF tracer not built (clang/bpftool/libbpf required) , skipping"
         gb_info "  Build: cd ${MODULE_DIR} && make BPF=1 ebpf"
         return 0
     fi
@@ -3922,11 +4217,11 @@ _gb_install_ebpf_tracer() {
         if kill -0 "$_bpf_bg_pid" 2>/dev/null; then
             gb_ok "eBPF tracer started (pid ${_bpf_bg_pid})"
         else
-            gb_warn "eBPF tracer exited immediately — check /var/log/greenboost/ebpf-trace.log"
+            gb_warn "eBPF tracer exited immediately , check /var/log/greenboost/ebpf-trace.log"
             gb_info "  Hint: requires CAP_BPF (root) and CONFIG_KALLSYMS_ALL=y"
         fi
     else
-        gb_info "eBPF tracer installed — will auto-start after: sudo modprobe greenboost"
+        gb_info "eBPF tracer installed , will auto-start after: sudo modprobe greenboost"
         gb_info "  Manual start: sudo ${_dst}"
     fi
 }
@@ -3954,8 +4249,8 @@ cmd_install() {
     # Step 0: clean previous installation to guarantee a fresh install
     # Skip when called from cmd_full_install which already ran do_purge at step 0/5.
     if [[ "${GB_SKIP_INSTALL_PURGE:-0}" -ne 1 ]]; then
-        gb_step "Removing previous GreenBoost installation (if any)..."
-        do_purge 0
+        gb_step 0 4 "Removing previous GreenBoost installation (if any)..."
+        do_purge 0 1
         gb_ok "Previous installation removed"
     fi
 
@@ -3970,7 +4265,7 @@ cmd_install() {
         echo "" >&2
         cat "$_build_log" >&2
         rm -f "$_build_log"
-        die "Build failed — see output above"
+        die "Build failed , see output above"
     fi
     rm -f "$_build_log"
     # Restore source-tree ownership so the developer can rebuild without sudo.
@@ -4013,12 +4308,57 @@ cmd_install() {
 options greenboost physical_vram_gb=${GB_PHYS} virtual_vram_gb=${GB_VIRT} safety_reserve_gb=${GB_RESERVE} nvme_pool_gb=${GB_NVME_POOL} t3_max_gb=${GB_NVME_POOL} t3_file_path=/var/lib/greenboost/t3_store pcores_max_cpu=${GB_PCORES_MAX} golden_cpu_min=${GB_GOLDEN_MIN} golden_cpu_max=${GB_GOLDEN_MAX} ecores_only=${GB_PCORES_ONLY}
 MODEOF
 
+    # Load the module NOW so it picks up the tuned parameters just written ,
+    # `make install` (dkms-install) only builds/registers the module with DKMS,
+    # it never inserts it into the running kernel, and this script never called
+    # modprobe itself either (it only ever PRINTED "sudo modprobe greenboost"
+    # as a suggestion). Confirmed 2026-07-09: a full reinstall completed
+    # cleanly but left the module unloaded , GreenBoost's T2 DDR spill then
+    # silently degraded into real OS swap (8 GB used, 90% iowait), which
+    # looked like generic slowness/"GPU thermal throttling" until traced back
+    # to this. Unload first if some (possibly stale-params) instance is
+    # already loaded, so the fresh modprobe.conf options actually take effect.
+    depmod -a 2>/dev/null || true
+    if lsmod | grep -q '^greenboost '; then
+        modprobe -r greenboost 2>/dev/null || _rmmod_with_retry || true
+    fi
+    if modprobe greenboost; then
+        gb_ok "Kernel module loaded (virtual_vram_gb=${GB_VIRT}, reserve=${GB_RESERVE} GB)"
+    else
+        gb_warn "modprobe greenboost failed after install , load manually: sudo modprobe greenboost"
+    fi
+
+    # Persist across reboots , same gap as the modprobe fix above but for the
+    # NEXT boot: without this file, systemd-modules-load.service has nothing
+    # telling it to load greenboost, and the module silently stays unloaded
+    # after a reboot until someone notices (confirmed gap 2026-07-10, this
+    # Full Install path never wrote it even after the modprobe fix above).
+    if [[ ! -f /etc/modules-load.d/greenboost.conf ]]; then
+        echo "greenboost" > /etc/modules-load.d/greenboost.conf
+        gb_ok "Boot-time autoload registered: /etc/modules-load.d/greenboost.conf"
+    fi
+
+    # Build for every OTHER kernel already on disk too , `make install` above
+    # only builds/registers DKMS for $(uname -r).
+    dkms autoinstall -m greenboost -v "$GB_VERSION" &>/dev/null || true
+
+    # Boot guard: self-heals a missing .ko for the running kernel (e.g. a
+    # kernel upgrade whose DKMS autoinstall never ran) before
+    # systemd-modules-load.service tries to load it.
+    if [[ -f "$MODULE_DIR/greenboost_boot_guard.sh" && -f "$MODULE_DIR/greenboost-boot-guard.service" ]]; then
+        install -m 755 "$MODULE_DIR/greenboost_boot_guard.sh" /usr/local/sbin/greenboost_boot_guard.sh
+        install -m 644 "$MODULE_DIR/greenboost-boot-guard.service" /etc/systemd/system/greenboost-boot-guard.service
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable greenboost-boot-guard.service &>/dev/null \
+            && gb_ok "Boot guard installed + enabled: greenboost-boot-guard.service"
+    fi
+
     # profile.d - auto-activate GreenBoost for all CUDA inference tools launched
     # from a login shell (terminal, SSH).  GREENBOOST_ACTIVE=1 is exported globally
     # so vLLM, PyTorch scripts, TGI, Transformers, etc. all work without any wrapper.
     # The greenboost() function remains available as a fallback for non-login contexts.
     cat > /etc/profile.d/greenboost.sh << PROFEOF
-# GreenBoost v3.0 - auto-activation for CUDA inference tools
+# GreenBoost v3.2 - auto-activation for CUDA inference tools
 export GREENBOOST_ACTIVE=1
 export GREENBOOST_SHIM="$SHIM_DEST/$SHIM_LIB"
 export GREENBOOST_VMM_OVERRIDE="$SHIM_DEST/libgreenboost_vmm_override.so"
@@ -4031,7 +4371,10 @@ greenboost() {
             GREENBOOST_ACTIVE=1 LD_PRELOAD="\${_gb_preload}" "\$@"
             unset _gb_preload
             ;;
-        *) echo "Usage: greenboost run <app> [args...]" >&2; return 1 ;;
+        # Fall through to the CLI wrapper , without this the exported function
+        # shadows /usr/local/bin/greenboost in every login shell and breaks
+        # all other subcommands (cluster, vitals, connect, ...).
+        *) command /usr/local/bin/greenboost "\$@" ;;
     esac
 }
 export -f greenboost
@@ -4055,6 +4398,7 @@ case "\$1" in
     connect)         exec "\$GB_SETUP" connect "\${@:2}" ;;
     disconnect)      exec "\$GB_SETUP" disconnect "\${@:2}" ;;
     cluster)         exec "\$GB_SETUP" cluster ;;
+    dataflux-ui)     exec "\$GB_SETUP" dataflux-ui "\${@:2}" ;;
     update)          exec "\$GB_SETUP" update "\${@:2}" ;;
     update-feeders)  exec "\$GB_SETUP" update-feeders ;;
     feeders)         exec "\$GB_SETUP" feeders "\${@:2}" ;;
@@ -4067,12 +4411,17 @@ case "\$1" in
     tune-libs)    exec "\$GB_SETUP" tune-libs ;;
     tune-all)     exec "\$GB_SETUP" tune-all ;;
     turboquant)   exec "\$GB_SETUP" turboquant "\${@:2}" ;;
+    ggml-2dev)    exec "\$GB_SETUP" ggml-2dev "\${@:2}" ;;
     vitals)       exec "\$GB_SETUP" vitals "\${@:2}" ;;
     faults)       exec "\$GB_SETUP" faults "\${@:2}" ;;
     top)          exec "\$GB_SETUP" top "\${@:2}" ;;
     residency)    exec "\$GB_SETUP" residency "\${@:2}" ;;
     debug)        exec "\$GB_SETUP" debug "\${@:2}" ;;
     gen-inference-config) exec "\$GB_SETUP" gen-inference-config "\${@:2}" ;;
+    doctor)          exec "\$GB_SETUP" doctor "\${@:2}" ;;
+    recommend)       exec "\$GB_SETUP" recommend "\${@:2}" ;;
+    pull)            exec "\$GB_SETUP" pull "\${@:2}" ;;
+    synapse)         exec "\$GB_SETUP" synapse "\${@:2}" ;;
     setup|install|full-install) exec "\$GB_SETUP" "\$@" ;;
     uninstall)          exec "\$GB_SETUP" uninstall ;;
     apparmor-uninstall) exec "\$GB_SETUP" apparmor-uninstall ;;
@@ -4143,6 +4492,12 @@ WRAPEOF
 
     # Install and (re)start eBPF tracer if the binary was built
     _gb_install_ebpf_tracer
+
+    # Ensure ollama is present + current so the host runs a known LLM backend
+    # version that feeders can match (kernel-name parity for feeder-GPU
+    # compute).  Best-effort; never fails the install.  Skip with
+    # GB_SKIP_OLLAMA_UPDATE=1.
+    _gb_ensure_ollama
 
     gb_ok "Installation complete"
     gb_info "Load:    sudo modprobe greenboost"
@@ -4238,7 +4593,7 @@ cmd_load() {
         if ! id -nG "$SUDO_USER" 2>/dev/null | tr ' ' '\n' | grep -q '^video$'; then
             usermod -aG video "$SUDO_USER" \
                 && info "User '$SUDO_USER' added to 'video' group (re-login or: newgrp video)" \
-                || warn "usermod failed — add $SUDO_USER to 'video' group manually"
+                || warn "usermod failed , add $SUDO_USER to 'video' group manually"
         else
             gb_info "User '$SUDO_USER' already in 'video' group"
         fi
@@ -4252,7 +4607,7 @@ cmd_load() {
     # Refresh Python files on every load (light-install path)
     [[ -d "$MODULE_DIR" ]] && cmd_install_python_files 2>/dev/null || true
 
-    info "GreenBoost v3.0 loaded - cuda memory pool active!"
+    info "GreenBoost v3.2 loaded - cuda memory pool active!"
     info ""
     info "  T1 ${GPU_NAME} : ${phys} GB  [hot layers]"
     info "  T2 ${RAM_TYPE} pool         : ${virt} GB  [cold layers]"
@@ -4493,7 +4848,7 @@ SYSFS
 # Restore the continuous OS tuner's levers (CPU governor/EPP, GPU clocks/
 # power limit, vm.* tunables) to the pre-tune baseline GbControl captured
 # the first time each lever was touched. Does NOT undo the static
-# install-time `tune`/`tune-sysctl`/`tune-grub` floor — only the dynamic
+# install-time `tune`/`tune-sysctl`/`tune-grub` floor , only the dynamic
 # Loop O-S levers in gb_control.py's os_tune_baseline.json.
 cmd_tune_revert() {
     need_root tune-revert
@@ -4506,7 +4861,7 @@ try:
     ctrl = GbControl()
     results = ctrl.restore_baseline()
     if not results:
-        print("[tune-revert] no baseline captured — nothing to revert")
+        print("[tune-revert] no baseline captured , nothing to revert")
     else:
         for key, ok in results.items():
             print(f"[tune-revert] {key}: {'restored' if ok else 'FAILED'}")
@@ -4707,7 +5062,7 @@ cmd_tune_sysctl() {
     echo ""
 
     # Write the header line with detected hardware (variables don't expand in 'HEREDOC')
-    printf '# GreenBoost v3.0 - Definitive sysctl config\n' > "$dest"
+    printf '# GreenBoost v3.2 - Definitive sysctl config\n' > "$dest"
     printf '# Hardware: %s | %s | %s-%s MT/s | PCIe Gen %s %s (~%s GB/s) | %s GB NVMe\n' \
         "${CPU_NAME}" "${GPU_NAME}" "${RAM_TYPE}" "${RAM_SPEED_MT}" \
         "${PCIE_GEN}" "${PCIE_WIDTH}" "${PCIE_BW_GBS}" "${NVME_SIZE_GB}" >> "$dest"
@@ -4798,6 +5153,15 @@ net.core.somaxconn = 65535
 net.core.netdev_max_backlog = 5000
 net.ipv4.tcp_fastopen = 3
 
+# ── Cluster fabric (host <-> feeder, greenboost-netd binary protocol) ──────
+# The fabric link goes idle between bursts (heartbeats every ~2s, then a
+# burst of H2D/D2H chunks or a per-layer activation handoff). Linux resets
+# cwnd after any idle period (RFC 2861), so every burst restarts from a tiny
+# window and slow-starts back up - the dominant added latency for small,
+# frequent transfers. Disabling this is safe on a private LAN link (no
+# outside traffic to protect against a runaway sender).
+net.ipv4.tcp_slow_start_after_idle = 0
+
 # ── Perf / profiling access ───────────────────────────────────────────────
 # Allow nsys / perf / CUDA Nsight without sudo (needed for GPU profiling).
 kernel.perf_event_paranoid = 1
@@ -4815,6 +5179,18 @@ SYSCTL_EOF
     _sysctl_if_exists kernel.sched_migration_cost_ns   5000000  /proc/sys/kernel/sched_migration_cost_ns
     _sysctl_if_exists kernel.sched_min_granularity_ns  10000000 /proc/sys/kernel/sched_min_granularity_ns
     _sysctl_if_exists kernel.sched_wakeup_granularity_ns 15000000 /proc/sys/kernel/sched_wakeup_granularity_ns
+
+    # BBR congestion control: lower latency + better throughput than the
+    # default CUBIC on the host<->feeder LAN link (bulk weight/KV transfers
+    # mixed with small latency-sensitive control RPCs). Only written if the
+    # running kernel actually has the module - avoids a hard sysctl error on
+    # kernels built without CONFIG_TCP_CONG_BBR.
+    modprobe tcp_bbr 2>/dev/null || true
+    if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        printf '\n# BBR congestion control - better latency/throughput than CUBIC for the\n# host<->feeder cluster fabric link.\nnet.ipv4.tcp_congestion_control = bbr\n' >> "$dest"
+    else
+        info "  BBR congestion control: unavailable on this kernel (tcp_bbr module missing) - skipped"
+    fi
 
     sysctl -p "$dest" 2>&1 | grep -v "^$" | sed 's/^/  /' || true
     echo ""
@@ -4934,7 +5310,7 @@ cmd_tune_libs() {
 
 cmd_tune_all() {
     need_root tune-all
-    info "Running full system tuning for GreenBoost v3.0..."
+    info "Running full system tuning for GreenBoost v3.2..."
     echo ""
     cmd_tune
     echo ""
@@ -5012,7 +5388,7 @@ cmd_clear_nvtx_logs() {
     [[ $cleared -eq 0 ]] && gb_info "No NVTX log files found (nothing to clear)"
 }
 
-# ── cmd_faults — eBPF tier-migration and UVM fault observability ─────────────
+# ── cmd_faults , eBPF tier-migration and UVM fault observability ─────────────
 # Usage: greenboost faults [--llm]
 #
 # Shows live T2↔T3 migration rates, cold-evict and alloc rates, and UVM
@@ -5035,7 +5411,7 @@ _cmd_faults_read_ebpf_stats() {
     EBPF_EVENTS_TOTAL=0
 
     local _sf="/run/greenboost/ebpf_stats"
-    [[ -f "$_sf" ]] || return
+    [[ -f "$_sf" ]] || return 0
     # Stale check: mtime within 3 s
     local _mtime _now
     _mtime=$(stat -c %Y "$_sf" 2>/dev/null || echo 0)
@@ -5065,7 +5441,7 @@ _cmd_faults_read_uvm_procfs() {
     # Fallback: read UVM fault counts from /proc/driver/nvidia-uvm
     UVM_PROCFS_FAULTS=0; UVM_PROCFS_PAGES_IN=0; UVM_PROCFS_PAGES_OUT=0
     local _base="/proc/driver/nvidia-uvm/gpus"
-    [[ -d "$_base" ]] || return
+    [[ -d "$_base" ]] || return 0
     local _gpu _line _val
     for _gpu in "$_base"/*/; do
         [[ -f "${_gpu}fault_stats" ]] || continue
@@ -5105,7 +5481,7 @@ _cmd_faults_snapshot() {
         echo -e "  ${C_LIME}${C_BOLD}●${C_RESET}  ${C_GRAY}eBPF tracer active${_pid_hint}  ${C_DIM}events: ${EBPF_EVENTS_TOTAL}${C_RESET}"
     else
         echo -e "  ${C_AMBER}${C_BOLD}○${C_RESET}  ${C_AMBER}eBPF tracer not running${C_RESET}  ${C_DIM}start: sudo greenboost-ebpf-trace${C_RESET}"
-        echo -e "  ${C_DIM}(UVM procfs counters shown below — rates not available without tracer)${C_RESET}"
+        echo -e "  ${C_DIM}(UVM procfs counters shown below , rates not available without tracer)${C_RESET}"
     fi
     echo ""
 
@@ -5143,7 +5519,7 @@ _cmd_faults_snapshot() {
         printf "  %-30s %s/s\n"  "T2 alloc rate"       "${EBPF_ALLOC_RATE}"
         printf "  %-30s %s/s\n"  "DMA-BUF pin rate"    "${EBPF_PIN_RATE}"
     else
-        echo -e "  ${C_DIM}Migration rates unavailable — tracer not running${C_RESET}"
+        echo -e "  ${C_DIM}Migration rates unavailable , tracer not running${C_RESET}"
     fi
     echo ""
 
@@ -5165,7 +5541,7 @@ _cmd_faults_snapshot() {
         printf "  ${C_DIM}  %-28s %s pages${C_RESET}\n" "pages out (← GPU)" "${UVM_PROCFS_PAGES_OUT}"
     else
         echo -e "  ${C_DIM}No managed memory (cudaMallocManaged) detected${C_RESET}"
-        echo -e "  ${C_DIM}GreenBoost uses pinned DDR (DMA-BUF) — no UVM page faults expected${C_RESET}"
+        echo -e "  ${C_DIM}GreenBoost uses pinned DDR (DMA-BUF) , no UVM page faults expected${C_RESET}"
     fi
     echo ""
 
@@ -5607,6 +5983,47 @@ _gb_proc_is_protected() {
     return 1
 }
 
+cmd_clear_cluster_workers() {
+    # Kill cluster stage/block workers on every feeder + host-side SSH
+    # tunnels, and remove stage temp files. Companion to 'clear memory-pool':
+    # orphaned gb_remote_blocks workers hold ~6 GB of feeder VRAM hostage.
+    gb_header
+    echo -e "  ${C_CYAN}${C_BOLD}Clear Cluster Workers${C_RESET}"
+    echo -e "  ${C_DIM}Kills feeder-side stage workers (gb_remote_blocks, encode/render stages)"
+    echo -e "  and host-side SSH tunnels; removes /tmp stage files on both sides.${C_RESET}"
+    echo ""
+
+    local conf="/etc/greenboost/cluster.conf"
+    if [[ ! -f "$conf" ]]; then
+        gb_info "No cluster.conf , nothing feeder-side to clear"
+    else
+        local _line _addr _ip _user
+        while IFS= read -r _line; do
+            _line="${_line%%#*}"; [[ -z "${_line// }" ]] && continue
+            _addr=$(echo "$_line" | awk '{print $1}')
+            _ip="${_addr%%:*}"
+            _user=$(echo "$_line" | awk '{print $3}')
+            _user="${_user:-${SUDO_USER:-$USER}}"
+            gb_info "Feeder ${_ip}: killing stage workers..."
+            # [g]/[e]/[r] patterns so pkill never matches its own shell.
+            ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+                "${_user}@${_ip}" \
+                'pkill -f "[g]b_remote_blocks.py --serve"; \
+                 pkill -f "[e]ncode_klein_prompts.py"; \
+                 pkill -f "[r]ender_klein_cards.py"; \
+                 rm -f /tmp/gb_feeder_te_* /tmp/gb_feeder_render_*; \
+                 exit 0' 2>/dev/null \
+                && gb_ok "  ${_ip} cleared" \
+                || gb_warn "  ${_ip} unreachable (skipped)"
+        done < "$conf"
+    fi
+
+    # Host side: worker tunnels + stage temp files.
+    pkill -f "[s]sh .*-L 9741:127.0.0.1:9741" 2>/dev/null || true
+    rm -f /tmp/gb_feeder_te_* /tmp/gb_feeder_render_* 2>/dev/null || true
+    gb_ok "Host tunnels + stage temp files cleared"
+}
+
 cmd_clear_memory_pool() {
     local GB_DEV=/dev/greenboost
     local SYSFS=/sys/class/greenboost/greenboost
@@ -5617,7 +6034,12 @@ cmd_clear_memory_pool() {
     echo -e "  Kills heavy GPU compute jobs (CUDA / GreenBoost); desktop & GNOME processes are protected.${C_RESET}"
     echo -e ""
 
-    [[ -c "$GB_DEV" ]] || die "GreenBoost module not loaded (/dev/greenboost not found)"
+    local module_loaded=0
+    if [[ -c "$GB_DEV" ]]; then
+        module_loaded=1
+    else
+        gb_warn "GreenBoost module not loaded (/dev/greenboost not found) — skipping kernel-level buffer release; GPU process cleanup still runs."
+    fi
 
     # Capture RAM state before any action
     local ram_before_free ram_before_cached ram_before_avail
@@ -5703,7 +6125,9 @@ cmd_clear_memory_pool() {
 
     # Root path: force-release T2/T3 buffers via GB_IOCTL_RELEASE_PID
     # struct gb_release_pid_req { uint32_t pid; uint32_t _pad; }  magic=0x47, nr=16
-    if [[ $EUID -eq 0 ]]; then
+    if [[ $EUID -ne 0 ]]; then
+        gb_info "  (run as root for kernel-level buffer release via GB_IOCTL_RELEASE_PID)"
+    elif [[ $module_loaded -eq 1 ]]; then
         python3 - "$GB_DEV" "${kill_list[@]}" <<'PYEOF'
 import sys, os, fcntl, struct
 GB_MAGIC = ord('G')
@@ -5721,7 +6145,7 @@ for pid in pids:
 os.close(fd)
 PYEOF
     else
-        gb_info "  (run as root for kernel-level buffer release via GB_IOCTL_RELEASE_PID)"
+        gb_info "  (module not loaded — kernel-level buffer release skipped)"
     fi
 
     # Drop system page cache so model weight files (read via read() / --no-mmap)
@@ -6010,7 +6434,7 @@ cmd_logs_stop() {
     fi
     local _pid; _pid=$(cat "$_GB_LOG_CAPTURE_PID_FILE" 2>/dev/null)
     if [[ -z "$_pid" ]]; then
-        gb_warn_ui "PID file empty — nothing to stop."
+        gb_warn_ui "PID file empty , nothing to stop."
         rm -f "$_GB_LOG_CAPTURE_PID_FILE"
         return 0
     fi
@@ -6597,18 +7021,18 @@ _cmd_vitals_snapshot() {
     # Gaming mode badge (from pynvml helper / sysfs)
     if (( ${GPU_GAMING_MODE:-0} == 1 )); then
         _sys_lines+=("  ${C_AMBER}⚡ Gaming Mode active${C_RESET}")
-        _diag_warns+=("Gaming mode active — inference T2 priority reduced")
+        _diag_warns+=("Gaming mode active , inference T2 priority reduced")
     fi
     # ECC double-bit error badge (hardware-critical)
     if (( ${GPU_ECC_DBE:-0} > 0 )); then
         _sys_lines+=("  ${C_RED}✗${C_RESET}  ${C_RED}ECC DBE ${GPU_ECC_DBE} error(s)!${C_RESET}")
-        _diag_errors+=("ECC double-bit error: ${GPU_ECC_DBE} volatile, ${GPU_ECC_DBE_AGG:-0} aggregate — hardware memory risk")
+        _diag_errors+=("ECC double-bit error: ${GPU_ECC_DBE} volatile, ${GPU_ECC_DBE_AGG:-0} aggregate , hardware memory risk")
     fi
 
     # ECC SBE early-warning (correctable but signals memory degradation trend)
     if (( ${GPU_ECC_SBE:-0} > 0 )); then
         _sys_lines+=("  ${C_AMBER}⚠${C_RESET}  ${C_AMBER}ECC SBE ${GPU_ECC_SBE} corrected bit(s)${C_RESET}")
-        _diag_warns+=("ECC single-bit errors: ${GPU_ECC_SBE} corrected — monitor for DBE escalation")
+        _diag_warns+=("ECC single-bit errors: ${GPU_ECC_SBE} corrected , monitor for DBE escalation")
     fi
     # DCGM hardware health
     if [[ "$GPU_HEALTH_OK" == "0" && -n "$GPU_HEALTH_SUMMARY" ]]; then
@@ -6721,7 +7145,7 @@ _cmd_vitals_snapshot() {
 
     # Remote Feeders (Cluster) - Combined line + per-feeder bars
     # Load per-feeder BW and health from metrics.json (set by shim, no handshake needed)
-    declare -A _fdr_bw _fdr_health
+    declare -A _fdr_bw _fdr_health _fdr_gpu_util _fdr_gpu_mem_util _fdr_gpu_temp _fdr_gpu_power
     _gb_read_feeder_metrics
 
     local _remote_gpus=0
@@ -6805,9 +7229,23 @@ _cmd_vitals_snapshot() {
                     fi
                     local _fbw_int=${_fbw_val%.*}
                     (( ${_fbw_int:-0} > 0 )) && _fbw_badge="  ${C_DIM}${_fbw_int} MB/s${C_RESET}"
-                    _feeder_bar_lines+=("  ${C_DIM}↳${C_RESET} ${C_CYAN}${_fn_pad}${C_RESET}  ${C_DIM}T1${C_RESET} ${_ft1bar} ${_ft1col}${_ft1u}/${_ft1tot} GB${C_RESET}  ${C_DIM}T2${C_RESET} ${_ft2bar} ${_ft2col}${_ft2u}/${_ft2tot} GB${C_RESET}  ${C_DIM}T3${C_RESET} ${_ft3bar} ${_ft3col}${_ft3u}/${_ft3tot} GB${C_RESET}${_fhealth_badge}${_fbw_badge}")
+                    # Feeder GPU COMPUTE (not just memory) - util%/mem-util%/temp/power
+                    # from the netd heartbeat (via metrics.json). A feeder can hold VRAM
+                    # (T1 bar above) while its GPU sits at 0% - this is the number that
+                    # shows whether the feeder is actually COMPUTING (ggml-2dev / feeder-
+                    # exclusive kernel dispatch) versus just storing weights.
+                    local _fgpu_badge=""
+                    local _fg_util="${_fdr_gpu_util[$ip]:-0}" _fg_mem="${_fdr_gpu_mem_util[$ip]:-0}"
+                    local _fg_temp="${_fdr_gpu_temp[$ip]:-0}" _fg_pwr="${_fdr_gpu_power[$ip]:-0}"
+                    if (( ${_fg_util:-0} > 0 || ${_fg_mem:-0} > 0 )); then
+                        # NOTE: unlike the T1/T2/T3 bars above, high GPU util% is GOOD
+                        # (the feeder is computing, not idle) - deliberately NOT using
+                        # gb_tier_color's danger scale (high%=red) here.
+                        _fgpu_badge="  ${C_DIM}GPU${C_RESET} ${C_CYAN}${_fg_util}%${C_RESET} ${C_DIM}mem${C_RESET} ${_fg_mem}%  ${_fg_temp}°C ${_fg_pwr}W${C_RESET}"
+                    fi
+                    _feeder_bar_lines+=("  ${C_DIM}↳${C_RESET} ${C_CYAN}${_fn_pad}${C_RESET}  ${C_DIM}T1${C_RESET} ${_ft1bar} ${_ft1col}${_ft1u}/${_ft1tot} GB${C_RESET}  ${C_DIM}T2${C_RESET} ${_ft2bar} ${_ft2col}${_ft2u}/${_ft2tot} GB${C_RESET}  ${C_DIM}T3${C_RESET} ${_ft3bar} ${_ft3col}${_ft3u}/${_ft3tot} GB${C_RESET}${_fhealth_badge}${_fbw_badge}${_fgpu_badge}")
                     # Surface feeder issues to vitals diag
-                    [[ "$_fh_val" == "2" ]] && _diag_errors+=("Feeder ${_fn}: ECC quarantine — weights unreliable")
+                    [[ "$_fh_val" == "2" ]] && _diag_errors+=("Feeder ${_fn}: ECC quarantine , weights unreliable")
                     [[ "$_fh_val" == "1" ]] && _diag_warns+=("Feeder ${_fn}: degraded health state")
                 fi
             fi
@@ -6929,20 +7367,20 @@ _cmd_vitals_snapshot() {
     # Tier allocation history (from shim_stats per-tier counters)
     local _any_tier=0
     _ds_tier() {
-        local _label="$1" _desc="$2" _cnt="$3" _mb="$4" _peak="$5"
+        local _label="$1" _desc="$2" _cnt="$3" _mb="$4" _peak="$5" _cur="${6:-0}"
         (( ${_cnt:-0} <= 0 )) && return
         _any_tier=1
-        printf "  ${C_LIME}✓${C_RESET}  %-18s ${C_DIM}%-22s${C_RESET}  ${C_CYAN}%6d${C_RESET} alloc(s)  ${C_GRAY}%7d MB${C_RESET}  ${C_DIM}peak: %d MB${C_RESET}\n" \
-            "$_label" "$_desc" "${_cnt:-0}" "${_mb:-0}" "${_peak:-0}"
+        printf "  ${C_LIME}✓${C_RESET}  %-18s ${C_DIM}%-22s${C_RESET}  ${C_CYAN}%6d${C_RESET} alloc(s)  ${C_AMBER}live: %6d MB${C_RESET}  ${C_GRAY}lifetime: %7d MB${C_RESET}  ${C_DIM}peak: %d MB${C_RESET}\n" \
+            "$_label" "$_desc" "${_cnt:-0}" "${_cur:-0}" "${_mb:-0}" "${_peak:-0}"
     }
-    _ds_tier "T1 local"    "(cudaMalloc)"            "${SS_TIER_T1_LOCAL_COUNT:-0}"  "${SS_TIER_T1_LOCAL_MB:-0}"  "${SS_TIER_T1_LOCAL_PEAK:-0}"
-    _ds_tier "T1 feeder"   "(remote VRAM)"           "${SS_TIER_T1_FEEDER_COUNT:-0}" "${SS_TIER_T1_FEEDER_MB:-0}" "${SS_TIER_T1_FEEDER_PEAK:-0}"
-    _ds_tier "T2 local"    "(DDR pool / Path A)"     "${SS_TIER_T2_LOCAL_COUNT:-0}"  "${SS_TIER_T2_LOCAL_MB:-0}"  "${SS_TIER_T2_LOCAL_PEAK:-0}"
-    _ds_tier "T2 feeder"   "(remote DDR)"            "${SS_TIER_T2_FEEDER_COUNT:-0}" "${SS_TIER_T2_FEEDER_MB:-0}" "${SS_TIER_T2_FEEDER_PEAK:-0}"
-    _ds_tier "T3 local"    "(NVMe GDS)"              "${SS_TIER_T3_LOCAL_COUNT:-0}"  "${SS_TIER_T3_LOCAL_MB:-0}"  "${SS_TIER_T3_LOCAL_PEAK:-0}"
-    _ds_tier "T3 feeder"   "(remote NVMe)"           "${SS_TIER_T3_FEEDER_COUNT:-0}" "${SS_TIER_T3_FEEDER_MB:-0}" "${SS_TIER_T3_FEEDER_PEAK:-0}"
-    _ds_tier "VMM"         "(cuMemCreate)"           "${SS_TIER_VMM_COUNT:-0}"       "${SS_TIER_VMM_MB:-0}"       "${SS_TIER_VMM_PEAK:-0}"
-    _ds_tier "Path B"      "(HostReg fallback)"      "${SS_TIER_PATH_B_COUNT:-0}"    "${SS_TIER_PATH_B_MB:-0}"    "${SS_TIER_PATH_B_PEAK:-0}"
+    _ds_tier "T1 local"    "(cudaMalloc)"            "${SS_TIER_T1_LOCAL_COUNT:-0}"  "${SS_TIER_T1_LOCAL_MB:-0}"  "${SS_TIER_T1_LOCAL_PEAK:-0}"  "${SS_TIER_T1_LOCAL_CUR:-0}"
+    _ds_tier "T1 feeder"   "(remote VRAM)"           "${SS_TIER_T1_FEEDER_COUNT:-0}" "${SS_TIER_T1_FEEDER_MB:-0}" "${SS_TIER_T1_FEEDER_PEAK:-0}" "${SS_TIER_T1_FEEDER_CUR:-0}"
+    _ds_tier "T2 local"    "(DDR pool / Path A)"     "${SS_TIER_T2_LOCAL_COUNT:-0}"  "${SS_TIER_T2_LOCAL_MB:-0}"  "${SS_TIER_T2_LOCAL_PEAK:-0}"  "${SS_TIER_T2_LOCAL_CUR:-0}"
+    _ds_tier "T2 feeder"   "(remote DDR)"            "${SS_TIER_T2_FEEDER_COUNT:-0}" "${SS_TIER_T2_FEEDER_MB:-0}" "${SS_TIER_T2_FEEDER_PEAK:-0}" "${SS_TIER_T2_FEEDER_CUR:-0}"
+    _ds_tier "T3 local"    "(NVMe GDS)"              "${SS_TIER_T3_LOCAL_COUNT:-0}"  "${SS_TIER_T3_LOCAL_MB:-0}"  "${SS_TIER_T3_LOCAL_PEAK:-0}"  "${SS_TIER_T3_LOCAL_CUR:-0}"
+    _ds_tier "T3 feeder"   "(remote NVMe)"           "${SS_TIER_T3_FEEDER_COUNT:-0}" "${SS_TIER_T3_FEEDER_MB:-0}" "${SS_TIER_T3_FEEDER_PEAK:-0}" "${SS_TIER_T3_FEEDER_CUR:-0}"
+    _ds_tier "VMM"         "(cuMemCreate)"           "${SS_TIER_VMM_COUNT:-0}"       "${SS_TIER_VMM_MB:-0}"       "${SS_TIER_VMM_PEAK:-0}"       "${SS_TIER_VMM_CUR:-0}"
+    _ds_tier "Path B"      "(HostReg fallback)"      "${SS_TIER_PATH_B_COUNT:-0}"    "${SS_TIER_PATH_B_MB:-0}"    "${SS_TIER_PATH_B_PEAK:-0}"    "${SS_TIER_PATH_B_CUR:-0}"
     (( _any_tier == 0 )) && printf "  ${C_DIM}No tier stats - shim not active${C_RESET}\n"
     unset -f _ds_tier
 
@@ -6993,10 +7431,62 @@ _cmd_vitals_snapshot() {
     # Last phase + total alloc count from tier stats
     local _total_allocs=$(( ${SS_TIER_T1_LOCAL_COUNT:-0} + ${SS_TIER_T1_FEEDER_COUNT:-0} + ${SS_TIER_T2_LOCAL_COUNT:-0} + ${SS_TIER_T2_FEEDER_COUNT:-0} + ${SS_TIER_T3_LOCAL_COUNT:-0} + ${SS_TIER_T3_FEEDER_COUNT:-0} + ${SS_TIER_VMM_COUNT:-0} + ${SS_TIER_PATH_B_COUNT:-0} ))
     local _phase_disp="${DIAG_LAST_PHASE:-${SS_PHASE:----}}"
-    printf "  ${C_DIM}Last phase: ${C_RESET}${C_VIOLET}%-22s${C_RESET}  ${C_DIM}Total allocs: ${C_RESET}${C_CYAN}%d${C_RESET}  ${C_DIM}H2D: %d MB  D2H: %d MB${C_RESET}\n" \
-        "${_phase_disp}" "${_total_allocs}" "${SS_H2D_MB:-0}" "${SS_D2H_MB:-0}"
+    printf "  ${C_DIM}Last phase: ${C_RESET}${C_VIOLET}%-22s${C_RESET}  ${C_DIM}Total allocs: ${C_RESET}${C_CYAN}%d${C_RESET}  ${C_DIM}H2D: %d MB  D2H: %d MB  Feeder dispatch: %d kernel(s)${C_RESET}\n" \
+        "${_phase_disp}" "${_total_allocs}" "${SS_H2D_MB:-0}" "${SS_D2H_MB:-0}" "${SS_KERNEL_DISPATCH:-0}"
 
-    # Orchestrator state — shown only when the daemon is running (keys non-empty)
+    # H2D/D2H throughput (MB/s) - delta of the cumulative shim_stats counters
+    # against the previous snapshot, so the data-flow rate is visible instead
+    # of only the cumulative total. State file survives across TUI refreshes
+    # (same process re-execs the snapshot function every 5s); first sample
+    # after shim restart or a fresh process has no prior state, shows "-".
+    _gb_vitals_rate_line() {
+        local _state="/run/greenboost/vitals_rate_state"
+        [[ -w /run/greenboost || -w "$_state" ]] || _state="/tmp/greenboost_vitals_rate_state"
+        local _now; _now=$(date +%s)
+        local _prev_ts=0 _prev_h2d=0 _prev_d2h=0
+        if [[ -f "$_state" ]]; then
+            # shellcheck disable=SC1090
+            source "$_state" 2>/dev/null || true
+        fi
+        local _h2d_rate="-" _d2h_rate="-"
+        local _dt=$(( _now - _prev_ts ))
+        if [[ $_prev_ts -gt 0 && $_dt -gt 0 ]]; then
+            local _dh=$(( ${SS_H2D_MB:-0} - _prev_h2d ))
+            local _dd=$(( ${SS_D2H_MB:-0} - _prev_d2h ))
+            (( _dh < 0 )) && _dh=0   # shim restarted, counters reset
+            (( _dd < 0 )) && _dd=0
+            _h2d_rate="$(( _dh / _dt ))"
+            _d2h_rate="$(( _dd / _dt ))"
+        fi
+        printf '_prev_ts=%d\n_prev_h2d=%d\n_prev_d2h=%d\n' "$_now" "${SS_H2D_MB:-0}" "${SS_D2H_MB:-0}" > "$_state" 2>/dev/null || true
+        if [[ "$_h2d_rate" != "-" ]]; then
+            printf "  ${C_DIM}Data flow:  ${C_RESET}${C_CYAN}%s MB/s${C_RESET} H2D (host→feeder)  ${C_CYAN}%s MB/s${C_RESET} D2H (feeder→host)${C_RESET}\n" \
+                "$_h2d_rate" "$_d2h_rate"
+        fi
+    }
+    _gb_vitals_rate_line
+    unset -f _gb_vitals_rate_line
+
+    # Modes line: TurboQuant (KV compression), ggml-2dev (feeder as CUDA
+    # device 1), and gb-quant's last recorded activity (NVTX gb:quantize:
+    # range - gb-quant has no dedicated status file, this is the cheapest
+    # true signal available without adding new Python-side plumbing).
+    {
+        local _tq_on="OFF" _2dev_on="OFF" _gbq_last=""
+        [[ -f /etc/greenboost/turboquant.enabled ]] && _tq_on="ON"
+        [[ -f /etc/greenboost/ggml_2dev.enabled ]] && _2dev_on="ON"
+        if [[ -f /run/greenboost/nvtx_events.log ]]; then
+            _gbq_last=$(grep -F 'gb:quantize' /run/greenboost/nvtx_events.log 2>/dev/null | tail -1 | cut -c1-19 || echo "")
+        fi
+        printf "  ${C_DIM}TurboQuant:${C_RESET} "
+        [[ "$_tq_on" == "ON" ]] && printf "${C_LIME}ON${C_RESET}  " || printf "${C_DIM}OFF${C_RESET}  "
+        printf "${C_DIM}ggml-2dev:${C_RESET} "
+        [[ "$_2dev_on" == "ON" ]] && printf "${C_LIME}ON${C_RESET}  " || printf "${C_DIM}OFF${C_RESET}  "
+        printf "${C_DIM}gb-quant last activity:${C_RESET} "
+        [[ -n "$_gbq_last" ]] && printf "${C_CYAN}%s${C_RESET}\n" "$_gbq_last" || printf "${C_DIM}none this session${C_RESET}\n"
+    }
+
+    # Orchestrator state , shown only when the daemon is running (keys non-empty)
     if [[ -n "$ORCH_WS_RESERVE_MB" ]]; then
         echo ""
         printf '  %b\n' "${C_PURPLE}${C_BOLD}Orchestrator${C_RESET}"
@@ -7073,7 +7563,7 @@ _cmd_vitals_snapshot() {
 # Called at end of every _cmd_vitals_snapshot invocation.
 _status_log_append() {
     local _dir; _dir=$(dirname "$GB_STATUS_LOG")
-    mkdir -p "$_dir" 2>/dev/null || return
+    mkdir -p "$_dir" 2>/dev/null || return 0
     # Rotate if > 1 MB
     if [[ -f "$GB_STATUS_LOG" ]] && (( $(stat -c%s "$GB_STATUS_LOG" 2>/dev/null || echo 0) > 1048576 )); then
         tail -n 2000 "$GB_STATUS_LOG" > "${GB_STATUS_LOG}.tmp" 2>/dev/null \
@@ -7222,6 +7712,38 @@ _gb_run_tui_loop() {
 }
 fi
 
+# ---- _gb_apply_fabric_net_tuning - keep the cluster fabric link tuned ----
+# Called from BOTH cmd_feed (feeder side) and cmd_connect (host side) so the
+# host<->feeder TCP link always runs with the lowest-latency/highest-
+# throughput settings this GreenBoost version knows about, not just when the
+# user separately remembers to run `tune-sysctl`. Live-applies immediately
+# AND persists to the same 99-zzz-greenboost.conf that tune-sysctl/Full
+# Install write, so it survives reboots. Idempotent (grep-guarded appends) -
+# safe to call on every connect/feed-start. Best-effort: never fails the
+# caller (feed/connect must still work on a locked-down or non-root path).
+_gb_apply_fabric_net_tuning() {
+    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1 || true
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    local _bbr_ok=0
+    grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null && _bbr_ok=1
+    [[ $_bbr_ok -eq 1 ]] && { sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true; }
+    gb_ok "Network link tuned (tcp_slow_start_after_idle=0$( [[ $_bbr_ok -eq 1 ]] && echo ', BBR' ))"
+
+    # Persisting to /etc/sysctl.d requires root; if not root the live-apply
+    # above still helps this boot, and Full Install's tune-sysctl step
+    # (which writes the full, canonical network block) will persist it
+    # properly the next time it runs as root.
+    [[ $EUID -eq 0 ]] || return 0
+    local dest="/etc/sysctl.d/99-zzz-greenboost.conf"
+    mkdir -p /etc/sysctl.d
+    if ! grep -q "^net\.ipv4\.tcp_slow_start_after_idle" "$dest" 2>/dev/null; then
+        printf '\n# Cluster fabric (auto-applied by feed/connect - see tune-sysctl for the full network block)\nnet.ipv4.tcp_slow_start_after_idle = 0\n' >> "$dest"
+    fi
+    if [[ $_bbr_ok -eq 1 ]] && ! grep -q "^net\.ipv4\.tcp_congestion_control" "$dest" 2>/dev/null; then
+        printf 'net.ipv4.tcp_congestion_control = bbr\n' >> "$dest"
+    fi
+}
+
 cmd_feed() {
     need_root "feed"
     local action="${1:-start}"
@@ -7234,6 +7756,19 @@ cmd_feed() {
                 info "Feeder daemon already running (pid $(cat "$GB_NETD_PID"))"
                 return 0
             fi
+            # Feeder GPU must be COMPUTE-ready, not just VRAM-ready: locked/
+            # low clocks silently cripple remote compute (found live: omen
+            # stuck at 180 MHz / 3.3 TFLOPS under load; -rgc restored
+            # 42.7 TFLOPS, a 13× difference). Reset clock locks, enable
+            # persistence, prefer the performance platform profile.
+            nvidia-smi -rgc &>/dev/null || true
+            nvidia-smi -pm 1 &>/dev/null || true
+            powerprofilesctl set performance &>/dev/null || true
+            gb_ok "Feeder GPU compute-ready (clock locks reset, persistence on)"
+            # Feeder link must be LATENCY-ready too, not just the GPU: this
+            # daemon is the sender for heartbeats, H2D/D2H responses, and
+            # (with the 2-device Ollama split) per-layer activation replies.
+            _gb_apply_fabric_net_tuning
             # Ensure T3 swap is provisioned: minimum T1 × 2, floor 16 GB
             local _t1_mib=0
             _t1_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits \
@@ -7295,7 +7830,7 @@ OEOF
                     gb_ok "ufw: opened port ${GB_NET_PORT}/tcp (feeder protocol)"
                     _fw_opened=1
                 else
-                    gb_warn_ui "ufw allow ${GB_NET_PORT}/tcp failed — workstation may not reach this feeder"
+                    gb_warn_ui "ufw allow ${GB_NET_PORT}/tcp failed , workstation may not reach this feeder"
                 fi
             elif command -v firewall-cmd &>/dev/null && firewall-cmd --state 2>/dev/null | grep -q running; then
                 if firewall-cmd --permanent --add-port="${GB_NET_PORT}/tcp" &>/dev/null && \
@@ -7303,7 +7838,7 @@ OEOF
                     gb_ok "firewalld: opened port ${GB_NET_PORT}/tcp (feeder protocol)"
                     _fw_opened=1
                 else
-                    gb_warn_ui "firewalld add-port failed — workstation may not reach this feeder"
+                    gb_warn_ui "firewalld add-port failed , workstation may not reach this feeder"
                 fi
             elif command -v iptables &>/dev/null; then
                 if ! iptables -C INPUT -p tcp --dport "$GB_NET_PORT" -j ACCEPT &>/dev/null; then
@@ -7315,7 +7850,7 @@ OEOF
                     _fw_opened=1  # rule already present
                 fi
             fi
-            [[ $_fw_opened -eq 0 ]] && gb_info "No active firewall detected — port ${GB_NET_PORT}/tcp assumed reachable"
+            [[ $_fw_opened -eq 0 ]] && gb_info "No active firewall detected , port ${GB_NET_PORT}/tcp assumed reachable"
 
             # N6: MPS daemon setup - start and validate nvidia-cuda-mps-server if requested
             local _mps_started_by_us=0
@@ -7444,6 +7979,19 @@ if psk is not None:
         nonce += chunk
     mac = hmac.new(psk, nonce, hashlib.sha256).digest()
     sock.sendall(mac)
+else:
+    # No local cluster.key. If the feeder immediately sends a 32-byte PSK
+    # nonce it requires auth and the plain handshake below would just get a
+    # connection reset , fail with the remediation instead.
+    sock.settimeout(0.6)
+    try:
+        pre = sock.recv(32, socket.MSG_PEEK)
+        if pre:
+            print('ERROR:psk_required - feeder requires cluster.key auth but this host has no /etc/greenboost/cluster.key. On the feeder: sudo greenboost feeders export-key ; then here: sudo greenboost feeders import-key <HEX64>', file=sys.stderr)
+            sys.exit(1)
+    except socket.timeout:
+        pass
+    sock.settimeout($timeout)
 
 # Wire protocol v3: header = magic(4) + msg_type(2) + flags(2) + payload_len(4) + seq_num(4) = 16 bytes
 HDR_FMT  = '<IHHII'
@@ -7538,7 +8086,7 @@ try:
 except Exception:
     pass
 
-# GB_MSG_FEEDER_STATUS (0x34) — v3.1 GPU telemetry (temp/power/util/ECC/throttle).
+# GB_MSG_FEEDER_STATUS (0x34) , v3.1 GPU telemetry (temp/power/util/ECC/throttle).
 # Replaces the SSH+nvidia-smi side-channel for feeder GPU health.
 # gb_feeder_status_resp v3.1: status(4) mps(4) t1f(8) t1t(8) t2f(8) t2t(8)
 #   t3f(8) t3t(8) kd_count(4) _pad(4) = 64 bytes (v3.0)
@@ -7586,9 +8134,12 @@ cmd_connect() {
 
     info "Connecting to ${ip}:${port}..."
 
-    local output
-    output=$(_gb_net_handshake "$ip" "$port")
-    local rc=$?
+    # 2>&1: _gb_net_handshake prints its ERROR: lines on stderr , without
+    # capturing them the die below reports "unknown error" for every failure.
+    # `|| rc=$?` keeps set -e from killing the script on handshake failure
+    # before the error is reported (the old code died here silently).
+    local output rc=0
+    output=$(_gb_net_handshake "$ip" "$port" 2>&1) || rc=$?
 
     if [[ $rc -ne 0 ]] || echo "$output" | grep -q "^ERROR:"; then
         local err
@@ -7653,11 +8204,78 @@ cmd_connect() {
     gb_info "SSH user: ${ssh_user}"
     _gb_write_cluster_extra_mem
 
+    # Tune the HOST side of the fabric link the moment a feeder joins the
+    # cluster - the feeder side is self-tuned by `greenboost feed start`.
+    _gb_apply_fabric_net_tuning
+
+    # ── Build-stamp parity check (2026-07-06) ────────────────────────────
+    # GreenBoost feeder-GPU compute requires the feeder to run the SAME
+    # GreenBoost build as the host (the netd binary is -march=native, and the
+    # remote kernel-dispatch path resolves host-dispatched kernel names).  On
+    # a stamp mismatch, offer to upgrade the feeder now , which pushes SOURCE
+    # and rebuilds on the feeder for its own CPU topology (see
+    # cmd_feeders_upgrade_greenboost, which builds on the feeder by default),
+    # not a host-built binary.
+    _gb_connect_check_parity "$ip" "$ssh_user"
+
     # The shim reads cluster.conf only once at init (gb_netc_init).
     # A running Ollama won't see the new feeder until it restarts.
     echo ""
-    gb_info "Feeder saved to $GB_CLUSTER_CONF — restart Ollama/inference services to activate:"
+    gb_info "Feeder saved to $GB_CLUSTER_CONF , restart Ollama/inference services to activate:"
     gb_info "  sudo systemctl restart ollama"
+}
+
+# _gb_connect_check_parity <ip> <ssh_user> , compare the host's GreenBoost
+# build stamp with the feeder's; warn (and offer upgrade) on mismatch so host
+# and feeder always run identical GreenBoost binaries.  Best-effort: never
+# fails the connect.
+_gb_connect_check_parity() {
+    local ip="$1" ssh_user="$2"
+    local _local_id=""
+    for _bi in "${MODULE_DIR}/build_info" /etc/greenboost/build_info; do
+        [[ -f "$_bi" ]] && { _local_id=$(grep '^BUILD_ID=' "$_bi" 2>/dev/null | cut -d= -f2); break; }
+    done
+    [[ -z "$_local_id" ]] && return 0
+
+    local _ssh_as=()
+    [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]] && _ssh_as=(runuser -u "$SUDO_USER" --)
+    local _remote_id
+    _remote_id=$("${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 \
+        -o StrictHostKeyChecking=no "${ssh_user}@${ip}" \
+        "grep '^BUILD_ID=' /etc/greenboost/build_info 2>/dev/null | cut -d= -f2" 2>/dev/null)
+
+    if [[ -z "$_remote_id" ]]; then
+        gb_warn "Feeder has no GreenBoost build stamp , feeder-GPU compute needs a matching build."
+        gb_info  "  Sync + rebuild on the feeder:  sudo greenboost update feeders"
+        return 0
+    fi
+    if [[ "$_remote_id" != "$_local_id" ]]; then
+        gb_warn "GreenBoost build mismatch , host ${_local_id} vs feeder ${_remote_id}."
+        gb_warn "  Feeder-GPU compute requires identical builds (netd is -march=native;"
+        gb_warn "  host CPU and feeder CPU may differ , Intel vs AMD , so binaries are NOT portable)."
+        gb_info  "  Align now:  sudo greenboost update feeders"
+    else
+        gb_ok "GreenBoost build parity OK (${_local_id})."
+    fi
+
+    # ollama version parity , the feeder's native libggml-cuda.so must expose
+    # the SAME CUDA kernels the host dispatches, which requires the SAME ollama
+    # build.  A skew (seen: host 0.30.8 vs feeder 0.21.1) is why remote kernel
+    # names don't resolve → LLM feeder-GPU compute can't run.
+    local _host_oll; _host_oll=$(_gb_host_ollama_version)
+    if [[ -n "$_host_oll" ]]; then
+        local _feeder_oll
+        _feeder_oll=$("${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 \
+            -o StrictHostKeyChecking=no "${ssh_user}@${ip}" \
+            "ollama --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1" 2>/dev/null)
+        if [[ "$_feeder_oll" != "$_host_oll" ]]; then
+            gb_warn "ollama version mismatch , host ${_host_oll} vs feeder ${_feeder_oll:-none}."
+            gb_warn "  LLM feeder-GPU compute needs matching ollama (kernel-name parity)."
+            gb_info  "  Align now:  sudo greenboost feeders sync-ollama"
+        else
+            gb_ok "ollama parity OK (${_host_oll}) , LLM feeder-GPU compute eligible."
+        fi
+    fi
 }
 
 # ── cmd_health_check - one-shot comprehensive cluster health audit (S1) ──────
@@ -7837,140 +8455,37 @@ cmd_disconnect() {
 # Completely unattended: uses SSH key auth (BatchMode); skips feeders that are
 # unreachable or missing key auth with a warning instead of aborting.
 _gb_update_all_feeders() {
+    # Thin wrapper: delegate to cmd_feeders_upgrade_greenboost, the maintained
+    # push path (pre-flight sudo -n check, atomic `install` swap, netd.pid
+    # readiness poll, stderr shown on failure). This function used to carry
+    # its own copy of the remote install script which ran WITHOUT sudo on the
+    # feeder , with a non-root SSH user it always failed rc=1 at the
+    # /usr/local/bin cp (hit on omen, 2026-07-06).
     [[ ! -f "$GB_CLUSTER_CONF" ]] && return 0
-    local _has_feeders=0
-    while IFS= read -r _line; do
-        [[ -z "$_line" || "$_line" == \#* ]] && continue
-        _has_feeders=1; break
-    done < "$GB_CLUSTER_CONF"
-    (( _has_feeders == 0 )) && return 0
-
-    local _netd_bin="$MODULE_DIR/greenboost-netd"
-    local _setup_sh="$MODULE_DIR/greenboost_setup.sh"
-    local _build_info="$MODULE_DIR/build_info"
-
-    if [[ ! -f "$_netd_bin" ]]; then
-        warn "Feeder update skipped - greenboost-netd binary not found (run: make netd)"
-        return 0
-    fi
-
-    # SSH/SCP must run as the invoking user, not root - root has no feeder keys
-    local _ssh_as=()
-    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
-        _ssh_as=(runuser -u "$SUDO_USER" --)
-    fi
-
-    info "Pushing update to connected feeders..."
-
-    while IFS= read -r _line; do
-        [[ -z "$_line" || "$_line" == \#* ]] && continue
-
-        # Parse: IP:PORT hostname [ssh_user]
-        local _addr _hostname _ssh_user
-        _addr=$(echo "$_line" | awk '{print $1}')
-        _hostname=$(echo "$_line" | awk '{print $2}')
-        _ssh_user=$(echo "$_line" | awk '{print $3}')
-        _ssh_user="${_ssh_user:-root}"
-
-        local _ip _port
-        _ip="${_addr%%:*}"
-        _port="${_addr##*:}"
-        [[ "$_port" == "$_ip" ]] && _port="$GB_NET_PORT"
-
-        # Audit F-L4-19: _port is expanded into the remote heredoc;
-        # validate it is a numeric port before use.
-        if [[ ! "$_port" =~ ^[0-9]{1,5}$ ]] || (( _port < 1 || _port > 65535 )); then
-            printf "  %-20s %b\n" "${_hostname:-$_ip}" "${C_RED}✗  invalid port '${_port}' - skipping${C_RESET}" >&2
-            continue
-        fi
-
-        printf "  %-20s %s@%s  " "${_hostname:-$_ip}" "$_ssh_user" "$_ip"
-
-        # PR-J/F-L4-02: pin host key via $GB_KNOWN_HOSTS through _gb_ssh_opts
-        # (the four call sites below were the highest-value security gap - root
-        # binary transfer + remote root install - and now no longer accept
-        # arbitrary new host keys mid-upgrade).
-        local _ssh_keyopts
-        _ssh_keyopts=$(_gb_ssh_opts "$_ip")
-
-        # Test SSH key auth before attempting transfer
-        if ! "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 $_ssh_keyopts \
-                "${_ssh_user}@${_ip}" true 2>/dev/null; then
-            printf '%b\n' "${C_AMBER}⚠  SSH key auth failed - run: ssh-copy-id ${_ssh_user}@${_ip}${C_RESET}"
-            continue
-        fi
-
-        # SCP files to feeder
-        local _tmp_files=("$_netd_bin" "$_setup_sh")
-        [[ -f "$_build_info" ]] && _tmp_files+=("$_build_info")
-
-        if ! "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=10 $_ssh_keyopts \
-                "${_ssh_user}@${_ip}" "mkdir -p /tmp/gb_update" 2>/dev/null; then
-            printf '%b\n' "${C_RED}✗  mkdir on feeder failed${C_RESET}"
-            continue
-        fi
-
-        if ! "${_ssh_as[@]}" scp -o BatchMode=yes -o ConnectTimeout=10 $_ssh_keyopts \
-                -q "${_tmp_files[@]}" "${_ssh_user}@${_ip}:/tmp/gb_update/" 2>/dev/null; then
-            printf '%b\n' "${C_RED}✗  SCP failed (unreachable or permission denied)${C_RESET}"
-            continue
-        fi
-
-        # Remote silent install
-        local _rc=0
-        "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=30 $_ssh_keyopts \
-            "${_ssh_user}@${_ip}" "bash -s" 2>/dev/null << REMOTE_INSTALL || _rc=$?
-set -e
-NETD=/tmp/gb_update/greenboost-netd
-SETUP=/tmp/gb_update/greenboost_setup.sh
-
-# Stop running feeder daemon
-systemctl stop greenboost-netd 2>/dev/null || true
-pkill -x greenboost-netd 2>/dev/null || true
-sleep 1
-
-# Install new binaries
-chmod +x "\$NETD" "\$SETUP"
-cp "\$NETD"  /usr/local/bin/greenboost-netd
-cp "\$SETUP" /usr/local/bin/greenboost
-chmod +x /usr/local/bin/greenboost-netd /usr/local/bin/greenboost
-
-# Propagate build_info
-mkdir -p /etc/greenboost
-[ -f /tmp/gb_update/build_info ] && cp /tmp/gb_update/build_info /etc/greenboost/build_info
-
-# Restart feeder daemon (unattended)
-mkdir -p /run/greenboost /var/log/greenboost
-nohup /usr/local/bin/greenboost-netd -d -p ${_port} \
-    >>/var/log/greenboost/netd.log 2>&1 &
-echo \$! > /run/greenboost/greenboost-netd.pid
-
-rm -rf /tmp/gb_update
-REMOTE_INSTALL
-
-        if (( _rc == 0 )); then
-            printf '%b\n' "${C_LIME}✓  updated + restarted${C_RESET}"
-        else
-            printf '%b\n' "${C_RED}✗  remote install script failed (rc=${_rc})${C_RESET}"
-        fi
-
-    done < "$GB_CLUSTER_CONF"
+    grep -q '^[^#[:space:]]' "$GB_CLUSTER_CONF" 2>/dev/null || return 0
+    cmd_feeders_upgrade_greenboost \
+        || gb_warn "Feeder update had failures (see above) - continuing install"
+    return 0
 }
 
 cmd_update_feeders() {
-    need_root "update-feeders"
+    need_root "update feeders"
     if [[ ! -f "$GB_CLUSTER_CONF" ]]; then
         die "No feeders configured - run: greenboost connect <IP>"
     fi
 
-    # Ensure the netd binary is up to date before pushing
-    local _netd_bin="$MODULE_DIR/greenboost-netd"
-    if [[ ! -f "$_netd_bin" ]]; then
-        info "Building greenboost-netd..."
-        make -C "$MODULE_DIR" netd 2>&1 | tail -5 || die "Build failed - run: make netd"
-    fi
+    # `greenboost update feeders` is THE canonical command to bring every
+    # feeder into parity with the host: (1) match ollama version so the
+    # feeder's native ggml has the host's kernels, then (2) rebuild + install
+    # GreenBoost (netd + interposer) ON each feeder from source (feeder CPU
+    # differs from host , Intel vs AMD , so binaries are never copied).
+    gb_section "Update feeders (match host)"
 
-    _gb_update_all_feeders
+    gb_info "Step 1/2 , matching ollama version…"
+    cmd_feeders_sync_ollama || gb_warn "ollama sync had failures (see above) , continuing to GreenBoost build"
+
+    gb_info "Step 2/2 , building GreenBoost on each feeder from source…"
+    _gb_feeders_upgrade_from_source
 
     info "Done. Verify with: greenboost cluster"
 }
@@ -8050,6 +8565,19 @@ cmd_feeders_diag() {
     [[ $_rc -eq 124 ]] && die "Diagnostic timed out after 120s - feeder may be unresponsive"
     [[ $_rc -ne 0  ]] && die "Diagnostic script failed (rc=${_rc}) - see output above"
     return 0
+}
+
+cmd_dataflux_ui() {
+    # Web UI over gb_cluster's dataflux event log (gb_dataflux.py) - shows
+    # how work has flowed through the cluster (host/feeder, which script,
+    # timing, errors) over a configurable window. Foreground server, same
+    # data an LLM can query via the greenboost-dataflux MCP server
+    # (gb_dataflux_mcp.py, registered in .mcp.json).
+    local _script="$MODULE_DIR/gb_dataflux.py"
+    if [[ ! -f "$_script" ]]; then
+        die "Dataflux script not found: $_script"
+    fi
+    exec python3 "$_script" serve "$@"
 }
 
 # cmd_feeders_genkey - generate a fresh random 32-byte cluster PSK and write
@@ -8225,11 +8753,190 @@ cmd_stability_monitor() {
 # cmd_feeders_upgrade_greenboost - full GreenBoost push to all feeders.
 # Pushes: greenboost-netd, greenboost_setup.sh, libgreenboost_cuda.so, build_info.
 # Restarts greenboost-netd on each feeder after install.
-# Usage: sudo greenboost feeders upgrade-greenboost
+# Usage: sudo greenboost update feeders
+# _gb_host_ollama_version , the host's ollama version string (x.y.z) or "".
+_gb_host_ollama_version() {
+    command -v ollama &>/dev/null || return 0
+    ollama --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
+}
+
+# cmd_feeders_sync_ollama , install the HOST's exact ollama version on every
+# feeder.  Feeder-GPU compute for LLM inference requires an identical ollama
+# build so the feeder's native libggml-cuda.so exposes the SAME CUDA kernels
+# the host dispatches (a version skew is why kernel names don't resolve).
+# Streams the installer output so the operator sees progress.
+# Usage: sudo greenboost feeders sync-ollama
+cmd_feeders_sync_ollama() {
+    need_root "feeders sync-ollama"
+    [[ -f "$GB_CLUSTER_CONF" ]] || die "No feeders configured - run: sudo greenboost connect <IP>"
+    local _hostver; _hostver=$(_gb_host_ollama_version)
+    [[ -z "$_hostver" ]] && die "Cannot determine host ollama version (is ollama installed?)"
+
+    gb_section "Sync ollama to feeders  (host version: ${_hostver})"
+    local _ssh_as=()
+    [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]] && _ssh_as=(runuser -u "$SUDO_USER" --)
+
+    local _ok=0 _fail=0
+    while IFS= read -r _line; do
+        [[ -z "$_line" || "$_line" == \#* ]] && continue
+        local _ip _user
+        _ip=$(echo "$_line" | awk '{print $1}'); _ip="${_ip%%:*}"
+        _user=$(echo "$_line" | awk '{print $3}'); _user="${_user:-root}"
+        printf "\n  ${C_VIOLET}%-22s${C_RESET} %s@%s\n" "$(echo "$_line" | awk '{print $2}')" "$_user" "$_ip"
+
+        local _fver
+        _fver=$("${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+            "${_user}@${_ip}" "ollama --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1" 2>/dev/null)
+        if [[ "$_fver" == "$_hostver" ]]; then
+            gb_ok "  Already on ${_hostver} , no change."
+            _ok=$((_ok+1)); continue
+        fi
+        gb_info "  Feeder has ${_fver:-none} → installing ${_hostver} (streaming installer output)…"
+        if ! "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+                "${_user}@${_ip}" "sudo -n bash -c true" 2>/dev/null; then
+            gb_warn "  No passwordless sudo , run: sudo greenboost feeders setup-sudo"
+            _fail=$((_fail+1)); continue
+        fi
+        # Official installer honours OLLAMA_VERSION to pin the exact release.
+        # NOTE: the feeder sudoers rule env_resets, so passing OLLAMA_VERSION
+        # THROUGH sudo is refused ("not allowed to set … OLLAMA_VERSION").
+        # Instead run everything inside one `sudo -n bash -c`, setting the var
+        # AFTER elevation (sudo never sees it).  Download the installer to a
+        # file first , piping curl|sh over ssh broke with "Failure writing".
+        # No -tt (it caused the connection-close + write failures).
+        local _rc=0
+        "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=30 -o StrictHostKeyChecking=no \
+            "${_user}@${_ip}" \
+            "sudo -n bash -c 'curl -fsSL https://ollama.com/install.sh -o /tmp/gb_ollama_install.sh && OLLAMA_VERSION=\"${_hostver}\" bash /tmp/gb_ollama_install.sh; rm -f /tmp/gb_ollama_install.sh'" \
+            2>&1 | sed 's/^/    /' || _rc=$?
+        local _newver
+        _newver=$("${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+            "${_user}@${_ip}" "ollama --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1" 2>/dev/null)
+        if [[ "$_newver" == "$_hostver" ]]; then
+            gb_ok "  Feeder now on ${_hostver}."
+            gb_info "  Point netd at the matched backend: it will use the feeder's own libggml-cuda.so"
+            _ok=$((_ok+1))
+        else
+            gb_warn "  Install did not reach ${_hostver} (feeder reports ${_newver:-none}, rc=${_rc})"
+            _fail=$((_fail+1))
+        fi
+    done < "$GB_CLUSTER_CONF"
+    echo ""
+    gb_info "ollama sync: ${_ok} ok, ${_fail} failed"
+    (( _fail == 0 ))
+}
+
+# _gb_feeders_upgrade_from_source , sync the GreenBoost source needed to build
+# greenboost-netd (+ its capture interposer) and `make` it ON each feeder, so
+# the -march=native binary matches the feeder's CPU.  Pushes the host build
+# stamp too so parity checks pass.  Best-effort per feeder; reports pass/fail.
+_gb_feeders_upgrade_from_source() {
+    # Minimal source set the netd targets need (see Makefile `netd`/`netd-capture`).
+    local _srcs=(greenboost_netd.c greenboost_netd_capture.c Makefile)
+
+    # Resolve where the .c sources actually live. When greenboost is invoked as an
+    # INSTALLED command, MODULE_DIR is the install dir and holds no sources , only
+    # the repo checkout does. Fall back to it so `update feeders` works from
+    # anywhere (honours GB_SRC_DIR, then the invoking user's ~/Dev checkout).
+    local _src_dir="$MODULE_DIR"
+    if [[ ! -f "$_src_dir/greenboost_netd.c" ]]; then
+        local _cand _sudo_home=""
+        [[ -n "${SUDO_USER:-}" ]] && _sudo_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+        for _cand in \
+            "${GB_SRC_DIR:-}" \
+            "${_sudo_home:+$_sudo_home/Dev/greenboost_all/greenboost}" \
+            "$HOME/Dev/greenboost_all/greenboost" \
+            /root/Dev/greenboost_all/greenboost; do
+            [[ -n "$_cand" && -f "$_cand/greenboost_netd.c" ]] && { _src_dir="$_cand"; break; }
+        done
+    fi
+
+    local _feat_dir="$_src_dir/features"
+    local _build_info="$_src_dir/build_info"
+    [[ ! -f "$_build_info" ]] && _build_info="/etc/greenboost/build_info"
+
+    for _s in "${_srcs[@]}"; do
+        [[ -f "$_src_dir/$_s" ]] || { warn "missing source $_s , not in \$MODULE_DIR nor a repo checkout (set GB_SRC_DIR=/path/to/greenboost_all/greenboost)"; return 1; }
+    done
+
+    local _ssh_as=()
+    [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]] && _ssh_as=(runuser -u "$SUDO_USER" --)
+
+    gb_section "GreenBoost Feeder Upgrade (build from source)"
+    local _ok=0 _fail=0
+    while IFS= read -r _line; do
+        [[ -z "$_line" || "$_line" == \#* ]] && continue
+        local _ip _user
+        _ip=$(echo "$_line" | awk '{print $1}'); _ip="${_ip%%:*}"
+        _user=$(echo "$_line" | awk '{print $3}'); _user="${_user:-root}"
+        printf "\n  ${C_VIOLET}%-22s${C_RESET} %s@%s\n" "$(echo "$_line" | awk '{print $2}')" "$_user" "$_ip"
+
+        if ! "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+                "${_user}@${_ip}" "sudo -n bash -c true" 2>/dev/null; then
+            printf "    %b\n" "${C_RED}✗  no passwordless sudo (run: sudo greenboost feeders setup-sudo)${C_RESET}"
+            _fail=$((_fail+1)); continue
+        fi
+
+        "${_ssh_as[@]}" ssh -o BatchMode=yes -o StrictHostKeyChecking=no "${_user}@${_ip}" \
+            "rm -rf /tmp/gb_src && mkdir -p /tmp/gb_src/features" 2>/dev/null
+        printf "    Pushing source... "
+        if ! "${_ssh_as[@]}" scp -o BatchMode=yes -o StrictHostKeyChecking=no -q \
+                "${_srcs[@]/#/$_src_dir/}" "${_user}@${_ip}:/tmp/gb_src/" 2>/dev/null \
+           || ! "${_ssh_as[@]}" scp -o BatchMode=yes -o StrictHostKeyChecking=no -q \
+                "$_feat_dir/net_fabric.h" "$_feat_dir/compat.h" "${_user}@${_ip}:/tmp/gb_src/features/" 2>/dev/null; then
+            printf '%b\n' "${C_RED}✗  SCP failed${C_RESET}"; _fail=$((_fail+1)); continue
+        fi
+        [[ -f "$_build_info" ]] && "${_ssh_as[@]}" scp -o BatchMode=yes -o StrictHostKeyChecking=no -q \
+            "$_build_info" "${_user}@${_ip}:/tmp/gb_src/build_info" 2>/dev/null
+        printf '%b\n' "${C_LIME}ok${C_RESET}"
+
+        printf "    Building netd on feeder (-march=native)... "
+        local _rc=0
+        "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=120 -o StrictHostKeyChecking=no \
+            "${_user}@${_ip}" "sudo -n bash -s -- $GB_NET_PORT" 2>/dev/null << 'REMOTE_BUILD' || _rc=$?
+set -e
+PORT="${1:-9740}"
+cd /tmp/gb_src
+make netd >/tmp/gb_src/build.log 2>&1 || { echo BUILD_FAILED; tail -5 /tmp/gb_src/build.log; exit 2; }
+pkill -9 -f greenboost-netd 2>/dev/null || true; sleep 2
+install -m 755 greenboost-netd /usr/local/bin/greenboost-netd
+[ -f libgreenboost_netd_capture.so ] && install -m 755 libgreenboost_netd_capture.so /usr/local/lib/libgreenboost_netd_capture.so
+mkdir -p /etc/greenboost /run/greenboost /var/log/greenboost
+[ -f build_info ] && cp build_info /etc/greenboost/build_info
+rm -f /run/greenboost/netd.pid
+setsid bash -c "nohup /usr/local/bin/greenboost-netd -d -p $PORT >>/var/log/greenboost/netd.log 2>&1 </dev/null &"
+for i in $(seq 1 25); do sleep 0.5; p=$(cat /run/greenboost/netd.pid 2>/dev/null); [ -n "$p" ] && kill -0 "$p" 2>/dev/null && { echo STARTED; exit 0; }; done
+echo FAILED_TO_START; exit 1
+REMOTE_BUILD
+        if (( _rc == 0 )); then
+            printf '%b\n' "${C_LIME}✓  built + restarted${C_RESET}"; _ok=$((_ok+1))
+        else
+            printf '%b\n' "${C_RED}✗  build/start failed (rc=$_rc)${C_RESET}"; _fail=$((_fail+1))
+        fi
+    done < "$GB_CLUSTER_CONF"
+
+    echo ""
+    gb_info "From-source upgrade: ${_ok} ok, ${_fail} failed"
+    (( _fail == 0 ))
+}
+
 cmd_feeders_upgrade_greenboost() {
     need_root "feeders upgrade-greenboost"
     if [[ ! -f "$GB_CLUSTER_CONF" ]] || ! grep -q '[^[:space:]]' "$GB_CLUSTER_CONF" 2>/dev/null; then
         die "No feeders configured - run: sudo greenboost connect <IP>"
+    fi
+
+    # Build from source ON the feeder by DEFAULT.  greenboost-netd + the shim
+    # compile -march=native, and the feeder CPU generally differs from the host
+    # (this cluster: Intel i9 host vs AMD Ryzen feeder) , so a host-built binary
+    # can use instructions the feeder lacks.  Building on the feeder is the only
+    # correct default.  `--binary` opts into the legacy copy path (safe ONLY
+    # when host and feeder CPUs are identical).
+    local _use_binary=0
+    for _a in "$@"; do [[ "$_a" == "--binary" ]] && _use_binary=1; done
+    if (( ! _use_binary )); then
+        _gb_feeders_upgrade_from_source
+        return $?
     fi
 
     local _netd_bin="$MODULE_DIR/greenboost-netd"
@@ -8419,6 +9126,32 @@ REMOTE_SCRIPT
 
 # cmd_built_stamp - print build stamp (local and/or feeders).
 # Usage: greenboost built-stamp [--feeders]
+cmd_capabilities() {
+    # Report what the installed/running GreenBoost shim supports, via the
+    # canonical read-only client gb_monitor.py (runtime manifest → install
+    # manifest → binary sniff). --llm/--json pass straight through.
+    local _mon=""
+    for _c in "${MODULE_DIR}/gb_monitor.py" \
+              "/usr/local/lib/greenboost/gb_monitor.py"; do
+        [[ -f "$_c" ]] && { _mon="$_c"; break; }
+    done
+    [[ -z "$_mon" ]] && die "gb_monitor.py not found — run: sudo greenboost install"
+    exec python3 "$_mon" --capabilities "$@"
+}
+
+cmd_pilot() {
+    # Pilot instrument panel over the dataflux flight recorder: per-stage
+    # wall-time trends, measured tok/s, pressure flags, evidence-backed
+    # advice. Read-only (v1 never moves a lever). Flags: --llm --json --days N.
+    local _pilot=""
+    for _c in "${MODULE_DIR}/gb_pilot.py" \
+              "/usr/local/lib/greenboost/gb_pilot.py"; do
+        [[ -f "$_c" ]] && { _pilot="$_c"; break; }
+    done
+    [[ -z "$_pilot" ]] && die "gb_pilot.py not found — run: sudo greenboost install"
+    exec python3 "$_pilot" "$@"
+}
+
 cmd_built_stamp() {
     local _show_feeders=0
     for _a in "$@"; do [[ "$_a" == "--feeders" ]] && _show_feeders=1; done
@@ -8504,7 +9237,7 @@ cmd_built_stamp() {
         printf "  ${C_DIM}%-14s${C_RESET} %b\n"  "Built"   "${C_GRAY}${_rdate:-${_repoch:-?}}${C_RESET}"
 
         [[ -n "$_id" && "$_rid" != "$_id" ]] && \
-            printf "  %b\n" "${C_AMBER}⚠  Stamp mismatch - run: sudo greenboost feeders upgrade-greenboost${C_RESET}"
+            printf "  %b\n" "${C_AMBER}⚠  Stamp mismatch - run: sudo greenboost update feeders${C_RESET}"
 
     done < "$GB_CLUSTER_CONF"
 
@@ -8513,21 +9246,28 @@ cmd_built_stamp() {
 
 
 # _gb_read_feeder_metrics - parse /run/greenboost/metrics.json into associative arrays.
-# Sets _fdr_bw[ip] and _fdr_health[ip] for each feeder entry in the JSON.
-# Safe to call with an unset _fdr_bw/_fdr_health - caller should declare -A first.
+# Sets _fdr_bw[ip], _fdr_health[ip], and (for the GPU-compute view) _fdr_gpu_util[ip],
+# _fdr_gpu_mem_util[ip], _fdr_gpu_temp[ip], _fdr_gpu_power[ip] for each feeder entry.
+# Safe to call with unset arrays - caller should declare -A them all first.
 _gb_read_feeder_metrics() {
     local _metrics_json="/run/greenboost/metrics.json"
     [[ -f "$_metrics_json" ]] && command -v python3 &>/dev/null || return 0
-    while IFS='|' read -r _fip _fbw _fhealth; do
+    while IFS='|' read -r _fip _fbw _fhealth _fgutil _fgmem _fgtemp _fgpower; do
         _fdr_bw["$_fip"]="$_fbw"
         _fdr_health["$_fip"]="$_fhealth"
+        _fdr_gpu_util["$_fip"]="$_fgutil"
+        _fdr_gpu_mem_util["$_fip"]="$_fgmem"
+        _fdr_gpu_temp["$_fip"]="$_fgtemp"
+        _fdr_gpu_power["$_fip"]="$_fgpower"
     done < <(python3 -c "
 import json
 try:
     d=json.load(open('$_metrics_json'))
     for f in d.get('feeders',[]):
         ip=f.get('feeder','?')
-        print(ip+'|'+str(f.get('bw_measured_mbs',0))+'|'+str(f.get('health_state',0)))
+        print(ip+'|'+str(f.get('bw_measured_mbs',0))+'|'+str(f.get('health_state',0))
+              +'|'+str(f.get('gpu_util_pct',0))+'|'+str(f.get('gpu_mem_util_pct',0))
+              +'|'+str(f.get('gpu_temp_c',0))+'|'+str(f.get('gpu_power_w',0)))
 except: pass
 " 2>/dev/null)
 }
@@ -8542,7 +9282,7 @@ _cmd_cluster_snapshot() {
     echo -e "  ${C_DIM}$(printf '─%.0s' $(seq 1 115))${C_RESET}"
 
     # Read per-feeder BW and health from shim metrics JSON (shared helper)
-    declare -A _fdr_bw _fdr_health
+    declare -A _fdr_bw _fdr_health _fdr_gpu_util _fdr_gpu_mem_util _fdr_gpu_temp _fdr_gpu_power
     _gb_read_feeder_metrics
 
     # Read shim stats for per-tier health badges (D2/D3) and virtual VRAM figure
@@ -8710,18 +9450,20 @@ _cmd_cluster_snapshot() {
     done
     echo ""
     echo -e "  ${C_DIM}Build stamps:${C_RESET}"
-    local _local_stamp_id _local_stamp_epoch _local_stamp_date
+    local _local_stamp_id _local_stamp_epoch _local_stamp_date _local_stamp_ver
     if [[ -n "$_local_bi" ]]; then
         _local_stamp_id=$(grep BUILD_ID "$_local_bi" 2>/dev/null | cut -d= -f2)
+        _local_stamp_ver=$(grep BUILD_VERSION "$_local_bi" 2>/dev/null | cut -d= -f2)
         _local_stamp_epoch=$(grep BUILD_EPOCH "$_local_bi" 2>/dev/null | cut -d= -f2)
         _local_stamp_date=$(date -d "@${_local_stamp_epoch}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "${_local_stamp_epoch}")
-        printf "  ${C_CYAN}%-12s${C_RESET}  ${C_LIME}%s${C_RESET}  ${C_DIM}%s${C_RESET}\n" \
-            "$(hostname -s)" "${_local_stamp_id:-?}" "${_local_stamp_date}"
+        printf "  ${C_CYAN}%-12s${C_RESET}  ${C_GRAY}v%-7s${C_RESET} ${C_LIME}%s${C_RESET}  ${C_DIM}%s${C_RESET}\n" \
+            "$(hostname -s)" "${_local_stamp_ver:-?}" "${_local_stamp_id:-?}" "${_local_stamp_date}"
     else
         printf "  ${C_CYAN}%-12s${C_RESET}  ${C_DIM}no build_info${C_RESET}\n" "$(hostname -s)"
     fi
 
     if [[ -f "$GB_CLUSTER_CONF" ]] && [[ -r "$GB_CLUSTER_CONF" ]]; then
+        local _any_stale=0
         while IFS= read -r _bline; do
             [[ "$_bline" =~ ^#.*$ || -z "$_bline" ]] && continue
             local _baddr _bnick _bssh
@@ -8736,8 +9478,9 @@ _cmd_cluster_snapshot() {
                 "${_bssh}@${_bip}" \
                 "cat /etc/greenboost/build_info 2>/dev/null" 2>/dev/null) || true
 
-            local _rid _repoch _rdate
+            local _rid _rver _repoch _rdate
             _rid=$(echo "$_rbi" | grep BUILD_ID | cut -d= -f2)
+            _rver=$(echo "$_rbi" | grep BUILD_VERSION | cut -d= -f2)
             _repoch=$(echo "$_rbi" | grep BUILD_EPOCH | cut -d= -f2)
             if [[ -n "$_repoch" ]]; then
                 _rdate=$(date -d "@${_repoch}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "${_repoch}")
@@ -8745,13 +9488,20 @@ _cmd_cluster_snapshot() {
                 _rdate="unreachable"
             fi
 
-            local _stamp_col="${C_LIME}"
-            [[ -n "$_local_stamp_id" && "$_rid" != "$_local_stamp_id" ]] && _stamp_col="${C_AMBER}"
+            local _stamp_col="${C_LIME}" _stale_tag=""
+            if [[ -n "$_local_stamp_id" && "$_rid" != "$_local_stamp_id" ]]; then
+                _stamp_col="${C_AMBER}"
+                _stale_tag="  ${C_AMBER}⚠ needs update${C_RESET}"
+                _any_stale=1
+            fi
 
-            printf "  ${C_PURPLE}%-12s${C_RESET}  ${_stamp_col}%s${C_RESET}  ${C_DIM}%s${C_RESET}\n" \
-                "${_bnick:-$_bip}" "${_rid:-?}" "${_rdate}"
+            printf "  ${C_PURPLE}%-12s${C_RESET}  ${C_GRAY}v%-7s${C_RESET} ${_stamp_col}%s${C_RESET}  ${C_DIM}%s${C_RESET}%b\n" \
+                "${_bnick:-$_bip}" "${_rver:-?}" "${_rid:-?}" "${_rdate}" "$_stale_tag"
 
         done < "$GB_CLUSTER_CONF"
+        if (( _any_stale )); then
+            printf "  %b\n" "${C_AMBER}⚠  Feeder(s) on older build , run: sudo greenboost update feeders${C_RESET}"
+        fi
     fi
     echo ""
 }
@@ -9732,6 +10482,284 @@ TQPROFEOF
     esac
 }
 
+# ── cmd_ggml_2dev - GREENBOOST_GGML_2DEV toggle (Ollama/ggml only) ───────────
+# Usage: greenboost ggml-2dev on|off|status|--llm
+#
+# Presents the connected cluster feeder as a real second CUDA device to
+# Ollama/llama.cpp so it natively splits an oversized model's layers across
+# local VRAM (device 0) and the feeder (device 1), with the feeder GPU
+# computing its assigned layers - instead of the whole overflow spilling to
+# local DDR (the default single-virtual-GPU path). OFF by default: this is a
+# newer code path than the proven feeder-as-memory-tier default and should
+# be validated (compute-sanitizer, a real generation, tok/s comparison)
+# before relying on it. Torch/HF pipelines are never affected by this flag -
+# they use GREENBOOST_CLUSTER=0 + gb_cluster's own block-offload path.
+cmd_ggml_2dev() {
+    local subcmd="${1:-status}"
+    local dropin="/etc/systemd/system/ollama.service.d/99-greenboost.conf"
+    local flag_file="/etc/greenboost/ggml_2dev.enabled"
+
+    case "$subcmd" in
+        on)
+            need_root "ggml-2dev on"
+            if [[ ! -f "$GB_CLUSTER_CONF" ]] || ! grep -q '[^[:space:]]' "$GB_CLUSTER_CONF" 2>/dev/null; then
+                gb_warn "No feeder connected ($GB_CLUSTER_CONF empty/missing) - connect one first:"
+                gb_info "  sudo greenboost connect <feeder-IP>"
+            fi
+            mkdir -p /etc/greenboost
+            touch "$flag_file"
+
+            if [[ -f "$dropin" ]]; then
+                if ! grep -q 'GREENBOOST_GGML_2DEV' "$dropin"; then
+                    sed -i '/GREENBOOST_ACTIVE=1/a Environment="GREENBOOST_GGML_2DEV=1"' "$dropin"
+                fi
+                systemctl daemon-reload
+                if systemctl is-active --quiet ollama; then
+                    systemctl restart ollama
+                    gb_ok "Ollama restarted - feeder presented as CUDA device 1"
+                else
+                    gb_ok "Ollama drop-in updated (service not running)"
+                fi
+            else
+                gb_warn "Ollama drop-in not found - only flag file written."
+                gb_info "Run: sudo greenboost install-sys-configs  to create the drop-in."
+            fi
+
+            echo ""
+            gb_ok "ggml-2dev ON"
+            gb_info "Ollama will enumerate 1 local + N feeder GPU(s) as separate CUDA devices."
+            gb_info "Verify:  journalctl -u ollama | grep -i 'inference compute'"
+            ;;
+
+        off)
+            need_root "ggml-2dev off"
+            rm -f "$flag_file"
+
+            if [[ -f "$dropin" ]]; then
+                sed -i '/GREENBOOST_GGML_2DEV/d' "$dropin"
+                systemctl daemon-reload
+                if systemctl is-active --quiet ollama; then
+                    systemctl restart ollama
+                    gb_ok "Ollama restarted - back to single-virtual-GPU (feeder as memory tier only)"
+                else
+                    gb_ok "Ollama drop-in reverted (service not running)"
+                fi
+            fi
+
+            echo ""
+            gb_ok "ggml-2dev OFF"
+            ;;
+
+        status|--llm)
+            local state="OFF" dropin_live="OFF"
+            [[ -f "$flag_file" ]] && state="ON"
+            [[ -f "$dropin" ]] && grep -q 'GREENBOOST_GGML_2DEV=1' "$dropin" 2>/dev/null && dropin_live="ON"
+
+            if [[ "$subcmd" == "--llm" ]]; then
+                echo "ggml_2dev_state=${state}"
+                echo "ggml_2dev_dropin_live=${dropin_live}"
+                return
+            fi
+            echo ""
+            printf "  ${C_BOLD}ggml-2dev (feeder as CUDA device 1):${C_RESET}  "
+            if [[ "$state" == "ON" ]]; then
+                printf "${C_LIME}${C_BOLD}ON${C_RESET}\n"
+            else
+                printf "${C_DIM}OFF${C_RESET}\n"
+            fi
+            printf "  ${C_GRAY}Ollama drop-in:${C_RESET}  "
+            [[ "$dropin_live" == "ON" ]] \
+                && printf "${C_LIME}GREENBOOST_GGML_2DEV=1${C_RESET}\n" \
+                || printf "${C_DIM}not set${C_RESET}\n"
+            echo ""
+            gb_info "Toggle: sudo greenboost ggml-2dev on|off"
+            ;;
+
+        *)
+            die "Usage: greenboost ggml-2dev on|off|status|--llm"
+            ;;
+    esac
+}
+
+
+# ── _gb_ollama_model_blob - resolve an Ollama model name to its GGUF blob path ─
+# Usage: _gb_ollama_model_blob <model[:tag]>
+# Outputs the absolute path to the model's GGUF blob file, or returns 1.
+_gb_ollama_model_blob() {
+    local model_name="$1"
+    local models_dir=""
+    for _d in /usr/share/ollama/.ollama/models "${HOME}/.ollama/models" /root/.ollama/models; do
+        [[ -d "${_d}/blobs" ]] && { models_dir="${_d}"; break; }
+    done
+    [[ -z "$models_dir" ]] && return 1
+
+    # Split name into namespace / model / tag
+    local ns name tag
+    if [[ "$model_name" == *"/"* ]]; then
+        ns="${model_name%%/*}"
+        name="${model_name#*/}"
+    else
+        ns="library"
+        name="$model_name"
+    fi
+    if [[ "$name" == *":"* ]]; then
+        tag="${name#*:}"; name="${name%:*}"
+    else
+        tag="latest"
+    fi
+
+    # Try registry.ollama.ai/<ns>/<name>/<tag> then library fallback
+    local manifest=""
+    for _mp in \
+        "${models_dir}/manifests/registry.ollama.ai/${ns}/${name}/${tag}" \
+        "${models_dir}/manifests/registry.ollama.ai/library/${name}/${tag}"; do
+        [[ -f "$_mp" ]] && { manifest="$_mp"; break; }
+    done
+    [[ -z "$manifest" ]] && return 1
+
+    # Extract the model-layer blob digest (mediaType contains "model")
+    local digest
+    digest=$(python3 - "$manifest" << 'PYEOF'
+import json, sys
+try:
+    m = json.load(open(sys.argv[1]))
+    for l in m.get("layers", []):
+        if "model" in l.get("mediaType", ""):
+            print(l["digest"].replace(":", "-")); sys.exit(0)
+    # fallback: largest layer
+    layers = sorted(m.get("layers",[]), key=lambda x: x.get("size",0), reverse=True)
+    if layers: print(layers[0]["digest"].replace(":", "-"))
+except Exception: pass
+PYEOF
+    ) || return 1
+    [[ -z "$digest" ]] && return 1
+
+    local blob="${models_dir}/blobs/${digest}"
+    [[ -f "$blob" ]] || return 1
+    echo "$blob"
+}
+
+
+# ── gb-synapse: HuggingFace-native, cluster-distributed GGUF serving ────────
+# All logic lives in gb_synapse.py / gb_synapse_api.py (repo root) - these are
+# thin CLI wrappers, per the project rule that bash only dispatches + renders.
+# See workflow/gb-synapse.md.
+_GB_SYNAPSE_PY="$MODULE_DIR/gb_synapse.py"
+
+_gb_synapse_run() {
+    [[ -f "$_GB_SYNAPSE_PY" ]] || die "gb-synapse script not found: $_GB_SYNAPSE_PY"
+    python3 "$_GB_SYNAPSE_PY" "$@"
+}
+
+# cmd_synapse_login - store a HuggingFace token. Masked /dev/tty read mirrors
+# the masked-password pattern in cmd_feeders_setup_sudo (line ~8246).
+# Usage: sudo greenboost synapse login [TOKEN]   (or: export HF_TOKEN=...)
+cmd_synapse_login() {
+    need_root "synapse login"
+    local _token="${1:-${HF_TOKEN:-}}"
+    if [[ -z "$_token" ]]; then
+        local _char
+        printf "  HuggingFace token: " > /dev/tty
+        while IFS= read -r -s -n1 _char < /dev/tty; do
+            case "$_char" in
+                '')            break ;;
+                $'\x7f'|$'\b') if [[ -n "$_token" ]]; then _token="${_token%?}"; printf '\b \b' > /dev/tty; fi ;;
+                *)             _token+="$_char"; printf '*' > /dev/tty ;;
+            esac
+        done
+        printf '\n' > /dev/tty
+    fi
+    [[ -z "$_token" ]] && die "No token provided"
+    _gb_synapse_run login "$_token"
+}
+
+cmd_synapse_pull() {
+    need_root "synapse pull"
+    [[ -z "${1:-}" ]] && die "Usage: sudo greenboost pull <repo>[:quant] [name]"
+    _gb_synapse_run pull "$@"
+}
+cmd_synapse_list()         { _gb_synapse_run list "$@"; }
+cmd_synapse_rm()           { need_root "synapse rm"; [[ -z "${1:-}" ]] && die "Usage: sudo greenboost synapse rm <name>"; _gb_synapse_run rm "$@"; }
+cmd_synapse_index_ollama() { need_root "synapse index-ollama"; _gb_synapse_run index-ollama "$@"; }
+cmd_synapse_build_engine() { need_root "synapse build-engine";  _gb_synapse_run build-engine; }
+cmd_synapse_update_engine(){ need_root "synapse update-engine"; _gb_synapse_run update-engine; }
+
+cmd_synapse_serve() {
+    [[ -z "${1:-}" ]] && die "Usage: greenboost synapse run <model> [port]"
+    _gb_synapse_run serve "$@"
+}
+cmd_synapse_stop() { [[ -z "${1:-}" ]] && die "Usage: greenboost synapse stop <model>"; _gb_synapse_run stop "$@"; }
+
+_cmd_synapse_ps_snapshot() {
+    echo ""
+    echo -e "  ${C_BOLD}gb-synapse - running servers${C_RESET}  ${C_DIM}$(date '+%H:%M:%S')${C_RESET}"
+    gb_separator
+    _gb_synapse_run ps
+    echo ""
+}
+cmd_synapse_ps() {
+    local _llm_mode=0
+    for _a in "$@"; do [[ "$_a" == "--llm" ]] && _llm_mode=1; done
+    (( _llm_mode )) && { _gb_synapse_run ps --llm; return; }
+    if [[ ! -t 0 ]]; then _cmd_synapse_ps_snapshot; return; fi
+    _gb_run_tui_loop "_cmd_synapse_ps_snapshot" 5 \
+        "  ${C_DIM}Updating every 5s  ${C_GRAY}Ctrl+S${C_DIM}: refresh  ${C_GRAY}Ctrl+C${C_DIM}: exit${C_RESET}"
+}
+
+cmd_synapse() {
+    case "${1:-}" in
+        login)         shift; cmd_synapse_login "$@" ;;
+        pull)          shift; cmd_synapse_pull "$@" ;;
+        list)          shift; cmd_synapse_list "$@" ;;
+        rm)            shift; cmd_synapse_rm "$@" ;;
+        index-ollama)  shift; cmd_synapse_index_ollama "$@" ;;
+        build-engine)  cmd_synapse_build_engine ;;
+        update-engine) cmd_synapse_update_engine ;;
+        run|serve)     shift; cmd_synapse_serve "$@" ;;
+        stop)          shift; cmd_synapse_stop "$@" ;;
+        ps)            shift; cmd_synapse_ps "$@" ;;
+        *) die "Usage: greenboost synapse [login|pull|list|rm|index-ollama|build-engine|update-engine|run|stop|ps]" ;;
+    esac
+}
+
+# _cmd_doctor_snapshot / cmd_doctor - cluster hardware + gb-synapse readiness
+# view. Follows the UI Command Paradigm (--llm, non-tty, _gb_run_tui_loop).
+_cmd_doctor_snapshot() {
+    echo ""
+    echo -e "  ${C_BOLD}greenboost doctor${C_RESET}  ${C_DIM}$(date '+%H:%M:%S')${C_RESET}"
+    gb_separator
+    _gb_synapse_run doctor
+    echo ""
+}
+cmd_doctor() {
+    local _llm_mode=0
+    for _a in "$@"; do [[ "$_a" == "--llm" ]] && _llm_mode=1; done
+    (( _llm_mode )) && { _gb_synapse_run doctor --llm; return; }
+    if [[ ! -t 0 ]]; then _cmd_doctor_snapshot; return; fi
+    _gb_run_tui_loop "_cmd_doctor_snapshot" 5 \
+        "  ${C_DIM}Updating every 5s  ${C_GRAY}Ctrl+S${C_DIM}: refresh  ${C_GRAY}Ctrl+C${C_DIM}: exit${C_RESET}"
+}
+
+# cmd_recommend - fit + throughput estimate per manifest model against the
+# live cluster's aggregate VRAM. One-shot (not a TUI loop - it's a report,
+# not a live status view).
+cmd_recommend() {
+    local _llm_mode=0
+    local -a _args=()
+    for _a in "$@"; do
+        if [[ "$_a" == "--llm" ]]; then _llm_mode=1; else _args+=("$_a"); fi
+    done
+    if (( _llm_mode )); then
+        _gb_synapse_run recommend "${_args[@]}" --llm
+        return
+    fi
+    echo ""
+    echo -e "  ${C_BOLD}greenboost recommend${C_RESET}"
+    gb_separator
+    _gb_synapse_run recommend "${_args[@]}"
+    echo ""
+}
+
 
 # ---- wizard (default interactive mode) --------------------------------
 # Shown when no arguments are given and stdin is a TTY.
@@ -9744,8 +10772,8 @@ cmd_wizard() {
         echo ""
 
         gb_section "Core"
-        gb_menu_item  1  "Full install"              "DKMS module + tune runtime + sysctl + GRUB + systemd services"  root
-        gb_menu_item  2  "Light install"             "DKMS module + hardware-tuned build - no system changes"  root
+        gb_menu_item  1  "Full install"              "DKMS module + tune runtime + sysctl + GRUB + systemd services + latest CUDA toolkit"  root
+        gb_menu_item  2  "Light install"             "DKMS module + hardware-tuned build - no system changes, no CUDA toolkit install"  root
         gb_menu_item  3  "Status"                    "Show cuda memory pool + system state"
         gb_menu_item  4  "Benchmark"                 "Measure T1/T2/T3 bandwidth"
 
@@ -9755,21 +10783,22 @@ cmd_wizard() {
         gb_menu_item  7  "Tune sysctl"               "Persistent kernel tunables - 99-zzz-greenboost.conf"  root
         gb_menu_item  8  "Tune GRUB"                 "Boot params: hugepages, rcu_nocbs, nohz_full (needs reboot)"  root
         gb_menu_item  9  "Generate inference config"  "Optimized Ollama/HF config for this hardware & environment"
+        gb_menu_item 10  "Build gb-synapse engine"   "From-source llama.cpp build (llama-server, rpc-server, llama-quantize)"  root
 
         gb_section "Restore"
-        gb_menu_item 10  "Restore sys configs"       "Remove Ollama drop-in, udev rules, LD_PRELOAD, governor service"  root
-        gb_menu_item 11  "Restore tune runtime"      "Reset CPU governor, NVMe scheduler, PCIe PM, VM defaults"  root
-        gb_menu_item 12  "Restore tune sysctl"       "Remove 99-zzz-greenboost.conf and reload kernel defaults"  root
-        gb_menu_item 13  "Restore tune GRUB"         "Strip GreenBoost boot params and run update-grub"  root
+        gb_menu_item 11  "Restore sys configs"       "Remove Ollama drop-in, udev rules, LD_PRELOAD, governor service"  root
+        gb_menu_item 12  "Restore tune runtime"      "Reset CPU governor, NVMe scheduler, PCIe PM, VM defaults"  root
+        gb_menu_item 13  "Restore tune sysctl"       "Remove 99-zzz-greenboost.conf and reload kernel defaults"  root
+        gb_menu_item 14  "Restore tune GRUB"         "Strip GreenBoost boot params and run update-grub"  root
 
         gb_section "Configuration"
-        gb_menu_item 14  "Profile management"        "Interactive wizard: create, activate, diff profiles"
+        gb_menu_item 15  "Profile management"        "Interactive wizard: create, activate, diff profiles"
 
         gb_section "Maintenance"
-        gb_menu_item 15  "GreenBoost Commands"       "All commands reference (also: greenboost help)"
-        gb_menu_item 16  "Clear logs"                "Clear dmesg and journal"
-        gb_menu_item 17  "Uninstall"                 "Remove GreenBoost (module + all config)"  root
-        gb_menu_item 18  "Install Python files"      "Copy gb_*.py orchestration stack to /usr/local/lib/greenboost/"  root
+        gb_menu_item 16  "GreenBoost Commands"       "All commands reference (also: greenboost help)"
+        gb_menu_item 17  "Clear logs"                "Clear dmesg and journal"
+        gb_menu_item 18  "Uninstall"                 "Remove GreenBoost (module + all config)"  root
+        gb_menu_item 19  "Install Python files"      "Copy gb_*.py orchestration stack to /usr/local/lib/greenboost/"  root
 
         gb_separator
         echo -e "  ${C_DIM}${C_GRAY}[Q]  Quit${C_RESET}"
@@ -9794,15 +10823,16 @@ cmd_wizard() {
             7)  cmd_tune_sysctl;                     gb_press_enter ;;
             8)  cmd_tune_grub;                       gb_press_enter ;;
             9)  cmd_gen_inference_config;            gb_press_enter ;;
-            10) cmd_restore_sys_configs;             gb_press_enter ;;
-            11) cmd_restore_tune_runtime;            gb_press_enter ;;
-            12) cmd_restore_tune_sysctl;             gb_press_enter ;;
-            13) cmd_restore_tune_grub;               gb_press_enter ;;
-            14) cmd_profile_wizard ;;
-            15) cmd_show_commands;                   gb_press_enter ;;
-            16) cmd_clear_logs;                      gb_press_enter ;;
-            17) cmd_uninstall;                       gb_press_enter ;;
-            18) cmd_install_python_files;            gb_press_enter ;;
+            10) cmd_synapse_build_engine;            gb_press_enter ;;
+            11) cmd_restore_sys_configs;             gb_press_enter ;;
+            12) cmd_restore_tune_runtime;            gb_press_enter ;;
+            13) cmd_restore_tune_sysctl;             gb_press_enter ;;
+            14) cmd_restore_tune_grub;               gb_press_enter ;;
+            15) cmd_profile_wizard ;;
+            16) cmd_show_commands;                   gb_press_enter ;;
+            17) cmd_clear_logs;                      gb_press_enter ;;
+            18) cmd_uninstall;                       gb_press_enter ;;
+            19) cmd_install_python_files;            gb_press_enter ;;
             q|Q|"") exit 0 ;;
             *) gb_warn_ui "Unknown option."; sleep 1 ;;
         esac
@@ -9998,6 +11028,7 @@ cmd_help() {
         printf "  ${C_LIME}%-20s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "uninstall"          "Remove module + all config"
         printf "  ${C_LIME}%-20s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "profile"            "Interactive profile wizard (create / activate / diff)"
         printf "  ${C_LIME}%-20s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "clear memory-pool"  "Force-release T1 VRAM + T2 RAM + T3 now (unloads inference models)"
+        printf "  ${C_LIME}%-20s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "clear cluster-workers" "Kill feeder stage/block workers + host tunnels, remove stage temp files"
         printf "  ${C_LIME}%-20s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "logs"               "Live log TUI (kernel, Ollama, AppArmor)"
         printf "  ${C_LIME}%-20s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "logs save [file]"   "Save full diagnostic bundle to file (prompts if omitted)"
         printf "  ${C_LIME}%-20s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "logs start [file]"  "Start background log capture (appends every 30s)"
@@ -10029,6 +11060,7 @@ cmd_help() {
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "vitals"             "Live TUI: tier usage, GPU telemetry, inference state, diagnostics  [--llm]"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "health-check"       "One-shot PASS/FAIL/WARN across module, VRAM, T2, T3, cluster  [--llm]"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "clear memory-pool"  "Force-release T1 VRAM + T2 RAM + T3 immediately (unloads models)"
+        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "clear cluster-workers" "Kill feeder stage/block workers + host tunnels, remove stage temp files"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "benchmark [flags]"  "Memory pool bandwidth benchmark  [--skip-bandwidth] [--llm]"
         echo -e ""
         echo -e "  ${C_CYAN}${C_BOLD}LOGGING:${C_RESET}"
@@ -10075,7 +11107,7 @@ cmd_help() {
 }
 
 # ---- install-deps ------------------------------------------------------
-# Install all Ubuntu packages needed for GreenBoost v3.0 + ExLlamaV3
+# Install all Ubuntu packages needed for GreenBoost v3.2 + ExLlamaV3
 
 cmd_install_build_deps() {
     need_root install-deps
@@ -10086,6 +11118,14 @@ cmd_install_build_deps() {
         build-essential gcc gcc-multilib make git curl wget
         "linux-headers-$(uname -r)"
         kmod dkms
+        # eBPF tracer build deps (clang/bpftool/libbpf , see
+        # _gb_install_ebpf_tracer / `make BPF=1 ebpf`). Previously absent from
+        # every install path, so the tracer silently skipped itself with a
+        # "clang/bpftool/libbpf required" notice on every fresh system and
+        # had to be built by hand afterward (verified 2026-07-09). Required,
+        # not optional, so a fresh install builds it in step [2/5] with no
+        # manual follow-up.
+        clang bpftool libbpf-dev
     )
     # CPU vendor-specific microcode (safe to install on any machine)
     local _cpu_vendor
@@ -10107,7 +11147,7 @@ cmd_install_build_deps() {
         gb_ok "Build dependencies already installed"
     else
         printf "  ${C_CYAN}❯${C_RESET}  ${C_DIM}Updating package lists...${C_RESET}"
-        apt-get update -qq 2>/dev/null
+        apt-get update -qq 2>/dev/null || true
         printf "\r%*s\r" "$(tput cols 2>/dev/null || echo 80)" ""
 
         # Install with live APT progress bar via APT::Status-Fd
@@ -10182,7 +11222,7 @@ cmd_install_optional_pkgs() {
     fi
 
     printf "  ${C_CYAN}❯${C_RESET}  ${C_DIM}Updating package lists...${C_RESET}"
-    apt-get update -qq 2>/dev/null
+    apt-get update -qq 2>/dev/null || true
     printf "\r%*s\r" "$(tput cols 2>/dev/null || echo 80)" ""
 
     # PR-J/F-L4-19: use mktemp -d so the FIFO path is atomically unique;
@@ -10295,7 +11335,7 @@ cmd_full_install() {
 
     # 0 - Purge any previous GreenBoost install to guarantee a clean slate
     gb_step 0 5 "Purging previous GreenBoost installation (if any)..."
-    if ! do_purge 0; then
+    if ! do_purge 0 1; then
         # Module is stuck in STATE_GOING.  Try to compile + install a fixed .ko
         # (without rmmod) so the next boot loads correctly and full-install can
         # proceed.  If compilation fails, fall back to boot cleanup (full wipe).
@@ -10359,6 +11399,13 @@ cmd_full_install() {
     cmd_install_optional_pkgs
     gb_ok "Optional AI/compute libraries installed"
 
+    # 4b - Latest CUDA toolkit (full install only - light install never
+    # touches system CUDA). Needed for gb-synapse's from-source llama.cpp
+    # build to target current GPU architectures (e.g. Blackwell sm_120,
+    # which requires CUDA >= 12.8 - a distro-packaged nvcc is often older).
+    gb_info "Checking CUDA toolkit (gb-synapse's engine build needs a current one)..."
+    _gb_install_cuda_toolkit
+
 
     # 5 - System tuning (sysctl + NVMe + CPU governor + THP)
     gb_step 5 5 "Applying system tuning..."
@@ -10383,6 +11430,21 @@ cmd_full_install() {
             && info "$svc restarted." \
             || warn "$svc restart failed - run: sudo systemctl restart $svc"
     done
+
+    # 6 - gb-synapse engine (llama-server, rpc-server, llama-quantize),
+    # from-source build against the CUDA toolkit installed in step 4b.
+    # Last step deliberately: needs CUDA + Python orchestration stack from
+    # earlier steps already in place. Best-effort under set -euo pipefail —
+    # a build failure (network hiccup fetching llama.cpp, disk space, a
+    # toolchain issue) shouldn't take down an otherwise-successful full
+    # install; the same step is also offered standalone (menu option 10 /
+    # `sudo greenboost synapse build-engine`) for retrying afterward.
+    gb_info "Building gb-synapse engine (llama.cpp: llama-server, rpc-server, llama-quantize)..."
+    if cmd_synapse_build_engine; then
+        gb_ok "gb-synapse engine built"
+    else
+        gb_warn_ui "gb-synapse engine build failed — retry later: sudo greenboost synapse build-engine"
+    fi
 
     echo ""
     gb_separator
@@ -10518,6 +11580,7 @@ case "$COMMAND" in
     connect)             cmd_connect "${@:2}"   ;;
     disconnect)          cmd_disconnect "${@:2}" ;;
     cluster)             cmd_cluster            ;;
+    dataflux-ui)         cmd_dataflux_ui "${@:2}" ;;
     update)
         case "${2:-}" in
             feeders) cmd_update_feeders ;;
@@ -10527,18 +11590,21 @@ case "$COMMAND" in
     update-feeders)      cmd_update_feeders     ;;
     feeders)
         case "${2:-}" in
-            upgrade-greenboost) cmd_feeders_upgrade_greenboost ;;
+            upgrade-greenboost) die "Use: sudo greenboost update feeders  (matches ollama + rebuilds GreenBoost on each feeder)" ;;
             setup-sudo)         cmd_feeders_setup_sudo ;;
             diag)               cmd_feeders_diag "${3:-all}" ;;
             export-key)         cmd_feeders_export_key ;;
             import-key)         cmd_feeders_import_key "${3:-}" ;;
             genkey)             cmd_feeders_genkey ;;
             redeploy-netd)      cmd_feeders_redeploy_netd ;;
-            *) die "Usage: greenboost feeders [upgrade-greenboost|setup-sudo|diag|export-key|import-key|genkey|redeploy-netd]" ;;
+            sync-ollama)        cmd_feeders_sync_ollama ;;
+            *) die "Usage: greenboost feeders [setup-sudo|diag|export-key|import-key|genkey|redeploy-netd|sync-ollama]  (to update feeders: sudo greenboost update feeders)" ;;
         esac
         ;;
     built-stamp)         cmd_built_stamp "${@:2}" ;;
-     
+    capabilities)        cmd_capabilities "${@:2}" ;;
+    pilot)               cmd_pilot "${@:2}" ;;
+
     t3-memory)           cmd_t3_memory "${2:-}" ;;
     clean)
         case "${2:-}" in
@@ -10563,15 +11629,21 @@ case "$COMMAND" in
 
             inference-logs)  cmd_clear_inference_logs ;;
             memory-pool)     cmd_clear_memory_pool ;;
+            cluster-workers) cmd_clear_cluster_workers ;;
             nvtx-logs)       cmd_clear_nvtx_logs ;;
-            *) die "Usage: greenboost clear logs|inference-logs|memory-pool|nvtx-logs" ;;
+            *) die "Usage: greenboost clear logs|inference-logs|memory-pool|cluster-workers|nvtx-logs" ;;
         esac
         ;;
     clean-logs)          cmd_clean_logs         ;;
     show-commands)       cmd_show_commands      ;;
     help|--help|-h)      cmd_help "${@:2}"      ;;
     turboquant)          cmd_turboquant "${@:2}" ;;
+    ggml-2dev)           cmd_ggml_2dev "${@:2}" ;;
     gen-inference-config) cmd_gen_inference_config "${@:2}" ;;
+    doctor)              cmd_doctor "${@:2}" ;;
+    recommend)           cmd_recommend "${@:2}" ;;
+    pull)                cmd_synapse_pull "${@:2}" ;;
+    synapse)             cmd_synapse "${@:2}" ;;
     health-check)        cmd_health_check "${@:2}"  ;;
     diag)               cmd_diag "${@:2}"    ;;
     stability)           cmd_stability_monitor "${@:2}" ;;

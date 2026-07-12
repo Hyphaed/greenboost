@@ -1,5 +1,5 @@
 """
-gb_llm.py — gb-quant for LLM inference (transformers / vLLM / ollama).
+gb_llm.py , gb-quant for LLM inference (transformers / vLLM / ollama).
 
 Same fit-first policy as gb_quant for diffusion: weights resident in T1 VRAM
 at the highest precision that fits (bf16 > int8 > int4), T2 DDR as the only
@@ -7,28 +7,28 @@ overflow, T3 NVMe never for speed-critical weights.
 
 Three runtimes, three levers:
 
-1. transformers (this module) — full gb-quant treatment. Any HF causal LM is
+1. transformers (this module) , full gb-quant treatment. Any HF causal LM is
    loaded on CPU and quantized-to-fit onto the GPU through gb_quant:
 
        import gb_llm
        model, tok = gb_llm.load_causal_lm("google/gemma-3-12b-it-qat-q4_0-unquantized")
        print(gb_llm.generate(model, tok, "Hola, com estàs?"))
 
-2. vLLM — the gb-quant backend ships a native vLLM plugin (registered under
-   the historical name "gemlite": `vllm.general_plugins` entry point
-   gemlite.vllm.backend:register). Entry points need a real install, so in
-   the vLLM venv run once:
+2. vLLM , gb_synapse._serve_vllm() drives this with vLLM's OWN native
+   quantization flags, not the gemlite/hqq vLLM plugins — both were tested
+   live against vLLM 0.24.0 and are currently broken (they subclass/import
+   internal quantization classes vLLM has since renamed or removed, and
+   loading either plugin breaks even `vllm --version`). Native flags,
+   confirmed working end-to-end on an RTX 5070 (Blackwell, cc 12.0):
 
-       pip install -e ~/Dev/turboquantsolutions/gemlite  # dev checkout with
-       # setup.py; same code greenboost carries in third_party/
+       vllm serve <model> --quantization fp8                              # fp8
+       vllm serve <model> --quantization bitsandbytes --load-format bitsandbytes  # int4 (bnb default)
 
-   then serve with on-the-fly gb-quant weights:
-
-       vllm serve <model> --quantization gemlite
-
+   Blackwell also needs `CUDA_HOME=/usr/local/cuda` set for vLLM's FlashInfer
+   dependency to JIT-compile SM 12.x kernels — see gb_synapse._cuda_home_for_vllm().
    (KV-cache side: gb_attn / turboquant cover compression there.)
 
-3. ollama — GGUF/llama.cpp runtime: no Python in-process hook is possible.
+3. ollama , GGUF/llama.cpp runtime: no Python in-process hook is possible.
    The equivalent levers are (a) the GreenBoost shim, which already
    intercepts ollama's CUDA allocations for T1+T2 placement, and (b) picking
    the GGUF quant level at pull time so the model fits T1 (the manual
@@ -61,12 +61,16 @@ def _auto_budget_gb() -> float:
 def load_causal_lm(model_id: str, budget_gb: "float | None" = None,
                    device: str = "cuda", dtype=torch.bfloat16,
                    cache_dir: "str | None" = None, trust_remote_code: bool = False,
-                   verbose: bool = True, **hf_kwargs):
+                   prefer_bits: "int | str" = 4, verbose: bool = True, **hf_kwargs):
     """Load an HF causal LM quantized-to-fit through the gb-quant layer.
 
     Loads on CPU first (never OOMs the GPU on load), plans per-component
     precision against `budget_gb` (default: 92% of currently free VRAM), then
     realises the plan layer-by-layer onto `device`. Returns (model, tokenizer).
+
+    `prefer_bits` is the floor precision plan_fit won't drop below (16,
+    "fp8", "nvfp4", 8, 4, "tq3", "tq2" , see gb_quant._PRECISION_LADDER);
+    default 4 matches gb_quant's own default.
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -98,7 +102,7 @@ def load_causal_lm(model_id: str, budget_gb: "float | None" = None,
             _nvtx_ctx = None
 
     gb_quant.quantize_to_fit(model, budget_gb=budget_gb, device=device,
-                             dtype=dtype, verbose=verbose)
+                             dtype=dtype, prefer_bits=prefer_bits, verbose=verbose)
     # Move what the plan kept in bf16 (embeddings, norms, lm_head) to the GPU
     # on the transfer stream for non-blocking overlap.
     if _gs is not None:
@@ -119,7 +123,7 @@ def load_causal_lm(model_id: str, budget_gb: "float | None" = None,
         m = _gb_init.snapshot()
         if m is not None:
             print(
-                f"[gb_llm] loaded — VRAM {m.fb_used_mb}/{m.fb_total_mb} MB "
+                f"[gb_llm] loaded , VRAM {m.fb_used_mb}/{m.fb_total_mb} MB "
                 f"({m.fb_used_pct:.0f}%)  pwr={m.power_w:.0f}W  "
                 f"temp={m.temp_c:.0f}°C",
                 flush=True,

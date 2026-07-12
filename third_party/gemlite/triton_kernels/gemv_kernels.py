@@ -13,7 +13,7 @@ from .utils import *
 KEYS          = ['M', 'N', 'K', 'group_size', 'elements_per_sample', 'type_id', 'channel_scale_mode']
 MATMUL_TYPE   = "GEMV"
 
-#Init MXFP workspace for dequant — lazy, allocated on first use (import-time
+#Init MXFP workspace for dequant , lazy, allocated on first use (import-time
 #cudaMalloc crashes under the GreenBoost LD_PRELOAD shim; see utils.LazyDeviceTensors)
 fp4_mapping = LazyDeviceTensors(
     [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12],

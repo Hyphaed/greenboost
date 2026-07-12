@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
- * GreenBoost v3.0 - Network Feeder Daemon (greenboost-netd)
+ * GreenBoost v3.2 - Network Feeder Daemon (greenboost-netd)
  *
  * Exposes local GPU(s) + system RAM to remote GreenBoost hosts over TCP.
  * Phase 1: handshake, heartbeat, GPU info query, memory info.
@@ -49,6 +49,19 @@
 #endif
 
 #include "features/net_fabric.h"
+
+#ifdef GB_HAVE_ZSTD
+#include <zstd.h>
+/* When built with libzstd the feeder advertises GB_NET_FEAT_ZSTD and
+ * transparently decompresses any H2D payload the host marks with
+ * GB_NET_FLAG_COMP_ZSTD. GB_NET_COMPRESS=0 on the feeder disables the
+ * advertisement (kill switch), so the host then sends raw. */
+static int gb_netd_zstd_advertise(void)
+{
+    const char *e = getenv("GB_NET_COMPRESS");
+    return (e && e[0] == '0') ? 0 : 1;
+}
+#endif
 
 /* ── PSK authentication helpers (F-L3-01) ───────────────────────────
  * Shared secret in /etc/greenboost/cluster.key (hex-encoded 32 bytes).
@@ -414,6 +427,8 @@ typedef cudaError_t (*pfn_cudaFree)(void *);
 typedef cudaError_t (*pfn_cudaHostAlloc)(void **, size_t, unsigned int);
 typedef cudaError_t (*pfn_cudaFreeHost)(void *);
 typedef cudaError_t (*pfn_cudaMemcpy)(void *, const void *, size_t, int);
+typedef cudaError_t (*pfn_cudaMemset)(void *, int, size_t);
+typedef cudaError_t (*pfn_cudaGetLastError)(void);
 typedef cudaError_t (*pfn_cudaDeviceSynchronize)(void);
 typedef cudaError_t (*pfn_cudaStreamCreate)(cudaStream_t *);
 typedef cudaError_t (*pfn_cudaStreamSynchronize)(cudaStream_t);
@@ -493,6 +508,8 @@ static pfn_cudaStreamDestroy       f_cudaStreamDestroy;
 static pfn_cudaHostAlloc           f_cudaHostAlloc;
 static pfn_cudaFreeHost            f_cudaFreeHost;
 static pfn_cudaMemcpy              f_cudaMemcpy;
+static pfn_cudaMemset              f_cudaMemset;
+static pfn_cudaGetLastError        f_cudaGetLastError;
 static pfn_cudaDeviceSynchronize   f_cudaDeviceSynchronize;
 
 
@@ -553,6 +570,10 @@ struct client {
      * Kernels are enqueued here without blocking the TCP handler; host drains
      * this stream implicitly via GB_MSG_CUDA_SYNC (cudaDeviceSynchronize). */
     cudaStream_t async_stream;
+    /* Fabric zstd negotiated with this client (GB_NET_FEAT_ZSTD echoed at
+     * handshake). H2D decompress is per-message, but this records the peer's
+     * capability for any compressed response direction. */
+    int      feat_zstd;
 #ifdef GREENBOOST_USE_NCCL
     ncclComm_t nccl_comm;
 #endif
@@ -585,6 +606,11 @@ static pthread_mutex_t     g_ancestry_lock = PTHREAD_MUTEX_INITIALIZER;
 /* ------------------------------------------------------------------ */
 /*  Logging                                                            */
 /* ------------------------------------------------------------------ */
+
+/* Forward decls , defined alongside the allowlist further down. */
+static void *gb_kernel_resolve(const char *kname);
+static void *gb_fatbin_resolve(const char *name);
+static int   gb_kernel_name_allowed(const char *kname);
 
 static uint64_t mono_ms(void)
 {
@@ -650,6 +676,8 @@ static int probe_gpus(void)
     f_cudaHostAlloc           = (pfn_cudaHostAlloc)dlsym(libcudart, "cudaHostAlloc");
     f_cudaFreeHost            = (pfn_cudaFreeHost)dlsym(libcudart, "cudaFreeHost");
     f_cudaMemcpy              = (pfn_cudaMemcpy)dlsym(libcudart, "cudaMemcpy");
+    f_cudaMemset              = (pfn_cudaMemset)dlsym(libcudart, "cudaMemset");
+    f_cudaGetLastError        = (pfn_cudaGetLastError)dlsym(libcudart, "cudaGetLastError");
     f_cudaDeviceSynchronize   = (pfn_cudaDeviceSynchronize)dlsym(libcudart, "cudaDeviceSynchronize");
     f_cudaStreamCreate        = (pfn_cudaStreamCreate)dlsym(libcudart, "cudaStreamCreate");
     f_cudaStreamSynchronize   = (pfn_cudaStreamSynchronize)dlsym(libcudart, "cudaStreamSynchronize");
@@ -928,7 +956,10 @@ static int send_msg(struct client *cli, uint16_t msg_type, uint16_t flags,
 
 static int handle_handshake(struct client *cli, const void *payload, uint32_t len)
 {
-    if (len < sizeof(struct gb_net_handshake_req)) {
+    /* feature_flags is a trailing field: accept a req that stops just before
+     * it (base size) so a host built without the feature still handshakes. */
+    size_t hs_base = offsetof(struct gb_net_handshake_req, feature_flags);
+    if (len < hs_base) {
         netd_log("WARN: handshake too short from %s (%u bytes)", cli->remote_addr, len);
         return -1;
     }
@@ -938,6 +969,8 @@ static int handle_handshake(struct client *cli, const void *payload, uint32_t le
     /* PR-UU: BE-safe field reads. */
     gb_u32 req_proto_version = GB_LE_U32(req->proto_version);
     gb_u32 req_gpu_count     = GB_LE_U32(req->gpu_count);
+    gb_u32 req_feature_flags =
+        (len >= sizeof(struct gb_net_handshake_req)) ? GB_LE_U32(req->feature_flags) : 0u;
 
     netd_log("Handshake from %s (host: %.*s, proto v%u, %u GPUs)",
              cli->remote_addr,
@@ -969,6 +1002,21 @@ static int handle_handshake(struct client *cli, const void *payload, uint32_t le
     resp.gpu_count     = (gb_u32)g_gpu_count;
     strncpy(resp.hostname, g_hostname, GB_NET_MAX_HOSTNAME - 1);
     memcpy(resp.gpus, g_gpus, sizeof(struct gb_net_gpu_info) * g_gpu_count);
+
+    /* Fabric zstd negotiation: advertise only if the host asked for it and this
+     * daemon was built with libzstd and not disabled. cli->feat_zstd gates
+     * whether responses to this client may be compressed (H2D decompress is
+     * driven per-message by GB_NET_FLAG_COMP_ZSTD regardless). */
+    cli->feat_zstd = 0;
+#ifdef GB_HAVE_ZSTD
+    if ((req_feature_flags & GB_NET_FEAT_ZSTD) && gb_netd_zstd_advertise()) {
+        resp.feature_flags |= GB_NET_FEAT_ZSTD;
+        cli->feat_zstd = 1;
+        netd_log("fabric zstd compression negotiated with %s", cli->remote_addr);
+    }
+#else
+    (void)req_feature_flags;
+#endif
 
     /* D1: PCIe link info - read from sysfs for GPU 0 */
     {
@@ -1854,7 +1902,8 @@ static int handle_cuda_free(struct client *cli, const void *payload, uint32_t le
                     &resp, sizeof(resp));
 }
 
-static int handle_cuda_memcpy_h2d(struct client *cli, const void *payload, uint32_t len)
+static int handle_cuda_memcpy_h2d(struct client *cli, const void *payload,
+                                  uint32_t len, uint16_t flags)
 {
     if (len < sizeof(struct gb_net_cuda_memcpy))
         return -1;
@@ -1872,6 +1921,48 @@ static int handle_cuda_memcpy_h2d(struct client *cli, const void *payload, uint3
         .orig_msg_type = GB_MSG_CUDA_MEMCPY_H2D,
         .status        = GB_STATUS_OK,
     };
+
+    /* Fabric zstd: payload is compressed. Decompress into a reusable scratch
+     * (netd is single-threaded per connection loop) sized to the wire-declared
+     * uncompressed req_size, then treat it as the real data. On any failure
+     * reject with ERR_INVALID rather than write garbage. */
+    if (flags & GB_NET_FLAG_COMP_ZSTD) {
+#ifdef GB_HAVE_ZSTD
+        static uint8_t *zscratch = NULL;
+        static size_t   zscratch_cap = 0;
+        if (req_size == 0 || req_size > (uint64_t)GB_NET_MAX_MSG_SIZE) {
+            resp.status = GB_STATUS_ERR_INVALID;
+            return send_msg(cli, GB_MSG_RESPONSE, GB_NET_FLAG_RESPONSE,
+                            &resp, sizeof(resp));
+        }
+        if (zscratch_cap < req_size) {
+            uint8_t *nb = (uint8_t *)realloc(zscratch, (size_t)req_size);
+            if (!nb) {
+                resp.status = GB_STATUS_ERR_OOM;
+                return send_msg(cli, GB_MSG_RESPONSE, GB_NET_FLAG_RESPONSE,
+                                &resp, sizeof(resp));
+            }
+            zscratch = nb; zscratch_cap = (size_t)req_size;
+        }
+        size_t dsize = ZSTD_decompress(zscratch, (size_t)req_size, data, data_len);
+        if (ZSTD_isError(dsize) || dsize != (size_t)req_size) {
+            netd_log("ERROR H2D: zstd decompress failed (%s) clen=%u ulen=%llu",
+                     ZSTD_isError(dsize) ? ZSTD_getErrorName(dsize) : "size mismatch",
+                     data_len, (unsigned long long)req_size);
+            resp.status = GB_STATUS_ERR_INVALID;
+            return send_msg(cli, GB_MSG_RESPONSE, GB_NET_FLAG_RESPONSE,
+                            &resp, sizeof(resp));
+        }
+        data = zscratch;
+        data_len = (uint32_t)dsize;
+#else
+        /* Host asked for compression a non-zstd build can't undo. */
+        netd_log("ERROR H2D: COMP_ZSTD flag but daemon built without libzstd");
+        resp.status = GB_STATUS_ERR_INVALID;
+        return send_msg(cli, GB_MSG_RESPONSE, GB_NET_FLAG_RESPONSE,
+                        &resp, sizeof(resp));
+#endif
+    }
 
     /* PR-II: hold g_alloc_lock across the entire memcpy + accounting access.
      *
@@ -1926,6 +2017,64 @@ static int handle_cuda_memcpy_h2d(struct client *cli, const void *payload, uint3
                  (unsigned long long)req_offset);
         NETD_EVT("MEMCPY_H2D", ra_tier == 0 ? "T1_GPU" : "T2_DDR",
                  copy_size >> 20, req_remote_handle, "h2d_done");
+    }
+
+    return send_msg(cli, GB_MSG_RESPONSE, GB_NET_FLAG_RESPONSE,
+                    &resp, sizeof(resp));
+}
+
+/* GB_MSG_CUDA_MEMSET - remote memset on a feeder allocation.  Mirrors the
+ * H2D handler's locking/bounds pattern.  ggml memsets quantized-tensor
+ * padding right after upload; without this, feeder-resident buffers abort
+ * the client with cudaErrorInvalidValue on first model load. */
+static int handle_cuda_memset(struct client *cli, const void *payload, uint32_t len)
+{
+    if (len < sizeof(struct gb_net_cuda_memset))
+        return -1;
+
+    const struct gb_net_cuda_memset *req = (const struct gb_net_cuda_memset *)payload;
+    gb_u64 req_remote_handle = GB_LE_U64(req->remote_handle);
+    gb_u64 req_offset        = GB_LE_U64(req->offset);
+    gb_u64 req_size          = GB_LE_U64(req->size);
+    gb_u32 req_value         = GB_LE_U32(req->value);
+
+    struct gb_net_response resp = {
+        .orig_msg_type = GB_MSG_CUDA_MEMSET,
+        .status        = GB_STATUS_OK,
+    };
+
+    pthread_mutex_lock(&g_alloc_lock);
+    struct remote_alloc *ra = ra_find(req_remote_handle);
+    if (!ra) {
+        pthread_mutex_unlock(&g_alloc_lock);
+        resp.status = GB_STATUS_ERR_INVALID;
+    } else if (req_offset > (uint64_t)ra->size ||
+               req_size > (uint64_t)ra->size - req_offset) {
+        netd_log("WARN MEMSET: out-of-bounds offset=%llu size=%llu vs alloc=%zu",
+                 (unsigned long long)req_offset,
+                 (unsigned long long)req_size, ra->size);
+        pthread_mutex_unlock(&g_alloc_lock);
+        resp.status = GB_STATUS_ERR_INVALID;
+    } else {
+        uint8_t  ra_tier      = ra->tier;
+        int      ra_device_id = ra->device_id;
+        void    *ra_dev_ptr   = ra->dev_ptr;
+        void    *ra_host_ptr  = ra->host_ptr;
+        if (ra_tier == 0) {
+            if (f_cudaSetDevice) f_cudaSetDevice(ra_device_id);
+            void *dst = (void *)((uintptr_t)ra_dev_ptr + (size_t)req_offset);
+            cudaError_t err = f_cudaMemset
+                ? f_cudaMemset(dst, (int)req_value, (size_t)req_size) : 1;
+            if (err != 0) resp.status = GB_STATUS_ERR_CUDA;
+        } else {
+            memset((char *)ra_host_ptr + (size_t)req_offset,
+                   (int)req_value, (size_t)req_size);
+        }
+        pthread_mutex_unlock(&g_alloc_lock);
+        netd_log("memset tier%d: %llu KB val=%u → handle 0x%llx+%llu",
+                 ra_tier, (unsigned long long)(req_size >> 10), req_value,
+                 (unsigned long long)req_remote_handle,
+                 (unsigned long long)req_offset);
     }
 
     return send_msg(cli, GB_MSG_RESPONSE, GB_NET_FLAG_RESPONSE,
@@ -2302,13 +2451,146 @@ static int handle_cuda_launch(struct client *cli, const void *payload, uint32_t 
 
 static int gb_kernel_name_allowed(const char *kname);
 
+/* RAW exec path (GB_NET_FLAG_EXEC_RAW): full packed param buffer + byte-offset
+ * relocations.  Handles struct-by-value args (ggml fused mul_mat_vec_q, torch
+ * descriptor structs) whose size >8B and whose embedded pointers must be
+ * rewritten , the 8-byte-per-arg path truncates them → err=700. */
+static int handle_cuda_exec_raw(struct client *cli, const void *payload, uint32_t len)
+{
+    struct gb_net_response err_resp = {
+        .orig_msg_type = GB_MSG_CUDA_EXEC, .status = GB_STATUS_ERR_INVALID };
+    #define RAW_ERR() do { netd_log("exec_raw rejected at %s:%d", __FILE__, __LINE__); \
+        return send_msg(cli, GB_MSG_RESPONSE, GB_NET_FLAG_RESPONSE, &err_resp, sizeof(err_resp)); } while (0)
+    if (len < sizeof(struct gb_net_cuda_exec_raw)) RAW_ERR();
+
+    const struct gb_net_cuda_exec_raw *req = (const struct gb_net_cuda_exec_raw *)payload;
+    uint32_t name_len   = GB_LE_U32(req->kernel_name_len);
+    uint32_t n_params   = GB_LE_U32(req->n_params);
+    uint32_t n_relocs   = GB_LE_U32(req->n_relocs);
+    uint32_t buf_bytes  = GB_LE_U32(req->param_buf_bytes);
+    if (n_params > 64 || n_relocs > 128) RAW_ERR();
+
+    size_t need = sizeof(*req) + name_len + n_params * sizeof(uint32_t)
+                + (size_t)n_relocs * sizeof(struct gb_net_ptr_reloc) + buf_bytes;
+    if (len < need) RAW_ERR();
+
+    const uint8_t *p = (const uint8_t *)payload + sizeof(*req);
+    char kernel_name[GB_NET_MAX_KERNEL_NAME];
+    if (name_len == 0 || name_len >= GB_NET_MAX_KERNEL_NAME) RAW_ERR();
+    memcpy(kernel_name, p, name_len); kernel_name[name_len] = '\0'; p += name_len;
+
+    const uint32_t *param_size = (const uint32_t *)p;  p += n_params * sizeof(uint32_t);
+    const struct gb_net_ptr_reloc *relocs = (const struct gb_net_ptr_reloc *)p;
+    p += (size_t)n_relocs * sizeof(struct gb_net_ptr_reloc);
+    const uint8_t *param_buf_wire = p;
+
+    /* Resolve kernel (same order as handle_cuda_exec). */
+    pthread_mutex_lock(&g_kernel_map_lock);
+    void *host_func = km_lookup(cli->feeder_id, kernel_name);
+    pthread_mutex_unlock(&g_kernel_map_lock);
+    int is_captured_stub = 0;
+    if (!host_func) {
+        if (!gb_kernel_name_allowed(kernel_name)) {
+            netd_log("WARN exec_raw: '%s' not on allowlist - rejected", kernel_name);
+            RAW_ERR();
+        }
+        host_func = gb_kernel_resolve(kernel_name);
+        if (!host_func) {
+            static const void *(*cap_lookup)(const char *) = NULL;
+            static int cap_probed = 0;
+            if (!cap_probed) { cap_probed = 1;
+                cap_lookup = (const void *(*)(const char *))dlsym(RTLD_DEFAULT, "gb_capture_lookup"); }
+            if (cap_lookup) { host_func = (void *)cap_lookup(kernel_name);
+                              if (host_func) is_captured_stub = 1; }
+        }
+        if (!host_func) host_func = gb_fatbin_resolve(kernel_name);  /* CUfunction */
+    }
+    if (!host_func) { netd_log("WARN exec_raw: '%s' not found", kernel_name); RAW_ERR(); }
+
+    /* Mutable copy of the param buffer; apply byte-offset relocations. */
+    if (buf_bytes > 65536) RAW_ERR();
+    uint8_t *pbuf = (uint8_t *)malloc(buf_bytes ? buf_bytes : 1);
+    if (!pbuf) RAW_ERR();
+    memcpy(pbuf, param_buf_wire, buf_bytes);
+
+    pthread_mutex_lock(&g_alloc_lock);
+    for (uint32_t i = 0; i < n_relocs; i++) {
+        uint32_t boff = GB_LE_U32(relocs[i].arg_idx);   /* byte offset into pbuf */
+        uint64_t rh   = GB_LE_U64(relocs[i].remote_handle);
+        if (boff >= buf_bytes || buf_bytes - boff < 8) continue;  /* overflow-safe bound check */
+        struct remote_alloc *ra = ra_find(rh);
+        if (!ra) { pthread_mutex_unlock(&g_alloc_lock); free(pbuf);
+                   netd_log("WARN exec_raw: unknown handle 0x%llx", (unsigned long long)rh);
+                   RAW_ERR(); }
+        void *real = (ra->tier == 0) ? ra->dev_ptr : ra->host_ptr;
+        memcpy(pbuf + boff, &real, 8);
+    }
+    pthread_mutex_unlock(&g_alloc_lock);
+
+    /* Build kernelParams: kp[i] → pbuf at each param's 8-byte-aligned offset
+     * (must match the host's packing in cudaLaunchKernelExC). */
+    void *kp[64];
+    uint32_t off = 0;
+    for (uint32_t i = 0; i < n_params; i++) {
+        uint32_t sz  = GB_LE_U32(param_size[i]); if (!sz) sz = 8;
+        uint32_t asz = (sz + 7u) & ~7u;
+        if (off + asz > buf_bytes) { free(pbuf); RAW_ERR(); }
+        kp[i] = pbuf + off;
+        off += asz;
+    }
+
+    struct gb_net_response resp = { .orig_msg_type = GB_MSG_CUDA_EXEC, .status = GB_STATUS_OK };
+    int err = -1;
+    if (is_captured_stub) {
+        typedef struct { unsigned x, y, z; } d3;
+        typedef int (*pfn_rt)(const void *, d3, d3, void **, size_t, void *);
+        static pfn_rt f_rt = NULL; static int pr = 0;
+        if (!pr) { pr = 1; f_rt = (pfn_rt)dlsym(RTLD_DEFAULT, "cudaLaunchKernel"); }
+        if (f_rt) {
+            d3 g = { GB_LE_U32(req->grid_x), GB_LE_U32(req->grid_y), GB_LE_U32(req->grid_z) };
+            d3 b = { GB_LE_U32(req->block_x), GB_LE_U32(req->block_y), GB_LE_U32(req->block_z) };
+            err = f_rt(host_func, g, b, n_params ? kp : NULL,
+                       (size_t)GB_LE_U32(req->shared_mem_bytes), NULL);
+        }
+    } else {
+        typedef int (*pfn_dv)(void *, unsigned, unsigned, unsigned, unsigned, unsigned,
+                              unsigned, unsigned, void *, void **, void **);
+        static pfn_dv f_dv = NULL; static int pr = 0;
+        if (!pr) { pr = 1; void *lc = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
+                   if (!lc) lc = dlopen("libcuda.so", RTLD_NOW | RTLD_GLOBAL);
+                   if (lc) f_dv = (pfn_dv)dlsym(lc, "cuLaunchKernel"); }
+        if (f_dv)
+            err = f_dv(host_func, GB_LE_U32(req->grid_x), GB_LE_U32(req->grid_y),
+                       GB_LE_U32(req->grid_z), GB_LE_U32(req->block_x),
+                       GB_LE_U32(req->block_y), GB_LE_U32(req->block_z),
+                       GB_LE_U32(req->shared_mem_bytes), NULL,
+                       n_params ? kp : NULL, NULL);
+    }
+    free(pbuf);
+
+    if (err != 0) {
+        resp.status = GB_STATUS_ERR_CUDA;
+        netd_log("exec_raw: launch '%s' failed err=%d (%s)", kernel_name, err,
+                 is_captured_stub ? "runtime" : "driver");
+    } else {
+        g_kernel_dispatch_count++;
+        netd_log("exec_raw: '%s' OK (%u params, %u relocs) [%s]", kernel_name,
+                 n_params, n_relocs, is_captured_stub ? "runtime-stub" : "driver");
+    }
+    return send_msg(cli, GB_MSG_RESPONSE, GB_NET_FLAG_RESPONSE, &resp, sizeof(resp));
+    #undef RAW_ERR
+}
+
 static int handle_cuda_exec(struct client *cli, const void *payload, uint32_t len)
 {
     struct gb_net_response err_resp = {
         .orig_msg_type = GB_MSG_CUDA_EXEC,
         .status        = GB_STATUS_ERR_INVALID,
     };
-#define EXEC_ERR() return send_msg(cli, GB_MSG_RESPONSE, GB_NET_FLAG_RESPONSE, &err_resp, sizeof(err_resp))
+#define EXEC_ERR() do { \
+        netd_log("WARN exec: rejected at %s:%d", __FILE__, __LINE__); \
+        return send_msg(cli, GB_MSG_RESPONSE, GB_NET_FLAG_RESPONSE, &err_resp, sizeof(err_resp)); \
+    } while (0)
 
     if (len < sizeof(struct gb_net_cuda_exec)) EXEC_ERR();
 
@@ -2412,6 +2694,8 @@ static int handle_cuda_exec(struct client *cli, const void *payload, uint32_t le
     pthread_mutex_lock(&g_kernel_map_lock);
     void *host_func = km_lookup(cli->feeder_id, kernel_name);
     pthread_mutex_unlock(&g_kernel_map_lock);
+    int is_captured_stub = 0;
+    int is_fatbin_fn = 0;   /* real CUfunction from .nv_fatbin → driver launch */
     if (!host_func) {
         /* Audit F-L3-04: gate dlsym fallback behind the allowlist.  Fail-closed:
          * if /etc/greenboost/kernels.allow is absent, all kernels are rejected. */
@@ -2419,7 +2703,34 @@ static int handle_cuda_exec(struct client *cli, const void *payload, uint32_t le
             netd_log("WARN exec: kernel '%s' not on allowlist - rejected", kernel_name);
             EXEC_ERR();
         }
-        host_func = dlsym(RTLD_DEFAULT, kernel_name);
+        host_func = gb_kernel_resolve(kernel_name);
+        /* Stripped libggml-cuda.so: device stubs aren't in the symbol table,
+         * so dlsym fails.  The __cudaRegisterFunction interposer
+         * (greenboost_netd_capture.c, LD_PRELOAD'd into netd) captured every
+         * name→host-stub at dlopen , use that.  A stub from here MUST be
+         * launched via the RUNTIME cudaLaunchKernel, not the driver
+         * cuLaunchKernel (see the launch site below). */
+        if (!host_func) {
+            static const void *(*cap_lookup)(const char *) = NULL;
+            static int cap_probed = 0;
+            if (!cap_probed) {
+                cap_probed = 1;
+                cap_lookup = (const void *(*)(const char *))
+                    dlsym(RTLD_DEFAULT, "gb_capture_lookup");
+            }
+            if (cap_lookup) {
+                host_func = (void *)cap_lookup(kernel_name);
+                if (host_func) is_captured_stub = 1;
+            }
+        }
+        /* General fallback (Option A): resolve from the .nv_fatbin directly as
+         * a real CUfunction , covers kernels neither dlsym nor
+         * __cudaRegisterFunction expose (ggml fused mmvq; torch image/video/
+         * mesh kernels).  Launched via the DRIVER cuLaunchKernel below. */
+        if (!host_func) {
+            host_func = gb_fatbin_resolve(kernel_name);
+            if (host_func) is_fatbin_fn = 1;
+        }
     }
 
     if (!host_func) {
@@ -2515,30 +2826,56 @@ static int handle_cuda_exec(struct client *cli, const void *payload, uint32_t le
             if (lc) f_cuLK = (pfn_cuLK)dlsym(lc, "cuLaunchKernel");
         }
 
-        if (f_cuLK) {
-            /* build kernelParams: array of pointers to each arg_vals[i] */
-            void *kp[256];
-            for (uint32_t i = 0; i < req_n_arg_vals; i++) kp[i] = &arg_vals[i];  /* PR-UU */
+        /* build kernelParams: array of pointers to each arg_vals[i] */
+        void *kp[256];
+        for (uint32_t i = 0; i < req_n_arg_vals; i++) kp[i] = &arg_vals[i];  /* PR-UU */
 
-            int err = f_cuLK(host_func,
-                             req_grid_x, req_grid_y, req_grid_z,
-                             req_block_x, req_block_y, req_block_z,
-                             req_shared_mem_bytes, NULL,
-                             req_n_arg_vals ? kp : NULL, NULL);
-            if (err != 0) {
-                resp.status = GB_STATUS_ERR_CUDA;
-                netd_log("exec: cuLaunchKernel '%s' failed err=%d", kernel_name, err);
-                NETD_EVT("KERN_ERR", "T1_GPU", 0, cli->feeder_id, kernel_name);
+        int err = -1;
+        if (is_captured_stub) {
+            /* Captured __cudaRegisterFunction stub → RUNTIME cudaLaunchKernel,
+             * which keys on the host stub pointer.  The driver cuLaunchKernel
+             * wants a CUfunction and would reject this. */
+            typedef struct { unsigned x, y, z; } gb_dim3_t;
+            typedef int (*pfn_cudaLK)(const void *, gb_dim3_t, gb_dim3_t,
+                                      void **, size_t, void *);
+            static pfn_cudaLK f_cudaLK = NULL;
+            static int probed = 0;
+            if (!probed) {
+                probed = 1;
+                /* libcudart already loaded (probe_gpus); RTLD_DEFAULT finds it. */
+                f_cudaLK = (pfn_cudaLK)dlsym(RTLD_DEFAULT, "cudaLaunchKernel");
+            }
+            if (f_cudaLK) {
+                gb_dim3_t g = { req_grid_x, req_grid_y, req_grid_z };
+                gb_dim3_t b = { req_block_x, req_block_y, req_block_z };
+                err = f_cudaLK(host_func, g, b,
+                               req_n_arg_vals ? kp : NULL,
+                               (size_t)req_shared_mem_bytes, NULL);
             } else {
-                netd_log("exec: '%s' grid=(%u,%u,%u) block=(%u,%u,%u) args=%u relocs=%u",
-                         kernel_name,
+                netd_log("exec: cudaLaunchKernel not available for captured stub");
+            }
+        } else if (f_cuLK) {
+            err = f_cuLK(host_func,
                          req_grid_x, req_grid_y, req_grid_z,
                          req_block_x, req_block_y, req_block_z,
-                         req_n_arg_vals, req_n_relocs);
-            }
+                         req_shared_mem_bytes, NULL,
+                         req_n_arg_vals ? kp : NULL, NULL);
         } else {
-            resp.status = GB_STATUS_ERR_CUDA;
             netd_log("exec: cuLaunchKernel not available");
+        }
+
+        if (err != 0) {
+            resp.status = GB_STATUS_ERR_CUDA;
+            netd_log("exec: launch '%s' failed err=%d (%s)", kernel_name, err,
+                     is_captured_stub ? "runtime" : "driver");
+            NETD_EVT("KERN_ERR", "T1_GPU", 0, cli->feeder_id, kernel_name);
+        } else {
+            netd_log("exec: '%s' grid=(%u,%u,%u) block=(%u,%u,%u) args=%u relocs=%u [%s]",
+                     kernel_name,
+                     req_grid_x, req_grid_y, req_grid_z,
+                     req_block_x, req_block_y, req_block_z,
+                     req_n_arg_vals, req_n_relocs,
+                     is_captured_stub ? "runtime-stub" : "driver");
         }
     }
 
@@ -2798,11 +3135,198 @@ static int handle_cuda_sync(struct client *cli, const void *payload, uint32_t le
                     &resp, sizeof(resp));
 }
 
+/* ── Trusted kernel library (2026-07-06) ─────────────────────────────────
+ * Remote dispatch can only run kernels whose host stubs exist in THIS
+ * process.  The daemon itself links no compute library, so it dlopens the
+ * feeder's own ggml CUDA backend (root-installed by Ollama) and resolves
+ * kernel names scoped to that handle , dlsym(g_kernel_lib, name) searches
+ * the library and its dependency chain only, never the daemon's own symbols.
+ * This is both what makes ggml dispatch WORK (RTLD_DEFAULT never resolved
+ * these) and a tighter sandbox than a name allowlist: only kernels shipped
+ * in the trusted library are launchable.  Loading it also runs the
+ * library's __cudaRegisterFatBinary constructors against its own cudart, so
+ * the returned stubs are valid launch handles for that runtime instance.
+ * Override the path with GB_NETD_KERNEL_LIB. */
+static void *g_kernel_lib = NULL;
+static int   g_kernel_lib_tried = 0;
+/* ── Fatbin kernel resolver (Option A, 2026-07-06) ──────────────────────
+ * General fallback for kernels that are neither dlsym-resolvable nor
+ * __cudaRegisterFunction-captured (e.g. ggml's fused mul_mat_vec_q family;
+ * torch kernels for image/video/mesh pipelines).  The kernel library's
+ * .nv_fatbin ELF section is a concatenation of fatbin containers;
+ * cuModuleLoadData accepts a whole container and picks the right arch.
+ * Strategy: mmap the .so once, index the containers, then on a name miss
+ * lazily load containers one at a time and probe cuModuleGetFunction until
+ * the name resolves.  Resolved CUfunctions launch via the driver
+ * cuLaunchKernel (they are real CUfunctions, unlike host stubs). */
+#include <elf.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+#define GB_FATBIN_MAGIC 0xBA55ED50u
+#define GB_FATBIN_MAX_CONTAINERS 4096
+#define GB_FATBIN_CACHE 1024
+
+struct gb_fatbin_hdr {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t header_size;
+    uint64_t fat_size;
+};
+
+static const uint8_t *g_fb_containers[GB_FATBIN_MAX_CONTAINERS];
+static void          *g_fb_modules[GB_FATBIN_MAX_CONTAINERS];   /* CUmodule, lazily loaded */
+static int8_t         g_fb_tried[GB_FATBIN_MAX_CONTAINERS];
+static int            g_fb_n = 0;
+static int            g_fb_init_done = 0;
+
+static struct { char name[GB_NET_MAX_KERNEL_NAME]; void *fn; } g_fb_cache[GB_FATBIN_CACHE];
+static int g_fb_cache_n = 0;
+
+static int (*fb_cuModuleLoadData)(void **, const void *);
+static int (*fb_cuModuleGetFunction)(void **, void *, const char *);
+
+static void gb_fatbin_init(const char *lib_path)
+{
+    if (g_fb_init_done) return;
+    g_fb_init_done = 1;
+
+    void *lc = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
+    if (!lc) lc = dlopen("libcuda.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!lc) return;
+    fb_cuModuleLoadData    = (int (*)(void **, const void *))dlsym(lc, "cuModuleLoadData");
+    fb_cuModuleGetFunction = (int (*)(void **, void *, const char *))dlsym(lc, "cuModuleGetFunction");
+    if (!fb_cuModuleLoadData || !fb_cuModuleGetFunction) return;
+
+    int fd = open(lib_path, O_RDONLY);
+    if (fd < 0) { netd_log("fatbin: cannot open %s", lib_path); return; }
+    struct stat st;
+    if (fstat(fd, &st) != 0) { close(fd); return; }
+    const uint8_t *base = (const uint8_t *)mmap(NULL, (size_t)st.st_size,
+                                                PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);   /* mapping stays valid */
+    if (base == MAP_FAILED) { netd_log("fatbin: mmap failed"); return; }
+
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)base;
+    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0) return;
+    const Elf64_Shdr *sh = (const Elf64_Shdr *)(base + eh->e_shoff);
+    const char *shstr = (const char *)(base + sh[eh->e_shstrndx].sh_offset);
+
+    for (int i = 0; i < eh->e_shnum; i++) {
+        if (strcmp(shstr + sh[i].sh_name, ".nv_fatbin") != 0) continue;
+        const uint8_t *p   = base + sh[i].sh_offset;
+        const uint8_t *end = p + sh[i].sh_size;
+        while (p + sizeof(struct gb_fatbin_hdr) <= end && g_fb_n < GB_FATBIN_MAX_CONTAINERS) {
+            const struct gb_fatbin_hdr *h = (const struct gb_fatbin_hdr *)p;
+            if (h->magic != GB_FATBIN_MAGIC) { p += 8; continue; }  /* skip padding */
+            if (p + h->header_size + h->fat_size > end) break;
+            g_fb_containers[g_fb_n++] = p;
+            p += h->header_size + h->fat_size;
+        }
+        break;
+    }
+    netd_log("fatbin: indexed %d containers from %s", g_fb_n, lib_path);
+}
+
+/* Resolve a kernel name to a CUfunction by lazily loading fatbin containers.
+ * Returns NULL if not found anywhere. */
+static void *gb_fatbin_resolve(const char *name)
+{
+    if (!g_fb_n || !fb_cuModuleGetFunction) return NULL;
+
+    for (int i = 0; i < g_fb_cache_n; i++)
+        if (strcmp(g_fb_cache[i].name, name) == 0) return g_fb_cache[i].fn;
+
+    for (int i = 0; i < g_fb_n; i++) {
+        if (!g_fb_modules[i] && !g_fb_tried[i]) {
+            g_fb_tried[i] = 1;
+            if (fb_cuModuleLoadData(&g_fb_modules[i], g_fb_containers[i]) != 0)
+                g_fb_modules[i] = NULL;   /* e.g. relocatable-only container */
+        }
+        if (!g_fb_modules[i]) continue;
+        void *fn = NULL;
+        if (fb_cuModuleGetFunction(&fn, g_fb_modules[i], name) == 0 && fn) {
+            if (g_fb_cache_n < GB_FATBIN_CACHE) {
+                strncpy(g_fb_cache[g_fb_cache_n].name, name, GB_NET_MAX_KERNEL_NAME - 1);
+                g_fb_cache[g_fb_cache_n].fn = fn;
+                g_fb_cache_n++;
+            }
+            netd_log("fatbin: resolved '%s' (container %d)", name, i);
+            return fn;
+        }
+    }
+    return NULL;
+}
+
+static void *gb_kernel_lib(void)
+{
+    if (!g_kernel_lib_tried) {
+        g_kernel_lib_tried = 1;
+        const char *cands[] = {
+            getenv("GB_NETD_KERNEL_LIB"),
+            "/usr/local/lib/ollama/cuda_v13/libggml-cuda.so",
+            "/usr/local/lib/ollama/libggml-cuda.so",
+            NULL
+        };
+        for (int i = 0; i < 3; i++) {
+            if (!cands[i]) continue;
+            /* libggml-cuda.so has no RUNPATH , Ollama supplies
+             * LD_LIBRARY_PATH to its children.  Pre-load libggml-base.so.0
+             * from the candidate's own dir and its parent so RTLD_NOW
+             * resolution of the main lib succeeds. */
+            char dep[512];
+            const char *slash = strrchr(cands[i], '/');
+            if (slash) {
+                int dirlen = (int)(slash - cands[i]);
+                snprintf(dep, sizeof(dep), "%.*s/libggml-base.so.0", dirlen, cands[i]);
+                if (!dlopen(dep, RTLD_NOW | RTLD_GLOBAL)) {
+                    const char *slash2 = memrchr(cands[i], '/', (size_t)dirlen);
+                    if (slash2) {
+                        snprintf(dep, sizeof(dep), "%.*s/libggml-base.so.0",
+                                 (int)(slash2 - cands[i]), cands[i]);
+                        dlopen(dep, RTLD_NOW | RTLD_GLOBAL);
+                    }
+                }
+            }
+            g_kernel_lib = dlopen(cands[i], RTLD_NOW | RTLD_GLOBAL);
+            if (g_kernel_lib) {
+                int (*capn)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "gb_capture_count");
+                netd_log("kernel lib: loaded %s (scoped dispatch enabled, %d stubs captured)",
+                         cands[i], capn ? capn() : -1);
+                gb_fatbin_init(cands[i]);   /* index .nv_fatbin for the general fallback */
+                break;
+            }
+            netd_log("kernel lib: %s failed: %s", cands[i], dlerror());
+        }
+        if (!g_kernel_lib)
+            netd_log("WARN: no kernel lib found (set GB_NETD_KERNEL_LIB) - "
+                     "remote dispatch limited to kernels.allow + RTLD_DEFAULT");
+    }
+    return g_kernel_lib;
+}
+
+/* Resolve a kernel symbol: prefer the trusted library handle; fall back to
+ * RTLD_DEFAULT only for allowlisted names (legacy behaviour). */
+static void *gb_kernel_resolve(const char *kname)
+{
+    void *lib = gb_kernel_lib();
+    if (lib) {
+        void *f = dlsym(lib, kname);
+        if (f) return f;
+    }
+    return dlsym(RTLD_DEFAULT, kname);
+}
+
 /* Audit F-L3-04: optional allowlist of kernel symbol names the daemon will
- * resolve.  Without the allowlist (file missing) the daemon still accepts any
- * symbol - preserving current behaviour and tests - but logs a clear warning.
- * With the file present, only matching names are dlsym'd; everything else is
- * rejected with GB_STATUS_ERR_REJECTED.  One symbol per line, '#' comments. */
+ * resolve.  Policy (2026-07-06):
+ *   - kernels.allow present → only listed names pass (strictest).
+ *   - file absent but the trusted kernel lib loaded → allowed; resolution is
+ *     scoped to that library, which is the real containment boundary.  A
+ *     256-entry name list can never cover ggml's kernel set (hundreds of
+ *     template instantiations) , requiring it made feeder compute
+ *     permanently dead.
+ *   - neither → reject all (fail-closed, unchanged). */
 #define GB_KERNEL_ALLOW_PATH "/etc/greenboost/kernels.allow"
 static int gb_kernel_name_allowed(const char *kname)
 {
@@ -2837,7 +3361,8 @@ static int gb_kernel_name_allowed(const char *kname)
                      GB_KERNEL_ALLOW_PATH);
         }
     }
-    if (!g_allow_present) return 0; /* fail-closed: no allowlist = reject all */
+    if (!g_allow_present)
+        return gb_kernel_lib() != NULL; /* lib-scoped resolution; else fail-closed */
     for (int i = 0; i < g_allow_count; i++) {
         if (strcmp(g_allow_names[i], kname) == 0) return 1;
     }
@@ -2879,8 +3404,9 @@ static int handle_cuda_register_fn(struct client *cli, const void *payload, uint
 
     /* Try to find the kernel function via dlsym.
      * CUDA device functions registered with __cudaRegisterFunction are
-     * available as host-side stubs with the same symbol name. */
-    void *func = dlsym(RTLD_DEFAULT, kname);
+     * available as host-side stubs with the same symbol name , resolved
+     * scoped to the trusted kernel library (see gb_kernel_resolve). */
+    void *func = gb_kernel_resolve(kname);
 
     if (func) {
         /* PR-L: client-scoped registration.  Take the lock so concurrent
@@ -2983,7 +3509,7 @@ static int handle_feeder_status(struct client *cli)
         resp.t3_free_bytes = resp.t3_total_bytes;
     }
 
-    /* v3.1 GPU telemetry fields — populated from NVML function pointers that
+    /* v3.1 GPU telemetry fields , populated from NVML function pointers that
      * are already resolved in probe_gpus().  Zero-valued if NVML unavailable. */
     if (g_nvml_devices[0]) {
         if (f_nvmlGetTemp) {
@@ -3041,15 +3567,20 @@ static int dispatch_message(struct client *cli, const struct gb_net_header *hdr,
     case GB_MSG_CUDA_FREE:
         return handle_cuda_free(cli, payload, hdr->payload_len);
     case GB_MSG_CUDA_MEMCPY_H2D:
-        return handle_cuda_memcpy_h2d(cli, payload, hdr->payload_len);
+        return handle_cuda_memcpy_h2d(cli, payload, hdr->payload_len,
+                                      le16toh(hdr->flags));
     case GB_MSG_CUDA_MEMCPY_D2H:
         return handle_cuda_memcpy_d2h(cli, payload, hdr->payload_len);
+    case GB_MSG_CUDA_MEMSET:
+        return handle_cuda_memset(cli, payload, hdr->payload_len);
     case GB_MSG_CUDA_MEMCPY_D2D:
         return handle_cuda_memcpy_d2d(cli, payload, hdr->payload_len);
     /* Phase 3: remote compute */
     case GB_MSG_CUDA_LAUNCH:
         return handle_cuda_launch(cli, payload, hdr->payload_len);
     case GB_MSG_CUDA_EXEC:
+        if (le16toh(hdr->flags) & GB_NET_FLAG_EXEC_RAW)
+            return handle_cuda_exec_raw(cli, payload, hdr->payload_len);
         return handle_cuda_exec(cli, payload, hdr->payload_len);
     case GB_MSG_CUDA_EXEC_ASYNC:
         return handle_cuda_exec_async(cli, payload, hdr->payload_len);
@@ -3281,6 +3812,19 @@ static void client_cleanup(struct client *cli)
         netd_log("disconnect cleanup: cleared %d kernel-map entries for client %u",
                  cleared, cli->feeder_id);
 
+    /* Drain any sticky CUDA error left by this client's last kernel launch.
+     * A remotely-dispatched kernel that faulted (e.g. an illegal access from a
+     * mismatched-build kernel) leaves the shared context in an error state that
+     * makes EVERY later alloc/launch fail , the "feeder VRAM used but compute
+     * 0%, then all ops fail" symptom (2026-07-06).  cudaGetLastError clears a
+     * sticky *launch* error; a hard corruption still needs the restart the
+     * caller does, but this recovers the common case without one. */
+    if (f_cudaGetLastError) {
+        cudaError_t _drained = f_cudaGetLastError();
+        if (_drained != 0)
+            netd_log("disconnect cleanup: drained sticky CUDA error %d", _drained);
+    }
+
     NETD_EVT("CLIENT_DISC", "NET", 0, cli->feeder_id, "client_disconnected");
     ag_close(cli->feeder_id);
     if (cli->fd >= 0) close(cli->fd);
@@ -3322,14 +3866,19 @@ static int client_process(struct client *cli)
         }
 
         /* F-L3-09: within-session replay/reordering guard.  seq_num must be
-         * strictly monotone; gap or replay → drop connection. */
+         * strictly monotone; gap or replay → drop connection.
+         * The increment happens BELOW, only after the full message is
+         * buffered: incrementing here broke every message that straddled a
+         * TCP read boundary , the partial-data break re-parsed the same
+         * header on the next call and saw its own increment as a replay
+         * ("expected N+1, got N" → connection dropped, shim got EPIPE,
+         * feeder tiers reported 0 bytes). */
         uint32_t hdr_seq = le32toh(hdr->seq_num);
         if (hdr_seq != cli->recv_seq) {
             netd_log("ERROR: seq mismatch from %s (expected %u, got %u) - dropping",
                      cli->remote_addr, cli->recv_seq, hdr_seq);
             return -1;
         }
-        cli->recv_seq++;
 
         uint32_t payload_len = le32toh(hdr->payload_len);
         /* Audit F-L3-03: explicit upper bound on payload_len before adding,
@@ -3350,6 +3899,9 @@ static int client_process(struct client *cli)
 
         if (cli->recv_len < total)
             break; /* need more data */
+
+        /* Full message buffered , consume the sequence number now. */
+        cli->recv_seq++;
 
         const void *payload = cli->recv_buf + GB_NET_HDR_SIZE;
 
@@ -3726,6 +4278,13 @@ static int run_server(void)
                  * handshake so that send/recv during auth use blocking I/O. */
                 int nodelay = 1;
                 setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+                /* Match the client's explicit socket buffer sizing (netc.c
+                 * connect_feeder) so throughput on bulk transfers isn't
+                 * capped by one side's default window while the other has
+                 * room. */
+                int sockbuf = 2 * (int)GB_NET_MAX_MSG_SIZE;
+                setsockopt(cfd, SOL_SOCKET, SO_SNDBUF, &sockbuf, sizeof(sockbuf));
+                setsockopt(cfd, SOL_SOCKET, SO_RCVBUF, &sockbuf, sizeof(sockbuf));
 
                 char addr_str[64];
 
@@ -3958,6 +4517,15 @@ static int run_server(void)
 
                 cli->recv_len += (size_t)n;
 
+                /* Any inbound traffic proves the client is alive.  Counting
+                 * only GB_MSG_HEARTBEAT here dropped clients mid-model-load:
+                 * the shim's heartbeats pause while the host loads weights
+                 * (20+ s of local memcpy), and a client streaming a large
+                 * H2D transfer holds per_lock so its heartbeat thread skips ,
+                 * both got disconnected at GB_NET_HEARTBEAT_TIMEOUT_MS while
+                 * demonstrably active (hit live 2026-07-06). */
+                cli->last_heartbeat_ms = mono_ms();
+
                 if (client_process(cli) < 0) {
                     epoll_ctl(epfd, EPOLL_CTL_DEL, cfd, NULL);
                     client_cleanup(cli);
@@ -3965,10 +4533,17 @@ static int run_server(void)
             }
         }
 
-        /* Heartbeat timeout check */
+        /* Heartbeat timeout check.  MUST use a FRESH clock, not the loop-top
+         * now_ms: a blocking handler earlier in this iteration (e.g. a 21 GB
+         * cudaHostAlloc pinning for 10-30 s) lets last_heartbeat_ms advance
+         * past the stale now_ms , the unsigned subtraction then wraps to a
+         * huge value and drops a client that was served THIS iteration
+         * (freed its 21 GB weights buffer mid-load, hit live 2026-07-06). */
+        uint64_t hb_now = mono_ms();
         for (int j = 0; j < MAX_CLIENTS; j++) {
             if (!g_clients[j].active) continue;
-            if (now_ms - g_clients[j].last_heartbeat_ms > GB_NET_HEARTBEAT_TIMEOUT_MS) {
+            if (g_clients[j].last_heartbeat_ms < hb_now &&
+                hb_now - g_clients[j].last_heartbeat_ms > GB_NET_HEARTBEAT_TIMEOUT_MS) {
                 netd_log("Client %s heartbeat timeout - disconnecting", g_clients[j].remote_addr);
                 epoll_ctl(epfd, EPOLL_CTL_DEL, g_clients[j].fd, NULL);
                 client_cleanup(&g_clients[j]);
@@ -4008,6 +4583,36 @@ static void usage(void)
 
 int main(int argc, char *argv[])
 {
+    /* Feeder GPU compute needs the __cudaRegisterFunction interposer active
+     * BEFORE libggml-cuda.so is dlopened, so the kernel name→stub map is
+     * captured (the lib is stripped; dlsym can't resolve device stubs).
+     * Re-exec ourselves once with the capture lib preloaded.  GB_NETD_CAPTURED=1
+     * prevents an exec loop; GB_NETD_NO_CAPTURE=1 opts out. */
+    if (!getenv("GB_NETD_CAPTURED") && !getenv("GB_NETD_NO_CAPTURE")) {
+        const char *cands[] = {
+            "/usr/local/lib/libgreenboost_netd_capture.so",
+            "./libgreenboost_netd_capture.so",
+            NULL
+        };
+        const char *cap = NULL;
+        for (int i = 0; cands[i]; i++) {
+            if (access(cands[i], R_OK) == 0) { cap = cands[i]; break; }
+        }
+        if (cap) {
+            const char *old = getenv("LD_PRELOAD");
+            char pl[1024];
+            if (old && old[0])
+                snprintf(pl, sizeof(pl), "%s:%s", cap, old);
+            else
+                snprintf(pl, sizeof(pl), "%s", cap);
+            setenv("LD_PRELOAD", pl, 1);
+            setenv("GB_NETD_CAPTURED", "1", 1);
+            execv("/proc/self/exe", argv);
+            /* exec failed , continue without capture (compute-less but alive). */
+            unsetenv("GB_NETD_CAPTURED");
+        }
+    }
+
     /* Parse args */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-d") == 0) {

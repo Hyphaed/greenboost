@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
 """
-Tests for gb_moe — int8 round-trip, block detection, _vram_budget_ok, B1, B2.
+Tests for gb_moe , int8 round-trip, block detection, _vram_budget_ok, B1, B2.
 
 CPU-only torch. No CUDA, no gb_init singleton, no /dev/greenboost.
 """
@@ -156,7 +156,7 @@ def test_find_moe_blocks_batched_detects_3d_params():
 def test_find_moe_blocks_batched_skips_modlist():
     """Blocks already covered by _find_moe_blocks should be skipped."""
     from gb_moe import _find_moe_blocks_batched
-    model = _MoEBlock(4)   # ModuleList — should NOT appear in batched results
+    model = _MoEBlock(4)   # ModuleList , should NOT appear in batched results
     found = _find_moe_blocks_batched(model)
     assert found == []
 
@@ -199,7 +199,7 @@ def test_vram_budget_true_when_budget_sufficient():
         assert _vram_budget_ok(500.0) is True
 
 
-# ── B2 — PCIe saturation gate ─────────────────────────────────────────────────
+# ── B2 , PCIe saturation gate ─────────────────────────────────────────────────
 
 def test_b2_pcie_gate_false_when_saturated():
     from gb_moe import _vram_budget_ok
@@ -235,7 +235,7 @@ def test_b2_pcie_high_water_gen4_x16():
     assert abs(hw - expected) < 1.0, f"Expected {expected} but got {hw}"
 
 
-# ── B1 — adaptive prefetch miss-rate counter ─────────────────────────────────
+# ── B1 , adaptive prefetch miss-rate counter ─────────────────────────────────
 
 def _make_batched_model(n_experts=4, d=8):
     """Minimal model with one batched-*Experts block for B1 testing."""
@@ -267,6 +267,28 @@ def _make_batched_model(n_experts=4, d=8):
     return _Model()
 
 
+def test_moe_manager_attach_detects_batched_blocks():
+    """Guard test: GbMoEManager.attach() must find >0 blocks on the known-good
+    batched fixture. The many downstream B1/B1+ tests below all skip silently
+    when attach() returns 0 blocks (to tolerate environments where detection
+    genuinely can't run) - without this assertion, a regression in attach()'s
+    detection logic would make the whole B1/B1+ test group pass vacuously via
+    skip instead of failing loudly."""
+    from gb_moe import GbMoEManager
+    from unittest.mock import patch
+
+    model = _make_batched_model(n_experts=4, d=8)
+    with patch("gb_moe._vram_budget_ok", return_value=False):
+        mgr = GbMoEManager(model, prefetch_topn=1, cold_bits=8,
+                           tier_manager=MagicMock())
+        n_blocks = mgr.attach()
+
+    assert n_blocks > 0, (
+        "GbMoEManager.attach() found no batched MoE blocks on the known-good "
+        "fixture - detection has regressed (downstream B1/B1+ tests would "
+        "silently skip instead of catching this)")
+
+
 def test_b1_miss_counter_increments():
     """Driving a cold expert through the hook increments bst.misses."""
     from gb_moe import GbMoEManager, _REBALANCE_EVERY
@@ -280,7 +302,7 @@ def test_b1_miss_counter_increments():
         n_blocks = mgr.attach()
 
     if n_blocks == 0:
-        pytest.skip("Model has no batched MoE blocks — skip B1 counter test")
+        pytest.skip("Model has no batched MoE blocks , skip B1 counter test")
 
     bst = mgr._batched_blocks[0]
     initial_misses = bst.misses
@@ -322,7 +344,7 @@ def test_b1_rebalance_adapts_prefetch_topn_up():
         n_blocks = mgr.attach()
 
     if n_blocks == 0:
-        pytest.skip("Model has no batched MoE blocks — skip B1 adaptation test")
+        pytest.skip("Model has no batched MoE blocks , skip B1 adaptation test")
 
     bst = mgr._batched_blocks[0]
     initial_topn = mgr.prefetch_topn
@@ -420,7 +442,7 @@ def test_b1_status_exposes_miss_rate_and_prefetch_topn():
         pytest.skip("No batched_3d blocks in status()")
 
 
-# ── B1+ — hot_threshold adaptation ───────────────────────────────────────────
+# ── B1+ , hot_threshold adaptation ───────────────────────────────────────────
 
 def test_b1plus_hot_threshold_rises_on_vram_pressure():
     """Under VRAM pressure (_vram_budget_ok=False), hot_threshold increases."""
@@ -539,7 +561,7 @@ def test_restore_expert_slice_dequant_path():
         assert isinstance(stored, tuple), "cold_bits=4 must store (q, scale) tuple"
         break
 
-    # Restore — uses dequant path
+    # Restore , uses dequant path
     mgr._restore_expert_slice(bst, expert_idx)
     assert expert_idx not in bst.cpu_bufs, "cpu_bufs entry should be cleared after restore"
     assert str(expert_idx) in bst.hot, "expert should be hot after restore"
@@ -1007,7 +1029,7 @@ def test_find_moe_blocks_batched_skips_inconsistent_expert_count():
         def __init__(self):
             super().__init__()
             self.w1 = nn.Parameter(torch.randn(4, 8, 4))   # 4 experts
-            self.w2 = nn.Parameter(torch.randn(6, 8, 4))   # 6 experts — mismatch
+            self.w2 = nn.Parameter(torch.randn(6, 8, 4))   # 6 experts , mismatch
 
     class _Block(nn.Module):
         def __init__(self):

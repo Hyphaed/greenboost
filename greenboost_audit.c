@@ -95,7 +95,7 @@ unsigned int la_version(unsigned int version)
 {
     /* PID-1 guard: returning 0 makes glibc silently disable this LD_AUDIT
      * library for the current process.  Never activate the audit hooks inside
-     * systemd or any other init process — per-process injection via systemd
+     * systemd or any other init process , per-process injection via systemd
      * drop-ins and greenboost-run* wrappers is the only supported path. */
     if (getpid() == 1) return 0;
 
@@ -116,96 +116,10 @@ unsigned int la_version(unsigned int version)
  * the triggering library is later dlclose()'d.  Subsequent la_objopen
  * calls return immediately via shim_loaded check.
  */
-/* -----------------------------------------------------------------------
- * Blackwell VMM intercept via la_symbind64
- *
- * libcuda.so.1 exports cuDeviceGetAttribute and cuMemAddressReserve as
- * UNVERSIONED symbols.  Our CUDA shim exports them as @@GB_HOOKS (versioned).
- * glibc's ELF linker PREFERS unversioned definitions for unversioned
- * references, so libcuda always wins the PLT race over our shim - regardless
- * of ld.so.preload order.  la_symbind64 intercepts the binding AT resolution
- * time, bypassing versioning entirely, and is the only reliable hook point.
- *
- * What these intercepts do:
- *  cuDeviceGetAttribute(CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED=193)
- *    → returns 0 on Blackwell (cc >= 12) desktop PCIe, forcing ggml-cuda to
- *      select pool_leg (cudaMalloc-based) over pool_vmm (cuMemCreate/cuMemMap).
- *      pool_vmm's HOST_NUMA_CURRENT fallback is DMA-only on Blackwell PCIe;
- *      cudaMalloc overflow routes through managed-UVM (SM-accessible).
- *  cuMemAddressReserve → returns NOT_SUPPORTED on Blackwell as defence-in-depth.
- *
- * Override: GREENBOOST_BLACKWELL_ALLOW_VMM=1 re-enables both (for ATS-capable
- * Blackwell server SKUs where HOST_NUMA_CURRENT IS SM-accessible).
- * ----------------------------------------------------------------------- */
-
-#define GB_AUDIT_ATTR_VMM_SUPPORTED 193  /* CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED */
-#define GB_AUDIT_ATTR_CC_MAJOR       75  /* CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR */
-
-typedef int  (*pfn_cuDGA)(int *, int, int);
-typedef int  (*pfn_cuMAR)(unsigned long long *, size_t, size_t, unsigned long long, unsigned long long);
-
-static pfn_cuDGA gb_real_cuDGA = NULL;
-static int        gb_audit_cc   = 0;
-
-/* Lazy-load the real cuDeviceGetAttribute directly from libcuda to avoid
- * infinite recursion when LD_PRELOAD/la_symbind has already redirected the
- * global symbol to this wrapper. */
-static pfn_cuDGA gb_get_real_cuDGA(void)
-{
-    if (gb_real_cuDGA) return gb_real_cuDGA;
-    void *h = dlopen("libcuda.so.1", RTLD_NOLOAD | RTLD_NOW | RTLD_GLOBAL);
-    if (!h) h = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL | RTLD_NODELETE);
-    if (h) gb_real_cuDGA = (pfn_cuDGA)dlsym(h, "cuDeviceGetAttribute");
-    return gb_real_cuDGA;
-}
-
-/* Wrapper replacing cuDeviceGetAttribute in ggml-cuda's PLT.
- * Zeroes VMM support flag on Blackwell to force legacy cudaMalloc pool. */
-__attribute__((visibility("default")))
-int gb_audit_cuDeviceGetAttribute(int *value, int attrib, int dev)
-{
-    pfn_cuDGA real = gb_get_real_cuDGA();
-    if (!real) return 100; /* CUDA_ERROR_NOT_SUPPORTED */
-
-    int ret = real(value, attrib, dev);
-    if (ret != 0) return ret;
-
-    if (attrib == GB_AUDIT_ATTR_VMM_SUPPORTED && value && *value != 0) {
-        if (!gb_audit_cc)
-            real(&gb_audit_cc, GB_AUDIT_ATTR_CC_MAJOR, dev);
-        if (gb_audit_cc >= 12) {
-            const char *e = getenv("GREENBOOST_BLACKWELL_ALLOW_VMM");
-            if (!e || e[0] == '0')
-                *value = 0;  /* disable VMM → forces ggml pool_leg */
-        }
-    }
-    return 0;
-}
-
-/* Wrapper replacing cuMemAddressReserve: return NOT_SUPPORTED on Blackwell
- * so ggml's pool_vmm availability test also fails (defence-in-depth). */
-__attribute__((visibility("default")))
-int gb_audit_cuMemAddressReserve(unsigned long long *ptr, size_t size,
-                                  size_t alignment, unsigned long long addr,
-                                  unsigned long long flags)
-{
-    if (!gb_audit_cc) {
-        pfn_cuDGA real = gb_get_real_cuDGA();
-        if (real) real(&gb_audit_cc, GB_AUDIT_ATTR_CC_MAJOR, 0);
-    }
-    if (gb_audit_cc >= 12) {
-        const char *e = getenv("GREENBOOST_BLACKWELL_ALLOW_VMM");
-        if (!e || e[0] == '0')
-            return 801; /* CUDA_ERROR_NOT_SUPPORTED */
-    }
-    /* Non-Blackwell or allow_vmm: pass through via the CUDA shim's hook */
-    typedef int (*pfn_t)(unsigned long long *, size_t, size_t,
-                         unsigned long long, unsigned long long);
-    void *h = dlopen("libcuda.so.1", RTLD_NOLOAD | RTLD_NOW | RTLD_GLOBAL);
-    pfn_t real = h ? (pfn_t)dlsym(h, "cuMemAddressReserve") : NULL;
-    if (!real) return 801;
-    return real(ptr, size, alignment, addr, flags);
-}
+/* Blackwell VMM intercept (cuDeviceGetAttribute VMM_SUPPORTED=193,
+ * cuMemAddressReserve) is implemented in greenboost_vmm_override.c, not here -
+ * see the la_symbind64 note below for why. This file previously carried its
+ * own (dead, never-invoked) copies of these two overrides; removed. */
 
 static volatile int shim_loaded = 0;
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
 """
-Centralized topology singleton — reads /etc/greenboost/profiles/default.md
+Centralized topology singleton , reads /etc/greenboost/profiles/default.md
 once per process and exposes typed constants to all consumer modules.
 
 Replace ad-hoc profile parsing scattered across gb_moe._get_pcie_high_water()
@@ -135,12 +135,12 @@ class TopologyProfile:
 
     @property
     def kv_step_mb(self) -> int:
-        """KV reserve growth step — one quarter of the configured base reserve."""
+        """KV reserve growth step , one quarter of the configured base reserve."""
         return max(128, self.kv_reserve_mb // 4)
 
     @property
     def kv_max_mb(self) -> int:
-        """KV reserve ceiling — 2× base reserve, hard cap at 8192 MB."""
+        """KV reserve ceiling , 2× base reserve, hard cap at 8192 MB."""
         return min(8192, self.kv_reserve_mb * 2)
 
     @property

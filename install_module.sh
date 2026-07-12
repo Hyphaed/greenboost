@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-GB_VERSION="3.0"
+GB_VERSION="3.2"
 DRIVER_NAME="greenboost"
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DKMS_SRC="/usr/src/${DRIVER_NAME}-${GB_VERSION}"
@@ -264,6 +264,14 @@ dkms install "${DRIVER_NAME}/${GB_VERSION}" \
     || gb_die "dkms install failed"
 gb_ok "Module installed"
 
+# Also build for every OTHER kernel already present on disk (e.g. a second
+# kernel installed via ~/Dev/kernel_inference but not yet booted) , the calls
+# above only ever cover $(uname -r), so any other installed kernel would stay
+# silently unbuilt until someone notices and reruns dkms for it by hand.
+# Best-effort: never fail the install over this.
+gb_info "Building for any other installed kernels..."
+dkms autoinstall -m "${DRIVER_NAME}" -v "${GB_VERSION}" 2>&1 | while read -r _l; do gb_info "$_l"; done || true
+
 # 4/4 - Detect hardware and load module with tuned parameters
 gb_step "[4/4] Detecting hardware and loading kernel module..."
 
@@ -315,6 +323,33 @@ modprobe "$DRIVER_NAME" \
     || gb_die "modprobe failed - check dmesg for errors"
 gb_ok "Module loaded"
 
+# Persist across reboots , a successful modprobe here only affects the current
+# boot. Without this file, systemd-modules-load.service has nothing telling it
+# to load greenboost on the NEXT boot, and the module silently stays unloaded
+# until someone notices and modprobes it by hand (confirmed gap 2026-07-10:
+# this file was missing here even though the module loaded fine at install time).
+if [[ ! -f /etc/modules-load.d/greenboost.conf ]]; then
+    echo "$DRIVER_NAME" > /etc/modules-load.d/greenboost.conf
+    gb_ok "Boot-time autoload registered: /etc/modules-load.d/greenboost.conf"
+else
+    gb_info "Boot-time autoload already registered: /etc/modules-load.d/greenboost.conf"
+fi
+
+# Boot guard: self-heals a missing .ko for the running kernel (e.g. a kernel
+# upgrade whose DKMS autoinstall never ran) BEFORE systemd-modules-load.service
+# tries to load it, so the module keeps loading at boot even across a kernel
+# bump that this install didn't know about.
+if [[ -f "$SRC_DIR/greenboost_boot_guard.sh" && -f "$SRC_DIR/greenboost-boot-guard.service" ]]; then
+    install -m 755 "$SRC_DIR/greenboost_boot_guard.sh" /usr/local/sbin/greenboost_boot_guard.sh
+    install -m 644 "$SRC_DIR/greenboost-boot-guard.service" /etc/systemd/system/greenboost-boot-guard.service
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable greenboost-boot-guard.service &>/dev/null \
+        && gb_ok "Boot guard installed + enabled: greenboost-boot-guard.service" \
+        || gb_warn "Could not enable greenboost-boot-guard.service (no systemd?)"
+else
+    gb_warn "greenboost_boot_guard.sh / .service not found next to this script , skipping boot guard"
+fi
+
 # ── Device permissions: udev rule + group membership ─────────────────────────
 # /dev/greenboost defaults to 0600 root:root without a udev rule.
 # Add the udev rule so any member of the 'video' group can open the device
@@ -338,7 +373,7 @@ if [[ -n "${SUDO_USER:-}" ]]; then
     if ! id -nG "$SUDO_USER" 2>/dev/null | tr ' ' '\n' | grep -q '^video$'; then
         usermod -aG video "$SUDO_USER" \
             && gb_ok "User '$SUDO_USER' added to 'video' group (re-login or: newgrp video)" \
-            || gb_warn "usermod failed — add $SUDO_USER to 'video' group manually"
+            || gb_warn "usermod failed , add $SUDO_USER to 'video' group manually"
     else
         gb_info "User '$SUDO_USER' already in 'video' group"
     fi
@@ -387,7 +422,7 @@ case "$1" in
     setup|install|full-install) exec "$GB_SETUP" "$@" ;;
     run)          shift; GREENBOOST_ACTIVE=1 LD_PRELOAD="$GB_SHIM" "$@" ;;
     help|--help|-h|"") exec "$GB_SETUP" show-commands ;;
-    *)            echo "Unknown command: '$1'  - run: greenboost help" >&2; exit 1 ;;
+    *)            exec "$GB_SETUP" "$@" ;;
 esac
 WRAPEOF
 chmod +x /usr/local/bin/greenboost
@@ -403,7 +438,7 @@ gb_step "Building and installing GreenBoost CUDA shim + native libs..."
 _shim_log=$(mktemp /tmp/gb_shim_build.XXXXX.log)
 make -C "$SRC_DIR" clean all install-libs >"$_shim_log" 2>&1 \
     || { echo "" >&2; cat "$_shim_log" >&2; rm -f "$_shim_log"; \
-         gb_die "Shim build failed — see output above"; }
+         gb_die "Shim build failed , see output above"; }
 rm -f "$_shim_log"
 # Restore ownership so the developer can rebuild without sudo.
 if [[ -n "${SUDO_USER:-}" ]]; then
@@ -414,11 +449,11 @@ gb_ok "CUDA shim + native libs installed"
 
 # ── Install GreenBoost Python orchestration stack ────────────────────────────
 # The Python stack (gb_telemetry, gb_quant, gb_diffusion_orch, etc.) must be
-# importable system-wide — by the active conda env, any venv, and system Python —
+# importable system-wide , by the active conda env, any venv, and system Python ,
 # without the user sourcing profile.d manually.  We install:
-#   /usr/local/lib/greenboost/   — the package directory
-#   /etc/profile.d/greenboost_pythonpath.sh — PYTHONPATH for login shells
-#   greenboost.pth               — dist-packages + conda pth drop-in
+#   /usr/local/lib/greenboost/   , the package directory
+#   /etc/profile.d/greenboost_pythonpath.sh , PYTHONPATH for login shells
+#   greenboost.pth               , dist-packages + conda pth drop-in
 gb_step "Installing GreenBoost Python orchestration stack..."
 GB_PY_DEST="/usr/local/lib/greenboost"
 mkdir -p "$GB_PY_DEST"
@@ -438,7 +473,7 @@ for _f in "${GB_PY_FILES[@]}"; do
 done
 # Package __init__.py
 if [[ ! -f "$GB_PY_DEST/__init__.py" ]]; then
-    printf '# GreenBoost Python orchestration stack — auto-generated\n' \
+    printf '# GreenBoost Python orchestration stack , auto-generated\n' \
         > "$GB_PY_DEST/__init__.py"
 fi
 # profile.d export
@@ -452,7 +487,7 @@ chmod 644 /etc/profile.d/greenboost_pythonpath.sh
 # Drop a .pth + sitecustomize into every system dist-packages.
 # The .pth adds the path AND imports greenboost_sitecustomize so that
 # processes launched with GREENBOOST_ACTIVE=1 get gb_init auto-imported.
-_GB_SC_CONTENT='# GreenBoost auto-bootstrap — generated by install_module.sh
+_GB_SC_CONTENT='# GreenBoost auto-bootstrap , generated by install_module.sh
 import os as _os
 if _os.environ.get("GREENBOOST_ACTIVE") == "1":
     try:

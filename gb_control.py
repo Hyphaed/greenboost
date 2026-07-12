@@ -2,21 +2,21 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
 """
-gb_control.py — unified GreenBoost runtime actuator layer.
+gb_control.py , unified GreenBoost runtime actuator layer.
 
 The ONE place that mutates GreenBoost runtime behavior.
 
 Three backends (tried in order per lever):
-  sysfs   — /sys/module/greenboost/parameters/<param>  (0644, re-read ~500ms)
-  ioctl   — /dev/greenboost  (requires CAP_SYS_ADMIN for most cmds)
-  control — /run/greenboost/control  (KEY=VALUE; shim reads every ~2 s)
+  sysfs   , /sys/module/greenboost/parameters/<param>  (0644, re-read ~500ms)
+  ioctl   , /dev/greenboost  (requires CAP_SYS_ADMIN for most cmds)
+  control , /run/greenboost/control  (KEY=VALUE; shim reads every ~2 s)
 
 Design principles (mirror g_t2_warn_adj controller in greenboost_cuda_shim.c):
-  clamp        — every value hard-clamped before any write
-  step         — bounded incremental; no set-point jumps
-  idempotence  — skip write when value unchanged
-  rate-limit   — min_interval_s (default 10 s) prevents thrashing
-  dry-run gate — when dry_run=True or GB_ORCH_ACTUATE != '1': compute + log only
+  clamp        , every value hard-clamped before any write
+  step         , bounded incremental; no set-point jumps
+  idempotence  , skip write when value unchanged
+  rate-limit   , min_interval_s (default 10 s) prevents thrashing
+  dry-run gate , when dry_run=True or GB_ORCH_ACTUATE != '1': compute + log only
 
 Privilege model:
   GbControl._priv = (os.geteuid() == 0)
@@ -108,7 +108,7 @@ _SYSFS_DEBUG_MODE        = f"{_SYSFS_PREFIX}/debug_mode"
 _CONTROL_FILE = Path("/run/greenboost/control")
 _CONTROL_TMP  = Path("/run/greenboost/.control.tmp")
 
-# ── OS tunable paths (continuous OS tuning — Loops O-S, supervisor mode only) ──
+# ── OS tunable paths (continuous OS tuning , Loops O-S, supervisor mode only) ──
 _CPUFREQ_GLOB     = "/sys/devices/system/cpu/cpu[0-9]*/cpufreq"
 _PROC_SYS_VM       = "/proc/sys/vm"
 _PROC_SYS_KERNEL   = "/proc/sys/kernel"
@@ -168,7 +168,7 @@ class GbControl:
             log.warning("[gb_control] no privilege for ioctl 0x%x", cmd)
             return False
         if not os.path.exists(_GB_DEV):
-            log.debug("[gb_control] %s absent — skipping ioctl 0x%x", _GB_DEV, cmd)
+            log.debug("[gb_control] %s absent , skipping ioctl 0x%x", _GB_DEV, cmd)
             return False
         try:
             fd = os.open(_GB_DEV, os.O_RDWR)
@@ -187,7 +187,7 @@ class GbControl:
     def _write_control(self, **kv: Any) -> bool:
         """
         Merge kv pairs into /run/greenboost/control atomically via temp+rename.
-        Pairs with the shim's mtime gate — only re-parses when mtime changes.
+        Pairs with the shim's mtime gate , only re-parses when mtime changes.
         """
         existing: dict[str, str] = {}
         try:
@@ -212,10 +212,10 @@ class GbControl:
             log.warning("[gb_control] control file write failed: %s", exc)
             return False
 
-    # ── OS-tunable backends (continuous OS tuning — supervisor mode only) ─────
+    # ── OS-tunable backends (continuous OS tuning , supervisor mode only) ─────
 
     def _write_path(self, path: str, value: str) -> bool:
-        """Generic /proc/sys or /sys write — same privilege gate as sysfs."""
+        """Generic /proc/sys or /sys write , same privilege gate as sysfs."""
         if not self._priv:
             log.warning("[gb_control] no privilege for write %s", path)
             return False
@@ -265,7 +265,7 @@ class GbControl:
     def _capture_baseline(self, key: str, current: Any) -> None:
         """Record the pre-tune value for `key` once, before the first write.
 
-        Subsequent calls for the same key are no-ops — the baseline is the
+        Subsequent calls for the same key are no-ops , the baseline is the
         value observed the FIRST time GreenBoost ever touches that lever,
         not a rolling snapshot. restore_baseline() reads this file back.
         """
@@ -288,7 +288,7 @@ class GbControl:
         """
         results: dict = {}
         if not _OS_BASELINE_FILE.exists():
-            log.info("[gb_control] no OS-tune baseline file — nothing to restore")
+            log.info("[gb_control] no OS-tune baseline file , nothing to restore")
             return results
         try:
             baseline = json.loads(_OS_BASELINE_FILE.read_text())
@@ -560,7 +560,7 @@ class GbControl:
         except Exception:
             return default
 
-    # ── OS-tunable public levers (continuous OS tuning — Loops O-S) ───────────
+    # ── OS-tunable public levers (continuous OS tuning , Loops O-S) ───────────
     # Each lever captures the pre-tune baseline on its first apply, so
     # restore_baseline() / `greenboost tune --revert` can put the OS back
     # exactly where install-time cmd_tune left it.
@@ -581,7 +581,7 @@ class GbControl:
         return self._lever("energy_perf_pref", epp, None, None, _apply, reason)
 
     def set_numa_balancing(self, on: bool, reason: str = "") -> ActuatorResult:
-        """Disable NUMA balancing during STEADY — avoids cross-NUMA migration
+        """Disable NUMA balancing during STEADY , avoids cross-NUMA migration
         jitter while a CUDA-graph-replayed decode loop wants low variance."""
         def _apply(v: bool) -> bool:
             self._capture_baseline("numa_balancing", self._read_proc_sys(f"{_PROC_SYS_KERNEL}/numa_balancing", "1"))
@@ -651,7 +651,7 @@ class GbControl:
         return ActuatorResult(name, ok, old, None, reason if ok else "apply_failed")
 
     def set_gpu_power_limit(self, w: int, reason: str = "") -> ActuatorResult:
-        """Step power limit DOWN under thermal/clock-throttle stress (Loop P) —
+        """Step power limit DOWN under thermal/clock-throttle stress (Loop P) ,
         trades peak clock for sustained throughput; step back up on clear."""
         def _apply(v: int) -> bool:
             self._capture_baseline("gpu_power_limit_w",
@@ -661,7 +661,7 @@ class GbControl:
 
     def steer_irqs(self, irqs: list, cpu_list: str, reason: str = "") -> ActuatorResult:
         """Steer NIC/NVMe IRQs onto E-cores, away from compute. Applied once at
-        activation (not per-tick) — no baseline capture; IRQ affinity resets
+        activation (not per-tick) , no baseline capture; IRQ affinity resets
         naturally to kernel defaults on reboot."""
         name = "irq_affinity"
         if self._dry_run or not self._actuate:
@@ -676,7 +676,7 @@ class GbControl:
     def set_proc_priority(self, pid: int, nice: int, ioclass: str = "be", iolevel: int = 4,
                            reason: str = "") -> ActuatorResult:
         """Raise Ollama's scheduling priority during active inference phases.
-        Transient — no baseline capture; process exit/restart clears it."""
+        Transient , no baseline capture; process exit/restart clears it."""
         name = f"proc_priority_{pid}"
         if self._dry_run or not self._actuate:
             log.info("[gb_control] DRY-RUN set_proc_priority pid=%d nice=%d ioclass=%s reason=%s",
@@ -720,7 +720,7 @@ class GbControl:
             log.warning("[gb_control] no privilege to persist sysctl drop-in")
             return False
         try:
-            path.write_text("# Generated by GreenBoost continuous OS tuner — see gb_control.py persist()\n"
+            path.write_text("# Generated by GreenBoost continuous OS tuner , see gb_control.py persist()\n"
                              + "\n".join(lines) + "\n")
             return True
         except Exception as exc:

@@ -47,6 +47,12 @@ GB_MSG_MEM_INFO       = 0x31
 GB_MSG_FEEDER_STATUS  = 0x34
 GB_MSG_RESPONSE       = 0x40
 
+# gb_feeder_status_resp sizes (features/net_fabric.h): v3.0 base struct is 64
+# bytes (status..._pad); v3.1 appends 20 bytes of GPU telemetry
+# (gpu_temp_c/gpu_power_w/gpu_util_pct/ecc_dbe_count/throttle_reasons/_pad2).
+GB_FEEDER_STATUS_V30_SIZE = 64
+GB_FEEDER_STATUS_V31_SIZE = 84
+
 GB_NET_FLAG_RESPONSE  = 0x0001
 
 GB_STATUS_OK             = 0
@@ -169,14 +175,24 @@ GB_NET_MAX_GPUS       = 8
 #                       + ram_available_bytes(8) + t3_bytes(8) + name(64) = 100 bytes
 GB_GPU_INFO_SIZE      = 100
 
-def _build_handshake_req():
+# GB_NET_FEAT_ZSTD (net_fabric.h): host advertises transparent zstd payload
+# compression; feeder echoes it when built with libzstd.
+GB_NET_FEAT_ZSTD = 1 << 0
+
+
+def _build_handshake_req(feature_flags: int = 0):
     # gb_net_handshake_req: proto_version(4) gpu_count(4) hostname(64) gpus[8](800)
-    # Total: 872 bytes - must match sizeof(struct gb_net_handshake_req)
+    #   = 872 bytes, plus a trailing feature_flags(4) (proto v3, optional).
+    # netd accepts the 872-byte short form (feature_flags read as 0); append the
+    # field only to negotiate a feature such as zstd compression.
     proto_version = GB_NET_PROTO_VER
     gpu_count = 0
     hostname = b"gb_diag\x00".ljust(GB_NET_MAX_HOSTNAME, b"\x00")
     gpus_blob = b"\x00" * (GB_NET_MAX_GPUS * GB_GPU_INFO_SIZE)
-    return struct.pack("<II", proto_version, gpu_count) + hostname + gpus_blob
+    req = struct.pack("<II", proto_version, gpu_count) + hostname + gpus_blob
+    if feature_flags:
+        req += struct.pack("<I", feature_flags)
+    return req
 
 def do_handshake(sock):
     payload = _build_handshake_req()
@@ -232,6 +248,62 @@ def query_mem_info(sock, device_id=0):
         "t3_free": t3_free, "t3_total": t3_total,
         "t3_speed_mbs": t3_spd,
     }
+
+
+# ── FEEDER_STATUS query (T1/T2/T3 + v3.1 GPU telemetry) ──────────────────────
+
+def query_feeder_status(sock):
+    """Send GB_MSG_FEEDER_STATUS (no payload) and parse gb_feeder_status_resp.
+
+    Returns a dict with T1/T2/T3 free/total bytes, mps_sm_pct,
+    kernel_dispatch_count, and (when the feeder's netd is v3.1+) live GPU
+    telemetry: gpu_util_pct, gpu_temp_c, gpu_power_w, ecc_dbe_count,
+    throttle_reasons. Telemetry fields are 0 on an older/short reply , this
+    is the live-utilization counterpart to query_mem_info's static free/total.
+    Returns None on a too-short or malformed reply.
+    """
+    _send_msg(sock, GB_MSG_FEEDER_STATUS)
+    msg_type, flags, resp = _recv_msg(sock)
+    if len(resp) < GB_FEEDER_STATUS_V30_SIZE:
+        return None
+    (status, mps_sm_pct,
+     t1_free, t1_total, t2_free, t2_total, t3_free, t3_total,
+     kernel_dispatch_count, _pad) = struct.unpack_from("<IIQQQQQQII", resp, 0)
+    out = {
+        "status": status, "mps_sm_pct": mps_sm_pct,
+        "t1_free": t1_free, "t1_total": t1_total,
+        "t2_free": t2_free, "t2_total": t2_total,
+        "t3_free": t3_free, "t3_total": t3_total,
+        "kernel_dispatch_count": kernel_dispatch_count,
+        "gpu_temp_c": 0, "gpu_power_w": 0, "gpu_util_pct": 0,
+        "ecc_dbe_count": 0, "throttle_reasons": 0,
+    }
+    if len(resp) >= GB_FEEDER_STATUS_V31_SIZE:
+        (gpu_temp_c, gpu_power_w, gpu_util_pct, ecc_dbe_count,
+         throttle_reasons, _pad2) = struct.unpack_from(
+            "<HHIIII", resp, GB_FEEDER_STATUS_V30_SIZE)
+        out.update(gpu_temp_c=gpu_temp_c, gpu_power_w=gpu_power_w,
+                   gpu_util_pct=gpu_util_pct, ecc_dbe_count=ecc_dbe_count,
+                   throttle_reasons=throttle_reasons)
+    return out
+
+
+def test_feeder_status(sock):
+    _head("Feeder live status (GB_MSG_FEEDER_STATUS)")
+    fs = query_feeder_status(sock)
+    if not fs:
+        _fail("FEEDER_STATUS query failed or response too short")
+        return False
+    _info(f"kernel_dispatch_count={fs['kernel_dispatch_count']}  "
+          f"mps_sm_pct={fs['mps_sm_pct']}")
+    if fs["gpu_util_pct"] or fs["gpu_temp_c"] or fs["gpu_power_w"]:
+        _info(f"GPU util={fs['gpu_util_pct']}%  temp={fs['gpu_temp_c']}C  "
+              f"power={fs['gpu_power_w']}W  ecc_dbe={fs['ecc_dbe_count']}  "
+              f"throttle=0x{fs['throttle_reasons']:x}")
+    else:
+        _warn("v3.1 GPU telemetry fields are all zero , feeder netd may "
+              "predate v3.1, or NVML util/temp/power queries failed")
+    return True
 
 
 # ── CUDA_MALLOC / CUDA_FREE ───────────────────────────────────────────────────
@@ -466,6 +538,7 @@ def _run_one_feeder(ip, port):
         results["T2"] = test_tier(sock, GB_ALLOC_TIER_T2, "T2 DDR", ip)
         results["T3"] = test_tier(sock, GB_ALLOC_TIER_T3, "T3 NVMe", ip)
         results["compute"] = test_compute(sock)
+        results["telemetry"] = test_feeder_status(sock)
     except (socket.timeout, OSError, EOFError, ValueError, struct.error) as e:
         results["error"] = str(e)
     finally:
@@ -496,8 +569,8 @@ def test_multi_feeder():
     _head("Multi-feeder summary")
     all_pass = True
     col = 22
-    print(f"  {'Feeder':<20}  {'T1':>4}  {'T2':>4}  {'T3':>4}  {'Compute':>8}")
-    print(f"  {'─' * 52}")
+    print(f"  {'Feeder':<20}  {'T1':>4}  {'T2':>4}  {'T3':>4}  {'Compute':>8}  {'Telem':>6}")
+    print(f"  {'─' * 60}")
     for addr, results in sorted(feeder_results.items()):
         def _s(k):
             v = results.get(k)
@@ -506,8 +579,9 @@ def test_multi_feeder():
             return f"{C_YELLOW} -- {C_RESET}"
         err = results.get("error", "")
         err_str = f"  {C_RED}({err}){C_RESET}" if err else ""
-        print(f"  {addr:<20}  {_s('T1'):>4}  {_s('T2'):>4}  {_s('T3'):>4}  {_s('compute'):>8}{err_str}")
-        if any(results.get(k) is False for k in ("T1", "T2", "T3", "compute")):
+        print(f"  {addr:<20}  {_s('T1'):>4}  {_s('T2'):>4}  {_s('T3'):>4}  "
+              f"{_s('compute'):>8}  {_s('telemetry'):>6}{err_str}")
+        if any(results.get(k) is False for k in ("T1", "T2", "T3", "compute", "telemetry")):
             all_pass = False
     print()
     return all_pass
@@ -637,7 +711,7 @@ def test_local() -> bool:
 def main():
     parser = argparse.ArgumentParser(description="GreenBoost feeder diagnostic tool")
     parser.add_argument("command", nargs="?", default="all",
-                        choices=["t1", "t2", "t3", "compute", "all", "info"],
+                        choices=["t1", "t2", "t3", "compute", "telemetry", "all", "info"],
                         help="Which test to run (default: all)")
     parser.add_argument("--ip",   default=None, help="Feeder IP (overrides cluster.conf)")
     parser.add_argument("--port", type=int, default=None, help="Feeder port (default: 9740)")
@@ -709,23 +783,36 @@ def main():
 
     results = {}
 
+    def _run_check(name, fn, *fn_args):
+        # One hung/erroring check (e.g. a GB_MSG_FEEDER_STATUS timeout) must
+        # not crash the whole `all` run with a raw traceback , that hides
+        # whether every OTHER check (notably GPU Compute) actually passed.
+        # Each check gets its own failure reported in the summary instead.
+        try:
+            results[name] = fn(*fn_args)
+        except Exception as e:
+            _fail(f"{name} check raised {e.__class__.__name__}: {e}")
+            results[name] = False
+
     try:
         test_mem_info(sock)
 
         # N10: extended diagnostic modes - exclusive; skip standard suite when used
         if args.heartbeat_latency:
-            results["Heartbeat RTT"] = test_heartbeat_latency(sock)
+            _run_check("Heartbeat RTT", test_heartbeat_latency, sock)
         elif args.rate_limit:
-            results["Rate Limit"] = test_rate_limit(sock)
+            _run_check("Rate Limit", test_rate_limit, sock)
         else:
             if args.command in ("t1", "all"):
-                results["T1 VRAM"]   = test_tier(sock, GB_ALLOC_TIER_T1, "T1 GPU VRAM", ip)
+                _run_check("T1 VRAM", test_tier, sock, GB_ALLOC_TIER_T1, "T1 GPU VRAM", ip)
             if args.command in ("t2", "all"):
-                results["T2 DDR"]    = test_tier(sock, GB_ALLOC_TIER_T2, "T2 DDR (pinned)", ip)
+                _run_check("T2 DDR", test_tier, sock, GB_ALLOC_TIER_T2, "T2 DDR (pinned)", ip)
             if args.command in ("t3", "all"):
-                results["T3 NVMe"]   = test_tier(sock, GB_ALLOC_TIER_T3, "T3 NVMe/pageable", ip)
+                _run_check("T3 NVMe", test_tier, sock, GB_ALLOC_TIER_T3, "T3 NVMe/pageable", ip)
             if args.command in ("compute", "all"):
-                results["GPU Compute"] = test_compute(sock)
+                _run_check("GPU Compute", test_compute, sock)
+            if args.command in ("telemetry", "all"):
+                _run_check("Telemetry", test_feeder_status, sock)
     finally:
         sock.close()
 

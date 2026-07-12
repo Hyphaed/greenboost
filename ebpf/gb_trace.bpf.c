@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * ebpf/gb_trace.bpf.c — GreenBoost eBPF observability layer
+ * ebpf/gb_trace.bpf.c , GreenBoost eBPF observability layer
  *
  * Attaches kprobes to greenboost.ko memory-tier migration functions and
  * emits structured events to a BPF_MAP_TYPE_RINGBUF.  The companion
@@ -8,11 +8,11 @@
  * rates, and writes them to /run/greenboost/ebpf_stats (key=value).
  *
  * Kprobe targets (all in greenboost.c):
- *   gb_t3_evict_buf   (line 431) — T2 DDR → T3 NVMe eviction
- *   gb_t3_promote_buf (line 573) — T3 NVMe → T2 DDR promotion
- *   gb_auto_evict_cold(line 2784)— cold-sweep eviction driver
- *   gb_alloc_buf      (line 1232)— T2 DDR page-pool allocation
- *   gb_pin_user_buf   (line 953) — DMA-BUF / pinned-path registration
+ *   gb_t3_evict_buf   (line 431) , T2 DDR → T3 NVMe eviction
+ *   gb_t3_promote_buf (line 573) , T3 NVMe → T2 DDR promotion
+ *   gb_auto_evict_cold(line 2784), cold-sweep eviction driver
+ *   gb_alloc_buf      (line 1232), T2 DDR page-pool allocation
+ *   gb_pin_user_buf   (line 953) , DMA-BUF / pinned-path registration
  *
  * struct gb_buf fields are accessed with bpf_probe_read_kernel at known
  * offsets (GB_BUF_*_OFFSET in gb_offsets.h) because greenboost.ko does
@@ -63,7 +63,7 @@ struct gb_event {
 /*  BPF maps                                                            */
 /* ──────────────────────────────────────────────────────────────────── */
 
-/* Main event ring — 4 MB; at ~100 events/s that's >40 s of history    */
+/* Main event ring , 4 MB; at ~100 events/s that's >40 s of history    */
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 4 * 1024 * 1024);
@@ -72,7 +72,7 @@ struct {
 /*
  * Entry-state map for kprobe→kretprobe handoff.
  * Key: 64-bit (tgid << 32 | pid).  Value: buf size read at entry.
- * Sized at 4096 concurrent kernel threads — more than enough for a
+ * Sized at 4096 concurrent kernel threads , more than enough for a
  * GreenBoost workload.  Entries are deleted on return.
  */
 struct {
@@ -176,7 +176,7 @@ int BPF_KRETPROBE(kp_cold_sweep_exit, int ret)
 
 /* ──────────────────────────────────────────────────────────────────── */
 /*  gb_alloc_buf(size_t size, u32 flags)                                */
-/*  Emit on entry (before it can fail — we want alloc-attempt rate)     */
+/*  Emit on entry (before it can fail , we want alloc-attempt rate)     */
 /* ──────────────────────────────────────────────────────────────────── */
 
 SEC("kprobe/gb_alloc_buf")
@@ -198,7 +198,7 @@ int BPF_KPROBE(kp_pin_user, __u64 vaddr, __u64 size, __u32 flags)
 }
 
 /* ──────────────────────────────────────────────────────────────────── */
-/*  NVIDIA UVM — optional, attached only when symbol present            */
+/*  NVIDIA UVM , optional, attached only when symbol present            */
 /*                                                                       */
 /*  uvm_perf_event_notify fires on every UVM page migration or fault.   */
 /*  We only capture cause + migration direction; byte count comes from  */

@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
 """
-gb_diffcache.py — GreenBoost diffusion activation caching (TeaCache/DeepCache-style).
+gb_diffcache.py , GreenBoost diffusion activation caching (TeaCache/DeepCache-style).
 
 WHY: Diffusion denoising calls the same DiT/transformer module once per
 timestep. Consecutive timesteps are often near-identical inputs (especially
 mid-schedule, away from the first/last few steps), so the transformer's
 output for this step can sometimes be approximated by reusing the previous
-step's output instead of recomputing it — trading a small, bounded quality
+step's output instead of recomputing it , trading a small, bounded quality
 cost for skipping the most expensive call in the loop.
 
 This is a *generic* implementation: it wraps the whole denoiser module's
@@ -16,7 +16,7 @@ forward call (not individual internal blocks, which would require per-
 architecture knowledge of DiT block boundaries) and decides whether to skip
 recomputation based on a cheap signal computed from the call's input. The
 default signal is the mean-pooled relative L1 distance between this step's
-input hidden-states and the previous step's — an architecture-agnostic
+input hidden-states and the previous step's , an architecture-agnostic
 proxy. Callers with architecture-specific knowledge (e.g. a FLUX model's
 `time_text_embed` modulation vector, which is the signal the published
 TeaCache paper uses for higher fidelity) can pass `signal_fn` to override
@@ -32,7 +32,7 @@ Usage:
     print(gb_diffcache.status(pipe.transformer))
     # {"calls": 28, "skipped": 9, "skip_rate": 0.32, "cache_key": "..."}
 
-A skipped call returns the previous call's *output* unchanged — this only
+A skipped call returns the previous call's *output* unchanged , this only
 makes sense for modules whose API returns the predicted noise/velocity
 tensor directly (the common Diffusers UNet/Transformer2DModel contract).
 """
@@ -67,7 +67,7 @@ class SkipDecider:
     wrapped call is intercepted. `patch()` below uses this internally to
     monkeypatch a module's `forward`; callers with a different interception
     point (e.g. ComfyUI's `model_function_wrapper`, which is not a module
-    forward call at all — see `comfy/samplers.py`'s
+    forward call at all , see `comfy/samplers.py`'s
     `model_options['model_function_wrapper'](apply_model, args_dict)` call
     site) can drive the same algorithm directly without monkeypatching."""
 
@@ -126,7 +126,7 @@ class SkipDecider:
 
 
 def _default_signal_fn(args, kwargs) -> Optional[torch.Tensor]:
-    """Mean-pooled |hidden_states| proxy — the first positional/keyword
+    """Mean-pooled |hidden_states| proxy , the first positional/keyword
     tensor argument, detached and reduced to a single scalar per call so
     the comparison below is O(1) regardless of sequence length."""
     candidate = None
@@ -207,7 +207,7 @@ def unpatch(module: torch.nn.Module) -> None:
 
 
 def reset(module: torch.nn.Module) -> None:
-    """Clear cached output/signal without removing the patch — call at the
+    """Clear cached output/signal without removing the patch , call at the
     start of a new image/video generation so the first step of a new run
     never reuses the previous run's last step."""
     with _state_lock:

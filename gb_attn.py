@@ -899,6 +899,17 @@ def patch_sdpa(bit_width: Union[int, float] = 3, device: str = "cuda",
     import torch.nn.functional as F2
     F2.scaled_dot_product_attention = patched
 
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({
+            "node": "host", "label": "gb_attn", "kind": "turboquant_activate",
+            "n_items": 1, "items": [mode], "duration_s": 0.0, "status": "ok",
+            "k_bits": kb, "v_bits": vb, "device": device,
+            "sparse_v": sparse_v, "mode": mode,
+        })
+    except Exception:
+        pass
+
 
 def unpatch_sdpa():
     """Restore the original F.scaled_dot_product_attention.
@@ -985,6 +996,36 @@ def turboquant_attention(bit_width: Union[int, float] = 3, device: str = "cuda",
     finally:
         if not already:
             unpatch_sdpa()
+
+
+def turboquant_attention_from_env(var: str = "GB_TQ_ATTN"):
+    """Context manager for the enclosed denoise/decode loop, configured from an
+    env var — the canonical form of the spec every consumer was re-parsing
+    locally (ai-forge gen_image._turboquant_ctx, gen_art). Formats:
+
+        k4v3      asymmetric: K gets 4 bits (full TurboQuant), V gets 3 (PolarQuant)
+        3         symmetric bit width (floats like 2.5 allowed)
+        (unset)   nullcontext — provably no-op
+
+    Any parse failure degrades to nullcontext rather than raising: an attention
+    optimization must never break a generation. Consumers keep only a try/except
+    import shim; the parsing lives here so image/video/texture pipelines can't
+    drift (e.g. GB_TQ_ATTN_VIDEO uses the same grammar via `var=`)."""
+    import contextlib
+    import os as _os
+    import re as _re
+
+    spec = _os.environ.get(var, "").strip().lower()
+    if not spec:
+        return contextlib.nullcontext()
+    m = _re.fullmatch(r"k(\d+)v(\d+(?:\.\d+)?)", spec)
+    try:
+        if m:
+            return turboquant_attention(k_bits=int(m.group(1)),
+                                        v_bits=float(m.group(2)))
+        return turboquant_attention(bit_width=float(spec))
+    except Exception:
+        return contextlib.nullcontext()
 
 
 def status() -> dict:

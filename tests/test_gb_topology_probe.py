@@ -3,7 +3,7 @@
 """
 Tests for GpuTopology probe, GpuMetrics topology properties, and B2 PCIe gate.
 
-All NVML / sysfs calls mocked — no GPU or driver required.
+All NVML / sysfs calls mocked , no GPU or driver required.
 """
 import sys
 from pathlib import Path
@@ -28,7 +28,7 @@ def _make_pynvml(
     width_cur=16, width_max=16,
     nvlink_states=None,   # list of (enabled, peer_idx) per link; None = no links
     n_devs=1,
-    p2p_pairs=None,       # list of (peer_idx, status) — status 0 = OK
+    p2p_pairs=None,       # list of (peer_idx, status) , status 0 = OK
 ):
     """Build a minimal pynvml mock for _probe_gpu_topology."""
     nv = MagicMock()
@@ -46,7 +46,7 @@ def _make_pynvml(
     nv.nvmlDeviceGetCurrPcieLinkWidth.return_value      = width_cur
     nv.nvmlDeviceGetMaxPcieLinkWidth.return_value       = width_max
 
-    # NVLink — default: all links disabled
+    # NVLink , default: all links disabled
     nv.NVML_FEATURE_ENABLED           = 1
     nv.NVML_FEATURE_DISABLED          = 0
     nv.NVML_NVLINK_DEVICE_TYPE_GPU    = 0
@@ -109,7 +109,7 @@ def test_sysfs_bdf_lowercased():
     assert _sysfs_bdf("00000000:0A:00.0") == "0000:0a:00.0"
 
 
-# ── _probe_gpu_topology — PCIe ────────────────────────────────────────────────
+# ── _probe_gpu_topology , PCIe ────────────────────────────────────────────────
 
 def test_probe_pcie_gen_width():
     nv = _make_pynvml(gen_cur=5, gen_max=5, width_cur=16, width_max=16)
@@ -167,7 +167,7 @@ def test_has_nvlink_true():
     assert topo.has_nvlink is True
 
 
-# ── _probe_gpu_topology — BDF + NUMA ─────────────────────────────────────────
+# ── _probe_gpu_topology , BDF + NUMA ─────────────────────────────────────────
 
 def test_probe_bdf_decoded():
     nv = _make_pynvml(bdf="00000000:01:00.0")
@@ -189,11 +189,11 @@ def test_probe_numa_node_minus1_when_missing():
     nv = _make_pynvml(bdf="00000000:99:00.0")
     # /sys/bus/pci/devices/0000:99:00.0/numa_node won't exist on test host
     topo = _probe_gpu_topology(nv, MagicMock(), device=0)
-    # Should be -1 (missing) or a real NUMA node — must not raise
+    # Should be -1 (missing) or a real NUMA node , must not raise
     assert isinstance(topo.numa_node, int)
 
 
-# ── _probe_gpu_topology — compute capability ─────────────────────────────────
+# ── _probe_gpu_topology , compute capability ─────────────────────────────────
 
 def test_probe_compute_capability():
     nv = _make_pynvml(cc=(8, 9))
@@ -206,10 +206,10 @@ def test_probe_cc_blackwell():
     assert topo.compute_capability == (12, 0)
 
 
-# ── _probe_gpu_topology — NVLink ─────────────────────────────────────────────
+# ── _probe_gpu_topology , NVLink ─────────────────────────────────────────────
 
 def test_probe_no_nvlink_when_raises():
-    """Consumer GPU with no NVLink support — exception on link 0 → count stays 0."""
+    """Consumer GPU with no NVLink support , exception on link 0 → count stays 0."""
     nv = _make_pynvml(nvlink_states=None)
     topo = _probe_gpu_topology(nv, MagicMock(), device=0)
     assert topo.nvlink_count == 0

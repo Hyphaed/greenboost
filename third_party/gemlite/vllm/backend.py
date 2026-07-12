@@ -302,7 +302,7 @@ _V2_SUPPORTED_METHODS = (
     "GemliteAwqLinearMethod",
     "GemliteA16W8Int8LinearMethod",
     "GemliteA8W8Int8DynamicLinearMethod",
-    # GGUF uses the legacy weight loader (shard_id / data_container) — keep it
+    # GGUF uses the legacy weight loader (shard_id / data_container) , keep it
     # OFF the v2 list or fused qkv/gate_up loading routes to load_qkv_weight
     # which isn't set up on plain UninitializedParameters.
 )
@@ -363,7 +363,7 @@ def enable_gemlite(names: Optional[Iterable[str]] = None) -> None:
 
         _vq.get_quantization_config = _patched
         # Other modules `from ...quantization import get_quantization_config`,
-        # which captures the original as a local name — patch those bindings
+        # which captures the original as a local name , patch those bindings
         # too or they keep returning the stock classes.
         for modname in (
             "vllm.model_executor.model_loader.weight_utils",

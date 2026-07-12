@@ -2,8 +2,12 @@
 # GreenBoost - Setup & installation script for Arch Linux
 # Supports: Arch, Manjaro, EndeavourOS, CachyOS, and any Arch-based distro.
 #
-# This script mirrors greenboost_setup.sh in functionality and UI.
-# Any change to greenboost_setup.sh must be propagated here manually.
+# This script mirrors greenboost_setup.sh's Arch-specific parts: package-manager
+# bootstrap (pacman) and the menu UI. Feature logic shared with the main script
+# (cluster connect, vitals/pool-info parsing, turboquant, etc.) is NOT duplicated
+# here - it execs into greenboost_setup.sh, so patches to that logic land here
+# automatically and never need manual porting. Only Arch-specific bootstrap/UI
+# changes need to be made in this file directly.
 #
 # USAGE:
 #   sudo ./greenboost_setup_arch.sh full-install     - full install (prompts for mode)
@@ -26,7 +30,7 @@ VULKAN_IMPLICIT_LAYER_DIR="/etc/vulkan/implicit_layer.d"
 SHIM_DEST="/usr/local/lib"
 MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-GB_VERSION="3.0"
+GB_VERSION="3.2"
 GB_PROFILES_DIR="/etc/greenboost/profiles"
 GB_ACTIVE_PROFILE_LINK="/etc/greenboost/active_profile.md"
 GB_STOPPED_SERVICES=""
@@ -71,7 +75,7 @@ GB_SPIN_FRAMES=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
 
 gb_header() {
     local cols; cols=$(tput cols 2>/dev/null || echo 64)
-    local title=" GreenBoost v${GB_VERSION} - CUDA Memory Orchestrator for NVidia GPUs (Arch)"
+    local title=" GreenBoost v${GB_VERSION} - CUDA Memory & Compute Orchestrator for NVIDIA GPUs (Arch)"
     echo -e ""
     echo -e "${C_VIOLET}${C_BOLD}  ╔$(printf '═%.0s' $(seq 1 $((cols - 4))))╗${C_RESET}"
     echo -e "${C_VIOLET}${C_BOLD}  ║${C_RESET} ${C_GRAY}${C_BOLD}${title}$(printf ' %.0s' $(seq 1 $((cols - 4 - ${#title} - 1))))${C_VIOLET}${C_BOLD}║${C_RESET}"
@@ -862,7 +866,7 @@ DROPIN
     gb_ok "Ollama drop-in written: $dropin_dir/99-greenboost.conf"
     gb_ok "Ollama context cap set to ${GB_OLLAMA_CTX} tokens (T1: ${GB_PHYS} GB, T2: ${GB_VIRT} GB)"
 
-    # GreenBoost no longer writes to /etc/ld.so.preload — doing so loads the
+    # GreenBoost no longer writes to /etc/ld.so.preload , doing so loads the
     # CUDA/audit interposers into every process including systemd PID 1 and
     # freezes boot ("Failed to load libmount.so").  Injection is per-process
     # via the systemd drop-in written above and the greenboost-run* wrappers.
@@ -1106,7 +1110,7 @@ cmd_show_commands() {
 # ---- Help ------------------------------------------------------------------
 cmd_help() {
     echo ""
-    echo -e "${C_VIOLET}${C_BOLD}GreenBoost v${GB_VERSION} - CUDA Memory Orchestrator for NVidia GPUs (Arch Linux)${C_RESET}"
+    echo -e "${C_VIOLET}${C_BOLD}GreenBoost v${GB_VERSION} - CUDA Memory & Compute Orchestrator for NVIDIA GPUs (Arch Linux)${C_RESET}"
     echo ""
     echo "USAGE:  sudo ./greenboost_setup_arch.sh <command>"
     echo ""

@@ -34,6 +34,7 @@ tests/bench/results.jsonl
 .claude/
 .claude-sessions/
 .mcp-cache/
+.mcp.json
 CLAUDE.md
 MEMORY.md
 memory/
@@ -50,6 +51,7 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+.coverage
 
 # Python venv (managed by greenboost_setup.sh)
 venv/
@@ -58,13 +60,14 @@ venv/
 # GitLab push helper (local-only, never commit credentials or remote config)
 push_to_gitlab.sh
 
-# Claude working folder (session plans, agent docs) — never committed
+# Claude working folder (session plans, agent docs) , never committed
 workflow/
+greenboost_next.md
 
-# Runtime cache (index.db etc) — never expose
+# Runtime cache (index.db etc) , never expose
 .cache/
 
-# Local dev/test/deploy scripts — may carry tokens & local paths, never commit
+# Local dev/test/deploy scripts , may carry tokens & local paths, never commit
 deploy_and_test.py
 deploy_shim.sh
 run_test.sh
@@ -72,6 +75,14 @@ test_qwen_vllm.sh
 
 # All compiled shared libraries (libgreenboost_cuda.so already covered above)
 *.so
+
+# gb-synapse: HuggingFace tokens, pulled GGUF weights, built engine - never
+# committed. Runtime state (/etc, /var/lib, /run) lives outside the repo tree
+# by default; these patterns only guard against a dev pointing GB_SYNAPSE_*
+# env overrides at an in-repo path during local testing.
+hf_token
+*.gguf
+synapse_models/
 
 # Compiler intermediates and manual editor backups
 *.ii
@@ -81,3 +92,9 @@ proton_copy
 # Stray / generated files that must not be committed
 sudo
 build_info
+
+# Claude agent skills/working files , never committed
+.agents/
+enhancements.md
+greenboost_next_check_polishroundup.md
+greenboost_jul12_1.md

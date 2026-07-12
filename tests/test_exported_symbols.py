@@ -237,7 +237,7 @@ class TestNoSo12DefaultVersion:
 
     Invariant: NO libcudart hook may default to @@libcudart.so.12.  Every
     .so.12 export must be a NON-default trampoline (@), with the real body
-    defaulting to @@libcudart.so.13 — exactly how cudaMalloc has always worked.
+    defaulting to @@libcudart.so.13 , exactly how cudaMalloc has always worked.
     """
 
     @pytest.fixture(scope="class")

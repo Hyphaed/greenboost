@@ -1,11 +1,11 @@
 """
-gb_quant_tq.py — TurboQuant WEIGHT backend for gb_quant (sub-4-bit modes).
+gb_quant_tq.py , TurboQuant WEIGHT backend for gb_quant (sub-4-bit modes).
 
 Implements the TurboQuant MSE quantizer (random rotation + per-coordinate
 Lloyd-Max, arXiv:2504.19874) as a *weight* format with a Triton LUT-GEMM
 execution kernel.  This is the "TQ-weight GEMM kernel (rotated activations +
 codebook dequant)" follow-up to workflow/experiments/tq_weight_study.py:
-at 4 bits per weight HQQ+GemLite wins, at <=3 bits TurboQuant wins — so this
+at 4 bits per weight HQQ+GemLite wins, at <=3 bits TurboQuant wins , so this
 module only offers "tq3" (3-bit) and "tq2" (2-bit) modes and gb_quant keeps
 int4-HQQ as the default.
 
@@ -41,7 +41,7 @@ import torch
 
 # ---------------------------------------------------------------------------
 # Lloyd-Max codebooks for d=128 (from turboquantsolutions/turboquant,
-# codebook_d128_b{2,3}.json — Beta-distribution-optimal scalar quantizers
+# codebook_d128_b{2,3}.json , Beta-distribution-optimal scalar quantizers
 # for coordinates of randomly rotated unit vectors). Embedded so gb_quant
 # stays self-carried: consumer venvs install nothing.
 # ---------------------------------------------------------------------------
@@ -216,10 +216,127 @@ except Exception as e:  # pragma: no cover - environment dependent
     _TRITON_ERR = e
 
 
+# ---------------------------------------------------------------------------
+# Persistent autotune cache for the TQ LUT-GEMM kernel.
+#
+# Unlike GemLite (which gb_quant persists via gemlite.cache_config/load_config,
+# see gb_quant._arm_autotune_cache), Triton's own @triton.autotune has no
+# cross-process persistence: _tq_gemm_kernel re-benchmarks its 8 configs on the
+# first launch of every process.  We snapshot the Autotuner's .cache dict
+# (key-tuple -> triton.Config) to disk and pre-populate it on the next run.
+#
+# Same env contract as the gemlite cache: GB_QUANT_NO_AUTOTUNE_CACHE=1 disables,
+# GB_QUANT_CACHE_DIR relocates.  File is keyed by GPU + CUDA + triton version so
+# a toolchain upgrade never reuses stale picks (the file name simply changes).
+# ---------------------------------------------------------------------------
+import os as _os
+
+_tq_cache_armed = False
+
+
+def _tq_cache_key() -> str:
+    dev = torch.cuda.get_device_name(0).replace(" ", "_").replace("/", "_")
+    cuda = (getattr(torch.version, "cuda", None) or "nocuda").replace(".", "")
+    try:
+        import triton as _tr
+        trv = str(getattr(_tr, "__version__", "0")).replace(".", "")
+    except Exception:
+        trv = "0"
+    return f"{dev}_cu{cuda}_tr{trv}"
+
+
+def _tq_cache_path() -> "str | None":
+    if _os.environ.get("GB_QUANT_NO_AUTOTUNE_CACHE", "") == "1":
+        return None
+    if not torch.cuda.is_available():
+        return None
+    cache_dir = _os.path.expanduser(
+        _os.environ.get("GB_QUANT_CACHE_DIR", "~/.cache/greenboost"))
+    return _os.path.join(cache_dir, f"tq_autotune_{_tq_cache_key()}.json")
+
+
+def _config_to_dict(cfg) -> "dict | None":
+    """Serialize a triton.Config to a plain dict (kwargs + launch params)."""
+    try:
+        d = {"kwargs": dict(cfg.kwargs),
+             "num_warps": int(cfg.num_warps),
+             "num_stages": int(cfg.num_stages)}
+        if getattr(cfg, "num_ctas", None) is not None:
+            d["num_ctas"] = int(cfg.num_ctas)
+        return d
+    except Exception:
+        return None
+
+
+def _dict_to_config(d: dict):
+    import triton
+    kw = {"num_warps": d.get("num_warps", 4),
+          "num_stages": d.get("num_stages", 2)}
+    if "num_ctas" in d:
+        kw["num_ctas"] = d["num_ctas"]
+    try:
+        return triton.Config(d["kwargs"], **kw)
+    except TypeError:
+        # older/newer signature: drop num_ctas and retry
+        kw.pop("num_ctas", None)
+        return triton.Config(d["kwargs"], **kw)
+
+
+def _arm_tq_cache() -> None:
+    """Load the TQ autotune cache and arm the at-exit save (idempotent)."""
+    global _tq_cache_armed
+    if _tq_cache_armed or _TRITON_ERR is not None:
+        return
+    _tq_cache_armed = True
+    path = _tq_cache_path()
+    if not path:
+        return
+    cache = getattr(_tq_gemm_kernel, "cache", None)
+    if cache is None:
+        return  # autotuner shape changed upstream; skip silently
+    import atexit
+    import json
+
+    _os.makedirs(_os.path.dirname(path), exist_ok=True)
+    try:
+        if _os.path.isfile(path):
+            with open(path) as f:
+                blob = json.load(f)
+            loaded = 0
+            for ent in blob.get("entries", []):
+                key = tuple(ent["key"])
+                cfg = _dict_to_config(ent["config"])
+                cache[key] = cfg
+                loaded += 1
+            if loaded:
+                print(f"[gb_quant_tq] TQ autotune cache loaded: {path} "
+                      f"({loaded} entries)")
+    except Exception as e:
+        print(f"[gb_quant_tq] TQ autotune cache load skipped ({e!r})")
+
+    def _save() -> None:
+        try:
+            entries = []
+            for key, cfg in _tq_gemm_kernel.cache.items():
+                cd = _config_to_dict(cfg)
+                if cd is None:
+                    continue
+                entries.append({"key": list(key), "config": cd})
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"entries": entries}, f)
+            _os.replace(tmp, path)
+        except Exception:
+            pass
+
+    atexit.register(_save)
+
+
 def tq_gemm(a: torch.Tensor, W_q: torch.Tensor, scales: torch.Tensor,
             lut: torch.Tensor, nbits: int, K: int,
             bias: "torch.Tensor | None" = None) -> torch.Tensor:
     """C = a @ dequant(W_q)  with a (M, K) already block-rotated."""
+    _arm_tq_cache()
     M = a.shape[0]
     N = W_q.shape[1]
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)

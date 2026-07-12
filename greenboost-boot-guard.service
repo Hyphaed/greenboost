@@ -1,0 +1,18 @@
+[Unit]
+Description=GreenBoost kernel module boot guard (DKMS self-heal + load)
+Documentation=file:///usr/local/sbin/greenboost_boot_guard.sh
+DefaultDependencies=no
+After=local-fs.target
+Before=systemd-modules-load.service sysinit.target
+ConditionCapability=CAP_SYS_MODULE
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/greenboost_boot_guard.sh
+# Best-effort by design (see script) , never let this hold up boot.
+TimeoutStartSec=60
+SuccessExitStatus=0
+
+[Install]
+WantedBy=sysinit.target

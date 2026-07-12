@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
 """
-Tests for ReactiveOrchestrator — Loops A, C, E (B3 cluster, B4 health).
+Tests for ReactiveOrchestrator , Loops A, C, E (B3 cluster, B4 health).
 
 All filesystem/ioctl calls patched out. No CUDA, no daemon.
 """
@@ -28,7 +28,7 @@ class _Result:
 class _MockGbControl:
     def __init__(self):
         self._last = {}
-        self.calls = []   # (method_name, value, reason) — Loops O-S assertions
+        self.calls = []   # (method_name, value, reason) , Loops O-S assertions
 
     def set_safety_reserve_gb(self, v, *, reason=""):
         self._last["safety_reserve_gb"] = (v, 0)
@@ -154,7 +154,7 @@ def orch_with_tier():
         yield o, tm
 
 
-# ── Loop A — ECC ratchet ──────────────────────────────────────────────────────
+# ── Loop A , ECC ratchet ──────────────────────────────────────────────────────
 
 def test_loop_a_ecc_ratchet_sets_degraded(orch):
     orch.on_metrics(_make_metrics(ecc_dbe_volatile=1))
@@ -179,7 +179,7 @@ def test_loop_a_shrinks_kv_reserve(orch):
     assert "kv_reserve_mb" in orch._ctrl._last
 
 
-# ── Loop C — predictive KV grow ───────────────────────────────────────────────
+# ── Loop C , predictive KV grow ───────────────────────────────────────────────
 
 def test_loop_c_skipped_while_ecc_degraded(orch):
     """Even with sustained KV pressure (25 polls), Loop C must not grow KV while ECC degraded."""
@@ -189,12 +189,12 @@ def test_loop_c_skipped_while_ecc_degraded(orch):
     # Record KV reserve after ECC shrink
     ecc_kv = orch._ctrl._last.get("kv_reserve_mb", (0, 0))[0]
 
-    # 25 polls at 93% KV pressure — enough to fire Loop C under normal conditions
+    # 25 polls at 93% KV pressure , enough to fire Loop C under normal conditions
     for _ in range(25):
         orch.on_metrics(_make_metrics(kv_reserve_mb=512, kv_used_mb=480))
 
     new_kv = orch._ctrl._last.get("kv_reserve_mb", (0, 0))[0]
-    assert new_kv <= ecc_kv, "Loop C grew KV while ECC degraded — must not happen"
+    assert new_kv <= ecc_kv, "Loop C grew KV while ECC degraded , must not happen"
 
 
 def test_loop_c_t1_headroom_clamp(orch):
@@ -213,7 +213,7 @@ def test_loop_c_t1_headroom_clamp(orch):
     assert kv_new <= max(0, headroom), f"KV grew beyond T1 headroom: {kv_new} > {headroom}"
 
 
-# ── Loop E — VRAM pressure → tier demotion ────────────────────────────────────
+# ── Loop E , VRAM pressure → tier demotion ────────────────────────────────────
 
 def test_loop_e_fires_auto_evict_after_sustained_pressure(orch_with_tier):
     o, tm = orch_with_tier
@@ -228,7 +228,7 @@ def test_loop_e_fires_auto_evict_after_sustained_pressure(orch_with_tier):
 
 def test_loop_e_does_not_fire_on_brief_spike(orch_with_tier):
     o, tm = orch_with_tier
-    # Only 3 polls at 90% — EMA hasn't settled to 87% yet
+    # Only 3 polls at 90% , EMA hasn't settled to 87% yet
     for _ in range(3):
         o.on_metrics(_make_metrics(fb_used_pct=90.0))
     assert o._vram_pressure is False
@@ -242,7 +242,7 @@ def test_loop_e_pressure_clears_when_vram_drops(orch_with_tier):
         o.on_metrics(_make_metrics(fb_used_pct=90.0))
     assert o._vram_pressure is True
 
-    # Feed 5 polls at 0% — EMA drops well below exit threshold (70%)
+    # Feed 5 polls at 0% , EMA drops well below exit threshold (70%)
     for _ in range(5):
         o.on_metrics(_make_metrics(fb_used_pct=0.0))
     assert o._vram_pressure is False
@@ -284,7 +284,7 @@ def test_dump_health_evict_armed_reflects_env(tmp_path, monkeypatch):
     assert o.dump()["health_evict_armed"] is True
 
 
-# ── B3 — Cluster-aware Loop E ─────────────────────────────────────────────────
+# ── B3 , Cluster-aware Loop E ─────────────────────────────────────────────────
 
 def test_b3_cluster_pressure_fires_auto_evict_without_local_threshold():
     """When cluster_tel.any_should_demote() is True, auto_evict fires even if
@@ -333,13 +333,13 @@ def test_b3_cluster_pressure_clears_when_feeders_ok():
 def test_b3_no_cluster_tel_single_gpu_unchanged(orch_with_tier):
     """Without cluster_tel, behaviour is unchanged."""
     o, tm = orch_with_tier
-    # 1 poll at 50% — no cluster_tel, no local threshold crossed
+    # 1 poll at 50% , no cluster_tel, no local threshold crossed
     o.on_metrics(_make_metrics(fb_used_pct=50.0))
     assert o._cluster_pressure is False
     tm.auto_evict.assert_not_called()
 
 
-# ── B4 — Loop F DCGM health ──────────────────────────────────────────────────
+# ── B4 , Loop F DCGM health ──────────────────────────────────────────────────
 
 def test_b4_health_advisory_without_env_flag():
     """When GB_ORCH_HEALTH_EVICT is not set, health degradation logs advisory
@@ -388,7 +388,7 @@ def test_b4_dump_has_health_evict_armed(monkeypatch):
     assert "health_ok" in d
 
 
-# ── Loop C — KV grow + shrink cycle ──────────────────────────────────────────
+# ── Loop C , KV grow + shrink cycle ──────────────────────────────────────────
 
 def test_do_kv_grow_sets_kv_reserve(orch):
     """_do_kv_grow calls set_kv_reserve_mb when T1 headroom allows."""
@@ -414,7 +414,7 @@ def test_do_kv_grow_clamps_to_headroom(orch):
     """When headroom < kv_step, grow is clamped to available headroom."""
     orch._total_vram_mb  = 12000
     orch._ws_reserve_mb  = 9000    # headroom = 12000 - 9000 - 0 - weights_floor
-    # headroom = 12000 - 9000 - weights_floor — less than kv_step (512)
+    # headroom = 12000 - 9000 - weights_floor , less than kv_step (512)
     # but > 0 when weights_floor = 2048, so headroom = 952
     d = {}
     orch._do_kv_grow("test_reason", d)
@@ -475,7 +475,7 @@ def test_kv_grow_shrink_records_decision(orch):
     assert len(orch._decisions) >= initial_decisions + 1  # at least shrink recorded
 
 
-# ── Loop B — workstation governor ─────────────────────────────────────────────
+# ── Loop B , workstation governor ─────────────────────────────────────────────
 
 def test_loop_b_raises_ws_reserve_when_non_gb_enters(orch):
     """Above enter threshold, ws_reserve climbs by WS_STEP_MB."""
@@ -517,7 +517,7 @@ def test_loop_b_no_action_before_total_vram_known(orch):
     assert orch._ws_above is False  # no fire without thresholds
 
 
-# ── Loop D — thermal governor ─────────────────────────────────────────────────
+# ── Loop D , thermal governor ─────────────────────────────────────────────────
 
 def test_loop_d_raises_safety_reserve_on_high_temp(orch):
     """When temp_c EMA crosses 83°C for confirm=3 polls, safety_reserve_gb is raised.
@@ -573,7 +573,7 @@ def test_t1_headroom_mb_returns_zero_when_vram_unknown(orch):
     assert orch._t1_headroom_mb() == 0  # _total_vram_mb starts at 0
 
 
-# ── Loop C — pressure signal path (full EMA drive) ────────────────────────────
+# ── Loop C , pressure signal path (full EMA drive) ────────────────────────────
 
 def test_loop_c_grows_kv_on_sustained_pressure(orch):
     """With 25 polls at 93% KV pressure, Loop C fires and grows KV reserve.
@@ -620,7 +620,7 @@ def test_loop_c_grow_then_shrink_full_cycle(orch):
     assert shrunk_kv >= orch._kv_floor_mb, "KV must not shrink below topology baseline"
 
 
-# ── Loop C — kv_spilled path ──────────────────────────────────────────────────
+# ── Loop C , kv_spilled path ──────────────────────────────────────────────────
 
 def test_kv_spilled_triggers_immediate_grow(orch):
     """When KV spills to T2, _on_kv_spilled fires an immediate grow."""
@@ -658,7 +658,7 @@ def test_kv_spilled_via_on_metrics(orch):
     assert "kv_reserve_mb" in orch._ctrl._last
 
 
-# ── Loop C — clamp path (0 < headroom < kv_step_mb) ──────────────────────────
+# ── Loop C , clamp path (0 < headroom < kv_step_mb) ──────────────────────────
 
 def test_do_kv_grow_clamp_path_fires_when_headroom_partial(orch):
     """When 0 < headroom < kv_step_mb, grow is clamped to available headroom.
@@ -678,7 +678,7 @@ def test_do_kv_grow_clamp_path_fires_when_headroom_partial(orch):
     assert kv_new == 3352, f"Expected clamped grow to 3352 MiB; got {kv_new}"
 
 
-# ── Loop D — temp_ok path ────────────────────────────────────────────────────
+# ── Loop D , temp_ok path ────────────────────────────────────────────────────
 
 def test_loop_d_temp_ok_fires_after_high_temp_exits(orch):
     """After sustained high temp (Loop D enter), clearing it fires _on_temp_ok."""
@@ -697,7 +697,7 @@ def test_loop_d_temp_ok_fires_after_high_temp_exits(orch):
     assert orch._temp_sig.in_hysteresis is False
 
 
-# ── B4 Loop F — health restored + no_tier_manager paths ──────────────────────
+# ── B4 Loop F , health restored + no_tier_manager paths ──────────────────────
 
 def test_b4_health_restored_logs_no_evict(monkeypatch):
     """After health degradation, restoring health_ok fires _on_health_change(True)."""
@@ -714,7 +714,7 @@ def test_b4_health_restored_logs_no_evict(monkeypatch):
     o.on_metrics(_make_metrics(health_ok=False))
     tm.auto_evict.assert_called_once()
 
-    # Restore health — confirm=2 polls with True
+    # Restore health , confirm=2 polls with True
     o.on_metrics(_make_metrics(health_ok=True))
     o.on_metrics(_make_metrics(health_ok=True))
     # No second evict on restoration
@@ -924,7 +924,7 @@ def test_loop_c_resumes_after_thermal_stress_clears():
         o.on_metrics(_make_metrics(kv_reserve_mb=512, kv_used_mb=0))
     kv_after_shrink = o._ctrl._last.get("kv_reserve_mb", (3072, 0))[0]
 
-    # 3. Re-enter high pressure — Loop C should grow from kv_after_shrink
+    # 3. Re-enter high pressure , Loop C should grow from kv_after_shrink
     for _ in range(25):
         o.on_metrics(_make_metrics(kv_reserve_mb=512, kv_used_mb=480))
     kv_after_resume = o._ctrl._last.get("kv_reserve_mb", (kv_after_shrink, 0))[0]
@@ -1074,7 +1074,7 @@ def test_write_state_file_exception_is_swallowed():
         o._write_state_file()   # must not raise
 
 
-# ── G1 — memory-bandwidth stress gate ────────────────────────────────────────
+# ── G1 , memory-bandwidth stress gate ────────────────────────────────────────
 
 def test_mem_bw_stress_starts_false():
     o = _make_orch_no_io()
@@ -1166,7 +1166,7 @@ def test_loop_g_clears_mem_bw_stress_via_on_metrics():
     assert o.mem_bw_stress is False
 
 
-# ── G2 — power_near_limit gate on Loop C ─────────────────────────────────────
+# ── G2 , power_near_limit gate on Loop C ─────────────────────────────────────
 
 def test_power_near_limit_false_when_limit_unknown():
     """power_near_limit is False when power_limit_w is 0 (field not sampled)."""
@@ -1181,7 +1181,7 @@ def test_power_near_limit_false_when_below_threshold():
     from gb_telemetry import GpuMetrics
     m = GpuMetrics()
     m.power_w = 200.0
-    m.power_limit_w = 300.0   # 66% — well below 93%
+    m.power_limit_w = 300.0   # 66% , well below 93%
     assert m.power_near_limit is False
 
 
@@ -1189,7 +1189,7 @@ def test_power_near_limit_true_when_above_threshold():
     from gb_telemetry import GpuMetrics
     m = GpuMetrics()
     m.power_w = 282.0
-    m.power_limit_w = 300.0   # 94% — above 93%
+    m.power_limit_w = 300.0   # 94% , above 93%
     assert m.power_near_limit is True
 
 
@@ -1226,7 +1226,7 @@ def test_loop_c_fires_when_power_ok():
     assert ctrl._last["kv_reserve_mb"][0] > 3072
 
 
-# ── H1 — ECC SBE early-warning ────────────────────────────────────────────────
+# ── H1 , ECC SBE early-warning ────────────────────────────────────────────────
 
 def test_sbe_elevated_starts_false():
     o = _make_orch_no_io()
@@ -1246,7 +1246,7 @@ def test_sbe_change_noop_when_count_does_not_rise():
     """_on_sbe_change is a no-op when new <= _sbe_seen (no new errors)."""
     o = _make_orch_no_io()
     o._sbe_seen = 5
-    o._on_sbe_change(5, 5)   # same value — no new errors
+    o._on_sbe_change(5, 5)   # same value , no new errors
     assert o.sbe_elevated is False
 
 
@@ -1284,8 +1284,8 @@ def test_loop_h_fires_via_on_metrics():
         return m
 
     # Signal confirm=2: need 2 consecutive polls with the same rising value
-    o.on_metrics(_sbe_metrics(2))   # first poll — sbe > _sbe_seen=0, sets signal
-    o.on_metrics(_sbe_metrics(2))   # second poll — confirm fires
+    o.on_metrics(_sbe_metrics(2))   # first poll , sbe > _sbe_seen=0, sets signal
+    o.on_metrics(_sbe_metrics(2))   # second poll , confirm fires
     assert o.sbe_elevated is True
     assert o._sbe_seen == 2
 
@@ -1297,12 +1297,12 @@ def test_loop_h_no_fire_without_confirm():
 
     m = _make_metrics()
     m.ecc_sbe_volatile = 1
-    o.on_metrics(m)   # first poll only — confirm not reached
+    o.on_metrics(m)   # first poll only , confirm not reached
     assert o.sbe_elevated is False
 
 
 def test_loop_h_does_not_actuate_levers():
-    """SBE warning is advisory only — kv_reserve and safety_reserve are unchanged."""
+    """SBE warning is advisory only , kv_reserve and safety_reserve are unchanged."""
     ctrl = _MockGbControl()
     o = _make_orch_no_io(ctrl=ctrl)
     o._on_sbe_change(5, 0)
@@ -1311,7 +1311,7 @@ def test_loop_h_does_not_actuate_levers():
     assert "safety_reserve_gb" not in ctrl._last
 
 
-# ── Loop I — SM clock throttle ────────────────────────────────────────────────
+# ── Loop I , SM clock throttle ────────────────────────────────────────────────
 
 def _feed_clock(o, sm_clock_mhz, count=1):
     """Feed N polls of sm_clock_mhz through on_metrics."""
@@ -1333,7 +1333,7 @@ def test_loop_i_no_fire_before_warmup():
     o = _make_orch_no_io()
     # Prime max with 2 polls at 2587 MHz (below warmup=3)
     _feed_clock(o, 2587, 2)
-    # Now feed low clock — should not fire yet (warmup incomplete)
+    # Now feed low clock , should not fire yet (warmup incomplete)
     _feed_clock(o, 2100, 2)
     assert o.clock_throttled is False
 
@@ -1451,7 +1451,7 @@ def test_loop_i_does_not_fire_when_sm_clock_zero():
     assert o._sm_clock_max == 0
 
 
-# ── Phase gate — shim_phase blocks KV grows during idle/loading ──────────────
+# ── Phase gate , shim_phase blocks KV grows during idle/loading ──────────────
 
 def test_phase_gate_blocks_kv_grow_during_model_load():
     """Loop C skips KV grow when shim_phase=MODEL_LOAD."""
@@ -1501,7 +1501,7 @@ def test_phase_gate_allows_kv_grow_during_inference():
 
 
 def test_phase_gate_allows_kv_grow_when_phase_unknown():
-    """Loop C fires when shim_phase='' (shim absent — conservative allow)."""
+    """Loop C fires when shim_phase='' (shim absent , conservative allow)."""
     ctrl = _MockGbControl()
     ctrl._last["kv_reserve_mb"] = (512, 0.0)
     ctrl._last["safety_reserve_gb"] = (4, 0.0)
@@ -1534,7 +1534,7 @@ def test_phase_in_dump():
     assert o.dump()["shim_phase"] == "INFERENCE"
 
 
-# ── Loop J — INFERENCE→IDLE phase-transition KV reclaim ─────────────────────
+# ── Loop J , INFERENCE→IDLE phase-transition KV reclaim ─────────────────────
 
 def test_loop_j_reclaims_kv_on_inference_to_idle():
     """INFERENCE→IDLE shrinks KV reserve to floor immediately."""
@@ -1634,7 +1634,7 @@ def test_loop_j_last_phase_in_dump():
     assert o.dump()["last_phase"] == "INFERENCE"
 
 
-# ── Loop K — post-throttle KV restore ────────────────────────────────────────
+# ── Loop K , post-throttle KV restore ────────────────────────────────────────
 
 def _feed_clock_and_pressure(o, mhz, pressure_ratio, count):
     """Feed clock + KV pressure polls to drive both Loop I and Loop C signals."""
@@ -1722,7 +1722,7 @@ def test_loop_k_blocked_during_idle_phase():
 
     kv_after_throttle = ctrl._last.get("kv_reserve_mb", (0, 0))[0]
 
-    # Clock recovers but we're now in IDLE — Loop K must not fire
+    # Clock recovers but we're now in IDLE , Loop K must not fire
     m_ok = _make_metrics(kv_reserve_mb=512, kv_used_mb=int(512 * 0.95))
     m_ok.sm_clock_mhz = 2820
     m_ok.shim_phase = "IDLE"
@@ -1738,11 +1738,11 @@ def test_loop_j_no_crash_when_ctrl_none():
     """_reclaim_kv_for_idle returns safely when ctrl is None."""
     o = _make_orch_no_io()
     o._ctrl = None  # simulate no control interface
-    # Must not raise — the null guard must fire and return early
+    # Must not raise , the null guard must fire and return early
     o._reclaim_kv_for_idle()
 
 
-# ── Loop N — Adaptive telemetry poll rate ────────────────────────────────────
+# ── Loop N , Adaptive telemetry poll rate ────────────────────────────────────
 
 def _make_orch_with_tel():
     """Orchestrator with a mock TelemetryManager for Loop N tests."""
@@ -1805,7 +1805,7 @@ def test_loop_n_no_op_without_tel_manager():
     """_adapt_poll_rate must not raise when tel_manager is None."""
     o = _make_orch_no_io()
     assert o._tel_manager is None
-    # Feed a transition — must not raise
+    # Feed a transition , must not raise
     _feed_phase(o, "INFERENCE")
     _feed_phase(o, "IDLE")
 
@@ -1835,7 +1835,7 @@ def test_loop_n_dump_default_without_tel():
     assert o.dump()["poll_ms"] == _POLL_MS_DEFAULT
 
 
-# ── Continuous OS tuning — Loops O-S ─────────────────────────────────────────
+# ── Continuous OS tuning , Loops O-S ─────────────────────────────────────────
 
 def _make_supervisor_orch(monkeypatch, os_tune="1", **kw):
     """Construct a supervisor-mode orchestrator with GB_OS_TUNE set before
@@ -1901,7 +1901,7 @@ def test_gaming_mode_fed_from_gb_pool_info(orch):
     assert orch.gaming_mode is True
 
 
-# ── Loop O — performance envelope ────────────────────────────────────────────
+# ── Loop O , performance envelope ────────────────────────────────────────────
 
 def test_loop_o_engages_performance_envelope_on_inference(monkeypatch):
     o, ctrl = _make_supervisor_orch(monkeypatch)
@@ -1971,7 +1971,7 @@ def test_loop_o_skips_clock_lock_without_sm_clock_max(monkeypatch):
     assert not any(c[0] == "lock_gpu_clocks" for c in ctrl.calls)
 
 
-# ── Loop P — thermal/throttle power cap ──────────────────────────────────────
+# ── Loop P , thermal/throttle power cap ──────────────────────────────────────
 
 def test_loop_p_thermal_high_steps_power_down(monkeypatch):
     o, ctrl = _make_supervisor_orch(monkeypatch)
@@ -2016,7 +2016,7 @@ def test_loop_p_noop_without_power_limit_known(monkeypatch):
     assert "gpu_power_limit_w" not in ctrl._last
 
 
-# ── Loop Q — host memory-pressure VM tune ────────────────────────────────────
+# ── Loop Q , host memory-pressure VM tune ────────────────────────────────────
 
 def test_loop_q_mem_psi_high_tightens_vm(monkeypatch):
     o, ctrl = _make_supervisor_orch(monkeypatch)
@@ -2054,7 +2054,7 @@ def test_loop_q_fires_via_on_metrics_psi_feed(monkeypatch):
     assert any(c[0] == "set_watermark_scale_factor" for c in ctrl.calls)
 
 
-# ── Loop R — host CPU/IO pressure assist ─────────────────────────────────────
+# ── Loop R , host CPU/IO pressure assist ─────────────────────────────────────
 
 def test_loop_r_cpu_psi_high_during_inference_reasserts_governor(monkeypatch):
     o, ctrl = _make_supervisor_orch(monkeypatch)
@@ -2073,14 +2073,14 @@ def test_loop_r_cpu_psi_high_outside_perf_phase_is_noop(monkeypatch):
 
 
 def test_loop_r_io_psi_high_during_t3_spill_is_advisory(monkeypatch):
-    """No GbControl lever exists yet for NVMe tuning — must not raise, must record."""
+    """No GbControl lever exists yet for NVMe tuning , must not raise, must record."""
     o, ctrl = _make_supervisor_orch(monkeypatch)
     gb = GbPoolInfo()
     gb.t3_pressure = 2
     o._last_metrics = _make_metrics()
     o._last_metrics.gb = gb
     o._on_io_psi_high(25.0)   # must not raise
-    assert ctrl.calls == []   # advisory only — no lever exists
+    assert ctrl.calls == []   # advisory only , no lever exists
 
 
 def test_loop_r_io_psi_high_without_t3_pressure_is_noop(monkeypatch):
@@ -2097,7 +2097,7 @@ def test_loop_r_noop_in_process_mode(orch):
     assert "cpu_governor" not in orch._ctrl._last
 
 
-# ── Loop S — PCIe saturation ──────────────────────────────────────────────────
+# ── Loop S , PCIe saturation ──────────────────────────────────────────────────
 
 def test_loop_s_pcie_saturated_engages_prefetch_throttle(monkeypatch):
     o, ctrl = _make_supervisor_orch(monkeypatch)

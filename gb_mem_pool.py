@@ -2,18 +2,18 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
 """
-gb_mem_pool.py — GreenBoost CUDA memory pool manager.
+gb_mem_pool.py , GreenBoost CUDA memory pool manager.
 
 Creates per-purpose CUDA memory pools to avoid fragmentation:
-  weights     — model weight tensors (large, long-lived)
-  activations — ephemeral activation buffers (small, short-lived)
-  latents     — diffusion latent tensors (medium, per-step)
-  temporaries — scratch space (freed within a single op)
+  weights     , model weight tensors (large, long-lived)
+  activations , ephemeral activation buffers (small, short-lived)
+  latents     , diffusion latent tensors (medium, per-step)
+  temporaries , scratch space (freed within a single op)
 
 Uses torch.cuda.MemPool (PyTorch ≥ 2.6) when available; falls back to
 the default allocator with explicit fragmentation tracking.
 
-GreenBoost note: we NEVER call torch.cuda.empty_cache() — it raises
+GreenBoost note: we NEVER call torch.cuda.empty_cache() , it raises
 CUDA invalid argument under the GreenBoost DynamicVRAM shim. Instead,
 pools manage their own memory lifecycle. For cross-pool reclaim, call
 pool.trim(target_mb).
@@ -67,7 +67,7 @@ class _Pool:
             self._mempool = torch.cuda.MemPool()
             self._supported = True
         except AttributeError:
-            # PyTorch < 2.6 — no MemPool API; use default allocator
+            # PyTorch < 2.6 , no MemPool API; use default allocator
             self._supported = False
 
     @contextlib.contextmanager

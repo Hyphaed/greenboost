@@ -1,17 +1,233 @@
 # GreenBoost Changelog
 
+
+<details>
+<summary><strong>Jump to a version</strong></summary>
+
+- [v3.2 , 2026-07-06](#v32--2026-07-06)
+- [v3.1 , 2026-06-16](#v31--2026-06-16)
+- [v3.0 , 2026-06-13](#v30--2026-06-13)
+- [v2.9 , 2026-06-10](#v29--2026-06-10)
+- [v2.8 , 2026-04-10](#v28--2026-04-10)
+- [v2.7 , 2026-03-29](#v27--2026-03-29-same-day-version-update-develop-branch-merged)
+- [v2.6 , 2026-03-29](#v26--2026-03-29)
+- [v2.5 , first open-source release](#v25--first-open-source-release)
+- [v2.4 , last private release](#v24--last-private-release)
+
+</details>
+
 ---
 
-## v3.2 : 2026-06-22
+## Unreleased , efficiency quick wins (2026-07-11)
 
-### Hot/cold residency engine — the kernel evictor is no longer pure LRU
+Four default-safe optimizations toward the "AI memory OS" roadmap
+(`greenboost_next.md`), none changing default behavior:
 
-The CUDA shim has tracked per-allocation access frequency since v2.x
-(`gb_ht_entry_t.access_count`, the "U1 ARC tracking" counter) but never used
-it for anything — the kernel evictor (`gb_try_evict_for_alloc`,
-`gb_auto_evict_cold` in `greenboost.c`) only ever walked the T2 LRU tail,
-so a weight buffer hit thousands of times in the last second could still be
-evicted before a buffer touched once and never again.
+- **Version-scoped gb-quant autotune cache.** The persisted GemLite Triton
+  autotune file is now keyed on GPU **+ CUDA + gemlite version**, so a toolchain
+  upgrade never silently reuses stale kernel configs. Opt-out
+  `GB_QUANT_NO_AUTOTUNE_CACHE=1`.
+- **Transparent zstd for T3 checkpoints.** Models evicted to NVMe compress
+  automatically (python-zstandard → `zstd` CLI → plain fallback); legacy plain
+  `.pt` still loads; ratio/timing recorded in the dataflux `tier_move` event.
+  Opt-out `GB_T3_COMPRESS=0`.
+- **Phase-aware T1 workspace reserve** (`GREENBOOST_T1_WORKSPACE_MB`, default
+  off). Holds VRAM back during model load so per-step compute workspace stays
+  in T1 instead of spilling to T2, released at inference — generalizes the
+  validated diffusion trick (denoise steps 37 s → 10 s) into the shim for every
+  workload.
+- **Opt-in tiered precision** (`GB_QUANT_TIERED_PRECISION=1`). Hot (fitting)
+  weights stay at fp8; the cold overflow tail drops to nvfp4 on Blackwell (else
+  int4), trading precision for bandwidth only where weights don't fit. fp8
+  stays the default; nvfp4/int4 never become the blanket default.
+
+Full test suite: 680 passed.
+
+## v3.2 : Big changes
+
+I want to explain the thinking behind this release before listing what's in
+it, because it's the reason GreenBoost exists at all. I don't like accepting
+hardware limits as a fact of life. When a GPU runs out of VRAM, the "normal"
+answer is to buy a bigger GPU. My answer has always been: find the memory
+somewhere else first, and keep using the card I already have. That's what T2
+(system RAM) and T3 (NVMe) already do. v3.2's big theme is doing the same
+thing one level further out: if there's a second machine with a GPU sitting
+idle on the network, that's more VRAM and more compute too, not a separate
+box you have to manage by hand.
+
+If that sounds like an odd thing to insist on, look at DLSS. DLSS doesn't add
+a single transistor to a GPU, yet a card from three years ago suddenly renders
+like a newer one because the software got smarter about using the silicon
+that's already there. That's not a gimmick, it's proof that software can be
+enhnace/improve the output of already owned hardware. GreenBoost is built
+on the same bet, applied to memory and compute.
+
+### Polished through real use, not just benchmarks
+
+Almost everything released came out of running GreenBoost on
+my own machines, mostly local image and video generation through Hugging Face
+diffusion pipelines, plus local LLMs, and fixing whatever actually got in the
+way. That matters because it's a different kind of testing than writing a
+feature and moving on.
+
+### `greenboost cluster` , proud to call this one done, not experimental
+
+Until now, `greenboost cluster` was labeled alpha. v3.2 is the first release
+where I'd call it genuinely working, and it's the headline of this release for
+a reason: **it brings local AI inference to the next level, because now you can
+orchestrate the hardware you already own on your own network instead of it
+sitting idle.:
+
+- **Memory aggregation is solid.** A feeder machine's GPU memory, system RAM,
+  and disk all fold into the *same* single virtual GPU that Ollama or any CUDA
+  app sees. Run `greenboost connect <feeder-ip>` once and that machine simply
+  becomes more room to load bigger models into. This tier ordering (local GPU
+  memory, then feeder GPU memory, then local system RAM, then feeder system
+  RAM, then local disk, then feeder disk) has now been stress-tested moving
+  multi-gigabyte weight sets back and forth over the network without
+  corruption, including automatic reconnection when a network link hiccups.
+
+- **A Python API that already makes image and video generation faster by
+  putting a second GPU to work.** `gb_cluster.py` lets any pipeline hand an
+  entire stage (say, prompt encoding) or the tail end of a model off to a
+  feeder machine's GPU, then get the result back over a secured connection. On
+  a real diffusion pipeline I run at home, combining this with a few other
+  fixes took a generation that used to take about 5.5 minutes down to about 42
+  seconds, roughly **7.8× faster**, by putting two consumer GPUs to work
+  together instead of waiting on one.
+
+**What this means in plain terms:** if you've got a gaming PC and a laptop
+with a GPU gathering dust, GreenBoost can now turn that idle laptop into a
+second brain for your local inference, instead of it just collecting dust in
+a corner.
+
+### dataflux , a flight recorder for everything GreenBoost is doing
+
+This is new in v3.2. GreenBoost now keeps a continuous, low-overhead log of
+what the whole system is doing, not just a snapshot when something breaks:
+VRAM used and free, GPU and CPU load, temperature and power draw, how full
+the KV cache is, when data moves between memory tiers, every quantization
+decision, per-machine throughput when a feeder is connected, and even the
+real, measured tokens-per-second the model actually delivered. Think of it
+like an aircraft's flight recorder: it's always running quietly in the
+background, so when you want to know "what was actually happening five
+minutes ago," the answer is already there instead of gone.
+
+To look at it, run:
+
+```bash
+greenboost dataflux-ui
+# or: python3 gb_dataflux.py serve
+```
+
+That opens a small local web page (`http://127.0.0.1:8799` by default) that
+auto-refreshes every 5 seconds, with sections for quantization decisions,
+memory-tier movement, live VRAM/GPU/CPU charts, and, once a feeder is
+connected, per-machine cluster throughput:
+
+![GreenBoost dataflux web UI](greenboost_dataflux_ui.png)
+
+It works standalone on a single machine, no feeder required, and there's also
+a plain-text `greenboost dataflux-ui --llm` / `summary` mode for a quick
+snapshot without opening a browser.
+
+### The dataflux MCP server 
+
+`gb_dataflux_mcp.py` is GreenBoost's own MCP server: a read-only window into
+the dataflux log above for any MCP-compatible AI assistant, so it can answer
+"what actually happened" without you opening the web UI or shelling out. It
+shipped in v3.2 with three tools; this cycle it grew to cover the log's full
+shape instead of just the top-level summary:
+
+- `dataflux_events` now filters by event **kind**, not just node/label/
+  status , the log holds several distinct kinds of activity (tier moves,
+  quantization decisions, measured tok/s, cluster job chunks, model pushes)
+  and there was previously no way to ask for just one.
+- `dataflux_kinds` (new) , a quick breakdown of how many events of each kind
+  were logged and when the most recent one happened, so you can see what
+  actually happened before drilling into any one thing.
+- `dataflux_tier_moves` (new) , just the memory-tier promote/demote/evict
+  events from `gb_model_tier.py`.
+- `dataflux_quantization` (new) , just the quantization decisions from
+  `gb_quant.py`, component and bits chosen, budget vs. actual GiB.
+- `dataflux_tok_s` (new) , measured, real tokens-per-second per model, the
+  actual client-observed number every orchestration decision is judged
+  against, not the predicted one.
+
+Still read-only, still local, still the same JSONL log that backs
+`greenboost dataflux-ui`.
+
+
+
+### gb-synapse , GreenBoost's own model server, spread across the cluster
+
+** enters this release at beta stage
+
+Also new in v3.2. Ollama is great, but it only serves models from its own
+registry. `gb-synapse` (`gb_synapse.py`) goes straight to the source: it
+pulls GGUF models directly from any HuggingFace repository, gated or public,
+given a token, and it also indexes whatever GGUFs Ollama already downloaded,
+so one command sees both. 
+
+The part I'm happiest with: gb-synapse doesn't reinvent cluster serving, it
+hands the cross-machine split to llama.cpp's own battle-tested RPC backend,
+so a model gets split layer-by-layer across every connected machine and only
+the small activation tensors cross the network, not the weights. The
+GreenBoost shim keeps doing what it already does underneath, on every node,
+so each machine's own share of the model can still spill into that machine's
+own RAM if it doesn't fit VRAM. In short: llama.cpp's RPC handles the split
+*between* machines, GreenBoost handles the tiers *within* each one.
+
+```bash
+sudo greenboost synapse login              # store a HuggingFace token
+sudo greenboost pull <repo>[:quant]        # download a GGUF
+greenboost synapse run <model>             # serve it, cluster-aware, on :11434
+```
+
+Once running, it speaks Ollama's API, OpenAI's API, and HuggingFace's TGI API
+on the same port, so existing tools don't need to know anything changed.
+Full command reference in
+
+[GREENBOOST_COMMANDS.md § gb-synapse](GREENBOOST_COMMANDS.md#-gb-synapse-huggingface-native-cluster-distributed-gguf-serving).
+
+
+### Reactive orchestration grows from 3 loops into a real control system
+
+v3.1 introduced `gb_orchestrator`, which closed three feedback loops that used
+to just log a problem and do nothing about it (an ECC memory error, VRAM
+pressure, and reclaiming idle models). v3.2 expands that considerably: it now
+also watches for thermal stress, memory-bandwidth stress, and GPU clock
+throttling, and adds a predictive KV-cache grower that only acts once six
+independent safety checks all agree it's safe to do so. For the root daemon,
+there's now an opt-in continuous tuner that reacts to live system pressure by
+adjusting the CPU governor, GPU clock and power limits, and kernel memory
+settings, and every change it makes can be undone with the new
+`greenboost tune-revert`.
+
+None of this touches your system unless you turn it on
+(`GB_ORCH_ACTUATE=1`), by default GreenBoost only watches and reports what it
+*would* do, visible through `greenboost vitals`. Under the hood, this runs on
+a small new reactive-signal library (`gb_reactive.py`, no external
+dependencies) and a hardware-topology module (`gb_topology.py`) that reads
+your actual CPU/GPU layout instead of guessing at it.
+
+### Telemetry, polished through daily use
+
+`gb_telemetry.py` picked up a round of real-world polish this cycle: it now
+tracks PCIe link health (so a GPU stuck in a degraded PCIe slot is visible
+instead of silently slower), host-level pressure metrics (CPU, memory, and
+disk I/O, read straight from the kernel's own pressure-stall accounting), and
+a feeder-aware mode so a connected feeder's GPU health shows up in the same
+telemetry stream as your local one. There's also a lighter-weight GPU-metrics
+fallback that needs no extra Python packages, and, closing the loop, a new
+measured-tokens-per-second signal that ties every orchestration decision back
+to the actual speed a model delivered, not just the speed GreenBoost expected.
+
+### Hot/cold residency engine , the kernel evictor is no longer pure LRU
+
+In plain terms: when GreenBoost has to make room in GPU memory, it now tries
+to evict the data you're actually using the least, not just the data that
+happened to arrive first.
 
 - New `GB_IOCTL_SET_HEAT` ioctl (`greenboost_ioctl.h` cmd 26): the shim's
   `prefetch_worker` thread now pushes a batched snapshot of live
@@ -20,50 +236,48 @@ evicted before a buffer touched once and never again.
   (ARC-style aging).
 - Both eviction sweeps now prefer the coldest eligible candidates first
   (heat==0, then heat≤2, then unbounded) before falling back to pure LRU
-  order within each tier — same skip-rule semantics (`frozen`,
+  order within each tier , same skip-rule semantics (`frozen`,
   `t1_priority`, `session_priority`, `GB_ALLOC_KV_CACHE` exemptions
   unchanged), just better-ordered eviction among already-eligible buffers.
 - New kernel debugfs export, `/sys/kernel/debug/greenboost/residency`
   (per-buffer id/tier/size/heat/flags/pid), and two new commands:
   `greenboost top` (live per-buffer residency, sorted hottest-first) and
   `greenboost residency` (aggregate hot/warm/cold byte breakdown + churn).
-
-### Path C (managed UVM) — considered for reintroduction, not reintroduced
-
-Evaluated reintroducing UVM demand-paging as an oversubscription fallback
-below T3 NVMe (motivated by an external review suggesting GreenBoost adopt
-UVM fault telemetry, e.g. `bpf_uvm`-style tracing). Decision: **not
-reintroduced as a spill tier.**
-
-- The explicit T3 NVMe tier already provides graceful oversubscription
-  without UVM's fault-driven demand-paging stalls — that stall behavior is
-  exactly why managed UVM was removed from the T2/T3 spill path in the
-  first place (see the v2.x note in `DOCUMENTATION.md` and
-  `CONTAINER_VM_MODE.md`'s Path C description). Reintroducing it would
-  re-break the Immutable Design Rule (GPU compute always; no CPU
-  page-fault-driven stalling on the inference critical path).
-- Managed UVM (`cuMemAllocManaged` + `cuMemAdvise`) remains exactly where
-  it already was: the pinned Blackwell-PCIe T2 backing method
-  (`gb_vmm_t2_alloc_blackwell_managed` in `greenboost_cuda_shim.c`), hinted
-  to stay in host RAM so it does **not** demand-page. This is unchanged.
-- No third-party attribution applies to Path C itself — it is built from
-  stock NVIDIA UVM primitives (CUDA Programming Guide §K, `cuMemAdvise`),
-  not adapted from any external project.
+  A related new command, `greenboost faults`, surfaces tier-migration and
+  memory-fault activity for day-to-day debugging.
 
 ### eBPF observability layer (`ebpf/gb_trace.bpf.c`)
 
+In plain terms: a zero-overhead kernel tracer that lets `greenboost faults`
+show real, live memory-movement activity instead of a periodic sample.
+
 A CO-RE eBPF tracer attaches kprobes to GreenBoost's own tier-migration
 functions (`gb_t3_evict_buf`, `gb_t3_promote_buf`, `gb_auto_evict_cold`,
-`gb_alloc_buf`, `gb_pin_user_buf` — not `nvidia_uvm`, which sees no faults
+`gb_alloc_buf`, `gb_pin_user_buf` , not `nvidia_uvm`, which sees no faults
 under GreenBoost's pinned-DDR design) and emits structured events to a
 ringbuf, consumed by `gb_telemetry.py`'s `EbpfProvider` and surfaced in
 `greenboost faults`. The kprobe→ringbuf→telemetry pattern is adapted from
 **[bpf_uvm](https://github.com/vchuravy/bpf_uvm)** (Valentin Churavy, MIT
-license) — repointed from `nvidia_uvm` fault events onto GreenBoost's own
+license) , repointed from `nvidia_uvm` fault events onto GreenBoost's own
 kernel paths, since that is where the actual migration signal lives for
 this architecture. See `THIRD_PARTY_NOTICES.md`. Builds only when
 `clang`/`bpftool`/`libbpf-dev` are present (`make BPF=1 ebpf`); degrades
 gracefully to procfs/shim_stats-only reporting otherwise.
+
+### Two experimental performance layers, reported honestly
+
+- `gb_prefetch.py` , overlaps loading the next transformer layer with
+  computing the current one, for models that aren't already placed by
+  gb-quant. Worth saying plainly: in my own benchmarking it hasn't beaten
+  the no-prefetch baseline on a gb-quant-placed model yet, so treat it as an
+  option to try, not a guaranteed win.
+
+- `gb_diffcache.py` , a TeaCache/DeepCache-style cache for diffusion models
+  that skips recomputing a step when barely anything changed since the last
+  one, with guards so it doesn't go stale when a LoRA changes mid-run.
+
+
+---
 
 ## v3.1 : 2026-06-16
 - Telemetry layer stitched directly into the CUDA shim , live ECC/power/PCIe signals now available in-process at 500 ms resolution.
@@ -71,6 +285,8 @@ gracefully to procfs/shim_stats-only reporting otherwise.
 - `vitals`/`cluster` commands now use in-process pynvml instead of nvidia-smi subprocess forks.
 - `vmm_override` PLT fix, `greenboost_setup.sh`.
 - Bugfixes
+
+---
 
 ## v3.0 : 2026-06-13
 v3.0 Includes the work not commited on v2.9 + bugfixes due issues reported by other users
@@ -254,7 +470,7 @@ I really shouldn't be near a keyboard right now.
 
 This release was made to comply with a trademark notice concerning the use of the NVIDIA wordmark in the project title. The tool has been renamed:
 
-> **GreenBoost : CUDA Memory Orchestrator for NVidia GPUs**
+> **GreenBoost : CUDA Memory & Compute Orchestrator for NVIDIA GPUs**
 
 "NVidia" is used here only as a hardware descriptor, not as a brand identifier.
 GreenBoost is an independent open-source project and is not affiliated with, endorsed by, or sponsored by NVIDIA Corporation. NVIDIA, CUDA, GeForce, and RTX are trademarks of NVIDIA Corporation.

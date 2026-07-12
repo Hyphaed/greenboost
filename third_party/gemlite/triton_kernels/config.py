@@ -15,7 +15,7 @@ BLOCK_QUANT_SIZE = 128
 WARP_SPECIALIZE = False
 
 # Use input dtype (fp16/bf16/fp32) as GEMV accumulator instead of the configured acc_dtype.
-# Faster on some GPUs but reduces accuracy — off by default; toggle via core.set_fast_gemv_acc().
+# Faster on some GPUs but reduces accuracy , off by default; toggle via core.set_fast_gemv_acc().
 GEMLITE_FAST_GEMV_ACC = False
 
 class AUTOTUNE:

@@ -146,7 +146,7 @@ def decode_q4_k(blob: torch.Tensor, K: int, dtype: torch.dtype = torch.float16):
 
     # qs [N, G_sb, 128] = [N, G_sb, 4 chunks, 32 bytes]. Output ordering:
     # sb_index = 2*chunk + nib. Broadcast a [0,4] shift over unsqueezed nib dim
-    # so the reshape lays out (chunk, nib, byte) directly — no permute needed.
+    # so the reshape lays out (chunk, nib, byte) directly , no permute needed.
     qs = b[:, :, 16:144].view(N, G_sb, 4, 1, 32).to(torch.int32)
     shifts = torch.tensor([0, 4], device=qs.device, dtype=torch.int32).view(1, 1, 1, 2, 1)
     W_q = ((qs >> shifts) & 0xF).to(torch.uint8).reshape(N, K)
@@ -176,7 +176,7 @@ def decode_q2_k(blob: torch.Tensor, K: int, dtype: torch.dtype = torch.float16):
     zeros = _safe_div(mn_f, sc_f).reshape(N, G_sb * 16).to(dtype)
 
     # qs [N, G_sb, 64] = [N, G_sb, half=2, g16=2, l=16]. Unsqueeze a shift dim
-    # between half and g16 so the reshape lays out (half, shift, g16, l) —
+    # between half and g16 so the reshape lays out (half, shift, g16, l) ,
     # exactly is = 8*half + 2*shift + g16.
     qs = b[:, :, 16:80].view(N, G_sb, 2, 1, 2, 16).to(torch.int32)
     shifts = torch.arange(0, 8, 2, device=qs.device, dtype=torch.int32).view(1, 1, 1, 4, 1, 1)

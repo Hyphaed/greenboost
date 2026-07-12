@@ -1,11 +1,11 @@
 """
-gb_quant_calib.py — per-layer sensitivity calibration for the gb_quant quality planner.
+gb_quant_calib.py , per-layer sensitivity calibration for the gb_quant quality planner.
 
 Computes the relative quantization error for every nn.Linear in a model at each
 candidate precision.  These estimates drive plan_quality()'s per-layer bit-allocation
 decisions, turning quality-blind uniform compression into "spend bits where they matter".
 
-Algorithm — relative Frobenius error proxy:
+Algorithm , relative Frobenius error proxy:
 
     rel_err(W, bits) = ‖W − Wq‖_F / ‖W‖_F
 
@@ -17,7 +17,7 @@ reconstructing in float32.  This equals the expected output error
 (by isotropy of Gaussian activations), which means the Frobenius ratio is the
 right sensitivity proxy for randomly distributed inputs.  The dominant driver of
 quantization sensitivity is the weight distribution (dynamic range, outlier fraction),
-not the specific activation pattern — so random-activation calibration captures the
+not the specific activation pattern , so random-activation calibration captures the
 key variance at zero forward-pass cost and no model-specific setup.
 
 A future `calibrate_with_prompts()` extension can refine with real activations for
@@ -26,7 +26,7 @@ the sub-0.1% regime; the API and cache schema are designed to slot it in cleanly
 Caching:
     Results are written to  ~/.cache/greenboost/sensitivity_<model_id>_<hash>.json.
     The hash covers model architecture (param shapes) + precision set + n_tokens.
-    Warm loads are O(µs); cold runs are O(seconds, CPU only — no GPU needed).
+    Warm loads are O(µs); cold runs are O(seconds, CPU only , no GPU needed).
 
 Public API:
     from gb_quant_calib import calibrate_sensitivity
@@ -66,7 +66,7 @@ _CACHE_DIR = os.path.expanduser(
 
 
 # ---------------------------------------------------------------------------
-# Weight dequantization proxies — CPU float32 only, no GemLite / Triton needed
+# Weight dequantization proxies , CPU float32 only, no GemLite / Triton needed
 # ---------------------------------------------------------------------------
 
 def _dequant_fp8(w: torch.Tensor, **_kw) -> torch.Tensor:
@@ -271,7 +271,7 @@ def calibrate_sensitivity(
         {layer_name: {bits: rel_err, …}, …}
     where rel_err = ‖W − Wq‖_F / ‖W‖_F ∈ [0, 1].
 
-    Results are cached to disk — second call for the same model + precision set
+    Results are cached to disk , second call for the same model + precision set
     loads from disk in milliseconds.  Use `force_recompute=True` to skip cache.
 
     Args:
@@ -317,7 +317,7 @@ def calibrate_sensitivity(
     gc.collect()
     _save_cache(cpath, _serializable(results))
     if verbose:
-        print(f"[gb_quant_calib] done — {len(results)} layers calibrated. "
+        print(f"[gb_quant_calib] done , {len(results)} layers calibrated. "
               f"Cache saved: {cpath}", flush=True)
     return results
 

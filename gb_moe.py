@@ -2,17 +2,17 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
 """
-gb_moe.py — GreenBoost MoE expert-routing-aware memory management.
+gb_moe.py , GreenBoost MoE expert-routing-aware memory management.
 
 WHY: Mixture-of-Experts models (Mixtral, Qwen-MoE, DeepSeek-MoE-style HF
 implementations) only execute a handful of experts per token per layer, but
 naive loading keeps every expert resident in VRAM. This module observes
 real routing decisions (a near-zero-cost forward hook on each layer's
-gate/router — it inspects logits already computed during the normal
+gate/router , it inspects logits already computed during the normal
 forward pass, no extra tensor compute) to:
 
   1. build a per-layer, per-expert frequency histogram (CPU-side bookkeeping
-     only — no tensor compute on CPU, per GreenBoost's immutable design rule),
+     only , no tensor compute on CPU, per GreenBoost's immutable design rule),
   2. keep cold experts compressed (gb_quant.quantize_module, int4) and
      DDR-resident (ModelTierManager, T2) instead of full-precision T1 VRAM,
   3. statistically prefetch the next layer's historically-hottest experts
@@ -28,12 +28,12 @@ achieved structurally here: experts are managed by this module's own
 rebalance loop, not registered with any shared auto_evict() telemetry
 callback, so they are never candidates for that path's T2→T3 eviction. A
 true kernel-level floor hint (GB_IOCTL_SET_FLOOR_TIER) is deferred to
-Phase 2 per the enhancements.md risk note — it would only matter if experts
+Phase 2 per the enhancements.md risk note , it would only matter if experts
 were *also* registered with a shared auto_evict pool, which they are not.
 
 Limitation (by design, not yet validated against a real model): cross-layer
 prefetch prediction is a historical-frequency heuristic, not a learned or
-exact router lookahead — layer i+1's actual routing depends on layer i's
+exact router lookahead , layer i+1's actual routing depends on layer i's
 output, which doesn't exist until layer i finishes. The prefetch therefore
 warms the statistically likely experts, with a synchronous promote fallback
 on misprediction; it does not (and cannot) guarantee a hit.
@@ -63,10 +63,10 @@ def _get_pcie_high_water() -> float:
     """Return PCIe saturation threshold (MB/s).
 
     Priority:
-    1. Live GpuTopology from the current telemetry snapshot — uses actual
+    1. Live GpuTopology from the current telemetry snapshot , uses actual
        negotiated gen×width so a degraded slot (x8, gen mismatch) automatically
        lowers the threshold to the real limit.
-    2. Config-file TopologyProfile (gb_topology.get_topology()) — theoretical
+    2. Config-file TopologyProfile (gb_topology.get_topology()) , theoretical
        from pcie_gen / pcie_lanes in /etc/greenboost/profiles/default.md.
     3. Hard fallback (PCIe 4.0 x16 @75% = 24576 MB/s).
     """
@@ -106,7 +106,7 @@ def _vram_budget_ok(needed_mb: float = 0.0) -> bool:
         snap = tel.snapshot()
         if snap.gpu_util_pct > 95.0:
             return False
-        # B2: PCIe direct gate — check actual bandwidth, not just SM utilization
+        # B2: PCIe direct gate , check actual bandwidth, not just SM utilization
         pcie_total = snap.pcie_tx_mb_s + snap.pcie_rx_mb_s
         if pcie_total > _get_pcie_high_water():
             return False
@@ -299,7 +299,7 @@ class GbMoEManager:
 
     def attach(self) -> int:
         """Register gate forward hooks on every detected MoE block. Returns
-        the number of blocks found (0 if the model has no MoE layers — safe
+        the number of blocks found (0 if the model has no MoE layers , safe
         no-op for dense models)."""
         if self._attached:
             return len(self._blocks)
@@ -322,7 +322,7 @@ class GbMoEManager:
                 st.hot.add(key)  # everything starts hot/full-precision
                 # Correctness safety net: real per-token MoE routing can
                 # select ANY expert regardless of its historical frequency
-                # — a demoted/cold expert WILL be invoked sometimes, not
+                # , a demoted/cold expert WILL be invoked sometimes, not
                 # just in theory. Without this, _rebalance()'s demote() can
                 # leave an expert on CPU while the model's own dispatch code
                 # feeds it a CUDA tensor, crashing with a device-mismatch
@@ -375,7 +375,7 @@ class GbMoEManager:
         Fires immediately after gate.forward() returns routing logits, before
         the batched expert GEMM reads the 3D param tensors. This gives us time
         to synchronously restore any cold expert's GPU slice that was zeroed by
-        _demote_expert_slice — the correctness guarantee for batched experts,
+        _demote_expert_slice , the correctness guarantee for batched experts,
         equivalent to _make_pre_hook on the ModuleList path.
         """
         def _hook(module, inputs, output):
@@ -393,7 +393,7 @@ class GbMoEManager:
                 # participate in the batched GEMM.
                 for i in top_idx.unique().tolist():
                     if str(i) not in bst.hot:
-                        bst.misses += 1  # B1: prefetch miss — expert was cold at compute time
+                        bst.misses += 1  # B1: prefetch miss , expert was cold at compute time
                         self._restore_expert_slice(bst, i)
             bst.calls += 1
             if bst.calls % _REBALANCE_EVERY == 0:
@@ -475,7 +475,7 @@ class GbMoEManager:
                 counts = torch.bincount(top_idx, minlength=st.freq.numel()).float()
                 counts = counts / counts.sum().clamp_min(1.0)
                 # freq is intentionally CPU-resident (cheap bookkeeping, not
-                # tensor compute) — the model may run on CUDA, so move this
+                # tensor compute) , the model may run on CUDA, so move this
                 # tiny per-block histogram update to CPU rather than freq to GPU.
                 st.freq.mul_(_EMA_DECAY).add_(counts.to(st.freq.device), alpha=1.0 - _EMA_DECAY)
 
@@ -523,7 +523,7 @@ class GbMoEManager:
         # the bar so more experts stay resident and avoid restore overhead.
         vram_ok = _vram_budget_ok()
         if not vram_ok:
-            # VRAM pressure: be aggressive — evict more experts to T2
+            # VRAM pressure: be aggressive , evict more experts to T2
             self.hot_threshold = min(0.20, self.hot_threshold * 1.10)
         elif bst.last_miss_rate > 0.25:
             # VRAM fine but many cold restores: widen the hot set
@@ -551,7 +551,7 @@ class GbMoEManager:
         correctly-predicted experts.
 
         Budget gate: skipped entirely when free VRAM headroom is below 64 MB or
-        GPU SM utilization is saturated (>95%) — competing prefetch I/O during
+        GPU SM utilization is saturated (>95%) , competing prefetch I/O during
         peak compute adds latency without benefit. The synchronous restore in
         _make_batched_hook remains as a correctness fallback for cold experts
         that become hot despite skipped prefetch.
@@ -587,7 +587,7 @@ class GbMoEManager:
     def _prefetch_next(self, st: _BlockState):
         """Prefetch the historically-hottest experts of the *next* MoE block
         on the transfer stream while this block's gate/expert compute runs.
-        Heuristic only (see module docstring) — never blocks, never required
+        Heuristic only (see module docstring) , never blocks, never required
         for correctness (promote() on the critical path is the fallback)."""
         if not _vram_budget_ok():
             return

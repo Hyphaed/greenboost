@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
 """
-gb_moe_vmm.py — GbExpertPool VMM-backed tiering for batched-*Experts MoE.
+gb_moe_vmm.py , GbExpertPool VMM-backed tiering for batched-*Experts MoE.
 
 Track 4 of enhancements.md: per-expert physical chunk management via CUDA VMM
 (cuMemCreate DEVICE + cuMemMap/Unmap) replaces Track 3's copy-based
@@ -17,7 +17,7 @@ can't independently tier individual expert rows within that allocation.
 GbExpertVMMPool wraps each per-param expert-tensor with a VMM virtual address
 range of the same total size, where each expert occupies a separately
 mappable DEVICE physical chunk (real VRAM).  Cold experts have their chunk
-unmapped and released — zero VRAM footprint, unlike Track 3 which zeros bytes
+unmapped and released , zero VRAM footprint, unlike Track 3 which zeros bytes
 but keeps the allocation.
 
 Why DEVICE chunks, not HOST_NUMA (like T2):
@@ -149,7 +149,7 @@ class _VMMTensorView:
 
     PyTorch's torch.as_tensor() accepts objects implementing this protocol
     (same mechanism CuPy uses for zero-copy interop).  The resulting tensor is
-    non-owning — PyTorch will not free the underlying memory on GC.
+    non-owning , PyTorch will not free the underlying memory on GC.
 
     Args:
         ptr:    CUdeviceptr (integer) of the GPU virtual address.
@@ -226,7 +226,7 @@ class GbExpertVMMPool:
         self._shim    = shim
         self._pool    = shim.gb_expert_pool_create(num_experts, expert_bytes)
         if not self._pool:
-            raise RuntimeError("gb_expert_pool_create returned NULL — "
+            raise RuntimeError("gb_expert_pool_create returned NULL , "
                                "shim not loaded or cuMem VMM unsupported")
         self.num_experts  = num_experts
         self.expert_bytes = expert_bytes

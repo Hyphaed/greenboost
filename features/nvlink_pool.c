@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0
- * GreenBoost v3.0 - NVLink Pooling Feature
+ * GreenBoost v3.2 - NVLink Pooling Feature
  *
  * Aggregates multiple GPU VRAM into a unified T1 pool via NVLink 2.0.
  *
@@ -127,109 +127,8 @@ void gb_nvlink_pool_exit(void)
 	mutex_unlock(&nvlink_pool_lock);
 }
 
-/*
- * gb_nvlink_query_fabric - Query NVLink fabric state.
- *
- * BUG-009 fix: For V100, always returns GB_NVLINK_STATE_NOT_SUPPORTED.
- * This is correct - V100 has no NVSwitch fabric.
- * Actual P2P capability is verified from user-space via nvmlDeviceGetP2PStatus().
- */
-int gb_nvlink_query_fabric(struct gb_gpu_fabric_state *state)
-{
-	if (!state)
-		return -EINVAL;
-
-	memset(state, 0, sizeof(*state));
-
-	/*
-	 * V100 NVLink 2.0 correction:
-	 *   - nvmlDeviceGetGpuFabricInfo() → GPU_FABRIC_STATE_NOT_SUPPORTED
-	 *   - This is expected - V100 has direct P2P, not an NVSwitch fabric
-	 *   - Actual readiness is set via gb_nvlink_set_ready() from kubelet plugin
-	 */
-	state->state   = GB_NVLINK_STATE_NOT_SUPPORTED;
-	state->status  = 0;
-	state->cliques = 0;
-
-	return 0;
-}
-
-/*
- * gb_nvlink_is_poolable - Check if NVLink pooling is active and ready.
- */
-bool gb_nvlink_is_poolable(void)
-{
-	bool ret;
-
-	mutex_lock(&nvlink_pool_lock);
-	ret = nvlink_pool.enabled && nvlink_pool.fabric_ready;
-	mutex_unlock(&nvlink_pool_lock);
-	return ret;
-}
-
-/*
- * gb_nvlink_get_aggregated_vram - Return aggregated T1 VRAM in GB.
- */
-u64 gb_nvlink_get_aggregated_vram(void)
-{
-	u64 ret;
-
-	mutex_lock(&nvlink_pool_lock);
-	ret = (nvlink_pool.enabled && nvlink_pool.fabric_ready) ?
-	      nvlink_pool.total_vram_gb : 0;
-	mutex_unlock(&nvlink_pool_lock);
-	return ret;
-}
-
-/*
- * gb_nvlink_get_gpu_info - Return per-GPU VRAM info.
- */
-int gb_nvlink_get_gpu_info(u32 gpu_id, struct gb_gpu_vram_info *info)
-{
-	u32 gpu_count;
-	u64 total_vram_gb;
-	bool clique_valid;
-
-	if (!info)
-		return -EINVAL;
-
-	mutex_lock(&nvlink_pool_lock);
-	gpu_count     = nvlink_pool.gpu_count;
-	total_vram_gb = nvlink_pool.total_vram_gb;
-	clique_valid  = nvlink_pool.clique_valid;
-	mutex_unlock(&nvlink_pool_lock);
-
-	/* F-L2-10: bounds check - reject out-of-range gpu_id */
-	if (gpu_count > 0 && gpu_id >= gpu_count)
-		return -ENODEV;
-
-	memset(info, 0, sizeof(*info));
-	info->gpu_id       = gpu_id;
-	/* F-L2-10: derive per-GPU VRAM from pool total instead of hardcoding 32.
-	 * Guard against division by zero when gpu_count is 0. */
-	info->vram_size_gb = (gpu_count > 0) ? (total_vram_gb / gpu_count) : 32;
-	info->nvlink_peers = (gpu_count > 0) ? gpu_count - 1 : 7;
-	info->in_clique    = clique_valid;
-
-	return 0;
-}
-
-/*
- * gb_nvlink_update_shim_vram - Update CUDA shim's virtual VRAM aggregation.
- * Called by the CUDA shim at init if nvlink_ready sysfs reads 1.
- */
-void gb_nvlink_update_shim_vram(u64 *virtual_vram_gb)
-{
-	u64 total;
-
-	mutex_lock(&nvlink_pool_lock);
-	if (!nvlink_pool.enabled || !nvlink_pool.fabric_ready) {
-		mutex_unlock(&nvlink_pool_lock);
-		return;
-	}
-	total = nvlink_pool.total_vram_gb;
-	mutex_unlock(&nvlink_pool_lock);
-
-	pr_info(DRIVER_NAME ": NVLink pooling active: T1=%llu GB aggregated\n", total);
-	/* The shim reads nvlink_ready + gpu_count_per_node sysfs directly */
-}
+/* gb_nvlink_query_fabric, gb_nvlink_is_poolable, gb_nvlink_get_aggregated_vram,
+ * gb_nvlink_get_gpu_info, gb_nvlink_update_shim_vram - removed (2026-07-09
+ * audit): zero callers anywhere in-kernel. The CUDA shim reads
+ * nvlink_ready + gpu_count_per_node sysfs directly instead of calling into
+ * this (kernel-side, unreachable from userspace) API. */

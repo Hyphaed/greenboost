@@ -1,5 +1,5 @@
 /*
- * GreenBoost v3.0 - Blackwell VMM override library
+ * GreenBoost v3.2 - Blackwell VMM override library
  *
  * WHY THIS FILE EXISTS:
  *   glibc's dynamic linker explicitly PREFERS unversioned symbol definitions
@@ -58,7 +58,7 @@
 #include <dlfcn.h>
 
 /*
- * __libc_dlsym — glibc-private bootstrap.  Lives in ld.so, not libdl, so it
+ * __libc_dlsym , glibc-private bootstrap.  Lives in ld.so, not libdl, so it
  * is NOT interceptable via PLT preemption.  Used by libfakeroot, libeatmydata,
  * nsswitch wrappers, etc. to safely call the real dlsym from inside a dlsym
  * override without infinite recursion.  Weak-reference so the build succeeds
@@ -120,7 +120,7 @@ static int gb_blackwell_disable_vmm(int dev)
     /* GREENBOOST_FORCE_CC_MAJOR: skips the lazy cuDeviceGetAttribute probe.
      * Eliminates the Blackwell timing race where the probe returns 0 because
      * CUDA is not yet initialized when the first VMM-supported attribute check
-     * fires during ggml_cuda_init() — causing the vmm/pool_leg split to be
+     * fires during ggml_cuda_init() , causing the vmm/pool_leg split to be
      * resolved incorrectly and GGML to crash at cuMemAddressReserve. */
     if (!gb_cc_major) {
         const char *cc_env = getenv("GREENBOOST_FORCE_CC_MAJOR");
@@ -205,7 +205,7 @@ int cuMemAddressReserve(unsigned long long *ptr, size_t size, size_t alignment,
 }
 
 /*
- * dlsym interception — closes the runtime dlopen/dlsym path that GGML uses to
+ * dlsym interception , closes the runtime dlopen/dlsym path that GGML uses to
  * load CUDA driver functions, bypassing PLT preemption entirely.
  *
  * Modern ollama's libggml-cuda.so does (roughly):
@@ -214,7 +214,7 @@ int cuMemAddressReserve(unsigned long long *ptr, size_t size, size_t alignment,
  *   pfn_cuDGA(&vmm, CU_DEVICE_ATTRIBUTE_VMM_SUPPORTED, dev);
  *
  * Because the function pointer is obtained at runtime via dlsym(), the PLT
- * preemption above (bare unversioned export) has NO effect — the pointer goes
+ * preemption above (bare unversioned export) has NO effect , the pointer goes
  * directly to libcuda.so.1's implementation.  This dlsym() wrapper intercepts
  * those lookups and returns our hooked versions instead.
  *
@@ -223,9 +223,9 @@ int cuMemAddressReserve(unsigned long long *ptr, size_t size, size_t alignment,
  * __libc_dlsym is NULL (weak ref) and the wrapper is a no-op.
  *
  * Thread safety: the static init is a compare-and-store of a single pointer
- * — benign on all x86-64 microarchitectures (TSO) even without a mutex.
+ * , benign on all x86-64 microarchitectures (TSO) even without a mutex.
  *
- * This is NOT overriding dlvsym() or dlopen() — only the unversioned dlsym().
+ * This is NOT overriding dlvsym() or dlopen() , only the unversioned dlsym().
  * Any caller that uses dlvsym() to get a versioned symbol gets the real result.
  */
 void *dlsym(void *handle, const char *name)
@@ -236,10 +236,10 @@ void *dlsym(void *handle, const char *name)
     if (!real_dlsym) {
         /* Use dlvsym with an explicit glibc version to find the real dlsym.
          * __libc_dlsym(map, name) is a glibc-private function that expects a
-         * real link-map pointer — passing RTLD_NEXT (a pseudo-handle) to it
+         * real link-map pointer , passing RTLD_NEXT (a pseudo-handle) to it
          * returns a broken wrapper that cannot perform handle-scoped lookups.
          * Ollama 0.30.8 registers ggml backends dynamically via
-         * dlsym(real_handle, entrypoint) — if real_dlsym is broken those
+         * dlsym(real_handle, entrypoint) , if real_dlsym is broken those
          * lookups return NULL and ggml registers zero backends, crashing every
          * model load with "no backends are loaded".
          * dlvsym with a versioned glibc symbol safely resolves the correct
@@ -253,7 +253,7 @@ void *dlsym(void *handle, const char *name)
             real_dlsym = (void *(*)(void *, const char *))
                 dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.17");
         if (!real_dlsym && __libc_dlsym)
-            /* musl / non-glibc last resort — RTLD_NEXT is accepted here on
+            /* musl / non-glibc last resort , RTLD_NEXT is accepted here on
              * some implementations even though it is not a link-map. */
             real_dlsym = (void *(*)(void *, const char *))
                 __libc_dlsym(RTLD_NEXT, "dlsym");
@@ -277,7 +277,7 @@ void *dlsym(void *handle, const char *name)
          * Why: Ollama's gpu-discover subprocess does dlopen("libcuda.so.1")+dlsym to
          * look up cuDeviceTotalMem_v2 by name, then calls the returned function pointer.
          * The PLT preemption used by the full shim (LD_PRELOAD) does NOT intercept
-         * runtime dlsym(specific_handle, name) calls — only PLT references at load
+         * runtime dlsym(specific_handle, name) calls , only PLT references at load
          * time.  Without this redirect, gpu-discover calls libcuda's real function and
          * sees only physical VRAM (12 GB), making Ollama place the model on CPU.
          *

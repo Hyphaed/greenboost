@@ -1,4 +1,4 @@
-# GreenBoost v2.9 - Kernel module + CUDA shim build system
+# GreenBoost v3.2 - Kernel module + CUDA shim build system
 # Author: Ferran Duarri
 #
 # Kbuild file handles kernel-internal rules (obj-m, ccflags-y).
@@ -29,7 +29,7 @@ AUDIT32 := libgreenboost_audit32.so
 VMM_OVERRIDE := libgreenboost_vmm_override.so
 MODULE  := greenboost.ko
 NETD    := greenboost-netd
-GB_VERSION := 3.0
+GB_VERSION := 3.2
 
 PHYS_GB    ?= 0
 VIRT_GB    ?= 0
@@ -110,6 +110,29 @@ ifneq ($(CUDA_DIR),)
 SHIM_CFLAGS    += -I$(CUDA_DIR)/include
 endif
 
+# libzstd probe: fabric payload compression (H2D over the cluster socket). When
+# present, both the shim (netc client) and netd feeder compile with
+# -DGB_HAVE_ZSTD -lzstd and negotiate GB_NET_FEAT_ZSTD at handshake. Absent →
+# the feature bit is never advertised and every transfer stays raw (no-op).
+ZSTD_CFLAGS := $(shell pkg-config --cflags libzstd 2>/dev/null)
+ZSTD_LIBS   := $(shell pkg-config --libs   libzstd 2>/dev/null)
+ifeq ($(ZSTD_LIBS),)
+  ifneq ($(wildcard /usr/include/zstd.h),)
+    ZSTD_LIBS := -lzstd
+  endif
+endif
+ifneq ($(ZSTD_LIBS),)
+SHIM_CFLAGS   += -DGB_HAVE_ZSTD $(ZSTD_CFLAGS)
+SHIM_LDFLAGS  += $(ZSTD_LIBS)
+NETD_ZSTD_CFLAGS := -DGB_HAVE_ZSTD $(ZSTD_CFLAGS)
+NETD_ZSTD_LIBS   := $(ZSTD_LIBS)
+$(info [GreenBoost] libzstd found - fabric compression enabled ($(ZSTD_LIBS)))
+else
+NETD_ZSTD_CFLAGS :=
+NETD_ZSTD_LIBS   :=
+$(info [GreenBoost] libzstd NOT found - fabric compression disabled)
+endif
+
 DKMS_ROOT := /usr/src/greenboost-$(GB_VERSION)
 
 # ── Optional eBPF observability tracer ────────────────────────────────────
@@ -128,7 +151,9 @@ ifeq ($(BPF),auto)
   _HAS_CLANG   := $(if $(CLANG),1,0)
   _HAS_BPFTOOL := $(shell command -v bpftool >/dev/null 2>&1 && echo 1 || echo 0)
   _HAS_LIBBPF  := $(shell pkg-config --exists libbpf 2>/dev/null && echo 1 || echo 0)
-  ifeq ($(_HAS_CLANG)$(_HAS_BPFTOOL)$(_HAS_LIBBPF),111)
+  # CO-RE BPF requires kernel BTF; without it vmlinux.h generation fails hard.
+  _HAS_BTF     := $(shell test -r /sys/kernel/btf/vmlinux && echo 1 || echo 0)
+  ifeq ($(_HAS_CLANG)$(_HAS_BPFTOOL)$(_HAS_LIBBPF)$(_HAS_BTF),1111)
     BPF := 1
   else
     BPF := 0
@@ -140,6 +165,13 @@ endif
 ifeq ($(BPF),1)
 EBPF_CFLAGS := -O2 -Wall -I ebpf/
 EBPF_LDLIBS := $(shell pkg-config --libs libbpf) -lelf -lz
+# clang -target bpf doesn't see the host's arch-specific include dir by
+# default, so <bpf/bpf_helper_defs.h>'s __u64/__u32 (from <linux/types.h> ->
+# <asm/types.h>) fail to resolve ("unknown type name '__u64'", verified
+# 2026-07-09 on Ubuntu 26.04 with clang 20 + libbpf-dev 1.6.3). -idirafter
+# (not -I) so it's a fallback behind ebpf/'s own headers, never shadowing
+# them.
+EBPF_BPF_CFLAGS := $(EBPF_CFLAGS) -idirafter /usr/include/$(shell uname -m)-linux-gnu -idirafter /usr/include
 endif
 
 .PHONY: all module shim audit audit32 netd ebpf clean test \
@@ -157,11 +189,28 @@ endif
 ifeq ($(BPF),1)
 ebpf/vmlinux.h:
 	@echo "[GreenBoost] Generating vmlinux.h from kernel BTF..."
-	bpftool btf dump file /sys/kernel/btf/vmlinux format c > $@
+	@if [ ! -e /sys/kernel/btf/vmlinux ]; then \
+	    echo "[GreenBoost] ERROR: /sys/kernel/btf/vmlinux does not exist on this" >&2; \
+	    echo "  kernel ($$(uname -r)) - it was not built with CONFIG_DEBUG_INFO_BTF=y," >&2; \
+	    echo "  so there is no BTF data to dump. The eBPF tracer needs a kernel with" >&2; \
+	    echo "  BTF support; this is a kernel build-config requirement, not a missing" >&2; \
+	    echo "  package (verified 2026-07-09: clang/bpftool/libbpf all present, this" >&2; \
+	    echo "  is the actual blocker). Skip 'make BPF=1' on this host, or rebuild the" >&2; \
+	    echo "  kernel with CONFIG_DEBUG_INFO_BTF=y." >&2; \
+	    exit 1; \
+	fi
+	@# Write to a temp file first: a failed bpftool run must NOT leave a
+	@# stale empty $@ behind, since make treats "target exists" as
+	@# "up to date" forever after regardless of content (verified
+	@# 2026-07-09 - an empty vmlinux.h from an earlier failed run silently
+	@# poisoned every subsequent build with "unknown type name '__u64'",
+	@# masking this actual root cause for who knows how long).
+	@bpftool btf dump file /sys/kernel/btf/vmlinux format c > $@.tmp && mv $@.tmp $@ \
+	    || { rm -f $@.tmp; echo "[GreenBoost] ERROR: bpftool btf dump failed" >&2; exit 1; }
 
 ebpf/gb_trace.bpf.o: ebpf/gb_trace.bpf.c ebpf/gb_offsets.h ebpf/vmlinux.h
 	@echo "[GreenBoost] Compiling BPF program..."
-	$(CLANG) -target bpf -g -O2 $(EBPF_CFLAGS) -D__TARGET_ARCH_x86 \
+	$(CLANG) -target bpf -g -O2 $(EBPF_BPF_CFLAGS) -D__TARGET_ARCH_x86 \
 	    -Wno-missing-declarations -c $< -o $@
 
 ebpf/gb_trace.skel.h: ebpf/gb_trace.bpf.o
@@ -180,7 +229,7 @@ ebpf-clean:
 	rm -f ebpf/vmlinux.h ebpf/gb_trace.bpf.o ebpf/gb_trace.skel.h $(EBPF_TRACE)
 else
 ebpf:
-	@echo "[GreenBoost] BPF=0 — eBPF tracer not built (install clang bpftool libbpf-dev)"
+	@echo "[GreenBoost] BPF=0 , eBPF tracer not built (install clang bpftool libbpf-dev)"
 
 ebpf-clean: ;
 endif
@@ -233,18 +282,38 @@ else
 	@echo "[GreenBoost]   (Run the appropriate greenboost_setup*.sh to install dependencies)"
 endif
 
-netd: greenboost_netd.c features/net_fabric.h
+netd: greenboost_netd.c features/net_fabric.h netd-capture
 	$(CC) $(COMMON_CFLAGS) -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
-	    -Wformat -Wformat-security \
-	    -o $(NETD) greenboost_netd.c -ldl -lpthread $(NCCL_LDFLAGS)
+	    -Wformat -Wformat-security -rdynamic $(NETD_ZSTD_CFLAGS) \
+	    -o $(NETD) greenboost_netd.c -ldl -lpthread $(NCCL_LDFLAGS) $(NETD_ZSTD_LIBS)
 	@echo "[GreenBoost] Built $(NETD)"
+
+# Feeder __cudaRegisterFunction interposer (LD_PRELOAD'd into netd so remote
+# dispatch can resolve the stripped lib's kernel stubs by name).
+netd-capture: greenboost_netd_capture.c
+	$(CC) -shared -fPIC -O2 -o libgreenboost_netd_capture.so \
+	    greenboost_netd_capture.c -ldl -lpthread
+	@echo "[GreenBoost] Built libgreenboost_netd_capture.so"
+
+# Stage-A2 opt-in: sm_120a NVFP4 GEMM CUTLASS torch extension. NOT part of `all`
+# or `install` (speculative, GPU-bench-gated). CUTLASS is header-only; point
+# GB_CUTLASS_PATH at the checkout (default: vendored under ~/Dev/greenboost_all).
+gb_cutlass:
+	GB_CUTLASS_PATH="$${GB_CUTLASS_PATH:-$$HOME/Dev/greenboost_all/vendor/cutlass}" \
+	    python3 third_party/gb_cutlass/setup.py build_ext --inplace
+	@echo "[GreenBoost] Built gb_cutlass extension (enable at runtime with GB_CUTLASS_ENABLE=1 after bench)"
 
 clean: ebpf-clean
 	$(MAKE) -C $(KDIR) M=$(PWD) $(KERNEL_LLVM) clean
 	rm -f $(SHIM) $(AUDIT) $(AUDIT32) $(VMM_OVERRIDE) $(NETD) greenboost_cuda_v12.o
+	rm -f third_party/gb_cutlass/*.so third_party/gb_cutlass/_gb_cutlass_C*.so
+	rm -rf third_party/gb_cutlass/build
 
 install: all dkms-install install-libs
 	@echo "[GreenBoost] Install complete. Load with: sudo modprobe greenboost"
+	@echo "[GreenBoost] (greenboost_setup.sh's full reinstall flow loads the"
+	@echo "[GreenBoost]  module itself, AFTER writing /etc/modprobe.d/greenboost.conf ,"
+	@echo "[GreenBoost]  see that script for the tuned-parameter load.)"
 
 install-legacy: all
 	$(MAKE) -C $(KDIR) M=$(PWD) $(KERNEL_LLVM) modules_install
@@ -266,7 +335,7 @@ install-libs: build-info
 		mv /usr/local/lib/$(VMM_OVERRIDE).new /usr/local/lib/$(VMM_OVERRIDE); \
 		echo "[GreenBoost] Installed $(VMM_OVERRIDE)"; \
 	else \
-		echo "[GreenBoost] NOTICE: $(VMM_OVERRIDE) not built — skipping (expected if CUDA headers absent)"; \
+		echo "[GreenBoost] NOTICE: $(VMM_OVERRIDE) not built , skipping (expected if CUDA headers absent)"; \
 	fi
 	rm -f /usr/local/lib/i386-linux-gnu/$(AUDIT) /usr/local/bin/$(NETD)
 	cp $(NETD) /usr/local/bin/
@@ -293,6 +362,12 @@ dkms-install:
 	dkms build greenboost/$(GB_VERSION)
 	dkms install greenboost/$(GB_VERSION)
 	@echo "[GreenBoost] DKMS module installed for kernel $(shell uname -r)"
+	@# Also build for every OTHER kernel already on disk (e.g. an installed-but-
+	@# not-yet-booted kernel from ~/Dev/kernel_inference) , `dkms install` above
+	@# only ever covers `uname -r`, so a second kernel present at install time
+	@# would otherwise stay silently unbuilt until someone notices and reruns
+	@# dkms by hand. Best-effort: never fail the install target over this.
+	@dkms autoinstall -m greenboost -v $(GB_VERSION) 2>&1 | sed 's/^/[GreenBoost] /' || true
 
 dkms-uninstall:
 	dkms remove greenboost/$(GB_VERSION) --all 2>/dev/null || true

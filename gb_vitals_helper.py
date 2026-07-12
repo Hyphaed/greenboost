@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
 """
-gb_vitals_helper.py — unified GPU + GreenBoost flow metrics helper.
+gb_vitals_helper.py , unified GPU + GreenBoost flow metrics helper.
 
 Called by greenboost_setup.sh vitals/cluster commands to replace
 nvidia-smi subprocess forks with in-process pynvml calls, and to surface
@@ -16,15 +16,15 @@ Modes (--json, --flow, --dcgm, default KEY=VALUE):
             (uses a 30s file cache at /run/greenboost/dcgm_health.json)
 
 Sources (consumed in order; degrade gracefully when unavailable):
-  1. gb_nvml.get_nvml()             — GPU hardware metrics via shared singleton
-  2. /run/greenboost/shim_stats     — shim flow state (phase, tiers, ws_reserve)
-  3. /sys/module/greenboost/…       — gaming_mode sysfs
-  4. /var/lib/greenboost/vram_pressure — supervisor pressure state
-  5. /run/greenboost/orch_state.json — orchestrator decisions (written by daemon)
-  6. GB_IOCTL_GET_INFO (ctypes)     — kernel module pool state (optional)
+  1. gb_nvml.get_nvml()             , GPU hardware metrics via shared singleton
+  2. /run/greenboost/shim_stats     , shim flow state (phase, tiers, ws_reserve)
+  3. /sys/module/greenboost/…       , gaming_mode sysfs
+  4. /var/lib/greenboost/vram_pressure , supervisor pressure state
+  5. /run/greenboost/orch_state.json , orchestrator decisions (written by daemon)
+  6. GB_IOCTL_GET_INFO (ctypes)     , kernel module pool state (optional)
 
 Exit 0: success (pynvml available)
-Exit 1: pynvml unavailable — caller should fall back to nvidia-smi
+Exit 1: pynvml unavailable , caller should fall back to nvidia-smi
 """
 from __future__ import annotations
 import json
@@ -34,7 +34,7 @@ import time
 from typing import Any
 
 _DCGM_CACHE = "/run/greenboost/dcgm_health.json"
-_DCGM_TTL   = 30  # seconds — reuse cached result within this window
+_DCGM_TTL   = 30  # seconds , reuse cached result within this window
 
 
 def _probe_dcgm(device: int = 0) -> dict:
@@ -71,7 +71,7 @@ def _probe_dcgm(device: int = 0) -> dict:
         except Exception:
             pass
     except Exception:
-        pass  # DCGM not available — caller uses empty dict
+        pass  # DCGM not available , caller uses empty dict
 
     # Write cache (best effort; may fail in containers)
     try:
@@ -108,17 +108,22 @@ def sample_shim_flow(stats_path: str = "/run/greenboost/shim_stats") -> dict[str
     Returns empty dict if the file is absent or unreadable (shim not active).
     Keys are prefixed with SHIM_ in the KEY=VALUE output for namespace clarity.
     """
-    result: dict[str, str] = {}
     try:
         with open(stats_path) as f:
-            for line in f:
-                line = line.strip()
-                if "=" in line:
-                    k, _, v = line.partition("=")
-                    result[k.strip()] = v.strip()
+            content = f.read()
     except Exception:
-        pass
-    return result
+        return {}
+    try:
+        from gb_monitor import parse_shim_stats  # canonical KEY=VALUE grammar
+        return parse_shim_stats(content)
+    except Exception:
+        result: dict[str, str] = {}
+        for line in content.splitlines():
+            line = line.strip()
+            if "=" in line:
+                k, _, v = line.partition("=")
+                result[k.strip()] = v.strip()
+        return result
 
 
 # ── orchestrator state reader ─────────────────────────────────────────────────
@@ -184,10 +189,10 @@ def main() -> None:
     except Exception:
         pass
 
-    # Shim flow state — zero-cost when shim is absent
+    # Shim flow state , zero-cost when shim is absent
     flow = sample_shim_flow()
 
-    # Orchestrator decisions — read from state file written by daemon
+    # Orchestrator decisions , read from state file written by daemon
     orch = _read_orch_state()
 
     # ── Output modes ─────────────────────────────────────────────────────────
@@ -221,10 +226,10 @@ def main() -> None:
             "ecc_dbe_agg":     ecc_dbe_agg,
             "gaming_mode":     gaming_mode,
             "pressure_state":  pressure_state,
-            # Shim flow fields (empty dict when shim inactive — no KeyError)
+            # Shim flow fields (empty dict when shim inactive , no KeyError)
             "shim_flow":       flow,
         }
-        # Orchestrator decisions block — surfaces per-signal state + recent actions
+        # Orchestrator decisions block , surfaces per-signal state + recent actions
         if orch:
             decisions_summary = []
             for sig in orch.get("signals", []):
@@ -268,7 +273,7 @@ def main() -> None:
         f"GPU_PCIE_RX_MB_S={pcie_rx:.1f}",
         f"GPU_GAMING_MODE={gaming_mode}",
         f"GB_PRESSURE_STATE={pressure_state}",
-        # Shim flow keys (new; bash parser ignores unknowns — back-compat)
+        # Shim flow keys (new; bash parser ignores unknowns , back-compat)
         f"SHIM_PHASE={flow.get('phase', '')}",
         f"SHIM_ACTIVE_PATH={flow.get('active_path', '')}",
         f"SHIM_T1_LOCAL_MB={flow.get('tier_t1_local_cur_mb', '')}",
@@ -304,7 +309,7 @@ def main() -> None:
         f"ORCH_GPU_CLOCKS_LOCKED={orch.get('control', {}).get('gpu_clocks_locked', {}).get('value', '')}",
         f"ORCH_SWAPPINESS={orch.get('control', {}).get('swappiness', {}).get('value', '')}",
     ]
-    # Topology constants (C0) — inference CPU pinning hints for the shell layer
+    # Topology constants (C0) , inference CPU pinning hints for the shell layer
     try:
         from gb_topology import get_topology
         _topo = get_topology()
@@ -318,7 +323,7 @@ def main() -> None:
         ]
     except Exception:
         pass
-    # DCGM health block — only probed when --dcgm flag passed (30s cache)
+    # DCGM health block , only probed when --dcgm flag passed (30s cache)
     if want_dcgm:
         dcgm = _probe_dcgm(0)
         lines += [

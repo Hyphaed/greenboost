@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
 """
-Tests for gb_reactive.Signal — EWMA, confirm debounce, hysteresis, isolation.
+Tests for gb_reactive.Signal , EWMA, confirm debounce, hysteresis, isolation.
 
 No CUDA, no /dev/greenboost, no running daemon needed.
 """
@@ -239,7 +239,7 @@ def test_on_enter_returns_unsubscribe_callable():
 
     unsub()
     s.set(50.0)             # exit
-    s.set(90.0)             # re-enter — should NOT fire (unsubscribed)
+    s.set(90.0)             # re-enter , should NOT fire (unsubscribed)
     assert len(entered) == 1
 
 
@@ -255,7 +255,7 @@ def test_on_exit_returns_unsubscribe_callable():
 
     unsub()
     s.set(85.0)             # re-enter
-    s.set(50.0)             # re-exit — should NOT fire (unsubscribed)
+    s.set(50.0)             # re-exit , should NOT fire (unsubscribed)
     assert len(exited) == 1
 
 
@@ -298,7 +298,7 @@ def test_name_property():
 def test_ewma_non_numeric_falls_back_to_raw():
     """When float(v) raises, EMA falls back to storing v directly."""
     s = Signal(None, ewma_alpha=0.5)
-    s.set("hot")   # can't float("hot") — fallback to raw assignment
+    s.set("hot")   # can't float("hot") , fallback to raw assignment
     assert s.get() == "hot"
     assert s.raw == "hot"
 
@@ -480,7 +480,7 @@ def test_filter_gate_checked_at_call_time_not_subscription_time():
     received = []
     s.pipe(rx_filter(lambda: gate[0])).on_enter(received.append)
 
-    s.set(90.0)               # gate is False — blocked
+    s.set(90.0)               # gate is False , blocked
     assert received == []
 
     gate[0] = True
@@ -501,7 +501,7 @@ def test_filter_blocks_exit_when_predicate_false():
 
     s.set(90.0)              # enter
     gate[0] = False          # close gate
-    s.set(50.0)              # exit hysteresis — but gate is False
+    s.set(50.0)              # exit hysteresis , but gate is False
     assert exited == [], "filter must block on_exit when predicate is False"
 
 
@@ -579,7 +579,7 @@ def test_with_latest_from_updates_with_latest_context():
     results = []
     trigger.pipe(with_latest_from(ctx)).subscribe(lambda t, c: results.append((t, c)))
     ctx.set("B")         # context changes
-    trigger.set(1.0)     # trigger fires — should see ctx="B"
+    trigger.set(1.0)     # trigger fires , should see ctx="B"
     assert results[-1][1] == "B"
 
 
@@ -687,7 +687,7 @@ def test_filter_exit_exception_isolated():
     def bad(v): raise RuntimeError("boom")
     s.pipe(rx_filter(lambda: True)).on_exit(bad)
     s.set(90.0)   # enter
-    s.set(50.0)   # exit — bad() must not propagate
+    s.set(50.0)   # exit , bad() must not propagate
 
 
 def test_filter_subscribe_exception_isolated():

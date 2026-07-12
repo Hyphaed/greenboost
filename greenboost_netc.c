@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
- * GreenBoost v3.0 - Network Client Implementation
+ * GreenBoost v3.2 - Network Client Implementation
  *
  * Author  : Ferran Duarri
  * License : GPL v2 (open-source) / Commercial - see LICENSE
@@ -33,6 +33,28 @@
 
 #include "greenboost_netc.h"
 #include "features/net_fabric.h"
+
+#ifdef GB_HAVE_ZSTD
+#include <zstd.h>
+/* ── Fabric zstd compression config (host/client side) ──────────────
+ * GbE (~110 MB/s) is the cluster bottleneck; zstd-3 compresses several×
+ * faster than the link, so effective H2D throughput ≈ link × ratio for
+ * compressible payloads (bf16 weights ~1.5-1.8×). Read once, cached. */
+static int      g_zstd_enabled = -1;   /* -1 = unread; 0/1 after parse   */
+static int      g_zstd_level   = 3;
+static uint32_t g_zstd_min     = 65536;
+
+static void gb_netc_zstd_init(void)
+{
+    if (g_zstd_enabled >= 0) return;
+    const char *e = getenv("GB_NET_COMPRESS");
+    g_zstd_enabled = (e && e[0] == '0') ? 0 : 1;   /* default ON when built */
+    const char *lv = getenv("GB_NET_COMPRESS_LEVEL");
+    if (lv && lv[0]) { int v = atoi(lv); if (v >= 1 && v <= 19) g_zstd_level = v; }
+    const char *mn = getenv("GB_NET_COMPRESS_MIN");
+    if (mn && mn[0]) { long v = atol(mn); if (v >= 0) g_zstd_min = (uint32_t)v; }
+}
+#endif
 
 /* ── PSK authentication helpers (F-L3-01) ───────────────────────────
  * Shared secret in /etc/greenboost/cluster.key (hex-encoded 32 bytes).
@@ -427,6 +449,12 @@ struct netc_feeder {
      * next_reconnect_ms is the mono_ms() at which next attempt is allowed. */
     uint64_t reconnect_delay_ms;
     uint64_t next_reconnect_ms;
+    /* Fabric zstd: negotiated at handshake (both sides advertise GB_NET_FEAT_
+     * ZSTD). zbuf is a per-feeder compression scratch reused across H2D sends
+     * (guarded by per_lock, which is held for the whole send). */
+    int      feat_zstd;
+    uint8_t *zbuf;
+    size_t   zbuf_cap;
 #ifdef GREENBOOST_USE_NCCL
     ncclComm_t nccl_comm;
 #endif
@@ -532,7 +560,7 @@ static int g_netc_debug = 0;
 
 #define netc_log(fmt, ...) do { \
     if (g_netc_debug) \
-        fprintf(stderr, "[GreenBoost-netc] " fmt "\n", ##__VA_ARGS__); \
+        fprintf(stderr, "[GreenBoost-netc %d] " fmt "\n", (int)getpid(), ##__VA_ARGS__); \
 } while (0)
 
 /* ------------------------------------------------------------------ */
@@ -766,6 +794,14 @@ static int connect_feeder(struct netc_feeder *f)
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     int nodelay = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+    /* Explicit socket buffers sized to 2x GB_NET_MAX_MSG_SIZE so a couple of
+     * H2D/D2H chunks (weight upload, per-layer activation staging) can be
+     * in flight without waiting on the kernel's slow auto-tuning ramp-up on
+     * a fresh/idle connection - matters most for the small, frequent
+     * cross-device activation transfers the 2-device split adds. */
+    int sockbuf = 2 * (int)GB_NET_MAX_MSG_SIZE;
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sockbuf, sizeof(sockbuf));
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sockbuf, sizeof(sockbuf));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -902,6 +938,10 @@ static int connect_feeder(struct netc_feeder *f)
     req.proto_version = GB_NET_PROTO_VER;
     req.gpu_count     = 0;
     gethostname(req.hostname, GB_NET_MAX_HOSTNAME - 1);
+#ifdef GB_HAVE_ZSTD
+    gb_netc_zstd_init();
+    if (g_zstd_enabled) req.feature_flags |= GB_NET_FEAT_ZSTD;
+#endif
 
     if (netc_send_msg(f, GB_MSG_HANDSHAKE_REQ, 0, &req, sizeof(req)) < 0) {
         f->fd = -1;
@@ -954,6 +994,23 @@ static int connect_feeder(struct netc_feeder *f)
                      f->pcie_effective_bw_mbs, resp->pcie_replay_count);
         }
     }
+
+    /* Fabric zstd: enabled only when we advertised it AND the feeder echoed
+     * GB_NET_FEAT_ZSTD in its (long-enough) reply. Older feeders send a short
+     * resp with no feature_flags → feat_zstd stays 0 → we send raw. */
+    f->feat_zstd = 0;
+#ifdef GB_HAVE_ZSTD
+    {
+        size_t need = offsetof(struct gb_net_handshake_resp, feature_flags)
+                      + sizeof(gb_u32);
+        if (g_zstd_enabled && resp_hdr.payload_len >= (uint32_t)need &&
+            (resp->feature_flags & GB_NET_FEAT_ZSTD)) {
+            f->feat_zstd = 1;
+            netc_log("feeder %s: fabric zstd compression negotiated (level %d, min %u B)",
+                     f->addr, g_zstd_level, g_zstd_min);
+        }
+    }
+#endif
 
 #ifdef GREENBOOST_USE_NCCL
     /* Phase 4: Init NCCL for this connection */
@@ -1030,8 +1087,9 @@ static int connect_feeder(struct netc_feeder *f)
     f->pid.dispatch_count  = 0;
     f->pid.window_start_ms = 0;
 
-    /* A1: initialize per-feeder network I/O mutex */
-    pthread_mutex_init(&f->per_lock, NULL);
+    /* A1: per_lock is initialized ONCE in gb_netc_init when the feeder slot
+     * is created , re-initializing it here on every N8 reconnect while
+     * another thread holds it is undefined behaviour. */
 
     /* A3: initialise heartbeat tracking */
     {
@@ -1102,6 +1160,9 @@ static struct netc_alloc *alloc_find(uint64_t fake_ptr)
     return NULL;
 }
 
+/* Defined below; forward-declared for gb_netc_memset (interior offsets). */
+static struct netc_alloc *alloc_find_range(uint64_t ptr);
+
 /* Must be called with g_alloc_lock held. */
 static struct netc_alloc *alloc_new(void)
 {
@@ -1150,6 +1211,45 @@ static uint64_t gb_alloc_bump_fake_ptr(size_t size)
 /*  Public API: Lifecycle                                              */
 /* ------------------------------------------------------------------ */
 
+/* ── Dedicated heartbeat/reconnect thread (2026-07-06) ───────────────────
+ * gb_netc_poll_health() used to run only from the shim's stats hook, i.e.
+ * only while the application was making CUDA calls.  Two live failures:
+ * a 20 s model-load pause stopped heartbeats → the feeder daemon dropped
+ * the client at GB_NET_HEARTBEAT_TIMEOUT_MS; and once disconnected, the N8
+ * reconnect never ran while the process idled , the feeder stayed lost for
+ * the life of the process.  A dedicated thread makes liveness and healing
+ * independent of application activity. */
+static pthread_t g_hb_thread;
+static _Atomic int g_hb_thread_started = 0;
+static _Atomic int g_hb_thread_stop    = 0;
+
+static void *gb_netc_hb_thread_main(void *arg)
+{
+    (void)arg;
+    while (!atomic_load_explicit(&g_hb_thread_stop, memory_order_relaxed)) {
+        gb_netc_poll_health();
+        for (int i = 0; i < 20; i++) {   /* 2 s in 100 ms slices for fast exit */
+            if (atomic_load_explicit(&g_hb_thread_stop, memory_order_relaxed)) break;
+            struct timespec ts = { 0, 100 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+        }
+    }
+    return NULL;
+}
+
+static void gb_netc_start_heartbeat_thread(void)
+{
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&g_hb_thread_started, &expected, 1))
+        return;
+    if (pthread_create(&g_hb_thread, NULL, gb_netc_hb_thread_main, NULL) != 0) {
+        atomic_store(&g_hb_thread_started, 0);
+        netc_log("WARN: heartbeat thread create failed - falling back to hook-driven polling");
+    } else {
+        pthread_detach(g_hb_thread);
+    }
+}
+
 int gb_netc_init(void)
 {
     pthread_mutex_lock(&g_netc_lock);
@@ -1160,6 +1260,20 @@ int gb_netc_init(void)
 
     const char *dbg = getenv("GREENBOOST_NET_DEBUG");
     if (dbg && dbg[0] != '0') g_netc_debug = 1;
+
+    /* GREENBOOST_CLUSTER=0 - per-process opt-out of the network fabric.
+     * Feeder kernel dispatch requires the kernel symbol to be dlsym-resolvable
+     * in greenboost-netd and on the kernels.allow allowlist; that holds for
+     * ggml/Ollama but NOT for PyTorch (static stubs, thousands of kernels).
+     * PyTorch consumers (ai-forge diffusion) set this to stay on the proven
+     * local T1/T2/T3 path instead of crashing on feeder-resident tensors. */
+    const char *clu = getenv("GREENBOOST_CLUSTER");
+    if (clu && clu[0] == '0') {
+        netc_log("GREENBOOST_CLUSTER=0 - network fabric disabled for this process");
+        g_netc_initialized = 1;
+        pthread_mutex_unlock(&g_netc_lock);
+        return 0;
+    }
 
     memset(g_feeders, 0, sizeof(g_feeders));
     memset(g_remote_gpus, 0, sizeof(g_remote_gpus));
@@ -1192,6 +1306,7 @@ int gb_netc_init(void)
         struct netc_feeder *nf = &g_feeders[g_feeder_count];
         memset(nf, 0, sizeof(*nf));
         nf->fd = -1;
+        pthread_mutex_init(&nf->per_lock, NULL);
 
         char *colon = strchr(addr_port, ':');
         if (colon) {
@@ -1230,6 +1345,7 @@ int gb_netc_init(void)
     if (g_remote_gpu_count > 0) {
         fprintf(stderr, "[GreenBoost] Network fabric: %d remote GPU(s) from %d feeder(s)\n",
                 g_remote_gpu_count, g_feeder_count);
+        gb_netc_start_heartbeat_thread();
     }
 
     /* U15: allocate pinned staging buffer pool for D2H transfers */
@@ -1259,6 +1375,7 @@ int gb_netc_init(void)
 
 void gb_netc_cleanup(void)
 {
+    atomic_store(&g_hb_thread_stop, 1);
     pthread_mutex_lock(&g_netc_lock);
     for (int i = 0; i < g_feeder_count; i++) {
         if (g_feeders[i].connected && g_feeders[i].fd >= 0) {
@@ -1340,26 +1457,76 @@ const char *gb_netc_feeder_addr(int remote_idx)
     return g_feeders[fi].addr;   /* IP-only string (port is stored separately in nf->port) */
 }
 
+/* Reconnect-on-demand: an allocation path that finds the feeder disconnected
+ * should not fail the alloc and wait for the 2 s heartbeat cycle , the
+ * residual early-connection drop otherwise blanks the feeder exactly during
+ * model-load alloc bursts (seen live: floor-refused local T2 + disconnected
+ * feeder = spurious FULL OOM).  Bounded: one attempt per 300 ms per feeder. */
+int gb_netc_ensure_connected(int remote_idx)
+{
+    if (remote_idx < 0 || remote_idx >= g_remote_gpu_count) return -1;
+    struct netc_feeder *nf = &g_feeders[g_remote_gpus[remote_idx].feeder_idx];
+    if (nf->connected && nf->fd >= 0) return 0;
+
+    struct timespec _ts;
+    clock_gettime(CLOCK_MONOTONIC, &_ts);
+    uint64_t now_ms = (uint64_t)_ts.tv_sec * 1000 + (uint64_t)_ts.tv_nsec / 1000000;
+    static _Atomic uint64_t last_attempt_ms = 0;
+    uint64_t prev = atomic_load_explicit(&last_attempt_ms, memory_order_relaxed);
+    if (now_ms - prev < 300) return nf->connected ? 0 : -1;
+    if (!atomic_compare_exchange_strong(&last_attempt_ms, &prev, now_ms))
+        return nf->connected ? 0 : -1;
+
+    if (pthread_mutex_trylock(&nf->per_lock) != 0)
+        return nf->connected ? 0 : -1;
+    int rc = 0;
+    if (!nf->connected || nf->fd < 0) {
+        rc = connect_feeder(nf);
+        if (rc == 0) {
+            fprintf(stderr, "[GreenBoost-netc] on-demand reconnect to feeder %s\n", nf->addr);
+            nf->reconnect_delay_ms = 500;
+            nf->health_state = GB_HEALTH_HEALTHY;
+        }
+    }
+    pthread_mutex_unlock(&nf->per_lock);
+    return rc == 0 ? 0 : -1;
+}
+
+static int netc_mem_info_request(struct netc_feeder *nf, int gi,
+                                 struct gb_net_header *out_hdr, void **out_payload);
+
+/* Block until at least one feeder GPU is connected, or timeout_ms elapses.
+ * Feeder-exclusive mode calls this before the FIRST allocation so the model's
+ * weights don't lose a race with netc's async connect and silently fall to
+ * local T2 (which then runs entirely local , omen idle). Returns 0 if a feeder
+ * is ready, -1 on timeout. */
+int gb_netc_wait_connected(int timeout_ms)
+{
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        for (int i = 0; i < g_remote_gpu_count; i++) {
+            struct netc_feeder *nf = &g_feeders[g_remote_gpus[i].feeder_idx];
+            if (nf->connected && nf->fd >= 0) return 0;
+            gb_netc_ensure_connected(i);
+        }
+        struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+        long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+        if (ms >= timeout_ms) return -1;
+        struct timespec s = { 0, 50 * 1000 * 1000 };
+        nanosleep(&s, NULL);
+    }
+}
+
 int gb_netc_mem_info(int remote_idx, uint64_t *free_bytes, uint64_t *total_bytes)
 {
     if (remote_idx < 0 || remote_idx >= g_remote_gpu_count) return -1;
     int fi = g_remote_gpus[remote_idx].feeder_idx;
     int gi = g_remote_gpus[remote_idx].feeder_gpu_id;
     struct netc_feeder *nf = &g_feeders[fi];
-    if (!nf->connected) return -1;
-
-    struct gb_net_mem_info req = { .device_id = (gb_u32)gi };
-
-    pthread_mutex_lock(&nf->per_lock);
-    int ret = netc_send_msg(nf, GB_MSG_MEM_INFO, 0, &req, sizeof(req));
-    if (ret < 0) { pthread_mutex_unlock(&nf->per_lock); return -1; }
 
     struct gb_net_header resp_hdr;
     void *resp_payload = NULL;
-    ret = netc_recv_response(nf, &resp_hdr, &resp_payload);
-    pthread_mutex_unlock(&nf->per_lock);
-
-    if (ret < 0 || !resp_payload) return -1;
+    if (netc_mem_info_request(nf, gi, &resp_hdr, &resp_payload) != 0) return -1;
 
     const struct gb_net_mem_info_resp *resp =
         (const struct gb_net_mem_info_resp *)resp_payload;
@@ -1391,36 +1558,51 @@ int gb_netc_t3_speed_mbs(int remote_idx)
     return (int)nf->t3_speed_mbs;  /* cached at connect time */
 }
 
+/* MEM_INFO request with ONE inline reconnect retry.  A "zombie" socket
+ * (connected=1 but peer already closed , the residual early-drop) otherwise
+ * blanks every feeder tier exactly during a model-load alloc burst, because
+ * the heartbeat thread needs up to ~2.5 s to notice and reconnect. */
+static int netc_mem_info_request(struct netc_feeder *nf, int gi,
+                                 struct gb_net_header *out_hdr, void **out_payload)
+{
+    struct gb_net_mem_info req = { .device_id = (gb_u32)gi };
+    for (int attempt = 0; attempt < 2; attempt++) {
+        pthread_mutex_lock(&nf->per_lock);
+        if (!nf->connected || nf->fd < 0) {
+            if (connect_feeder(nf) != 0) {
+                pthread_mutex_unlock(&nf->per_lock);
+                return -1;
+            }
+            fprintf(stderr, "[GreenBoost-netc] mem_info: inline reconnect to %s\n", nf->addr);
+        }
+        *out_payload = NULL;
+        if (netc_send_msg(nf, GB_MSG_MEM_INFO, 0, &req, sizeof(req)) == 0 &&
+            netc_recv_response(nf, out_hdr, out_payload) >= 0 && *out_payload) {
+            pthread_mutex_unlock(&nf->per_lock);
+            return 0;
+        }
+        free(*out_payload); *out_payload = NULL;
+        /* Dead or desynced stream , close so the retry reconnects fresh. */
+        if (nf->fd >= 0) close(nf->fd);
+        nf->fd = -1;
+        nf->connected = 0;
+        pthread_mutex_unlock(&nf->per_lock);
+    }
+    return -1;
+}
+
 int gb_netc_t1_mem_info(int remote_idx, uint64_t *t1_free, uint64_t *t1_total)
 {
     if (remote_idx < 0 || remote_idx >= g_remote_gpu_count) return -1;
     int fi = g_remote_gpus[remote_idx].feeder_idx;
     int gi = g_remote_gpus[remote_idx].feeder_gpu_id;
     struct netc_feeder *nf = &g_feeders[fi];
-    if (!nf->connected) {
-        fprintf(stderr, "[GreenBoost-netc] t1_mem_info[%d]: feeder not connected\n", remote_idx);
-        return -1;
-    }
-
-    struct gb_net_mem_info req = { .device_id = (gb_u32)gi };
-
-    pthread_mutex_lock(&nf->per_lock);
-    int ret = netc_send_msg(nf, GB_MSG_MEM_INFO, 0, &req, sizeof(req));
-    if (ret < 0) {
-        pthread_mutex_unlock(&nf->per_lock);
-        fprintf(stderr, "[GreenBoost-netc] t1_mem_info[%d]: send failed (errno=%d)\n",
-                remote_idx, errno);
-        return -1;
-    }
 
     struct gb_net_header resp_hdr;
     void *resp_payload = NULL;
-    ret = netc_recv_response(nf, &resp_hdr, &resp_payload);
-    pthread_mutex_unlock(&nf->per_lock);
-
-    if (ret < 0 || !resp_payload) {
-        fprintf(stderr, "[GreenBoost-netc] t1_mem_info[%d]: recv failed ret=%d payload=%p (errno=%d)\n",
-                remote_idx, ret, resp_payload, errno);
+    if (netc_mem_info_request(nf, gi, &resp_hdr, &resp_payload) != 0) {
+        fprintf(stderr, "[GreenBoost-netc] t1_mem_info[%d]: request failed (errno=%d)\n",
+                remote_idx, errno);
         return -1;
     }
 
@@ -1454,15 +1636,8 @@ netc_query_mem_info(int remote_idx, struct gb_net_header *out_hdr, void **out_pa
     int fi = g_remote_gpus[remote_idx].feeder_idx;
     int gi = g_remote_gpus[remote_idx].feeder_gpu_id;
     struct netc_feeder *nf = &g_feeders[fi];
-    if (!nf->connected) return NULL;
 
-    struct gb_net_mem_info req = { .device_id = (gb_u32)gi };
-    pthread_mutex_lock(&nf->per_lock);
-    int ret = netc_send_msg(nf, GB_MSG_MEM_INFO, 0, &req, sizeof(req));
-    if (ret < 0) { pthread_mutex_unlock(&nf->per_lock); return NULL; }
-    ret = netc_recv_response(nf, out_hdr, out_payload);
-    pthread_mutex_unlock(&nf->per_lock);
-    if (ret < 0 || !*out_payload) return NULL;
+    if (netc_mem_info_request(nf, gi, out_hdr, out_payload) != 0) return NULL;
     return (const struct gb_net_mem_info_resp *)*out_payload;
 }
 
@@ -1771,11 +1946,34 @@ int gb_netc_free(uint64_t fake_ptr)
     return 0;
 }
 
+/* Transfers larger than the wire's max message must be chunked , a 121 MB
+ * embedding tensor sent whole gets "payload_len too large" and a dropped
+ * connection (hit live 2026-07-06, qwen3-0.6b first tensor).  3 MB chunks
+ * leave headroom for header+desc under GB_NET_MAX_MSG_SIZE and release
+ * per_lock between chunks so heartbeats interleave. */
+#define GB_NETC_XFER_CHUNK (3u * 1024u * 1024u)
+
+static int gb_netc_memcpy_h2d_one(uint64_t fake_dst, const void *host_src, uint64_t size);
+
 int gb_netc_memcpy_h2d(uint64_t fake_dst, const void *host_src, uint64_t size)
+{
+    uint64_t done = 0;
+    while (done < size) {
+        uint64_t n = size - done;
+        if (n > GB_NETC_XFER_CHUNK) n = GB_NETC_XFER_CHUNK;
+        if (gb_netc_memcpy_h2d_one(fake_dst + done,
+                                   (const uint8_t *)host_src + done, n) != 0)
+            return -1;
+        done += n;
+    }
+    return 0;
+}
+
+static int gb_netc_memcpy_h2d_one(uint64_t fake_dst, const void *host_src, uint64_t size)
 {
     NETC_NVTX_PUSH("GB:net_h2d", NETC_NVTX_COLOR_MEMCPY);
     pthread_mutex_lock(&g_alloc_lock);
-    struct netc_alloc *a = alloc_find(fake_dst);
+    struct netc_alloc *a = alloc_find_range(fake_dst);
     if (!a) { pthread_mutex_unlock(&g_alloc_lock); NETC_NVTX_POP(); return -1; }
 
     uint64_t remote_handle = a->remote_handle;
@@ -1797,9 +1995,38 @@ int gb_netc_memcpy_h2d(uint64_t fake_dst, const void *host_src, uint64_t size)
     clock_gettime(CLOCK_MONOTONIC, &_t0);
 
     pthread_mutex_lock(&nf->per_lock);
-    int ret = netc_send_msg_with_data(nf, GB_MSG_CUDA_MEMCPY_H2D, 0,
+
+    /* Fabric zstd: compress the payload before framing when the feeder
+     * negotiated it and the chunk is worth compressing. The gb_net_cuda_memcpy
+     * .size field stays the UNCOMPRESSED size (feeder sizes its decompress from
+     * it). Compressing here (not inside netc_send_msg_with_data) means the
+     * per-message MAC naturally covers the compressed bytes actually sent, and
+     * we fall back to raw whenever compression is unavailable or unprofitable. */
+    const void *send_data = host_src;
+    uint32_t    send_len  = (uint32_t)size;
+    uint16_t    send_flags = 0;
+#ifdef GB_HAVE_ZSTD
+    if (nf->feat_zstd && g_zstd_enabled && size >= g_zstd_min) {
+        size_t bound = ZSTD_compressBound(size);
+        if (nf->zbuf_cap < bound) {
+            uint8_t *nb = (uint8_t *)realloc(nf->zbuf, bound);
+            if (nb) { nf->zbuf = nb; nf->zbuf_cap = bound; }
+        }
+        if (nf->zbuf && nf->zbuf_cap >= bound) {
+            size_t csize = ZSTD_compress(nf->zbuf, nf->zbuf_cap,
+                                         host_src, size, g_zstd_level);
+            if (!ZSTD_isError(csize) && csize < size) {
+                send_data  = nf->zbuf;
+                send_len   = (uint32_t)csize;
+                send_flags = GB_NET_FLAG_COMP_ZSTD;
+            }
+        }
+    }
+#endif
+
+    int ret = netc_send_msg_with_data(nf, GB_MSG_CUDA_MEMCPY_H2D, send_flags,
                                       &hdr_payload, sizeof(hdr_payload),
-                                      host_src, (uint32_t)size);
+                                      send_data, send_len);
     if (ret < 0) { pthread_mutex_unlock(&nf->per_lock); return -1; }
 
     struct gb_net_header resp_hdr;
@@ -1822,18 +2049,83 @@ int gb_netc_memcpy_h2d(uint64_t fake_dst, const void *host_src, uint64_t size)
 
     if (ret >= 0)
         NETC_NVTX_EVENT("MEMCPY_H2D_NET", "NET", size >> 20, fake_dst, nf->addr);
-    else
+    else {
         NETC_NVTX_EVENT("MEMCPY_H2D_FAIL", "NET", size >> 20, fake_dst, nf->addr);
+        netc_log("memcpy H2D FAILED: dst=0x%llx off=%llu size=%llu ret=%d errno=%d",
+                 (unsigned long long)fake_dst, (unsigned long long)offset,
+                 (unsigned long long)size, ret, errno);
+    }
     netc_log("memcpy H2D: %llu MB → feeder %s", (unsigned long long)(size >> 20), nf->addr);
     NETC_NVTX_POP();
     return (ret < 0) ? -1 : 0;
 }
 
+/* Remote memset on a feeder allocation (interior pointers supported).
+ * Needed because ggml memsets quantized-tensor padding right after upload. */
+int gb_netc_memset(uint64_t fake_dst, int value, uint64_t size)
+{
+    /* Range lookup: ggml memsets tensor padding at interior offsets. */
+    pthread_mutex_lock(&g_alloc_lock);
+    struct netc_alloc *a = alloc_find_range(fake_dst);
+    if (!a) { pthread_mutex_unlock(&g_alloc_lock); return -1; }
+
+    uint64_t remote_handle = a->remote_handle;
+    uint64_t offset        = fake_dst - a->fake_ptr;
+    int      feeder_idx    = a->feeder_idx;
+    pthread_mutex_unlock(&g_alloc_lock);
+
+    struct netc_feeder *nf = &g_feeders[feeder_idx];
+    if (!nf->connected) return -1;
+
+    struct gb_net_cuda_memset req = {
+        .remote_handle = remote_handle,
+        .offset        = offset,
+        .size          = size,
+        .value         = (gb_u32)(value & 0xFF),
+    };
+
+    pthread_mutex_lock(&nf->per_lock);
+    int ret = netc_send_msg(nf, GB_MSG_CUDA_MEMSET, 0, &req, sizeof(req));
+    if (ret < 0) { pthread_mutex_unlock(&nf->per_lock); return -1; }
+
+    struct gb_net_header resp_hdr;
+    void *resp_payload = NULL;
+    ret = netc_recv_response(nf, &resp_hdr, &resp_payload);
+    pthread_mutex_unlock(&nf->per_lock);
+
+    int status_ok = 0;
+    if (ret >= 0 && resp_payload &&
+        resp_hdr.payload_len >= sizeof(struct gb_net_response)) {
+        const struct gb_net_response *r = (const struct gb_net_response *)resp_payload;
+        status_ok = (r->status == GB_STATUS_OK);
+    }
+    free(resp_payload);
+    netc_log("memset: %llu KB val=%d → feeder %s (%s)",
+             (unsigned long long)(size >> 10), value, nf->addr,
+             status_ok ? "ok" : "FAILED");
+    return status_ok ? 0 : -1;
+}
+
+static int gb_netc_memcpy_d2h_one(void *host_dst, uint64_t fake_src, uint64_t size);
+
 int gb_netc_memcpy_d2h(void *host_dst, uint64_t fake_src, uint64_t size)
+{
+    uint64_t done = 0;
+    while (done < size) {
+        uint64_t n = size - done;
+        if (n > GB_NETC_XFER_CHUNK) n = GB_NETC_XFER_CHUNK;
+        if (gb_netc_memcpy_d2h_one((uint8_t *)host_dst + done, fake_src + done, n) != 0)
+            return -1;
+        done += n;
+    }
+    return 0;
+}
+
+static int gb_netc_memcpy_d2h_one(void *host_dst, uint64_t fake_src, uint64_t size)
 {
     NETC_NVTX_PUSH("GB:net_d2h", NETC_NVTX_COLOR_MEMCPY);
     pthread_mutex_lock(&g_alloc_lock);
-    struct netc_alloc *a = alloc_find(fake_src);
+    struct netc_alloc *a = alloc_find_range(fake_src);
     if (!a) { pthread_mutex_unlock(&g_alloc_lock); NETC_NVTX_POP(); return -1; }
 
     uint64_t remote_handle = a->remote_handle;
@@ -1944,7 +2236,21 @@ void gb_netc_register_kernel(const void *host_func, const char *device_name)
     }
 
     /* Propagate to connected feeders so they can dlsym the kernel and
-     * execute it locally when we dispatch via GB_MSG_CUDA_EXEC. */
+     * execute it locally when we dispatch via GB_MSG_CUDA_EXEC.
+     * Cap the pushes: torch processes register 4000+ kernels at import
+     * (none dlsym-resolvable on the feeder anyway , netd resolves scoped to
+     * its ggml lib), which floods the daemon with a ~4 MB burst at connect
+     * time. ggml registers well under the cap. Registration is an
+     * optimisation only: exec falls back to the feeder's own scoped dlsym. */
+    static _Atomic uint32_t g_kernel_push_count = 0;
+    uint32_t push_max = 1024;
+    const char *pm = getenv("GREENBOOST_KERNEL_PUSH_MAX");
+    if (pm) push_max = (uint32_t)atoi(pm);
+    if (atomic_fetch_add_explicit(&g_kernel_push_count, 1, memory_order_relaxed)
+            >= push_max) {
+        pthread_mutex_unlock(&g_netc_lock);
+        return;
+    }
     uint32_t name_len = (uint32_t)strlen(device_name);
     if (name_len >= GB_NET_MAX_KERNEL_NAME) name_len = GB_NET_MAX_KERNEL_NAME - 1;
     uint32_t msg_size = (uint32_t)sizeof(struct gb_net_cuda_register_fn) + name_len;
@@ -1958,7 +2264,7 @@ void gb_netc_register_kernel(const void *host_func, const char *device_name)
         if (!nf->connected) continue;
         /* Must hold per_lock while sending: heartbeat thread (gb_netc_poll_health)
          * also writes to this socket under per_lock. g_netc_lock alone does not
-         * prevent the race — they are independent locks. Concurrent writes corrupt
+         * prevent the race , they are independent locks. Concurrent writes corrupt
          * the TCP framing, causing the feeder to close the connection on seq mismatch. */
         pthread_mutex_lock(&nf->per_lock);
         netc_send_msg(nf, GB_MSG_CUDA_REGISTER_FN, 0, buf, msg_size);
@@ -2231,6 +2537,73 @@ void gb_netc_alloc_release_ref(uint64_t ptr)
     pthread_mutex_unlock(&g_alloc_lock);
 }
 
+int gb_netc_exec_kernel_raw(int feeder_idx,
+                            const char *kernel_name,
+                            unsigned int gx, unsigned int gy, unsigned int gz,
+                            unsigned int bx, unsigned int by, unsigned int bz,
+                            uint32_t shared_mem,
+                            const uint8_t *param_buf, uint32_t param_buf_bytes,
+                            const uint32_t *param_sizes, uint32_t n_params,
+                            const struct gb_exec_reloc_raw *relocs, int n_relocs)
+{
+    if (feeder_idx < 0 || feeder_idx >= g_feeder_count) return -1;
+    struct netc_feeder *nf = &g_feeders[feeder_idx];
+    if (!nf->connected) return -1;
+
+    uint32_t name_len    = (uint32_t)strlen(kernel_name);
+    uint32_t psize_bytes = n_params * (uint32_t)sizeof(uint32_t);
+    uint32_t reloc_bytes = (uint32_t)n_relocs * (uint32_t)sizeof(struct gb_net_ptr_reloc);
+    uint32_t total = (uint32_t)sizeof(struct gb_net_cuda_exec_raw)
+                   + name_len + psize_bytes + reloc_bytes + param_buf_bytes;
+
+    uint8_t *payload = (uint8_t *)malloc(total);
+    if (!payload) return -1;
+
+    struct gb_net_cuda_exec_raw hdr = {
+        .grid_x = gx, .grid_y = gy, .grid_z = gz,
+        .block_x = bx, .block_y = by, .block_z = bz,
+        .shared_mem_bytes = shared_mem,
+        .kernel_name_len  = name_len,
+        .n_params         = n_params,
+        .n_relocs         = (gb_u32)n_relocs,
+        .param_buf_bytes  = param_buf_bytes,
+        .launch_mode      = 0,   /* feeder decides by resolution */
+    };
+
+    uint8_t *p = payload;
+    memcpy(p, &hdr, sizeof(hdr));            p += sizeof(hdr);
+    memcpy(p, kernel_name, name_len);        p += name_len;
+    memcpy(p, param_sizes, psize_bytes);     p += psize_bytes;
+    for (int i = 0; i < n_relocs; i++) {
+        struct gb_net_ptr_reloc r;
+        r.arg_idx       = relocs[i].buf_offset;   /* reinterpreted as byte offset */
+        r.t2_speed_mts  = 0;
+        r.remote_handle = relocs[i].remote_handle;
+        memcpy(p, &r, sizeof(r));            p += sizeof(r);
+    }
+    memcpy(p, param_buf, param_buf_bytes);   p += param_buf_bytes;
+
+    pthread_mutex_lock(&nf->per_lock);
+    int ret = netc_send_msg(nf, GB_MSG_CUDA_EXEC, GB_NET_FLAG_EXEC_RAW, payload, total);
+    free(payload);
+    if (ret < 0) { pthread_mutex_unlock(&nf->per_lock); return -1; }
+
+    struct gb_net_header resp_hdr;
+    void *resp_payload = NULL;
+    ret = netc_recv_response(nf, &resp_hdr, &resp_payload);
+    pthread_mutex_unlock(&nf->per_lock);
+    if (ret < 0 || !resp_payload) {
+        netc_log("exec_kernel_raw '%s': recv failed ret=%d", kernel_name, ret);
+        return -1;
+    }
+    const struct gb_net_response *resp = (const struct gb_net_response *)resp_payload;
+    int ok = (resp->status == GB_STATUS_OK);
+    if (!ok) netc_log("exec_kernel_raw '%s': feeder status=%u", kernel_name,
+                      (unsigned)resp->status);
+    free(resp_payload);
+    return ok ? 0 : -1;
+}
+
 int gb_netc_exec_kernel(int feeder_idx,
                         const char *kernel_name,
                         unsigned int gx, unsigned int gy, unsigned int gz,
@@ -2329,17 +2702,27 @@ int gb_netc_exec_kernel(int feeder_idx,
     int ret = netc_send_msg(nf, GB_MSG_CUDA_EXEC, 0, payload, total);
     free(payload);
 
-    if (ret < 0) { pthread_mutex_unlock(&nf->per_lock); NETC_NVTX_POP(); return -1; }
+    if (ret < 0) {
+        pthread_mutex_unlock(&nf->per_lock);
+        netc_log("exec_kernel '%s': send failed errno=%d", kernel_name, errno);
+        NETC_NVTX_POP(); return -1;
+    }
 
     struct gb_net_header resp_hdr;
     void *resp_payload = NULL;
     ret = netc_recv_response(nf, &resp_hdr, &resp_payload);
     pthread_mutex_unlock(&nf->per_lock);
 
-    if (ret < 0 || !resp_payload) { NETC_NVTX_POP(); return -1; }
+    if (ret < 0 || !resp_payload) {
+        netc_log("exec_kernel '%s': recv failed ret=%d errno=%d", kernel_name, ret, errno);
+        NETC_NVTX_POP(); return -1;
+    }
 
     const struct gb_net_response *resp = (const struct gb_net_response *)resp_payload;
-    if (resp->status != GB_STATUS_OK) { free(resp_payload); NETC_NVTX_POP(); return -1; }
+    if (resp->status != GB_STATUS_OK) {
+        netc_log("exec_kernel '%s': feeder returned status=%u", kernel_name, (unsigned)resp->status);
+        free(resp_payload); NETC_NVTX_POP(); return -1;
+    }
 
     /* Audit F-L3-18: validate that the response payload is at least large
      * enough to contain the gb_net_response header plus the downloads we
@@ -2512,9 +2895,18 @@ void gb_netc_poll_health(void)
         clock_gettime(CLOCK_MONOTONIC, &_hb_ts);
         uint64_t now_ms = (uint64_t)_hb_ts.tv_sec * 1000 + (uint64_t)_hb_ts.tv_nsec / 1000000;
 
-        /* N8: handle disconnected feeders with exponential backoff reconnect */
+        /* N8: handle disconnected feeders with exponential backoff reconnect.
+         * MUST hold per_lock: connect_feeder replaces nf->fd and resets the
+         * seq counters , doing that while another thread is mid send/recv on
+         * the old socket abandons a live connection (netd then drops it idle
+         * at 15 s and every later send gets EPIPE; hit live 2026-07-06). */
         if (!nf->connected || nf->fd < 0) {
             if (now_ms < nf->next_reconnect_ms) continue;
+            if (pthread_mutex_trylock(&nf->per_lock) != 0) continue;
+            if (nf->connected && nf->fd >= 0) {   /* raced: someone reconnected */
+                pthread_mutex_unlock(&nf->per_lock);
+                continue;
+            }
             NETC_NVTX_EVENT("RECONNECT_ATTEMPT", "NET", 0, i, nf->addr);
             if (connect_feeder(nf) == 0) {
                 fprintf(stderr, "[GreenBoost-netc] N8: reconnected to feeder %s\n", nf->addr);
@@ -2531,6 +2923,7 @@ void gb_netc_poll_health(void)
                         nf->addr, (unsigned long long)delay);
                 NETC_NVTX_EVENT("RECONNECT_FAIL", "NET", delay / 1000, i, nf->addr);
             }
+            pthread_mutex_unlock(&nf->per_lock);
             continue;
         }
 
@@ -2546,50 +2939,41 @@ void gb_netc_poll_health(void)
         memset(&req, 0, sizeof(req));
         req.timestamp_ms = now_ms;
 
-        if (netc_send_msg(nf, GB_MSG_HEARTBEAT, 0, &req, sizeof(req)) < 0) {
-            /* A3: send failed - check if timeout exceeded */
-            nf->heartbeat_miss_count++;
-            if (now_ms - nf->last_heartbeat_ms > GB_NET_HEARTBEAT_TIMEOUT_MS) {
-                if (nf->health_state <= GB_HEALTH_DEGRADED) {
-                    fprintf(stderr, "[GreenBoost-netc] A3: feeder %s heartbeat timeout "
-                            "(%u ms) → UNHEALTHY, closing socket\n", nf->addr,
-                            (unsigned)(now_ms - nf->last_heartbeat_ms));
-                    nf->health_state = GB_HEALTH_UNHEALTHY;
-                    nf->health_state_since_ms = now_ms;
-                }
-                /* N8: close socket and start backoff reconnect */
-                close(nf->fd);
-                nf->fd = -1;
-                nf->connected = 0;
-                if (nf->reconnect_delay_ms < 500) nf->reconnect_delay_ms = 500;
-                nf->next_reconnect_ms = now_ms + nf->reconnect_delay_ms;
-                NETC_NVTX_EVENT("HEARTBEAT_TIMEOUT", "NET", 0, i, nf->addr);
-            }
-            pthread_mutex_unlock(&nf->per_lock);
-            NETC_NVTX_POP();
-            continue;
-        }
-
+        /* A3 (rewritten 2026-07-06): a failed heartbeat means the stream is
+         * dead or desynced , EPIPE/reset, a lost response, or a seq mismatch
+         * all leave the connection unusable for every other caller too.
+         * Waiting out the 15 s staleness window just meant 7 more guaranteed
+         * failures while allocs got "feeder not connected". Close and let N8
+         * reconnect within ~500 ms instead. */
+        int hb_dead = 0;
         struct gb_net_header hdr;
         void *pay = NULL;
-        if (netc_recv_response(nf, &hdr, &pay) < 0 || !pay) {
-            /* A3: recv failed */
+        if (netc_send_msg(nf, GB_MSG_HEARTBEAT, 0, &req, sizeof(req)) < 0) {
+            if (g_netc_debug)
+                fprintf(stderr, "[GreenBoost-netc %d] heartbeat send failed: fd=%d errno=%d (%s)\n",
+                        (int)getpid(), nf->fd, errno, strerror(errno));
+            hb_dead = 1;
+            NETC_NVTX_EVENT("HEARTBEAT_TIMEOUT", "NET", 0, i, nf->addr);
+        } else if (netc_recv_response(nf, &hdr, &pay) < 0 || !pay) {
+            if (g_netc_debug)
+                fprintf(stderr, "[GreenBoost-netc %d] heartbeat recv failed: fd=%d errno=%d (%s)\n",
+                        (int)getpid(), nf->fd, errno, strerror(errno));
+            hb_dead = 1;
+            NETC_NVTX_EVENT("HEARTBEAT_RECV_TIMEOUT", "NET", 0, i, nf->addr);
+        }
+        if (hb_dead) {
             nf->heartbeat_miss_count++;
-            if (now_ms - nf->last_heartbeat_ms > GB_NET_HEARTBEAT_TIMEOUT_MS) {
-                if (nf->health_state <= GB_HEALTH_DEGRADED) {
-                    fprintf(stderr, "[GreenBoost-netc] A3: feeder %s heartbeat recv timeout → UNHEALTHY, closing socket\n",
-                            nf->addr);
-                    nf->health_state = GB_HEALTH_UNHEALTHY;
-                    nf->health_state_since_ms = now_ms;
-                }
-                /* N8: close socket and start backoff reconnect */
-                close(nf->fd);
-                nf->fd = -1;
-                nf->connected = 0;
-                if (nf->reconnect_delay_ms < 500) nf->reconnect_delay_ms = 500;
-                nf->next_reconnect_ms = now_ms + nf->reconnect_delay_ms;
-                NETC_NVTX_EVENT("HEARTBEAT_RECV_TIMEOUT", "NET", 0, i, nf->addr);
+            if (nf->health_state <= GB_HEALTH_DEGRADED) {
+                fprintf(stderr, "[GreenBoost-netc] A3: feeder %s heartbeat failed → "
+                        "reconnecting\n", nf->addr);
+                nf->health_state = GB_HEALTH_DEGRADED;
+                nf->health_state_since_ms = now_ms;
             }
+            close(nf->fd);
+            nf->fd = -1;
+            nf->connected = 0;
+            nf->reconnect_delay_ms = 500;
+            nf->next_reconnect_ms  = now_ms + 500;
             pthread_mutex_unlock(&nf->per_lock);
             NETC_NVTX_POP();
             continue;
@@ -2598,6 +2982,7 @@ void gb_netc_poll_health(void)
         /* A3: heartbeat received successfully - reset miss counter */
         nf->last_heartbeat_ms   = now_ms;
         nf->heartbeat_miss_count = 0;
+        netc_log("heartbeat OK fd=%d send_seq=%u", nf->fd, nf->send_seq);
         NETC_NVTX_EVENT("HEARTBEAT_OK", "NET", 0, i, nf->addr);
 
         /* Struct may be larger than old version - check payload length before reading new fields */

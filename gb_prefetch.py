@@ -2,19 +2,19 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
 """
-gb_prefetch.py — GreenBoost generic dense-LLM layer-sequential prefetch.
+gb_prefetch.py , GreenBoost generic dense-LLM layer-sequential prefetch.
 
 WHY: gb_moe.py predictively prefetches MoE experts (routing is stochastic,
 so the next-layer expert set is a frequency-based guess). gb_diffusion_orch.py
 prefetches the VAE ahead of the last denoising step. Neither covers the more
 common case: a dense transformer's decoder-layer stack, executed in a fixed,
 known order every forward pass. Unlike MoE routing, dense-layer order needs
-no prediction at all — layer i is always followed by layer i+1 — so this is
+no prediction at all , layer i is always followed by layer i+1 , so this is
 a strictly simpler, deterministic instance of the same overlap pattern
 (DeepSpeed ZeRO-Infinity's overlap-centric offload: bring tier N+1 onto the
 GPU on the transfer stream while tier N computes on the compute stream),
 applied to GreenBoost's own explicit T1/T2/T3 tiers via the existing
-ModelTierManager and gb_stream_sched primitives — no new tier or kernel
+ModelTierManager and gb_stream_sched primitives , no new tier or kernel
 change needed.
 
 Design (mirrors gb_moe.py's validated per-expert pre-hook pattern, scaled
@@ -31,7 +31,7 @@ down since there is no misprediction to correct here):
          earlier) computed, wait for that transfer to land, then mark it
          resident. If it was NOT prefetched (cold start, or
          `keep_resident`/`lookahead` misconfigured), promote it
-         synchronously — this is the only "fallback" path, and unlike
+         synchronously , this is the only "fallback" path, and unlike
          MoE there is no steady-state case where it should ever fire.
       2. Demote the layer `keep_resident` steps behind (sliding window)
          back to T2, then kick off an async prefetch of the layer
@@ -39,13 +39,27 @@ down since there is no misprediction to correct here):
          the H2D copy overlaps layer i's own compute instead of blocking
          layer i+1's pre-hook.
 
-Limitation (by design, not yet validated against a multi-billion-parameter
-model): correctness was validated against a real, GPU-resident synthetic
-decoder stack (see tests/test_gb_prefetch.py) with real H2D/D2H transfers
-on the "transfer" CUDA stream and real overlap timing; it has not yet been
-run against a full-size checkpoint (Llama/Qwen/Mistral) end to end the way
-gb_moe.py's Track 3 was. Treat `keep_resident`/`lookahead` defaults as a
-starting point for a real model, not a validated value.
+Validated against a real checkpoint (2026-06-22, tests/bench/run_real_model.py,
+Qwen/Qwen3-8B, int4-via-gb_quant, RTX 5070). Two real correctness bugs were
+found and fixed in the process (see workflow/known-issues.md for the full
+writeup): the prefetch-hit path's stream sync raced the H2D copy against the
+GEMM (silent corruption -> NaN on real-size tensors, invisible on the KB-scale
+unit-test model), and the same bug existed in ModelTierManager.promote/demote.
+
+Performance finding (do not re-litigate without new data): when the model has
+already been placed by gb_quant's fit-to-VRAM planner, LayerPrefetcher's
+sliding window is NOT beneficial - it re-partitions an already-tuned static
+placement and adds per-token H2D/D2H churn instead of removing latency. Swept
+keep_resident in {2,4,8,16,24,32} x lookahead in {1,2}: tok/s rose monotonically
+with keep_resident (2.65 -> 9.91) but never matched the no-prefetch baseline
+(15.45 tok/s) even at keep_resident=32 of 36 layers; lookahead had no
+measurable effect. Defaults below are left unchanged (no swept value beat the
+baseline, so there is no winning default to bake in) - this module's intended
+use case is a model NOT already placed by gb_quant (e.g. a raw bf16/fp8 stack
+overflowing via the shim's transparent cudaMalloc path), matching the
+DeepSpeed ZeRO-Infinity overlap pattern this module is modeled on. Stacking
+LayerPrefetcher on top of gb_llm.load_causal_lm (which always routes through
+gb_quant) is currently a net loss - don't do both.
 
 Usage:
     import gb_prefetch
@@ -213,9 +227,23 @@ class LayerPrefetcher:
             e = self._tm._entries[name]
 
             if self._state.in_flight.pop(idx, False):
-                # Prefetched while an earlier layer computed - just sync the
-                # transfer stream before this layer's compute touches it.
-                gs.wait_for("transfer", on="gemm")
+                # Prefetched while an earlier layer computed - sync the
+                # transfer into whatever stream is about to run THIS
+                # layer's forward compute. Do not use gs.wait_for(...,
+                # on="gemm"): the named "gemm" stream is only current
+                # inside an explicit `with gs.on("gemm")` block (e.g.
+                # gb_diffusion_orch.py's denoise loop). Callers like
+                # gb_llm.generate() never enter that block, so forward
+                # compute actually runs on torch's ambient current
+                # stream - waiting on "gemm" there is a no-op and the
+                # async H2D copy can still be in flight when the GEMM
+                # reads the weight (silent corruption -> NaN/inf on
+                # real-size tensors; invisible on the KB-scale tensors
+                # in this module's unit tests, where the copy finishes
+                # before the race window matters).
+                ev = torch.cuda.Event()
+                gs.stream("transfer").record_event(ev)
+                torch.cuda.current_stream().wait_event(ev)
                 e.tier = Tier.T1
                 self._state.promote_count += 1
             elif e.tier != Tier.T1:

@@ -1,11 +1,13 @@
-# Chapter G. GreenBoost, Host-RAM Tiering for CUDA
+# 📖 Chapter G. GreenBoost, Host-Memory Tiering, Weight Compression, and Cluster Aggregation for CUDA
 
 > **Disclaimer.** This document is **not** an official NVIDIA publication. It is a
 > third-party supplement to the *CUDA C++ Programming Guide*.
 > It documents **GreenBoost**, an experimental,
 > open-source Linux kernel module and CUDA `LD_PRELOAD` shim that extends the
 > tiered-memory model described in Programming Guide §3.2 and §4.1 onto host
-> system RAM and (optionally) remote machines. GreenBoost is created by Ferran
+> system RAM and (optionally) remote machines, complemented by a Python weight-
+> compression layer (gb-quant, §G.13) that quantizes models to fit VRAM directly.
+> GreenBoost is created by Ferran
 > Duarri and is opensource licensed (GPL v2 ), see `LICENSE` in the
 > source tree. The CUDA, NVIDIA, NVML, NVTX, Hopper, Grace, Ada, Blackwell, and
 > Tegra names are trademarks of NVIDIA Corporation. GreenBoost is not affiliated
@@ -18,6 +20,27 @@ relies on, the relevant section number is cross-referenced. Where GreenBoost
 introduces behavior that is **not** documented by NVIDIA, typically because it
 combines documented primitives in ways NVIDIA never described, or alters what
 the runtime *reports* about devices, that fact is called out explicitly.
+
+<details>
+<summary><strong>📑 Table of contents</strong> (click to expand)</summary>
+
+- [G.1. Overview](#g1-overview)
+- [G.2. The Problem GreenBoost Solves](#g2-the-problem-greenboost-solves)
+- [G.3. Architecture](#g3-architecture)
+- [G.4. The Three Allocation Paths](#g4-the-three-allocation-paths)
+- [G.5. Why GreenBoost Is Better Than Ollama / vLLM CPU Spillover](#g5-why-greenboost-is-better-than-ollama-vllm-cpu-spillover)
+- [G.6. Use Cases](#g6-use-cases)
+- [G.7. Documented vs. Undocumented Behavior](#g7-documented-vs-undocumented-behavior)
+- [G.8. Detection, Safety, and Telemetry](#g8-detection-safety-and-telemetry)
+- [G.9. Limitations and Caveats](#g9-limitations-and-caveats)
+- [G.10. Compatibility Matrix](#g10-compatibility-matrix)
+- [G.11. Licensing and Attribution](#g11-licensing-and-attribution)
+- [G.12. Cross-Reference Index to the CUDA C++ Programming Guide](#g12-cross-reference-index-to-the-cuda-c-programming-guide)
+- [G.13. v3.0 Additions (Python Layers and Compatibility Fixes)](#g13-v30-additions-python-layers-and-compatibility-fixes)
+- [G.14. LMCache Coexistence (vLLM Path Only)](#g14-lmcache-coexistence-vllm-path-only)
+- [G.15. Heat-Augmented Eviction and eBPF Observability (v3.2)](#g15-heat-augmented-eviction-and-ebpf-observability-v32)
+
+</details>
 
 ---
 
@@ -37,7 +60,10 @@ single virtual GPU device** whose reported total memory equals
 that exceed physical VRAM are transparently routed onto host system RAM (and
 optionally NVMe or other machines), but in a way that keeps **all tensor
 computation on the GPU's streaming multiprocessors (SMs)**. The CPU never
-executes tensor math.
+executes tensor math. Where memory tiering alone isn't the better answer , a
+model 1.5-3× VRAM pays a PCIe bandwidth tax even when it fits , the companion
+Python layer (gb-quant, §G.13) quantizes the model itself so the working set
+runs at full VRAM bandwidth instead.
 
 The trick is to take three documented NVIDIA primitives and combine them in a
 configuration the Programming Guide does not describe:
@@ -749,7 +775,7 @@ GreenBoost v3.0 adds five Python-level layers that complement the CUDA shim
 without touching any CUDA-documented primitive. These are GreenBoost-specific
 designs, not combinations of NVIDIA-documented APIs:
 
-**`gb_init.py`** — single-import bootstrap. On import it:
+**`gb_init.py`** , single-import bootstrap. On import it:
 - Monkey-patches `torch.cuda.empty_cache → lambda: None`. Rationale: the
   PyTorch CUDA caching allocator's `cudaFree` calls conflict with the
   `DynamicVRAM` allocator's ownership of the pool. NVIDIA documents
@@ -763,13 +789,13 @@ designs, not combinations of NVIDIA-documented APIs:
   does not alter any NVIDIA-documented behaviour; it reads DCGM fields
   that are documented as part of the DCGM API surface (FI 311, FI 313).
 
-**`gb_telemetry.py`** — embedded DCGM mode. Uses `dcgmStartEmbedded` instead
+**`gb_telemetry.py`** , embedded DCGM mode. Uses `dcgmStartEmbedded` instead
 of connecting to a `dcgmd` daemon. NVIDIA's DCGM documentation lists
 `dcgmStartEmbedded` as supported. The combination of embedded DCGM +
 NVML + GreenBoost ioctl in a single telemetry poll loop is not described
 in any NVIDIA document; it is a GreenBoost composition.
 
-**`gb_quant.py`** — weight quantization. Uses PyTorch / HQQ (Half-Quadratic
+**`gb_quant.py`** , weight quantization. Uses PyTorch / HQQ (Half-Quadratic
 Quantization, MIT-licensed) and GemLite (Apache-2.0 Triton GEMM kernels).
 None of this touches CUDA-documented APIs at the shim level; the quantized
 weights are plain PyTorch tensors. The *result* is that fewer bytes are
@@ -778,7 +804,7 @@ Path A/B allocation. GreenBoost provides the VRAM budget information
 (from `gb_telemetry.GreenBoostProvider` ioctl) so the planner knows what
 precision level fits without trial-and-error.
 
-**`gb_llm.py`** and **`gb_diffusion_orch.py`** — application-level wrappers.
+**`gb_llm.py`** and **`gb_diffusion_orch.py`** , application-level wrappers.
 No new CUDA primitives. They coordinate model loading and quantization
 using the layers above. The NVTX ranges emitted (`gb:llm_load:<model>`,
 `gb:quantize:<bits>`) are standard NVTX markers (documented by NVIDIA).
@@ -797,7 +823,7 @@ context before issuing driver-API calls that need one. Programming Guide
 §5.3.1 (Implicit Context) notes that the *runtime* API (`cudaSetDevice`,
 `cudaMemGetInfo`) retains the primary context automatically. The guide does
 not discuss what happens when frameworks call the driver API without first
-establishing a context — the documented expectation is that they do so.
+establishing a context , the documented expectation is that they do so.
 
 **GreenBoost's behaviour.** When `cuMemGetInfo_v2` or `cuDeviceTotalMem_v2`
 returns `CUDA_ERROR_INVALID_CONTEXT` (201) or `CUDA_ERROR_DEINITIALIZED`
@@ -811,7 +837,7 @@ returns `CUDA_ERROR_INVALID_CONTEXT` (201) or `CUDA_ERROR_DEINITIALIZED`
 
 The result is that the caller receives the correct inflated values without
 needing to have called `cudaSetDevice` first. This is **not documented by
-NVIDIA** — specifically, the fallback from a failing driver-API call to the
+NVIDIA** , specifically, the fallback from a failing driver-API call to the
 corresponding runtime-API call, and the mixing of driver-API output with
 GreenBoost-applied inflation, is a GreenBoost-specific design.
 
@@ -855,7 +881,7 @@ launches `vllm serve` with `--kv-transfer-config
 {"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}` and
 `LMCACHE_LOCAL_CPU`/`LMCACHE_LOCAL_DISK` env. LMCache (Apache-2.0,
 `pip install lmcache`) is a third-party KV-cache reuse layer that ships
-connectors for vLLM, SGLang, and TensorRT-LLM only — it is **not** a
+connectors for vLLM, SGLang, and TensorRT-LLM only , it is **not** a
 GreenBoost-authored primitive and does not touch the CUDA shim.
 
 **Why it composes safely with GreenBoost:**
@@ -865,20 +891,20 @@ GreenBoost-authored primitive and does not touch the CUDA shim.
   GreenBoost decides which physical tier backs whatever vLLM allocates.
 - LMCache's CPU offload buffer (`LMCACHE_MAX_LOCAL_CPU_SIZE`, default 8 GB)
   is sized from host RAM headroom, deliberately **not** from
-  `GREENBOOST_VIRTUAL_VRAM_MB` — this keeps LMCache's own DDR claim disjoint
+  `GREENBOOST_VIRTUAL_VRAM_MB` , this keeps LMCache's own DDR claim disjoint
   from the GreenBoost T2 pool rather than double-counting the same bytes.
 - `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` (already required by
   the shim, G.13.1) is left untouched; LMCache does not require
   `expandable_segments` and does not conflict with the shim's `cudaMalloc`/
   `cuMemGetInfo` interception.
 
-**Scope boundary — what LMCache does *not* cover:**
+**Scope boundary , what LMCache does *not* cover:**
 - **Ollama / llama.cpp (GGUF).** No LMCache connector exists for llama.cpp.
   KV-side acceleration for the Ollama backend remains GreenBoost's own
   **TurboQuant** (`q4_0` KV compression, G.6/G.8). To get LMCache's
   cross-request KV reuse, the model must run on the CLI's `vllm/` backend.
 - **Diffusion pipelines (ComfyUI, FLUX 2 Klein + LoRAs, etc.).** Diffusion
-  models have no autoregressive KV cache — there is nothing for LMCache to
+  models have no autoregressive KV cache , there is nothing for LMCache to
   reuse. These pipelines already benefit from GreenBoost's T2/T3 VRAM
   tiering (G.4); a genuine diffusion-side speedup would require activation
   caching (DeepCache / TeaCache / first-block-cache–style techniques), which
@@ -897,7 +923,7 @@ but previously unused) to the kernel via a new ioctl, `GB_IOCTL_SET_HEAT`.
 The kernel stores it as `struct gb_buf.heat`, decays it every watchdog tick
 (~2s), and the eviction sweeps now prefer `heat == 0` candidates before
 falling back to LRU order. This is GreenBoost-specific bookkeeping layered
-on top of standard CUDA/driver primitives — no NVIDIA API is used in a
+on top of standard CUDA/driver primitives , no NVIDIA API is used in a
 non-standard way here, only GreenBoost's own kernel-module accounting.
 
 **Deviation:** A CO-RE eBPF tracer (`ebpf/gb_trace.bpf.c`) attaches kprobes
@@ -905,7 +931,7 @@ to GreenBoost's own kernel-module functions (not NVIDIA driver symbols)
 to observe tier-migration events. It optionally attaches to
 `uvm_perf_event_notify` (NVIDIA's UVM driver) when present, for systems
 that also use managed/UVM memory outside GreenBoost's own allocation
-paths — but GreenBoost's primary tensor-memory path (pinned DDR / DMA-BUF
+paths , but GreenBoost's primary tensor-memory path (pinned DDR / DMA-BUF
 over PCIe) generates no `nvidia_uvm` page faults by design, so this probe
 is supplementary, not GreenBoost's primary signal source. See
 `THIRD_PARTY_NOTICES.md` for the `bpf_uvm` pattern attribution.
@@ -913,8 +939,16 @@ is supplementary, not GreenBoost's primary signal source. See
 **Confirmed not reintroduced:** managed UVM (`cuMemAllocManaged` +
 `cuMemAdvise`, §G.4/G.7) remains used only as the pinned Blackwell-PCIe T2
 backing method, hinted to stay in host RAM. It is not used as a
-demand-paged oversubscription tier — see `CHANGELOG.md` v3.2 for the full
+demand-paged oversubscription tier , see `CHANGELOG.md` v3.2 for the full
 reasoning.
+
+**Deviation:** none , observability addendum. v3.2 adds `gb_dataflux.py`, a
+continuous local event log (VRAM/GPU/CPU telemetry, tier-migration and
+quantization events, cluster throughput) fed by the providers in §G.8 and by
+the eBPF tracer above, plus an optional local web UI for inspecting it. This
+is host-side bookkeeping over data already collected through standard
+NVML/DCGM/GreenBoost-ioctl reads; no CUDA or NVML primitive is invoked in a
+new or non-standard way to build it.
 
 ---
 

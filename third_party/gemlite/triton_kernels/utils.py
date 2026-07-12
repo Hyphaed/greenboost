@@ -29,7 +29,7 @@ class LazyDeviceTensors:
     Drop-in replacement for the old import-time `list-per-device` pattern:
     call sites keep indexing with `[device_index]`. Buffers are cached, so
     addresses stay stable across CUDA-graph replays; allocation during graph
-    capture is refused — run a warmup call first."""
+    capture is refused , run a warmup call first."""
 
     def __init__(self, values, dtype):
         self._values = values
@@ -42,7 +42,7 @@ class LazyDeviceTensors:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "gemlite device workspace first requested during CUDA graph "
-                    "capture — run a warmup call before capturing."
+                    "capture , run a warmup call before capturing."
                 )
             buf = torch.tensor(self._values, dtype=self._dtype,
                                device=f"cuda:{device_index}")

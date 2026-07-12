@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0
- * GreenBoost v3.0 - NVLink Pooling Feature
+ * GreenBoost v3.2 - NVLink Pooling Feature
  *
  * Aggregates multiple GPU VRAM into a unified T1 pool via NVLink 2.0
  * Used for V100 clusters (cc 7.0) with all-to-all NVLink 2.0 connectivity
@@ -50,21 +50,6 @@ struct gb_nvlink_pool {
 /* Initialize NVLink pooling subsystem */
 int gb_nvlink_pool_init(void);
 void gb_nvlink_pool_exit(void);
-
-/* Query NVLink fabric state */
-int gb_nvlink_query_fabric(struct gb_gpu_fabric_state *state);
-
-/* Check if NVLink pooling is viable for current system */
-bool gb_nvlink_is_poolable(void);
-
-/* Get aggregated VRAM size (T1 unified pool) */
-u64 gb_nvlink_get_aggregated_vram(void);
-
-/* Get per-GPU VRAM info */
-int gb_nvlink_get_gpu_info(u32 gpu_id, struct gb_gpu_vram_info *info);
-
-/* Update CUDA shim virtual VRAM aggregation */
-void gb_nvlink_update_shim_vram(u64 *virtual_vram_gb);
 
 /* Called by kubelet plugin sysfs store after NVML P2P verification (V100 P2P approach).
  * Sets fabric_ready=ready, updates gpu_count and total_vram_gb. */

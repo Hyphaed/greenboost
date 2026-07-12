@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
 """
-gb_supervisor.py — GreenBoost unified system supervisor.
+gb_supervisor.py , GreenBoost unified system supervisor.
 
 Replaces the four separate systemd daemons that shipped installed-but-inert:
   greenboost-recovery         oneshot boot-time crash recovery
@@ -12,7 +12,7 @@ Replaces the four separate systemd daemons that shipped installed-but-inert:
 
 Key design improvements over the four-daemon design:
   - No nvidia-smi forks.  VRAM pressure is read from TelemetryManager.snapshot()
-    backed by pynvml embedded calls — same path as gb_telemetry.  Zero subprocess
+    backed by pynvml embedded calls , same path as gb_telemetry.  Zero subprocess
     overhead on the GPU query path.
   - Single sd_notify READY=1 sent AFTER boot recovery completes, so the
     Before=ollama.service boot ordering is preserved without an extra oneshot.
@@ -129,7 +129,7 @@ class _NVMLSampler:
             from gb_nvml import get_nvml
             self._h = get_nvml(device)
         except Exception as exc:
-            log.warning("gb_nvml unavailable (%s) — using GbInfo ioctl only", exc)
+            log.warning("gb_nvml unavailable (%s) , using GbInfo ioctl only", exc)
             self._h = None
 
     @property
@@ -158,7 +158,7 @@ class _NVMLSampler:
         pass  # gb_nvml.get_nvml() singleton is shut down via atexit
 
 
-# Module-level lazy sampler — avoids nvmlInit/Shutdown per-call handle churn.
+# Module-level lazy sampler , avoids nvmlInit/Shutdown per-call handle churn.
 # Created on first use; lives for the process lifetime.  Safe to call from
 # recovery (before GreenBoostSupervisor is constructed).
 _g_nvml_sampler: "_NVMLSampler | None" = None
@@ -225,9 +225,9 @@ def _run_recovery() -> str:
     # 0. Dirty-shutdown detection
     dirty = SENTINEL_FILE.exists() or RUNNING_FILE.exists()
     if dirty:
-        log.warning("Dirty shutdown detected — running full recovery sequence")
+        log.warning("Dirty shutdown detected , running full recovery sequence")
     else:
-        log.info("No dirty-shutdown sentinel — last boot was clean")
+        log.info("No dirty-shutdown sentinel , last boot was clean")
 
     # 1. Kernel module check
     # Sup-M2: add timeouts so a hung subprocess can't block READY=1 indefinitely.
@@ -236,7 +236,7 @@ def _run_recovery() -> str:
         if "greenboost" in lsmod.stdout:
             log.info("greenboost.ko loaded")
         else:
-            log.warning("greenboost.ko not loaded — attempting modprobe")
+            log.warning("greenboost.ko not loaded , attempting modprobe")
             try:
                 r = subprocess.run(["modprobe", "greenboost"],
                                     capture_output=True, text=True, timeout=15)
@@ -246,9 +246,9 @@ def _run_recovery() -> str:
                     log.error("modprobe greenboost failed: %s", r.stderr.strip())
                     # Non-fatal: Path B still works without the module
             except subprocess.TimeoutExpired:
-                log.warning("modprobe greenboost timed out — continuing without module")
+                log.warning("modprobe greenboost timed out , continuing without module")
     except subprocess.TimeoutExpired:
-        log.warning("lsmod timed out — skipping module check")
+        log.warning("lsmod timed out , skipping module check")
     except Exception as exc:
         log.warning("lsmod/modprobe check failed: %s", exc)
 
@@ -264,7 +264,7 @@ def _run_recovery() -> str:
         except Exception as exc:
             log.warning("GB_IOCTL_RESET failed (non-fatal): %s", exc)
     else:
-        log.info("%s not present — skipping OOM reset (Path B mode)", _GB_DEV)
+        log.info("%s not present , skipping OOM reset (Path B mode)", _GB_DEV)
 
     # 2b. /run/greenboost permissions
     RUN_DIR.mkdir(parents=True, exist_ok=True)
@@ -295,7 +295,7 @@ def _run_recovery() -> str:
     jq_all    = _jq()          # all journals
     jq_kernel = _jq("-k")     # kernel ring (dmesg equivalent)
 
-    # Sup-H1: use re.search for regex-shaped patterns — plain `in` treated them
+    # Sup-H1: use re.search for regex-shaped patterns , plain `in` treated them
     # as literal substrings so ECC/thermal recovery was effectively dead.
     if "Killed process" in jq_kernel and "oom" in jq_kernel.lower():
         fault = "oom_kill"
@@ -317,25 +317,25 @@ def _run_recovery() -> str:
 
     # 2d. Per-fault remediation
     if fault == "ecc_dbe":
-        log.warning("ECC double-bit error — setting ecc_dbe_flag to reduce T1 quota")
+        log.warning("ECC double-bit error , setting ecc_dbe_flag to reduce T1 quota")
         ECC_DBE_FLAG.write_text("1")
     elif fault == "thermal":
-        log.warning("Thermal fault — inserting 10 s cooling pause before Ollama restart")
+        log.warning("Thermal fault , inserting 10 s cooling pause before Ollama restart")
         time.sleep(10)
     elif fault == "apparmor":
-        log.warning("AppArmor denial — patching snap-confine profiles")
+        log.warning("AppArmor denial , patching snap-confine profiles")
         _patch_apparmor()
     elif fault == "xid_fault":
-        log.warning("Xid GPU fault — forcing NVIDIA driver module reset")
+        log.warning("Xid GPU fault , forcing NVIDIA driver module reset")
         try:
             subprocess.run(["rmmod", "nvidia_drm", "nvidia_modeset", "nvidia"],
                            capture_output=True, timeout=20)
         except subprocess.TimeoutExpired:
-            log.warning("rmmod nvidia timed out — continuing")
+            log.warning("rmmod nvidia timed out , continuing")
         try:
             subprocess.run(["modprobe", "nvidia"], capture_output=True, timeout=20)
         except subprocess.TimeoutExpired:
-            log.warning("modprobe nvidia timed out — continuing")
+            log.warning("modprobe nvidia timed out , continuing")
 
     # 3. Sentinel cleanup
     SENTINEL_FILE.unlink(missing_ok=True)
@@ -516,7 +516,7 @@ class _VramMonitor:
         if state != self._prev_state:
             if state == "critical":
                 log.critical(
-                    "CRITICAL: free VRAM %d MiB < threshold %d MiB%s — "
+                    "CRITICAL: free VRAM %d MiB < threshold %d MiB%s , "
                     "non-GB consumers: %d MiB (browser NVDEC / compositor?). "
                     "Consider closing GPU-heavy apps or increasing GREENBOOST_WORKSTATION_RESERVE_MB.",
                     free_mb, self._crit_free_mb,
@@ -524,13 +524,13 @@ class _VramMonitor:
                 )
             elif state == "warn":
                 log.warning(
-                    "WARN: non-GB GPU usage %d MiB > %d MiB threshold%s — "
+                    "WARN: non-GB GPU usage %d MiB > %d MiB threshold%s , "
                     "free VRAM %d MiB.",
                     non_gb_mb, self._warn_mb,
                     " [gaming_mode doubled]" if gaming_mode else "", free_mb,
                 )
             else:
-                log.info("OK: physical VRAM pressure cleared — used %d MiB, free %d MiB",
+                log.info("OK: physical VRAM pressure cleared , used %d MiB, free %d MiB",
                          used_mb, free_mb)
             self._prev_state = state
 
@@ -560,15 +560,15 @@ class GreenBoostSupervisor:
         self._nvml          = _NVMLSampler(device=0)
         self._vram_mon      = _VramMonitor(self._nvml, WARN_PCT, CRIT_FREE_PCT)
         self._ecc_dbe_seen  = 0   # last known volatile DBE count (detect new errors)
-        # Reactive orchestrator — closes dead feedback loops (ECC, workstation, thermal)
+        # Reactive orchestrator , closes dead feedback loops (ECC, workstation, thermal)
         try:
             ReactiveOrchestrator = _import_orchestrator()
             self._orch = ReactiveOrchestrator(mode="supervisor")
         except Exception as exc:
-            log.warning("ReactiveOrchestrator unavailable (%s) — signals disabled", exc)
+            log.warning("ReactiveOrchestrator unavailable (%s) , signals disabled", exc)
             self._orch = None
 
-        # Supplemental telemetry providers — fill the GpuMetrics passed to the
+        # Supplemental telemetry providers , fill the GpuMetrics passed to the
         # orchestrator each tick with the fields Loops O-S need (shim_phase,
         # T2/T3 pool, host PSI pressure, power_limit_w/sm_clock for GPU clock
         # locks) that the hand-built metrics above don't carry. Constructed
@@ -596,10 +596,10 @@ class GreenBoostSupervisor:
         _notify_status("running boot recovery")
         _run_recovery()
 
-        # Phase 2: lifecycle sentinel — touch running file
+        # Phase 2: lifecycle sentinel , touch running file
         RUNNING_FILE.write_text(str(os.getpid()))
 
-        # Signal systemd we are ready (Ollama may start now — Before= ordering)
+        # Signal systemd we are ready (Ollama may start now , Before= ordering)
         _notify_ready()
         _notify_status("monitoring VRAM + idle reclaim")
         log.info("GreenBoost supervisor ready (poll=%ds, warn_pct=%d, crit_free_pct=%d, aggressive=%s)",
@@ -624,7 +624,7 @@ class GreenBoostSupervisor:
         self._shutdown()
 
     def _tick(self) -> None:
-        # 3a. Gaming mode — doubles VRAM reserve thresholds
+        # 3a. Gaming mode , doubles VRAM reserve thresholds
         gaming = _read_gaming_mode()
 
         # 3b. VRAM pressure (NVML, no nvidia-smi)
@@ -642,7 +642,7 @@ class GreenBoostSupervisor:
             )
             ECC_DBE_FLAG.write_text(str(ecc_dbe))
             _sd_notify(
-                f"STATUS=ECC DBE error: {ecc_dbe} uncorrectable error(s) — hardware risk\n"
+                f"STATUS=ECC DBE error: {ecc_dbe} uncorrectable error(s) , hardware risk\n"
             )
             self._ecc_dbe_seen = ecc_dbe
 
@@ -657,7 +657,7 @@ class GreenBoostSupervisor:
                     gb               = None,
                 )
                 # Enrich with T2/T3 pool + shim_phase, host PSI pressure, and
-                # power/clock/PCIe/topology fields — feeds Loops J/O-S.
+                # power/clock/PCIe/topology fields , feeds Loops J/O-S.
                 if self._gb_provider is not None:
                     self._gb_provider.fill(m)
                 if self._sys_provider is not None:
@@ -671,26 +671,27 @@ class GreenBoostSupervisor:
 
         # 3d. Phase file idle detection → reclaim
         phase = _read_phase()
+
         if phase == "DEEP_IDLE" and _gpu_util < 1.0:
             self._idle_count += 1
             if self._idle_count >= CONFIRM_POLLS:
-                log.info("DEEP_IDLE confirmed (%d/%d polls) — triggering reclaim",
+                log.info("DEEP_IDLE confirmed (%d/%d polls) , triggering reclaim",
                          self._idle_count, CONFIRM_POLLS)
                 if _ollama_unload_models(OLLAMA_URL):
                     log.info("Ollama models unloaded gracefully")
                 elif AGGRESSIVE:
-                    log.warning("Ollama unload failed — aggressive reclaim engaged")
+                    log.warning("Ollama unload failed , aggressive reclaim engaged")
                     _aggressive_reclaim()
                 else:
                     log.info("No models to unload (or Ollama not running)")
                 self._idle_count = 0  # reset after action
         else:
-            # Non-idle or GPU still active — reset counter
+            # Non-idle or GPU still active , reset counter
             if self._idle_count > 0:
                 self._idle_count = 0
 
     def _on_stop(self, signum: int, frame) -> None:
-        log.info("Received signal %d — shutting down", signum)
+        log.info("Received signal %d , shutting down", signum)
         self._running = False
 
     def _shutdown(self) -> None:

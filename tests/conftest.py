@@ -18,10 +18,57 @@ that exercise the wire format + the file-loader logic with mocks.
 Run with: pytest tests/  (or `python3 -m pytest tests/`)
 """
 import os
-import struct
 import tempfile
+from pathlib import Path
+
+# Module-level (not a fixture): runs once, at conftest.py load time, BEFORE
+# pytest imports any test module. Several gb_*.py modules (gb_quant, gb_attn,
+# gb_cluster, ...) read GREENBOOST_ACTIVE at import time and, if it's "1",
+# gb_init auto-bootstraps a REAL background TelemetryManager thread , outside
+# any single test's scope, so a per-test monkeypatch can't contain it. On a
+# desktop session with GreenBoost's gaming profile active (GREENBOOST_ACTIVE=1
+# exported globally), collecting this suite would otherwise start real
+# background telemetry. Force it off for every test run; only affects this
+# process/its children, never the parent shell.
+os.environ["GREENBOOST_ACTIVE"] = "0"
+
+# Session-wide dataflux quarantine (also module-level, set once). Several
+# gb_*.py classes (ModelTierManager) emit a dataflux event from __del__-
+# triggered cleanup, which fires at a GC-determined time that can be AFTER a
+# per-test monkeypatch.setenv has already reverted for that test (function-
+# scoped monkeypatch only guarantees the override during the test body, not
+# whenever Python's refcounting/GC actually collects the object). Setting the
+# "resting" value here , BEFORE any per-test override , means a delayed
+# __del__ firing between tests, or at session teardown, still lands in a
+# throwaway scratch file instead of the user's real
+# ~/.local/share/greenboost/dataflux.jsonl. The per-test fixture below layers
+# a fresh per-test path on top for normal test isolation; when IT reverts,
+# execution falls back to THIS session scratch path, never the real one.
+_SESSION_DATAFLUX_DIR = tempfile.mkdtemp(prefix="gb_dataflux_session_")
+os.environ["GREENBOOST_DATAFLUX_LOG"] = str(Path(_SESSION_DATAFLUX_DIR) / "session.jsonl")
+
+import struct
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_dataflux_log_globally(tmp_path, monkeypatch):
+    """gb_quant/gb_attn/gb_model_tier/gb_cluster all call gb_dataflux.emit()
+    on real code paths (quantize, TurboQuant activation, tier promote/
+    demote, cluster dispatch) , several pre-existing tests exercise those
+    paths directly (e.g. test_gb_model_tier's auto_evict tests) without
+    mocking gb_dataflux.emit. Autouse + session-wide so EVERY test file gets
+    this for free; a test that wants to assert on emitted events still
+    mocks gb_dataflux.emit explicitly (mocking wins over this redirect since
+    the mock replaces the function entirely).
+
+    gb_dataflux resolves its log path from the GREENBOOST_DATAFLUX_LOG env
+    var on every call (gb_dataflux._log_path()), not a frozen module
+    constant , monkeypatch.setenv is the reliable lever here; patching a
+    pre-computed Path attribute is fragile against import/fixture ordering.
+    """
+    monkeypatch.setenv("GREENBOOST_DATAFLUX_LOG", str(tmp_path / "dataflux-test.jsonl"))
 
 
 # Constants mirroring features/net_fabric.h.  Tests fail loudly if these

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
 """
-Tests for gb_prefetch — layer-stack detection, and a real-CUDA end-to-end
+Tests for gb_prefetch , layer-stack detection, and a real-CUDA end-to-end
 forward pass through a synthetic decoder stack exercising the actual
 T2<->T1 transfers on gb_stream_sched's "transfer" stream.
 

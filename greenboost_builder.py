@@ -264,7 +264,7 @@ class GreenBoostBuilder:
         else:
             print(
                 "[greenboost_builder] INFO: eBPF prereqs OK "
-                "(clang, bpftool, libbpf) — tracer will be built",
+                "(clang, bpftool, libbpf) , tracer will be built",
                 file=sys.stderr,
             )
 

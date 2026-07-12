@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
 """
-tests/bench/run_real_model.py — Phase 0 measurement harness (roadmap Track A/C/D
+tests/bench/run_real_model.py , Phase 0 measurement harness (roadmap Track A/C/D
 prerequisite).
 
 WHY: gb_prefetch.py / gb_moe.py / gb_moe_vmm.py are unit-tested against CPU
@@ -22,7 +22,7 @@ Usage:
 Without --prefetch/--moe this is a pure shim-overflow baseline run (Phase 0
 "shim ON, prefetch OFF"). Run again with --prefetch (dense) or --moe (MoE
 routing) to compare. Run the whole binary with LD_PRELOAD unset for a
-"shim OFF" baseline (will OOM on models that don't fit local VRAM — expected,
+"shim OFF" baseline (will OOM on models that don't fit local VRAM , expected,
 record the OOM in results.jsonl rather than crashing the sweep).
 """
 from __future__ import annotations
@@ -35,12 +35,18 @@ import sys
 import time
 from pathlib import Path
 
+# Repo root must win over the installed /usr/local/lib/greenboost copy (set via
+# global PYTHONPATH) so this harness exercises the dev modules under test, not
+# a stale deploy that may be missing files entirely (e.g. gb_prefetch.py /
+# gb_moe.py are untracked-but-not-yet-deployed as of this writing).
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 RESULTS_PATH = Path(__file__).parent / "results.jsonl"
 
 
 def _read_ebpf_stats() -> dict:
     """Best-effort: parse `greenboost faults --llm` machine-readable output.
-    Returns {} if the eBPF tracer or CLI isn't available — never raises."""
+    Returns {} if the eBPF tracer or CLI isn't available , never raises."""
     try:
         out = subprocess.run(["greenboost", "faults", "--llm"], capture_output=True,
                               text=True, timeout=5).stdout
@@ -98,6 +104,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True, help="HF model id, e.g. Qwen/Qwen2.5-7B-Instruct")
+    ap.add_argument("--budget-gb", type=float, default=None,
+                     help="force gb_quant's fit-to-VRAM budget low enough that the model "
+                          "overflows into T2 (default: gb_llm's auto budget, ~92%% free VRAM, "
+                          "which may let small models fit entirely in T1 and never overflow)")
     ap.add_argument("--moe", action="store_true", help="attach gb_moe.GbMoEManager")
     ap.add_argument("--moe-vmm", action="store_true", help="use gb_moe_vmm.GbMoEVMMManager instead of gb_moe")
     ap.add_argument("--prefetch", action="store_true", help="attach gb_prefetch.LayerPrefetcher (dense)")
@@ -115,6 +125,7 @@ def main() -> int:
     record = {
         "tag": args.tag,
         "model": args.model,
+        "budget_gb": args.budget_gb,
         "moe": args.moe,
         "moe_vmm": args.moe_vmm,
         "prefetch": args.prefetch,
@@ -127,7 +138,7 @@ def main() -> int:
 
     t_load0 = time.monotonic()
     try:
-        model, tok = gb_llm.load_causal_lm(args.model)
+        model, tok = gb_llm.load_causal_lm(args.model, budget_gb=args.budget_gb)
     except Exception as exc:
         record["error"] = f"load_failed: {exc}"
         _append(record)

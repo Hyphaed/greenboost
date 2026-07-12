@@ -268,7 +268,7 @@ struct gb_gaming_req {
 };
 #define GB_IOCTL_GAMING_MODE  _IOW(GB_IOCTL_MAGIC, 20, struct gb_gaming_req)
 
-/* Diffusion pipeline stage hints — allow the kernel to tune T2 eviction
+/* Diffusion pipeline stage hints , allow the kernel to tune T2 eviction
  * pressure for the active pipeline stage:
  *   GB_STAGE_IDLE    0   no inference running
  *   GB_STAGE_ENCODE  1   text encoders active; small tensors, high turnover
@@ -277,7 +277,7 @@ struct gb_gaming_req {
  *
  * The kernel uses this to adjust T2 LRU weights: DENOISE keeps weight
  * buffers HOT; ENCODE marks denoiser buffers COLD for early eviction.
- * This is advisory only — the kernel never forcibly moves tensors, only
+ * This is advisory only , the kernel never forcibly moves tensors, only
  * adjusts LRU priority based on the hint.
  */
 #define GB_STAGE_IDLE    0
@@ -291,7 +291,7 @@ struct gb_diffusion_stage_req {
 };
 #define GB_IOCTL_DIFFUSION_STAGE _IOW(GB_IOCTL_MAGIC, 21, struct gb_diffusion_stage_req)
 
-/* Latent buffer registration — hint to the kernel that a given DMA-BUF
+/* Latent buffer registration , hint to the kernel that a given DMA-BUF
  * fd contains a diffusion latent (not a weight or KV entry).  The kernel
  * sets GB_ALLOC_ACTIVATIONS semantics internally: never spills to T3,
  * released at end of phase.  pid=0 means the caller's own PID. */
@@ -302,7 +302,7 @@ struct gb_latent_reg_req {
 #define GB_IOCTL_LATENT_REGISTER  _IOW(GB_IOCTL_MAGIC, 22, struct gb_latent_reg_req)
 #define GB_IOCTL_LATENT_RELEASE   _IOW(GB_IOCTL_MAGIC, 23, struct gb_latent_reg_req)
 
-/* Expert VMM pool registration — shim calls once per GbExpertPool so the
+/* Expert VMM pool registration , shim calls once per GbExpertPool so the
  * kernel can expose pool metadata (va_base, stride, num_experts, pid) for
  * cross-process consumers (greenboost vitals, Synapse CLI, cluster fabric).
  * Residency state is NOT stored in the kernel; it is read directly from the
@@ -329,7 +329,7 @@ struct gb_vpage_query_req {
 #define GB_IOCTL_VPAGE_REGISTER  _IOW( GB_IOCTL_MAGIC, 24, struct gb_vpage_register_req)
 #define GB_IOCTL_VPAGE_QUERY     _IOWR(GB_IOCTL_MAGIC, 25, struct gb_vpage_query_req)
 
-/* Heat push — shim reports per-buffer access frequency (gb_ht_entry_t.access_count,
+/* Heat push , shim reports per-buffer access frequency (gb_ht_entry_t.access_count,
  * the "U1 ARC tracking" counter) so the kernel evictor can prefer recency+reuse
  * (ARC-like) over pure LRU.  Batched: one ioctl call per shim heat-pusher tick
  * (prefetch_worker loop) instead of one syscall per buffer.

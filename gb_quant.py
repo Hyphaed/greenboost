@@ -1,16 +1,16 @@
 """
-gb_quant.py — GreenBoost weight-quantization companion (quality-first strategy).
+gb_quant.py , GreenBoost weight-quantization companion (quality-first strategy).
 
 The project-agnostic Python complement to gb_attn.py.  Where gb_attn.py
 compresses the *KV cache* (TurboQuant: rotation + Lloyd-Max + 1-bit QJL),
 gb_quant.py compresses *model weights* to maximize effective quality subject to
-VRAM+DDR budgets — NOT just "fit to VRAM".
+VRAM+DDR budgets , NOT just "fit to VRAM".
 
 Core insight:  T2 DDR as a quality reservoir
     On Blackwell (RTX 5070), T2 DDR costs only ~1.3× the BF16 latency for
     compute-bound diffusion (Ch. G.5 of the GreenBoost extension doc).  This means
     quality-critical layers can stay at BF16 in T2 instead of being crushed to int4
-    — you get near-lossless inference at the cost of ~1.3× wall-clock, not ~0.3×
+    , you get near-lossless inference at the cost of ~1.3× wall-clock, not ~0.3×
     quality.  The shim routes allocations that don't fit T1 to T2 transparently.
 
 Three quality tiers:
@@ -22,7 +22,7 @@ Three quality tiers:
         Moderate target (< 2% per-layer error); most layers at fp8/nvfp4.
         Usually fits T1 alone → shimless.
     compact
-        Footprint-first (today's original behaviour) — scalar bits floor,
+        Footprint-first (today's original behaviour) , scalar bits floor,
         component-granular planning via plan_fit.  Shimless, fastest throughput.
 
 GPU family abstraction:
@@ -32,7 +32,7 @@ GPU family abstraction:
 
 Execution backends (unchanged):
     - GemLite (Triton low-bit GEMM, MXFP4/NVFP4 on Blackwell sm_120) for
-      int8/int4/fp8/nvfp4 — vendored under third_party/ and importable here.
+      int8/int4/fp8/nvfp4 , vendored under third_party/ and importable here.
     - gb_quant_tq (TurboQuant rotation + Lloyd-Max + Triton LUT-GEMM) for the
       sub-4-bit modes "tq3"/"tq2".
 
@@ -57,12 +57,13 @@ from __future__ import annotations
 
 import gc
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
-# GreenBoost layer bootstrap — patches empty_cache, starts telemetry singleton,
+# GreenBoost layer bootstrap , patches empty_cache, starts telemetry singleton,
 # wires stream scheduler + tier manager + mem pools.  No-op when not active.
 try:
     import gb_init as _gb_init
@@ -73,7 +74,7 @@ except ImportError:
 
 
 def _gb_cache_release():
-    """Drop caching allocator cache — no-op under GreenBoost DynamicVRAM."""
+    """Drop caching allocator cache , no-op under GreenBoost DynamicVRAM."""
     if not _GB_ACTIVE and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -91,9 +92,27 @@ def _gb_nvtx(msg: str, color: str = "cyan"):
     return contextlib.nullcontext()
 
 
+def _df_emit_quant(component: str, bits, quality, model_id: str,
+                   duration_s: float, status: str = "ok") -> None:
+    """Record a quantization decision to the dataflux log (gb_dataflux.py) ,
+    works standalone on a single host, no cluster/feeder required. Best-
+    effort, never raises."""
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({
+            "node": "host", "label": "gb_quant", "kind": "quantize",
+            "n_items": 1, "items": [component],
+            "duration_s": round(duration_s, 3), "status": status,
+            "bits": _bits_tag(bits) if quality is None else quality,
+            "model_id": model_id,
+        })
+    except Exception:
+        pass
+
+
 # The low-bit GEMM backend is PART OF GREENBOOST: ported into
 # greenboost/third_party/ (Triton GEMM kernels originally from GemLite,
-# Apache-2.0, plus the hqq quantizer). gb_quant CARRIES its backend —
+# Apache-2.0, plus the hqq quantizer). gb_quant CARRIES its backend ,
 # consumer venvs (LTX-2, ai-forge envs, artpipeline, ...) install nothing.
 # Only runtime deps (numpy, tqdm, triton) ship with every torch venv.
 # Search order per module: env override > greenboost/third_party (canonical)
@@ -148,7 +167,7 @@ except Exception as e:  # pragma: no cover - environment dependent
 # block norm per 128 params: bits/8 + 2/128).
 _BYTES_PER_PARAM = {
     16: 2.0,
-    "fp8": 1.05,   # FP8 e4m3fn, channel-wise — same storage as INT8
+    "fp8": 1.05,   # FP8 e4m3fn, channel-wise , same storage as INT8
     "e4m3": 1.05,  # alias
     8: 1.05,       # INT8
     "nvfp4": 0.50, # Blackwell NVFP4: 4-bit weights + FP8 scale per group-16
@@ -242,15 +261,15 @@ def gpu_profile(device: int = 0) -> GpuProfile:
 # rel_err = ‖W − Wq‖_F / ‖W‖_F (from gb_quant_calib.relative_quant_error).
 #
 # Empirical fp8 e4m3fn per-row error on FLUX/T5 weights: ~2.5-2.7% (all layers).
-# This is physics of 3-bit mantissa, not a calibration failure — fp8 is still
+# This is physics of 3-bit mantissa, not a calibration failure , fp8 is still
 # perceptually identical to BF16 for diffusion models.
 # near_lossless = 3.0% keeps everything at fp8; BF16 T2 reservoir is only
 # used for genuinely pathological layers (>3% fp8 error).
 # balanced = 8.0% allows nvfp4/int4 where fp8 is overkill.
 _TARGET_ERROR_CEIL: Dict[str, float] = {
-    "near_lossless": 0.030,   # 3.0%  — fp8 qualifies (fp8≈2.6%); BF16 only for outliers
-    "balanced":      0.080,   # 8.0%  — nvfp4/int4 qualify for most layers
-    "compact":       1.000,   # unlimited — footprint-first (legacy behaviour)
+    "near_lossless": 0.030,   # 3.0%  , fp8 qualifies (fp8≈2.6%); BF16 only for outliers
+    "balanced":      0.080,   # 8.0%  , nvfp4/int4 qualify for most layers
+    "compact":       1.000,   # unlimited , footprint-first (legacy behaviour)
 }
 
 QUALITY_TIERS = tuple(_TARGET_ERROR_CEIL.keys())
@@ -284,6 +303,10 @@ class FitReport:
     components: list[ComponentPlan] = field(default_factory=list)
     total_bf16_gb: float = 0.0
     total_quant_gb: float = 0.0
+    # Advisory fp8-floor placement (set only when GB_PLACEMENT=1). A
+    # gb_placement.PlacementPlan; the orchestrator reads `.tail_blocks` to
+    # apply gb_cluster.offload_tail_blocks. None on the default path.
+    placement: object = None
 
     @property
     def fits_vram(self) -> bool:
@@ -358,6 +381,21 @@ def _require_gemlite() -> None:
 _autotune_cache_armed = False
 
 
+def _autotune_cache_key() -> str:
+    """Cache key = GPU name + CUDA + gemlite version.  A driver/CUDA/gemlite
+    upgrade can change kernel signatures or add autotune configs, so a
+    version-blind key would silently reuse stale picks; scope the file to the
+    exact toolchain that produced it instead."""
+    dev = torch.cuda.get_device_name(0).replace(" ", "_").replace("/", "_")
+    cuda = (getattr(torch.version, "cuda", None) or "nocuda").replace(".", "")
+    try:
+        import gemlite
+        glv = str(getattr(gemlite, "__version__", "0")).replace(".", "")
+    except Exception:
+        glv = "0"
+    return f"{dev}_cu{cuda}_gl{glv}"
+
+
 def _autotune_cache_path() -> "str | None":
     if os.environ.get("GB_QUANT_NO_AUTOTUNE_CACHE", "") == "1":
         return None
@@ -365,8 +403,7 @@ def _autotune_cache_path() -> "str | None":
         return None
     cache_dir = os.path.expanduser(
         os.environ.get("GB_QUANT_CACHE_DIR", "~/.cache/greenboost"))
-    dev = torch.cuda.get_device_name(0).replace(" ", "_").replace("/", "_")
-    return os.path.join(cache_dir, f"gemlite_autotune_{dev}.json")
+    return os.path.join(cache_dir, f"gemlite_autotune_{_autotune_cache_key()}.json")
 
 
 def _arm_autotune_cache() -> None:
@@ -432,14 +469,35 @@ def _init_nvfp4() -> None:
     gemlite.set_fast_nvfp4(True)
 
 
-def _build_processor(bits, device: str, dtype, group_size: int):
-    """Build (and return) the GemLite/HQQ processor for `bits`.
+def _build_processor(bits, device: str, dtype, group_size: int,
+                     backend: str = "gemlite"):
+    """Build (and return) the weight-quantization processor for `bits`.
 
-    Returns None for bits=16 (BF16 — no quantization).
+    `backend` selects the GEMM kernel family (see gb_kernel_backends):
+      - "gemlite" (default) — the GemLite/HQQ processors below.
+      - "scaled_mm"         — fp8 e4m3 via torch._scaled_mm.
+      - "bf16"              — passthrough (returns None; no quantization).
+    Backend resolution (env + per-layer shape) happens in `_delegate_patch`;
+    this function just constructs the chosen backend's processor.
+
+    Returns None for bits=16 or backend="bf16" (BF16 , no quantization).
     Raises ValueError for unsupported values.
     """
-    if bits == 16:
+    if bits == 16 or backend == "bf16":
         return None
+    if backend == "scaled_mm":
+        import gb_kernel_backends
+        return gb_kernel_backends.build_scaled_mm_processor(bits, device, dtype)
+    if backend == "cutlass":
+        import gb_kernel_backends
+        proc = gb_kernel_backends.build_cutlass_nvfp4_processor(bits, device, dtype)
+        if proc is not None:
+            return proc
+        # Stage-A2 not yet bench-validated (build_cutlass_nvfp4_processor still
+        # a stub): fall through to the nvfp4 gemlite path. resolve_backend only
+        # returns "cutlass" when gb_cutlass.available() is True (build +
+        # GB_CUTLASS_ENABLE=1), so in the default config this branch is unreached.
+    # backend == "gemlite" (default): GemLite/HQQ + TurboQuant processors.
     if bits in (3, 2, "tq3", "tq2"):
         from gb_quant_tq import A16Wtq
         nb = int(str(bits).lstrip("tq"))
@@ -459,7 +517,8 @@ def _build_processor(bits, device: str, dtype, group_size: int):
 
 def _delegate_patch(module, processor, skip_modules, group_size, device,
                     per_layer_bits: "Optional[Dict[str, object]]" = None,
-                    processors_by_bits: "Optional[Dict]" = None):
+                    processors_by_bits: "Optional[Dict]" = None,
+                    scalar_bits: "Optional[object]" = None):
     """Quantize every nn.Linear in `module` via `processor`, IN PLACE.
 
     Unlike the backend's patch_model (which swaps child modules with setattr),
@@ -473,14 +532,25 @@ def _delegate_patch(module, processor, skip_modules, group_size, device,
 
     per_layer_bits:   if provided, maps each layer name to its bits precision.
                       Layers with bits=16 are kept at BF16 (no quantization).
-                      Layers missing from the dict use `processor` (scalar fallback).
-    processors_by_bits: pre-built {bits: processor} dict for per-layer mode.
-                        Built lazily if not provided.
+                      Layers missing from the dict use `scalar_bits` (fallback).
+    processors_by_bits: pre-built {(backend, bits): processor} cache.
+    scalar_bits:      the single precision for the scalar path (per_layer_bits
+                      is None). When set, the processor is (re)built per layer
+                      via the resolved backend; `processor` is a legacy
+                      pre-built fallback used only when scalar_bits is None.
+
+    Backend: each layer's GEMM backend is resolved per (precision, shape, arch)
+    via gb_kernel_backends.resolve_backend (GB_KERNEL_BACKEND). Unset => gemlite
+    => identical to the pre-registry behaviour.
     """
     from hqq.core.quantize import HQQLinear, BaseQuantizeConfig  # vendored
+    import gb_kernel_backends as _kb
 
     dtype = getattr(module, "dtype", torch.bfloat16) or torch.bfloat16
     _proc_cache: Dict = dict(processors_by_bits or {})
+    _env_backend = _kb.env_backend()
+    _cc = _kb.device_cc(device)
+    _backend_counts: Dict[str, int] = {}
 
     seen = set()
     linears = [(n, l) for n, l in module.named_modules()
@@ -495,32 +565,43 @@ def _delegate_patch(module, processor, skip_modules, group_size, device,
             continue
         # GemLite MIN_SIZE=32: in_features must be divisible by 32 AND by
         # group_size (for 4-bit). Tiny layers (e.g. in_features=16 gate
-        # projections in FLUX) stay full-precision — negligible quality loss.
+        # projections in FLUX) stay full-precision , negligible quality loss.
         in_f = layer.in_features
+        out_f = layer.out_features
         if in_f % 32 != 0:
             continue
 
-        # Determine this layer's bits and processor.
+        # Determine this layer's bits.
         if per_layer_bits is not None:
             bits = per_layer_bits.get(name)
             if bits is None or bits == 16:
-                # Not in plan or kept BF16 — skip quantization.
+                # Not in plan or kept BF16 , skip quantization.
                 continue
             gs = group_size if bits == 4 else None
             if gs is not None and in_f % gs != 0:
                 continue
-            proc = _proc_cache.get(bits)
-            if proc is None:
-                proc = _build_processor(bits, device, layer.weight.dtype, group_size)
-                _proc_cache[bits] = proc
-            if proc is None:
-                continue  # bits==16 shouldn't reach here, but guard
         else:
-            # Scalar-bits (legacy) path.
+            # Scalar-bits path.
             if group_size is not None and in_f % group_size != 0:
                 continue
-            proc = processor
+            bits = scalar_bits
             gs = group_size
+
+        # Resolve GEMM backend for this (precision, shape, arch), then
+        # build/cache the matching processor. Legacy pre-built `processor`
+        # (scalar path, scalar_bits is None) short-circuits resolution.
+        if scalar_bits is None and per_layer_bits is None:
+            proc = processor
+        else:
+            backend = _kb.resolve_backend(bits, in_f, out_f, _cc, _env_backend)
+            proc = _proc_cache.get((backend, bits))
+            if proc is None:
+                proc = _build_processor(bits, device, layer.weight.dtype,
+                                        group_size, backend=backend)
+                _proc_cache[(backend, bits)] = proc
+            if proc is None:
+                continue  # bf16 backend / bits==16 , keep layer BF16
+            _backend_counts[backend] = _backend_counts.get(backend, 0) + 1
 
         if hasattr(proc, "from_hqqlinear"):
             nb = proc.W_nbits
@@ -540,6 +621,15 @@ def _delegate_patch(module, processor, skip_modules, group_size, device,
         layer.forward = impl.forward
     module.to(device=device)
 
+    if _backend_counts:
+        try:
+            import gb_dataflux
+            gb_dataflux.emit({"kind": "kernel_backend",
+                              "env": _env_backend,
+                              "backends": _backend_counts})
+        except Exception:
+            pass
+
 
 def quantize_module(module, bits, device: str = "cuda",
                     dtype=None, group_size: int = 64,
@@ -547,12 +637,12 @@ def quantize_module(module, bits, device: str = "cuda",
                     per_layer_bits: "Optional[Dict[str, object]]" = None):
     """Quantize every Linear in `module` to `bits` (4, 8, "fp8"/"e4m3",
     "nvfp4", "tq3" or "tq2") moving layer-by-layer to `device` (bounded peak
-    memory — never loads the full BF16 module onto the GPU).
+    memory , never loads the full BF16 module onto the GPU).
     4/8/fp8/nvfp4 execute on GemLite Triton kernels; "tq3"/"tq2" (also plain
     3/2) execute on the TurboQuant LUT-GEMM backend (gb_quant_tq) with
     int4-HQQ fallback for non-128-multiple layers.
 
-    bits="fp8" / bits="e4m3" — GemLite FP8 e4m3fn, channel-wise (no
+    bits="fp8" / bits="e4m3" , GemLite FP8 e4m3fn, channel-wise (no
     group_size).  Best choice for max-quality shimless VRAM-fit inference:
     same footprint as INT8 (~1.05 B/param) but preserves dynamic range better
     for attention projections.
@@ -575,13 +665,15 @@ def quantize_module(module, bits, device: str = "cuda",
         return module
 
     # Scalar-bits path (legacy / compact tier).
+    if bits == 16:
+        return module  # no-op
     _bits_label = _bits_tag(bits)
     with _gb_nvtx(f"gb:quantize:{_bits_label}", color="cyan"):
-        proc = _build_processor(bits, device, dtype, group_size)
-        if proc is None:
-            return module  # bits==16 → no-op
         gs = group_size if bits == 4 else None
-        _delegate_patch(module, proc, list(skip_modules), gs, device)
+        # Backend resolved per layer inside _delegate_patch (GB_KERNEL_BACKEND);
+        # unset => gemlite => one processor built and reused, as before.
+        _delegate_patch(module, None, list(skip_modules), gs, device,
+                        scalar_bits=bits)
     gc.collect()
     _gb_cache_release()
     return module
@@ -590,7 +682,8 @@ def quantize_module(module, bits, device: str = "cuda",
 def plan_fit(obj, budget_gb: float,
              components: "tuple[str, ...] | None" = None,
              skip_components=_DEFAULT_SKIP_COMPONENTS,
-             prefer_bits: "int | str" = 4) -> FitReport:
+             prefer_bits: "int | str" = 4,
+             tiered: "Optional[bool]" = None) -> FitReport:
     """Decide per-component precision so the total fits `budget_gb`.
 
     Quality-first strategy: every component gets the HIGHEST precision that
@@ -598,8 +691,28 @@ def plan_fit(obj, budget_gb: float,
     The floor is `prefer_bits` (int 4/8 or "tq3"/"tq2"); the headroom check
     assumes the remaining components can drop to the floor, so precision is
     only spent where the budget truly allows it. Components in
-    `skip_components` stay BF16. T3 NVMe is never planned for — anything past
-    the budget relies on GreenBoost T2 DDR overflow."""
+    `skip_components` stay BF16. T3 NVMe is never planned for , anything past
+    the budget relies on GreenBoost T2 DDR overflow.
+
+    Tiered precision (GB_QUANT_TIERED_PRECISION=1 or tiered=True): instead of
+    downgrading every component uniformly toward `prefer_bits`, cap the ceiling
+    at the GPU family's `quality_default` (fp8 on Ada/Hopper/Blackwell) and set
+    the floor to its compact `floor_default` (nvfp4 on Blackwell, else int4).
+    Components that fit in the VRAM budget (hot, kept in T1) keep fp8 quality;
+    those that overflow to T2 drop to the compact floor, trading precision for
+    bandwidth only on the cold weights.  fp8 stays the effective default; nvfp4/
+    int4 are used only for the overflow tail, never as the blanket default."""
+    if tiered is None:
+        tiered = os.environ.get("GB_QUANT_TIERED_PRECISION", "") == "1"
+    ceiling = None
+    if tiered:
+        prof = gpu_profile()
+        # Owner precision rule: fp8 is the quality default; nvfp4 only where the
+        # hardware makes it a real win (Blackwell), int4 never as a blanket
+        # default.  So the HOT (fitting) tier tops out at fp8 when supported, and
+        # the COLD (overflow) tier floors at nvfp4 on Blackwell, else int4.
+        ceiling = "fp8" if "fp8" in prof.precisions else prof.quality_default
+        prefer_bits = "nvfp4" if "nvfp4" in prof.precisions else prof.floor_default
     report = FitReport(budget_gb=budget_gb)
     comps = []
     for name, comp in _iter_named_components(obj):
@@ -625,11 +738,18 @@ def plan_fit(obj, budget_gb: float,
     # nibbled away by small ones (best GB-per-quality allocation).
     comps.sort(key=lambda t: t[1], reverse=True)
     # Smallest possible footprint of everything (skip components stay bf16,
-    # the rest at the floor precision) — the headroom reserve for "the rest".
+    # the rest at the floor precision) , the headroom reserve for "the rest".
     floor_total = sum(_gb(n, 16 if keep else prefer_bits)
                       for _, n, keep in comps)
+    # Ladder = [ceiling .. floor].  Default ceiling is bf16 (index 0); tiered
+    # mode caps it at fp8 so hot weights top out at fp8 rather than bf16, and
+    # filters to precisions the GPU family can actually accelerate (so e.g. a
+    # non-Blackwell GPU never gets nvfp4 assigned).
+    _hi = _PRECISION_LADDER.index(ceiling) if ceiling is not None else 0
     ladder = list(
-        _PRECISION_LADDER[:_PRECISION_LADDER.index(prefer_bits) + 1])
+        _PRECISION_LADDER[_hi:_PRECISION_LADDER.index(prefer_bits) + 1])
+    if tiered:
+        ladder = [b for b in ladder if b in prof.precisions]
     running = 0.0
     for name, n, keep in comps:
         bf16_gb = _gb(n, 16)
@@ -676,7 +796,7 @@ def quantize_to_fit(obj, budget_gb: float = 11.0, device: str = "cuda",
         m = _gb_init.snapshot()
         if m is not None and m.fb_free_mb > 0:
             live_budget = m.fb_free_mb / 1024.0 * 0.92
-            # Use telemetry budget only when it's tighter — avoids over-spending
+            # Use telemetry budget only when it's tighter , avoids over-spending
             # when the caller already passed an intentionally conservative value.
             if live_budget < budget_gb:
                 if verbose:
@@ -688,15 +808,46 @@ def quantize_to_fit(obj, budget_gb: float = 11.0, device: str = "cuda",
                     )
                 budget_gb = live_budget
 
+    # fp8-floor cluster-fit planning (opt-in GB_PLACEMENT=1, default off).
+    # Before letting plan_fit drop weights below fp8, ask gb_placement whether
+    # the cluster (or local T1+T2) can hold the fp8 footprint; if so, clamp the
+    # precision floor to fp8 and surface the placement (tail_blocks) so the
+    # orchestrator can offload to the feeder instead of losing quality.
+    _placement = None
+    if os.environ.get("GB_PLACEMENT") == "1":
+        try:
+            import gb_placement
+            prelim = plan_fit(obj, budget_gb, components=components,
+                              prefer_bits=prefer_bits)
+            fp8_gb = prelim.total_bf16_gb * 0.525   # fp8 ~1.05 B/param vs bf16 2.0
+            t2_gb = 0.0
+            try:
+                t2_gb = max(0, int(os.environ.get("GREENBOOST_T2_POOL_MB", "0"))) / 1024.0
+            except ValueError:
+                pass
+            _placement = gb_placement.plan_and_emit(
+                "torch", weights_fp8_gb=fp8_gb, kv_gb=0.0,
+                local_t1_gb=budget_gb, local_t2_gb=t2_gb)
+            if _placement.keeps_fp8() and prefer_bits not in (16, "fp8"):
+                if verbose:
+                    print(f"[gb_quant] placement: {_placement.strategy} , "
+                          f"clamping precision floor to fp8 ({_placement.notes})",
+                          flush=True)
+                prefer_bits = "fp8"
+        except Exception as e:  # never let placement break quantization
+            if verbose:
+                print(f"[gb_quant] placement skipped ({e!r})", flush=True)
+
     report = plan_fit(obj, budget_gb, components=components,
                       prefer_bits=prefer_bits)
+    report.placement = _placement
     if verbose:
         print(str(report), flush=True)
     name_to_module = dict(_iter_named_components(obj))
     # Execution order matters for PEAK memory, not just final footprint:
     # patch_model briefly holds each layer in BF16 on the GPU before replacing it
     # with its int4 version. Quantizing the largest component first leaves it
-    # resident while the next component's transient BF16 layers load on top —
+    # resident while the next component's transient BF16 layers load on top ,
     # which OOMs even though the final int4 footprints fit. Quantize the
     # smallest-footprint components first so the big transformer accumulates last
     # against the least resident memory (validated on FLUX.2-klein-9B: text
@@ -724,8 +875,20 @@ def quantize_to_fit(obj, budget_gb: float = 11.0, device: str = "cuda",
                 pass
     if verbose and torch.cuda.is_available():
         used = torch.cuda.memory_allocated() / 2**30
-        print(f"[gb_quant] done — VRAM in use {used:.1f} GiB "
+        print(f"[gb_quant] done , VRAM in use {used:.1f} GiB "
               f"(budget {budget_gb:.1f} GiB)", flush=True)
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({
+            "node": "host", "label": "gb_quant", "kind": "quantize_to_fit",
+            "n_items": len(report.components),
+            "items": [f"{p.name}:{_bits_tag(p.bits)}" for p in report.components],
+            "duration_s": 0.0, "status": "ok",
+            "budget_gb": budget_gb, "total_quant_gb": report.total_quant_gb,
+            "total_bf16_gb": report.total_bf16_gb,
+        })
+    except Exception:
+        pass
     return report
 
 
@@ -767,7 +930,7 @@ def plan_quality(module: "torch.nn.Module",
     profile = profile or gpu_profile()
 
     if sensitivity is None:
-        # Lazy calibration — falls through to cache on second call.
+        # Lazy calibration , falls through to cache on second call.
         from gb_quant_calib import calibrate_sensitivity
         # Build precision set: all profile precisions except BF16.
         calib_precs = tuple(b for b in profile.precisions if b != 16)
@@ -805,7 +968,7 @@ def plan_quality(module: "torch.nn.Module",
             bits = q_default  # quality default is the floor for non-compact tiers
             # Walk the profile ladder: pick the LOWEST precision that still
             # meets the error ceiling (highest quality that isn't BF16).
-            # Profile ladder is (16, "fp8", "nvfp4", 8, 4, ...) — skip 16.
+            # Profile ladder is (16, "fp8", "nvfp4", 8, 4, ...) , skip 16.
             for candidate in profile.precisions:
                 if candidate == 16:
                     continue
@@ -814,7 +977,7 @@ def plan_quality(module: "torch.nn.Module",
                     bits = candidate
                     break
             else:
-                # No quantized precision meets the ceiling — this layer is
+                # No quantized precision meets the ceiling , this layer is
                 # genuinely sensitive. Keep BF16 (goes to T2 reservoir).
                 bits = 16
             # Record the calibrated error for the chosen bits.
@@ -928,7 +1091,7 @@ def quantize_for_quality(module: "torch.nn.Module",
 
     if verbose and torch.cuda.is_available():
         used = torch.cuda.memory_allocated() / 2 ** 30
-        print(f"[gb_quant] quality done — VRAM {used:.1f} GiB  "
+        print(f"[gb_quant] quality done , VRAM {used:.1f} GiB  "
               f"(T2 {report.t2_estimated_gb:.1f} GiB via shim)",
               flush=True)
     return report
@@ -944,7 +1107,7 @@ def quantize_for_quality(module: "torch.nn.Module",
 #   4. quantize_denoiser()   transformer/unet -> int4 on GPU, move VAE
 #
 # or the one-call encode_then_quantize(). Project scripts (gen_art.py,
-# ai-forge runners, ...) stay THIN callers — all quantization policy lives
+# ai-forge runners, ...) stay THIN callers , all quantization policy lives
 # here so every project inherits improvements (NVFP4, TurboQuant weights, ...)
 # without per-project edits.
 
@@ -977,6 +1140,7 @@ def quantize_encoders(pipe, bits: "int | str" = "fp8", device: str = "cuda",
     """
     names = []
     for name, mod in _live_modules(pipe, encoder_attrs):
+        t0 = time.time()
         if quality is not None:
             if verbose:
                 print(f"[gb_quant] quantizing {name} "
@@ -993,6 +1157,7 @@ def quantize_encoders(pipe, bits: "int | str" = "fp8", device: str = "cuda",
                       f"on {device} …", flush=True)
             quantize_module(mod, bits=bits, device=device, dtype=dtype,
                             group_size=group_size)
+        _df_emit_quant(name, bits, quality, model_id, time.time() - t0)
         names.append(name)
     return names
 
@@ -1057,6 +1222,7 @@ def quantize_denoiser(pipe, bits: "int | str" = "fp8", device: str = "cuda",
     """
     names = []
     for name, mod in _live_modules(pipe, denoiser_attrs):
+        t0 = time.time()
         if quality is not None:
             if verbose:
                 print(f"[gb_quant] quantizing {name} "
@@ -1073,6 +1239,7 @@ def quantize_denoiser(pipe, bits: "int | str" = "fp8", device: str = "cuda",
                       f"on {device} …", flush=True)
             quantize_module(mod, bits=bits, device=device, dtype=dtype,
                             group_size=group_size)
+        _df_emit_quant(name, bits, quality, model_id, time.time() - t0)
         names.append(name)
     for name, mod in _live_modules(pipe, move_attrs):
         try:
@@ -1084,7 +1251,7 @@ def quantize_denoiser(pipe, bits: "int | str" = "fp8", device: str = "cuda",
         if verbose:
             alloc = torch.cuda.memory_allocated() / 2**30
             peak = torch.cuda.max_memory_allocated() / 2**30
-            print(f"[gb_quant] generation-ready — VRAM {alloc:.1f} GiB "
+            print(f"[gb_quant] generation-ready , VRAM {alloc:.1f} GiB "
                   f"(peak {peak:.1f} GiB)", flush=True)
     return names
 

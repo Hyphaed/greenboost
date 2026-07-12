@@ -2,27 +2,27 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
 """
-gb_telemetry.py — GreenBoost GPU telemetry layer.
+gb_telemetry.py , GreenBoost GPU telemetry layer.
 
 Provider-based architecture: each backend produces the same GpuMetrics
 snapshot; the TelemetryManager assembles them and caches the result in a
 lock-protected atomic slot.  Orchestrators read the CACHED snapshot at
-stage boundaries — no blocking ioctl/NVML calls on the inference path.
+stage boundaries , no blocking ioctl/NVML calls on the inference path.
 
 Provider stack (in priority order):
-  NVMLProvider       — pynvml; VRAM / clocks / power / temp / PCIe
-  DCGMProvider       — embedded host engine (no daemon); ECC error detection,
+  NVMLProvider       , pynvml; VRAM / clocks / power / temp / PCIe
+  DCGMProvider       , embedded host engine (no daemon); ECC error detection,
                        instant power (FI 157), NVLink bw (FI 449), health-check
                        system (DCGM_HEALTH_WATCH_ALL), NVLink topology;
                        cluster-aware: one provider watches ALL GPUs in a group
-  GreenBoostProvider — GB_IOCTL_GET_INFO; T2/T3 pool stats, pressure levels,
-                       phase sequence, buffer counts — nothing NVML/DCGM exposes
-  EbpfProvider       — /run/greenboost/ebpf_stats; T2↔T3 migration rates,
+  GreenBoostProvider , GB_IOCTL_GET_INFO; T2/T3 pool stats, pressure levels,
+                       phase sequence, buffer counts , nothing NVML/DCGM exposes
+  EbpfProvider       , /run/greenboost/ebpf_stats; T2↔T3 migration rates,
                        cold-evict/alloc/pin rates, UVM fault rates from the
                        greenboost-ebpf-trace daemon (ebpf/gb_trace.c).
                        Zero-cost when tracer absent (fields stay 0.0)
-  TorchFallbackProvider — torch.cuda.memory_allocated(); last resort
-  NVTXAnnotator      — pushes "gb:telemetry" ranges into the NVTX event log
+  TorchFallbackProvider , torch.cuda.memory_allocated(); last resort
+  NVTXAnnotator      , pushes "gb:telemetry" ranges into the NVTX event log
                        (~/Dev/nvidia_dcgm/NVTX/python/src/) for Nsight capture
 
 Background design:
@@ -32,7 +32,7 @@ Background design:
   - The snapshot field is read-without-lock (Python GIL protects the object
     reference replacement; readers get either old or new, never corrupt)
 
-DCGM — embedded mode (dcgmStartEmbedded, no dcgmd daemon required):
+DCGM , embedded mode (dcgmStartEmbedded, no dcgmd daemon required):
   Single GPU: ECC, instant power, health check, NVLink returns 0 (RTX 5070)
   Cluster (2+ GPUs): device group, per-device field watches, topology query,
     cluster-wide health check across all devices in the GreenBoost cluster.
@@ -56,7 +56,7 @@ Usage:
     # Single GPU
     tel = TelemetryManager(device=0, poll_ms=100)
     tel.start()
-    m = tel.snapshot()       # always fast — reads cached value
+    m = tel.snapshot()       # always fast , reads cached value
     if m.ecc_dbe_volatile:
         raise RuntimeError(f"ECC double-bit error: {m.ecc_dbe_volatile}")
     if m.should_demote:
@@ -166,7 +166,7 @@ class GbPoolInfo:
     oom_active: bool     = False
     active_buffers: int  = 0
     phase_reset_seq: int = 0
-    # Extended fields — previously discarded from GB_IOCTL_GET_INFO
+    # Extended fields , previously discarded from GB_IOCTL_GET_INFO
     gaming_mode: bool    = False
     kv_reserve_mb: int   = 0
     kv_used_mb: int      = 0
@@ -188,7 +188,7 @@ _NVLINK_MAX_LINKS = 18
 @dataclass(frozen=True)
 class GpuTopology:
     """
-    Static hardware topology for one GPU — probed once at NVML init.
+    Static hardware topology for one GPU , probed once at NVML init.
 
     Fields survive for the lifetime of the process; never re-probed unless
     the TelemetryManager is torn down and rebuilt.  Attached to every
@@ -197,7 +197,7 @@ class GpuTopology:
     """
     device: int               = 0
 
-    # PCIe BDF ("0000:01:00.0") — used to look up sysfs NUMA node.
+    # PCIe BDF ("0000:01:00.0") , used to look up sysfs NUMA node.
     bdf: str                  = ""
 
     # NUMA node that the GPU PCIe root port hangs off (-1 = unknown/UMA).
@@ -244,7 +244,7 @@ class GpuTopology:
 
     @property
     def pcie_saturation_mb_s(self) -> float:
-        """75% of current one-direction peak — TX+RX combined threshold.
+        """75% of current one-direction peak , TX+RX combined threshold.
 
         When pcie_tx_mb_s + pcie_rx_mb_s exceeds this the PCIe bus is the
         dominant bottleneck for T2→T1 DMA prefetch (B2 gate).
@@ -375,7 +375,7 @@ def _probe_gpu_topology(pynvml_mod: object, handle: object, device: int) -> Opti
                 except Exception:
                     pass
             except Exception:
-                break  # link index out of range — stop scanning
+                break  # link index out of range , stop scanning
     except Exception:
         pass
 
@@ -416,7 +416,7 @@ def _probe_gpu_topology(pynvml_mod: object, handle: object, device: int) -> Opti
 @dataclass
 class SystemMetrics:
     """
-    Host-level OS pressure snapshot — SystemProvider only (no NVML/DCGM
+    Host-level OS pressure snapshot , SystemProvider only (no NVML/DCGM
     equivalent).  These are the signals a continuous OS tuner needs that pure
     GPU telemetry cannot see: CPU saturation, memory reclaim stalls, IO waits.
     All fields read from /proc; PSI fields are 0.0 on kernels without
@@ -440,7 +440,7 @@ class SystemMetrics:
 @dataclass
 class GpuMetrics:
     """
-    Point-in-time GPU metrics snapshot — assembled from all providers.
+    Point-in-time GPU metrics snapshot , assembled from all providers.
     Immutable once published; readers share it safely under the GIL.
     """
     timestamp: float       = field(default_factory=time.monotonic)
@@ -465,26 +465,26 @@ class GpuMetrics:
     pcie_rx_mb_s: float    = 0.0
     # NVLink total bandwidth (DCGM FI 449; 0 on RTX 5070 / no NVLink)
     nvlink_bw_mb_s: float  = 0.0
-    # ECC error counters (DCGM FI 310/311/313) — production-critical
+    # ECC error counters (DCGM FI 310/311/313) , production-critical
     ecc_sbe_volatile: int  = 0   # single-bit errors (correctable)
-    ecc_dbe_volatile: int  = 0   # double-bit errors (uncorrectable — hardware risk)
+    ecc_dbe_volatile: int  = 0   # double-bit errors (uncorrectable , hardware risk)
     ecc_dbe_aggregate: int = 0   # persistent aggregate DBE (lifetime counter)
     # DCGM health check result
     health_ok: bool        = True
     health_summary: str    = ""  # human-readable DCGM health status
-    # GreenBoost T2/T3 pool (GreenBoostProvider — not in NVML/DCGM)
+    # GreenBoost T2/T3 pool (GreenBoostProvider , not in NVML/DCGM)
     gb: Optional[GbPoolInfo] = None
     # Shim inference phase (from /run/greenboost/phase; empty when shim absent)
     shim_phase: str          = ""
 
-    # Static hardware topology — probed once at NVMLProvider init, attached
+    # Static hardware topology , probed once at NVMLProvider init, attached
     # to every snapshot.  None in TorchFallback / container environments.
     topology: Optional[GpuTopology] = None
 
-    # Host OS pressure (SystemProvider — CPU/mem/IO; not exposed by NVML/DCGM)
+    # Host OS pressure (SystemProvider , CPU/mem/IO; not exposed by NVML/DCGM)
     sys: Optional[SystemMetrics] = None
 
-    # eBPF tier-migration telemetry (EbpfProvider — /run/greenboost/ebpf_stats)
+    # eBPF tier-migration telemetry (EbpfProvider , /run/greenboost/ebpf_stats)
     # All rates are per-second averages over a 5-second sliding window.
     # Fields stay at 0.0 / 0 when the eBPF tracer is not running.
     t3_evict_rate:    float = 0.0   # T2 → T3 evictions / s
@@ -502,17 +502,17 @@ class GpuMetrics:
 
     @property
     def should_demote(self) -> bool:
-        """VRAM > 90% — trigger ModelTierManager demotion."""
+        """VRAM > 90% , trigger ModelTierManager demotion."""
         return self.fb_used_pct > 90.0
 
     @property
     def can_promote(self) -> bool:
-        """VRAM < 60% — safe to promote a model from CPU."""
+        """VRAM < 60% , safe to promote a model from CPU."""
         return self.fb_used_pct < 60.0
 
     @property
     def t2_critical(self) -> bool:
-        """T2 DDR pool at critical pressure — consider T3 eviction."""
+        """T2 DDR pool at critical pressure , consider T3 eviction."""
         return bool(self.gb and self.gb.t2_pressure >= 2)
 
     @property
@@ -522,7 +522,7 @@ class GpuMetrics:
 
     @property
     def ecc_critical(self) -> bool:
-        """Double-bit ECC error detected — hardware-level memory corruption risk."""
+        """Double-bit ECC error detected , hardware-level memory corruption risk."""
         return self.ecc_dbe_volatile > 0
 
     @property
@@ -539,7 +539,7 @@ class GpuMetrics:
 
     @property
     def power_near_limit(self) -> bool:
-        """True when GPU is drawing >93% of its TDP — power-limit throttle imminent.
+        """True when GPU is drawing >93% of its TDP , power-limit throttle imminent.
 
         Used as an additional Loop C gate: growing the KV reserve when near the
         power limit increases memory bandwidth consumption, which raises power draw
@@ -569,7 +569,7 @@ class GpuMetrics:
     def numa_node(self) -> int:
         """NUMA node the GPU is attached to (-1 = unknown/UMA).
 
-        Convenience accessor — delegates to topology so callers don't need
+        Convenience accessor , delegates to topology so callers don't need
         to guard `topology is not None`.
         """
         return self.topology.numa_node if self.topology else -1
@@ -579,7 +579,7 @@ class GpuMetrics:
         """True when CPU PSI "some" pressure exceeds 20% over 10s.
 
         Signals the host CPU is the bottleneck (scheduling delay), not the
-        GPU — Loop R uses this to assert governor=performance even when GPU
+        GPU , Loop R uses this to assert governor=performance even when GPU
         util alone wouldn't justify it (e.g. heavy tokenization/dispatch).
         """
         return bool(self.sys and self.sys.psi_cpu_some_avg10 > 20.0)
@@ -588,7 +588,7 @@ class GpuMetrics:
     def mem_pressure_high(self) -> bool:
         """True when memory reclaim is stalling tasks (PSI mem "some" > 10%).
 
-        Distinct from gb.t2_pressure (GreenBoost's own T2 pool accounting) —
+        Distinct from gb.t2_pressure (GreenBoost's own T2 pool accounting) ,
         this reflects whole-system reclaim stalls, including non-GreenBoost
         memory users.  Loop Q uses this to tighten vm.* tunables.
         """
@@ -631,7 +631,7 @@ class GpuMetrics:
 # ── Providers ─────────────────────────────────────────────────────────────────
 
 class _Provider:
-    """Base provider — fill fields it knows into a GpuMetrics instance."""
+    """Base provider , fill fields it knows into a GpuMetrics instance."""
     name: str = "base"
 
     def available(self) -> bool:
@@ -645,7 +645,7 @@ class _Provider:
 
 
 def _log_topology(t: GpuTopology) -> None:
-    """One-shot startup log — summarises the probed topology."""
+    """One-shot startup log , summarises the probed topology."""
     degraded = " DEGRADED(slot)" if t.pcie_degraded else ""
     nvlink = f" NVLink×{t.nvlink_count}(peers={list(t.nvlink_peer_ids)})" if t.has_nvlink else ""
     p2p = f" P2P→{list(t.p2p_device_ids)}" if t.p2p_device_ids else ""
@@ -663,7 +663,7 @@ def _log_topology(t: GpuTopology) -> None:
 
 class NVMLProvider(_Provider):
     """
-    pynvml — VRAM, clocks, utilization, power, temperature, PCIe.
+    pynvml , VRAM, clocks, utilization, power, temperature, PCIe.
     Always attempted first; available on any NVIDIA driver install.
     """
     name = "nvml"
@@ -674,7 +674,12 @@ class NVMLProvider(_Provider):
         self._ok = False
         self._topology: Optional[GpuTopology] = None
         try:
-            import pynvml
+            try:
+                import pynvml
+            except ImportError:
+                # ctypes fallback over libnvidia-ml.so.1 , same API surface,
+                # no pip dependency (gb_nvml_ctypes.py ships with GreenBoost).
+                import gb_nvml_ctypes as pynvml
             self._pynvml = pynvml
             pynvml.nvmlInit()
             self._handle = pynvml.nvmlDeviceGetHandleByIndex(device)
@@ -744,7 +749,7 @@ class NVMLProvider(_Provider):
 
 class DCGMProvider(_Provider):
     """
-    DCGM embedded host engine — no daemon required (dcgmStartEmbedded).
+    DCGM embedded host engine , no daemon required (dcgmStartEmbedded).
 
     Single GPU: supplements NVMLProvider with instant power (FI 157), ECC
     error counters (FI 310/311/313), and DCGM_HEALTH_WATCH_ALL pre-inference
@@ -752,7 +757,7 @@ class DCGMProvider(_Provider):
 
     GreenBoost cluster (2+ GPUs): uses dcgmGroupCreate / dcgmGroupAddDevice to
     build a device group over ALL detected GPUs.  Field watches run per-device;
-    health check spans the entire group.  NVLink topology is queried —
+    health check spans the entire group.  NVLink topology is queried ,
     RTX 5070 returns 0 for NVLink bandwidth (no physical NVLink), which is
     handled gracefully.
 
@@ -786,8 +791,8 @@ class DCGMProvider(_Provider):
         | 0x80   # DCGM_HEALTH_WATCH_THERMAL
         | 0x100  # DCGM_HEALTH_WATCH_POWER
         | 0x200  # DCGM_HEALTH_WATCH_DRIVER
-        # NVLink (0x02) and NVSwitch (0x400/0x800) omitted — unsupported on RTX 5070
-        # ConnectX (0x1000) omitted — only relevant in InfiniBand clusters
+        # NVLink (0x02) and NVSwitch (0x400/0x800) omitted , unsupported on RTX 5070
+        # ConnectX (0x1000) omitted , only relevant in InfiniBand clusters
     )
 
     def __init__(self, device: int = 0):
@@ -816,7 +821,7 @@ class DCGMProvider(_Provider):
             self._structs = dcgm_structs
             self._agent   = dcgm_agent
 
-            # Embedded host engine — no dcgmd daemon required
+            # Embedded host engine , no dcgmd daemon required
             handle = dcgm_agent.dcgmStartEmbedded(
                 dcgm_structs.DCGM_OPERATION_MODE_AUTO
             )
@@ -849,7 +854,7 @@ class DCGMProvider(_Provider):
                             maxKeepSamples=10,
                         )
                     except Exception:
-                        pass   # field unsupported on this GPU — skip gracefully
+                        pass   # field unsupported on this GPU , skip gracefully
 
             dcgm_agent.dcgmUpdateAllFields(handle, waitForUpdate=True)
 
@@ -867,7 +872,7 @@ class DCGMProvider(_Provider):
                 except Exception:
                     pass
 
-            # Query NVLink topology — detect cluster NVLink connectivity
+            # Query NVLink topology , detect cluster NVLink connectivity
             if len(all_ids) > 1:
                 try:
                     topo = dcgm_agent.dcgmGetDeviceTopology(handle, all_ids[0])
@@ -887,7 +892,7 @@ class DCGMProvider(_Provider):
                 flush=True,
             )
         except Exception as exc:
-            # DCGM unavailable — inference continues without it
+            # DCGM unavailable , inference continues without it
             print(f"[gb_telemetry] DCGM unavailable ({exc.__class__.__name__}): {exc}",
                   flush=True)
 
@@ -924,12 +929,12 @@ class DCGMProvider(_Provider):
             else self._gpu_ids[0]
         )
 
-        # Instant power — more accurate than NVML averaged power
+        # Instant power , more accurate than NVML averaged power
         v = self._get_field_value(gpu_id, self._FI_POWER_INSTANT)
         if v is not None and v > 0:
             m.power_instant_w = v / 1000.0
 
-        # ECC counters — production-critical (HBM bit-flip detection)
+        # ECC counters , production-critical (HBM bit-flip detection)
         v = self._get_field_value(gpu_id, self._FI_ECC_SBE_VOL)
         if v is not None:
             m.ecc_sbe_volatile = max(0, int(v))
@@ -942,12 +947,12 @@ class DCGMProvider(_Provider):
         if v is not None:
             m.ecc_dbe_aggregate = max(0, int(v))
 
-        # NVLink bandwidth (0 on RTX 5070 — no NVLink hardware)
+        # NVLink bandwidth (0 on RTX 5070 , no NVLink hardware)
         v = self._get_field_value(gpu_id, self._FI_NVLINK_BW)
         if v is not None and v >= 0:
             m.nvlink_bw_mb_s = v
 
-        # DCGM health check — run every 60 polls (~30 s at 500 ms poll interval)
+        # DCGM health check , run every 60 polls (~30 s at 500 ms poll interval)
         # to avoid interfering with Triton kernel launches and inference steps.
         self._health_check_counter += 1
         if self._health_check_counter >= 60:
@@ -984,7 +989,7 @@ class DCGMProvider(_Provider):
                     incidents = [f"health={result.overallHealth}"]
                 m.health_summary = " ".join(incidents)
         except Exception:
-            pass   # health check API unavailable — leave health_ok unchanged
+            pass   # health check API unavailable , leave health_ok unchanged
 
     def cluster_device_count(self) -> int:
         """Number of GPUs in the DCGM device group."""
@@ -998,7 +1003,7 @@ class DCGMProvider(_Provider):
         """
         Run DCGM diagnostics synchronously.  level: 1=quick, 2=medium, 3=long.
         Returns a human-readable result string.  Call from pre-inference sanity
-        checks — NOT from the telemetry background thread.
+        checks , NOT from the telemetry background thread.
         """
         if not self._ok:
             return "DCGM unavailable"
@@ -1027,7 +1032,7 @@ class DCGMProvider(_Provider):
 
 class GreenBoostProvider(_Provider):
     """
-    GreenBoost ioctl provider — T2/T3 pool info not exposed by NVML or DCGM.
+    GreenBoost ioctl provider , T2/T3 pool info not exposed by NVML or DCGM.
     Reads GB_IOCTL_GET_INFO (cmd 2) from /dev/greenboost.
     """
     name = "greenboost"
@@ -1052,7 +1057,7 @@ class GreenBoostProvider(_Provider):
                     oom_active          = bool(info.oom_active),
                     active_buffers      = info.active_buffers,
                     phase_reset_seq     = info.phase_reset_seq,
-                    # Extended — previously discarded
+                    # Extended , previously discarded
                     gaming_mode         = bool(info.gaming_mode),
                     kv_reserve_mb       = info.kv_reserve_mb,
                     kv_used_mb          = info.kv_used_mb,
@@ -1076,6 +1081,42 @@ class GreenBoostProvider(_Provider):
                         break
         except Exception:
             pass
+        # Shim-side stats (/run/greenboost/shim_stats , key=value per line,
+        # rewritten continuously during load/decode). Only trust it while
+        # fresh (<=30s old) so a stale file from a dead/replaced process
+        # never clobbers live ioctl data. Fills the phase (more current than
+        # /run/greenboost/phase on some builds) and backstops kv/t2 fields the
+        # kmod ioctl reports as 0 (e.g. when GB_IOCTL_GET_INFO doesn't track
+        # shim-local counters).
+        try:
+            stats_path = "/run/greenboost/shim_stats"
+            if os.path.exists(stats_path):
+                kv: dict[str, str] = {}
+                with open(stats_path) as _f:
+                    for _line in _f:
+                        if "=" in _line:
+                            _k, _, _v = _line.strip().partition("=")
+                            kv[_k.strip()] = _v.strip()
+
+                def _sf(key: str) -> float:
+                    try:
+                        return float(kv.get(key, "0"))
+                    except ValueError:
+                        return 0.0
+
+                fresh = (time.time() - _sf("timestamp")) <= 30.0
+                if fresh:
+                    if kv.get("phase"):
+                        m.shim_phase = kv["phase"]
+                    if m.gb is not None:
+                        if not m.gb.kv_reserve_mb:
+                            m.gb.kv_reserve_mb = int(_sf("kv_reserve_effective_mb"))
+                        if not m.gb.kv_used_mb:
+                            m.gb.kv_used_mb = int(_sf("kv_t1_tracked_mb"))
+                        if not m.gb.t2_allocated_mb:
+                            m.gb.t2_allocated_mb = int(_sf("tier_t2_local_cur_mb"))
+        except Exception:
+            pass
 
 
 class EbpfProvider(_Provider):
@@ -1087,7 +1128,7 @@ class EbpfProvider(_Provider):
     migration fields of GpuMetrics (t3_evict_rate, t3_promote_rate, etc.).
 
     When the tracer is not running all fields stay at their default 0.0 /
-    0 values — callers must not treat absence as an error.
+    0 values , callers must not treat absence as an error.
 
     Format of ebpf_stats: one "key=value\\n" pair per line.  Same
     convention as /run/greenboost/shim_stats written by the CUDA shim.
@@ -1135,7 +1176,7 @@ class EbpfProvider(_Provider):
 
 class SystemProvider(_Provider):
     """
-    Host OS pressure provider — /proc only, no NVML/DCGM equivalent.
+    Host OS pressure provider , /proc only, no NVML/DCGM equivalent.
 
     Fills GpuMetrics.sys with CPU/memory/IO pressure signals the continuous
     OS tuner (gb_orchestrator Loops O-S) needs to decide when to flip
@@ -1143,7 +1184,7 @@ class SystemProvider(_Provider):
     reads per poll); never blocks the inference path.
 
     PSI (/proc/pressure/*) requires CONFIG_PSI (kernel >= 4.20, most distros
-    since ~2019) and is absent in some containers — guarded individually so
+    since ~2019) and is absent in some containers , guarded individually so
     a missing file never breaks the rest of the snapshot.
     """
     name = "system"
@@ -1223,7 +1264,7 @@ class SystemProvider(_Provider):
 
 class TorchFallbackProvider(_Provider):
     """
-    Pure torch.cuda fallback — used when pynvml is not installed.
+    Pure torch.cuda fallback , used when pynvml is not installed.
     Limited to: VRAM used/free.
     """
     name = "torch"
@@ -1255,7 +1296,7 @@ class RemoteFeederProvider(_Provider):
     The JSON is written every 250 ms by ``gb_write_stats()`` in the CUDA shim
     and includes temp, power, utilization, ECC and health for every connected
     feeder (populated from the heartbeat stream netd→netc).  No network I/O
-    here — we just read the file the running shim already maintains.
+    here , we just read the file the running shim already maintains.
 
     Parameters
     ----------
@@ -1421,7 +1462,7 @@ class TelemetryManager:
     def set_poll_interval_ms(self, ms: int) -> None:
         """
         Adjust the background poll interval at runtime (clamped 50–2000 ms).
-        The change takes effect on the next sleep expiry — at most one old
+        The change takes effect on the next sleep expiry , at most one old
         interval passes before the new rate is active.
 
         Used by the orchestrator to speed up polling during INFERENCE (250 ms)
@@ -1477,7 +1518,7 @@ class ClusterTelemetryManager:
 
     Creates one TelemetryManager per GPU device, sharing a single DCGMProvider
     that watches the entire device group (DCGM handles multi-GPU natively in
-    embedded mode — no dcgmd cluster daemon required).
+    embedded mode , no dcgmd cluster daemon required).
 
     Usage:
         clus = ClusterTelemetryManager(poll_ms=100)
@@ -1629,7 +1670,7 @@ def _detect_feeder_count() -> int:
 
 
 def sample_once(device: int = 0) -> GpuMetrics:
-    """Take a single synchronous telemetry snapshot. Lightweight — no thread."""
+    """Take a single synchronous telemetry snapshot. Lightweight , no thread."""
     m = GpuMetrics(device=device)
     for Cls in (NVMLProvider, TorchFallbackProvider, GreenBoostProvider, SystemProvider):
         p = Cls(device) if Cls is NVMLProvider else Cls()

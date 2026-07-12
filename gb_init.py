@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
 """
-gb_init.py — GreenBoost Python layer bootstrap.
+gb_init.py , GreenBoost Python layer bootstrap.
 
 Single-import wiring module: idempotent, safe to import multiple times.
 All downstream GreenBoost modules (gb_quant, gb_diffusion_orch, gb_llm,
@@ -69,7 +69,7 @@ def _bootstrap():
         return
     _initialized = True
 
-    # 1. Enforce expandable_segments:False — GreenBoost DynamicVRAM requirement.
+    # 1. Enforce expandable_segments:False , GreenBoost DynamicVRAM requirement.
     # Setting this after torch is imported has no effect (allocator is already
     # initialized), but it documents intent and guards env for child processes.
     alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
@@ -87,7 +87,7 @@ def _bootstrap():
     # empty_cache from gemlite, hqq, diffusers callbacks, or user scripts
     # that expect it to be a reliable flushing mechanism.  Removing this
     # patch would restore the original behavior if the shim fix proves
-    # sufficient in practice — test before removing.
+    # sufficient in practice , test before removing.
     try:
         import torch
         if not _torch_patched:
@@ -118,7 +118,22 @@ def _bootstrap():
     except Exception as exc:
         print(f"[gb_init] telemetry unavailable: {exc}", file=sys.stderr)
 
-    # 4. ECC DBE callback — loud stderr warning on hardware memory errors.
+    # 3b. Dataflux snapshot recorder , continuous VRAM/GPU-util/KV-pressure
+    # history to ~/.local/share/greenboost/dataflux.jsonl (gb_dataflux.py),
+    # the "flight recorder" view alongside quantize/tier/dispatch events
+    # emitted elsewhere. Host-only, no feeder required. Opt-out: set
+    # GREENBOOST_DATAFLUX=0.
+    if telemetry is not None and os.environ.get("GREENBOOST_DATAFLUX", "1") != "0":
+        try:
+            import gb_dataflux
+            gb_dataflux.start_snapshot_recorder(telemetry, interval_s=5.0)
+            if cluster_tel is not None:
+                for _mgr in cluster_tel._managers[1:]:  # feeders (dev 0 already covered)
+                    gb_dataflux.start_snapshot_recorder(_mgr, interval_s=5.0)
+        except Exception as exc:
+            print(f"[gb_init] dataflux recorder unavailable: {exc}", file=sys.stderr)
+
+    # 4. ECC DBE callback , loud stderr warning on hardware memory errors.
     # Registered on the local manager AND each feeder manager so both local
     # and remote double-bit errors are caught (Phase 3d: feeder ECC guard).
     if telemetry is not None:
@@ -151,7 +166,7 @@ def _bootstrap():
         from gb_model_tier import ModelTierManager
         _tier_manager = ModelTierManager(hbm_headroom_mb=1500)
     except PermissionError:
-        # Expected when running as non-root — model_pages is a privileged path.
+        # Expected when running as non-root , model_pages is a privileged path.
         pass
     except Exception as exc:
         print(f"[gb_init] tier manager unavailable: {exc}", file=sys.stderr)
@@ -166,7 +181,7 @@ def _bootstrap():
     # 8. Clean atexit shutdown.
     atexit.register(_shutdown)
 
-    # 9. Reactive orchestrator (process mode — only writes control-file hints;
+    # 9. Reactive orchestrator (process mode , only writes control-file hints;
     #    kernel/sysfs levers belong to gb_supervisor in supervisor mode).
     #    Feeds on the same telemetry add_callback bus used by _ecc_guard above.
     try:
@@ -253,7 +268,7 @@ def auto_budget_gb(headroom: float = 0.92) -> float:
 
     Telemetry first: fb_free_mb reflects GreenBoost virtual memory (T1+T2+T3)
     so it correctly accounts for the expanded address space.
-    Torch fallback: raw cuMemGetInfo — real VRAM only, misses T2/T3 overflow.
+    Torch fallback: raw cuMemGetInfo , real VRAM only, misses T2/T3 overflow.
 
     Downstream callers (gb_quant, gb_llm) should call this instead of querying
     torch.cuda.mem_get_info() directly so all budget decisions use the same view.
@@ -347,7 +362,7 @@ def pre_inference_check(run_dcgm_diag: bool = False) -> bool:
     ok = True
     m = snapshot()
     if m is None:
-        return True   # Telemetry not available — proceed optimistically
+        return True   # Telemetry not available , proceed optimistically
 
     if m.ecc_dbe_volatile > 0:
         print(
@@ -362,7 +377,7 @@ def pre_inference_check(run_dcgm_diag: bool = False) -> bool:
             f"[gb_init] PRE-INFERENCE WARN: DCGM health not OK: {m.health_summary}",
             file=sys.stderr, flush=True,
         )
-        # Health warn doesn't block — DCGM may report false positives on
+        # Health warn doesn't block , DCGM may report false positives on
         # consumer GPUs for subsystems like NVLink that aren't present.
 
     if m.fb_free_mb < 1024:

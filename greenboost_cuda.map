@@ -40,7 +40,12 @@ libcudart.so.13 {
         cudaMemGetInfo;
         cudaMemcpy;
         cudaMemcpyAsync;
+        cudaMemset;
+        cudaMemsetAsync;
+        cudaMemcpy2DAsync;
         cudaLaunchKernel;
+        cudaLaunchKernelExC;
+        cudaStreamBeginCapture;
         cudaStreamSynchronize;
         cudaGetDriverEntryPointByVersion;
         __cudaRegisterFunction;
@@ -50,15 +55,20 @@ libcudart.so.13 {
          * `cudaX(...)`.  If the hook body's DEFAULT version is .so.12 (i.e. the
          * symbol is listed ONLY in the .so.12 node below), that intra-object
          * call binds to the trampoline's own @.so.12 alias instead of the hook
-         * body — infinite self-recursion, observed as a 100% CPU hang in the
+         * body , infinite self-recursion, observed as a 100% CPU hang in the
          * PyTorch cu128 path (torch.cuda.get_device_properties → spin).
          * Listing them here (processed first) makes the body default to
-         * @@.so.13 — exactly how cudaMalloc already avoids the trap — while the
+         * @@.so.13 , exactly how cudaMalloc already avoids the trap , while the
          * .so.12 trampoline below still satisfies PyTorch's versioned import. */
         cudaGetDeviceProperties;
         cudaGetDeviceProperties_v2;
         cudaFreeAsync;
         cudaMemPrefetchAsync;
+        cudaDeviceCanAccessPeer;
+        cudaDeviceEnablePeerAccess;
+        cudaPointerGetAttributes;
+        cudaMemcpyPeer;
+        cudaMemcpyPeerAsync;
 };
 
 /* libcudart.so.12 - version node for CUDA-12-era runtime callers (PyTorch cu128).
@@ -74,8 +84,12 @@ libcudart.so.12 {
         cudaMemGetInfo;
         cudaMemcpy;
         cudaMemcpyAsync;
+        cudaMemset;
+        cudaMemsetAsync;
+        cudaMemcpy2DAsync;
         cudaMemPrefetchAsync;
         cudaLaunchKernel;
+        cudaLaunchKernelExC;
         cudaStreamSynchronize;
         cudaGetDeviceCount;
         cudaSetDevice;
@@ -132,6 +146,9 @@ GB_HOOKS {
         cuDeviceTotalMem_v2;
         cuDeviceGetAttribute;
         cudaDeviceGetAttribute;
+        cudaDeviceCanAccessPeer;
+        cudaDeviceEnablePeerAccess;
+        cudaPointerGetAttributes;
         cuMemGetInfo;
         cuMemGetInfo_v2;
         cuMemAlloc_v2;
@@ -148,6 +165,11 @@ GB_HOOKS {
         cuMemSetAccess;
         cudaMemcpy;
         cudaMemcpyAsync;
+        cudaMemcpyPeer;
+        cudaMemcpyPeerAsync;
+        cudaMemset;
+        cudaMemsetAsync;
+        cudaMemcpy2DAsync;
         cuLaunchKernel;
         cuLaunchKernelEx;
         /* PR-Z: cuLaunchCooperativeKernel was DEFINED in the shim but missing
@@ -155,6 +177,8 @@ GB_HOOKS {
          * tests/test_exported_symbols. */
         cuLaunchCooperativeKernel;
         cudaLaunchKernel;
+        cudaLaunchKernelExC;
+        cudaStreamBeginCapture;
         cudaStreamSynchronize;
         __cudaRegisterFunction;
         /* PR-Z: cuStreamSynchronize listed here previously but no function

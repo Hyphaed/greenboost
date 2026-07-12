@@ -12,7 +12,7 @@ where each is used.
 - **Source:** https://github.com/vchuravy/bpf_uvm
 - **License:** MIT
 - **Used in:** `ebpf/gb_trace.bpf.c`, `ebpf/gb_trace.c`,
-  `ebpf/reference/uvm_perf_events_ref.h`
+  `ebpf/reference/uvm_perf_events_ref.c`
 
 The kprobe → ringbuf → userspace-aggregation pattern for tracing kernel
 memory-migration events is adapted from bpf_uvm. bpf_uvm traces NVIDIA's
@@ -58,36 +58,15 @@ SOFTWARE.
 
 - **Authors:** Samyam Rajbhandari, Olatunji Ruwase, Jeff Rasley, Shaden
   Smith, Yuxiong He (Microsoft)
-- **Source:** https://www.deepspeed.ai/ — "ZeRO-Infinity: Breaking the GPU
+- **Source:** https://www.deepspeed.ai/ , "ZeRO-Infinity: Breaking the GPU
   Memory Wall for Extreme Scale Deep Learning" (arXiv:2104.07857)
 - **License:** Apache-2.0
 - **Used in:** `greenboost_cuda_shim.c` (`prefetch_worker`'s T3→T2 admission
   control, labeled "U5: DeepSpeed-style T3→T2 prefetch admission control")
 
-Concept attribution only — no DeepSpeed code is vendored or copied.
+Concept attribution only , no DeepSpeed code is vendored or copied.
 GreenBoost's prefetch admission control (back off when T2 is near its
 warn threshold, re-queue rather than push T2 past cap) is inspired by
 ZeRO-Infinity's overlap-centric, bandwidth-aware offload design, applied
 to GreenBoost's own explicit T1/T2/T3 tiers rather than ZeRO's
 GPU/CPU/NVMe training-state partitioning.
-
----
-
-## ExpertFlow
-
-- **Authors:** Xin He, Shunkang Zhang, Kaijie Tang, Shaohuai Shi, Yuxin
-  Wang, Zihao Zeng, Zhenheng Tang, Xiaowen Chu, Haiyan Yin, Ivor W. Tsang,
-  Yew Soon Ong
-- **Source:** "ExpertFlow: Efficient Mixture-of-Experts Inference via
-  Predictive Expert Caching and Token Scheduling", DAC '26 (2026)
-- **License:** N/A (paper citation, no code released/vendored)
-- **Used in:** `gb_moe.py` (routing-frequency histogram, predictive
-  next-block expert prefetch, synchronous promote-on-misprediction
-  fallback)
-
-Concept attribution only. `gb_moe.py`'s design (predictive locality-aware
-expert caching with a real-time correction fallback) follows the same
-shape as ExpertFlow's PLEC + real-time correction, implemented as an
-online historical-frequency heuristic rather than ExpertFlow's trained
-T5-style routing-path predictor — see `gb_moe.py`'s module docstring for
-the documented limitation (no learned router lookahead).

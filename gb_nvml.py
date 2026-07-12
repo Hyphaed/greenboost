@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
 """
-gb_nvml.py — unified pynvml singleton for GreenBoost.
+gb_nvml.py , unified pynvml singleton for GreenBoost.
 
 Replaces four divergent pynvml impls:
-  NVMLProvider     (gb_telemetry.py)   — hot-path 500 ms poller
-  _NVMLSampler     (gb_supervisor.py)  — supervisor tick queries
-  inline pynvml    (gb_vitals_helper.py) — superset queries incl power_limit
+  NVMLProvider     (gb_telemetry.py)   , hot-path 500 ms poller
+  _NVMLSampler     (gb_supervisor.py)  , supervisor tick queries
+  inline pynvml    (gb_vitals_helper.py) , superset queries incl power_limit
 
 get_nvml(device=0) returns a per-process NvmlHandle singleton.
 atexit shutdown is registered once; all callers share the same handle.
@@ -33,7 +33,10 @@ class NvmlHandle:
         self._h      = None
         self._nvml   = None
         try:
-            import pynvml
+            try:
+                import pynvml
+            except ImportError:
+                import gb_nvml_ctypes as pynvml  # ctypes fallback, no pip dep
             self._nvml = pynvml
             pynvml.nvmlInit()
             self._h  = pynvml.nvmlDeviceGetHandleByIndex(device)
@@ -193,7 +196,7 @@ class NvmlHandle:
 
 
 def _shutdown_all() -> None:
-    """Called once at process exit — close every open handle."""
+    """Called once at process exit , close every open handle."""
     for h in list(_handles.values()):
         h.close()
     _handles.clear()
@@ -203,7 +206,7 @@ def get_nvml(device: int = 0) -> NvmlHandle:
     """
     Return the per-process NvmlHandle singleton for *device*.
     atexit shutdown registered on first call.  Subsequent calls return
-    the cached handle — no re-init.  Thread-safe under the GIL.
+    the cached handle , no re-init.  Thread-safe under the GIL.
     """
     global _atexit_registered
     if device not in _handles:

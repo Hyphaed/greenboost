@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
 """
-Tests for gb_topology — profile parser, derived properties, singleton behavior.
+Tests for gb_topology , profile parser, derived properties, singleton behavior.
 
 No GPU, no daemon. Uses tmp_path for isolated profile files.
 """
@@ -106,7 +106,7 @@ def test_parse_missing_file_returns_defaults():
 
 
 def test_parse_partial_profile(tmp_path):
-    """Only GPU section present — CPU fields fall back to defaults."""
+    """Only GPU section present , CPU fields fall back to defaults."""
     p = _write_profile(tmp_path, "vram_gb: 8\npcie_gen: 3\npcie_lanes: 8\n")
     t = _parse_profile(p)
 

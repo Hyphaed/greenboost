@@ -54,25 +54,37 @@ def metrics_mtime() -> float:
         return 0.0
 
 
+def _parse_shim_text(content: str) -> dict[str, Any]:
+    """Parse KEY=VALUE, coercing int-like values (exporter needs numeric gauges).
+    Delegates the raw split to gb_monitor.parse_shim_stats when importable so the
+    KEY=VALUE grammar has a single owner; falls back to an inline parse otherwise."""
+    try:
+        from gb_monitor import parse_shim_stats  # canonical grammar
+        raw = parse_shim_stats(content)
+    except Exception:
+        raw = {}
+        for line in content.splitlines():
+            if "=" in line:
+                k, _, v = line.partition("=")
+                raw[k.strip()] = v.strip()
+    result: dict[str, Any] = {}
+    for k, v in raw.items():
+        try:
+            result[k] = int(v)
+        except (ValueError, TypeError):
+            result[k] = v
+    return result
+
+
 def read_shim_stats() -> dict[str, Any]:
     """Parse /run/greenboost/shim_stats (key=value plaintext written by the CUDA shim)."""
     for path in [SHIM_STATS_PATH, SHIM_STATS_ALT]:
         try:
             with open(path) as f:
                 content = f.read()
-            result: dict[str, Any] = {}
-            for line in content.splitlines():
-                if "=" not in line:
-                    continue
-                k, _, v = line.partition("=")
-                v = v.strip()
-                try:
-                    result[k.strip()] = int(v)
-                except ValueError:
-                    result[k.strip()] = v
-            return result
         except OSError:
             continue
+        return _parse_shim_text(content)
     return {}
 
 

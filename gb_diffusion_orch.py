@@ -2,15 +2,15 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
 """
-gb_diffusion_orch.py — GreenBoost diffusion pipeline orchestrator.
+gb_diffusion_orch.py , GreenBoost diffusion pipeline orchestrator.
 
 Ties together all GreenBoost layers for Hugging Face Diffusers pipelines
 (FLUX.2-klein, SD-XL, LTX-2.3, etc.):
 
-  GpuTelemetry   — live HBM / PCIe / power metrics
-  ModelTierManager — T1/T2/T3 model paging
-  MemPoolManager  — per-purpose CUDA pools (no empty_cache!)
-  Stream scheduler — overlap compute / transfers / quantization
+  GpuTelemetry   , live HBM / PCIe / power metrics
+  ModelTierManager , T1/T2/T3 model paging
+  MemPoolManager  , per-purpose CUDA pools (no empty_cache!)
+  Stream scheduler , overlap compute / transfers / quantization
 
 Stage-aware lifecycle:
   1. encode   : text encoders on GPU, UNet/VAE on CPU
@@ -19,7 +19,7 @@ Stage-aware lifecycle:
   3. decode   : VAE on GPU, UNet demoted
 
 GreenBoost-specific rules enforced here:
-  - NEVER calls torch.cuda.empty_cache() — patched to no-op at startup
+  - NEVER calls torch.cuda.empty_cache() , patched to no-op at startup
   - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False must remain set
   - Uses gb_quant batch mode: quantize → encode_all → free_encoders → quantize_denoiser
 
@@ -74,6 +74,16 @@ class DiffusionOrchestrator:
         Minimum free VRAM before a promote operation; excess models are demoted.
     telemetry_interval_s : float
         Background telemetry polling interval. 0 = disable.
+    feeder_block_attr : str, optional
+        Name of a uniformly-called transformer block list on the denoiser
+        (e.g. "single_transformer_blocks" for Flux/Flux2) to offload to a
+        connected feeder's GPU , see gb_cluster.offload_tail_blocks. When
+        set, denoise_phase() implicitly tries the offload the first time
+        it's entered: no per-pipeline cluster code required, mirroring the
+        auto-on feeder use ai-forge's gen_art.py already does explicitly.
+        None (default) , no implicit feeder use; unaffected by feeders.
+    feeder_vram_budget_gb : float
+        VRAM budget on the feeder to fill with offloaded blocks.
     """
 
     def __init__(
@@ -84,11 +94,17 @@ class DiffusionOrchestrator:
         vae_attrs: tuple = ("vae",),
         hbm_headroom_mb: int = 1500,
         telemetry_interval_s: float = 0.0,
+        feeder_block_attr: Optional[str] = None,
+        feeder_vram_budget_gb: float = 5.5,
     ):
         self.pipe = pipe
         self.encoder_attrs = encoder_attrs
         self.denoiser_attrs = denoiser_attrs
         self.vae_attrs = vae_attrs
+        self.feeder_block_attr = feeder_block_attr
+        self.feeder_vram_budget_gb = feeder_vram_budget_gb
+        self._feeder_block_client = None
+        self._feeder_offload_tried = False
 
         from gb_model_tier import ModelTierManager, Tier
         from gb_mem_pool import MemPoolManager
@@ -135,6 +151,38 @@ class DiffusionOrchestrator:
     def _on_metrics(self, m):
         if m.should_demote:
             self.tm.auto_evict(m)
+
+    def _maybe_offload_to_feeder(self):
+        """Implicit cluster flux: if feeder_block_attr was given at
+        construction and a feeder is online (checked once, lazily, so
+        pipelines that never connect a feeder pay zero cost), move the tail
+        of the denoiser onto the feeder GPU. Silent no-op with zero feeders
+        or on any offload failure , this is a speed optimization, never a
+        requirement. Opt-out: GB_AUTO_CLUSTER=0.
+        """
+        if self._feeder_offload_tried or self.feeder_block_attr is None:
+            return
+        self._feeder_offload_tried = True
+        if os.environ.get("GB_AUTO_CLUSTER", "1") == "0":
+            return
+        try:
+            import gb_cluster
+            if not gb_cluster.cluster_available():
+                return
+            for attr in self.denoiser_attrs:
+                mod = getattr(self.pipe, attr, None)
+                if mod is not None and hasattr(mod, self.feeder_block_attr):
+                    self._feeder_block_client = gb_cluster.offload_tail_blocks(
+                        mod, self.feeder_block_attr,
+                        vram_budget_gb=self.feeder_vram_budget_gb)
+                    if self._feeder_block_client is not None:
+                        print(f"[gb_orch] denoise_phase: offloaded tail of "
+                              f"{attr}.{self.feeder_block_attr} to feeder",
+                              flush=True)
+                    break
+        except Exception as e:
+            print(f"[gb_orch] feeder block offload skipped: "
+                  f"{e.__class__.__name__}: {e}", flush=True)
 
     # ── phase context managers ────────────────────────────────────────────────
 
@@ -199,6 +247,8 @@ class DiffusionOrchestrator:
         for attr in self.vae_attrs:
             if attr in self.tm._entries:
                 self.tm.demote(attr)
+
+        self._maybe_offload_to_feeder()
 
         self._prefetch_vae_done = False
         self._total_steps = total_steps
@@ -342,6 +392,9 @@ class DiffusionOrchestrator:
         # Only stop the telemetry thread if we own it (not the gb_init singleton).
         if self._tel_owned:
             self.tel.stop()
+        if self._feeder_block_client is not None:
+            self._feeder_block_client.close()
+            self._feeder_block_client = None
         self.tm.close()
         self.pools.trim_all()
 

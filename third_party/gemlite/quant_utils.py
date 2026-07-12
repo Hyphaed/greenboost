@@ -30,7 +30,7 @@ def get_dtype_range(compute_dtype: torch.dtype) -> float:
 ####################################################################################################################
 
 #Cache workspace for multiple gpus (less than a KB per GPU).
-#LazyDeviceTensors: allocated on FIRST USE, never at import — import-time
+#LazyDeviceTensors: allocated on FIRST USE, never at import , import-time
 #cudaMalloc crashes under the GreenBoost LD_PRELOAD shim and breaks CPU-only
 #imports. Call sites keep indexing with [device_index].
 fp4_values = LazyDeviceTensors(
@@ -2120,10 +2120,10 @@ def scale_activations_mxfp4_triton_v5(tensor: Tensor) -> Tuple[Tensor, Tensor]:
 
 ####################################################################################################################
 # Per-device buffers for dynamic NVFP4 meta_scale computation.
-# Allocated lazily on first use (NEVER at import — import-time cudaMalloc
+# Allocated lazily on first use (NEVER at import , import-time cudaMalloc
 # crashes under the GreenBoost LD_PRELOAD shim). LazyDeviceTensors caches the
 # buffers, so their addresses are stable across CUDAGraph replays and it
-# refuses to allocate during capture — run a warmup call before capturing.
+# refuses to allocate during capture , run a warmup call before capturing.
 _nvfp4_meta_scale_bufs = LazyDeviceTensors([0.0], torch.float32)  # meta_scale output (float32 scalar)
 _nvfp4_amax_bufs = LazyDeviceTensors([0.0], torch.float32)        # atomic max scratch (float32 scalar)
 _nvfp4_counter_bufs = LazyDeviceTensors([0], torch.int32)         # grid sync counter (int32 scalar)
@@ -2574,7 +2574,7 @@ def scale_activations_per_block_triton_v1(
 # Each tile covers BLOCK_SIZE_M rows × BLOCK_SIZE_K cols (BLOCK_SIZE_K is a multiple of the 128 quant
 # block); the tile is reshaped to [BLOCK_SIZE_M * GROUPS_PER_BLOCK, 128] so the per-128 amax becomes
 # one row-reduction, letting each program amortize launch overhead over many rows.
-# Autotune key is (M_CLOSEST, K), identical to the other quant_utils kernels — M_CLOSEST is bucketed
+# Autotune key is (M_CLOSEST, K), identical to the other quant_utils kernels , M_CLOSEST is bucketed
 # by get_closest_m so changing M across buckets does not force a recompile.
 @triton.autotune(
     configs=[

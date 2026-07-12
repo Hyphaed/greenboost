@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * ebpf/gb_trace.c — GreenBoost eBPF tracer userspace loader
+ * ebpf/gb_trace.c , GreenBoost eBPF tracer userspace loader
  *
  * Loads gb_trace.bpf.o via the generated skeleton (gb_trace.skel.h),
  * attaches kprobes to greenboost.ko symbols, drains the ringbuf, and
@@ -8,7 +8,7 @@
  * 500 ms so the Python telemetry layer can pick them up without polling.
  *
  * Additionally reads /proc/driver/nvidia-uvm/.../fault_stats for UVM
- * page migration counters (no eBPF needed for those — procfs is enough).
+ * page migration counters (no eBPF needed for those , procfs is enough).
  *
  * Startup sequence:
  *   1. Verify CAP_BPF / BTF availability; exit 2 (not an error) if absent.
@@ -20,9 +20,9 @@
  *   7. On SIGINT / SIGTERM: remove stats and PID files, clean exit.
  *
  * Output files:
- *   /run/greenboost/ebpf_stats   — key=value rates (read by EbpfProvider)
- *   /run/greenboost/ebpf_events  — bounded ring of recent decoded events
- *   /run/greenboost/ebpf_trace.pid — PID (for lifecycle management)
+ *   /run/greenboost/ebpf_stats   , key=value rates (read by EbpfProvider)
+ *   /run/greenboost/ebpf_events  , bounded ring of recent decoded events
+ *   /run/greenboost/ebpf_trace.pid , PID (for lifecycle management)
  */
 
 #include <stdio.h>
@@ -310,7 +310,7 @@ static volatile int g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
 /* ──────────────────────────────────────────────────────────────────── */
-/*  Kprobe attach helper — skips on ENOENT / EINVAL (symbol absent)    */
+/*  Kprobe attach helper , skips on ENOENT / EINVAL (symbol absent)    */
 /* ──────────────────────────────────────────────────────────────────── */
 
 static struct bpf_link *attach_kprobe(struct bpf_program *prog,
@@ -324,7 +324,7 @@ static struct bpf_link *attach_kprobe(struct bpf_program *prog,
     if (!lnk) {
         int err = -errno;
         if (err == -ENOENT || err == -EINVAL) {
-            /* Symbol not in kallsyms — module not loaded or CONFIG_KALLSYMS_ALL=n */
+            /* Symbol not in kallsyms , module not loaded or CONFIG_KALLSYMS_ALL=n */
             fprintf(stderr,
                 "[gb-trace] kprobe %s%s not available (skip)\n",
                 retprobe ? "ret:" : "", sym);
@@ -389,7 +389,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Attach kprobes — skip missing symbols, don't fail                 */
+    /* Attach kprobes , skip missing symbols, don't fail                 */
     struct bpf_link *links[12] = {};
     int nl = 0;
 
@@ -419,7 +419,7 @@ int main(int argc, char **argv)
 
     if (active_links == 0) {
         fprintf(stderr,
-            "[gb-trace] no kprobes attached — is greenboost.ko loaded?\n"
+            "[gb-trace] no kprobes attached , is greenboost.ko loaded?\n"
             "           check CONFIG_KALLSYMS_ALL=y and CAP_BPF\n");
         gb_trace_bpf__destroy(skel);
         return 2;  /* exit 2: not an error, tracer not needed */
@@ -442,7 +442,7 @@ int main(int argc, char **argv)
     write_pid();
 
     fprintf(stderr,
-        "[gb-trace] started — %d kprobes active, writing %s\n",
+        "[gb-trace] started , %d kprobes active, writing %s\n",
         active_links, GB_STATS_FILE);
 
     /* Poll loop                                                          */

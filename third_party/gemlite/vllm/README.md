@@ -1,4 +1,4 @@
-# gemlite.vllm — gemlite integration for vLLM
+# gemlite.vllm , gemlite integration for vLLM
 
 Route vLLM's quantized forward path through gemlite's Triton kernels, or
 quantize fp16/bf16 checkpoints on the fly at load time.
@@ -9,10 +9,10 @@ dynamic, GPTQ / AWQ / GPTQMarlin / AWQMarlin int4 and int8, compressed-tensors
 NVFP4/MXFP4/WNA16, GGUF (Q4_0 / Q4_1 / Q4_K / Q8_0 / Q2_K).
 
 Entry points:
-- `enable_gemlite(names=None)` — route pre-quantized checkpoints through gemlite.
-- `set_onthefly_quant(...)` — quantize fp16/bf16 checkpoints at load time.
-- `patch_vllm()` — env-driven application of both (idempotent).
-- `register()` — vLLM plugin entry point (calls `patch_vllm()`).
+- `enable_gemlite(names=None)` , route pre-quantized checkpoints through gemlite.
+- `set_onthefly_quant(...)` , quantize fp16/bf16 checkpoints at load time.
+- `patch_vllm()` , env-driven application of both (idempotent).
+- `register()` , vLLM plugin entry point (calls `patch_vllm()`).
 
 ## How the patch works
 
@@ -22,7 +22,7 @@ delegated to stock vLLM (so HF loading, sharding, fused qkv/gate_up all keep
 working); only `process_weights_after_loading` and `apply` are replaced.
 
 **The swap must run before vLLM resolves the quant-config class for the
-model** — i.e. before `LLM(...)` or `vllm serve` finishes importing the
+model** , i.e. before `LLM(...)` or `vllm serve` finishes importing the
 engine. All examples below follow that ordering.
 
 Any checkpoint / layer that gemlite doesn't handle (K-quants other than
@@ -33,7 +33,7 @@ vLLM with a warning. Nothing hard-fails.
 
 - `gemlite` (this package)
 - `vllm`
-- `hqq` — only if you use on-the-fly `int4_weightonly`
+- `hqq` , only if you use on-the-fly `int4_weightonly`
 
 On Blackewell, make sure you use CUDA 13 PTXAS
 ```
@@ -119,12 +119,12 @@ Aliases: `A16W4_INT` → `A16W4_HQQ_INT`, `A16W8_INT` → `A16W8_HQQ_INT`.
 ## 4. On-the-fly quantization
 
 Quantize an **fp16 / bf16** checkpoint at load time. This path is a no-op
-on already-quantized checkpoints (FP8 / AWQ / GPTQ / GGUF / …) — those
+on already-quantized checkpoints (FP8 / AWQ / GPTQ / GGUF / …) , those
 arrive with a `quant_config` attached, and the on-the-fly hook only
 replaces layers whose `quant_config is None`. For pre-quantized models use
 `VLLM_GEMLITE_ENABLE=1` (section 2/3) instead.
 
-Via env var (uses a named preset) — **the recommended path** for `vllm serve`
+Via env var (uses a named preset) , **the recommended path** for `vllm serve`
 and offline `LLM`, because it propagates to v1 worker subprocesses:
 
 ```bash
@@ -133,11 +133,11 @@ export VLLM_GEMLITE_SKIP_MODULES=lm_head,visual,vision
 vllm serve Qwen/Qwen3-4B --dtype bfloat16 --port 8000
 ```
 
-`VLLM_GEMLITE_ONTHEFLY_QUANT` alone is enough — gemlite's plugin
+`VLLM_GEMLITE_ONTHEFLY_QUANT` alone is enough , gemlite's plugin
 `register()` runs `patch_vllm()` in every worker, which calls
 `set_onthefly_quant(...)` with the matching preset.
 
-Programmatic — works for offline `LLM` only when v1 spawn is disabled
+Programmatic , works for offline `LLM` only when v1 spawn is disabled
 (`VLLM_USE_V1=0`) or for code paths that don't fork workers; under v1 the
 parent-process monkey-patch does **not** propagate to workers, so use the
 env-var path for `vllm serve` / multi-process scenarios:
@@ -161,17 +161,17 @@ select it via `VLLM_GEMLITE_ONTHEFLY_QUANT`.
 
 | Preset                     | weight_bits | group_size | quant_mode          | block_quant |
 | -------------------------- | ----------- | ---------- | ------------------- | ----------- |
-| `A16W8_INT8`               | 8           | —          | `int8_weightonly`   | —           |
-| `A16W8_FP8`                | 8           | —          | `fp8_weightonly`    | —           |
-| `A16W4_INT4_HQQ`           | 4           | 64         | `int4_weightonly`   | —           |
-| `A8W8_INT8_DYNAMIC`        | 8           | —          | `int8_dynamic`      | false       |
-| `A8W8_FP8_DYNAMIC`         | 8           | —          | `fp8_dynamic`       | false       |
-| `A8W8_FP8_DYNAMIC_BLOCK`   | 8           | —          | `fp8_dynamic`       | true        |
-| `MXFP8_DYNAMIC`            | 8           | 32         | `mxfp8_dynamic`     | —           |
-| `MXFP4_WEIGHTONLY`         | 4           | —          | `mxfp4_weightonly`  | —           |
-| `MXFP4_DYNAMIC`            | 4           | —          | `mxfp4_dynamic`     | —           |
-| `A8W4_MXFP_DYNAMIC`        | 4           | —          | `mxfp8_dynamic`     | —           |
-| `NVFP4_DYNAMIC`            | 4           | —          | `nvfp4_dynamic`     | —           |
+| `A16W8_INT8`               | 8           | ,          | `int8_weightonly`   | ,           |
+| `A16W8_FP8`                | 8           | ,          | `fp8_weightonly`    | ,           |
+| `A16W4_INT4_HQQ`           | 4           | 64         | `int4_weightonly`   | ,           |
+| `A8W8_INT8_DYNAMIC`        | 8           | ,          | `int8_dynamic`      | false       |
+| `A8W8_FP8_DYNAMIC`         | 8           | ,          | `fp8_dynamic`       | false       |
+| `A8W8_FP8_DYNAMIC_BLOCK`   | 8           | ,          | `fp8_dynamic`       | true        |
+| `MXFP8_DYNAMIC`            | 8           | 32         | `mxfp8_dynamic`     | ,           |
+| `MXFP4_WEIGHTONLY`         | 4           | ,          | `mxfp4_weightonly`  | ,           |
+| `MXFP4_DYNAMIC`            | 4           | ,          | `mxfp4_dynamic`     | ,           |
+| `A8W4_MXFP_DYNAMIC`        | 4           | ,          | `mxfp8_dynamic`     | ,           |
+| `NVFP4_DYNAMIC`            | 4           | ,          | `nvfp4_dynamic`     | ,           |
 
 `int4_weightonly` requires `pip install hqq`.
 
@@ -181,17 +181,17 @@ select it via `VLLM_GEMLITE_ONTHEFLY_QUANT`.
 | ----------------------------- | --------- | ---------------------------------------------------- |
 | `VLLM_GEMLITE_ENABLE`         | `0`       | Set to `"1"` to route pre-quantized checkpoints through gemlite. Required for `vllm serve` (both plugin and bootstrap paths). |
 | `VLLM_GEMLITE_ENABLE_LIST`    | (unset)   | Comma-separated subset of `SUPPORTED` scheme names.  |
-| `VLLM_GEMLITE_ONTHEFLY_QUANT` | (unset)   | Preset name — enables on-the-fly quantization (fp16/bf16 checkpoints only). |
+| `VLLM_GEMLITE_ONTHEFLY_QUANT` | (unset)   | Preset name , enables on-the-fly quantization (fp16/bf16 checkpoints only). |
 | `VLLM_GEMLITE_SKIP_MODULES`   | `lm_head,visual,vision` | Comma-separated module names to leave unquantized (on-the-fly only). |
 
 ## Notes
 
-- **Autotune cache** — first call on a new shape runs Triton autotune (can
+- **Autotune cache** , first call on a new shape runs Triton autotune (can
   take minutes). Decisions are persisted to `/tmp/gemlite_cache.json` and
   reused on subsequent runs.
-- **CUDA graphs** — keep them on (vLLM default). Gemlite kernels are
+- **CUDA graphs** , keep them on (vLLM default). Gemlite kernels are
   captured correctly under `torch.compile`'s PIECEWISE mode.
-- **Fallback on unsupported layers** — a warning is logged and that layer
+- **Fallback on unsupported layers** , a warning is logged and that layer
   keeps its stock vLLM forward path. This applies per-layer, not per-model:
   a model with unsupported GGUF tensors still uses gemlite on the supported
   ones.
@@ -215,7 +215,7 @@ must use `--dtype float16` (vLLM rejects `bfloat16` for GGUF).
 
 ## Troubleshooting
 
-- **`KeyError: 'gemlite_linear'` after toggling `VLLM_GEMLITE_ENABLE`** —
+- **`KeyError: 'gemlite_linear'` after toggling `VLLM_GEMLITE_ENABLE`** ,
   vLLM's torch.compile cache key doesn't include the quant method, so a
   graph compiled with gemlite enabled gets reused on the next run with
   gemlite disabled (and vice-versa), and the cached graph references
@@ -226,17 +226,17 @@ must use `--dtype float16` (vLLM rejects `bfloat16` for GGUF).
   rm -rf ~/.cache/vllm/torch_compile_cache
   ```
 
-- **GGUF + bfloat16 rejected** — vLLM only accepts `float16` / `float32`
+- **GGUF + bfloat16 rejected** , vLLM only accepts `float16` / `float32`
   for GGUF quant. Pass `--dtype float16`. Also pass `--hf-config-path
   <unquantized-repo>` if the GGUF repo doesn't ship a `config.json`
   (e.g. `unsloth/*-GGUF` repos).
 
-- **`collective_rpc` with custom functions** — set
+- **`collective_rpc` with custom functions** , set
   `VLLM_ALLOW_INSECURE_SERIALIZATION=1` to let vLLM pickle arbitrary
   callables to workers. Only relevant if you pass your own probe/closure,
   not for normal inference.
 
-- **Plugin not firing under plain `vllm serve`** — verify the entry point
+- **Plugin not firing under plain `vllm serve`** , verify the entry point
   is registered:
 
   ```bash

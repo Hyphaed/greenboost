@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
 """
-gb_reactive.py — reactive-state primitives for GreenBoost.
+gb_reactive.py , reactive-state primitives for GreenBoost.
 
 Inspired by BehaviorSubject / operator composition patterns from
 rxRust (~/Dev/rxRust), RxCpp (~/Dev/RxCpp), and RxGo (~/Dev/RxGo).
@@ -10,32 +10,32 @@ All operators are pure Python, stdlib only, thread-safe.
 
 Classes
 -------
-Signal          — EWMA-smoothed observable with confirm debounce, hysteresis,
+Signal          , EWMA-smoothed observable with confirm debounce, hysteresis,
                   and on_enter/on_exit callbacks.  Also serves as the source
                   for any piped operator chain.
 
-BehaviorSubject — Signal that immediately calls on_enter subscribers when the
+BehaviorSubject , Signal that immediately calls on_enter subscribers when the
                   signal is already in hysteresis at subscription time (the core
                   BehaviorSubject contract from rxRust/RxCpp).
 
-FilteredSignal  — Derived observable: only propagates on_enter/on_exit from its
+FilteredSignal  , Derived observable: only propagates on_enter/on_exit from its
                   source when a runtime predicate is True.  Used for declarative
                   gate composition (replaces inline if-chains).
 
-PairwiseSignal  — Derived observable: emits (previous, current) pairs on each
+PairwiseSignal  , Derived observable: emits (previous, current) pairs on each
                   source notification (pairwise operator from rxRust).  Used for
                   transition detection (e.g. INFERENCE→IDLE phase gate).
 
-WithLatestFrom  — Derived observable: when any of N sources fires, calls
+WithLatestFrom  , Derived observable: when any of N sources fires, calls
                   subscriber with (trigger_val, *latest_from_each_other)
                   (with_latest_from operator from rxRust).
 
-ScanSignal      — Derived signal: applies an accumulator function on each
+ScanSignal      , Derived signal: applies an accumulator function on each
                   source emission and emits the running result (scan operator).
                   EWMA inside Signal is a special case; ScanSignal generalises
                   to any fold function.
 
-Computed        — Legacy derived Signal: recomputes fn(*deps) when any dep
+Computed        , Legacy derived Signal: recomputes fn(*deps) when any dep
                   notifies (kept for backward compat).
 
 Operator factories (chainable via Signal.pipe)
@@ -176,7 +176,7 @@ class Signal:
             if self._confirm_count < self._confirm:
                 return False
 
-            # Threshold crossed and confirmed — proceed
+            # Threshold crossed and confirmed , proceed
             self._confirm_count  = 0
             prev_for_subs        = self._prev_notified
             self._prev_notified  = current
@@ -343,7 +343,7 @@ class Computed(Signal):
 class BehaviorSubject(Signal):
     """
     Signal that immediately emits to new on_enter subscribers when already
-    in hysteresis — the core BehaviorSubject contract from rxRust/RxCpp.
+    in hysteresis , the core BehaviorSubject contract from rxRust/RxCpp.
 
     Late subscribers don't miss the current state: if a new diagnostic loop
     registers on_enter after the metric that crossed the threshold, it still
@@ -434,7 +434,7 @@ class FilteredSignal:
 
 
 def filter(predicate: Callable[[], bool]) -> Callable[[Signal], FilteredSignal]:  # noqa: A001
-    """Rx filter operator factory — use with Signal.pipe()."""
+    """Rx filter operator factory , use with Signal.pipe()."""
     return lambda source: FilteredSignal(source, predicate)
 
 
@@ -471,7 +471,7 @@ class PairwiseSignal:
 
 
 def pairwise() -> Callable[[Signal], PairwiseSignal]:
-    """Rx pairwise operator factory — use with Signal.pipe()."""
+    """Rx pairwise operator factory , use with Signal.pipe()."""
     return lambda source: PairwiseSignal(source)
 
 
@@ -481,7 +481,7 @@ class WithLatestFrom:
     """
     When the trigger Signal notifies, combines its value with the latest
     value from each of the other signals and calls subscribers with
-    (trigger_val, other1_val, other2_val, ...) — with_latest_from from rxRust.
+    (trigger_val, other1_val, other2_val, ...) , with_latest_from from rxRust.
 
     Useful for gated combinations: "when KV pressure fires, combine with the
     latest clock state and phase to decide the action"::
@@ -515,7 +515,7 @@ class WithLatestFrom:
 
 
 def with_latest_from(*others: Signal) -> Callable[[Signal], WithLatestFrom]:
-    """Rx with_latest_from operator factory — use with Signal.pipe()."""
+    """Rx with_latest_from operator factory , use with Signal.pipe()."""
     return lambda trigger: WithLatestFrom(trigger, *others)
 
 
@@ -555,5 +555,5 @@ class ScanSignal(Signal):
 
 
 def scan(fn: Callable[[Any, Any], Any], seed: Any) -> Callable[[Signal], ScanSignal]:
-    """Rx scan operator factory — use with Signal.pipe()."""
+    """Rx scan operator factory , use with Signal.pipe()."""
     return lambda source: ScanSignal(source, fn, seed)

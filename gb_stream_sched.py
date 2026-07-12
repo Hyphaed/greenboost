@@ -2,15 +2,15 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
 """
-gb_stream_sched.py — GreenBoost multi-stream CUDA scheduler.
+gb_stream_sched.py , GreenBoost multi-stream CUDA scheduler.
 
 Creates dedicated CUDA streams for each workload class so compute, memory
 transfers, and quantization can overlap:
 
-  gemm      — weight GEMMs and attention (main compute)
-  transfer  — H2D / D2H model page moves (async CPU↔GPU)
-  quant     — quantization passes (gb_quant calls)
-  copy      — inter-buffer copies, VAE encode/decode staging
+  gemm      , weight GEMMs and attention (main compute)
+  transfer  , H2D / D2H model page moves (async CPU↔GPU)
+  quant     , quantization passes (gb_quant calls)
+  copy      , inter-buffer copies, VAE encode/decode staging
 
 Usage:
     import gb_stream_sched as gs

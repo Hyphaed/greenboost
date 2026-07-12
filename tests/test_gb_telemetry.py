@@ -3,7 +3,7 @@
 """
 Tests for GpuMetrics decision-helper properties and ClusterTelemetryManager aggregates.
 
-No GPU, no NVML, no daemon — pure dataclass tests with fake managers.
+No GPU, no NVML, no daemon , pure dataclass tests with fake managers.
 """
 import sys
 from pathlib import Path
@@ -236,7 +236,7 @@ def test_power_near_limit_false_exactly_at_93_pct():
     """Boundary: exactly 93% is NOT above threshold."""
     m = _metrics()
     m.power_w = 279.0
-    m.power_limit_w = 300.0   # 93.0% — not strictly >
+    m.power_limit_w = 300.0   # 93.0% , not strictly >
     assert m.power_near_limit is False
 
 
@@ -291,21 +291,26 @@ def test_nvtx_range_without_nvtx_yields():
 
 # ── NVMLProvider failure path ────────────────────────────────────────────────
 
-def test_nvml_provider_not_available_when_pynvml_missing():
-    """NVMLProvider.available() is False when pynvml cannot be imported."""
+def test_nvml_provider_not_available_when_no_nvml_backend():
+    """NVMLProvider.available() is False when neither pynvml nor the
+    gb_nvml_ctypes fallback can be imported."""
     import sys
-    # Temporarily hide pynvml
-    orig = sys.modules.get("pynvml")
-    sys.modules["pynvml"] = None   # blocks import
+    # Temporarily hide both NVML backends , gb_nvml_ctypes.nvmlInit() will
+    # then raise (no library / no symbols), same as pynvml being absent.
+    orig_pynvml = sys.modules.get("pynvml")
+    orig_ctypes_fallback = sys.modules.get("gb_nvml_ctypes")
+    sys.modules["pynvml"] = None            # blocks import
+    sys.modules["gb_nvml_ctypes"] = None    # blocks fallback import too
     try:
         from gb_telemetry import NVMLProvider
         p = NVMLProvider(device=0)
         assert p.available() is False
     finally:
-        if orig is None:
-            sys.modules.pop("pynvml", None)
-        else:
-            sys.modules["pynvml"] = orig
+        for name, orig in (("pynvml", orig_pynvml), ("gb_nvml_ctypes", orig_ctypes_fallback)):
+            if orig is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = orig
 
 
 # ── TorchFallbackProvider ─────────────────────────────────────────────────────

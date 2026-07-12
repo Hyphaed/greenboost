@@ -43,7 +43,7 @@ def _scalar_max_fp32(t):
 
 
 def _recip_max(t):
-    """1 / max(t) in fp32 — the ModelOpt meta_scale convention."""
+    """1 / max(t) in fp32 , the ModelOpt meta_scale convention."""
     return 1.0 / _scalar_max_fp32(t)
 
 
@@ -324,7 +324,7 @@ _AWQ_CLEANUP = ("qweight", "qzeros", "scales", "g_idx", "workspace")
 
 
 class GemliteAwqLinearMethod(StockWrappedGemliteMethod):
-    """AWQ via A16W{4,8}_HQQ_INT. Handles both `awq` and `awq_marlin` — the
+    """AWQ via A16W{4,8}_HQQ_INT. Handles both `awq` and `awq_marlin` , the
     raw tensor layout is identical."""
 
     def __init__(self, quant_config, stock_method,
@@ -394,7 +394,7 @@ class GemliteCTW4A4Fp4(GemliteCTApplyMixin, CompressedTensorsW4A4Fp4):
 
 
 class GemliteCTW4A16Fp4(GemliteCTApplyMixin, CompressedTensorsW4A16Fp4):
-    """W4A16 NVFP4 — weight-only NVFP4."""
+    """W4A16 NVFP4 , weight-only NVFP4."""
 
     def process_weights_after_loading(self, layer) -> None:
         w = layer.weight_packed.data
@@ -409,7 +409,7 @@ class GemliteCTW4A16Fp4(GemliteCTApplyMixin, CompressedTensorsW4A16Fp4):
 
 
 class GemliteCTW4A16Mxfp4(GemliteCTApplyMixin, CompressedTensorsW4A16Mxfp4):
-    """W4A16 MXFP4 — e8m0 scales, no global scale."""
+    """W4A16 MXFP4 , e8m0 scales, no global scale."""
 
     def process_weights_after_loading(self, layer) -> None:
         w = layer.weight_packed.data

@@ -528,7 +528,7 @@ class A8W8_dynamic:
         If ``scales`` is None, ``weight`` is quantized in-place (expected to be a
         floating-point tensor) using per-block amax. If ``scales`` is provided,
         ``weight`` must already be pre-quantized (FP8/INT8) and ``scales`` must
-        be shape ``[N//B, K//B]`` in fp32 — no re-quantization is performed.
+        be shape ``[N//B, K//B]`` in fp32 , no re-quantization is performed.
         """
         if(self.fp8):
             w_dtype, input_dtype = self.fp8, TORCH_TO_DTYPE[self.fp8]
@@ -607,7 +607,7 @@ class A8W8_dynamic:
         placeholder = torch.ones((out_features, 1), dtype=torch.float32, device=self.device)
         gemlite_linear.pack(W_q, scales=placeholder, zeros=None, bias=bias)
 
-        # Replace scales buffer with block-quant layout [K//B, N//B] fp32 — shape is
+        # Replace scales buffer with block-quant layout [K//B, N//B] fp32 , shape is
         # ceil(K/B) x ceil(N/B) so kernel lookups for the partial edge blocks remain in bounds.
         block_scales = scales.t().contiguous()  # [K//B, N//B]
         gemlite_linear.scales = torch.nn.Parameter(block_scales, requires_grad=False)

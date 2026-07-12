@@ -63,12 +63,12 @@ MODULE_IMPORT_NS("DMA_BUF");        /* string form    - < 5.16 or ≥ 6.13   */
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Ferran Duarri");
-MODULE_DESCRIPTION("GreenBoost : CUDA Memory Orchestrator for NVidia GPUs");
+MODULE_DESCRIPTION("GreenBoost : CUDA Memory & Compute Orchestrator for NVIDIA GPUs");
 MODULE_VERSION("2.9");
 
 /* Single version string - used in banner, status, and pool_brief.
  * Update this when bumping MODULE_VERSION above. */
-#define GB_VERSION  "v2.9"
+#define GB_VERSION  "v3.2"
 
 /* 2 MiB hugepage constants */
 #define GB_HPAGE_ORDER  9u
@@ -114,7 +114,7 @@ static int debug_mode        =  0;
 static int gaming_mode       =  0;  /* 1 when a game is active - deprioritises inference T2 */
 static int use_hugepages     =  1;  /* 2 MB compound pages (T2 only)    */
 
-/* Expert VMM pool registry — shim registers pools so vitals/Synapse can
+/* Expert VMM pool registry , shim registers pools so vitals/Synapse can
  * discover them cross-process.  Residency is NOT tracked here; read it
  * directly from the shim via gb_expert_pool_residency() or /proc maps. */
 #define GB_VPAGE_REGISTRY_MAX 64
@@ -1994,7 +1994,8 @@ static long gb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 	case GB_IOCTL_SET_KV_RESERVE: {
 		struct gb_kv_reserve_req req;
-		int requested, max_kv, clamped;
+		gb_u32 requested;
+		int max_kv, clamped;
 
 		/* SEC-01: Changing the system-wide KV reserve affects all inference
 		 * sessions - restrict to privileged callers. */
@@ -2006,19 +2007,22 @@ static long gb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 		/* Clamp to effective T1 headroom: never reserve more than T1 - 2 GB safety.
 		 * Without this clamp, the shim overflow check is ALWAYS true and every
-		 * cudaMalloc overflows to T2, collapsing performance to ~32 GB/s. */
-		requested = (int)req.reserve_mb;
+		 * cudaMalloc overflows to T2, collapsing performance to ~32 GB/s.
+		 * Compare in the unsigned domain first (max_kv is always >= 512, so the
+		 * cast up is safe) - casting requested down to int before the comparison
+		 * would make values >= 0x80000000 negative and bypass the clamp entirely. */
+		requested = req.reserve_mb;
 		max_kv    = physical_vram_gb * 1024 - 2048;
 		if (max_kv < 512)
 			max_kv = 512;
-		clamped = (requested > max_kv) ? max_kv : requested;
+		clamped = (requested > (gb_u32)max_kv) ? max_kv : (int)requested;
 		/* MED-03: Use WRITE_ONCE to avoid compiler-torn write; sysfs show
 		 * and watchdog read this concurrently without a lock. */
 		WRITE_ONCE(kv_reserve_mb, clamped);
 
-		if (clamped != requested)
+		if (clamped != (int)requested)
 			pr_info(DRIVER_NAME
-				": KV reserve: requested %d MB clamped to %d MB "
+				": KV reserve: requested %u MB clamped to %d MB "
 				"(T1=%dGB limit). Weights overflow to T2 sooner; "
 				"KV stays in T1.\n",
 				requested, clamped, physical_vram_gb);
@@ -2320,6 +2324,14 @@ static long gb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		spin_lock(&gb_vpage_lock);
 		for (i = 0; i < gb_vpage_count; i++) {
 			if (gb_vpage_registry[i].va_base == req.va_base) {
+				/* SEC: only the registering process (or CAP_SYS_ADMIN) may
+				 * query a vpage entry - it leaks another tenant's MoE buffer
+				 * layout (stride/expert count) and owning pid otherwise. */
+				if (gb_vpage_registry[i].pid != (u32)current->pid &&
+				    !capable(CAP_SYS_ADMIN)) {
+					spin_unlock(&gb_vpage_lock);
+					return -EPERM;
+				}
 				req.out_stride_bytes = gb_vpage_registry[i].stride_bytes;
 				req.out_num_experts  = gb_vpage_registry[i].num_experts;
 				req.out_pid          = gb_vpage_registry[i].pid;
@@ -2348,23 +2360,34 @@ static long gb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 		/* Same ownership rule as GB_IOCTL_MADVISE/EVICT: only the
 		 * allocating process (or CAP_SYS_ADMIN) may steer eviction
-		 * priority for a buffer it does not own. */
-		mutex_lock(&gb_dev.lock);
-		spin_lock(&gb_dev.lru_lock);
+		 * priority for a buffer it does not own.
+		 *
+		 * Two-phase per entry (matches MADVISE/EVICT): pin the buffer
+		 * under gb_dev.lock, drop it, THEN take lru_lock. Never hold
+		 * both locks at once - gb_try_evict_for_alloc's own doc-comment
+		 * requires being called without gb_dev.lock held, and every
+		 * other caller in this file honors that ordering. */
 		for (i = 0; i < req.count; i++) {
+			mutex_lock(&gb_dev.lock);
 			buf = idr_find(&gb_dev.idr, req.ent[i].buf_id);
+			if (buf)
+				get_dma_buf(buf->dmabuf);
+			mutex_unlock(&gb_dev.lock);
 			if (!buf)
 				continue;
 			if (buf->owner_pid != task_pid_vnr(current) &&
-			    !capable(CAP_SYS_ADMIN))
+			    !capable(CAP_SYS_ADMIN)) {
+				dma_buf_put(buf->dmabuf);
 				continue;
+			}
+			spin_lock(&gb_dev.lru_lock);
 			/* Additive: the shim's access_count only grows between
 			 * pushes, so OR-ing in the new sample never loses heat
 			 * to a stale/out-of-order batch entry. */
 			buf->heat |= req.ent[i].heat;
+			spin_unlock(&gb_dev.lru_lock);
+			dma_buf_put(buf->dmabuf);
 		}
-		spin_unlock(&gb_dev.lru_lock);
-		mutex_unlock(&gb_dev.lock);
 		return 0;
 	}
 
@@ -3428,7 +3451,7 @@ static struct notifier_block gb_panic_nb = {
 /*  Module init / exit                                                  */
 /* ------------------------------------------------------------------ */
 
-/* Audit F-L2-07: /dev/greenboost group access — created 0600 root:root by
+/* Audit F-L2-07: /dev/greenboost group access , created 0600 root:root by
  * default when no devnode callback is set.  The udev rule (99-greenboost.rules,
  * GROUP="video" MODE="0660") relaxes this in userspace, but only after
  * udevadm runs.  Setting the mode here in the kernel ensures the node is

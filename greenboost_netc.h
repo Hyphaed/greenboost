@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
- * GreenBoost v3.0 - Network Client (host-side, compiled into CUDA shim)
+ * GreenBoost v3.2 - Network Client (host-side, compiled into CUDA shim)
  *
  * Manages TCP connections to feeder daemons, remote device tracking,
  * fake pointer mapping, and CUDA operation forwarding.
@@ -108,6 +108,9 @@ int  gb_netc_free(uint64_t fake_ptr);
 
 /* Copy host→device (upload).  fake_dst is a remote pointer. */
 int  gb_netc_memcpy_h2d(uint64_t fake_dst, const void *host_src, uint64_t size);
+int  gb_netc_memset(uint64_t fake_dst, int value, uint64_t size);
+int  gb_netc_ensure_connected(int remote_idx);
+int  gb_netc_wait_connected(int timeout_ms);
 
 /* Copy device→host (download).  fake_src is a remote pointer. */
 int  gb_netc_memcpy_d2h(void *host_dst, uint64_t fake_src, uint64_t size);
@@ -204,6 +207,27 @@ int  gb_netc_exec_kernel(int feeder_idx,
                          const struct gb_exec_reloc *relocs, int n_relocs,
                          struct gb_exec_upload *uploads, int n_uploads,
                          int n_downloads);
+
+/* Byte-offset relocation for the RAW exec path: a remote fake_ptr sitting at
+ * byte offset `buf_offset` in the packed param buffer (may be inside a struct
+ * param) → feeder device ptr. */
+struct gb_exec_reloc_raw {
+    uint32_t buf_offset;
+    uint64_t remote_handle;
+    int      feeder_idx;
+};
+
+/* RAW exec: transmit the full packed param buffer + per-param sizes so struct-
+ * by-value args survive and their embedded pointers relocate.  launch_mode:
+ * 0=driver CUfunction, 1=runtime host stub (feeder decides via resolution). */
+int  gb_netc_exec_kernel_raw(int feeder_idx,
+                             const char *kernel_name,
+                             unsigned int gx, unsigned int gy, unsigned int gz,
+                             unsigned int bx, unsigned int by, unsigned int bz,
+                             uint32_t shared_mem,
+                             const uint8_t *param_buf, uint32_t param_buf_bytes,
+                             const uint32_t *param_sizes, uint32_t n_params,
+                             const struct gb_exec_reloc_raw *relocs, int n_relocs);
 
 /* Phase 2b: async fire-and-forget kernel dispatch (GREENBOOST_ASYNC_DISPATCH=1).
  * Sends GB_MSG_CUDA_EXEC_ASYNC and returns as soon as the feeder ACKs.

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
- * GreenBoost v3.0 - Network Fabric Protocol Definitions
+ * GreenBoost v3.2 - Network Fabric Protocol Definitions
  *
  * Shared between greenboost_netd (feeder daemon) and the CUDA shim (host client).
  * Wire format: little-endian, binary.  TCP transport on port GB_NET_PORT.
@@ -69,7 +69,11 @@
 #define GB_NET_MAX_EXEC_UPLOAD_BYTES (256u * 1024u * 1024u)
 
 #define GB_NET_HEARTBEAT_INTERVAL_MS  5000
-#define GB_NET_HEARTBEAT_TIMEOUT_MS  15000
+/* 60 s: must ride out the daemon's own blocking ops , pinning a 20+ GB
+ * cudaHostAlloc for a feeder-T2 weights buffer takes 10-30 s, during which
+ * the single-threaded epoll loop processes nothing and the client's
+ * heartbeat thread is per_lock-starved (its request is what's blocking). */
+#define GB_NET_HEARTBEAT_TIMEOUT_MS  60000
 
 /* Little-endian portability helpers for wire fields.  The wire format is
  * documented LE; on LE hosts these are no-ops.  Big-endian hosts get correct
@@ -154,6 +158,7 @@ enum gb_net_msg_type {
     GB_MSG_CUDA_MEMCPY_H2D  = 0x12,
     GB_MSG_CUDA_MEMCPY_D2H  = 0x13,
     /* 0x14 intentionally vacant - see GB_MSG_CUDA_MEMCPY_D2D define below */
+    GB_MSG_CUDA_MEMSET      = 0x15,
 
     /* Compute operations */
     GB_MSG_CUDA_LAUNCH      = 0x20,
@@ -211,7 +216,27 @@ enum gb_net_status {
 
 /* Flags for message header */
 #define GB_NET_FLAG_RESPONSE  (1u << 0)
+/* GB_MSG_CUDA_EXEC carries a RAW param buffer (full arg bytes, byte-offset
+ * relocations) instead of the 8-byte-per-arg arg_vals[] layout.  Required for
+ * kernels with struct-by-value args (e.g. ggml fused mul_mat_vec_q's
+ * ggml_cuda_mm_fusion_args_device) whose size exceeds 8 bytes and/or whose
+ * embedded pointers must be relocated.  See struct gb_net_cuda_exec_raw. */
+#define GB_NET_FLAG_EXEC_RAW  (1u << 1)
 #define GB_NET_FLAG_ASYNC     (1u << 1)
+/* Payload data (after the message's fixed struct header) is zstd-compressed.
+ * Set by the sender ONLY when both peers advertised GB_NET_FEAT_ZSTD at
+ * handshake AND compression shrank the payload. The message's own size field
+ * (e.g. gb_net_cuda_memcpy.size) always carries the UNCOMPRESSED length, which
+ * the receiver uses to size the decompress. Bit 2 is reserved GLOBALLY for this
+ * (unlike bits 0/1 which are per-msg_type) so any future message type can use
+ * transparent payload compression. */
+#define GB_NET_FLAG_COMP_ZSTD (1u << 2)
+
+/* Handshake feature negotiation (gb_net_handshake_req/resp.feature_flags).
+ * Trailing field, proto stays v3 (same back-compat pattern as the v2 pcie
+ * fields): peers that predate a feature send a short message and the field
+ * reads as 0. A feature is used only when BOTH sides advertise its bit. */
+#define GB_NET_FEAT_ZSTD      (1u << 0)  /* transparent zstd payload compression */
 
 /* ------------------------------------------------------------------ */
 /*  Wire header - precedes every message                               */
@@ -247,6 +272,9 @@ struct gb_net_handshake_req {
     gb_u32 gpu_count;
     char   hostname[GB_NET_MAX_HOSTNAME];
     struct gb_net_gpu_info gpus[GB_NET_MAX_GPUS];
+    /* Trailing feature bitmask (GB_NET_FEAT_*) - zero on peers that send a
+     * short req; receiver reads it only when len >= sizeof(this struct). */
+    gb_u32 feature_flags;
 } __attribute__((packed));
 
 struct gb_net_handshake_resp {
@@ -261,6 +289,9 @@ struct gb_net_handshake_resp {
     gb_u32 pcie_link_width;         /* e.g. 16 for ×16                    */
     gb_u32 pcie_effective_bw_mbs;   /* measured effective BW MB/s         */
     gb_u32 pcie_replay_count;       /* error indicator - non-zero = degraded link */
+    /* Trailing feature bitmask (GB_NET_FEAT_*) - zero on old feeders that send
+     * a short reply; host reads it only when the resp payload is long enough. */
+    gb_u32 feature_flags;
 } __attribute__((packed));
 
 /* ------------------------------------------------------------------ */
@@ -313,6 +344,18 @@ struct gb_net_cuda_memcpy {
     gb_u64 size;
     /* For H2D: payload data follows immediately after this struct.
      * For D2H: response carries the data payload. */
+} __attribute__((packed));
+
+/* GB_MSG_CUDA_MEMSET (0x15) - remote cudaMemset on a feeder allocation.
+ * ggml memsets the padding of every quantized tensor right after upload
+ * (ggml_backend_cuda_buffer init) - without this message a feeder-resident
+ * buffer aborts llama-server with cudaErrorInvalidValue at first load. */
+struct gb_net_cuda_memset {
+    gb_u64 remote_handle;
+    gb_u64 offset;
+    gb_u64 size;
+    gb_u32 value;      /* byte value (0-255) */
+    gb_u32 _pad;
 } __attribute__((packed));
 
 /* ------------------------------------------------------------------ */
@@ -441,6 +484,30 @@ struct gb_net_cuda_exec {
      */
 } __attribute__((packed));
 
+/* GB_MSG_CUDA_EXEC with GB_NET_FLAG_EXEC_RAW: raw param-buffer variant.
+ * Handles kernels whose args are not all 8-byte scalars/pointers , struct-by-
+ * value params (ggml fused kernels; torch kernels taking descriptor structs)
+ * are transmitted whole, and relocations target BYTE OFFSETS into the packed
+ * param buffer so pointers embedded inside a struct get rewritten too. */
+struct gb_net_cuda_exec_raw {
+    gb_u32 grid_x, grid_y, grid_z;
+    gb_u32 block_x, block_y, block_z;
+    gb_u32 shared_mem_bytes;
+    gb_u32 kernel_name_len;
+    gb_u32 n_params;         /* # kernel params (== # kernelParams entries)   */
+    gb_u32 n_relocs;         /* # byte-offset relocations                     */
+    gb_u32 param_buf_bytes;  /* total bytes of the packed param buffer        */
+    gb_u32 launch_mode;      /* 0 = driver CUfunction, 1 = runtime host stub  */
+    /* wire layout after this struct:
+     *   char                    kernel_name[kernel_name_len]  (not null-terminated)
+     *   gb_u32                  param_size[n_params]          (bytes of each param)
+     *   struct gb_net_ptr_reloc relocs[n_relocs]  (arg_idx REINTERPRETED as
+     *                                              byte offset into param_buf)
+     *   gb_u8                   param_buf[param_buf_bytes]    (params concatenated
+     *                                              in order, each 8-byte aligned)
+     */
+} __attribute__((packed));
+
 /* Phase 4: NCCL Initialization */
 #define GB_MSG_NCCL_INIT 0x50
 
@@ -506,7 +573,7 @@ struct gb_net_mps_set {
 /* Host → feeder: no payload (just the header with msg_type=GB_MSG_FEEDER_STATUS).
  * Feeder responds via GB_MSG_RESPONSE with this struct as payload. */
 struct gb_feeder_status_resp {
-    /* v3.0 fields — always present */
+    /* v3.0 fields , always present */
     gb_u32 status;               /* GB_STATUS_OK or error                  */
     gb_u32 mps_sm_pct;           /* current MPS SM% (0 = not active)       */
     gb_u64 t1_free_bytes;        /* GPU VRAM free                          */
@@ -517,7 +584,7 @@ struct gb_feeder_status_resp {
     gb_u64 t3_total_bytes;       /* NVMe swap total                        */
     gb_u32 kernel_dispatch_count; /* total kernel dispatches since start   */
     gb_u32 _pad;
-    /* v3.1 GPU telemetry — host checks payload_len >= GB_FEEDER_STATUS_V31_SIZE
+    /* v3.1 GPU telemetry , host checks payload_len >= GB_FEEDER_STATUS_V31_SIZE
      * before reading; older netd versions send the shorter v3.0 struct only.  */
     gb_u16 gpu_temp_c;           /* GPU temperature °C (GPU 0)             */
     gb_u16 gpu_power_w;          /* current power draw Watts (GPU 0)       */
@@ -539,7 +606,7 @@ struct gb_feeder_status_resp {
 # include <sys/stat.h>
 # include <grp.h>
 
-/* GB_KEYFILE_GRP — group name that may read cluster.key at mode 0640.
+/* GB_KEYFILE_GRP , group name that may read cluster.key at mode 0640.
  * Members of this group can run inference tools that need cluster access
  * (greenboost-cli, vLLM, llama-server) without requiring root.  The key
  * file MUST be owned by this group; any other group GID is rejected even
@@ -547,7 +614,7 @@ struct gb_feeder_status_resp {
  * write/exec (S_IWGRP | S_IXGRP) are always rejected. */
 # define GB_KEYFILE_GRP "greenboost"
 
-/* gb_check_keyfile_mode — validate that a key file's permission bits are
+/* gb_check_keyfile_mode , validate that a key file's permission bits are
  * acceptable.  Accepted modes:
  *   0600 / 0400  root-only (always accepted)
  *   0640         root:greenboost group-readable (accepted when GID matches)

@@ -181,12 +181,18 @@ def get_matmul_type(batch_size: int, W_nbits: int, mx_dtype: bool = False):
 #######################################################################################################################
 def enable_activation_scaling(batch_size):
     """
-    This functions enables adaptive activation quantization based on the batch-size. 
-    For example, it would only do dynamic activation in more compute-bound settings (batch_size >=32 / 64). 
+    This functions enables adaptive activation quantization based on the batch-size.
+    For example, it would only do dynamic activation in more compute-bound settings (batch_size >=32 / 64).
     Only works with the MXFP format - use with A8W4_MXFP/A4W4_MXFP.
     """
-    return True
-    #return batch_size >= 2 #TODO: Needs Triton fix https://github.com/triton-lang/triton/pull/9577
+    # `return True` unconditionally hit the small-M / non-EVEN_M masked branch of
+    # channel_scale_mode==5's Triton codegen (gemm_kernels.py / gemm_splitK_kernels.py),
+    # which fails to compile on this GPU/Triton version regardless of dtype (fp8 or
+    # int4) — confirmed 2026-07-10 via mispeech/Dasheng-AudioGen-Multilingual (mt5
+    # encoder attention AND the model's own DiT backbone attention both hit the
+    # identical CompilationError at batch_size=1). Restoring the batch-gated logic
+    # the TODO already describes avoids that broken path for small batches.
+    return batch_size >= 2  # TODO: needs Triton fix https://github.com/triton-lang/triton/pull/9577
 
 
 #Main functional forward call

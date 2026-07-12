@@ -126,7 +126,7 @@ Four providers are tried in order; each fills fields it can supply:
 
 ### DCGM embedded mode
 
-`DCGMProvider` uses `dcgmStartEmbedded(DCGM_OPERATION_MODE_AUTO)` — no dcgmd
+`DCGMProvider` uses `dcgmStartEmbedded(DCGM_OPERATION_MODE_AUTO)` , no dcgmd
 daemon required. This works on bare-metal workstations and cluster nodes alike.
 
 **Field watch intervals**: DCGM fields are added via `dcgmWatchFields` with a
@@ -145,7 +145,7 @@ values are sampled at each poll.
 | Thermal | 0x80 | Active |
 | Power | 0x100 | Active |
 | Driver | 0x200 | Active |
-| NVLink / NVSwitch / ConnectX | — | **Omitted** — RTX 5070 has no NVLink hardware; fields return 0 |
+| NVLink / NVSwitch / ConnectX | , | **Omitted** , RTX 5070 has no NVLink hardware; fields return 0 |
 
 Health check runs every 60 telemetry polls (~30 s) to avoid interfering with
 Triton kernel launches.
@@ -169,9 +169,9 @@ On V100 NVLink clusters this field reflects aggregate NVLink bandwidth.
 |---|---|---|---|
 | `fb_free_mb` | int | NVML / GB / Torch | `quantize_to_fit` budget tightening |
 | `should_demote` | bool | NVML (fb_free_mb < headroom) | `ModelTierManager.auto_evict` |
-| `ecc_dbe_volatile` | int | DCGM FI 311 | `pre_inference_check` — blocks generation |
+| `ecc_dbe_volatile` | int | DCGM FI 311 | `pre_inference_check` , blocks generation |
 | `ecc_critical` | bool | `dbe_volatile > 0` | ECC guard callback |
-| `health_ok` | bool | DCGM health check | `pre_inference_check` — warns |
+| `health_ok` | bool | DCGM health check | `pre_inference_check` , warns |
 | `health_summary` | str | DCGM health check | Logged to stderr |
 | `power_w` | float | NVML / DCGM FI 157 | Telemetry log, cluster monitoring |
 | `temp_c` | float | NVML | Telemetry log |

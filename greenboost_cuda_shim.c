@@ -1,5 +1,5 @@
 /*
- * GreenBoost v3.0 - CUDA LD_PRELOAD memory shim
+ * GreenBoost v3.2 - CUDA LD_PRELOAD memory shim
  *
  * Routes CUDA VRAM overflow to system RAM via GPU-compute paths (tried in order):
  *
@@ -44,6 +44,11 @@
  *                                Weights overflow to T2 sooner; KV cache stays in T1.
  *                                Adaptive: reserve collapses as KV fills T1 -
  *                                no double-counting with cuMemGetInfo free_vram.
+ *   GREENBOOST_T1_WORKSPACE_MB   MB of T1 VRAM held back during MODEL_LOAD so
+ *                                per-step compute workspace stays in T1 instead
+ *                                of spilling to T2 (default 0=off; ~2560 is the
+ *                                validated value for diffusion). Released at
+ *                                INFERENCE. See g_workspace_reserve_bytes.
  *   GREENBOOST_KV_OVERFLOW       1 = all overflow allocs get GB_ALLOC_KV_CACHE|
  *                                GB_ALLOC_T1_PRIORITY - kernel freezes them in T2 LRU
  *                                and refuses T3 spill. Use for ExLlamaV3 / engines where
@@ -100,6 +105,13 @@
 #include "greenboost_netc.h"      /* remote cluster GPU client */
 #include "features/net_fabric.h"  /* GB_ALLOC_TIER_* constants */
 #include "features/tq_compress.h" /* K/V int8 compression metadata (Phase 2) */
+
+/* Shim build version + capability-manifest ABI. Bump GB_SHIM_VERSION on any
+ * change to the /run/greenboost/capabilities.json feature set; bump
+ * GB_SHIM_CAP_ABI only on a breaking manifest schema change (consumers gate on
+ * it via gb_monitor.capabilities()). */
+#define GB_SHIM_VERSION "3.2"
+#define GB_SHIM_CAP_ABI 1
 
 /* ------------------------------------------------------------------ */
 /*  NVTX instrumentation (optional - compile with USE_NVTX=1)          */
@@ -290,6 +302,7 @@ typedef CUstream            cudaStream_t;
  * and NVML error returns. Values are stable ABI since CUDA 3 / NVML 1.0. */
 #define CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR  75
 #define NVML_SUCCESS                                   0
+#define NVML_ERROR_INVALID_ARGUMENT                    2
 #define NVML_ERROR_FUNCTION_NOT_FOUND                999
 
 /* Fake NVML handle sentinel for cluster remote GPUs.
@@ -511,6 +524,7 @@ static void gb_block_evt_emit(uint8_t type, uint64_t hash,
  * here so prefetch_worker - defined ahead of all of that in the file - can
  * call it. */
 static void gb_push_heat_batch(void);
+static void gb_kv_prefetch_tick(void);
 
 static void* prefetch_worker(void* arg) {
     /* U-HEAT: independent 2s cadence for the heat pusher above, checked on
@@ -527,6 +541,7 @@ static void* prefetch_worker(void* arg) {
             clock_gettime(CLOCK_MONOTONIC, &now);
             if (now.tv_sec - last_heat_push.tv_sec >= 2) {
                 gb_push_heat_batch();
+                gb_kv_prefetch_tick();   /* no-op unless GREENBOOST_KV_PREFETCH set */
                 last_heat_push = now;
             }
         }
@@ -1072,6 +1087,20 @@ typedef CUresult    (*pfn_cuDeviceGet)(CUdevice *, int);
 typedef CUresult    (*pfn_cuGetProcAddress)(const char *symbol, void **pfn, int driverVersion, unsigned long long flags, void *symbolStatus);
 typedef cudaError_t (*pfn_cudaGetDeviceCount)(int *);
 typedef cudaError_t (*pfn_cudaSetDevice)(int);
+
+/* Minimal cudaPointerAttributes - avoids a CUDA SDK header dependency, matches
+ * driver_types.h's stable layout (type/device/devicePointer/hostPointer). */
+typedef enum { cudaMemoryTypeUnregistered = 0, cudaMemoryTypeHost = 1,
+               cudaMemoryTypeDevice = 2, cudaMemoryTypeManaged = 3 } gb_cudaMemoryType;
+typedef struct {
+    gb_cudaMemoryType type;
+    int   device;
+    void *devicePointer;
+    void *hostPointer;
+} gb_cudaPointerAttributes;
+typedef cudaError_t (*pfn_cudaDeviceCanAccessPeer)(int *, int, int);
+typedef cudaError_t (*pfn_cudaDeviceEnablePeerAccess)(int, unsigned int);
+typedef cudaError_t (*pfn_cudaPointerGetAttributes)(gb_cudaPointerAttributes *, const void *);
 typedef CUresult    (*pfn_cuLaunchKernel)(CUfunction,
                                           unsigned int, unsigned int, unsigned int,
                                           unsigned int, unsigned int, unsigned int,
@@ -1117,12 +1146,41 @@ typedef CUresult    (*pfn_cuLaunchKernelEx)(const gb_CUlaunchConfig *,
 typedef struct { unsigned x, y, z; } gb_dim3;
 typedef cudaError_t (*pfn_cudaLaunchKernel)(const void *, gb_dim3, gb_dim3,
                                              void **, size_t, cudaStream_t);
+
+/* PR-CLKExC take 2 (2026-07-06): the 2026-06-24 attempt crashed because its
+ * passthrough resolved the real function via dlsym(RTLD_NEXT) — the SYSTEM
+ * libcudart — while ggml cuda_v13 runs its own libcudart instance (F-ABI1).
+ * Every call was serviced by the wrong runtime → "invalid argument" on the
+ * first launch. Identical failure mode hit (and fixed) today for the
+ * cudaMemset hook. This hook resolves via the REBOUND instance
+ * (real_cudaLaunchKernelExC ← gb_cudart_sym) and adds the same data-driven
+ * feeder dispatch as cudaLaunchKernel — the gating piece for feeder GPU
+ * compute with cuda_v13 ggml. */
+typedef struct {
+    gb_dim3      gridDim;
+    gb_dim3      blockDim;
+    size_t       dynamicSmemBytes;
+    cudaStream_t stream;
+    void        *attrs;      /* cudaLaunchAttribute * - opaque passthrough */
+    unsigned int numAttrs;
+} gb_cudaLaunchConfig;
+typedef cudaError_t (*pfn_cudaLaunchKernelExC)(const gb_cudaLaunchConfig *,
+                                               const void *, void **);
 typedef cudaError_t (*pfn_cudaStreamSynchronize)(cudaStream_t);
 /* CUDA doc: stream priority APIs (CUDA 5.0+, cudaDevAttrStreamPrioritiesSupported). */
 typedef cudaError_t (*pfn_cudaStreamCreateWithPriority)(cudaStream_t *, unsigned int, int);
 typedef cudaError_t (*pfn_cudaDeviceGetAttribute)(int *, int, int);
 typedef cudaError_t (*pfn_cudaDeviceGetStreamPriorityRange)(int *, int *);
 typedef cudaError_t (*pfn_cudaStreamCreate)(cudaStream_t *, unsigned int);
+/* CUDA graph stream capture status (CUDA 10.1+). Values are stable across
+ * driver versions; no need to include cuda_runtime_api.h for this enum. */
+typedef enum {
+    gb_cudaStreamCaptureStatusNone        = 0,
+    gb_cudaStreamCaptureStatusActive      = 1,
+    gb_cudaStreamCaptureStatusInvalidated = 2,
+} gb_cudaStreamCaptureStatus;
+typedef cudaError_t (*pfn_cudaStreamIsCapturing)(cudaStream_t, gb_cudaStreamCaptureStatus *);
+typedef cudaError_t (*pfn_cudaStreamBeginCapture)(cudaStream_t, int /* cudaStreamCaptureMode */);
 
 /* __cudaRegisterFunction - CUDA runtime internal kernel registration.
  * Called for every __global__ function at library load time.  Gives us
@@ -1204,6 +1262,25 @@ static pfn_cudaFree                        real_cudaFree;
 static pfn_cudaMallocManaged               real_cudaMallocManaged;
 static pfn_cudaMallocAsync                 real_cudaMallocAsync;
 static pfn_cudaFreeAsync                   real_cudaFreeAsync;
+/* F-ABI1 fix (2026-06-22): these two were the only cudart hooks still using
+ * their own per-function dlsym(RTLD_NEXT,...) instead of the robust
+ * gb_cudart_sym() ELF-walk every other hook uses (see gb_cudart_resolve_syms
+ * below). RTLD_NEXT can return NULL for the first N calls if the app's real
+ * libcudart.so isn't yet visible in this process's link-map scope - found by
+ * tracing why TENSOR_LOAD_COPY (gb_track_tensor_load_copy) never fired on a
+ * real GGUF load: cudaMemcpyAsync's local real_fn was NULL, so every call hit
+ * the early `return real_fn ? ... : 0` BEFORE reaching the tracking call,
+ * silently no-op'ing the copy (returns cudaSuccess without copying anything). */
+static cudaError_t (*real_cudaMemcpy)(void *, const void *, size_t, int);
+static cudaError_t (*real_cudaMemset)(void *, int, size_t);
+static cudaError_t (*real_cudaMemsetAsync)(void *, int, size_t, cudaStream_t);
+static cudaError_t (*real_cudaMemcpy2DAsync)(void *, size_t, const void *, size_t,
+                                             size_t, size_t, int, cudaStream_t);
+static pfn_cudaLaunchKernelExC real_cudaLaunchKernelExC;
+static cudaError_t (*real_cudaGetKernel)(void **, const void *);
+static cudaError_t (*real_cudaMemcpyAsync)(void *, const void *, size_t, int, void *);
+static cudaError_t (*real_cudaMemcpyPeer)(void *, int, const void *, int, size_t);
+static cudaError_t (*real_cudaMemcpyPeerAsync)(void *, int, const void *, int, size_t, void *);
 static pfn_cudaImportExternalMemory        real_cudaImportExternalMemory;
 static pfn_cudaExternalMemoryGetMappedBuffer real_cudaExternalMemoryGetMappedBuffer;
 static pfn_cudaDestroyExternalMemory       real_cudaDestroyExternalMemory;
@@ -1216,6 +1293,9 @@ static pfn_cuDeviceGet                     real_cuDeviceGet;
 static pfn_cuGetProcAddress                real_cuGetProcAddress;
 static pfn_cudaGetDeviceCount              real_cudaGetDeviceCount;
 static pfn_cudaSetDevice                   real_cudaSetDevice;
+static pfn_cudaDeviceCanAccessPeer         real_cudaDeviceCanAccessPeer;
+static pfn_cudaDeviceEnablePeerAccess      real_cudaDeviceEnablePeerAccess;
+static pfn_cudaPointerGetAttributes        real_cudaPointerGetAttributes;
 static pfn_cuLaunchKernel                  real_cuLaunchKernel;
 static pfn_cuLaunchCooperativeKernel       real_cuLaunchCooperativeKernel;
 static pfn_cuFuncGetParamInfo              real_cuFuncGetParamInfo;  /* PR-NN */
@@ -1223,6 +1303,8 @@ static pfn_cuLaunchKernelEx                real_cuLaunchKernelEx;  /* PR-O */
 static pfn_cudaLaunchKernel                real_cudaLaunchKernel;
 static pfn_cudaStreamSynchronize           real_cudaStreamSynchronize;
 static pfn_cudaStreamCreateWithPriority    real_cudaStreamCreateWithPriority;
+static pfn_cudaStreamIsCapturing           real_cudaStreamIsCapturing;
+static pfn_cudaStreamBeginCapture          real_cudaStreamBeginCapture;
 static pfn_cudaDeviceGetAttribute          real_cudaDeviceGetAttribute;
 static pfn_cudaDeviceGetStreamPriorityRange real_cudaDeviceGetStreamPriorityRange;
 static pfn___cudaRegisterFunction          real___cudaRegisterFunction;
@@ -2320,6 +2402,7 @@ static size_t g_nvme_pool_bytes      = 0; /* NVMe backing pool size - set at ini
 
 /* Forward declaration - defined after gb_shim_init resolves sysfs values */
 static size_t gb_get_mem_available(void);
+static int gb_feeder_exclusive(void);
 static size_t gb_nvlink_aggregated_bytes = 0; /* NVLink aggregated VRAM - added when nvlink_ready=1 */
 static size_t g_cluster_remote_total_bytes      = 0; /* sum of all feeder T1+T2+T3, cached at shim init */
 static size_t g_cluster_remote_free_bytes       = 0; /* feeder free memory (T1+T2+T3), cached at shim init */
@@ -2419,6 +2502,10 @@ static int    g_kv_overflow_mode      = 0;
  * truth so their internal allocator doesn't issue oversized allocations that
  * exceed real T1 before the cudaMalloc hook can spill to T2. */
 static int    g_report_physical_vram  = 0;
+/* GREENBOOST_DEBUG_ATTR=1: log every device-attribute query (attr, ordinal,
+ * local count, and whether it resolved local or feeder) - the diagnostic for
+ * the ROADMAP P4 shared-mem-attr misroute. Off by default. */
+static int    g_debug_attr            = 0;
 /* DMA-BUF mmap+register is the primary path now. */
 static int    gb_use_dmabuf         = 1;
 /* Path B: cuMemHostRegister without greenboost.ko (containers/VMs).
@@ -2455,6 +2542,16 @@ static pthread_mutex_t gb_dev_lock = PTHREAD_MUTEX_INITIALIZER;
  * and all remaining VRAM is available to weights / activations.
  */
 static _Atomic size_t g_kv_reserve_bytes;      /* set at init from ioctl / env */
+/* Phase-aware T1 workspace reserve (GREENBOOST_T1_WORKSPACE_MB, default 0=off).
+ * Mirrors g_kv_reserve_bytes but for per-step compute workspace, not KV: during
+ * MODEL_LOAD this many bytes of T1 are held back so weight staging spills the
+ * COLDEST weights to T2 instead of filling T1 to the floor.  The freed VRAM
+ * then absorbs the transient workspace allocations of every decode/denoise step
+ * (which otherwise land on T2 zero-copy DDR and dominate step time — validated
+ * live in gen_art.py: denoise steps 37 s → 10 s once workspace stayed in T1).
+ * Released (treated as 0) once the phase advances past MODEL_LOAD, so
+ * activations/workspace claim it during INFERENCE. */
+static _Atomic size_t g_workspace_reserve_bytes = 0;
 /* Set to 1 when env-var or OLLAMA_NUM_CTX auto-scaler has written g_kv_reserve_bytes.
  * Prevents gb_refresh_kv_reserve() from silently clobbering that value with the
  * kernel module's kv_reserve_mb (which may be 0 on a fresh insmod). */
@@ -2468,6 +2565,32 @@ static _Atomic size_t g_kv_allocated_t1_bytes;
  * proactively evict oldest KV blocks before each new T2 KV alloc. */
 static _Atomic size_t g_kv_t2_live_bytes = 0;
 static size_t         g_swa_window_bytes  = 0; /* 0 = disabled */
+
+/* ── Phase-aware KV prefetch (Stage 3), GREENBOOST_KV_PREFETCH ─────────────
+ * Runs on the existing 2s heat-pusher cadence (no new thread). During decode
+ * (phase INFERENCE/STEADY) with KV spilled to T2 (g_kv_t2_live_bytes>0) and
+ * headroom left in the T1 KV reserve, decode re-reads that T2 KV every step,
+ * so promoting the hottest T2 KV blocks into the reserved T1 window ahead of
+ * the next decode removes a recurring PCIe read.
+ *
+ * Modes (default off — provably no-op unless explicitly enabled):
+ *   0/unset  disabled
+ *   "stats"  measure opportunity only (counters below, NO data movement) —
+ *            the safe first step; lets a real overflowing-KV run show whether
+ *            the tick would fire before any hot-path copy is turned on.
+ *   "1"      active promotion — GATED, pending a long-context hardware bench
+ *            (a live cuMemcpyHtoDAsync into the T1 reserve is a hot-path
+ *            mutation in a crash-sensitive shim; not enabled from software
+ *            until validated on an overflowing context). Falls back to stats.
+ */
+#define GB_KV_PREFETCH_OFF    0
+#define GB_KV_PREFETCH_STATS  1
+#define GB_KV_PREFETCH_ACTIVE 2
+static int              g_kv_prefetch_mode = GB_KV_PREFETCH_OFF;
+static _Atomic uint64_t g_kv_prefetch_ticks         = 0;
+static _Atomic uint64_t g_kv_prefetch_opportunities = 0;
+static _Atomic uint64_t g_kv_prefetch_headroom_mb   = 0;  /* last tick's T1-reserve headroom */
+static _Atomic uint64_t g_kv_prefetch_t2_kv_mb      = 0;  /* last tick's KV bytes resident in T2 */
 /* CRIT-04: Must be _Atomic - incremented concurrently from multiple CUDA stream
  * threads; a plain unsigned int would be a data race (undefined behaviour in C11). */
 static _Atomic unsigned int g_alloc_count = 0;
@@ -2518,6 +2641,41 @@ typedef enum {
  * not require sequentially consistent ordering between unrelated alloc paths. */
 static _Atomic int            g_alloc_phase    /* gb_alloc_phase_t */ = GB_PHASE_INIT;
 static int                    g_phase_detect   = 1;    /* GREENBOOST_PHASE_DETECT */
+
+/* Phase-aware KV prefetch tick — runs on the 2s heat-pusher cadence. Measures
+ * (and, once hardware-validated, will promote) hot KV that spilled to T2 while
+ * the T1 KV reserve still has room. Provably a no-op when GREENBOOST_KV_PREFETCH
+ * is unset. Defined here (after the phase enum + KV reserve globals it reads);
+ * forward-declared near prefetch_worker. */
+static void gb_kv_prefetch_tick(void)
+{
+    if (g_kv_prefetch_mode == GB_KV_PREFETCH_OFF)
+        return;
+    atomic_fetch_add_explicit(&g_kv_prefetch_ticks, 1, memory_order_relaxed);
+
+    int phase = atomic_load_explicit(&g_alloc_phase, memory_order_relaxed);
+    if (phase != GB_PHASE_INFERENCE && phase != GB_PHASE_STEADY)
+        return;   /* only during decode; MODEL_LOAD/IDLE are owned elsewhere */
+
+    size_t rsv  = atomic_load_explicit(&g_kv_reserve_bytes,      memory_order_relaxed);
+    size_t t1   = atomic_load_explicit(&g_kv_allocated_t1_bytes, memory_order_relaxed);
+    size_t t2kv = atomic_load_explicit(&g_kv_t2_live_bytes,      memory_order_relaxed);
+    size_t headroom = (t1 >= rsv) ? 0 : (rsv - t1);
+
+    atomic_store_explicit(&g_kv_prefetch_headroom_mb, headroom >> 20, memory_order_relaxed);
+    atomic_store_explicit(&g_kv_prefetch_t2_kv_mb,    t2kv     >> 20, memory_order_relaxed);
+
+    /* Opportunity = KV is resident in T2 AND the T1 reserve can pull some back.
+     * When KV fits entirely in T1 (t2kv==0) or the reserve is full, this is a
+     * no-op, exactly as required. */
+    if (t2kv > 0 && headroom > 0) {
+        atomic_fetch_add_explicit(&g_kv_prefetch_opportunities, 1, memory_order_relaxed);
+        /* GB_KV_PREFETCH_ACTIVE live promotion (async H2D of the hottest T2 KV
+         * blocks into the reserved T1 window) is intentionally deferred until a
+         * long-context bench validates it on real overflowing KV — a hot-path
+         * copy in this shim must be proven before it ships enabled. */
+    }
+}
 /* Allocs above this threshold during INFERENCE phase are classified KV */
 static size_t                 g_kv_size_threshold_bytes = 64ULL * 1024 * 1024;  /* 64 MB - catches small-model KV allocs */
 
@@ -2804,6 +2962,62 @@ static void gb_write_phase_file(int phase, uint64_t idle_ms)
 }
 
 /*
+ * gb_write_capabilities_file - write /run/greenboost/capabilities.json once at
+ * shim init so consumers can discover what this shim supports WITHOUT sniffing
+ * the .so binary for a log literal (the fragile pre-manifest scheme in
+ * ai-forge forge/gpu.py). Read back by gb_monitor.capabilities().
+ *
+ * Static features (gb_quant_cudart_rebind, expert_pool, cluster_fabric) are
+ * true for every build of this shim; runtime features (gds, kv_compress,
+ * report_physical_vram) reflect the env this process was launched with.
+ * tmp+rename so a concurrent reader never sees a half-written file.
+ */
+static void gb_write_capabilities_file(void)
+{
+    struct timespec rt;
+    char buf[512];
+    char tmp[] = "/run/greenboost/capabilities.json.tmp";
+    int fd, n;
+
+    clock_gettime(CLOCK_REALTIME, &rt);
+    n = snprintf(buf, sizeof(buf),
+        "{\n"
+        "  \"shim_version\": \"%s\",\n"
+        "  \"abi\": %d,\n"
+        "  \"pid\": %d,\n"
+        "  \"ts\": %lld,\n"
+        "  \"features\": {\n"
+        "    \"gb_quant_cudart_rebind\": true,\n"
+        "    \"expert_pool\": true,\n"
+        "    \"cluster_fabric\": true,\n"
+        "    \"gds\": %s,\n"
+        "    \"kv_compress\": %s,\n"
+        "    \"report_physical_vram\": %s\n"
+        "  }\n"
+        "}\n",
+        GB_SHIM_VERSION, GB_SHIM_CAP_ABI, (int)getpid(),
+        (long long)rt.tv_sec,
+        g_gds_ok ? "true" : "false",
+        g_kv_compress_enabled ? "true" : "false",
+        g_report_physical_vram ? "true" : "false");
+    if (n <= 0 || n >= (int)sizeof(buf))
+        return;
+
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        mkdir("/run/greenboost", 0755);
+        fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    }
+    if (fd < 0)
+        return;
+    ssize_t _wr = write(fd, buf, (size_t)n);
+    (void)_wr;
+    close(fd);
+    if (rename(tmp, "/run/greenboost/capabilities.json") != 0)
+        unlink(tmp);
+}
+
+/*
  * gb_idle_flush_weights - flush non-KV hash-table entries when Ollama has been
  * idle for g_idle_timeout_ms.  KV cache entries are kept so the loaded model
  * stays warm.  Called from gb_check_idle_phase after detecting STEADY→IDLE.
@@ -2956,6 +3170,12 @@ static uint32_t gb_phase_classify(size_t bytesize)
                    (unsigned long long)gap_ms,
                    avg >> 20, load_count, bytesize >> 20);
             GB_NVTX_EVENT("PHASE_INFERENCE", "PHASE", bytesize >> 20, 0, "model_load_to_inference");
+            {
+                size_t _ws = atomic_load_explicit(&g_workspace_reserve_bytes, memory_order_relaxed);
+                if (_ws > 0)
+                    GB_NVTX_EVENT("T1_WORKSPACE_RELEASE", "PHASE", _ws >> 20, 0,
+                                  "released_at_inference");
+            }
 
             /* This alloc that triggered the transition is the KV alloc */
             if (bytesize >= g_kv_size_threshold_bytes) {
@@ -3581,6 +3801,22 @@ static void gb_write_stats(void)
     fprintf(f, "kv_reserve_nominal_mb=%zu\n", _kv_rsv >> 20);
     fprintf(f, "kv_reserve_effective_mb=%zu\n", _kv_eff >> 20);
     fprintf(f, "kv_t1_tracked_mb=%zu\n",      _kv_t1 >> 20);
+    fprintf(f, "kv_prefetch_mode=%d\n",       g_kv_prefetch_mode);
+    fprintf(f, "kv_prefetch_ticks=%llu\n",
+            (unsigned long long)atomic_load_explicit(&g_kv_prefetch_ticks, memory_order_relaxed));
+    fprintf(f, "kv_prefetch_opportunities=%llu\n",
+            (unsigned long long)atomic_load_explicit(&g_kv_prefetch_opportunities, memory_order_relaxed));
+    fprintf(f, "kv_prefetch_headroom_mb=%llu\n",
+            (unsigned long long)atomic_load_explicit(&g_kv_prefetch_headroom_mb, memory_order_relaxed));
+    fprintf(f, "kv_prefetch_t2_kv_mb=%llu\n",
+            (unsigned long long)atomic_load_explicit(&g_kv_prefetch_t2_kv_mb, memory_order_relaxed));
+    {
+        size_t _ws_rsv = atomic_load_explicit(&g_workspace_reserve_bytes, memory_order_relaxed);
+        int _ws_phase = atomic_load_explicit(&g_alloc_phase, memory_order_relaxed);
+        fprintf(f, "t1_workspace_reserve_mb=%zu\n", _ws_rsv >> 20);
+        fprintf(f, "t1_workspace_reserve_eff_mb=%zu\n",
+                (_ws_phase <= (int)GB_PHASE_MODEL_LOAD) ? (_ws_rsv >> 20) : (size_t)0);
+    }
     fprintf(f, "vram_headroom_mb=%zu\n",       vram_headroom_bytes >> 20);
     /* P1b: publish workstation reserve so gb_vitals_helper + greenboost vitals
      * can show how much VRAM headroom the shim is holding back.
@@ -3816,7 +4052,9 @@ static void gb_maybe_write_stats(void)
                 if (atomic_compare_exchange_strong_explicit(&gb_last_health_ms, &hp, now_ms,
                                                             memory_order_relaxed,
                                                             memory_order_relaxed)) {
-                    gb_netc_poll_health();
+                    /* poll_health is owned by netc's dedicated heartbeat
+                     * thread (gb_netc_hb_thread_main) — calling it from here
+                     * too made two actors race on reconnect/socket state. */
                     gb_read_control();   /* apply supervisor hints without restart */
                 }
             }
@@ -4193,7 +4431,31 @@ static void gb_cudart_resolve_syms(void *libcudart)
     real_cudaMallocAsync      = (pfn_cudaMallocAsync)      gb_cudart_sym(libcudart, "cudaMallocAsync");
     real_cudaGetDeviceCount   = (pfn_cudaGetDeviceCount)   gb_cudart_sym(libcudart, "cudaGetDeviceCount");
     real_cudaSetDevice        = (pfn_cudaSetDevice)        gb_cudart_sym(libcudart, "cudaSetDevice");
-
+    real_cudaDeviceCanAccessPeer    = (pfn_cudaDeviceCanAccessPeer)
+        gb_cudart_sym(libcudart, "cudaDeviceCanAccessPeer");
+    real_cudaDeviceEnablePeerAccess = (pfn_cudaDeviceEnablePeerAccess)
+        gb_cudart_sym(libcudart, "cudaDeviceEnablePeerAccess");
+    real_cudaPointerGetAttributes   = (pfn_cudaPointerGetAttributes)
+        gb_cudart_sym(libcudart, "cudaPointerGetAttributes");
+    real_cudaMemcpy           = (cudaError_t (*)(void *, const void *, size_t, int))
+        gb_cudart_sym(libcudart, "cudaMemcpy");
+    real_cudaMemset           = (cudaError_t (*)(void *, int, size_t))
+        gb_cudart_sym(libcudart, "cudaMemset");
+    real_cudaMemsetAsync      = (cudaError_t (*)(void *, int, size_t, cudaStream_t))
+        gb_cudart_sym(libcudart, "cudaMemsetAsync");
+    real_cudaMemcpy2DAsync    = (cudaError_t (*)(void *, size_t, const void *, size_t,
+                                                 size_t, size_t, int, cudaStream_t))
+        gb_cudart_sym(libcudart, "cudaMemcpy2DAsync");
+    real_cudaLaunchKernelExC  = (pfn_cudaLaunchKernelExC)
+        gb_cudart_sym(libcudart, "cudaLaunchKernelExC");
+    real_cudaGetKernel        = (cudaError_t (*)(void **, const void *))
+        gb_cudart_sym(libcudart, "cudaGetKernel");
+    real_cudaMemcpyAsync      = (cudaError_t (*)(void *, const void *, size_t, int, void *))
+        gb_cudart_sym(libcudart, "cudaMemcpyAsync");
+    real_cudaMemcpyPeer       = (cudaError_t (*)(void *, int, const void *, int, size_t))
+        gb_cudart_sym(libcudart, "cudaMemcpyPeer");
+    real_cudaMemcpyPeerAsync  = (cudaError_t (*)(void *, int, const void *, int, size_t, void *))
+        gb_cudart_sym(libcudart, "cudaMemcpyPeerAsync");
     real_cudaImportExternalMemory        = (pfn_cudaImportExternalMemory)
         gb_cudart_sym(libcudart, "cudaImportExternalMemory");
     real_cudaExternalMemoryGetMappedBuffer = (pfn_cudaExternalMemoryGetMappedBuffer)
@@ -4217,6 +4479,8 @@ static void gb_cudart_resolve_syms(void *libcudart)
         gb_cudart_sym(libcudart, "cudaGetDriverEntryPointByVersion");
     real_cudaLaunchKernel     = (pfn_cudaLaunchKernel)     gb_cudart_sym(libcudart, "cudaLaunchKernel");
     real_cudaStreamSynchronize = (pfn_cudaStreamSynchronize) gb_cudart_sym(libcudart, "cudaStreamSynchronize");
+    real_cudaStreamIsCapturing  = (pfn_cudaStreamIsCapturing)  gb_cudart_sym(libcudart, "cudaStreamIsCapturing");
+    real_cudaStreamBeginCapture = (pfn_cudaStreamBeginCapture) gb_cudart_sym(libcudart, "cudaStreamBeginCapture");
     /* CUDA doc: cudaStreamCreateWithPriority - resolve for stream priority
      * elevation hook; optional (silently skipped if unavailable). */
     real_cudaStreamCreateWithPriority = (pfn_cudaStreamCreateWithPriority)
@@ -4412,6 +4676,18 @@ static void gb_shim_init(void)
         g_kv_reserve_from_env = 1;
     }
 
+    env = getenv("GREENBOOST_T1_WORKSPACE_MB");
+    if (env) {
+        long long ws = gb_atoll(env);
+        if (ws > 0) {
+            atomic_store_explicit(&g_workspace_reserve_bytes,
+                                  (size_t)ws * 1024ULL * 1024ULL,
+                                  memory_order_relaxed);
+            GB_NVTX_EVENT("T1_WORKSPACE_RESERVE", "PHASE", (size_t)ws, 0,
+                          "reserve_armed_for_model_load");
+        }
+    }
+
     env = getenv("GREENBOOST_VIRTUAL_VRAM_MB");
     if (env) gb_virtual_vram_bytes = (size_t)gb_atoll(env) * 1024ULL * 1024ULL;
 
@@ -4443,6 +4719,9 @@ static void gb_shim_init(void)
     env = getenv("GREENBOOST_REPORT_PHYSICAL_VRAM");
     if (env && env[0] == '1') g_report_physical_vram = 1;
 
+    env = getenv("GREENBOOST_DEBUG_ATTR");
+    if (env && env[0] == '1') g_debug_attr = 1;
+
     /* N11: SWA sliding-window per-request KV eviction.
      * GREENBOOST_SWA_WINDOW=<MB>: when live T2 KV bytes exceed this, evict
      * oldest KV blocks before each new KV alloc. 0 = disabled (default). */
@@ -4466,6 +4745,22 @@ static void gb_shim_init(void)
     if (env && env[0] == '1') {
         g_kv_compress_enabled = 1;
         GB_INIT_LOG_ONCE("[GreenBoost] GREENBOOST_KV_COMPRESS=1: K/V int8 compression enabled\n");
+    }
+
+    /* Phase-aware KV prefetch (Stage 3). Default off. "stats" measures
+     * opportunity only; "1"/"active" is reserved for the live-promotion path
+     * (currently behaves as stats until a long-context hardware bench). */
+    env = getenv("GREENBOOST_KV_PREFETCH");
+    if (env && env[0]) {
+        if (env[0] == '0') {
+            g_kv_prefetch_mode = GB_KV_PREFETCH_OFF;
+        } else if (!strcmp(env, "stats")) {
+            g_kv_prefetch_mode = GB_KV_PREFETCH_STATS;
+            GB_INIT_LOG_ONCE("[GreenBoost] GREENBOOST_KV_PREFETCH=stats: KV-prefetch opportunity metering on\n");
+        } else {
+            g_kv_prefetch_mode = GB_KV_PREFETCH_ACTIVE;
+            GB_INIT_LOG_ONCE("[GreenBoost] GREENBOOST_KV_PREFETCH active: live promotion pending hardware bench, metering as stats\n");
+        }
     }
 
     /* U18/A4: Double-buffer T3→T2 prefetch staging pipeline */
@@ -4540,6 +4835,9 @@ static void gb_shim_init(void)
     /* Create /run/greenboost/ and write initial phase file for the daemon. */
     mkdir("/run/greenboost", 0755);
     gb_write_phase_file((int)GB_PHASE_INIT, 0);
+    /* Feature manifest for consumers (gb_monitor.capabilities). Runtime feature
+     * globals (gds/kv_compress/report_physical_vram) are resolved above. */
+    gb_write_capabilities_file();
 
 
     forced = (getenv("GREENBOOST_ACTIVE") != NULL);
@@ -4969,7 +5267,7 @@ static void gb_shim_init(void)
      * libcuda.so.1 is in ldconfig (NVIDIA driver installs it), so the shim
      * activates for ls, bash, systemd, etc.  Silent by default. */
     if (gb_debug) {
-        fprintf(stderr, "[GreenBoost] v3.0 patched - vram_headroom=%zuMB kv_reserve=%zuMB(adaptive) kv_threshold=%zuMB virtual_vram=%zuMB use_dmabuf=%d debug=%d report_phys=%d\n",
+        fprintf(stderr, "[GreenBoost] v3.2 patched - vram_headroom=%zuMB kv_reserve=%zuMB(adaptive) kv_threshold=%zuMB virtual_vram=%zuMB use_dmabuf=%d debug=%d report_phys=%d\n",
                 vram_headroom_bytes >> 20, g_kv_reserve_bytes >> 20,
                 g_kv_size_threshold_bytes >> 20,
                 gb_virtual_vram_bytes >> 20, gb_use_dmabuf, gb_debug, g_report_physical_vram);
@@ -5427,6 +5725,24 @@ static int gb_needs_overflow(size_t bytesize)
         }
     }
 
+    /* GREENBOOST_FEEDER_EXCLUSIVE=1 — owner-directive mode (2026-07-06):
+     * force every allocation ≥1 MB off local VRAM so the ENTIRE working set
+     * (weights + KV + compute buffers) is feeder-resident.  With arena
+     * allocators, per-kernel mixed-args staging cannot know transfer extents;
+     * full co-residency makes every dispatched kernel's args coherent on the
+     * feeder — the host becomes a pure orchestrator and the feeder GPU does
+     * the compute, reading its own GDDR7/DDR locally. */
+    if (gb_feeder_exclusive() && bytesize > 0) {
+        /* Force EVERY buffer (not just ≥1 MB) onto the feeder.  A kernel that
+         * mixes a remote weight with a small LOCAL output/scratch pointer
+         * faults on the feeder — the local ptr isn't a 0xAA fake and can't be
+         * relocated.  Full co-residency makes every arg relocatable (found
+         * live: mul_mat_vec_q got only 2 of 3 pointer args relocated because
+         * its <1 MB output stayed local → err=700). */
+        gb_log("VRAM: req=%zuB → OVERFLOW (feeder-exclusive mode)", bytesize);
+        return 1;
+    }
+
     /* KV cache reservation: weights spill to T2 while kv_reserve > 0, leaving
      * T1 headroom for the KV cache.  KV is read+written every generation step -
      * T1 (~336 GB/s) vs T2 (~32 GB/s PCIe) is ~10x throughput difference.
@@ -5445,11 +5761,20 @@ static int gb_needs_overflow(size_t bytesize)
             kv_reserve = 0;
         }
     }
+    /* Phase-aware T1 workspace reserve: hold VRAM back for per-step compute
+     * workspace ONLY during model load (INIT/MODEL_LOAD).  Once the phase
+     * advances to INFERENCE the reserve is released (treated as 0) so the
+     * freed VRAM absorbs activations/workspace instead of forcing them to T2.
+     * See g_workspace_reserve_bytes comment for the rationale/measurements. */
+    size_t ws_reserve = 0;
+    if (cur_phase <= GB_PHASE_MODEL_LOAD)
+        ws_reserve = atomic_load_explicit(&g_workspace_reserve_bytes, memory_order_relaxed);
+
     {
-        if (bytesize + vram_headroom_bytes + kv_reserve > free_vram) {
-            gb_log("VRAM: req=%zuMB free=%zuMB headroom=%zuMB kv_reserve=%zuMB(eff) phase=%d oversize=%d → OVERFLOW",
+        if (bytesize + vram_headroom_bytes + kv_reserve + ws_reserve > free_vram) {
+            gb_log("VRAM: req=%zuMB free=%zuMB headroom=%zuMB kv_reserve=%zuMB(eff) ws_reserve=%zuMB phase=%d oversize=%d → OVERFLOW",
                    bytesize >> 20, free_vram >> 20, vram_headroom_bytes >> 20,
-                   kv_reserve >> 20, cur_phase,
+                   kv_reserve >> 20, ws_reserve >> 20, cur_phase,
                    (gb_physical_vram_bytes > 0 && bytesize > gb_physical_vram_bytes));
             if (bytesize >= GB_DECISION_LOG_MIN_BYTES) {
                 char _dbuf[160];
@@ -5590,7 +5915,10 @@ static void gb_batch_flush(struct gb_migrate_batch *batch)
     }
 
     /* Issue async copies on the batch stream */
-    static pfn_cudaMemcpyAsync_migrate_t _real_cma = NULL;
+    /* F-ABI1 fix: use the robustly-resolved global instead of a local
+     * dlsym(RTLD_NEXT,...) - see real_cudaMemcpyAsync's declaration comment. */
+    pfn_cudaMemcpyAsync_migrate_t _real_cma =
+        (pfn_cudaMemcpyAsync_migrate_t)real_cudaMemcpyAsync;
     if (!_real_cma)
         _real_cma = (pfn_cudaMemcpyAsync_migrate_t)dlsym(RTLD_NEXT, "cudaMemcpyAsync");
 
@@ -6023,6 +6351,21 @@ static CUresult gb_overflow_alloc_ex(CUdeviceptr *dptr, size_t bytesize)
      * pages stay in host RAM hinted PREFERRED_LOCATION=CPU; GPU SMs access them
      * over PCIe (~20 GB/s) with no migration (CUDA UVM §4.1.4.2). */
     if (gb_cc_major >= 12) {
+        /* Bug found 2026-06-22 while tracing why TENSOR_LOAD_COPY never
+         * fired on a real GGUF load (see workflow/known-issues.md, hot-
+         * expert VRAM caching plan): every branch below this point returns
+         * directly (zerocopy/managed success, or one of several OOM paths),
+         * so gb_phase_classify() at the bottom of this function - the only
+         * place that ever advances g_alloc_phase past GB_PHASE_INIT - was
+         * never reached on Blackwell (cc >= 12). g_alloc_phase stayed 0
+         * forever, which silently disabled every phase-gated feature on
+         * this hardware class, not just tensor-load tracking. Call it here
+         * for its phase-tracking side effect; the returned alloc_flags
+         * aren't used on the Blackwell zerocopy/managed path (T2 placement
+         * there is unconditional, not phase-dependent), so discarding the
+         * return value changes no allocation behavior. */
+        (void)gb_phase_classify(bytesize);
+
         /* Explicit opt-out escape hatch.  The blanket auto-engage that was here before
          * is removed: managed UVM is SM-accessible on Blackwell PCIe (cc >= 12),
          * so there is no longer a reason to hard-refuse all T2 on Blackwell. */
@@ -6455,8 +6798,48 @@ path_b_hostreg:
 /* ------------------------------------------------------------------ */
 /*  gb_overflow_alloc wrapper                                           */
 /* ------------------------------------------------------------------ */
+/* Host RAM floor — local T2 must NEVER drive the machine into memory
+ * pressure: with e.g. 64 GB total, GreenBoost may consume DDR only while
+ * MemAvailable stays above the floor (default 9 GB ≈ "cap total use at
+ * ~55 GB", counting every other process too since MemAvailable already
+ * reflects them).  When an allocation would cross the floor, local T2 is
+ * refused and smart_alloc cascades to feeder T2/T3 — protecting the host
+ * AND putting the feeder's DDR to work.  Override: GREENBOOST_HOST_RAM_FLOOR_MB. */
+static size_t gb_host_ram_floor_bytes(void)
+{
+    static size_t floor_b = (size_t)-1;
+    if (floor_b == (size_t)-1) {
+        long mb = 9216;
+        const char *e = getenv("GREENBOOST_HOST_RAM_FLOOR_MB");
+        if (e && atol(e) >= 0) mb = atol(e);
+        floor_b = (size_t)mb << 20;
+    }
+    return floor_b;
+}
+
+/* GREENBOOST_FEEDER_EXCLUSIVE=1 — see gb_needs_overflow.  Cached env. */
+static int gb_feeder_exclusive(void)
+{
+    static int _fx = -1;
+    if (_fx < 0) {
+        const char *e = getenv("GREENBOOST_FEEDER_EXCLUSIVE");
+        _fx = (e && e[0] == '1') ? 1 : 0;
+    }
+    return _fx;
+}
+
 static CUresult gb_overflow_alloc(CUdeviceptr *dptr, size_t bytesize)
 {
+    size_t floor_b = gb_host_ram_floor_bytes();
+    if (floor_b > 0) {
+        size_t avail = gb_get_mem_available();
+        if (avail > 0 && (avail < floor_b || avail - floor_b < bytesize)) {
+            gb_log("local T2 refused: MemAvailable=%zu MB - %zu MB req would cross "
+                   "host RAM floor (%zu MB) - cascading to feeder tiers",
+                   avail >> 20, bytesize >> 20, floor_b >> 20);
+            return CUDA_ERROR_OUT_OF_MEMORY;
+        }
+    }
     return gb_overflow_alloc_ex(dptr, bytesize);
 }
 
@@ -6578,6 +6961,9 @@ static int gb_try_feeder_alloc_tier(CUdeviceptr *dptr, size_t bytesize, uint8_t 
     if (!gb_netc_is_active()) return -1;
     int _n = gb_netc_remote_gpu_count();
     for (int _ri = 0; _ri < _n; _ri++) {
+        /* Heal a dropped connection inline — an alloc burst must not read
+         * "feeder not connected" for the 0.5-2 s the heartbeat thread needs. */
+        gb_netc_ensure_connected(_ri);
         /* U4: skip feeders in DISABLED state entirely */
         if (gb_netc_feeder_disabled(_ri)) continue;
         uint64_t _free = 0, _total = 0;
@@ -6623,6 +7009,21 @@ static int gb_try_feeder_alloc_tier(CUdeviceptr *dptr, size_t bytesize, uint8_t 
 static CUresult gb_smart_overflow_alloc(CUdeviceptr *dptr, size_t bytesize) {
     int cur_phase = atomic_load_explicit(&g_alloc_phase, memory_order_relaxed);
 
+    /* Feeder-exclusive: block for the feeder on the FIRST alloc so weights
+     * don't lose netc's async-connect race and fall to local T2 (→ omen idle,
+     * every kernel local). One-time up-front wait; after that connect is warm. */
+    if (gb_feeder_exclusive() && gb_netc_is_active()) {
+        static _Atomic int waited = 0;
+        int expected = 0;
+        if (atomic_compare_exchange_strong(&waited, &expected, 1)) {
+            if (gb_netc_wait_connected(8000) == 0)
+                gb_log("feeder-exclusive: feeder connected, routing all buffers remote");
+            else
+                gb_log("feeder-exclusive: WARN feeder not connected after 8s - "
+                       "allocs may fall local");
+        }
+    }
+
     /* U3: count this overflow event and update rolling eviction rate.
      * Skip during MODEL_LOAD/INIT: sequential weight placement is not thrashing;
      * counting it saturates the rate counter instantly and blocks feeder T1. */
@@ -6664,38 +7065,39 @@ static CUresult gb_smart_overflow_alloc(CUdeviceptr *dptr, size_t bytesize) {
         }
     }
 
-    /* During GB_PHASE_MODEL_LOAD with an active cluster, prefer feeder T2 to place
-     * model weights on the feeder. The fake pointer from feeder T2 enables
-     * cuLaunchKernel data-driven dispatch: all tensor ops route to feeder GPU.
-     * During INFERENCE/STEADY the normal speed comparison restores local priority. */
-    int prefer_feeder_t2 = (!skip_t2 && cur_phase <= GB_PHASE_MODEL_LOAD
-                            && gb_netc_is_active());
-
+    /* Documented tier order (CLAUDE.md): T2_host BEFORE T2_feeder — always.
+     * A MODEL_LOAD "[cluster-load]" preference for feeder T2 was tried on
+     * 2026-07-06 (route the whole weights buffer to the feeder so dispatch
+     * follows the data) and reverted: (a) ggml clears buffers with cudaMemset,
+     * which has no shim hook — the feeder fake ptr reaches real CUDA and
+     * aborts llama-server with "invalid argument"; (b) kv_reserve keeps KV in
+     * local T1, so decode kernels mix local and remote args, which remote
+     * dispatch cannot serve.  Local T2 zerocopy is the proven, faster path
+     * for a single overflow buffer (raw DDR MT/s comparison ignores the TCP
+     * hop, so it is not a valid reason to jump the order either).  Feeder T2
+     * remains the fallback when local T2 is exhausted.  (feeder_t2 kept for
+     * the log line only.) */
     if (!skip_t2) {
-        if (prefer_feeder_t2 || feeder_t2 > local_t2) {
-            if (gb_try_feeder_alloc_tier(dptr, bytesize, GB_ALLOC_TIER_T2) == 0) {
-                gb_log("smart_alloc: feeder T2 %s(%u vs %u MT/s, %zu MB)",
-                       prefer_feeder_t2 ? "[cluster-load] " : "[faster] ",
-                       feeder_t2, local_t2, bytesize >> 20);
-                gb_tier_record_alloc(GB_TIER_T2_FEEDER, bytesize);
-                return CUDA_SUCCESS;
-            }
-            if (gb_overflow_alloc(dptr, bytesize) == CUDA_SUCCESS) {
-                gb_log("smart_alloc: local T2 fallback (%zu MB)", bytesize >> 20);
-                gb_tier_record_alloc(GB_TIER_T2_LOCAL, bytesize);
-                return CUDA_SUCCESS;
-            }
-        } else {
-            if (gb_overflow_alloc(dptr, bytesize) == CUDA_SUCCESS) {
-                gb_log("smart_alloc: local T2 (%u MT/s, %zu MB)", local_t2, bytesize >> 20);
-                gb_tier_record_alloc(GB_TIER_T2_LOCAL, bytesize);
-                return CUDA_SUCCESS;
-            }
-            if (gb_try_feeder_alloc_tier(dptr, bytesize, GB_ALLOC_TIER_T2) == 0) {
-                gb_log("smart_alloc: feeder T2 fallback (%zu MB)", bytesize >> 20);
-                gb_tier_record_alloc(GB_TIER_T2_FEEDER, bytesize);
-                return CUDA_SUCCESS;
-            }
+        /* Feeder-exclusive mode: keep the working set co-resident on the
+         * feeder — feeder T2 BEFORE local T2 (local kept as last resort so
+         * the process survives a full feeder). */
+        if (gb_feeder_exclusive() &&
+            gb_try_feeder_alloc_tier(dptr, bytesize, GB_ALLOC_TIER_T2) == 0) {
+            gb_log("smart_alloc: feeder T2 [exclusive] (%zu MB)", bytesize >> 20);
+            gb_tier_record_alloc(GB_TIER_T2_FEEDER, bytesize);
+            return CUDA_SUCCESS;
+        }
+        if (gb_overflow_alloc(dptr, bytesize) == CUDA_SUCCESS) {
+            gb_log("smart_alloc: local T2 (%u MT/s, %zu MB)", local_t2, bytesize >> 20);
+            gb_tier_record_alloc(GB_TIER_T2_LOCAL, bytesize);
+            return CUDA_SUCCESS;
+        }
+        if (!gb_feeder_exclusive() &&
+            gb_try_feeder_alloc_tier(dptr, bytesize, GB_ALLOC_TIER_T2) == 0) {
+            gb_log("smart_alloc: feeder T2 fallback (%u vs %u MT/s, %zu MB)",
+                   feeder_t2, local_t2, bytesize >> 20);
+            gb_tier_record_alloc(GB_TIER_T2_FEEDER, bytesize);
+            return CUDA_SUCCESS;
         }
     } else {
         gb_log("smart_alloc: MID gate skip T2 (%zu MB > 1 MB, T2 > %d%%)",
@@ -6788,6 +7190,27 @@ CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize)
 
     if (!initialized || !real_cuMemAlloc_v2)
         return CUDA_ERROR_OUT_OF_MEMORY;
+
+    /* Primary remote path: Ollama called cudaSetDevice(N) for a cluster feeder
+     * (GREENBOOST_GGML_2DEV) - allocate directly on that feeder, mirroring
+     * cudaMalloc's active-remote branch. ggml-cuda's legacy pool normally
+     * allocates via the runtime API, but cover the driver-API entry point too
+     * so any caller that uses cuMemAlloc_v2 directly on device 1 still lands
+     * on the feeder instead of silently falling through to real_cuMemAlloc_v2
+     * (which would allocate on the actual current LOCAL CUDA context). */
+    if (gb_netc_is_active()) {
+        int _ri = gb_netc_get_active_remote();
+        if (_ri >= 0) {
+            uint64_t _fake = 0;
+            if (gb_netc_malloc(_ri, (uint64_t)bytesize, 0, &_fake) == 0) {
+                gb_log("cuMemAlloc_v2 remote[%d]: %zu MB → fake=0x%llx", _ri, bytesize >> 20,
+                       (unsigned long long)_fake);
+                *dptr = (CUdeviceptr)_fake;
+                return CUDA_SUCCESS;
+            }
+            return CUDA_ERROR_OUT_OF_MEMORY;
+        }
+    }
 
     if (gb_needs_overflow(bytesize)) {
         CUresult or_ret = gb_smart_overflow_alloc(dptr, bytesize);
@@ -7849,6 +8272,27 @@ CUresult cuMemGetInfo_v2(size_t *free_out, size_t *total_out)
         return fn ? fn(free_out, total_out) : CUDA_ERROR_NOT_SUPPORTED;
     }
 
+    /* GREENBOOST_GGML_2DEV: when the caller's current device is the feeder
+     * (cudaSetDevice(1) -> gb_netc_set_active_remote), report the feeder's
+     * OWN real free/total instead of the aggregated single-vGPU pool -
+     * ggml's multi-GPU layer-split sizer needs the true per-device numbers
+     * to assign a sane layer count to device 1, not device 0's inflated
+     * total. Live network round-trip; acceptable off the decode hot path
+     * (called once per device at model-load split-sizing time). */
+    {
+        int _active_remote = gb_netc_get_active_remote();
+        if (_active_remote >= 0) {
+            uint64_t _rf = 0, _rt = 0;
+            if (gb_netc_mem_info(_active_remote, &_rf, &_rt) == 0 && _rt > 0) {
+                if (free_out)  *free_out  = (size_t)_rf;
+                if (total_out) *total_out = (size_t)_rt;
+                gb_log("cuMemGetInfo_v2: active_remote=%d free=%zuMB total=%zuMB",
+                       _active_remote, (size_t)_rf >> 20, (size_t)_rt >> 20);
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+
     ret = real_cuMemGetInfo(&real_free, &real_total);
     if (ret != CUDA_SUCCESS) {
         /* CUDA 13 / cu130: the driver API requires a current CUDA context.
@@ -7920,6 +8364,27 @@ CUresult cuMemGetInfo_v2(size_t *free_out, size_t *total_out)
         _ws_applied = ws;
         if (real_free > ws) real_free -= ws;
         else                real_free  = 0;
+    }
+
+    /* GREENBOOST_REPORT_PHYSICAL_VRAM=1 (diffusion/PyTorch workloads, see
+     * cuDeviceTotalMem_v2 above): report REAL free/total, no pool inflation.
+     * Without this branch, PyTorch's caching allocator (which sizes every
+     * allocation and formats OOM errors off cudaMemGetInfo/cuMemGetInfo, NOT
+     * cudaGetDeviceProperties/cuDeviceTotalMem_v2) still saw the inflated
+     * total_virtual = real_total + gb_virtual_vram_bytes + cluster_remote
+     * figure even when the caller had disabled inflation everywhere else —
+     * confirmed 2026-07-09: a feeder torch process reported "total capacity
+     * of 129.53 GiB" (an 8 GiB card + full cluster pool) from THIS function
+     * while cuDeviceTotalMem_v2 correctly reported the physical figure, so
+     * gb-quant/bf16 sizing decisions OOM'd against a capacity that was never
+     * really there. */
+    if (g_report_physical_vram) {
+        if (free_out)  *free_out  = real_free;
+        if (total_out) *total_out = real_total;
+        gb_log("cuMemGetInfo_v2: reporting physical free=%zuMB total=%zuMB "
+               "(inflation disabled by GREENBOOST_REPORT_PHYSICAL_VRAM=1)",
+               real_free >> 20, real_total >> 20);
+        return CUDA_SUCCESS;
     }
 
     if (free_out)  *free_out  = real_free  + t2_free + remote_free;
@@ -8064,6 +8529,15 @@ CUresult cuDeviceGetAttribute(int *value, int attrib, CUdevice dev)
     int local = 1;
     if (real_cuDeviceGetCount)
         real_cuDeviceGetCount(&local);
+    /* Never let a zero/failed device count route a LOCAL ordinal (esp. device
+     * 0) to the feeder path: that returns *value=0 for shared-memory-per-block
+     * attrs and Triton reports "shared memory Hardware limit: 0", crashing bf16
+     * diffusion under the shim (ROADMAP P4). Local ordinals always resolve on
+     * the real driver below. */
+    if (local < 1) local = 1;
+    if (__builtin_expect(g_debug_attr, 0))
+        fprintf(stderr, "[GreenBoost] cuDeviceGetAttribute: attr=%d dev=%d local=%d %s\n",
+                attrib, (int)dev, local, ((int)dev >= local) ? "-> feeder" : "-> real");
 
     if ((int)dev >= local) {
         int ret = gb_netc_device_get_attribute((int)dev - local, attrib, value);
@@ -8118,6 +8592,29 @@ cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device)
     pfn_cudaDeviceGetAttribute fn = real_cudaDeviceGetAttribute;
     if (!fn) fn = (pfn_cudaDeviceGetAttribute)dlsym(RTLD_NEXT, "cudaDeviceGetAttribute");
     if (!fn) return (cudaError_t)CUDA_ERROR_NOT_SUPPORTED;
+
+    /* GREENBOOST_GGML_2DEV: route a remote ordinal to the feeder, mirroring
+     * cuDeviceGetAttribute (driver API) above. Without this, a remote
+     * ordinal (which the real driver has never heard of - it only knows
+     * local devices 0..local-1) hits the real cudaDeviceGetAttribute and
+     * returns "invalid device ordinal", aborting llama-server's
+     * --list-devices GPU discovery entirely (observed live: Ollama then
+     * silently falls back to the Vulkan backend, bypassing this shim). */
+    if (initialized) {
+        int local = 1;
+        if (real_cudaGetDeviceCount)
+            real_cudaGetDeviceCount(&local);
+        /* See cuDeviceGetAttribute: clamp so device 0 never misroutes to the
+         * feeder on a zero/failed count (ROADMAP P4 shared-mem=0 crash). */
+        if (local < 1) local = 1;
+        if (__builtin_expect(g_debug_attr, 0))
+            fprintf(stderr, "[GreenBoost] cudaDeviceGetAttribute: attr=%d dev=%d local=%d %s\n",
+                    attr, device, local, (device >= local) ? "-> feeder" : "-> real");
+        if (device >= local) {
+            int ret = gb_netc_device_get_attribute(device - local, attr, value);
+            return (ret == 0) ? CUDA_SUCCESS : (cudaError_t)CUDA_ERROR_INVALID_DEVICE;
+        }
+    }
 
     cudaError_t ret = fn(value, attr, device);
 
@@ -8213,13 +8710,35 @@ cudaError_t cudaGetDeviceProperties(void *prop, int device)
 /* ------------------------------------------------------------------ */
 /*  Cluster device enumeration - cudaGetDeviceCount / cudaSetDevice     */
 /*                                                                      */
-/*  GreenBoost presents a single virtual GPU (device 0) to all callers.*/
-/*  Remote feeder memory is aggregated into device 0's reported VRAM   */
-/*  via cuDeviceTotalMem / cudaGetDeviceProperties hooks - apps never  */
-/*  need to know about the physical cluster topology. Exposing remote   */
-/*  GPUs as device N+1 breaks PyTorch _cuda_init() because the real    */
-/*  CUDA driver only knows local devices (ordinal 0..local-1).         */
+/*  GreenBoost presents a single virtual GPU (device 0) to all callers */
+/*  by default. Remote feeder memory is aggregated into device 0's    */
+/*  reported VRAM via cuDeviceTotalMem / cudaGetDeviceProperties hooks */
+/*  - apps never need to know about the physical cluster topology.    */
+/*  Exposing remote GPUs as device N+1 breaks PyTorch _cuda_init()    */
+/*  because the real CUDA driver only knows local devices (ordinal    */
+/*  0..local-1), so this stays OFF for torch (GREENBOOST_CLUSTER=0     */
+/*  is the torch convention already).                                  */
+/*                                                                      */
+/*  GREENBOOST_GGML_2DEV=1 flips this off for the ggml/Ollama path     */
+/*  only (set in the Ollama systemd drop-in, never by torch): the      */
+/*  feeder is enumerated as a real second CUDA device so llama.cpp     */
+/*  natively splits an oversized model's layers across local VRAM and  */
+/*  feeder VRAM, with the feeder GPU computing its assigned layers.    */
+/*  cuDeviceGet/cuDeviceGetAttribute/cuDeviceTotalMem/                 */
+/*  cudaGetDeviceProperties_v2/cudaSetDevice already handle ordinal    */
+/*  >= local by routing to the feeder - this flag only widens the      */
+/*  count hooks below so callers ever iterate that far.                */
 /* ------------------------------------------------------------------ */
+
+static int gb_ggml_2dev(void)
+{
+    static int _2dev = -1;
+    if (_2dev < 0) {
+        const char *e = getenv("GREENBOOST_GGML_2DEV");
+        _2dev = (e && e[0] == '1') ? 1 : 0;
+    }
+    return _2dev;
+}
 
 cudaError_t cudaGetDeviceCount(int *count)
 {
@@ -8228,7 +8747,7 @@ cudaError_t cudaGetDeviceCount(int *count)
     if (real_cudaGetDeviceCount)
         real_cudaGetDeviceCount(&local);
     if (count)
-        *count = local;
+        *count = gb_ggml_2dev() ? (local + gb_netc_remote_gpu_count()) : local;
     return CUDA_SUCCESS;
 }
 
@@ -8238,7 +8757,7 @@ CUresult cuDeviceGetCount(int *count)
     if (real_cuDeviceGetCount)
         real_cuDeviceGetCount(&local);
     if (count)
-        *count = local;
+        *count = gb_ggml_2dev() ? (local + gb_netc_remote_gpu_count()) : local;
     return CUDA_SUCCESS;
 }
 
@@ -8319,6 +8838,96 @@ cudaError_t cudaSetDevice(int device)
         gb_netc_set_active_remote(-1);
         return real_cudaSetDevice ? real_cudaSetDevice(device) : CUDA_SUCCESS;
     }
+}
+
+/* GREENBOOST_GGML_2DEV peer-access hooks.
+ *
+ * A fake feeder device (ordinal >= local) is NOT real GPU-peer-accessible
+ * memory - it lives on the far side of a TCP link, not NVLink/PCIe. Without
+ * these hooks, ggml/llama.cpp's multi-GPU init would call the REAL
+ * cudaDeviceCanAccessPeer/cudaDeviceEnablePeerAccess against a device
+ * ordinal the real CUDA driver has never heard of, and either get a
+ * confusing error or (worse) succeed against the wrong local device and
+ * later issue a real cudaMemcpyPeer straight at a 0xAA fake pointer.
+ * Forcing canAccessPeer=0 for any pair involving a remote ordinal makes
+ * ggml fall back to its staged-copy path, which the cudaMemcpy/
+ * cudaMemcpyAsync hooks (see the device0<->feeder bounce-buffer staging)
+ * already handle correctly. Real local<->local peer access (a box with 2+
+ * genuine local GPUs) passes through unchanged - this only touches remote
+ * ordinals. */
+cudaError_t cudaDeviceCanAccessPeer(int *canAccessPeer, int device, int peerDevice)
+{
+    GB_CUDART_ENSURE();
+    if (!initialized) {
+        if (canAccessPeer) *canAccessPeer = 0;
+        return real_cudaDeviceCanAccessPeer
+            ? real_cudaDeviceCanAccessPeer(canAccessPeer, device, peerDevice) : CUDA_SUCCESS;
+    }
+
+    int local = 1;
+    if (real_cudaGetDeviceCount)
+        real_cudaGetDeviceCount(&local);
+
+    if (device >= local || peerDevice >= local) {
+        if (canAccessPeer) *canAccessPeer = 0;
+        return CUDA_SUCCESS;
+    }
+    return real_cudaDeviceCanAccessPeer
+        ? real_cudaDeviceCanAccessPeer(canAccessPeer, device, peerDevice)
+        : (cudaError_t)CUDA_ERROR_NOT_SUPPORTED;
+}
+
+cudaError_t cudaDeviceEnablePeerAccess(int peerDevice, unsigned int flags)
+{
+    GB_CUDART_ENSURE();
+    if (!initialized)
+        return real_cudaDeviceEnablePeerAccess
+            ? real_cudaDeviceEnablePeerAccess(peerDevice, flags) : CUDA_SUCCESS;
+
+    int local = 1;
+    if (real_cudaGetDeviceCount)
+        real_cudaGetDeviceCount(&local);
+
+    /* Remote ordinal: no-op success. cudaDeviceCanAccessPeer already told
+     * the caller this pair can't peer-access, so a caller that still tries
+     * to enable it anyway gets a harmless success rather than a real-CUDA
+     * error against a device ordinal the driver never allocated. */
+    if (peerDevice >= local)
+        return CUDA_SUCCESS;
+    return real_cudaDeviceEnablePeerAccess
+        ? real_cudaDeviceEnablePeerAccess(peerDevice, flags)
+        : (cudaError_t)CUDA_ERROR_NOT_SUPPORTED;
+}
+
+/* cudaPointerGetAttributes on a fake feeder pointer must report real device
+ * memory on the feeder's ordinal, not fall through to the real CUDA driver
+ * (which has never seen this pointer and would return
+ * cudaErrorInvalidValue). feeder_idx comes from the same alloc-tracking
+ * table gb_netc_free/gb_netc_memcpy_* already use to resolve a fake pointer
+ * back to its owning feeder. */
+cudaError_t cudaPointerGetAttributes(gb_cudaPointerAttributes *attributes, const void *ptr)
+{
+    GB_CUDART_ENSURE();
+    if (attributes && ptr && gb_is_remote_ptr((uint64_t)(uintptr_t)ptr)) {
+        int local = 1;
+        if (real_cudaGetDeviceCount)
+            real_cudaGetDeviceCount(&local);
+        int feeder_idx = -1;
+        int found = (gb_netc_get_alloc_info((uint64_t)(uintptr_t)ptr, NULL, NULL, NULL,
+                                             &feeder_idx) == 0);
+        if (found) gb_netc_alloc_release_ref((uint64_t)(uintptr_t)ptr);
+        attributes->type          = cudaMemoryTypeDevice;
+        attributes->device        = local + ((found && feeder_idx >= 0) ? feeder_idx : 0);
+        attributes->devicePointer = (void *)ptr;
+        attributes->hostPointer   = NULL;
+        return CUDA_SUCCESS;
+    }
+    if (!initialized)
+        return real_cudaPointerGetAttributes
+            ? real_cudaPointerGetAttributes(attributes, ptr) : CUDA_SUCCESS;
+    return real_cudaPointerGetAttributes
+        ? real_cudaPointerGetAttributes(attributes, ptr)
+        : (cudaError_t)CUDA_ERROR_NOT_SUPPORTED;
 }
 
 /* ------------------------------------------------------------------ */
@@ -8758,8 +9367,32 @@ CUresult cuLaunchKernelEx(const gb_CUlaunchConfig *config, CUfunction f,
 /*  Inflate total + free so the layer scheduler sees virtual VRAM.      */
 /* ------------------------------------------------------------------ */
 
+/* GREENBOOST_GGML_2DEV: a fake NVML handle (returned by our
+ * nvmlDeviceGetHandleByIndex hook for the feeder) is a sentinel value, NOT a
+ * real NVML opaque pointer - passing it into the real NVML call would
+ * dereference garbage. Report the feeder's OWN real free/total instead of
+ * folding it into device 0, so Ollama's per-device GPU discovery sizes the
+ * feeder's layer split correctly. Live network round-trip; called once per
+ * device at discovery time, not on the decode hot path. */
+static int gb_nvml_fake_mem_info(nvmlDevice_t device, unsigned long long *out_total,
+                                  unsigned long long *out_free, unsigned long long *out_used)
+{
+    if (!gb_is_fake_nvml(device))
+        return 0;
+    int ri = gb_fake_nvml_idx(device);
+    uint64_t _f = 0, _t = 0;
+    if (gb_netc_mem_info(ri, &_f, &_t) != 0 || _t == 0)
+        return 0;
+    if (out_total) *out_total = (unsigned long long)_t;
+    if (out_free)  *out_free  = (unsigned long long)_f;
+    if (out_used)  *out_used  = (unsigned long long)(_t - _f);
+    return 1;
+}
+
 nvmlReturn_t nvmlDeviceGetMemoryInfo(nvmlDevice_t device, nvmlMemory_t *memory)
 {
+    if (memory && gb_nvml_fake_mem_info(device, &memory->total, &memory->free, &memory->used))
+        return NVML_SUCCESS;
     if (!real_nvmlDeviceGetMemoryInfo)
         return NVML_ERROR_FUNCTION_NOT_FOUND;
 
@@ -8781,6 +9414,11 @@ nvmlReturn_t nvmlDeviceGetMemoryInfo(nvmlDevice_t device, nvmlMemory_t *memory)
 
 nvmlReturn_t nvmlDeviceGetMemoryInfo_v2(nvmlDevice_t device, nvmlMemory_v2_t *memory)
 {
+    if (memory && gb_nvml_fake_mem_info(device, &memory->total, &memory->free, &memory->used)) {
+        memory->version = 0;
+        memory->reserved = 0;
+        return NVML_SUCCESS;
+    }
     if (!real_nvmlDeviceGetMemoryInfo_v2)
         return NVML_ERROR_FUNCTION_NOT_FOUND;
 
@@ -8803,6 +9441,11 @@ nvmlReturn_t nvmlDeviceGetMemoryInfo_v2(nvmlDevice_t device, nvmlMemory_v2_t *me
 
 nvmlReturn_t nvmlDeviceGetMemoryInfo_v3(nvmlDevice_t device, nvmlMemory_v3_t *memory)
 {
+    if (memory && gb_nvml_fake_mem_info(device, &memory->total, &memory->free, &memory->used)) {
+        memory->reserved = 0;
+        memory->exportedToOtherProcess = 0;
+        return NVML_SUCCESS;
+    }
     if (!real_nvmlDeviceGetMemoryInfo_v3)
         return NVML_ERROR_FUNCTION_NOT_FOUND;
 
@@ -8815,17 +9458,36 @@ nvmlReturn_t nvmlDeviceGetMemoryInfo_v3(nvmlDevice_t device, nvmlMemory_v3_t *me
     return ret;
 }
 
-/* Single-virtual-GPU: NVML still reports the real physical device count.
- * Feeder memory is aggregated into device 0's reported size, not as extra devices. */
+/* Single-virtual-GPU (default): NVML still reports the real physical device
+ * count. Feeder memory is aggregated into device 0's reported size, not as
+ * extra devices. Under GREENBOOST_GGML_2DEV (ggml/Ollama only, see the
+ * cudaGetDeviceCount comment above) the feeder is counted as an extra NVML
+ * device too, using the same fake-handle range nvmlDeviceGetName already
+ * serves. */
 
 nvmlReturn_t nvmlDeviceGetCount(unsigned int *count)
 {
     if (!real_nvmlDeviceGetCount) return NVML_ERROR_FUNCTION_NOT_FOUND;
-    return real_nvmlDeviceGetCount(count);
+    nvmlReturn_t ret = real_nvmlDeviceGetCount(count);
+    if (ret == NVML_SUCCESS && count && gb_ggml_2dev())
+        *count += (unsigned int)gb_netc_remote_gpu_count();
+    return ret;
 }
 
 nvmlReturn_t nvmlDeviceGetHandleByIndex(unsigned int index, nvmlDevice_t *device)
 {
+    if (gb_ggml_2dev()) {
+        unsigned int local = 0;
+        if (real_nvmlDeviceGetCount && real_nvmlDeviceGetCount(&local) == NVML_SUCCESS
+            && index >= local) {
+            int remote_idx = (int)(index - local);
+            if (remote_idx >= gb_netc_remote_gpu_count())
+                return NVML_ERROR_INVALID_ARGUMENT;
+            if (device)
+                *device = (nvmlDevice_t)(GB_FAKE_NVML_BASE + (uintptr_t)remote_idx);
+            return NVML_SUCCESS;
+        }
+    }
     if (!real_nvmlDeviceGetHandleByIndex) return NVML_ERROR_FUNCTION_NOT_FOUND;
     return real_nvmlDeviceGetHandleByIndex(index, device);
 }
@@ -8920,6 +9582,13 @@ CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream hStream)
 
 /* ------------------------------------------------------------------ */
 /*  dlsym hook - intercepts dlopen-based GPU API lookups               */
+cudaError_t cudaMemset(void *devPtr, int value, size_t count);
+cudaError_t cudaMemsetAsync(void *devPtr, int value, size_t count, cudaStream_t stream);
+cudaError_t cudaMemcpy2DAsync(void *dst, size_t dpitch, const void *src,
+                              size_t spitch, size_t width, size_t height,
+                              int kind, cudaStream_t stream);
+cudaError_t cudaLaunchKernelExC(const gb_cudaLaunchConfig *config,
+                                const void *func, void **args);
 /*                                                                      */
 /*  Ollama accesses NVML and CUDA driver via dlopen+dlsym, which       */
 /*  bypasses standard LD_PRELOAD interception.  We override dlsym to   */
@@ -8988,8 +9657,11 @@ static void gb_dlsym_bootstrap(void)
  * resolve to the real libcudart instead of our hooks → hang on fake T2 ptrs. */
 cudaError_t cudaMemcpy(void *, const void *, size_t, int);
 cudaError_t cudaMemcpyAsync(void *, const void *, size_t, int, cudaStream_t);
+cudaError_t cudaMemcpyPeer(void *, int, const void *, int, size_t);
+cudaError_t cudaMemcpyPeerAsync(void *, int, const void *, int, size_t, cudaStream_t);
 cudaError_t cudaLaunchKernel(const void *, gb_dim3, gb_dim3, void **, size_t, cudaStream_t);
 cudaError_t cudaStreamSynchronize(cudaStream_t);
+cudaError_t cudaStreamBeginCapture(cudaStream_t, int);
 cudaError_t cudaStreamCreate(cudaStream_t *, unsigned int);
 void __cudaRegisterFunction(void **, const char *, char *, const char *, int,
                             gb_uint3 *, gb_uint3 *, gb_dim3 *, gb_dim3 *, int *);
@@ -9056,18 +9728,35 @@ static void *gb_get_hook(const char *name)
     if (strcmp(name, "cuLaunchKernel")                == 0) return (void *)cuLaunchKernel;
     if (strcmp(name, "cudaLaunchKernel")              == 0) return (void *)cudaLaunchKernel;
     if (strcmp(name, "cudaStreamSynchronize")         == 0) return (void *)cudaStreamSynchronize;
+    if (strcmp(name, "cudaStreamBeginCapture")        == 0) return (void *)cudaStreamBeginCapture;
     if (strcmp(name, "cudaStreamCreate")              == 0) return (void *)cudaStreamCreate;
     if (strcmp(name, "__cudaRegisterFunction")        == 0) return (void *)__cudaRegisterFunction;
     if (strcmp(name, "cudaMemcpy")                    == 0) return (void *)cudaMemcpy;
     if (strcmp(name, "cudaMemcpyAsync")               == 0) return (void *)cudaMemcpyAsync;
+    if (strcmp(name, "cudaMemcpyPeer")                == 0) return (void *)cudaMemcpyPeer;
+    if (strcmp(name, "cudaMemcpyPeerAsync")           == 0) return (void *)cudaMemcpyPeerAsync;
+    if (strcmp(name, "cudaMemset")                    == 0) return (void *)cudaMemset;
+    if (strcmp(name, "cudaMemsetAsync")               == 0) return (void *)cudaMemsetAsync;
+    if (strcmp(name, "cudaMemsetAsync_ptsz")          == 0) return (void *)cudaMemsetAsync;
+    if (strcmp(name, "cudaMemcpy2DAsync")             == 0) return (void *)cudaMemcpy2DAsync;
+    if (strcmp(name, "cudaMemcpy2DAsync_ptsz")        == 0) return (void *)cudaMemcpy2DAsync;
+    if (strcmp(name, "cudaLaunchKernelExC")           == 0) return (void *)cudaLaunchKernelExC;
+    if (strcmp(name, "cudaLaunchKernelExC_ptsz")      == 0) return (void *)cudaLaunchKernelExC;
     if (strcmp(name, "cudaGetDeviceProperties")       == 0) return (void *)cudaGetDeviceProperties;
     if (strcmp(name, "cudaGetDeviceProperties_v2")    == 0) return (void *)cudaGetDeviceProperties_v2;
 
     if (strcmp(name, "cuDeviceGetAttribute")          == 0) return (void *)cuDeviceGetAttribute;
     if (strcmp(name, "cudaDeviceGetAttribute")        == 0) return (void *)cudaDeviceGetAttribute;
 
-    /* Single-virtual-GPU: NVML device count/handle pass through to real NVML.
-     * Feeder memory is aggregated into device 0 - no fake device handles needed. */
+    /* GREENBOOST_GGML_2DEV peer-access + pointer-attribute hooks */
+    if (strcmp(name, "cudaDeviceCanAccessPeer")       == 0) return (void *)cudaDeviceCanAccessPeer;
+    if (strcmp(name, "cudaDeviceEnablePeerAccess")    == 0) return (void *)cudaDeviceEnablePeerAccess;
+    if (strcmp(name, "cudaPointerGetAttributes")      == 0) return (void *)cudaPointerGetAttributes;
+
+    /* Single-virtual-GPU (default): NVML device count/handle pass through to
+     * real NVML, feeder memory aggregated into device 0. Under
+     * GREENBOOST_GGML_2DEV the feeder is counted/handled as an extra NVML
+     * device instead - see nvmlDeviceGetCount/nvmlDeviceGetHandleByIndex. */
 
     return NULL;
 }
@@ -9200,9 +9889,6 @@ typedef enum {
     cudaMemcpyDefault        = 4,
 } gb_cudaMemcpyKind;
 
-typedef int (*pfn_cudaMemcpy_t)(void *, const void *, size_t, int);
-typedef int (*pfn_cudaMemcpyAsync_t)(void *, const void *, size_t, int, void *);
-
 /* Phase 1 of the hot-expert VRAM caching investigation (see
  * workflow/known-issues.md): record (offset, size) for every H2D copy that
  * lands inside a Blackwell zero-copy T2 buffer during model load, so an
@@ -9227,41 +9913,160 @@ static void gb_track_tensor_load_copy(uint64_t dstp, size_t count)
     GB_NVTX_EVENT("TENSOR_LOAD_COPY", "T2_DDR", count >> 20, dstp, _dbuf);
 }
 
+/* ------------------------------------------------------------------ */
+/*  GREENBOOST_GGML_2DEV: device0<->feeder cross-device staging        */
+/*                                                                      */
+/*  llama.cpp's per-layer activation handoff between local VRAM         */
+/*  (device 0) and the feeder (device 1) copies a REAL local device     */
+/*  pointer to/from a fake feeder pointer. gb_netc_memcpy_h2d/d2h treat  */
+/*  their "local" side as plain host-visible memory (a raw pointer read  */
+/*  or write) - handing them a genuine VRAM address either segfaults    */
+/*  (VRAM is not mapped into the process's normal address space) or,    */
+/*  on platforms where it happens not to fault, silently reads/writes   */
+/*  the wrong bytes. Stage through a bounce buffer instead: a real      */
+/*  cudaMemcpy moves data between VRAM and the bounce buffer, then the  */
+/*  existing fabric call moves it between the bounce buffer and the     */
+/*  feeder - exactly like a normal H2D/D2H copy from the fabric's point  */
+/*  of view.                                                             */
+/*                                                                      */
+/*  gb_is_local_device_ptr distinguishes a genuine local device pointer  */
+/*  (T1 VRAM, or a Path-A cudaImportExternalMemory mapping - both are    */
+/*  real device address space) from a GreenBoost-managed HOST-visible    */
+/*  pointer (Path-B mmap+cuMemHostRegister zero-copy, or plain malloc'd  */
+/*  host memory): every ht_insert call site for the latter sets          */
+/*  mapped_ptr to the actual host address, while local-device call sites */
+/*  always pass mapped_ptr=NULL, fd=-1 (see the ht_insert call sites     */
+/*  throughout this file). Host-visible pointers must NOT be staged -    */
+/*  they already work directly with gb_netc_memcpy_h2d/d2h (that is the  */
+/*  validated, pre-existing path; staging them would just add a         */
+/*  redundant copy).                                                    */
+/* ------------------------------------------------------------------ */
+
+static int gb_is_local_device_ptr(const void *ptr)
+{
+    size_t sz; int managed; void *mapped_ptr; int fd;
+    if (!ht_lookup((CUdeviceptr)(uintptr_t)ptr, &sz, &managed, &mapped_ptr, &fd))
+        return 0;
+    return (!managed && mapped_ptr == NULL && fd < 0);
+}
+
+/* Thread-local bounce buffer, grown on demand and kept for reuse across
+ * calls on the same thread - avoids a fresh allocation on every per-layer
+ * activation handoff. Plain heap memory (not cudaHostAlloc-pinned): pinning
+ * would speed up the D2H/H2D leg slightly but adds another CUDA resource to
+ * resolve and manage for a copy that is small (KB-low MB activations) and
+ * infrequent (once per layer boundary per token), not the dominant cost. */
+static __thread void  *g_stage_bounce      = NULL;
+static __thread size_t g_stage_bounce_cap  = 0;
+
+static void *gb_stage_bounce_get(size_t need)
+{
+    if (g_stage_bounce_cap >= need)
+        return g_stage_bounce;
+    void *p = realloc(g_stage_bounce, need);
+    if (!p)
+        return NULL;
+    g_stage_bounce     = p;
+    g_stage_bounce_cap = need;
+    return p;
+}
+
+/* dst is a fake feeder pointer, src is a confirmed real local device
+ * pointer. Returns 0 on success, -1 on failure. */
+static int gb_staged_memcpy_device_to_remote(uint64_t dstp, const void *src, size_t count)
+{
+    void *bounce = gb_stage_bounce_get(count);
+    if (!bounce) return -1;
+    cudaError_t (*real_fn)(void *, const void *, size_t, int) = real_cudaMemcpy;
+    if (!real_fn) return -1;
+    if (real_fn(bounce, src, count, 2 /* cudaMemcpyDeviceToHost */) != 0)
+        return -1;
+    return gb_netc_memcpy_h2d(dstp, bounce, (uint64_t)count);
+}
+
+/* src is a fake feeder pointer, dst is a confirmed real local device
+ * pointer. Returns 0 on success, -1 on failure. */
+static int gb_staged_memcpy_remote_to_device(void *dst, uint64_t srcp, size_t count)
+{
+    void *bounce = gb_stage_bounce_get(count);
+    if (!bounce) return -1;
+    if (gb_netc_memcpy_d2h(bounce, srcp, (uint64_t)count) != 0)
+        return -1;
+    cudaError_t (*real_fn)(void *, const void *, size_t, int) = real_cudaMemcpy;
+    if (!real_fn) return -1;
+    return real_fn(dst, bounce, count, 1 /* cudaMemcpyHostToDevice */) == 0 ? 0 : -1;
+}
+
+/* Shared routing decision for cudaMemcpy / cudaMemcpyAsync / cudaMemcpyPeer /
+ * cudaMemcpyPeerAsync: all four reduce to the same "is either side a fake
+ * feeder pointer" classification - cudaMemcpyPeer's explicit device
+ * arguments are redundant with that, since our cudaMalloc/cuMemAlloc_v2
+ * active-remote branch already returns a fake pointer for any allocation
+ * made while the current device was set to a feeder ordinal.
+ *
+ * Returns 1 if this call fully handled the copy (*out_ret holds the
+ * cudaError_t to return); 0 if neither side is a remote pointer (caller
+ * falls through to the real, local copy primitive). */
+static int gb_route_cross_device_memcpy(void *dst, const void *src, size_t count,
+                                         cudaError_t *out_ret)
+{
+    uint64_t dstp = (uint64_t)(uintptr_t)dst;
+    uint64_t srcp = (uint64_t)(uintptr_t)src;
+    int dst_remote = gb_is_remote_ptr(dstp);
+    int src_remote = gb_is_remote_ptr(srcp);
+    if (!dst_remote && !src_remote)
+        return 0;
+
+    int rc;
+    if (dst_remote && !src_remote && gb_is_local_device_ptr(src)) {
+        rc = gb_staged_memcpy_device_to_remote(dstp, src, count);
+    } else if (src_remote && !dst_remote && gb_is_local_device_ptr(dst)) {
+        rc = gb_staged_memcpy_remote_to_device(dst, srcp, count);
+    } else if (dst_remote && !src_remote) {
+        GB_NVTX_PUSH("GB:net_h2d", GB_NVTX_COLOR_NET);
+        rc = gb_netc_memcpy_h2d(dstp, src, (uint64_t)count);
+        GB_NVTX_POP();
+        atomic_fetch_add_explicit(&g_h2d_mb, count >> 20, memory_order_relaxed);
+    } else if (src_remote && !dst_remote) {
+        GB_NVTX_PUSH("GB:net_d2h", GB_NVTX_COLOR_NET);
+        rc = gb_netc_memcpy_d2h(dst, srcp, (uint64_t)count);
+        GB_NVTX_POP();
+        atomic_fetch_add_explicit(&g_d2h_mb, count >> 20, memory_order_relaxed);
+    } else if (dst_remote) {
+        /* both remote (or dst_remote with the src-local-device check above
+         * already false) - existing feeder<->feeder path, unsupported in
+         * default (non-NCCL) builds; unchanged from prior behavior. */
+        rc = gb_netc_memcpy_d2d_push(dstp, src, (uint64_t)count);
+    } else {
+        rc = gb_netc_memcpy_d2d_pull(dst, srcp, (uint64_t)count);
+    }
+    *out_ret = (rc == 0) ? CUDA_SUCCESS : (cudaError_t)1; /* cudaErrorInvalidValue */
+    return 1;
+}
+
 cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind)
 {
     GB_CUDART_ENSURE();
-    static pfn_cudaMemcpy_t real_fn = NULL;
+    /* F-ABI1 fix: use the robustly-resolved global (gb_cudart_resolve_syms),
+     * not a local dlsym(RTLD_NEXT,...) - see the declaration comment above
+     * real_cudaMemcpy for why the old per-function dlsym silently dropped
+     * copies. RTLD_NEXT fallback kept only for the case GB_CUDART_ENSURE()
+     * hasn't run yet (real_cudaMemcpy still NULL pre-first-rebind). */
+    cudaError_t (*real_fn)(void *, const void *, size_t, int) = real_cudaMemcpy;
     if (!real_fn)
-        real_fn = (pfn_cudaMemcpy_t)dlsym(RTLD_NEXT, "cudaMemcpy");
+        real_fn = (cudaError_t (*)(void *, const void *, size_t, int))
+            dlsym(RTLD_NEXT, "cudaMemcpy");
 
     if (!initialized || !real_fn)
         return real_fn ? real_fn(dst, src, count, kind) : 0;
 
-    /* Route operations involving remote cluster pointers through netc */
+    /* Route operations involving remote cluster pointers through netc
+     * (including the device0<->feeder staged path - see
+     * gb_route_cross_device_memcpy above). */
     {
-        uint64_t dstp = (uint64_t)(uintptr_t)dst;
-        uint64_t srcp = (uint64_t)(uintptr_t)src;
-        int dst_remote = gb_is_remote_ptr(dstp);
-        int src_remote = gb_is_remote_ptr(srcp);
-        if (dst_remote || src_remote) {
-            int rc;
-            if (dst_remote && !src_remote) {
-                GB_NVTX_PUSH("GB:net_h2d", GB_NVTX_COLOR_NET);
-                rc = gb_netc_memcpy_h2d(dstp, src, (uint64_t)count);
-                GB_NVTX_POP();
-                atomic_fetch_add_explicit(&g_h2d_mb, count >> 20, memory_order_relaxed);
-            } else if (src_remote && !dst_remote) {
-                GB_NVTX_PUSH("GB:net_d2h", GB_NVTX_COLOR_NET);
-                rc = gb_netc_memcpy_d2h(dst, srcp, (uint64_t)count);
-                GB_NVTX_POP();
-                atomic_fetch_add_explicit(&g_d2h_mb, count >> 20, memory_order_relaxed);
-            } else if (dst_remote) {
-                rc = gb_netc_memcpy_d2d_push(dstp, src, (uint64_t)count);
-            } else {
-                rc = gb_netc_memcpy_d2d_pull(dst, srcp, (uint64_t)count);
-            }
-            return rc == 0 ? CUDA_SUCCESS : (cudaError_t)1; /* cudaErrorInvalidValue */
-        }
+        cudaError_t remote_ret;
+        if (gb_route_cross_device_memcpy(dst, src, count, &remote_ret))
+            return remote_ret;
     }
 
     /* U12: check if dst or src was previously evicted and is being re-accessed */
@@ -9294,13 +10099,100 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, int kind)
     return real_fn(dst, src, count, kind);
 }
 
+/* cudaMemcpy2DAsync — ggml uses strided copies for some tensor layouts.
+ * Remote fake pointers are served row-by-row over the fabric (load-time
+ * only, correctness over speed); local pointers pass through to the
+ * rebound cudart instance. */
+cudaError_t cudaMemcpy2DAsync(void *dst, size_t dpitch, const void *src,
+                              size_t spitch, size_t width, size_t height,
+                              int kind, cudaStream_t stream)
+{
+    GB_CUDART_ENSURE();
+    cudaError_t (*real_fn)(void *, size_t, const void *, size_t,
+                           size_t, size_t, int, cudaStream_t) = real_cudaMemcpy2DAsync;
+    if (!real_fn)
+        real_fn = (cudaError_t (*)(void *, size_t, const void *, size_t,
+                                   size_t, size_t, int, cudaStream_t))
+            dlsym(RTLD_NEXT, "cudaMemcpy2DAsync");
+
+    if (initialized) {
+        uint64_t dstp = (uint64_t)(uintptr_t)dst;
+        uint64_t srcp = (uint64_t)(uintptr_t)src;
+        int dst_remote = gb_is_remote_ptr(dstp);
+        int src_remote = gb_is_remote_ptr(srcp);
+        if (dst_remote || src_remote) {
+            if (dst_remote && src_remote) return (cudaError_t)1; /* unsupported */
+            for (size_t row = 0; row < height; row++) {
+                int rc;
+                if (dst_remote)
+                    rc = gb_netc_memcpy_h2d(dstp + row * dpitch,
+                                            (const uint8_t *)src + row * spitch,
+                                            (uint64_t)width);
+                else
+                    rc = gb_netc_memcpy_d2h((uint8_t *)dst + row * dpitch,
+                                            srcp + row * spitch,
+                                            (uint64_t)width);
+                if (rc != 0) return (cudaError_t)1;
+            }
+            return CUDA_SUCCESS;
+        }
+    }
+    return real_fn ? real_fn(dst, dpitch, src, spitch, width, height, kind, stream)
+                   : (cudaError_t)1;
+}
+
+/* cudaMemset/cudaMemsetAsync — required for feeder-resident buffers: ggml
+ * memsets the padding of every quantized tensor right after uploading it
+ * (ggml_backend_cuda_buffer init).  Unhooked, the fake 0xAA pointer reaches
+ * real CUDA and aborts llama-server with cudaErrorInvalidValue (hit live
+ * 2026-07-06 on the first feeder-T1 model buffer). */
+cudaError_t cudaMemset(void *devPtr, int value, size_t count)
+{
+    GB_CUDART_ENSURE();
+    /* F-ABI1: use the REBOUND cudart instance (real_cudaMemset via
+     * gb_cudart_sym), NOT dlsym(RTLD_NEXT) — RTLD_NEXT resolves the system
+     * cudart while ollama's cuda_v13 runtime is a different instance, and a
+     * valid local pointer fed to the wrong instance returns invalid argument
+     * (crashed llama-server at 13:55 on a purely LOCAL model load). */
+    cudaError_t (*real_fn)(void *, int, size_t) = real_cudaMemset;
+    if (!real_fn)
+        real_fn = (cudaError_t (*)(void *, int, size_t))
+            dlsym(RTLD_NEXT, "cudaMemset");
+
+    if (initialized && gb_is_remote_ptr((uint64_t)(uintptr_t)devPtr)) {
+        int rc = gb_netc_memset((uint64_t)(uintptr_t)devPtr, value, (uint64_t)count);
+        return rc == 0 ? CUDA_SUCCESS : (cudaError_t)1;
+    }
+    return real_fn ? real_fn(devPtr, value, count) : (cudaError_t)1;
+}
+
+cudaError_t cudaMemsetAsync(void *devPtr, int value, size_t count, cudaStream_t stream)
+{
+    GB_CUDART_ENSURE();
+    /* F-ABI1: same rebound-instance rule as cudaMemset above. */
+    cudaError_t (*real_fn)(void *, int, size_t, cudaStream_t) = real_cudaMemsetAsync;
+    if (!real_fn)
+        real_fn = (cudaError_t (*)(void *, int, size_t, cudaStream_t))
+            dlsym(RTLD_NEXT, "cudaMemsetAsync");
+
+    if (initialized && gb_is_remote_ptr((uint64_t)(uintptr_t)devPtr)) {
+        /* Synchronous over the fabric — the TCP round-trip already orders it
+         * against every other message on this feeder's socket. */
+        int rc = gb_netc_memset((uint64_t)(uintptr_t)devPtr, value, (uint64_t)count);
+        return rc == 0 ? CUDA_SUCCESS : (cudaError_t)1;
+    }
+    return real_fn ? real_fn(devPtr, value, count, stream) : (cudaError_t)1;
+}
+
 cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count,
                              int kind, cudaStream_t stream)
 {
     GB_CUDART_ENSURE();
-    static pfn_cudaMemcpyAsync_t real_fn = NULL;
+    /* F-ABI1 fix - see cudaMemcpy above. */
+    cudaError_t (*real_fn)(void *, const void *, size_t, int, void *) = real_cudaMemcpyAsync;
     if (!real_fn)
-        real_fn = (pfn_cudaMemcpyAsync_t)dlsym(RTLD_NEXT, "cudaMemcpyAsync");
+        real_fn = (cudaError_t (*)(void *, const void *, size_t, int, void *))
+            dlsym(RTLD_NEXT, "cudaMemcpyAsync");
 
     if (!initialized || !real_fn)
         return real_fn ? real_fn(dst, src, count, kind, stream) : 0;
@@ -9315,7 +10207,26 @@ cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count,
         int src_remote = gb_is_remote_ptr(srcp);
         if (dst_remote || src_remote) {
             int rc;
-            if (dst_remote && !src_remote) {
+            /* Device0<->feeder staging (see gb_route_cross_device_memcpy /
+             * the comment above cudaMemcpy) - checked first so the 2-device
+             * Ollama split's per-layer activation handoff never reaches the
+             * host-memory-assuming h2d/d2h calls below with a real VRAM
+             * pointer. */
+            if (dst_remote && !src_remote && gb_is_local_device_ptr(src)) {
+                GB_NVTX_PUSH("GB:net_h2d", GB_NVTX_COLOR_NET);
+                GB_NVTX_EVENT("MEMCPY_H2D_NET_STAGED", "T1_FEEDER", count >> 20, dstp,
+                               "cudaMemcpyAsync_h2d_feeder_staged");
+                rc = gb_staged_memcpy_device_to_remote(dstp, src, count);
+                GB_NVTX_POP();
+                atomic_fetch_add_explicit(&g_h2d_mb, count >> 20, memory_order_relaxed);
+            } else if (src_remote && !dst_remote && gb_is_local_device_ptr(dst)) {
+                GB_NVTX_PUSH("GB:net_d2h", GB_NVTX_COLOR_NET);
+                GB_NVTX_EVENT("MEMCPY_D2H_NET_STAGED", "T1_FEEDER", count >> 20, srcp,
+                               "cudaMemcpyAsync_d2h_feeder_staged");
+                rc = gb_staged_memcpy_remote_to_device(dst, srcp, count);
+                GB_NVTX_POP();
+                atomic_fetch_add_explicit(&g_d2h_mb, count >> 20, memory_order_relaxed);
+            } else if (dst_remote && !src_remote) {
                 GB_NVTX_PUSH("GB:net_h2d", GB_NVTX_COLOR_NET);
                 GB_NVTX_EVENT("MEMCPY_H2D_NET", "T1_FEEDER", count >> 20, dstp, "cudaMemcpyAsync_h2d_feeder");
                 rc = gb_netc_memcpy_h2d(dstp, src, (uint64_t)count);
@@ -9346,6 +10257,68 @@ cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count,
     return real_fn(dst, src, count, kind, stream);
 }
 
+/* cudaMemcpyPeer / cudaMemcpyPeerAsync - GREENBOOST_GGML_2DEV cross-device
+ * copy. ggml's multi-GPU backend may use these (rather than plain
+ * cudaMemcpy) for its device0<->device1 activation handoff. The explicit
+ * dstDevice/srcDevice arguments are redundant with pointer classification
+ * here (see gb_route_cross_device_memcpy) - any allocation made while the
+ * active device was a feeder ordinal already got a fake 0xAA pointer from
+ * cudaMalloc/cuMemAlloc_v2, regardless of what device index a later memcpy
+ * call names. When neither side is remote (a real multi-local-GPU box),
+ * fall through to the real driver function unchanged. */
+cudaError_t cudaMemcpyPeer(void *dst, int dstDevice, const void *src, int srcDevice,
+                           size_t count)
+{
+    GB_CUDART_ENSURE();
+    cudaError_t (*real_fn)(void *, int, const void *, int, size_t) = real_cudaMemcpyPeer;
+    if (!real_fn)
+        real_fn = (cudaError_t (*)(void *, int, const void *, int, size_t))
+            dlsym(RTLD_NEXT, "cudaMemcpyPeer");
+
+    if (initialized) {
+        cudaError_t remote_ret;
+        if (gb_route_cross_device_memcpy(dst, src, count, &remote_ret))
+            return remote_ret;
+    }
+    return real_fn ? real_fn(dst, dstDevice, src, srcDevice, count) : (cudaError_t)1;
+}
+
+cudaError_t cudaMemcpyPeerAsync(void *dst, int dstDevice, const void *src, int srcDevice,
+                                size_t count, cudaStream_t stream)
+{
+    GB_CUDART_ENSURE();
+    cudaError_t (*real_fn)(void *, int, const void *, int, size_t, void *) = real_cudaMemcpyPeerAsync;
+    if (!real_fn)
+        real_fn = (cudaError_t (*)(void *, int, const void *, int, size_t, void *))
+            dlsym(RTLD_NEXT, "cudaMemcpyPeerAsync");
+
+    if (initialized) {
+        cudaError_t remote_ret;
+        /* Network transfers are inherently synchronous - same rationale as
+         * cudaMemcpyAsync above; stream ordering is preserved by the
+         * barrier cudaStreamSynchronize adds after dispatch. */
+        if (gb_route_cross_device_memcpy(dst, src, count, &remote_ret))
+            return remote_ret;
+    }
+    return real_fn ? real_fn(dst, dstDevice, src, srcDevice, count, stream) : (cudaError_t)1;
+}
+
+/* ------------------------------------------------------------------ */
+/*  cudaStreamBeginCapture — CUDA graph capture entry point             */
+/*                                                                      */
+/*  ggml/llama.cpp (USE_GRAPHS=1) calls this once per decode batch to   */
+/*  start a CUDA graph capture pass.                                    */
+/* ------------------------------------------------------------------ */
+cudaError_t cudaStreamBeginCapture(cudaStream_t stream, int mode)
+{
+    GB_CUDART_ENSURE();
+    if (!real_cudaStreamBeginCapture)
+        real_cudaStreamBeginCapture = (pfn_cudaStreamBeginCapture)
+            dlsym(RTLD_NEXT, "cudaStreamBeginCapture");
+    if (!real_cudaStreamBeginCapture) return (cudaError_t)1;
+    return real_cudaStreamBeginCapture(stream, mode);
+}
+
 /* ------------------------------------------------------------------ */
 /*  cudaLaunchKernel - runtime API equivalent of cuLaunchKernel        */
 /*                                                                      */
@@ -9362,7 +10335,12 @@ cudaError_t cudaLaunchKernel(const void *func, gb_dim3 gridDim, gb_dim3 blockDim
                               void **args, size_t sharedMem, cudaStream_t stream)
 {
     GB_CUDART_ENSURE();
-    if (initialized && gb_netc_is_active() && func && args) {
+    /* Feeder dispatch in feeder-exclusive mode OR when this thread's active
+     * device is the feeder under GREENBOOST_GGML_2DEV (see the widened gate
+     * comment on cudaLaunchKernelExC below). */
+    if (initialized && gb_netc_is_active() &&
+        (gb_feeder_exclusive() || gb_netc_get_active_remote() >= 0) &&
+        func && args) {
         const char *kname = gb_netc_lookup_kernel(func);
         if (kname) {
             struct gb_exec_reloc relocs[32];
@@ -9414,6 +10392,142 @@ cudaError_t cudaLaunchKernel(const void *func, gb_dim3 gridDim, gb_dim3 blockDim
     return real_cudaLaunchKernel(func, gridDim, blockDim, args, sharedMem, stream);
 }
 
+/* cudaLaunchKernelExC — cuda_v13 ggml's launch entry point (PR-CLKExC take 2,
+ * see the typedef comment for why the 2026-06-24 attempt failed).  Same
+ * data-driven feeder dispatch as cudaLaunchKernel; attrs are forwarded
+ * untouched on the local path and dropped on the remote path (the feeder
+ * executes on its own stream). */
+/* Query a runtime-API kernel's real parameter count + sizes.
+ * cudaLaunchKernelExC's args[] has NO NULL-terminator guarantee (unlike the
+ * de-facto layout ggml uses for plain cudaLaunchKernel) — scanning past the
+ * real count dereferences stack garbage and SIGSEGVs (hit live 2026-07-06,
+ * first warmup launch in feeder-exclusive mode).  cudaGetKernel (12.1+) maps
+ * the host stub to a CUkernel; cuKernelGetParamInfo enumerates params. */
+static int gb_kernel_param_sizes(const void *func, uint32_t sizes[64])
+{
+    static int (*p_paraminfo)(void *, size_t, size_t *, size_t *) = NULL;
+    static int probed = 0;
+    if (!probed) {
+        probed = 1;
+        void *lc = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
+        if (lc) p_paraminfo = (int (*)(void *, size_t, size_t *, size_t *))
+            dlsym(lc, "cuKernelGetParamInfo");
+    }
+    /* F-ABI1: MUST be the rebound cudart instance — the kernel stubs are
+     * registered with ggml's cuda_v13 runtime; the system cudart's
+     * cudaGetKernel does not know them (hit live: -1 param count made the
+     * launch fall through LOCALLY with remote fake-ptr args → sticky
+     * illegal-memory-access reported at the next cudaFuncGetAttributes). */
+    cudaError_t (*p_getk)(void **, const void *) = real_cudaGetKernel;
+    if (!p_getk)
+        p_getk = (cudaError_t (*)(void **, const void *))
+            dlsym(RTLD_NEXT, "cudaGetKernel");
+    if (!p_getk || !p_paraminfo) return -1;
+    void *k = NULL;
+    if (p_getk(&k, func) != 0 || !k) return -1;
+    int n = 0;
+    for (; n < 64; n++) {
+        size_t off = 0, sz = 0;
+        if (p_paraminfo(k, (size_t)n, &off, &sz) != 0) break;
+        sizes[n] = (uint32_t)sz;   /* full size — struct-by-value params can be >8B */
+    }
+    return n;
+}
+
+cudaError_t cudaLaunchKernelExC(const gb_cudaLaunchConfig *config,
+                                const void *func, void **args)
+{
+    GB_CUDART_ENSURE();
+    cudaError_t (*real_fn)(const gb_cudaLaunchConfig *, const void *, void **)
+        = real_cudaLaunchKernelExC;
+    if (!real_fn)
+        real_fn = (pfn_cudaLaunchKernelExC)dlsym(RTLD_NEXT, "cudaLaunchKernelExC");
+
+    /* Feeder kernel DISPATCH only runs where a kernel's args are actually
+     * feeder-resident — either feeder-exclusive mode (the whole working set
+     * is feeder-side), or GREENBOOST_GGML_2DEV with the CURRENT THREAD's
+     * active device set to the feeder (gb_netc_get_active_remote() >= 0):
+     * under the 2-device Ollama split, device 1's layer weights, staged
+     * activations, and KV are ALL feeder-resident by construction (see the
+     * cudaMemcpy staging above), so this launch's args are exactly as safe
+     * to pack/scan as feeder-exclusive's. In the default single-vGPU path a
+     * large model's buffers sit in LOCAL T2 (feeder T1 is skipped when the
+     * buffer exceeds feeder VRAM), so every arg is local: running the
+     * param-size query + packing on every launch there added cost and a
+     * crash risk on the proven-working path (regression: SIGSEGV during
+     * ggml warmup after 2026-07-06 Full Install).  Gate it. */
+    if (initialized && gb_netc_is_active() &&
+        (gb_feeder_exclusive() || gb_netc_get_active_remote() >= 0) &&
+        config && func && args) {
+        const char *kname = gb_netc_lookup_kernel(func);
+        uint32_t psizes[64];
+        int n_params = kname ? gb_kernel_param_sizes(func, psizes) : -1;
+        /* RAW path: need real param sizes (struct-by-value args exceed 8B and
+         * carry embedded pointers).  Without cuKernelGetParamInfo we cannot
+         * safely pack the buffer, so fall through to local launch. */
+        if (kname && n_params > 0 && n_params <= 64) {
+            /* Pack params into an 8-byte-aligned buffer; scan every 8-byte
+             * slot (top-level AND inside structs) for remote fake pointers. */
+            static __thread uint8_t  param_buf[8192];
+            uint32_t param_off[64];
+            struct gb_exec_reloc_raw relocs[128];
+            int n_relocs = 0, dispatch_feeder = -1;
+            uint32_t off = 0;
+            int packed_ok = 1;
+
+            for (int i = 0; i < n_params; i++) {
+                uint32_t sz = psizes[i] ? psizes[i] : 8;
+                uint32_t asz = (sz + 7u) & ~7u;               /* 8-byte align */
+                if (off + asz > sizeof(param_buf)) { packed_ok = 0; break; }
+                param_off[i] = off;
+                memcpy(param_buf + off, args[i], sz);
+                if (asz > sz) memset(param_buf + off + sz, 0, asz - sz);
+                /* scan this param's 8-byte slots for remote fake ptrs */
+                for (uint32_t b = 0; b + 8 <= sz && n_relocs < 128; b += 8) {
+                    uint64_t v;
+                    memcpy(&v, param_buf + off + b, 8);
+                    if (!gb_is_remote_ptr(v)) continue;
+                    uint64_t rh = 0; int fi = -1;
+                    if (gb_netc_get_alloc_info(v, &rh, NULL, NULL, &fi) == 0) {
+                        relocs[n_relocs].buf_offset    = off + b;
+                        relocs[n_relocs].remote_handle = rh;
+                        relocs[n_relocs].feeder_idx    = fi;
+                        n_relocs++;
+                        if (dispatch_feeder < 0) dispatch_feeder = fi;
+                    }
+                }
+                off += asz;
+            }
+
+            if (packed_ok && dispatch_feeder >= 0) {
+                gb_log("cudaLaunchKernelExC: RAW dispatch '%s' → feeder %d "
+                       "(%d params, %u buf bytes, %d remote ptrs incl. struct-embedded)",
+                       kname, dispatch_feeder, n_params, off, n_relocs);
+                int rc = gb_netc_exec_kernel_raw(dispatch_feeder, kname,
+                                                 config->gridDim.x, config->gridDim.y, config->gridDim.z,
+                                                 config->blockDim.x, config->blockDim.y, config->blockDim.z,
+                                                 (uint32_t)config->dynamicSmemBytes,
+                                                 param_buf, off, psizes, (uint32_t)n_params,
+                                                 relocs, n_relocs);
+                for (int _ri = 0; _ri < n_relocs; _ri++) {
+                    uint64_t v;
+                    memcpy(&v, param_buf + relocs[_ri].buf_offset, 8);
+                    gb_netc_alloc_release_ref(v);
+                }
+                if (rc == 0) atomic_fetch_add_explicit(&g_kernel_dispatch_count, 1, memory_order_relaxed);
+                return rc == 0 ? CUDA_SUCCESS : (cudaError_t)700;
+            }
+            for (int _ri = 0; _ri < n_relocs; _ri++) {
+                uint64_t v;
+                memcpy(&v, param_buf + relocs[_ri].buf_offset, 8);
+                gb_netc_alloc_release_ref(v);
+            }
+        }
+    }
+
+    return real_fn ? real_fn(config, func, args) : (cudaError_t)1;
+}
+
 /* ------------------------------------------------------------------ */
 /*  cudaStreamSynchronize - sync local + remote streams                 */
 /*                                                                      */
@@ -9431,6 +10545,19 @@ cudaError_t cudaStreamSynchronize(cudaStream_t stream)
      * extra round-trip, avoiding unnecessary latency for idle feeders. */
     if (initialized && gb_netc_is_active())
         gb_netc_selective_stream_sync();
+
+    /* Keep shim_stats fresh during decode. Every prior gb_maybe_write_stats()
+     * call site is on the alloc/free path, which goes quiet once a model has
+     * finished loading - vitals then reads a >30s-stale file and reports
+     * "shim stats unavailable"/"shim not active" even though inference is
+     * actively running. cudaStreamSynchronize fires once per decode step
+     * (ggml/llama.cpp syncs after each batch) regardless of whether a
+     * feeder is involved, unconditionally on the local-only path too - the
+     * one hot-path call site that reliably refreshes the timestamp for
+     * every inference session, not just feeder-cluster ones. Cheap: the
+     * function is itself CAS+250ms-interval gated. */
+    if (initialized)
+        gb_maybe_write_stats();
 
     if (!real_cudaStreamSynchronize)
         real_cudaStreamSynchronize = (pfn_cudaStreamSynchronize)dlsym(RTLD_NEXT,
