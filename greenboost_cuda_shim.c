@@ -6716,6 +6716,363 @@ static int gb_try_feeder_alloc_tier(CUdeviceptr *dptr, size_t bytesize, uint8_t 
     return -1;
 }
 
+/* ================================================================== */
+/*  RULE #1 — front-load VRAM split  (GB_VRAM_FRONTLOAD, default OFF)   */
+/*                                                                      */
+/*  Problem: a large model's weights arrive as ONE big cudaMalloc.      */
+/*  gb_needs_overflow() is all-or-nothing, so gb_smart_overflow_alloc   */
+/*  places the ENTIRE buffer in a single tier (usually local T2 DDR)    */
+/*  while physical VRAM sits partly free.  This violates the immutable  */
+/*  "fill GPU VRAM to ~90%" rule.                                       */
+/*                                                                      */
+/*  Fix: for a large overflow buffer, reserve ONE contiguous VA of the  */
+/*  full size, back the FIRST portion with physical-VRAM DEVICE handles */
+/*  (filling up to a ~pct% target) and the REMAINDER with host-pinned   */
+/*  VMM handles — the exact CU_MEM_LOCATION_TYPE_HOST_NUMA_CURRENT       */
+/*  PINNED path already used by the cuMemCreate() intercept.  Both       */
+/*  portions live in one VA range mapped with one cuMemSetAccess, so any */
+/*  kernel / memcpy sees a single coherent buffer.                       */
+/*                                                                      */
+/*  Guarded OFF by default: when GB_VRAM_FRONTLOAD is unset/"0" this     */
+/*  path is never entered and behaviour is byte-for-byte the previous    */
+/*  allocator.  Any error inside the split path unwinds fully and        */
+/*  returns non-success, so gb_smart_overflow_alloc falls through to the */
+/*  existing tiers unchanged — an alloc that used to succeed still does. */
+/* ================================================================== */
+
+static int gb_frontload_enabled(void)
+{
+    static int v = -1;
+    if (__builtin_expect(v < 0, 0)) {
+        const char *e = getenv("GB_VRAM_FRONTLOAD");
+        v = (e && e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
+/* Fill target as a percentage of TOTAL VRAM (default 90, clamped 50..99). */
+static unsigned gb_frontload_pct(void)
+{
+    static unsigned p = 0;
+    if (__builtin_expect(p == 0, 0)) {
+        const char *e = getenv("GB_VRAM_FRONTLOAD_PCT");
+        long v = e ? (long)gb_atoll(e) : 0;
+        if (v < 50 || v > 99) v = 90;
+        p = (unsigned)v;
+    }
+    return p;
+}
+
+/* Minimum overflow-buffer size that triggers a split (default 512 MB). */
+static size_t gb_frontload_min_bytes(void)
+{
+    static size_t b = 0;
+    if (__builtin_expect(b == 0, 0)) {
+        const char *e = getenv("GB_VRAM_FRONTLOAD_MIN_MB");
+        long mb = e ? (long)gb_atoll(e) : 512;
+        if (mb < 1) mb = 512;
+        b = (size_t)mb << 20;
+    }
+    return b;
+}
+
+/* Sub-range physical backing for a front-load split allocation. */
+typedef struct {
+    CUmemGenericAllocationHandle handle; /* physical handle (device or host) */
+    CUdeviceptr                  addr;   /* va + offset (start of this chunk) */
+    size_t                       size;   /* mapped bytes (granularity-aligned) */
+} gb_fl_chunk_t;
+
+typedef struct {
+    CUdeviceptr    va;           /* 0 = empty, UINT64_MAX = tombstone */
+    size_t         va_size;      /* reserved VA length */
+    size_t         device_bytes; /* VRAM-backed bytes  → GB_TIER_T1_LOCAL */
+    size_t         host_bytes;   /* host-backed bytes  → GB_TIER_T2_LOCAL + T2 cap */
+    gb_fl_chunk_t *chunks;       /* malloc'd array, n_chunks entries */
+    uint32_t       n_chunks;
+} gb_fl_entry_t;
+
+#define GB_FL_HT_BITS   8u
+#define GB_FL_HT_SIZE   (1u << GB_FL_HT_BITS)
+#define GB_FL_HT_MASK   (GB_FL_HT_SIZE - 1u)
+#define GB_FL_TOMBSTONE ((CUdeviceptr)UINT64_MAX)
+/* Chunk unit: physical handles are created in pieces of this size (aligned up
+ * to the allocation granularity) so a slightly-too-high 90% estimate stops the
+ * device portion at a chunk boundary and rolls the rest into host memory. */
+#define GB_FL_CHUNK_UNIT (1ULL << 30)  /* 1 GiB */
+
+static gb_fl_entry_t   gb_fl_ht[GB_FL_HT_SIZE];
+static pthread_mutex_t gb_fl_ht_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static inline uint32_t gb_fl_hash(CUdeviceptr va)
+{
+    return (uint32_t)(((uint64_t)va * 0x9E3779B97F4A7C15ULL) >> (64 - GB_FL_HT_BITS));
+}
+
+/* Returns 1 on success, 0 if the (tiny) table is full. */
+static int gb_fl_ht_insert(CUdeviceptr va, size_t va_size, size_t device_bytes,
+                           size_t host_bytes, gb_fl_chunk_t *chunks, uint32_t n_chunks)
+{
+    int ok = 0;
+    pthread_mutex_lock(&gb_fl_ht_lock);
+    uint32_t slot = gb_fl_hash(va) & GB_FL_HT_MASK;
+    for (uint32_t i = 0; i < GB_FL_HT_SIZE; i++) {
+        gb_fl_entry_t *e = &gb_fl_ht[(slot + i) & GB_FL_HT_MASK];
+        if (e->va == 0 || e->va == GB_FL_TOMBSTONE) {
+            e->va = va; e->va_size = va_size;
+            e->device_bytes = device_bytes; e->host_bytes = host_bytes;
+            e->chunks = chunks; e->n_chunks = n_chunks;
+            ok = 1; break;
+        }
+    }
+    pthread_mutex_unlock(&gb_fl_ht_lock);
+    return ok;
+}
+
+/* Returns 1 and copies the entry to *out (caller frees out->chunks) if found. */
+static int gb_fl_ht_remove(CUdeviceptr va, gb_fl_entry_t *out)
+{
+    if (!va) return 0;
+    int found = 0;
+    pthread_mutex_lock(&gb_fl_ht_lock);
+    uint32_t slot = gb_fl_hash(va) & GB_FL_HT_MASK;
+    for (uint32_t i = 0; i < GB_FL_HT_SIZE; i++) {
+        gb_fl_entry_t *e = &gb_fl_ht[(slot + i) & GB_FL_HT_MASK];
+        if (e->va == 0) break;               /* end of probe chain */
+        if (e->va == va) {
+            *out = *e;
+            e->va = GB_FL_TOMBSTONE; e->chunks = NULL; e->n_chunks = 0;
+            e->va_size = e->device_bytes = e->host_bytes = 0;
+            found = 1; break;
+        }
+    }
+    pthread_mutex_unlock(&gb_fl_ht_lock);
+    return found;
+}
+
+/* Front-load split: fill VRAM to ~pct% with DEVICE handles, remainder with
+ * host-pinned VMM handles, all mapped into ONE reserved VA.  On ANY failure
+ * unwinds every side effect and returns non-success so the caller falls back
+ * to the existing whole-buffer overflow path.  Never records tier accounting
+ * unless it returns CUDA_SUCCESS. */
+static CUresult gb_frontload_split_alloc(CUdeviceptr *dptr, size_t bytesize)
+{
+    if (!real_cuMemAddressReserve || !real_cuMemCreate || !real_cuMemMap ||
+        !real_cuMemSetAccess || !real_cuMemAddressFree || !real_cuMemRelease ||
+        !real_cuMemUnmap || !real_cuMemGetAllocationGranularity)
+        return CUDA_ERROR_NOT_SUPPORTED;
+
+    /* Resolve host location type once (shared cache with the hostnuma /
+     * cuMemCreate paths — prefers HOST_NUMA_CURRENT, HOST on single-socket). */
+    if (__builtin_expect(gb_vmm_host_loc_type == 0, 0))
+        gb_vmm_host_loc_type = CU_MEM_LOCATION_TYPE_HOST_NUMA_CURRENT;
+
+    CUmemAllocationProp dprop; memset(&dprop, 0, sizeof(dprop));
+    dprop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    dprop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    dprop.location.id   = 0;
+    CUmemAllocationProp hprop; memset(&hprop, 0, sizeof(hprop));
+    hprop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    hprop.location.type = gb_vmm_host_loc_type;
+    hprop.location.id   = 0;
+
+    /* Common granularity = max(device, host) so every chunk boundary is legal
+     * for both handle types mapped into the same VA. */
+    size_t dgran = 0, hgran = 0;
+    if (real_cuMemGetAllocationGranularity(&dgran, &dprop, 0 /*MINIMUM*/) != CUDA_SUCCESS || dgran == 0)
+        dgran = 2ULL << 20;
+    if (real_cuMemGetAllocationGranularity(&hgran, &hprop, 0 /*MINIMUM*/) != CUDA_SUCCESS || hgran == 0)
+        hgran = 2ULL << 20;
+    size_t gran = dgran > hgran ? dgran : hgran;
+
+    size_t va_size = (bytesize + gran - 1) & ~(gran - 1);
+
+    /* Target VRAM fill = free VRAM minus the (100-pct)% fill headroom and the
+     * same reserves gb_needs_overflow() honours.  Being conservative here is
+     * safe: the device-chunk loop stops early on real OOM if the estimate is
+     * slightly high, rolling the rest into host memory. */
+    size_t free_vram  = atomic_load_explicit(&g_cached_free_vram,  memory_order_relaxed);
+    size_t total_vram = atomic_load_explicit(&g_cached_total_vram, memory_order_relaxed);
+    if (free_vram == 0 || total_vram == 0)
+        return CUDA_ERROR_NOT_SUPPORTED;
+
+    size_t fill_headroom = total_vram * (100 - gb_frontload_pct()) / 100;
+    size_t kv_reserved   = atomic_load_explicit(&g_kv_reserve_bytes,      memory_order_relaxed);
+    size_t kv_in_t1      = atomic_load_explicit(&g_kv_allocated_t1_bytes, memory_order_relaxed);
+    size_t kv_reserve    = (kv_in_t1 >= kv_reserved) ? 0 : (kv_reserved - kv_in_t1);
+    size_t ws_reserve    = 0;
+    if (atomic_load_explicit(&g_alloc_phase, memory_order_relaxed) <= GB_PHASE_MODEL_LOAD)
+        ws_reserve = atomic_load_explicit(&g_workspace_reserve_bytes, memory_order_relaxed);
+
+    size_t reserved_total = fill_headroom + vram_headroom_bytes + kv_reserve + ws_reserve;
+    if (free_vram <= reserved_total)
+        return CUDA_ERROR_NOT_SUPPORTED;              /* no VRAM to front-load */
+    size_t target_free = free_vram - reserved_total;
+
+    size_t device_portion = (bytesize < target_free) ? bytesize : target_free;
+    device_portion &= ~(gran - 1);                    /* round DOWN to gran */
+    if (device_portion == 0)
+        return CUDA_ERROR_NOT_SUPPORTED;
+
+    /* Reserve one VA for the whole logical buffer. */
+    CUdeviceptr va = 0;
+    CUresult ret = real_cuMemAddressReserve(&va, va_size, 0, 0, 0);
+    if (ret != CUDA_SUCCESS) {
+        gb_log("frontload: cuMemAddressReserve %zu MB FAILED ret=%d — fallback",
+               va_size >> 20, ret);
+        return ret;
+    }
+
+    size_t chunk_unit = GB_FL_CHUNK_UNIT;
+    if (chunk_unit < gran) chunk_unit = gran;
+    chunk_unit &= ~(gran - 1);
+    if (chunk_unit == 0) chunk_unit = gran;
+
+    uint32_t max_chunks = (uint32_t)(va_size / chunk_unit) + 2;
+    gb_fl_chunk_t *chunks = (gb_fl_chunk_t *)calloc(max_chunks, sizeof(gb_fl_chunk_t));
+    if (!chunks) {
+        real_cuMemAddressFree(va, va_size);
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+    uint32_t nc = 0;
+    size_t off = 0, dev_mapped = 0;
+    int t2_reserved = 0;
+    size_t host_portion = 0;
+
+    /* --- DEVICE portion: fill physical VRAM up to the target --- */
+    while (off < device_portion) {
+        size_t csz = device_portion - off;
+        if (csz > chunk_unit) csz = chunk_unit;      /* csz stays gran-aligned */
+        CUmemGenericAllocationHandle h;
+        CUresult cret = real_cuMemCreate(&h, csz, &dprop, 0);
+        if (cret != CUDA_SUCCESS) {
+            /* Real device OOM: stop the device portion early; the rest goes to
+             * host.  Never fail the whole alloc because 90% was slightly high. */
+            gb_log("frontload: device cuMemCreate stopped at %zu/%zu MB (ret=%d) — rest to host",
+                   dev_mapped >> 20, device_portion >> 20, cret);
+            break;
+        }
+        cret = real_cuMemMap(va + off, csz, 0, h, 0);
+        if (cret != CUDA_SUCCESS) {
+            real_cuMemRelease(h);
+            gb_log("frontload: device cuMemMap off=%zu MB FAILED ret=%d — stopping device portion",
+                   off >> 20, cret);
+            break;
+        }
+        chunks[nc].handle = h; chunks[nc].addr = va + off; chunks[nc].size = csz; nc++;
+        off += csz; dev_mapped += csz;
+    }
+    device_portion = dev_mapped;                     /* actual VRAM mapped */
+    host_portion   = va_size - device_portion;       /* remainder incl. tail */
+
+    /* --- HOST portion: pinned VMM handles for the remainder --- */
+    if (host_portion > 0) {
+        if (gb_t2_try_reserve(host_portion) != 0) {
+            gb_log("frontload: host portion %zu MB would exceed T2 cap — fallback",
+                   host_portion >> 20);
+            goto fl_unwind;                          /* t2 not reserved */
+        }
+        t2_reserved = 1;
+        while (off < va_size) {
+            size_t csz = va_size - off;
+            if (csz > chunk_unit) csz = chunk_unit;
+            CUmemGenericAllocationHandle h;
+            CUresult cret = real_cuMemCreate(&h, csz, &hprop, 0);
+            if (cret == CUDA_ERROR_INVALID_VALUE &&
+                hprop.location.type == CU_MEM_LOCATION_TYPE_HOST_NUMA_CURRENT) {
+                /* Single-socket UMA: HOST_NUMA_CURRENT unsupported → HOST. */
+                gb_vmm_host_loc_type = CU_MEM_LOCATION_TYPE_HOST;
+                hprop.location.type  = CU_MEM_LOCATION_TYPE_HOST;
+                cret = real_cuMemCreate(&h, csz, &hprop, 0);
+            }
+            if (cret != CUDA_SUCCESS) {
+                gb_log("frontload: host cuMemCreate off=%zu MB FAILED ret=%d — unwinding",
+                       off >> 20, cret);
+                goto fl_unwind;
+            }
+            cret = real_cuMemMap(va + off, csz, 0, h, 0);
+            if (cret != CUDA_SUCCESS) {
+                real_cuMemRelease(h);
+                gb_log("frontload: host cuMemMap off=%zu MB FAILED ret=%d — unwinding",
+                       off >> 20, cret);
+                goto fl_unwind;
+            }
+            chunks[nc].handle = h; chunks[nc].addr = va + off; chunks[nc].size = csz; nc++;
+            off += csz;
+        }
+    }
+
+    /* --- one RW device mapping over the whole VA --- */
+    {
+        CUmemAccessDesc desc; memset(&desc, 0, sizeof(desc));
+        desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        desc.location.id   = 0;
+        desc.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        ret = real_cuMemSetAccess(va, va_size, &desc, 1);
+        if (ret != CUDA_SUCCESS) {
+            gb_log("frontload: cuMemSetAccess FAILED ret=%d — unwinding", ret);
+            goto fl_unwind;
+        }
+    }
+
+    if (!gb_fl_ht_insert(va, va_size, device_portion, host_portion, chunks, nc)) {
+        gb_log("frontload: tracking table full — unwinding");
+        goto fl_unwind;
+    }
+
+    /* Success: record tiers so tier_t1_local_cur_mb reflects the front-loaded
+     * VRAM (this is what makes RULE #1 visible in dataflux). */
+    gb_tier_record_alloc(GB_TIER_T1_LOCAL, device_portion);
+    if (host_portion > 0)
+        gb_tier_record_alloc(GB_TIER_T2_LOCAL, host_portion);
+    *dptr = va;
+    gb_log("frontload split: req=%zu MB → T1(VRAM)=%zu MB + T2(host)=%zu MB "
+           "va=0x%llx chunks=%u pct=%u",
+           bytesize >> 20, device_portion >> 20, host_portion >> 20,
+           (unsigned long long)va, nc, gb_frontload_pct());
+    GB_NVTX_EVENT("ALLOC_FRONTLOAD", "T1_GPU", device_portion >> 20, va,
+                  "vram_frontload_split");
+    gb_maybe_write_stats();
+    return CUDA_SUCCESS;
+
+fl_unwind:
+    if (t2_reserved) gb_t2_release_reserved(host_portion);
+    for (uint32_t i = 0; i < nc; i++) {
+        real_cuMemUnmap(chunks[i].addr, chunks[i].size);
+        real_cuMemRelease(chunks[i].handle);
+    }
+    real_cuMemAddressFree(va, va_size);
+    free(chunks);
+    return CUDA_ERROR_OUT_OF_MEMORY;
+}
+
+/* Free a front-load split allocation: unmap + release every chunk, free the
+ * VA, release the T2 reservation, and update tier accounting.  Returns 1 if
+ * dptr was a front-load VA (caller returns success), 0 otherwise. */
+static int gb_frontload_free_dispatch(CUdeviceptr dptr)
+{
+    gb_fl_entry_t e;
+    if (!gb_fl_ht_remove(dptr, &e))
+        return 0;
+    GB_NVTX_EVENT("FREE_FRONTLOAD", "T1_GPU", e.device_bytes >> 20, dptr,
+                  "vram_frontload_free");
+    for (uint32_t i = 0; i < e.n_chunks; i++) {
+        if (real_cuMemUnmap)   real_cuMemUnmap(e.chunks[i].addr, e.chunks[i].size);
+        if (real_cuMemRelease) real_cuMemRelease(e.chunks[i].handle);
+    }
+    if (real_cuMemAddressFree) real_cuMemAddressFree(e.va, e.va_size);
+    free(e.chunks);
+    if (e.host_bytes > 0)
+        atomic_fetch_sub_explicit(&gb_t2_overflow_bytes, e.host_bytes, memory_order_relaxed);
+    gb_tier_record_free(GB_TIER_T1_LOCAL, e.device_bytes);
+    if (e.host_bytes > 0)
+        gb_tier_record_free(GB_TIER_T2_LOCAL, e.host_bytes);
+    gb_log("frontload free: va=0x%llx T1=%zu MB T2=%zu MB",
+           (unsigned long long)dptr, e.device_bytes >> 20, e.host_bytes >> 20);
+    gb_maybe_write_stats();
+    return 1;
+}
+
 static CUresult gb_smart_overflow_alloc(CUdeviceptr *dptr, size_t bytesize) {
     int cur_phase = atomic_load_explicit(&g_alloc_phase, memory_order_relaxed);
 
@@ -6732,6 +7089,22 @@ static CUresult gb_smart_overflow_alloc(CUdeviceptr *dptr, size_t bytesize) {
                 gb_log("feeder-exclusive: WARN feeder not connected after 8s - "
                        "allocs may fall local");
         }
+    }
+
+    /* RULE #1 front-load VRAM split (GB_VRAM_FRONTLOAD, default OFF): before
+     * any feeder-T1/local-T2 tier, try to fill physical VRAM to ~pct% and place
+     * only the remainder in host T2, returning ONE contiguous VA.  Gated on a
+     * large buffer, meaningful free physical VRAM, and non-feeder-exclusive
+     * mode.  Any failure falls through to the existing tiers unchanged. */
+    if (gb_frontload_enabled() && !gb_feeder_exclusive() &&
+        bytesize >= gb_frontload_min_bytes() &&
+        atomic_load_explicit(&g_cached_free_vram, memory_order_relaxed) > (1ULL << 30)) {
+        if (gb_frontload_split_alloc(dptr, bytesize) == CUDA_SUCCESS) {
+            gb_log("smart_alloc: frontload split (%zu MB)", bytesize >> 20);
+            return CUDA_SUCCESS;
+        }
+        gb_log("smart_alloc: frontload declined for %zu MB — using existing tiers",
+               bytesize >> 20);
     }
 
     /* U3: count this overflow event and update rolling eviction rate.
@@ -7372,6 +7745,10 @@ CUresult cuMemFree_v2(CUdeviceptr dptr)
     /* Blackwell T2: bvmm_ht pointers were never inserted into ht - check
      * first.  See gb_bvmm_free_dispatch (PR-D/R2) which deduplicates the
      * Path-A/B/C free dispatch that used to be triplicated here. */
+    /* RULE #1 front-load split VAs are tracked in gb_fl_ht, not ht/bvmm_ht. */
+    if (gb_frontload_free_dispatch(dptr))
+        return CUDA_SUCCESS;
+
     if (gb_bvmm_free_dispatch(dptr))
         return CUDA_SUCCESS;
 
@@ -7755,6 +8132,10 @@ cudaError_t cudaFreeAsync(void *devPtr, cudaStream_t stream)
     /* Blackwell T2: bvmm_ht pointers were never inserted into ht - check
      * first.  See gb_bvmm_free_dispatch (PR-D/R2) which deduplicates the
      * Path-A/B/C free dispatch that used to be triplicated here. */
+    /* RULE #1 front-load split VAs are tracked in gb_fl_ht, not ht/bvmm_ht. */
+    if (gb_frontload_free_dispatch(dptr))
+        return CUDA_SUCCESS;
+
     if (gb_bvmm_free_dispatch(dptr))
         return CUDA_SUCCESS;
 
@@ -7818,6 +8199,10 @@ cudaError_t cudaFree(void *devPtr)
     /* Blackwell T2: bvmm_ht pointers were never inserted into ht - check
      * first.  See gb_bvmm_free_dispatch (PR-D/R2) which deduplicates the
      * Path-A/B/C free dispatch that used to be triplicated here. */
+    /* RULE #1 front-load split VAs are tracked in gb_fl_ht, not ht/bvmm_ht. */
+    if (gb_frontload_free_dispatch(dptr))
+        return CUDA_SUCCESS;
+
     if (gb_bvmm_free_dispatch(dptr))
         return CUDA_SUCCESS;
 
@@ -9251,6 +9636,10 @@ CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream hStream)
      * cuMemFreeAsync leaks the bvmm_ht entry, gb_t2_overflow_bytes drifts
      * up by `sz` per cycle, and a later alloc that reuses the same VA
      * would see a stale entry → wrong-type cleanup on next free. */
+    /* RULE #1 front-load split VAs are tracked in gb_fl_ht, not ht/bvmm_ht. */
+    if (gb_frontload_free_dispatch(dptr))
+        return CUDA_SUCCESS;
+
     if (gb_bvmm_free_dispatch(dptr))
         return CUDA_SUCCESS;
 
