@@ -12,9 +12,9 @@
 **Run bigger models on the GPU you already have.**
 
 > GreenBoost does it three ways, together:
-> 1. lends your GPU system RAM + NVMe (memory tiering)
-> 2. compresses models to fit real VRAM (gb-quant weights + TurboQuant K/V cache)
-> 3. pools idle machines on your LAN (cluster mode)
+>> lends your GPU system RAM + NVMe (memory tiering) <<
+>> compresses models to fit real VRAM (gb-quant weights + TurboQuant K/V cache) <<
+>> pools idle machines on your LAN (cluster mode) <<
 
 [Quick install](#-quick-install) ·
 [How it works](#-how-it-works) ·
