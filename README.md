@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🧠 ⚡ GreenBoost ⚡ 🧠 ⭐⭐⭐⭐⭐ 📈📈
+# 📈 🧠 ⚡ GreenBoost ⚡ 🧠 📈
 
 ### CUDA Memory & Compute Orchestrator for NVIDIA GPUs
 
@@ -23,7 +23,7 @@
 
 | Feature | Description |
 |---------|-------------|
-| 📦 **Memory Tiering** | Extend GPU memory using system RAM and NVMe. |
+| 📦 **GB-Tiering** | Extend GPU memory using system RAM and NVMe. |
 | 🗜️ **GB-Quant** | Compress model weights and the KV cache so larger models fit into available VRAM. |
 | 📡 **GB-Dataflux** | Live telemetry exposed through the GreenBoost Dataflux MCP server and a web dashboard. Launch the UI with `greenboost dataflux-ui`. |
 | 🌐 **GB-Cluster** | Borrow idle GPU and RAM resources from other machines on your local network. |
