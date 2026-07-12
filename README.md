@@ -29,6 +29,9 @@ No retraining. No code changes. Just install GreenBoost and keep using Ollama, l
 
 </div>
 
+
+<div align="center">
+
 [Quick Start](#-quick-install) ·
 [Documentation](#-documentation-map) ·
 [Architecture](#-how-it-works) ·
