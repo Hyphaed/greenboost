@@ -85,6 +85,15 @@ RPC_PORT_BASE = 50052
 _SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
              "-o", "StrictHostKeyChecking=accept-new"]
 
+# How long a feeder's rpc-server gets to bind its port after we launch it
+# (CUDA init on a cold GPU dominates), and how long serve() watches a freshly
+# spawned engine before handing it back to the caller as "still loading".
+# The grace window only needs to outlive the failures that happen at load
+# time (unsupported hyperparameters, missing blob, OOM) — a legitimately slow
+# multi-GB load is reported as loading, never waited out.
+RPC_READY_TIMEOUT_S = float(os.environ.get("GB_SYNAPSE_RPC_READY_S", "10"))
+SERVE_READY_GRACE_S = float(os.environ.get("GB_SYNAPSE_READY_GRACE_S", "20"))
+
 
 def _run(cmd: list[str], capture: bool = False, check: bool = True, **kw) -> subprocess.CompletedProcess:
     print("  [gb-synapse] $ " + " ".join(cmd), flush=True)
@@ -1082,11 +1091,26 @@ def _read_run_states() -> list[ServerState]:
 
 
 def _pid_alive(pid: int) -> bool:
+    """True only if the process is running — a ZOMBIE is dead.
+
+    signal-0 alone succeeds against a zombie, and an engine that crashed on
+    startup stays a zombie for as long as its parent (greenboost-cli, which
+    spawned it and never waits) lives. That made every liveness check in this
+    module lie: serve() "reused" a crashed server, status reported it up, and
+    the proxy kept relaying to a corpse until the client saw a truncated
+    stream. Read the real state instead of asking whether the PID exists.
+    """
     try:
         os.kill(pid, 0)
-        return True
     except (OSError, ProcessLookupError):
         return False
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_bytes()
+        # "pid (comm) STATE ..." — comm may contain spaces/parens, so index
+        # from the LAST ')'.
+        return stat[stat.rindex(b")") + 2: stat.rindex(b")") + 3] != b"Z"
+    except (OSError, ValueError):
+        return True     # no procfs (non-Linux): fall back to the signal-0 answer
 
 
 def _resolve_model(spec: str) -> ModelEntry:
@@ -1109,28 +1133,60 @@ def _feeder_ssh_target(feeder) -> str:
     return f"{feeder.ssh_user or 'root'}@{feeder.ip}"
 
 
-def ensure_feeder_rpc(feeder, rpc_port: int = RPC_PORT_BASE, device: int = 0) -> None:
-    """Start rpc-server on a feeder over SSH if not already listening on
+def _rpc_reachable(ip: str, port: int, timeout: float = 2.0) -> bool:
+    import socket
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def ensure_feeder_rpc(feeder, rpc_port: int = RPC_PORT_BASE, device: int = 0) -> bool:
+    """Start rpc-server on a feeder over SSH if not already serving on
     rpc_port, under the feeder's own shim (GREENBOOST_CLUSTER=0 — local
     DDR/NVMe tier extension only; the cross-node split is RPC's job, not the
-    shim's per-kernel dispatch)."""
-    tgt = _feeder_ssh_target(feeder)
-    check = subprocess.run(["ssh", *_SSH_OPTS, tgt,
-                             f"pgrep -f 'rpc-server.*--port {rpc_port}' >/dev/null"],
-                            capture_output=True)
-    if check.returncode == 0:
-        return
+    shim's per-kernel dispatch).
+
+    Returns True only once the port is REACHABLE FROM THIS HOST. A feeder whose
+    rpc-server never came up must never reach --rpc/--tensor-split: llama.cpp
+    would size the split for a device it cannot talk to and the load dies with
+    "Failed to connect to <ip>:<port>" — which is precisely what a `pgrep`-only
+    check (SSH says the process exists; the port is firewalled) let through.
+    """
+    if _rpc_reachable(feeder.ip, rpc_port):
+        return True
+
+    # Resolve the engine ON the feeder: a Full-Install feeder has it in the
+    # system dir, a dev/user build in the user dir. Assuming one path is why
+    # this silently launched nothing.
     remote_cmd = (
-        f"nohup env GREENBOOST_ACTIVE=1 GREENBOOST_CLUSTER=0 "
-        f"LD_PRELOAD={gb_cluster.GREENBOOST_SHIM} "
-        f"/usr/local/lib/greenboost/synapse/rpc-server "
-        f"--host 0.0.0.0 --port {rpc_port} --device {device} "
-        f">/tmp/gb_synapse_rpc.log 2>&1 & disown"
+        'for p in /usr/local/lib/greenboost/synapse/rpc-server '
+        '"$HOME/.local/share/greenboost/synapse/rpc-server"; do '
+        '[ -x "$p" ] && RPC="$p" && break; done; '
+        '[ -n "${RPC:-}" ] || { echo "rpc-server not found — run: greenboost synapse build-engine" >&2; exit 1; }; '
+        'nohup env GREENBOOST_ACTIVE=1 GREENBOOST_CLUSTER=0 '
+        f'LD_PRELOAD={gb_cluster.GREENBOOST_SHIM} '
+        # rpc-server's --device takes a backend device NAME (CUDA0), not an
+        # ordinal; "--device 0" is rejected and the server exits at once.
+        f'"$RPC" --host 0.0.0.0 --port {rpc_port} --device CUDA{device} '
+        '>/tmp/gb_synapse_rpc.log 2>&1 & disown'
     )
-    launch = subprocess.run(["ssh", *_SSH_OPTS, tgt, remote_cmd], capture_output=True, text=True)
+    launch = subprocess.run(["ssh", *_SSH_OPTS, _feeder_ssh_target(feeder), remote_cmd],
+                            capture_output=True, text=True)
     if launch.returncode != 0:
-        raise RuntimeError(f"failed to start rpc-server on {feeder.ip}: {launch.stderr.strip()}")
-    time.sleep(1.5)
+        print(f"  [gb-synapse] feeder {feeder.ip}: rpc-server launch failed: "
+              f"{launch.stderr.strip()[:200]}", flush=True)
+        return False
+
+    for _ in range(int(RPC_READY_TIMEOUT_S * 2)):   # binds only after CUDA init
+        if _rpc_reachable(feeder.ip, rpc_port):
+            return True
+        time.sleep(0.5)
+    print(f"  [gb-synapse] feeder {feeder.ip}: rpc-server did not open :{rpc_port} within "
+          f"{RPC_READY_TIMEOUT_S:.0f}s (firewall? see /tmp/gb_synapse_rpc.log on the feeder)",
+          flush=True)
+    return False
 
 
 def _clamp_ctx_to_budget(requested_ctx: int, entry: ModelEntry, budget_gb: float) -> int:
@@ -1197,12 +1253,129 @@ def _compute_tensor_split(host_free_mb: int, online_feeders: list,
     return split
 
 
-def _launch_proxy_and_record(entry: ModelEntry, upstream_pid: int, port: int, internal_port: int,
-                              tensor_split: str = "", feeders: list | None = None) -> ServerState:
-    """Shared tail for every engine (llama.cpp/vLLM/transformers): start the
-    gb_synapse_api.py proxy in front of whatever's listening on internal_port
-    and record ServerState. The proxy only ever talks OpenAI /v1/* to the
-    upstream, so it's identical regardless of which engine is behind it."""
+def _upstream_log_tail(model: str, n: int = 8) -> str:
+    """The lines the engine wrote just before it died. A client can only ever
+    observe a closed connection; the actual reason (unsupported hyperparameter,
+    missing blob, OOM) exists nowhere but this log, so every failure we raise
+    carries it."""
+    try:
+        lines = _run_log_path(model).read_text(errors="replace").splitlines()
+    except OSError:
+        return ""
+    errs = [ln for ln in lines if re.search(r"\berror\b|\bfailed\b|\bE\b", ln)]
+    return "\n".join("      " + ln.strip() for ln in (errs or lines)[-n:])
+
+
+def _wait_upstream_ready(entry: ModelEntry, proc: subprocess.Popen, internal_port: int,
+                          grace_s: float = SERVE_READY_GRACE_S) -> bool:
+    """Watch a freshly spawned engine until it serves, dies, or `grace_s` runs out.
+
+    True  = /health is green, the model is loaded.
+    False = still loading (a 20+ GB GGUF legitimately takes minutes — the caller
+            reports that rather than blocking the user's terminal on it).
+    Raises = the process is gone, i.e. it never had a chance of serving.
+
+    That last case is the one worth catching here: without this gate serve()
+    returned a ServerState for a corpse, callers printed "✓ started (pid N)",
+    and the truth only surfaced later as an unreadable mid-stream
+    RemoteProtocolError in whatever client had believed them.
+    """
+    import urllib.error
+    import urllib.request
+
+    deadline = time.time() + grace_s
+    url = f"http://127.0.0.1:{internal_port}/health"
+    while time.time() < deadline:
+        # poll() is the authoritative answer for a child WE spawned, and it
+        # reaps — unlike a PID check, which a zombie passes.
+        if proc.poll() is not None:
+            raise RuntimeError(
+                f"'{entry.name}' failed to load: the engine exited during startup "
+                f"(rc={proc.returncode}).\n"
+                f"    log: {_run_log_path(entry.name)}\n{_upstream_log_tail(entry.name)}")
+        try:
+            with urllib.request.urlopen(url, timeout=2) as r:
+                if r.status == 200 and not _health_says_loading(r.read(256)):
+                    return True
+        except urllib.error.HTTPError:
+            pass          # 503 "loading model" — alive and working
+        except OSError:
+            pass          # not listening yet
+        time.sleep(0.5)
+    return False
+
+
+def _health_says_loading(body: bytes) -> bool:
+    """llama.cpp is not consistent about how /health reports a load in progress:
+    newer builds answer 503, but the engine we ship answers 200 with
+    {"status": "loading model"}. Trusting the status code alone marks a model
+    "served" seconds before it has parsed its own hyperparameters — the exact
+    window in which a bad GGUF exits. vLLM/gb_llm_server answer 200 with no
+    status field, which is genuinely ready."""
+    try:
+        status = json.loads(body or b"{}").get("status", "ok")
+    except (ValueError, AttributeError):
+        return False
+    return status != "ok"
+
+
+def failure_report(model: str) -> str:
+    """Why a served model stopped answering, in words a client can print.
+
+    A client (greenboost-cli, any OpenAI SDK) only ever sees a truncated body:
+    the proxy relays /v1 byte-for-byte, so when the engine dies mid-stream all
+    that reaches it is "peer closed connection". This looks up what actually
+    happened on this side — engine still alive? gone? what did it log last? —
+    so that failure can be reported instead of an httpx exception name.
+    """
+    st = next((s for s in _read_run_states() if s.model == model), None)
+    if st is None:
+        return "gb-synapse has no running server for this model (start it with /llamaserve)."
+    if _pid_alive(st.llama_pid):
+        return ("the engine is alive but closed the connection mid-response — most often it is "
+                "still loading the model, or the request exceeded its context window.\n"
+                f"    log: {_run_log_path(model)}")
+    tail = _upstream_log_tail(model)
+    return (f"the engine (pid {st.llama_pid}) is gone — it died while serving this request.\n"
+            f"    log: {_run_log_path(model)}" + (f"\n{tail}" if tail else ""))
+
+
+def _emit_serve(entry: ModelEntry, status: str, **fields) -> None:
+    """Every serve attempt lands in dataflux — success and failure alike. A
+    model that won't load is an orchestration fact (it decides whether the
+    cluster path is available at all), so it belongs in the flux next to the
+    tier moves and quantization decisions that assume a served model."""
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({"kind": "synapse_serve", "status": status,
+                          "model": entry.name, "arch": entry.arch or "",
+                          "quant": entry.quant or "",
+                          "weights_gb": round(entry.n_bytes / (1024 ** 3), 2),
+                          **fields})
+    except Exception:
+        pass
+
+
+def _launch_proxy_and_record(entry: ModelEntry, upstream: subprocess.Popen, port: int,
+                              internal_port: int, tensor_split: str = "",
+                              feeders: list | None = None) -> ServerState:
+    """Shared tail for every engine (llama.cpp/vLLM/transformers): wait for the
+    engine to come up, start the gb_synapse_api.py proxy in front of it, and
+    record ServerState. The proxy only ever talks OpenAI /v1/* to the upstream,
+    so it's identical regardless of which engine is behind it — and all three
+    expose /health, so the readiness gate is too."""
+    t0 = time.time()
+    common = {"port": port, "tensor_split": tensor_split, "feeders": feeders or []}
+    try:
+        ready = _wait_upstream_ready(entry, upstream, internal_port)
+    except RuntimeError as e:
+        # No proxy is started for a dead engine: a proxy on :11434 in front of
+        # nothing is what turns "the model failed to load" into "connection
+        # closed mid-stream" three layers away.
+        _emit_serve(entry, "error", error=str(e).splitlines()[0],
+                    load_s=round(time.time() - t0, 1), **common)
+        raise
+
     proxy_cmd = [sys.executable, str(_REPO_DIR / "gb_synapse_api.py"),
                  "--port", str(port), "--upstream-port", str(internal_port),
                  "--model-name", entry.name]
@@ -1210,10 +1383,12 @@ def _launch_proxy_and_record(entry: ModelEntry, upstream_pid: int, port: int, in
     proxy_proc = subprocess.Popen(proxy_cmd, stdout=proxy_log, stderr=subprocess.STDOUT,
                                    start_new_session=True)
 
-    state = ServerState(model=entry.name, llama_pid=upstream_pid, proxy_pid=proxy_proc.pid,
+    state = ServerState(model=entry.name, llama_pid=upstream.pid, proxy_pid=proxy_proc.pid,
                          port=port, internal_port=internal_port, tensor_split=tensor_split,
                          feeders=feeders or [], started_ts=time.time())
     _write_run_state(state)
+    _emit_serve(entry, "ok" if ready else "loading",
+                load_s=round(time.time() - t0, 1), **common)
     return state
 
 
@@ -1315,7 +1490,7 @@ def _serve_vllm(entry: ModelEntry, port: int) -> ServerState:
     log = open(_run_log_path(entry.name), "ab")
     proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT,
                              start_new_session=True)
-    return _launch_proxy_and_record(entry, proc.pid, port, internal_port)
+    return _launch_proxy_and_record(entry, proc, port, internal_port)
 
 
 def _serve_transformers(entry: ModelEntry, port: int) -> ServerState:
@@ -1337,7 +1512,7 @@ def _serve_transformers(entry: ModelEntry, port: int) -> ServerState:
     log = open(_run_log_path(entry.name), "ab")
     proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT,
                              start_new_session=True)
-    return _launch_proxy_and_record(entry, proc.pid, port, internal_port)
+    return _launch_proxy_and_record(entry, proc, port, internal_port)
 
 
 def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 65536,
@@ -1398,7 +1573,12 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 65536,
             if not f.online:
                 continue
             rpc_port = RPC_PORT_BASE + i
-            ensure_feeder_rpc(f, rpc_port)
+            # Only a feeder we can actually REACH may influence the budget and
+            # the split. Degrading to a host-only serve is always better than
+            # handing llama.cpp a device it can't talk to, which fails the load
+            # outright instead of just being slower.
+            if not ensure_feeder_rpc(f, rpc_port):
+                continue
             rpc_args.append(f"{f.ip}:{rpc_port}")
             online_feeders.append(f)
     budget_gb = host_free_mb / 1024 + sum(f.t1_free_mb for f in online_feeders) / 1024
@@ -1439,7 +1619,7 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 65536,
     llama_proc = subprocess.Popen(cmd, env=env, stdout=llama_log, stderr=subprocess.STDOUT,
                                    start_new_session=True)
 
-    return _launch_proxy_and_record(entry, llama_proc.pid, port, internal_port,
+    return _launch_proxy_and_record(entry, llama_proc, port, internal_port,
                                      tensor_split=tensor_split,
                                      feeders=[f.ip for f in online_feeders])
 

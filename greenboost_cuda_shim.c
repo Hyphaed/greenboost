@@ -4047,9 +4047,15 @@ static void gb_kernel_sigs_load_file(const char *path);
 /*  the app actually mapped and re-resolves all pointers from it.       */
 /*  GREENBOOST_CUDART_PATH (explicit override) disables the rebind.     */
 /* ------------------------------------------------------------------ */
-static char g_cudart_init_path[512];        /* resolved path init loaded   */
+static char g_cudart_init_path[512];        /* path init dlopen()ed        */
+static char g_cudart_init_real[512];        /* ...canonicalized (realpath) */
 static int  g_cudart_override;              /* GREENBOOST_CUDART_PATH used */
 static _Atomic int g_cudart_rebound;        /* one-shot latch              */
+/* Set once we are bound to a libcudart the APP mapped (not our own fallback).
+ * Until then the rebind stays re-armable: a backend that is dlopen()ed late
+ * (llama.cpp loads libggml-cuda.so, and its libcudart, long after our
+ * constructor) brings its runtime in after the first hook has already run. */
+static _Atomic int g_cudart_is_app;
 
 /* F-ABI1: resolve a symbol from ONE specific loaded library by walking its
  * ELF dynamic symbol table directly (DT_GNU_HASH / DT_HASH).  dlsym(handle)
@@ -4231,16 +4237,28 @@ static void gb_cudart_rebind(void)
     }
 
     /* A cudart hook is executing, so the caller's libcudart is mapped NOW.
-     * Pick the first libcudart in maps that is not the one init loaded. */
+     * Pick the first libcudart in maps that is not the one init loaded.
+     *
+     * Compare CANONICAL paths: dlopen records the name it was given
+     * ("libcudart.so", a symlink), while maps always lists the target
+     * ("libcudart.so.13.3.29").  A plain strcmp therefore never recognized
+     * our own fallback, so the shim "rebound" onto itself and latched — and
+     * a backend dlopen()ed later with a DIFFERENT CUDA major (llama.cpp's
+     * libggml-cuda.so pulls libcudart.so.12; our fallback is 13) could never
+     * be picked up afterwards.  Kernels then registered into one runtime and
+     * were looked up in the other: cudaFuncGetAttributes -> "invalid device
+     * function", which aborts ggml at its first kernel. */
     m = fopen("/proc/self/maps", "r");
     if (m) {
         char line[1024];
         while (fgets(line, sizeof(line), m)) {
+            char real[512];
             char *p = strchr(line, '/');
             if (!p || !strstr(p, "libcudart.so"))
                 continue;
             p[strcspn(p, "\n")] = '\0';
-            if (g_cudart_init_path[0] && strcmp(p, g_cudart_init_path) == 0)
+            if (g_cudart_init_real[0] && realpath(p, real) &&
+                strcmp(real, g_cudart_init_real) == 0)
                 continue;               /* the fallback WE dlopened - skip */
             snprintf(found, sizeof(found), "%s", p);
             break;
@@ -4254,13 +4272,15 @@ static void gb_cudart_rebind(void)
         void *h = dlopen(found, RTLD_NOW | RTLD_LOCAL);
         if (h) {
             gb_cudart_resolve_syms(h);
+            atomic_store_explicit(&g_cudart_is_app, 1, memory_order_release);
             gb_log("cudart rebind -> %s (init fallback was %s)",
                    found, g_cudart_init_path[0] ? g_cudart_init_path : "none");
         }
     }
-    /* Latch even when nothing was found: a hook reached via dynamic
-     * interposition implies the caller's libcudart is the one in maps -
-     * if only init's path is there, init already picked the right one. */
+    /* Latch so the hot hooks (cudaLaunchKernel) never re-scan maps. When the
+     * app's own libcudart has NOT appeared yet, g_cudart_is_app stays 0 and
+     * __cudaRegisterFunction re-arms this latch once per newly loaded CUDA
+     * library — the only moment a new runtime can enter the process. */
     atomic_store_explicit(&g_cudart_rebound, 1, memory_order_release);
     pthread_mutex_unlock(&rebind_mu);
 }
@@ -4651,6 +4671,11 @@ static void gb_shim_init(void)
             struct link_map *lm = NULL;
             if (dlinfo(libcudart, RTLD_DI_LINKMAP, &lm) == 0 && lm && lm->l_name[0])
                 snprintf(g_cudart_init_path, sizeof(g_cudart_init_path), "%s", lm->l_name);
+            /* Canonical form is what /proc/self/maps shows; the rebind compares
+             * against THIS, never the (possibly symlinked) dlopen name. */
+            if (!g_cudart_init_path[0] ||
+                !realpath(g_cudart_init_path, g_cudart_init_real))
+                g_cudart_init_real[0] = '\0';
             if (gb_debug)
                 fprintf(stderr, "[GreenBoost] libcudart loaded (%s)\n",
                         g_cudart_init_path[0] ? g_cudart_init_path : "?");
@@ -10685,6 +10710,25 @@ void __cudaRegisterFunction(void **fatCubinHandle, const char *hostFun,
                             gb_dim3 *bDim, gb_dim3 *gDim, int *wSize)
 {
     GB_CUDART_ENSURE();
+
+    /* A registration call means a CUDA library was just loaded — the one
+     * moment a libcudart we have not seen can enter the process (llama.cpp
+     * dlopen()s libggml-cuda.so, and its libcudart.so.12, long after our
+     * constructor picked a fallback).  While we are still bound to our OWN
+     * fallback, re-arm the rebind once per fatbin so this registration is
+     * forwarded into the runtime the CALLER will look the kernel up in.
+     * Bounded by the number of CUDA libraries loaded, not by kernel count:
+     * every kernel of one library shares its fatCubinHandle. */
+    if (!atomic_load_explicit(&g_cudart_is_app, memory_order_acquire)) {
+        static _Atomic(void *) last_handle;
+        void *prev = atomic_exchange_explicit(&last_handle, (void *)fatCubinHandle,
+                                              memory_order_acq_rel);
+        if (prev != (void *)fatCubinHandle) {
+            atomic_store_explicit(&g_cudart_rebound, 0, memory_order_release);
+            gb_cudart_rebind();
+        }
+    }
+
     if (deviceName && hostFun)
         gb_netc_register_kernel((const void *)hostFun, deviceName);
 
