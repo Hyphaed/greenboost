@@ -1,6 +1,6 @@
 <div align="center">
 
-# 📈 🧠 ⚡ GreenBoost ⚡ 🧠 📈
+# ⚡ 🧠 ⚡ GreenBoost ⚡ 🧠 ⚡
 
 ### CUDA Memory & Compute Orchestrator for NVIDIA GPUs
 
