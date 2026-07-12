@@ -375,6 +375,14 @@ def run_stage_on_feeder(argv: list[str],
         if not online:
             raise RuntimeError("run_stage_on_feeder: no feeder online")
         feeder = online[0]
+    # Self-provisioning gate: verify the feeder's env before dispatch so we
+    # never ship a stage to a broken runtime and silently lose it (CLAUDE.md
+    # cluster rule). Emits a loud feeder_provision event on failure.
+    if os.environ.get("GB_SKIP_FEEDER_READY") != "1" and \
+            not ensure_feeder_ready(feeder, code_roots=(), deps=("torch",), python=python):
+        raise RuntimeError(
+            f"run_stage_on_feeder: feeder {feeder.hostname or feeder.ip} not ready "
+            f"(env deps missing at {python}; see dataflux feeder_provision)")
     user = feeder.ssh_user or os.environ.get("USER", "root")
     tgt = f"{user}@{feeder.ip}"
     # aes128-gcm: AES-NI wire-speed transfers (~2× the chacha20 default).
@@ -502,6 +510,108 @@ def ensure_feeder_model(feeder: Feeder, repo_id: str, hf_home: str | None = None
     _df_emit(_new_run_id(), node, "ensure_feeder_model", "model_push", [repo_id],
              time.monotonic() - t0)
     print(f"  [feeder-model] {repo_id} pushed to {node}", flush=True)
+    return True
+
+
+AIFORGE_ROOT = os.environ.get("GB_AIFORGE_ROOT", os.path.expanduser("~/Dev/ai-forge"))
+_feeder_ready_cache: set = set()
+
+
+def ensure_feeder_ready(feeder: Feeder,
+                        code_roots: tuple[str, ...] = (),
+                        deps: tuple[str, ...] = ("torch", "diffusers"),
+                        model_repo: str | None = None,
+                        python: str = FEEDER_STAGE_PYTHON,
+                        feeder_hf_home: str | None = None,
+                        use_cache: bool = True,
+                        timeout_s: int = 3600) -> bool:
+    """Self-provisioning readiness gate , make a feeder usable BEFORE dispatch,
+    so the cluster NEVER silently falls back to host-only (CLAUDE.md immutable
+    rule: drive both GPUs). Three steps, each mirrored to dataflux as a
+    `feeder_provision` event so a failure is followable via the MCP:
+
+      1. rsync each code_root host->feeder to the SAME absolute path (idempotent
+         delta; excludes .git/.venv/__pycache__/outputs/generated). Pass the
+         pipeline source tree(s) that the feeder imports; omit for the express
+         bundle path (cluster_map ships its own self-contained bundle).
+      2. ensure_feeder_model(model_repo) so weights are present (rsync delta).
+      3. verify the feeder's `python` env imports every dep in `deps`.
+
+    Returns True when the feeder is ready to take work. Returns False (with a
+    LOUD `feeder_provision` error event + stderr line naming what to provision)
+    when it can't be made ready , callers may then fall back to local, but the
+    reason is recorded, never silent. Cached per process (keyed on the request)
+    so the rsync+probe run once per feeder per run, not per dispatched item."""
+    import shlex
+    import subprocess
+
+    node = feeder.hostname or feeder.ip
+    ck = (feeder.ip, tuple(code_roots), tuple(deps), model_repo)
+    if use_cache and ck in _feeder_ready_cache:
+        return True
+    user = feeder.ssh_user or os.environ.get("USER", "root")
+    tgt = f"{user}@{feeder.ip}"
+    ssh_opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-c", "aes128-gcm@openssh.com", "-o", "Compression=no"]
+    t0 = time.monotonic()
+
+    # 1 · sync pipeline code tree(s) to the same absolute path on the feeder.
+    for root in code_roots:
+        root = os.path.expanduser(root)
+        if not os.path.isdir(root):
+            continue
+        parent = str(Path(root).parent)
+        mk = subprocess.run(["ssh", *ssh_opts, tgt, f"mkdir -p {shlex.quote(parent)}"],
+                            capture_output=True, text=True)
+        push = None
+        if mk.returncode == 0:
+            push = subprocess.run(
+                ["rsync", "-rltO", "-e", "ssh " + " ".join(ssh_opts),
+                 "--exclude", ".git", "--exclude", ".venv",
+                 "--exclude", "__pycache__", "--exclude", "*.pyc",
+                 "--exclude", "outputs", "--exclude", "generated",
+                 f"{root}/", f"{tgt}:{root}/"],
+                capture_output=True, text=True, timeout=timeout_s)
+        if mk.returncode != 0 or push is None or push.returncode != 0:
+            err = (mk.stderr or (push.stderr if push else "") or "").strip()
+            _df_emit(_new_run_id(), node, "ensure_feeder_ready", "feeder_provision",
+                     [root], time.monotonic() - t0, status="error",
+                     error=f"code sync {root}: {err}")
+            print(f"  [feeder-ready] {node}: code sync FAILED for {root} , {err}",
+                  flush=True)
+            return False
+
+    # 2 · ensure model weights present on the feeder.
+    if model_repo and not ensure_feeder_model(
+            feeder, model_repo, feeder_hf_home=feeder_hf_home, timeout_s=timeout_s):
+        _df_emit(_new_run_id(), node, "ensure_feeder_ready", "feeder_provision",
+                 [model_repo], time.monotonic() - t0, status="error",
+                 error=f"model {model_repo} unavailable on feeder")
+        return False
+
+    # 3 · verify the feeder python env imports every required dep.
+    if deps:
+        imports = "; ".join(f"import {d.split('==')[0].split('>')[0]}" for d in deps)
+        probe = subprocess.run(
+            ["ssh", *ssh_opts, tgt,
+             f"{python} -c {shlex.quote(imports + '; print(chr(111)+chr(107))')}"],
+            capture_output=True, text=True, timeout=180)
+        if probe.returncode != 0 or "ok" not in probe.stdout:
+            err = (probe.stderr.strip() or probe.stdout.strip() or "unknown")[:300]
+            _df_emit(_new_run_id(), node, "ensure_feeder_ready", "feeder_provision",
+                     list(deps), time.monotonic() - t0, status="error",
+                     error=f"deps missing in {python}: {err}")
+            print(f"  [feeder-ready] {node}: MISSING DEPS in {python} , provision "
+                  f"the env (need {', '.join(deps)}). NOT dispatching here. {err}",
+                  flush=True)
+            return False
+
+    _df_emit(_new_run_id(), node, "ensure_feeder_ready", "feeder_provision",
+             list(code_roots) or [node], time.monotonic() - t0)
+    if use_cache:
+        _feeder_ready_cache.add(ck)
+    print(f"  [feeder-ready] {node}: ready (code+model+deps verified)", flush=True)
     return True
 
 
@@ -684,7 +794,16 @@ def _online_feeders_for_dispatch() -> list[Feeder]:
             continue
         if f["link_mbps_ewma"] and f["link_mbps_ewma"] < _MIN_USEFUL_LINK_MBPS:
             continue
-        out.append(Feeder(**f))
+        fdr = Feeder(**f)
+        # Self-provisioning gate (CLAUDE.md immutable cluster rule): never
+        # silently dispatch to a feeder whose runtime isn't ready. Verify the
+        # feeder env imports torch+diffusers (cached per run); a not-ready
+        # feeder is dropped with a LOUD feeder_provision dataflux event instead
+        # of a silent host-only fallback. Opt out with GB_SKIP_FEEDER_READY=1.
+        if os.environ.get("GB_SKIP_FEEDER_READY") != "1" and \
+                not ensure_feeder_ready(fdr, code_roots=(), deps=("torch", "diffusers")):
+            continue
+        out.append(fdr)
     return out
 
 
