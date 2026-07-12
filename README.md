@@ -21,8 +21,6 @@ No retraining. No code changes. Just install GreenBoost and keep using Ollama, l
 
 <div align="center">
 
-| | |
-|:--|:--|
 | 📦 **Memory Tiering** | Extend GPU memory with system RAM and NVMe |
 | 🗜️ **GB-Quant + TurboQuant** | Compress weights and KV cache so models fit in VRAM |
 | 📡 **Gb-Dataflux** | Live data telemtry exposed at greenboost dataflux mcp and also visually at  |
