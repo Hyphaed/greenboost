@@ -14,23 +14,20 @@
 
 **Turn GPU VRAM + System RAM + NVMe + idle LAN GPUs into one larger CUDA device.**
 
-No retraining. No code changes. Just install GreenBoost and keep using Ollama, llama.cpp, vLLM, PyTorch, and Diffusers.
+**No retraining. No code changes.** Just install **GreenBoost** and keep using **Ollama**, **llama.cpp**, **vLLM**, **PyTorch**, and **Diffusers**.
 
 </div>
 
 
 <div align="center">
 
-| 📦 **Memory Tiering** | Extend GPU memory with system RAM and NVMe |
-
-| 🗜️ **GB-Quant** | Compress weights and KV cache so models fit in VRAM |
-
-| 📡 **Gb-Dataflux** | Live data telemtry exposed at greenboost dataflux mcp and also visually trough web UI when running commad; $ greenboost dataflux-ui |
-
-| 🌐 **Gb-Cluster** | Borrow idle GPUs and RAM from machines on your LAN |
-
-| 🔗 **Gb-Synapse** | Translation proxy exposing Ollama endpoints (/api/generate, /api/chat, /api/tags, /api/ps) + OpenAI /v1/* on :11434 in front of gb-synapse (llama-server + --rpc), and it even emits proxy-side dataflux tok/s. So it's a genuine drop-in for ollama with cross-GPU RPC split + gb-quant + telemetry|
-
+| Feature | Description |
+|---------|-------------|
+| 📦 **Memory Tiering** | Extend GPU memory using system RAM and NVMe. |
+| 🗜️ **GB-Quant** | Compress model weights and the KV cache so larger models fit into available VRAM. |
+| 📡 **GB-Dataflux** | Live telemetry exposed through the GreenBoost Dataflux MCP server and a web dashboard. Launch the UI with `greenboost dataflux-ui`. |
+| 🌐 **GB-Cluster** | Borrow idle GPU and RAM resources from other machines on your local network. |
+| 🔗 **GB-Synapse** | Translation proxy exposing Ollama-compatible endpoints (`/api/generate`, `/api/chat`, `/api/tags`, `/api/ps`) and the OpenAI-compatible `/v1/*` API on port `11434`. It sits in front of `gb-synapse` (`llama-server --rpc`), enabling cross-GPU RPC execution, GB-Quant, and proxy-side Dataflux telemetry (including tokens/sec). A genuine drop-in replacement for Ollama. |
 </div>
 
 
