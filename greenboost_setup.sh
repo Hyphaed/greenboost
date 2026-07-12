@@ -4086,6 +4086,7 @@ cmd_install_python_files() {
         gb_tiering.py
         gb_synapse.py
         gb_synapse_api.py
+        gb_aviary.py
         gb_cluster.py
         gb_mcp.py
         gb_synapse_mcp.py gb_synapse_tools.py

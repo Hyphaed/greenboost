@@ -127,6 +127,37 @@ def _ollama_format_to_response_format(fmt) -> "dict | None":
     return None
 
 
+def _ollama_messages_to_openai(messages: list) -> list:
+    """Translate Ollama's per-message `images: [b64, ...]` into OpenAI's
+    multimodal content parts.
+
+    Ollama carries images beside the text ({"content": "...", "images": [b64]});
+    OpenAI (and therefore llama-server's /v1 surface) carries them INSIDE
+    content as image_url parts. Relaying the messages untouched dropped every
+    image on the floor — and a VLM asked to describe an image it never received
+    does not fail, it invents. Silent wrong answers are worse than errors, and
+    this is the single translation an Ollama-API vision client (ai-forge's
+    critic) needs from us.
+    """
+    out = []
+    for m in messages:
+        imgs = m.get("images")
+        if not imgs:
+            out.append(m)
+            continue
+        parts = []
+        if m.get("content"):
+            parts.append({"type": "text", "text": m["content"]})
+        for img in imgs:
+            # Accept a bare base64 payload (what Ollama clients send) or an
+            # already-formed data URL, so both callers work unchanged.
+            url = img if str(img).startswith("data:") else f"data:image/jpeg;base64,{img}"
+            parts.append({"type": "image_url", "image_url": {"url": url}})
+        out.append({k: v for k, v in m.items() if k not in ("images", "content")}
+                   | {"content": parts})
+    return out
+
+
 async def ollama_generate(request: web.Request) -> web.StreamResponse:
     body = await request.json()
     model = body.get("model") or MODEL_NAME
@@ -177,7 +208,9 @@ async def ollama_chat(request: web.Request) -> web.StreamResponse:
     body = await request.json()
     model = body.get("model") or MODEL_NAME
     stream = body.get("stream", True)
-    upstream_req = {"model": model, "messages": body.get("messages", []), "stream": stream,
+    upstream_req = {"model": model,
+                     "messages": _ollama_messages_to_openai(body.get("messages", [])),
+                     "stream": stream,
                      **_ollama_opts(body.get("options", {}) or {})}
     if stream:
         upstream_req["stream_options"] = {"include_usage": True}

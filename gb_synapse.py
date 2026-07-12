@@ -67,7 +67,28 @@ from gb_gguf_tensor_map import _load_gguf_reader
 # Paths
 # ---------------------------------------------------------------------------
 
-ENGINE_DIR = Path(os.environ.get("GB_SYNAPSE_ENGINE_DIR", "/usr/local/lib/greenboost/synapse"))
+def _resolve_engine_dir() -> Path:
+    """Where llama-server actually IS, not where we wish it were.
+
+    A Full Install puts the engine in the system dir; a `gb_synapse build` by a
+    normal user puts it under ~/.local/share. Hardcoding the system path meant a
+    perfectly good user-built engine was invisible — engine_installed() reported
+    False, and serve() died with a bare FileNotFoundError on a path that had
+    simply never been populated. Pick the first directory that holds a real
+    binary; the env var still wins for a non-standard install.
+    """
+    env = os.environ.get("GB_SYNAPSE_ENGINE_DIR")
+    if env:
+        return Path(env)
+    candidates = [Path("/usr/local/lib/greenboost/synapse"),
+                  Path.home() / ".local/share/greenboost/synapse"]
+    for d in candidates:
+        if (d / "llama-server").is_file():
+            return d
+    return candidates[0]          # nothing built yet: report the install target
+
+
+ENGINE_DIR = _resolve_engine_dir()
 ENGINE_SRC_DIR = _REPO_DIR.parent / "greenboost-sources" / "llama.cpp"
 LLAMA_CPP_REMOTE = "https://github.com/ggml-org/llama.cpp"
 
@@ -91,7 +112,10 @@ _SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
 # The grace window only needs to outlive the failures that happen at load
 # time (unsupported hyperparameters, missing blob, OOM) — a legitimately slow
 # multi-GB load is reported as loading, never waited out.
-RPC_READY_TIMEOUT_S = float(os.environ.get("GB_SYNAPSE_RPC_READY_S", "10"))
+# 30s, not 10: a cold GPU's CUDA init on the feeder routinely takes ~20s, and
+# timing out early drops a feeder that was seconds from ready — costing the run
+# its whole second GPU.
+RPC_READY_TIMEOUT_S = float(os.environ.get("GB_SYNAPSE_RPC_READY_S", "30"))
 SERVE_READY_GRACE_S = float(os.environ.get("GB_SYNAPSE_READY_GRACE_S", "20"))
 
 
@@ -595,6 +619,24 @@ def _split_model_tag(model_name: str) -> tuple[str, str, str]:
 def ollama_model_blob(model_name: str) -> str | None:
     """Resolve an Ollama model name ("qwen3-coder" or "ns/name:tag") to its
     on-disk GGUF blob path."""
+    found = _ollama_model_layers(model_name)
+    return found[0] if found else None
+
+
+def ollama_model_projector(model_name: str) -> str | None:
+    """The vision projector blob of an Ollama model, if it has one.
+
+    Ollama stores the mmproj as a SEPARATE layer beside the weights
+    (mediaType ...image.projector) under an opaque sha256- filename, so no
+    filename glob can ever find it. Without resolving it here, an
+    Ollama-indexed VLM (ai-forge's qwen3-vl critic) is served text-only and
+    answers about images it never saw."""
+    found = _ollama_model_layers(model_name)
+    return found[1] if found else None
+
+
+def _ollama_model_layers(model_name: str) -> "tuple[str, str | None] | None":
+    """(weights_blob, projector_blob|None) for an Ollama model."""
     models_dir = _ollama_models_dir()
     if models_dir is None:
         return None
@@ -613,8 +655,14 @@ def ollama_model_blob(model_name: str) -> str | None:
         if not layer:
             continue
         blob = models_dir / "blobs" / layer["digest"].replace(":", "-")
-        if blob.is_file():
-            return str(blob)
+        if not blob.is_file():
+            continue
+        proj = next((l for l in layers if "projector" in l.get("mediaType", "")), None)
+        proj_blob = None
+        if proj:
+            p = models_dir / "blobs" / proj["digest"].replace(":", "-")
+            proj_blob = str(p) if p.is_file() else None
+        return str(blob), proj_blob
     return None
 
 
@@ -1157,6 +1205,13 @@ def ensure_feeder_rpc(feeder, rpc_port: int = RPC_PORT_BASE, device: int = 0) ->
     if _rpc_reachable(feeder.ip, rpc_port):
         return True
 
+    # rpc-server is ggml/CUDA, so it hits the SAME shim incompatibility as
+    # llama-server (SIGABRT: "invalid device function"). Preloading the shim
+    # here would take the feeder's GPU down with it, which is the opposite of
+    # the point. Gate it on the same switch as the host engine.
+    shim_pre = (f'LD_PRELOAD={gb_cluster.GREENBOOST_SHIM} GREENBOOST_ACTIVE=1 '
+                if os.environ.get("GB_SYNAPSE_SHIM", "0") == "1" else "")
+
     # Resolve the engine ON the feeder: a Full-Install feeder has it in the
     # system dir, a dev/user build in the user dir. Assuming one path is why
     # this silently launched nothing.
@@ -1165,8 +1220,13 @@ def ensure_feeder_rpc(feeder, rpc_port: int = RPC_PORT_BASE, device: int = 0) ->
         '"$HOME/.local/share/greenboost/synapse/rpc-server"; do '
         '[ -x "$p" ] && RPC="$p" && break; done; '
         '[ -n "${RPC:-}" ] || { echo "rpc-server not found — run: greenboost synapse build-engine" >&2; exit 1; }; '
-        'nohup env GREENBOOST_ACTIVE=1 GREENBOOST_CLUSTER=0 '
-        f'LD_PRELOAD={gb_cluster.GREENBOOST_SHIM} '
+        # rpc-server is dynamically linked against the ggml libraries that sit
+        # NEXT TO IT, and a user-dir engine is on no default search path — so it
+        # died instantly with "libggml.so.0: cannot open shared object file" and
+        # the port never opened. Point the loader at its own engine directory.
+        'nohup env GREENBOOST_CLUSTER=0 '
+        'LD_LIBRARY_PATH="$(dirname "$RPC")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" '
+        f'{shim_pre}'
         # rpc-server's --device takes a backend device NAME (CUDA0), not an
         # ordinal; "--device 0" is rejected and the server exits at once.
         f'"$RPC" --host 0.0.0.0 --port {rpc_port} --device CUDA{device} '
@@ -1219,6 +1279,14 @@ def _find_mmproj(entry: ModelEntry) -> "Path | None":
     override = os.environ.get("GB_SYNAPSE_MMPROJ")
     if override:
         return Path(override) if Path(override).is_file() else None
+
+    # Ollama keeps the projector as its own sha256- blob, named nothing like
+    # "mmproj" — only its manifest knows which layer it is.
+    if entry.source == "ollama":
+        proj = ollama_model_projector(entry.name)
+        if proj:
+            return Path(proj)
+
     d = Path(entry.path).parent
     for pat in ("mmproj*.gguf", "*mmproj*.gguf"):
         for p in sorted(d.glob(pat)):
@@ -1686,10 +1754,21 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
     else:
         shim_note = "on (GB_SYNAPSE_SHIM=1)"
 
+    # -ngl 999 ("every layer on the GPU") is right only when the weights can
+    # actually LAND there. Without the shim inflating VRAM, forcing all layers
+    # onto a card that cannot hold them doesn't spill, it fails the load
+    # outright ("unable to allocate CUDA0 buffer of size 21398561280"). When the
+    # weights exceed the VRAM budget, let llama.cpp fit the layers itself: it
+    # puts as many on the GPU as fit and keeps the rest in host RAM. That is
+    # slower, and it is what the cluster (RPC) and the shim (T2) exist to avoid,
+    # so we say plainly which one we got.
+    weights_gb = entry.n_bytes / (1024 ** 3)
+    fits_vram = weights_gb <= budget_gb or "LD_PRELOAD" in env
+
     SLOT_DIR.mkdir(parents=True, exist_ok=True)
     cmd = [str(ENGINE_DIR / "llama-server"), "-m", entry.path,
            "--host", "127.0.0.1", "--port", str(internal_port),
-           "-ngl", "999", "--ctx-size", str(ctx),
+           "--ctx-size", str(ctx),
            "--slot-save-path", str(SLOT_DIR), "--no-webui",
            "--flash-attn", "auto",
            "--no-mmap",  # DMA-BUF pinning (Path A) is incompatible with mmap-backed pages
@@ -1703,8 +1782,11 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
            # calling Glob/Read with no "pattern"/"file_path"). See known-issues.md.
            "--jinja"]
 
+    if fits_vram:
+        cmd += ["-ngl", "999"]        # all layers on GPU — the fast path
+
     # No mmap: DMA-BUF pinning needs owned pages. Without the shim there is
-    # nothing to pin, and mmap lets the page cache serve a 23 GB GGUF instead of
+    # nothing to pin, and mmap lets the page cache serve a 20 GB GGUF instead of
     # re-reading it from disk on every restart.
     if "LD_PRELOAD" not in env:
         cmd.remove("--no-mmap")
@@ -1729,10 +1811,17 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
         cmd += shlex.split(extra_args)
 
     kv_grade = "certification-grade" if kv_type == "f16" else "budget"
+    placement = "all-GPU" if fits_vram else "PARTIAL CPU OFFLOAD (slow)"
     print(f"  [gb-synapse] {entry.name}: ctx={ctx} kv={kv_type} ({kv_grade}) "
+          f"weights={weights_gb:.1f}GB/{budget_gb:.1f}GB budget → {placement}, "
           f"shim={shim_note}"
           f"{' +mtp' if _has_mtp(entry) else ''}{' +vision' if mmproj else ''}"
           f"{' rpc=' + ','.join(rpc_args) if rpc_args else ''}", flush=True)
+    if not fits_vram:
+        print(f"  [gb-synapse] {weights_gb:.1f} GB of weights do not fit "
+              f"{budget_gb:.1f} GB of VRAM: layers are running on the CPU, which "
+              f"costs far more than any memory transfer. Connect a feeder "
+              f"(greenboost cluster) so RPC can split across both GPUs.", flush=True)
 
     llama_log = open(_run_log_path(entry.name), "ab")
     llama_proc = subprocess.Popen(cmd, env=env, stdout=llama_log, stderr=subprocess.STDOUT,

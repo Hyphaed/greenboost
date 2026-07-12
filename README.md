@@ -247,6 +247,15 @@ From Python, `gb_tiering.py` is the one import for the tier layer
 state); over MCP, `tiering_status` / `greenboost_status` expose the same thing
 to an assistant.
 
+
+GreenBoost way: **compute stays on the GPU, only memory moves.** 
+When a kernel needs a weight that lives in DDR, the GPU reads it over PCIe (≈25 GB/s on PCIe 4.0 x16, ≈55 GB/s on PCIe 5.0). 
+The CPU is not in the data path.
+
+End-to-end, you get something close to "GPU with 2-4× more VRAM" rather than "GPU + CPU painfully sharing the work." Yet System DDR is slower than GPU VRAM.
+
+GreenBoost applies techniques to avoid CPU spillover always that harms ai inference speed and/or quality. It provdies a direct VRAM <> System RAM + GPU transfer of data, without need for a copy at CPU which only adds more latency. 
+
 ---
 
 ## 🗜️ GB-Quant
@@ -492,28 +501,6 @@ Full Install deploys it into `/usr/local/lib/greenboost/cli-venv` and puts
 `gb` + `greenboost-cli` on your PATH; the `greenboost` MCP server exposes its
 rag/goals/factory surface to other assistants.
 
----
-
-## 🔍 GreenBoost vs CPU offload
-
-Some tools (llama.cpp `-ngl`, accelerate `device_map="auto"`) handle VRAM
-overflow by running parts of the model on the CPU. That works but it's
-*slow*. Inference becomes CPU-bound.
-≈30× less compute throughput than the GPU, plus transfer overhead.
-CPU spillover pays both a memory transfer penalty and a compute penalty by moving execution to the CPU.
-
-GreenBoost way: **compute stays on the GPU, only memory moves.** 
-When a kernel needs a weight that lives in DDR, the GPU reads it over PCIe (≈25 GB/s on PCIe 4.0 x16, ≈55 GB/s on PCIe 5.0). 
-The CPU is not in the data path.
-
-End-to-end, you get something close to "GPU with 2-4× more VRAM" rather
-than "GPU + CPU painfully sharing the work." Yet System DDR is slower than GPU VRAM.
-
-GPU VRAM bandwidth: ≈670 GB/s (12 GB of GDDR7 on a 192-bit bus)
-
-GPU access to system RAM via PCIe:
-PCIe 4.0 x16: ≈25 GB/s  (≈25x slower than integrated GPU VRAM)
-PCIe 5.0 x16: ≈50–55 GB/s  (≈12× slower than integrated GPU VRAM)
 
 ---
 
