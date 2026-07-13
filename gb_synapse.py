@@ -45,6 +45,7 @@ CLI:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shlex
@@ -369,12 +370,22 @@ def _quant_from_filename(fname: str) -> str:
 
 
 def list_repo_gguf(repo: str) -> list[dict]:
-    """[{filename, size}, ...] for every .gguf sibling file in an HF repo."""
+    """[{filename, size}, ...] for every .gguf sibling file in an HF repo that
+    is a candidate MAIN model weight file — excludes mmproj/vision-projector
+    GGUFs (same "mmproj" substring match as _find_mmproj's glob), which are
+    never valid standalone `-m` targets. Without this, pull()'s "nothing fits
+    the budget" fallback (smallest file wins) could pick a ~1 GB projector
+    over the real multi-GB model when the model itself doesn't fit — silently
+    registering a vision-only stub as if it were the whole LLM (confirmed
+    live: satgeze/Qwen3.6-35B-Uncensored-HauhauCS-1M-GGUF's manifest entry
+    pointed at mmproj-qwen36-hauhau-f16.gguf, arch "clip", 0.84 GB — not the
+    35B model at all)."""
     from huggingface_hub import HfApi
     api = HfApi(token=hf_token())
     info = api.model_info(repo, files_metadata=True)
     return [{"filename": s.rfilename, "size": s.size or 0}
-            for s in info.siblings if s.rfilename.endswith(".gguf")]
+            for s in info.siblings
+            if s.rfilename.endswith(".gguf") and "mmproj" not in s.rfilename.lower()]
 
 
 def _convert_hf_to_gguf(local_dir: str, out_path: Path, outtype: str = "bf16") -> None:
@@ -833,6 +844,17 @@ def _read_ram_total_mb() -> int:
     return 0
 
 
+def _read_ram_available_mb() -> int:
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return 0
+
+
 def doctor(probe_feeders: bool = True) -> dict:
     """Aggregate hardware view: host GPU/RAM + every cluster feeder's
     GPU/RAM, plus gb-synapse readiness (engine built, HF token set). This is
@@ -1251,6 +1273,91 @@ def ensure_feeder_rpc(feeder, rpc_port: int = RPC_PORT_BASE, device: int = 0) ->
 
 MTP_DRAFT_N = int(os.environ.get("GB_SYNAPSE_MTP_DRAFT_N", "3"))
 
+# llama.cpp's graph/compute workspace per CUDA device, on top of the weights
+# and KV it holds. Measured against the observed feeder OOM, not guessed low:
+# undershooting this is a failed load, overshooting only costs a layer.
+GPU_COMPUTE_RESERVE_GB = float(os.environ.get("GB_SYNAPSE_COMPUTE_RESERVE_GB", "1.5"))
+GPU_FIT_MARGIN = float(os.environ.get("GB_SYNAPSE_FIT_MARGIN", "0.85"))
+
+# Architectures whose CUDA backend cannot survive a CPU/GPU split (upstream
+# llama.cpp regression — see the cpu_quirk branch in serve() for the verified
+# evidence matrix). Models of these archs that don't fit VRAM are served
+# CPU-only instead of crash-looping. Shrink this set as upstream fixes land.
+ARCH_CPU_SPLIT_BROKEN = {"qwen35moe"}
+
+
+def _moe_expert_gb_per_layer(entry: ModelEntry) -> float:
+    """GiB of EXPERT weight in one layer (the `*_exps` tensors), 0 if not MoE.
+
+    Measured from the GGUF, because the ratio is the whole point: this model is
+    20.2 GiB of which 18.6 (92%) is experts and only 1.6 is attention/norms.
+    """
+    try:
+        from gb_gguf_tensor_map import tensor_map
+        tm = tensor_map(entry.path)
+    except Exception:
+        return 0.0
+    expert_bytes = sum(n for name, n in tm if "exps" in name)
+    if not expert_bytes:
+        return 0.0
+    layers = {name.split(".")[1] for name, _ in tm
+              if name.startswith("blk.") and "exps" in name}
+    return (expert_bytes / (1024 ** 3)) / max(1, len(layers))
+
+
+def _fit_cpu_moe_layers(entry: ModelEntry, budget_gb: float, kv_gb: float,
+                        n_devices: int = 1) -> int:
+    """How many layers must keep their EXPERTS off-GPU (llama.cpp --n-cpu-moe).
+
+    For an MoE that doesn't fit VRAM this beats dropping whole layers, and it
+    isn't close. A dropped layer takes its ATTENTION to the CPU — and attention
+    is read for every token. Experts are the opposite: they are ~92% of the
+    bytes but only 8 of 256 fire per token, so they are the cheapest thing in
+    the model to keep out of VRAM. Move experts, keep every layer's attention
+    and KV on the GPU.
+    """
+    per_layer = _moe_expert_gb_per_layer(entry)
+    n_layers = entry.n_layers or 0
+    if per_layer <= 0 or n_layers <= 0:
+        return 0
+    weights_gb = entry.n_bytes / (1024 ** 3)
+    room = budget_gb - kv_gb - GPU_COMPUTE_RESERVE_GB * max(1, n_devices)
+    deficit = weights_gb - room * GPU_FIT_MARGIN
+    if deficit <= 0:
+        return 0
+    return max(0, min(n_layers, math.ceil(deficit / per_layer)))
+
+
+def _fit_gpu_layers(entry: ModelEntry, budget_gb: float, kv_gb: float,
+                    n_devices: int = 1) -> int:
+    """How many layers actually fit the cluster's free VRAM.
+
+    llama.cpp puts EVERY layer on the GPU unless told otherwise, and
+    --tensor-split then spreads them by ratio — so a model larger than the
+    aggregate VRAM doesn't degrade, it dies mid-load ("failed to allocate
+    RPC0 buffer of size 12676098304" against a feeder with 7.5 GB free).
+    Sizing the layer count to the real budget is what turns "won't load" into
+    "loads, with the tail on the CPU": every layer we can keep on a GPU is one
+    that isn't paying the CPU penalty.
+    """
+    n_layers = entry.n_layers or 0
+    if n_layers <= 0:
+        return 999
+    per_layer_gb = (entry.n_bytes / (1024 ** 3)) / n_layers
+    # Every device — host AND each RPC feeder — needs its own compute/graph
+    # workspace on top of the weights it holds. Counting that once (or not at
+    # all) overshoots the smallest GPU, and on a GPU an overshoot is a hard OOM,
+    # not a spill: the feeder was handed a 9.5 GB share of a 7.5 GB card.
+    usable = budget_gb - kv_gb - GPU_COMPUTE_RESERVE_GB * max(1, n_devices)
+    if usable <= 0:
+        return 0
+    # An MoE's layers are not uniform: the expert-carrying ones are far larger
+    # than the mean, so sizing by the average over-commits the tail and the
+    # smallest device OOMs (the feeder was asked for 0.7 GB/layer against a
+    # 0.49 GB mean). Keep a margin rather than model every tensor: a layer left
+    # on the CPU costs throughput, a failed load costs everything.
+    return max(0, min(n_layers, int(usable * GPU_FIT_MARGIN / per_layer_gb)))
+
 
 def _pick_kv_type(ctx: int, entry: ModelEntry, budget_gb: float) -> str:
     """f16 KV when it fits the live budget, q8_0 when it is the only way to
@@ -1348,7 +1455,13 @@ def _compute_tensor_split(host_free_mb: int, online_feeders: list,
     also runs the output head + sampling, so a mild >1.0 bias can be worth it
     on a slow (GbE) link. Default path is byte-identical to v1.
     """
-    free = [max(host_free_mb, 1)] + [max(f.t1_free_mb, 1) for f in online_feeders]
+    # Every device also needs a compute/graph workspace, so the WEIGHTS a device
+    # can hold are its free VRAM minus that reserve. Splitting on raw free VRAM
+    # over-serves the smallest card — a 7.5 GB feeder was handed an 8.4 GB share
+    # and the load died there, not on the host that had room to spare.
+    reserve_mb = GPU_COMPUTE_RESERVE_GB * 1024.0
+    free = [max(int(host_free_mb - reserve_mb), 1)] + \
+           [max(int(f.t1_free_mb - reserve_mb), 1) for f in online_feeders]
     v2 = os.environ.get("GB_SYNAPSE_SPLIT_V2", "") == "1"
     try:
         host_bias = float(os.environ.get("GB_SYNAPSE_HOST_BIAS", "1.0"))
@@ -1707,36 +1820,15 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
             online_feeders.append(f)
     budget_gb = host_free_mb / 1024 + sum(f.t1_free_mb for f in online_feeders) / 1024
 
-    # ctx=0 means "whatever the model itself was certified for" — a 1M YaRN bake
-    # exists precisely so it can be USED, and a hardcoded 64K default silently
-    # discarded 94% of it. The budget clamp below still decides what actually
-    # fits, so asking for the model's full context is never dangerous, just
-    # honest about the ceiling.
-    if ctx <= 0:
-        ctx = entry.ctx_length or 65536
-    ctx = _clamp_ctx_to_budget(ctx, entry, budget_gb)
-
-    # KV precision is a QUALITY tier, not a memory knob, so it is chosen against
-    # the budget rather than hardcoded: f16 is certification grade, q8_0 is a
-    # budget config that buys ~2x the cache for roughly one needle at long
-    # rungs. Serving q8_0 unconditionally (as this did) quietly demoted every
-    # model to the budget tier — including ones whose KV fits f16 with room to
-    # spare. Take f16 whenever it fits; drop to q8_0 only to make the context
-    # reachable at all, and say so.
-    kv_type = _pick_kv_type(ctx, entry, budget_gb)
-
-    # Split reflects the (clamped) ctx's KV footprint at the KV tier we actually
-    # serve — an f16 cache is twice a q8_0 one, and a split sized for the wrong
-    # tier pushes weights onto a node that has no room left for them.
-    kv_total_gb = estimate_kv_gb(ctx, entry.n_bytes, entry.quant,
-                                 n_layers=entry.n_layers, n_kv_heads=entry.n_kv_heads,
-                                 head_dim=entry.head_dim,
-                                 kv_bytes_per_elem=2.0 if kv_type == "f16" else 1.0)
-    tensor_split = _compute_tensor_split(host_free_mb, online_feeders, kv_total_gb)
-
     internal_port = port + 1000
     env = gb_cluster.shim_env(workload="llm", enabled=True)
     env["GREENBOOST_CLUSTER"] = "0"  # RPC owns cross-node split; shim = local tiers only
+    # Pin the loader to the engine dir: the binary's RUNPATH points at the
+    # BUILD TREE, so without this a rebuilt tree silently swaps the ggml libs
+    # under an older binary (confirmed by crash backtraces referencing
+    # build-synapse/bin paths) — two engine versions in one process.
+    env["LD_LIBRARY_PATH"] = str(ENGINE_DIR) + (
+        ":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
 
     # The shim currently aborts llama.cpp's CUDA backend on this host:
     # LD_PRELOAD of libgreenboost_cuda.so makes cudaFuncGetAttributes return
@@ -1764,6 +1856,49 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
     # so we say plainly which one we got.
     weights_gb = entry.n_bytes / (1024 ** 3)
     fits_vram = weights_gb <= budget_gb or "LD_PRELOAD" in env
+    cpu_quirk = (not fits_vram and entry.arch in ARCH_CPU_SPLIT_BROKEN
+                 and os.environ.get("GB_SYNAPSE_FORCE_SPLIT") != "1")
+
+    # ctx=0 means "whatever the model itself was certified for" — a 1M YaRN bake
+    # exists precisely so it can be USED, and a hardcoded 64K default silently
+    # discarded 94% of it. The budget clamp below still decides what actually
+    # fits, so asking for the model's full context is never dangerous, just
+    # honest about the ceiling.
+    #
+    # Which budget, though: when `cpu_quirk` is about to force this model onto
+    # the CPU-only arch-split-crash path, weights AND KV cache live in plain
+    # host+feeder RAM, not VRAM — clamping ctx/KV-type against the (already
+    # weights-insufficient) VRAM budget starved ctx down to a few thousand
+    # tokens even with 60+ GB of RAM sitting idle (observed: ctx clamped to
+    # 6144 on a model certified to 1M). Use the real RAM budget in that case.
+    ctx_kv_budget_gb = budget_gb
+    if cpu_quirk:
+        ram_free_mb = _read_ram_available_mb()
+        ctx_kv_budget_gb = max(
+            budget_gb,
+            ram_free_mb / 1024 + sum(f.t2_free_mb for f in online_feeders) / 1024)
+
+    if ctx <= 0:
+        ctx = entry.ctx_length or 65536
+    ctx = _clamp_ctx_to_budget(ctx, entry, ctx_kv_budget_gb)
+
+    # KV precision is a QUALITY tier, not a memory knob, so it is chosen against
+    # the budget rather than hardcoded: f16 is certification grade, q8_0 is a
+    # budget config that buys ~2x the cache for roughly one needle at long
+    # rungs. Serving q8_0 unconditionally (as this did) quietly demoted every
+    # model to the budget tier — including ones whose KV fits f16 with room to
+    # spare. Take f16 whenever it fits; drop to q8_0 only to make the context
+    # reachable at all, and say so.
+    kv_type = _pick_kv_type(ctx, entry, ctx_kv_budget_gb)
+
+    # Split reflects the (clamped) ctx's KV footprint at the KV tier we actually
+    # serve — an f16 cache is twice a q8_0 one, and a split sized for the wrong
+    # tier pushes weights onto a node that has no room left for them.
+    kv_total_gb = estimate_kv_gb(ctx, entry.n_bytes, entry.quant,
+                                 n_layers=entry.n_layers, n_kv_heads=entry.n_kv_heads,
+                                 head_dim=entry.head_dim,
+                                 kv_bytes_per_elem=2.0 if kv_type == "f16" else 1.0)
+    tensor_split = _compute_tensor_split(host_free_mb, online_feeders, kv_total_gb)
 
     SLOT_DIR.mkdir(parents=True, exist_ok=True)
     cmd = [str(ENGINE_DIR / "llama-server"), "-m", entry.path,
@@ -1771,6 +1906,14 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
            "--ctx-size", str(ctx),
            "--slot-save-path", str(SLOT_DIR), "--no-webui",
            "--flash-attn", "auto",
+           # Reuse cached KV for repeated prefixes (system prompt, prior turns)
+           # instead of reprocessing them from scratch every request — the
+           # model card's own recommended invocation for agentic/Claude-Code
+           # use includes this exact flag. Without it, a multi-turn tool-call
+           # loop (call → tool result → final answer) reprocesses the whole
+           # growing context on EVERY turn; confirmed live (2026-07-13) this
+           # was the dominant cost, not raw decode speed, on a CPU-only serve.
+           "--cache-reuse", "256",
            "--no-mmap",  # DMA-BUF pinning (Path A) is incompatible with mmap-backed pages
            "-np", str(n_slots), "--threads", str(_pcore_threads()),
            "--cache-type-k", kv_type, "--cache-type-v", kv_type,
@@ -1782,8 +1925,38 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
            # calling Glob/Read with no "pattern"/"file_path"). See known-issues.md.
            "--jinja"]
 
+    n_cpu_moe = 0
     if fits_vram:
         cmd += ["-ngl", "999"]        # all layers on GPU — the fast path
+    elif cpu_quirk:
+        # Upstream llama.cpp CUDA regression (2026-07-12, engine 6b4dc2116):
+        # for this arch ANY CPU/GPU split aborts at the first batched prompt
+        # ("ggml_cuda_compute_forward: SOFT_MAX failed — invalid argument").
+        # Verified exhaustively: -ngl 10 plain, --n-cpu-moe, --cpu-moe, FA
+        # on/off, GGML_CUDA_DISABLE_GRAPHS, -ub 8, --no-op-offload — all crash;
+        # -ngl 0 works (11.2 tok/s measured, 3B-active MoE). Full-VRAM would
+        # also work but no quant of this model fits the cluster. Until the
+        # kernel is fixed upstream, CPU-only is the ONLY placement that serves
+        # at all — an explicit, temporary exception to the GPU-always rule,
+        # not a policy change. Re-test with GB_SYNAPSE_FORCE_SPLIT=1.
+        # See workflow/known-issues.md + ggml-org/llama.cpp#19816 (same family).
+        #
+        # -ngl 0 alone is NOT CPU-only: llama.cpp still creates a CUDA context
+        # and op-offloads batched matmuls to the GPU above ~32 tokens — a tiny
+        # curl probe passed while greenboost-cli's 4k-token agentic prompt
+        # crashed the same way. Hide the GPU entirely so no tensor can touch
+        # the broken kernel, whatever the batch size.
+        cmd += ["-ngl", "0", "--no-op-offload"]
+        env["CUDA_VISIBLE_DEVICES"] = ""
+    elif entry.is_moe:
+        # Every layer still runs on the GPU; only the experts of the first
+        # n_cpu_moe layers live in host DDR.
+        n_cpu_moe = _fit_cpu_moe_layers(entry, budget_gb, kv_total_gb,
+                                        1 + len(online_feeders))
+        cmd += ["-ngl", "999", "--n-cpu-moe", str(n_cpu_moe)]
+    else:
+        n_gpu = _fit_gpu_layers(entry, budget_gb, kv_total_gb, 1 + len(online_feeders))
+        cmd += ["-ngl", str(n_gpu)]
 
     # No mmap: DMA-BUF pinning needs owned pages. Without the shim there is
     # nothing to pin, and mmap lets the page cache serve a 20 GB GGUF instead of
@@ -1811,17 +1984,36 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
         cmd += shlex.split(extra_args)
 
     kv_grade = "certification-grade" if kv_type == "f16" else "budget"
-    placement = "all-GPU" if fits_vram else "PARTIAL CPU OFFLOAD (slow)"
+    if fits_vram:
+        placement = "all-GPU"
+    elif cpu_quirk:
+        placement = "CPU-ONLY (arch CUDA-split quirk — see known-issues.md)"
+    else:
+        placement = "PARTIAL CPU OFFLOAD (slow)"
     print(f"  [gb-synapse] {entry.name}: ctx={ctx} kv={kv_type} ({kv_grade}) "
           f"weights={weights_gb:.1f}GB/{budget_gb:.1f}GB budget → {placement}, "
           f"shim={shim_note}"
           f"{' +mtp' if _has_mtp(entry) else ''}{' +vision' if mmproj else ''}"
           f"{' rpc=' + ','.join(rpc_args) if rpc_args else ''}", flush=True)
-    if not fits_vram:
+    if cpu_quirk:
+        print(f"  [gb-synapse] {weights_gb:.1f} GB of weights vs {budget_gb:.1f} GB VRAM "
+              f"AND arch '{entry.arch}' cannot survive a CPU/GPU split on this llama.cpp "
+              f"build (upstream CUDA regression) — serving CPU-ONLY. Measured 11.2 tok/s "
+              f"decode (3B-active MoE). Re-test the split with GB_SYNAPSE_FORCE_SPLIT=1 "
+              f"after an engine upgrade.", flush=True)
+    elif not fits_vram and n_cpu_moe:
+        print(f"  [gb-synapse] {weights_gb:.1f} GB of weights vs {budget_gb:.1f} GB VRAM: "
+              f"ALL {entry.n_layers} layers stay on GPU (attention + KV); experts of "
+              f"{n_cpu_moe}/{entry.n_layers} layers held in DDR "
+              f"({_moe_expert_gb_per_layer(entry):.2f} GB/layer). Only 8 of "
+              f"{entry.n_experts} experts fire per token, so this is the cheapest "
+              f"weight in the model to keep out of VRAM.", flush=True)
+    elif not fits_vram:
+        _fit = _fit_gpu_layers(entry, budget_gb, kv_total_gb, 1 + len(online_feeders))
         print(f"  [gb-synapse] {weights_gb:.1f} GB of weights do not fit "
-              f"{budget_gb:.1f} GB of VRAM: layers are running on the CPU, which "
-              f"costs far more than any memory transfer. Connect a feeder "
-              f"(greenboost cluster) so RPC can split across both GPUs.", flush=True)
+              f"{budget_gb:.1f} GB of VRAM: {_fit}/{entry.n_layers} layers on GPU, the "
+              f"rest on CPU. CPU layers cost far more than any memory transfer — add "
+              f"VRAM (another feeder) or a smaller quant to close the gap.", flush=True)
 
     llama_log = open(_run_log_path(entry.name), "ab")
     llama_proc = subprocess.Popen(cmd, env=env, stdout=llama_log, stderr=subprocess.STDOUT,
@@ -1830,7 +2022,7 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
     return _launch_proxy_and_record(entry, llama_proc, port, internal_port,
                                      tensor_split=tensor_split,
                                      feeders=[f.ip for f in online_feeders],
-                                     ctx=ctx, kv_type=kv_type,
+                                     ctx=ctx, kv_type=kv_type, placement=placement,
                                      mtp=bool(_has_mtp(entry)), vision=bool(mmproj))
 
 

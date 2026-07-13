@@ -45,6 +45,105 @@ diffusion pipelines, plus local LLMs, and fixing whatever actually got in the
 way. That matters because it's a different kind of testing than writing a
 feature and moving on.
 
+### The six subsystems
+
+GreenBoost is organised as six named subsystems, and from v3.2 the docs, the
+telemetry and the MCP servers all use the same names:
+
+| Subsystem | What it does in v3.2 |
+|---|---|
+| 📦 **GB-Tiering** | Extends GPU memory with system RAM (T2) and NVMe (T3). Access frequency, not allocation order, decides what stays in VRAM: the KV cache is reserved in T1 first, weights fill what's left. |
+| 🗜️ **GB-Quant** | Compresses **weights** (quantize-to-fit planner, bf16 > int8 > int4, GemLite kernels) **and the KV cache** (TurboQuant, the KV branch , it is *not* a separate product). |
+| 📡 **GB-Dataflux** | The flight recorder. Every placement, quantization, tier move, serve and measured tok/s lands in one event log, queryable live over MCP and in a web UI (`greenboost dataflux-ui`). |
+| 🌐 **GB-Cluster** | Borrows idle GPUs and RAM from LAN machines ("feeders"), and now peers their *compute*, not just their memory. |
+| 🔗 **GB-Synapse** | GreenBoost's own model server + Ollama/OpenAI proxy on `:11434`, in front of `llama-server --rpc`. A drop-in replacement for Ollama that can split one model across two machines' GPUs. |
+| 🖥️ **GB-CLI** | The agentic terminal client, **installed by Full Install , no separate setup**. `gb` for the REPL, `gb -p "…"` for one-shot prompts, `gb rag-search …` for headless JSON. It always talks to GB-Synapse on `:11434`, so whatever the cluster is serving is what the agent thinks with. |
+
+### 🖥️ GB-CLI , the agent that ships with GreenBoost
+
+New in v3.2 and previously missing from these notes entirely. Full Install
+deploys it into `/usr/local/lib/greenboost/cli-venv` and puts `gb` and
+`greenboost-cli` on your PATH. It is **gb-synapse-only** by design: there is no
+cloud fallback and no separate ollama path, so every token it generates goes
+through the GreenBoost stack (cluster split, gb-quant, tiering) and every turn's
+throughput is recorded to GB-Dataflux (`tok_s_measured`). The `greenboost` MCP
+server exposes its RAG / goals / factory surface to other assistants, and
+`greenboost-synapse` exposes a bridge (`cli_run`, `cli_prompt`) so an LLM can
+drive it.
+
+Reliability work this release (all found by running it, not by reading it):
+
+- **Zombie processes were reported as healthy servers.** `_pid_alive()` used a
+  signal-0 check, which *succeeds* against a zombie , and a crashed engine stays
+  a zombie for as long as the CLI that spawned it lives. So gb-synapse "reused"
+  dead servers, `status` lied, and the proxy relayed to a corpse until the user
+  saw a truncated stream. Liveness is now read from the real process state.
+- **`serve()` never checked readiness.** It returned a server handle the moment
+  the process was *spawned*, so the CLI printed `✓ gb-synapse started (pid N)`
+  for an engine that was already exiting. It now waits on `/health` (reading the
+  body , this llama.cpp answers `200 {"status":"loading model"}`, not `503`) and
+  **raises with the engine's own error** instead. No proxy is started in front of
+  a dead engine.
+- **Mid-stream disconnects surfaced as `RemoteProtocolError` tracebacks.** The
+  CLI now asks gb-synapse what actually happened and prints that.
+
+### 🔗 GB-Synapse , now an orchestrator, not just a launcher
+
+The name is the promise: synapse is the *bridge* between a model and GreenBoost,
+and its job is to make that model run as well as this cluster can run it. v3.2
+teaches it to read what a model actually *is* and place it accordingly:
+
+- **MoE-aware placement.** For a mixture-of-experts model that doesn't fit VRAM,
+  the naive fix is to leave whole layers off the GPU , but a dropped layer takes
+  its *attention* with it, and attention is read for every token. Measured on
+  Qwen3.6-35B: **experts are 18.6 of 20.2 GiB (92%) yet only 8 of 256 fire per
+  token**. So gb-synapse keeps every layer's attention and KV on the GPU
+  (`-ngl 999`) and offloads only the **expert tensors** (`--n-cpu-moe N`), sized
+  from the GGUF's real tensor table.
+- **MTP speculative decoding** (`--spec-type draft-mtp`), detected from the
+  GGUF's tensors rather than its filename. The draft head is the model's own
+  grafted layer, so it costs no VRAM, and the trunk verifies every drafted token
+  , the output distribution is unchanged. Upstream measures +34% decode.
+- **Vision** (`--mmproj`). Without it a VLM is served text-only and images are
+  *silently dropped* , the model then describes a picture it never received.
+  Note that Ollama's own blobs carry **no separate projector layer**, so
+  vision/OCR models must come from HuggingFace as GGUF + mmproj.
+- **KV cache as a quality tier**, not a memory knob: `f16` (certification grade)
+  whenever it fits, `q8_0` (budget grade) only to make a context reachable , and
+  labelled as such in telemetry. It used to be hardcoded to `q8_0`, quietly
+  demoting every model.
+- **Context** now defaults to the model's own certified length, clamped to what
+  the KV budget can actually hold (it was hardcoded to 64K, discarding 94% of a
+  1M-token bake).
+- **Cluster fixes:** the feeder's `rpc-server` needed its own engine dir on
+  `LD_LIBRARY_PATH` (it died instantly with `libggml.so.0: cannot open shared
+  object file`), takes a device *name* (`CUDA0`, not `0`), and is now verified
+  **reachable from the host** before it is allowed into `--rpc`/`--tensor-split`
+  , an unreachable feeder used to be handed a share of the model anyway, which
+  fails the load outright.
+- **Ollama `images` are now translated** to OpenAI `image_url` parts by the
+  proxy, which is what lets an Ollama-API vision client (ai-forge's critic) work
+  through gb-synapse at all.
+
+### 🧪 gb-aviary , 1M context, certified rather than claimed
+
+New module (`gb_aviary.py`), adapted from the aviary-1m harness (MIT):
+
+- **`bake_yarn()`** writes YaRN rope-scaling metadata into a GGUF , 1M context,
+  no weight changes. It **derives the smallest factor that reaches the target**
+  rather than accepting one, because the factor itself costs quality: the same
+  model at the same 1M rung scores 10/10 baked at factor 6 and 9/10 at factor 8.
+- **`niah_certify()`** plants needles at spread depths and scores retrieval
+  against the *serving* stack, so a model is certified on the same cluster that
+  runs it. The KV tier is recorded with the score, because a retrieval number
+  without it is a claim, not a certificate.
+- **`smoke_gate()`** catches repetition-collapse, the failure signature of a
+  quant pushed too far. This is what makes the "never below fp8" rule
+  enforceable against **evidence** instead of a table of bit-widths.
+
+All three emit dataflux events (`yarn_bake`, `niah_cert`, `smoke_gate`) ,
+including the failures.
+
 ### `greenboost cluster` , proud to call this one done, not experimental
 
 Until now, `greenboost cluster` was labeled alpha. v3.2 is the first release

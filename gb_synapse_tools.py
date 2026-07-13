@@ -293,6 +293,16 @@ def messages_to_openai_for_injection(messages: list) -> list:
 
 _QWEN_FUNCTION_RE  = re.compile(r"<function=([^>]+)>([\s\S]*?)</function>")
 _QWEN_PARAMETER_RE = re.compile(r"<parameter=([^>]+)>([\s\S]*?)</parameter>")
+# Fallback when the model doesn't close with the exact `</function>` tag —
+# confirmed live (2026-07-13, satgeze/qwen36-35b-uncensored-1m): it emitted
+# `</parameters>` (plural, no matching `<function>` open) instead, dropping
+# the whole tool call silently since _QWEN_FUNCTION_RE requires a literal
+# `</function>`. `raw` here is already bounded by the outer `<tool_call>...
+# </tool_call>` match, so once the opening `<function=NAME>` tag is found,
+# whatever comes after it — to any of the plausible near-miss closers, or
+# just the end of `raw` — is a safe body to scan for <parameter=...> pairs.
+_QWEN_FUNCTION_OPEN_RE = re.compile(r"<function=([^>]+)>")
+_QWEN_FUNCTION_CLOSE_RE = re.compile(r"</function>|</parameters>")
 
 
 def _coerce_qwen_value(raw: str, ptype: "str | None"):
@@ -337,10 +347,21 @@ def _parse_qwen_xml_tool_call(raw: str, tool_schemas: list) -> "dict | None":
     no value here and this avoids the escaping edge cases that approach has to
     work around."""
     m = _QWEN_FUNCTION_RE.search(raw)
-    if not m:
-        return None
-    name = m.group(1).strip()
-    body = m.group(2)
+    if m:
+        name = m.group(1).strip()
+        body = m.group(2)
+    else:
+        # No exact `</function>` close — fall back to the open tag plus
+        # whatever's left of `raw` (itself already bounded by the outer
+        # <tool_call> match), trimmed at the first near-miss closer if one
+        # is present so a stray `</parameters>` etc. doesn't leak into body.
+        om = _QWEN_FUNCTION_OPEN_RE.search(raw)
+        if not om:
+            return None
+        name = om.group(1).strip()
+        rest = raw[om.end():]
+        cm = _QWEN_FUNCTION_CLOSE_RE.search(rest)
+        body = rest[:cm.start()] if cm else rest
 
     schema = next((s for s in tool_schemas if s.get("name") == name), None)
     props = (schema or {}).get("input_schema", {}).get("properties", {})

@@ -3713,6 +3713,16 @@ do_purge() {
     local restart_after="${1:-0}"
     local preserve_cluster="${2:-0}"
 
+    # -1. Stop everything BEFORE touching any file: force-release T1/T2/T3 and
+    #     kill lingering GPU inference processes (same as `greenboost clear
+    #     memory-pool`), and stop feeding if this machine is currently a
+    #     feeder (`greenboost feed start` was run here) , its greenboost-netd
+    #     otherwise keeps running against soon-to-be-replaced binaries/state
+    #     through the rest of the install. Both are no-ops (safe, silent) when
+    #     nothing is loaded/running, so this always runs, on every purge.
+    cmd_clear_memory_pool || true
+    cmd_feed stop || true
+
     # 0. Remove any legacy boot-cleanup artifacts from previous failed install attempts.
     #    These services caused more problems than they solved (kernel oops during boot).
     systemctl disable --now greenboost-boot-cleanup.service 2>/dev/null || true
@@ -4190,9 +4200,22 @@ if _os.environ.get("GREENBOOST_ACTIVE") == "1":
 # Best-effort: a missing source checkout, offline mode, or a pip failure only
 # warns — Full Install must never abort on the CLI step.
 # Called from: cmd_install (full-install) and the install-cli verb.
+#
+# 2026-07-13: greenboost-cli is now VENDORED at $MODULE_DIR/greenboost-cli ,
+# fused into this repo so Full Install never depends on a separate sibling
+# checkout existing next to it. This is what made CLI install fail on a
+# feeder (or any machine with only `greenboost` cloned, no `greenboost-cli`):
+# the old default was "$MODULE_DIR/../greenboost-cli", a path that only
+# resolves on a dev machine with both repos checked out side by side.
+# GB_CLI_SRC is still honoured for CLI development against a separate
+# checkout; the co-located sibling path is kept as a second fallback for that
+# same dev workflow, but the vendored copy is what every real install uses.
 cmd_install_cli() {
-    local _src="${GB_CLI_SRC:-$MODULE_DIR/../greenboost-cli}"
-    if [[ ! -f "$_src/pyproject.toml" ]]; then
+    local _src="" _cand
+    for _cand in "${GB_CLI_SRC:-}" "$MODULE_DIR/greenboost-cli" "$MODULE_DIR/../greenboost-cli"; do
+        [[ -n "$_cand" && -f "$_cand/pyproject.toml" ]] && { _src="$_cand"; break; }
+    done
+    if [[ -z "$_src" ]]; then
         gb_warn "greenboost-cli source not found (set GB_CLI_SRC) — skipping CLI install"
         return 0
     fi
@@ -4259,8 +4282,23 @@ WRAPEOF
 # script only warns , Full Install must never abort on this step.
 # Called from: cmd_install (full-install) and the install-pipelines verb.
 cmd_install_pipelines() {
-    local _af="${GB_AIFORGE_SRC:-$MODULE_DIR/../ai-forge}"
-    if [[ ! -d "$_af" ]]; then
+    # Try, in order: explicit override, co-located sibling checkout (some dev
+    # layouts nest it next to greenboost), then the canonical location
+    # (~/Dev/ai-forge , see this repo's CLAUDE.md). Most users who have
+    # ai-forge at all have it at the canonical path, not co-located.
+    # Full Install runs via sudo, so $HOME is /root , resolve the invoking
+    # (non-root) user's home instead, same idiom cmd_feeders_redeploy_netd uses.
+    local _sudo_home=""
+    [[ -n "${SUDO_USER:-}" ]] && _sudo_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+    local _af="" _af_candidate
+    for _af_candidate in \
+        "${GB_AIFORGE_SRC:-}" \
+        "$MODULE_DIR/../ai-forge" \
+        "${_sudo_home:+$_sudo_home/Dev/ai-forge}" \
+        "$HOME/Dev/ai-forge"; do
+        [[ -n "$_af_candidate" && -d "$_af_candidate" ]] && { _af="$_af_candidate"; break; }
+    done
+    if [[ -z "$_af" ]]; then
         gb_warn "ai-forge not found (set GB_AIFORGE_SRC) — skipping pipeline deps"
         return 0
     fi
@@ -4280,12 +4318,26 @@ cmd_install_pipelines() {
     # and any future setup_*.sh with zero changes here.  Each script is expected
     # to be idempotent and is run non-fatally: a failure warns and continues so
     # one broken setup script never aborts Full Install.
+    #
+    # Run as the invoking (non-root) user, not root: these scripts install INTO
+    # a user-owned env (miniforge/conda , see the DELIBERATE UNINSTALL
+    # ASYMMETRY note above) and resolve their target interpreter via $HOME
+    # (e.g. setup_paddleocr.sh's "$HOME/.miniforge3/bin/python" search). Full
+    # Install runs under sudo, so plain `bash "$_script"` as root has
+    # $HOME=/root , the miniforge lookup misses a real, working env and falls
+    # back to the system python3, which is PEP-668 externally-managed and
+    # rejects pip installs outright. `sudo -u <user> -H` fixes both: HOME
+    # resolves correctly AND installed files land user-owned, not root-owned.
+    local -a _run_as=()
+    if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+        _run_as=(sudo -u "$SUDO_USER" -H)
+    fi
     local _ran=0 _script _name
     shopt -s nullglob
     for _script in "$_jobs_dir"/setup_*.sh; do
         _name=$(basename "$_script")
         gb_info "Running pipeline dep setup: $_name"
-        if bash "$_script"; then
+        if "${_run_as[@]}" bash "$_script"; then
             gb_ok "pipeline dep setup ok: $_name"
             (( _ran++ )) || true
         else
@@ -4320,7 +4372,17 @@ cmd_register_mcp() {
         _run=(sudo -u "$_u")
     fi
 
-    if ! "${_run[@]}" bash -lc 'command -v claude' &>/dev/null; then
+    # Most user ~/.bashrc files start with the stock Debian/Ubuntu guard
+    # `case $- in *i*) ;; *) return;; esac`, which no-ops the WHOLE file
+    # (including nvm's `. "$NVM_DIR/nvm.sh"` line) under a non-interactive
+    # `bash -lc` — exactly what `sudo -u <user> bash -lc ...` is. That left
+    # `claude` (installed via nvm) invisible here even though it's on the
+    # user's normal interactive PATH, so every step below failed silently.
+    # Source nvm.sh directly — it has no such guard — instead of relying on
+    # rc-file loading.
+    local _prelude='export NVM_DIR="$HOME/.nvm"; [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" >/dev/null 2>&1; PATH="$HOME/.local/bin:$PATH";'
+
+    if ! "${_run[@]}" bash -c "$_prelude command -v claude" &>/dev/null; then
         gb_warn "Claude CLI not found — skipping MCP registration; run 'greenboost register-mcp' later"
         return 0
     fi
@@ -4333,7 +4395,7 @@ cmd_register_mcp() {
         "greenboost-orchestrator:$_py/gb_mcp.py"
         "greenboost-synapse:$_py/gb_synapse_mcp.py"
     )
-    local _entry _name _path _ok=0
+    local _entry _name _path _ok=0 _err
     for _entry in "${_servers[@]}"; do
         _name="${_entry%%:*}"
         _path="${_entry#*:}"
@@ -4342,11 +4404,11 @@ cmd_register_mcp() {
             continue
         fi
         # Idempotent: drop any prior registration, then add fresh.
-        "${_run[@]}" bash -lc "claude mcp remove '$_name'" &>/dev/null || true
-        if "${_run[@]}" bash -lc "claude mcp add --scope user '$_name' -- python3 '$_path'" &>/dev/null; then
+        "${_run[@]}" bash -c "$_prelude claude mcp remove '$_name'" &>/dev/null || true
+        if _err=$("${_run[@]}" bash -c "$_prelude claude mcp add --scope user '$_name' -- python3 '$_path'" 2>&1); then
             (( _ok++ )) || true
         else
-            gb_warn "MCP registration failed: $_name — continuing"
+            gb_warn "MCP registration failed: $_name — continuing (${_err//$'\n'/ })"
         fi
     done
     [[ $_ok -gt 0 ]] && gb_ok "Registered $_ok MCP server(s) with Claude CLI (user: $_u)"
@@ -4531,14 +4593,24 @@ MODEOF
     # looked like generic slowness/"GPU thermal throttling" until traced back
     # to this. Unload first if some (possibly stale-params) instance is
     # already loaded, so the fresh modprobe.conf options actually take effect.
-    depmod -a 2>/dev/null || true
-    if lsmod | grep -q '^greenboost '; then
-        modprobe -r greenboost 2>/dev/null || _rmmod_with_retry || true
-    fi
-    if modprobe greenboost; then
-        gb_ok "Kernel module loaded (virtual_vram_gb=${GB_VIRT}, reserve=${GB_RESERVE} GB)"
-    else
-        gb_warn "modprobe greenboost failed after install , load manually: sudo modprobe greenboost"
+    #
+    # Skip when cmd_full_install is about to run its own step 3/5 "Loading
+    # kernel module..." (cmd_load) right after this returns , cmd_load does
+    # the full load (ACLs, ollama-consumer stop/start, Python file sync, KV
+    # auto-tune) and would otherwise find this modprobe's module already
+    # loaded and redundantly unload + reload it (stopping ollama/llama-server
+    # twice for one install). Standalone `greenboost install` (no cmd_load
+    # follow-up) still needs this block , same GB_SKIP_INSTALL_PURGE pattern.
+    if [[ "${GB_SKIP_INSTALL_LOAD:-0}" -ne 1 ]]; then
+        depmod -a 2>/dev/null || true
+        if lsmod | grep -q '^greenboost '; then
+            modprobe -r greenboost 2>/dev/null || _rmmod_with_retry || true
+        fi
+        if modprobe greenboost; then
+            gb_ok "Kernel module loaded (virtual_vram_gb=${GB_VIRT}, reserve=${GB_RESERVE} GB)"
+        else
+            gb_warn "modprobe greenboost failed after install , load manually: sudo modprobe greenboost"
+        fi
     fi
 
     # Persist across reboots , same gap as the modprobe fix above but for the
@@ -8458,31 +8530,42 @@ cmd_connect() {
 # fails the connect.
 _gb_connect_check_parity() {
     local ip="$1" ssh_user="$2"
-    local _local_id=""
+    # Compare BUILD_GIT (source revision), never BUILD_ID (wall-clock
+    # "DDMM-HHMM" install timestamp , see cmd_install). Host and feeder are
+    # installed at different times even from identical source, so comparing
+    # BUILD_ID guarantees a false "mismatch" on almost every connect.
+    local _local_id="" _local_git=""
     for _bi in "${MODULE_DIR}/build_info" /etc/greenboost/build_info; do
-        [[ -f "$_bi" ]] && { _local_id=$(grep '^BUILD_ID=' "$_bi" 2>/dev/null | cut -d= -f2); break; }
+        if [[ -f "$_bi" ]]; then
+            _local_id=$(grep '^BUILD_ID=' "$_bi" 2>/dev/null | cut -d= -f2)
+            _local_git=$(grep '^BUILD_GIT=' "$_bi" 2>/dev/null | cut -d= -f2)
+            break
+        fi
     done
     [[ -z "$_local_id" ]] && return 0
 
     local _ssh_as=()
     [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]] && _ssh_as=(runuser -u "$SUDO_USER" --)
-    local _remote_id
-    _remote_id=$("${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 \
+    local _remote_bi
+    _remote_bi=$("${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 \
         -o StrictHostKeyChecking=no "${ssh_user}@${ip}" \
-        "grep '^BUILD_ID=' /etc/greenboost/build_info 2>/dev/null | cut -d= -f2" 2>/dev/null)
+        "cat /etc/greenboost/build_info 2>/dev/null" 2>/dev/null)
+    local _remote_id _remote_git
+    _remote_id=$(echo "$_remote_bi" | grep '^BUILD_ID=' | cut -d= -f2)
+    _remote_git=$(echo "$_remote_bi" | grep '^BUILD_GIT=' | cut -d= -f2)
 
     if [[ -z "$_remote_id" ]]; then
         gb_warn "Feeder has no GreenBoost build stamp , feeder-GPU compute needs a matching build."
         gb_info  "  Sync + rebuild on the feeder:  sudo greenboost update feeders"
         return 0
     fi
-    if [[ "$_remote_id" != "$_local_id" ]]; then
-        gb_warn "GreenBoost build mismatch , host ${_local_id} vs feeder ${_remote_id}."
+    if [[ -n "$_local_git" && -n "$_remote_git" && "$_remote_git" != "$_local_git" ]]; then
+        gb_warn "GreenBoost build mismatch , host ${_local_git} (${_local_id}) vs feeder ${_remote_git} (${_remote_id})."
         gb_warn "  Feeder-GPU compute requires identical builds (netd is -march=native;"
         gb_warn "  host CPU and feeder CPU may differ , Intel vs AMD , so binaries are NOT portable)."
         gb_info  "  Align now:  sudo greenboost update feeders"
     else
-        gb_ok "GreenBoost build parity OK (${_local_id})."
+        gb_ok "GreenBoost build parity OK (${_local_git:-$_local_id})."
     fi
 
     # ollama version parity , the feeder's native libggml-cuda.so must expose
@@ -9677,11 +9760,12 @@ _cmd_cluster_snapshot() {
     done
     echo ""
     echo -e "  ${C_DIM}Build stamps:${C_RESET}"
-    local _local_stamp_id _local_stamp_epoch _local_stamp_date _local_stamp_ver
+    local _local_stamp_id _local_stamp_epoch _local_stamp_date _local_stamp_ver _local_stamp_git
     if [[ -n "$_local_bi" ]]; then
         _local_stamp_id=$(grep BUILD_ID "$_local_bi" 2>/dev/null | cut -d= -f2)
         _local_stamp_ver=$(grep BUILD_VERSION "$_local_bi" 2>/dev/null | cut -d= -f2)
         _local_stamp_epoch=$(grep BUILD_EPOCH "$_local_bi" 2>/dev/null | cut -d= -f2)
+        _local_stamp_git=$(grep BUILD_GIT "$_local_bi" 2>/dev/null | cut -d= -f2)
         _local_stamp_date=$(date -d "@${_local_stamp_epoch}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "${_local_stamp_epoch}")
         printf "  ${C_CYAN}%-12s${C_RESET}  ${C_GRAY}v%-7s${C_RESET} ${C_LIME}%s${C_RESET}  ${C_DIM}%s${C_RESET}\n" \
             "$(hostname -s)" "${_local_stamp_ver:-?}" "${_local_stamp_id:-?}" "${_local_stamp_date}"
@@ -9705,18 +9789,22 @@ _cmd_cluster_snapshot() {
                 "${_bssh}@${_bip}" \
                 "cat /etc/greenboost/build_info 2>/dev/null" 2>/dev/null) || true
 
-            local _rid _rver _repoch _rdate
+            local _rid _rver _repoch _rdate _rgit
             _rid=$(echo "$_rbi" | grep BUILD_ID | cut -d= -f2)
             _rver=$(echo "$_rbi" | grep BUILD_VERSION | cut -d= -f2)
             _repoch=$(echo "$_rbi" | grep BUILD_EPOCH | cut -d= -f2)
+            _rgit=$(echo "$_rbi" | grep BUILD_GIT | cut -d= -f2)
             if [[ -n "$_repoch" ]]; then
                 _rdate=$(date -d "@${_repoch}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "${_repoch}")
             else
                 _rdate="unreachable"
             fi
 
+            # Compare BUILD_GIT (source revision), not BUILD_ID (install
+            # timestamp , always differs between independently-run installs
+            # even from identical source, see _gb_connect_check_parity).
             local _stamp_col="${C_LIME}" _stale_tag=""
-            if [[ -n "$_local_stamp_id" && "$_rid" != "$_local_stamp_id" ]]; then
+            if [[ -n "$_local_stamp_git" && -n "$_rgit" && "$_rgit" != "$_local_stamp_git" ]]; then
                 _stamp_col="${C_AMBER}"
                 _stale_tag="  ${C_AMBER}⚠ needs update${C_RESET}"
                 _any_stale=1
@@ -11592,8 +11680,12 @@ cmd_full_install() {
     cmd_install_build_deps
 
     # 2 - Build + install kernel module + CUDA shim
+    # GB_SKIP_INSTALL_LOAD=1: step 3 (cmd_load, right below) does the real
+    # load , skip cmd_install's own bare-modprobe load so it isn't loaded
+    # twice (was causing "Module already loaded - reloading..." + a spurious
+    # extra unload/reload cycle, stopping ollama/llama-server twice per install).
     gb_step 2 5 "Building and installing kernel module + CUDA shim..."
-    GB_SKIP_INSTALL_PURGE=1 cmd_install
+    GB_SKIP_INSTALL_PURGE=1 GB_SKIP_INSTALL_LOAD=1 cmd_install
     gb_ok "Kernel module + CUDA shim installed"
 
     # 3 - Load kernel module
