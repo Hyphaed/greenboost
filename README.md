@@ -14,7 +14,7 @@
 
 **Turn GPU VRAM + System RAM + NVMe + idle LAN GPUs into one larger CUDA device.**
 
-**No retraining. No code changes.** Just install **GreenBoost** and keep using **Ollama**, **llama.cpp**, **vLLM**, **PyTorch**, and **Diffusers**.
+**No retraining. No code changes.** Just install **GreenBoost** and keep using **Ollama**, **llama.cpp**, **vLLM**, **PyTorch**, and **Diffusers** and/or step further, use directly **GB-Synapse + Greenboost MCP** for your pipelines.
 
 </div>
 
