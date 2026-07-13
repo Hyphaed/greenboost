@@ -12,6 +12,9 @@ Environment override: GB_TOPOLOGY_PROFILE=/path/to/alt.md (useful in tests).
 from __future__ import annotations
 
 import os
+import re
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -21,6 +24,161 @@ _PROFILE_PATH = Path(
 )
 
 _PCIE_BW_PER_LANE_GBS = {3: 1.0, 4: 2.0, 5: 4.0, 6: 8.0}
+
+
+def _warn(msg: str) -> None:
+    print(f"[gb_topology] WARNING: {msg}", file=sys.stderr, flush=True)
+
+
+# ── Live hardware detection ───────────────────────────────────────────────────
+# CLAUDE.md rule: hardware-shaped fields never inherit the reference box's
+# numbers. Resolution order: profile value → live detection (NVML /
+# /proc/meminfo) → sentinel 0/"" with a LOUD warning. Cached per process.
+
+_DETECT_CACHE: dict = {}
+
+
+def _cached(key: str, fn):
+    if key not in _DETECT_CACHE:
+        _DETECT_CACHE[key] = fn()
+    return _DETECT_CACHE[key]
+
+
+def _nvml():
+    """(pynvml module, device-0 handle) or (None, None). Cached, never raises.
+    Falls back to the vendored gb_nvml_ctypes binding (same as gb_telemetry)
+    on nodes without the pynvml package."""
+    def _init():
+        try:
+            try:
+                import pynvml
+            except ImportError:
+                import gb_nvml_ctypes as pynvml
+            pynvml.nvmlInit()
+            return pynvml, pynvml.nvmlDeviceGetHandleByIndex(0)
+        except Exception:
+            return None, None
+    return _cached("nvml", _init)
+
+
+def _detect_vram_mb() -> int:
+    def _go():
+        nv, h = _nvml()
+        if h is not None:
+            try:
+                return int(nv.nvmlDeviceGetMemoryInfo(h).total // (1024 * 1024))
+            except Exception:
+                pass
+        try:  # pynvml missing — one nvidia-smi probe, cached for the process
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10)
+            return int(out.stdout.splitlines()[0].strip())
+        except Exception:
+            return 0
+    return _cached("vram_mb", _go)
+
+
+def _detect_vram_gb() -> int:
+    mb = _detect_vram_mb()
+    return int(round(mb / 1024)) if mb else 0
+
+
+def _detect_compute_capability() -> str:
+    def _go():
+        nv, h = _nvml()
+        if h is not None:
+            try:
+                major, minor = nv.nvmlDeviceGetCudaComputeCapability(h)
+                return f"{major}.{minor}"
+            except Exception:
+                pass
+        return ""
+    return _cached("cc", _go)
+
+
+def _detect_pcie_gen() -> int:
+    def _go():
+        nv, h = _nvml()
+        if h is not None:
+            try:
+                return int(nv.nvmlDeviceGetMaxPcieLinkGeneration(h))
+            except Exception:
+                pass
+        return 0
+    return _cached("pcie_gen", _go)
+
+
+def _detect_ram_total_gb() -> int:
+    def _go():
+        try:
+            for line in Path("/proc/meminfo").read_text().splitlines():
+                if line.startswith("MemTotal:"):
+                    return int(round(int(line.split()[1]) / (1024 * 1024)))
+        except (OSError, ValueError, IndexError):
+            pass
+        return 0
+    return _cached("ram_total_gb", _go)
+
+
+def _detect_ram_speed_mt() -> int:
+    def _go():
+        try:  # dmidecode is root-only; unprivileged failure → sentinel 0
+            out = subprocess.run(["dmidecode", "-t", "memory"],
+                                 capture_output=True, text=True, timeout=10)
+            for line in out.stdout.splitlines():
+                line = line.strip()
+                if line.startswith(("Configured Memory Speed:", "Speed:")):
+                    tok = line.split(":", 1)[1].strip().split()
+                    if tok and tok[0].isdigit():
+                        return int(tok[0])
+        except Exception:
+            pass
+        return 0
+    return _cached("ram_speed_mt", _go)
+
+
+def _detect_virtual_vram_gb() -> int:
+    """Physical VRAM + kernel T2 pool (pool_brief) — the node's real virtual span."""
+    def _go():
+        vram = _detect_vram_gb()
+        if not vram:
+            return 0
+        t2 = 0
+        try:
+            m = re.search(r"T2:\d+/(\d+)GB",
+                          Path("/sys/class/greenboost/greenboost/pool_brief").read_text())
+            if m:
+                t2 = int(m.group(1))
+        except OSError:
+            pass
+        return vram + t2
+    return _cached("virtual_vram_gb", _go)
+
+
+# ── Shared %-derived reserves (rule: budgets/reserves are %-of-topology) ──────
+
+def compute_reserve_gb(physical_vram_mb: float) -> float:
+    """Per-device compute/graph workspace reserve: max(0.75 GiB, 8% of VRAM).
+
+    THE shared derivation for gb_synapse (--tensor-split / layer fitting) and
+    gb_cluster.feeder_env (per-node gb-quant budgets) — one formula, so a new
+    card size never needs a new literal anywhere."""
+    return max(0.75, 0.08 * physical_vram_mb / 1024.0)
+
+
+def hbm_headroom_mb(physical_vram_mb: "int | None" = None) -> int:
+    """T1 activation/latent headroom: max(512, 10% of physical VRAM MB).
+
+    Single derivation for gb_init and gb_model_tier (previously two divergent
+    literals: 1500 and 1024 MB, both shaped by the reference card)."""
+    if physical_vram_mb is None:
+        physical_vram_mb = get_topology().physical_vram_mb or _detect_vram_mb()
+    if physical_vram_mb <= 0:
+        _warn("hbm_headroom_mb: VRAM undetected — falling back to 1024 MB")
+        return 1024
+    return max(512, int(physical_vram_mb * 0.10))
 
 
 @dataclass(frozen=True)
@@ -34,21 +192,22 @@ class TopologyProfile:
     l3_cache_mb:    int = 0
     numa_nodes:     int = 1
 
-    # GPU
-    vram_gb:             int = 12
-    compute_capability:  str = "8.0"
-    pcie_gen:            int = 4
+    # GPU — 0/"" sentinels: real values come from the profile or live
+    # detection in _parse_profile (rule: never inherit reference-box numbers)
+    vram_gb:             int = 0
+    compute_capability:  str = ""
+    pcie_gen:            int = 0
     pcie_lanes:          int = 16
 
-    # RAM
-    ram_total_gb: int = 64
-    ram_speed_mt: int = 3200
+    # RAM — 0 sentinels, same rule as the GPU block
+    ram_total_gb: int = 0
+    ram_speed_mt: int = 0
 
-    # GreenBoost runtime params
-    virtual_vram_gb:   int = 42
-    safety_reserve_gb: int = 4
+    # GreenBoost runtime params — reserves are %-derived in _parse_profile
+    virtual_vram_gb:   int = 0
+    safety_reserve_gb: int = 0
     nvme_swap_gb:      int = 0
-    kv_reserve_mb:     int = 2048
+    kv_reserve_mb:     int = 0
     ollama_num_ctx:    int = 8192
 
     # ── Derived properties ────────────────────────────────────────────────────
@@ -184,6 +343,41 @@ def _parse_profile(path: Path) -> TopologyProfile:
                 result.append(int(part))
         return result
 
+    def _hw_int(k: str, detect) -> int:
+        """Hardware-shaped field: profile → live detection → 0 sentinel, LOUD."""
+        try:
+            return int(raw[k])
+        except (KeyError, ValueError, TypeError):
+            pass
+        v = detect()
+        if not v:
+            _warn(f"{k}: missing from {path} and not detectable — sentinel 0")
+        return v
+
+    vram_gb = _hw_int("vram_gb", _detect_vram_gb)
+    ram_total_gb = _hw_int("ram_total_gb", _detect_ram_total_gb)
+
+    cc = _str("compute_capability", "")
+    if not cc:
+        cc = _detect_compute_capability()
+        if not cc:
+            _warn(f'compute_capability: missing from {path} and not detectable — sentinel ""')
+
+    # Reserves are %-derived from THIS node's topology, never inherited absolutes:
+    #   safety = max(2 GB, 6% of RAM); kv = profile → env (>0) → max(512, VRAM/6)
+    #   (VRAM/6 reproduces the old 2048 MB exactly on the 12 GB reference card).
+    safety_reserve_gb = _int("safety_reserve_gb", 0)
+    if safety_reserve_gb <= 0:
+        safety_reserve_gb = max(2, ram_total_gb * 6 // 100)
+    kv_reserve_mb = _int("kv_reserve_mb", 0)
+    if kv_reserve_mb <= 0:
+        try:  # kmod/env-provided reserve wins when present (and > 0)
+            kv_reserve_mb = int(os.environ.get("GREENBOOST_KV_RESERVE_MB", "0"))
+        except ValueError:
+            kv_reserve_mb = 0
+    if kv_reserve_mb <= 0:
+        kv_reserve_mb = max(512, vram_gb * 1024 // 6)
+
     return TopologyProfile(
         p_core_cpus=_cpulist("p_core_cpus"),
         e_core_cpus=_cpulist("e_core_cpus"),
@@ -192,16 +386,16 @@ def _parse_profile(path: Path) -> TopologyProfile:
         pcores_max_cpu=_int("pcores_max_cpu", 15),
         l3_cache_mb=_int("l3_cache_mb", 0),
         numa_nodes=_int("numa_nodes", 1),
-        vram_gb=_int("vram_gb", 12),
-        compute_capability=_str("compute_capability", "8.0"),
-        pcie_gen=_int("pcie_gen", 4),
+        vram_gb=vram_gb,
+        compute_capability=cc,
+        pcie_gen=_hw_int("pcie_gen", _detect_pcie_gen),
         pcie_lanes=_int("pcie_lanes", 16),
-        ram_total_gb=_int("ram_total_gb", 64),
-        ram_speed_mt=_int("ram_speed_mt", 3200),
-        virtual_vram_gb=_int("virtual_vram_gb", 42),
-        safety_reserve_gb=_int("safety_reserve_gb", 4),
+        ram_total_gb=ram_total_gb,
+        ram_speed_mt=_hw_int("ram_speed_mt", _detect_ram_speed_mt),
+        virtual_vram_gb=_hw_int("virtual_vram_gb", _detect_virtual_vram_gb),
+        safety_reserve_gb=safety_reserve_gb,
         nvme_swap_gb=_int("nvme_swap_gb", 0),
-        kv_reserve_mb=_int("kv_reserve_mb", 2048),
+        kv_reserve_mb=kv_reserve_mb,
         ollama_num_ctx=_int("ollama_num_ctx", 8192),
     )
 

@@ -69,7 +69,9 @@ _WORKLOAD_PROFILES: dict[str, dict[str, str]] = {
         "GREENBOOST_ACTIVE": "1",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
         "GREENBOOST_KV_RESERVE_MB": "0",
-        "GREENBOOST_HOST_RAM_SAFETY_MB": "2048",
+        # GREENBOOST_HOST_RAM_SAFETY_MB is intentionally NOT a static entry:
+        # it is %-derived from THIS node's MemTotal in shim_env() at call time
+        # (rule: never inherit the reference box's flat 2048).
         "GREENBOOST_A0_DISABLE": "1",
         "GREENBOOST_DISABLE_T2_ON_BLACKWELL": "0",
         "GREENBOOST_CLUSTER": "0",
@@ -131,6 +133,19 @@ def _local_t2_pool_total_mb() -> int | None:
     import re as _re
     m = _re.search(r"T2:\d+/(\d+)GB", brief)
     return int(m.group(1)) * 1024 if m else None
+
+
+def _host_ram_safety_mb() -> int:
+    """Host-RAM safety reserve: max(2048 MB, 3% of THIS node's MemTotal).
+    %-derived at call time (rule: not a static reference-box literal)."""
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                total_mb = int(line.split()[1]) // 1024
+                return max(2048, total_mb * 3 // 100)
+    except (OSError, ValueError, IndexError):
+        pass
+    return 2048   # /proc/meminfo unreadable — the formula's floor
 
 
 @dataclass
@@ -412,6 +427,9 @@ def shim_env(workload: str = "diffusion", enabled: bool = True,
         for k, v in profile.items():
             env.setdefault(k, v)
         if workload in _T2_POOL_WORKLOADS:
+            # %-of-MemTotal, computed per call on the executing node (rule).
+            env.setdefault("GREENBOOST_HOST_RAM_SAFETY_MB",
+                           str(_host_ram_safety_mb()))
             t2_total = _local_t2_pool_total_mb()
             if t2_total:
                 env.setdefault("GREENBOOST_T2_POOL_MB", str(t2_total * 85 // 100))
@@ -939,9 +957,17 @@ def feeder_env(feeder: Feeder, workload: str = "diffusion",
         raise ValueError(f"unknown workload {workload!r} , "
                          f"one of {sorted(_WORKLOAD_PROFILES)}")
     env = dict(profile)
+    if workload in _T2_POOL_WORKLOADS:
+        # Feeder MemTotal is unknown host-side: ship the safety formula's
+        # floor; a feeder-local shim_env() derivation overrides it (rule).
+        env.setdefault("GREENBOOST_HOST_RAM_SAFETY_MB", "2048")
     if feeder.t1_free_mb > 0:
-        # ~1 GB headroom for CUDA context + activations on the feeder.
-        budget_gb = max(1.0, (feeder.t1_free_mb - 1024) / 1024.0)
+        # CUDA-context + activation headroom on the feeder: %-derived from
+        # THAT node's VRAM via the shared gb_topology.compute_reserve_gb
+        # (rule: no flat 1 GiB cushion inherited from the reference card).
+        from gb_topology import compute_reserve_gb
+        budget_gb = max(1.0, feeder.t1_free_mb / 1024.0
+                        - compute_reserve_gb(feeder.t1_total_mb or feeder.t1_free_mb))
         env["GB_QUANT_BUDGET_GB"] = f"{budget_gb:.1f}"
     if os.environ.get("GREENBOOST_TURBOQUANT") == "1" or \
        Path("/etc/greenboost/turboquant.enabled").exists():

@@ -3371,6 +3371,15 @@ _rmmod_with_retry() {
 
     grep -q "^${DRIVER_NAME} " <<< "$(lsmod)" || return 0   # not loaded - nothing to do
 
+    # Stop the eBPF tracer first , its kprobes take a module reference and
+    # would hold every rmmod below in EBUSY forever.  fuser/lsof can't see it
+    # (it holds no fd on /dev/greenboost), so kill it explicitly here, the
+    # common choke point for all unload paths (purge, reload, unload).
+    if [[ -f /run/greenboost/ebpf_trace.pid ]]; then
+        kill "$(cat /run/greenboost/ebpf_trace.pid 2>/dev/null)" 2>/dev/null || true
+    fi
+    pkill -f '/usr/local/bin/greenboost-ebpf-trace' 2>/dev/null || true
+
     # Check if the module is already stuck in Unloading state (MODULE_STATE_GOING).
     # This happens when a previous rmmod process was killed before the exit function
     # could complete. The kernel won't let a new rmmod succeed while in this state.
@@ -3859,6 +3868,11 @@ do_purge() {
 
     # 6. Disable + remove ALL GreenBoost systemd services - generic glob catches any
     #    service file installed by any version of full-install, regardless of name.
+    # Record whether the supervisor was running FIRST , the install paths and
+    # the abort-recovery trap use this to restore it (symmetry: a service
+    # stopped by the purge must be running again when the install ends).
+    systemctl is-active --quiet greenboost-supervisor.service 2>/dev/null \
+        && GB_SUPERVISOR_WAS_ACTIVE=1
     local _svcs_removed=0
     for _svc_file in /etc/systemd/system/greenboost*.service \
                      /etc/systemd/system/greenboostd.service \
@@ -4102,6 +4116,18 @@ cmd_install_python_files() {
         gb_synapse_mcp.py gb_synapse_tools.py
         gb_dataflux_mcp.py
         gb_cluster_mcp.py
+        # Modules previously MISSING from this list although installed modules
+        # import them at runtime (audit 2026-07-13): gb_prefetch (gb_init),
+        # gb_topology (gb_orchestrator/gb_telemetry), gb_diffcache
+        # (gb_diffusion_orch), gb_remote_blocks (gb_cluster), plus standalone
+        # entry points gb_moe / gb_llm_server / gb_rotator.
+        gb_prefetch.py
+        gb_topology.py
+        gb_diffcache.py
+        gb_remote_blocks.py
+        gb_moe.py
+        gb_llm_server.py
+        gb_rotator.py
     )
     local _installed=0
     for _f in "${_py_files[@]}"; do
@@ -4501,6 +4527,73 @@ _gb_install_ebpf_tracer() {
     fi
 }
 
+# _gb_check_live_gpu_users , warn before an install tears down live GPU work.
+# The purge + shim-lib swap kills any in-flight inference (confirmed
+# 2026-07-13: a running gen_image job died when Full Install replaced the
+# libs + unloaded the module under it).  Interactive: require confirmation.
+# Non-interactive: warn loudly and continue after a short grace period.
+_gb_check_live_gpu_users() {
+    local _live=""
+    if [[ -f "$SHIM_DEST/$SHIM_LIB" ]] && command -v fuser &>/dev/null; then
+        local _fu; _fu=$(fuser "$SHIM_DEST/$SHIM_LIB" 2>/dev/null | tr -s ' ' || true)
+        [[ -n "${_fu// /}" ]] && _live+="shim mmapped by PID(s):${_fu}"$'\n'
+    fi
+    if command -v nvidia-smi &>/dev/null; then
+        local _ca; _ca=$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null || true)
+        [[ -n "$_ca" ]] && _live+=$(echo "$_ca" | sed 's/^/GPU compute: /')$'\n'
+    fi
+    local _inf; _inf=$(pgrep -af 'gen_image|llama-server|ollama runner' 2>/dev/null | cut -c1-110 || true)
+    [[ -n "$_inf" ]] && _live+=$(echo "$_inf" | sed 's/^/inference proc: /')$'\n'
+    [[ -z "$_live" ]] && return 0
+    echo ""
+    gb_warn_ui "${C_BOLD}Live GPU / shim activity detected , installing now WILL kill these in-flight jobs:${C_RESET}"
+    while IFS= read -r _l; do [[ -n "$_l" ]] && gb_warn_ui "  $_l"; done <<< "$_live"
+    if [[ -t 0 ]]; then
+        gb_confirm "Proceed anyway (kills the jobs above)?" \
+            || die "Install cancelled , wait for GPU jobs to finish, then re-run."
+    else
+        gb_warn_ui "Non-interactive run , continuing in 5s (Ctrl+C to abort)…"
+        sleep 5
+    fi
+    return 0
+}
+
+# _gb_install_abort_recover , EXIT-trap handler armed while cmd_full_install /
+# standalone cmd_install run.  If the install aborts anywhere past the purge
+# (a die, a set -e trip in a helper, Ctrl+C), put the system back into a
+# working state instead of leaving it half-torn.  Exact incident 2026-07-13:
+# install died after step 2, leaving the module unloaded (T2 spill silently
+# degrades to OS swap) and greenboost-supervisor stopped + unit removed.
+_gb_install_abort_recover() {
+    local _rc="${1:-$?}"
+    trap - EXIT INT TERM
+    (( _rc == 0 )) && return 0
+    echo ""
+    gb_warn_ui "${C_BOLD}Install aborted (exit ${_rc}) , restoring pre-install runtime state…${C_RESET}"
+    # Module: if this run already wrote modprobe.conf + DKMS-installed the
+    # module, load it now so T2 spill doesn't silently degrade to OS swap.
+    if ! lsmod | grep -q '^greenboost ' && [[ -f /etc/modprobe.d/greenboost.conf ]]; then
+        if modprobe greenboost 2>/dev/null && [[ -e /dev/greenboost ]]; then
+            gb_ok "Kernel module loaded (recovery)"
+        else
+            gb_fail "Kernel module NOT loaded , T2 spill will degrade to OS swap. Run: sudo modprobe greenboost"
+        fi
+    fi
+    # Supervisor: the purge disable+removes its unit; reinstall + start it.
+    if [[ "${GB_SUPERVISOR_WAS_ACTIVE:-0}" -eq 1 ]] && \
+       ! systemctl is-active --quiet greenboost-supervisor.service 2>/dev/null; then
+        cmd_install_supervisor \
+            || gb_fail "greenboost-supervisor NOT restored , run: sudo greenboost install-sys-configs"
+    fi
+    local svc
+    for svc in ${GB_STOPPED_SERVICES:-}; do
+        systemctl start "$svc" 2>/dev/null \
+            && gb_ok "$svc restarted (recovery)" \
+            || gb_fail "$svc failed to restart , run: sudo systemctl start $svc"
+    done
+    return 0
+}
+
 cmd_install() {
     need_root install
 
@@ -4522,8 +4615,15 @@ cmd_install() {
     _gb_backup_create
 
     # Step 0: clean previous installation to guarantee a fresh install
-    # Skip when called from cmd_full_install which already ran do_purge at step 0/5.
+    # Skip when called from cmd_full_install which already ran do_purge at step 0/5
+    # (and already armed the abort-recovery trap + live-GPU check itself).
+    GB_STOPPED_SERVICES="${GB_STOPPED_SERVICES:-}"
     if [[ "${GB_SKIP_INSTALL_PURGE:-0}" -ne 1 ]]; then
+        GB_SUPERVISOR_WAS_ACTIVE=0
+        trap '_gb_install_abort_recover $?' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        _gb_check_live_gpu_users
         gb_step 0 4 "Removing previous GreenBoost installation (if any)..."
         do_purge 0 1
         gb_ok "Previous installation removed"
@@ -4563,10 +4663,18 @@ cmd_install() {
     rm -f "$_install_log"
     gb_ok "Kernel module + libs installed"
 
-    cp "$MODULE_DIR/$SHIM_LIB" "$SHIM_DEST/"
-    [[ -f "$MODULE_DIR/$AUDIT_LIB" ]] && cp "$MODULE_DIR/$AUDIT_LIB" "$SHIM_DEST/"
-    [[ -f "$MODULE_DIR/libgreenboost_vmm_override.so" ]] && \
-        cp "$MODULE_DIR/libgreenboost_vmm_override.so" "$SHIM_DEST/"
+    # Swap libs atomically (copy to temp + rename): a plain cp truncates the
+    # destination inode in place, which SIGBUSes any live process that still
+    # has the old lib mmapped (killed an in-flight gen_image job 2026-07-13).
+    # rename(2) leaves the old inode intact for existing mappings.
+    [[ -f "$MODULE_DIR/$SHIM_LIB" ]] || die "$SHIM_LIB missing from build tree , build failed?"
+    local _lib
+    for _lib in "$SHIM_LIB" "$AUDIT_LIB" libgreenboost_vmm_override.so; do
+        if [[ -f "$MODULE_DIR/$_lib" ]]; then
+            cp "$MODULE_DIR/$_lib" "$SHIM_DEST/.$_lib.tmp.$$"
+            mv -f "$SHIM_DEST/.$_lib.tmp.$$" "$SHIM_DEST/$_lib"
+        fi
+    done
     { ldconfig 2>/dev/null; } &
     gb_spin $! "Installing CUDA shim + VMM override + LD_AUDIT library..."
     gb_ok "Libraries installed to $SHIM_DEST/"
@@ -4606,11 +4714,14 @@ MODEOF
         if lsmod | grep -q '^greenboost '; then
             modprobe -r greenboost 2>/dev/null || _rmmod_with_retry || true
         fi
-        if modprobe greenboost; then
-            gb_ok "Kernel module loaded (virtual_vram_gb=${GB_VIRT}, reserve=${GB_RESERVE} GB)"
-        else
-            gb_warn "modprobe greenboost failed after install , load manually: sudo modprobe greenboost"
-        fi
+        modprobe greenboost \
+            || die "modprobe greenboost failed after install , check: dmesg | tail -20  (accepted params: modinfo -p greenboost)"
+        udevadm settle 2>/dev/null || true
+        # Verify , never end this step believing the module is up when it
+        # isn't (an unloaded module silently degrades T2 spill to OS swap).
+        lsmod | grep -q '^greenboost ' && [[ -e /dev/greenboost ]] \
+            || die "greenboost modprobe'd but lsmod//dev/greenboost check failed , check: dmesg | tail -20"
+        gb_ok "Kernel module loaded + verified (/dev/greenboost present, virtual_vram_gb=${GB_VIRT}, reserve=${GB_RESERVE} GB)"
     fi
 
     # Persist across reboots , same gap as the modprobe fix above but for the
@@ -4633,9 +4744,14 @@ MODEOF
     if [[ -f "$MODULE_DIR/greenboost_boot_guard.sh" && -f "$MODULE_DIR/greenboost-boot-guard.service" ]]; then
         install -m 755 "$MODULE_DIR/greenboost_boot_guard.sh" /usr/local/sbin/greenboost_boot_guard.sh
         install -m 644 "$MODULE_DIR/greenboost-boot-guard.service" /etc/systemd/system/greenboost-boot-guard.service
+        # Boot-time DKMS self-heal (full module rebuild after a kernel upgrade)
+        # exceeds 60 s on a cold cache , 300 s keeps the guard best-effort
+        # without systemd killing a compile mid-way.
+        sed -i 's/^TimeoutStartSec=60$/TimeoutStartSec=300/' /etc/systemd/system/greenboost-boot-guard.service
         systemctl daemon-reload 2>/dev/null || true
         systemctl enable greenboost-boot-guard.service &>/dev/null \
-            && gb_ok "Boot guard installed + enabled: greenboost-boot-guard.service"
+            && gb_ok "Boot guard installed + enabled: greenboost-boot-guard.service" \
+            || gb_warn "boot-guard enable failed , run: sudo systemctl enable greenboost-boot-guard"
     fi
 
     # profile.d - auto-activate GreenBoost for all CUDA inference tools launched
@@ -4755,12 +4871,12 @@ WRAPEOF
 
     # Install GreenBoost Python orchestration files (gb_*.py) so they are
     # importable from any CUDA env on PYTHONPATH=/usr/local/lib/greenboost.
-    cmd_install_python_files
+    cmd_install_python_files || gb_warn "Python file install had failures , re-run: sudo greenboost install-python"
     # Install greenboost-cli (`gb`) into its venv , best-effort, never aborts.
-    cmd_install_cli
+    cmd_install_cli || gb_warn "greenboost-cli install failed , continuing"
     # Provision ai-forge pipeline deps (PaddleOCR etc.) , best-effort, never aborts.
     # Deliberately NOT reversed by Full Uninstall (see cmd_install_pipelines).
-    cmd_install_pipelines
+    cmd_install_pipelines || gb_warn "pipeline dep provisioning failed , continuing"
 
     # Ensure 'greenboost' group exists and the invoking user is a member so
     # non-root processes can read cluster.key (mode 0640 root:greenboost).
@@ -4782,19 +4898,24 @@ WRAPEOF
     gb_info "Generating hardware profile..."
     cmd_profile_create || gb_warn "profile create failed - DDR speed will default to 2400 MT/s"
 
-    # Install and (re)start eBPF tracer if the binary was built
-    _gb_install_ebpf_tracer
+    # Install and (re)start eBPF tracer if the binary was built.
+    # These tail helpers are all best-effort BY CONTRACT , the explicit
+    # `|| gb_warn` guards below are what enforce that contract under
+    # `set -euo pipefail`: on 2026-07-13 a Full Install aborted in this tail
+    # AFTER the build stamp, so step 3 (modprobe) and step 4 (supervisor
+    # reinstall) never ran , module left unloaded, supervisor left dead.
+    _gb_install_ebpf_tracer || gb_warn "eBPF tracer install failed , continuing"
 
     # Ensure ollama is present + current so the host runs a known LLM backend
     # version that feeders can match (kernel-name parity for feeder-GPU
     # compute).  Best-effort; never fails the install.  Skip with
     # GB_SKIP_OLLAMA_UPDATE=1.
-    _gb_ensure_ollama
+    _gb_ensure_ollama || gb_warn "ollama install/update check failed , continuing"
 
     # Register GreenBoost MCP servers with the Claude CLI (per-user) so an LLM
     # assistant can query cluster/dataflux/orchestrator/synapse state. The
     # gb_*_mcp.py modules were just deployed to $GB_PY_DEST above. Best-effort.
-    cmd_register_mcp
+    cmd_register_mcp || gb_warn "MCP registration failed , run: greenboost register-mcp"
 
     gb_ok "Installation complete"
     gb_info "Load:    sudo modprobe greenboost"
@@ -4804,7 +4925,26 @@ WRAPEOF
     gb_info "Residency: greenboost residency"
 
     # Push update to all connected feeders (unattended, best-effort)
-    _gb_update_all_feeders
+    _gb_update_all_feeders || gb_warn "feeder update failed , run: sudo greenboost update-feeders"
+
+    # Standalone `greenboost install` symmetry: do_purge (step 0 above)
+    # stopped ollama/llama-server and disabled+removed the supervisor, and
+    # nothing else in this path ever brought them back (cmd_full_install has
+    # its own end-of-install restart , this block covers the standalone verb).
+    if [[ "${GB_SKIP_INSTALL_PURGE:-0}" -ne 1 ]]; then
+        if [[ "${GB_SUPERVISOR_WAS_ACTIVE:-0}" -eq 1 ]] && \
+           ! systemctl is-active --quiet greenboost-supervisor.service 2>/dev/null; then
+            cmd_install_supervisor \
+                || gb_warn "supervisor reinstall failed , run: sudo systemctl enable --now greenboost-supervisor"
+        fi
+        local _svc
+        for _svc in ${GB_STOPPED_SERVICES:-}; do
+            systemctl start "$_svc" 2>/dev/null \
+                && gb_ok "$_svc restarted (was running before install)" \
+                || gb_warn "$_svc failed to restart , run: sudo systemctl start $_svc"
+        done
+        trap - EXIT INT TERM
+    fi
 }
 
 cmd_load() {
@@ -4874,7 +5014,7 @@ cmd_load() {
         ecores_only="$ecores_only" \
         kv_reserve_mb="${GB_KV_RESERVE_MB:-2048}" \
         active_profile_name="${PROF_NAME:-autodetect}" \
-        || die "insmod failed - check: dmesg | tail -20"
+        || die "insmod failed - check: dmesg | tail -20  (params this .ko accepts: $(modinfo -F parm "$ko" 2>/dev/null | cut -d: -f1 | tr '\n' ' '))"
 
     # Ensure /dev/greenboost has correct group permission immediately after insmod.
     # The .devnode kernel callback sets mode 0660 at creation, but run udevadm
@@ -4884,6 +5024,15 @@ cmd_load() {
         || udevadm trigger --subsystem-match=greenboost 2>/dev/null \
         || true
     udevadm settle 2>/dev/null || true
+
+    # Verify the load actually took , fail LOUDLY here rather than let the
+    # rest of the install continue believing the module is up (2026-07-13: an
+    # install ended with the module unloaded and nothing noticed until T2
+    # spill degraded to OS swap under inference).
+    lsmod | grep -q "^${DRIVER_NAME} " \
+        || die "greenboost missing from lsmod after insmod - check: dmesg | tail -20"
+    [[ -e /dev/greenboost ]] \
+        || die "/dev/greenboost missing after insmod - check: dmesg | tail -20"
 
     # Add invoking user to 'video' group + grant immediate ACL for the current session.
     if [[ -n "${SUDO_USER:-}" ]]; then
@@ -11593,6 +11742,14 @@ cmd_install_deps() {
 cmd_full_install() {
     need_root full-install
     GB_STOPPED_SERVICES=""
+    GB_SUPERVISOR_WAS_ACTIVE=0
+    # Finally-style recovery: if the install aborts anywhere past the purge
+    # (a die, a set -e trip, Ctrl+C), never leave the machine half-torn ,
+    # module unloaded + supervisor dead was the exact state a run left behind
+    # on 2026-07-13.  Cleared on the success paths below.
+    trap '_gb_install_abort_recover $?' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
     # Strip libgreenboost entries from ld.so.preload before spawning any
     # subprocess.  See cmd_install for rationale.
@@ -11651,6 +11808,10 @@ cmd_full_install() {
 
     # ── SHARED PATH: kernel module (runs for both module-only and full) ──────
 
+    # The purge + lib swap below kill any in-flight GPU inference , surface
+    # that BEFORE touching anything (interactive: confirm; scripted: warn).
+    _gb_check_live_gpu_users
+
     # 0 - Purge any previous GreenBoost install to guarantee a clean slate
     gb_step 0 5 "Purging previous GreenBoost installation (if any)..."
     if ! do_purge 0 1; then
@@ -11688,12 +11849,40 @@ cmd_full_install() {
     GB_SKIP_INSTALL_PURGE=1 GB_SKIP_INSTALL_LOAD=1 cmd_install
     gb_ok "Kernel module + CUDA shim installed"
 
-    # 3 - Load kernel module
+    # 3 - Load kernel module (cmd_load verifies lsmod + /dev/greenboost and
+    # dies loudly if the load didn't take)
     gb_step 3 5 "Loading kernel module..."
     cmd_load
     gb_ok "Kernel module loaded"
 
+    # Module is up now , start the eBPF tracer.  Step 2 installs the binary
+    # but its auto-start branch never fires on Full Install (the module loads
+    # here in step 3, not in step 2), so retry the start now.
+    _gb_install_ebpf_tracer || gb_warn "eBPF tracer start failed , continuing"
+
+    # Boot guard: step 2 enabled it for the NEXT boot , verify that, and kick
+    # the oneshot now so its RemainAfterExit state reflects this boot too.
+    if [[ -f /etc/systemd/system/greenboost-boot-guard.service ]]; then
+        systemctl is-enabled --quiet greenboost-boot-guard.service 2>/dev/null \
+            || gb_warn_ui "boot-guard not enabled for next boot , run: sudo systemctl enable greenboost-boot-guard"
+        systemctl start greenboost-boot-guard.service 2>/dev/null || true
+    fi
+
     if [[ "$GB_INSTALL_MODE" == "module" ]]; then
+        # Symmetry for module-only: the step-0 purge stopped the supervisor
+        # and inference services, and step 4 (which reinstalls the supervisor)
+        # will not run , restore them before returning.
+        if [[ "${GB_SUPERVISOR_WAS_ACTIVE:-0}" -eq 1 ]] && \
+           ! systemctl is-active --quiet greenboost-supervisor.service 2>/dev/null; then
+            cmd_install_supervisor \
+                || gb_warn_ui "supervisor reinstall failed , run: sudo systemctl enable --now greenboost-supervisor"
+        fi
+        for svc in $GB_STOPPED_SERVICES; do
+            systemctl start "$svc" 2>/dev/null \
+                && gb_ok "$svc restarted (was running before install)" \
+                || gb_warn_ui "$svc failed to restart , run: sudo systemctl start $svc"
+        done
+        trap - EXIT INT TERM
         echo ""
         gb_separator
         echo ""
@@ -11745,7 +11934,7 @@ cmd_full_install() {
 
     # Always regenerate profile on full-install to ensure it reflects current hardware.
     gb_info "Regenerating hardware profile..."
-    cmd_profile_create
+    cmd_profile_create || gb_warn_ui "profile regeneration failed , run: sudo greenboost profile create"
 
     # Restart only services that were stopped during purge
     for svc in $GB_STOPPED_SERVICES; do
@@ -11769,6 +11958,21 @@ cmd_full_install() {
     else
         gb_warn_ui "gb-synapse engine build failed — retry later: sudo greenboost synapse build-engine"
     fi
+
+    # ── Final state guarantee (defects 2026-07-13) ───────────────────────
+    # A Full Install must never end with the supervisor dead or the module
+    # unloaded , verify both, loudly.  Step 4 normally reinstalls+starts the
+    # supervisor; this is the belt in case that call was skipped or failed.
+    if ! systemctl is-active --quiet greenboost-supervisor.service 2>/dev/null; then
+        cmd_install_supervisor \
+            || gb_fail "greenboost-supervisor is NOT running , run: sudo systemctl enable --now greenboost-supervisor"
+    fi
+    if lsmod | grep -q '^greenboost ' && [[ -e /dev/greenboost ]]; then
+        gb_ok "Verified: module loaded, /dev/greenboost present, supervisor $(systemctl is-active greenboost-supervisor.service 2>/dev/null || echo unknown)"
+    else
+        gb_fail "Kernel module NOT loaded at end of install , T2 spill will degrade to OS swap. Run: sudo modprobe greenboost"
+    fi
+    trap - EXIT INT TERM
 
     echo ""
     gb_separator

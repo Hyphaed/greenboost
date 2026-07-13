@@ -28,7 +28,7 @@ Usage:
     from gb_diffusion_orch import DiffusionOrchestrator
 
     pipe = FluxPipeline.from_pretrained(...)
-    orch = DiffusionOrchestrator(pipe, hbm_headroom_mb=1500)
+    orch = DiffusionOrchestrator(pipe)   # headroom %-derived from local VRAM
 
     # Standard two-phase batch gen:
     with orch.encode_phase():
@@ -92,7 +92,8 @@ class DiffusionOrchestrator:
         encoder_attrs: tuple = ("text_encoder", "text_encoder_2", "text_encoder_3"),
         denoiser_attrs: tuple = ("transformer", "unet"),
         vae_attrs: tuple = ("vae",),
-        hbm_headroom_mb: int = 1500,
+        hbm_headroom_mb: "int | None" = None,   # None → gb_topology.hbm_headroom_mb()
+                                                # (%-derived; owner rule 2026-07-13)
         telemetry_interval_s: float = 0.0,
         feeder_block_attr: Optional[str] = None,
         feeder_vram_budget_gb: float = 5.5,

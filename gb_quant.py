@@ -42,7 +42,7 @@ Public API:
     # Quality-first (new default): per-layer calibrated mixed precision
     report = gb_quant.quantize_for_quality(model.transformer,
                                             target="near_lossless",
-                                            t1_budget_gb=11.0, t2_budget_gb=8.0)
+                                            t1_budget_gb=None, t2_budget_gb=None)
     print(report)        # per-layer bits, T1/T2 split, shim_required flag
 
     # Pipeline helpers (quality-aware by default):
@@ -51,7 +51,7 @@ Public API:
 
     # Legacy scalar precision (compact/speed path):
     gb_quant.quantize_module(model.transformer, bits=4)
-    report = gb_quant.quantize_to_fit(pipe, budget_gb=11.0)
+    report = gb_quant.quantize_to_fit(pipe)   # budget auto-derived from local VRAM
 """
 from __future__ import annotations
 
@@ -775,13 +775,14 @@ def plan_fit(obj, budget_gb: float,
     return report
 
 
-def quantize_to_fit(obj, budget_gb: float = 11.0, device: str = "cuda",
+def quantize_to_fit(obj, budget_gb: "float | None" = None, device: str = "cuda",
                     dtype=None, components: "tuple[str, ...] | None" = None,
                     group_size: int = 64, allow_t3: bool = False,
                     prefer_bits: "int | str" = 4,
                     verbose: bool = True) -> FitReport:
     """Quantize a diffusers pipeline (or nn.Module) so it fits `budget_gb` of T1
     VRAM, then realise the plan in place. Returns the FitReport.
+    budget_gb=None (default) derives the budget from THIS node's VRAM.
 
     `allow_t3` is accepted for API symmetry but intentionally ignored here:
     gb_quant never routes weights to T3 NVMe (it would break the speed goal).
@@ -789,6 +790,14 @@ def quantize_to_fit(obj, budget_gb: float = 11.0, device: str = "cuda",
     GreenBoost's T2 DDR overflow (the shim handles that transparently)."""
     _require_gemlite()
     dtype = dtype or torch.bfloat16
+
+    if budget_gb is None:
+        # Rule: the default budget derives from the EXECUTING node's VRAM
+        # (_auto_budgets), never the reference box's 11.0 literal.
+        budget_gb = _auto_budgets()[0]
+        if verbose:
+            print(f"[gb_quant] auto budget: T1={budget_gb:.1f} GiB "
+                  f"(derived from local VRAM)", flush=True)
 
     # Read live VRAM from telemetry to refine budget if GB telemetry is active.
     # This uses the cached snapshot (no I/O on the hot path).
@@ -898,8 +907,8 @@ def quantize_to_fit(obj, budget_gb: float = 11.0, device: str = "cuda",
 
 def plan_quality(module: "torch.nn.Module",
                  target: str = "near_lossless",
-                 t1_budget_gb: float = 11.0,
-                 t2_budget_gb: float = 8.0,
+                 t1_budget_gb: "float | None" = None,   # None → _auto_budgets()
+                 t2_budget_gb: "float | None" = None,
                  sensitivity: "Optional[Dict[str, Dict]]" = None,
                  profile: "Optional[GpuProfile]" = None,
                  group_size: int = 64,
@@ -928,6 +937,10 @@ def plan_quality(module: "torch.nn.Module",
         raise ValueError(f"target={target!r} not in {QUALITY_TIERS}")
     error_ceil = _TARGET_ERROR_CEIL[target]
     profile = profile or gpu_profile()
+    if t1_budget_gb is None or t2_budget_gb is None:
+        auto_t1, auto_t2 = _auto_budgets()
+        t1_budget_gb = auto_t1 if t1_budget_gb is None else t1_budget_gb
+        t2_budget_gb = auto_t2 if t2_budget_gb is None else t2_budget_gb
 
     if sensitivity is None:
         # Lazy calibration , falls through to cache on second call.
@@ -1035,13 +1048,42 @@ def plan_quality(module: "torch.nn.Module",
     return report
 
 
+def _auto_budgets() -> "tuple[float, float]":
+    """Device-derived (t1_budget_gb, t2_budget_gb) — Rule #1: plan against
+    ~90% of the LOCAL card's physical VRAM minus what's already resident.
+
+    The previous hardcoded defaults (11.0/8.0 — host-tuned for the 12 GB
+    RTX 5070) fatally over-planned on an 8 GB feeder: 2026-07-13 live
+    incident, gb_quant printed "T1=11.0 GiB" while the card had 7.5 GiB,
+    the transformer load OOM'd and the runner escalated to shimless bf16
+    (which can never fit) — the whole cluster job failed. Under the
+    diffusion profile GREENBOOST_REPORT_PHYSICAL_VRAM=1 makes
+    torch.cuda.mem_get_info report the real card, not the pooled figure."""
+    t1, t2 = 11.0, 8.0                      # legacy fallback (host-shaped)
+    try:
+        free_b, total_b = torch.cuda.mem_get_info()
+        used_gb = (total_b - free_b) / 2 ** 30
+        t1 = max(1.0, round(total_b / 2 ** 30 * 0.90 - used_gb, 1))
+    except Exception:
+        pass
+    try:
+        import re as _re
+        with open("/sys/class/greenboost/greenboost/pool_brief") as f:
+            m = _re.search(r"T2:(\d+)/(\d+)GB", f.read())
+        if m:
+            t2 = max(1.0, float(int(m.group(2)) - int(m.group(1))))
+    except Exception:
+        pass
+    return t1, t2
+
+
 def quantize_for_quality(module: "torch.nn.Module",
                           target: str = "near_lossless",
                           device: str = "cuda",
                           dtype=None,
                           group_size: int = 64,
-                          t1_budget_gb: float = 11.0,
-                          t2_budget_gb: float = 8.0,
+                          t1_budget_gb: "float | None" = None,
+                          t2_budget_gb: "float | None" = None,
                           sensitivity: "Optional[Dict[str, Dict]]" = None,
                           profile: "Optional[GpuProfile]" = None,
                           model_id: str = "model",
@@ -1069,6 +1111,10 @@ def quantize_for_quality(module: "torch.nn.Module",
     _arm_autotune_cache()
     dtype = dtype or torch.bfloat16
     profile = profile or gpu_profile()
+    if t1_budget_gb is None or t2_budget_gb is None:
+        auto_t1, auto_t2 = _auto_budgets()
+        t1_budget_gb = auto_t1 if t1_budget_gb is None else t1_budget_gb
+        t2_budget_gb = auto_t2 if t2_budget_gb is None else t2_budget_gb
 
     if verbose:
         print(f"[gb_quant] quality={target} on {profile.family} "
@@ -1130,8 +1176,8 @@ def quantize_encoders(pipe, bits: "int | str" = "fp8", device: str = "cuda",
                       quality: "Optional[str]" = "near_lossless",
                       sensitivity: "Optional[Dict]" = None,
                       model_id: str = "model",
-                      t1_budget_gb: float = 11.0,
-                      t2_budget_gb: float = 8.0) -> list:
+                      t1_budget_gb: "float | None" = None,
+                      t2_budget_gb: "float | None" = None) -> list:
     """Quantize every text encoder on `pipe` and move it to `device`.
 
     When `quality` is set (default "near_lossless"), uses calibrated per-layer
@@ -1211,8 +1257,8 @@ def quantize_denoiser(pipe, bits: "int | str" = "fp8", device: str = "cuda",
                       quality: "Optional[str]" = "near_lossless",
                       sensitivity: "Optional[Dict]" = None,
                       model_id: str = "model",
-                      t1_budget_gb: float = 11.0,
-                      t2_budget_gb: float = 8.0) -> list:
+                      t1_budget_gb: "float | None" = None,
+                      t2_budget_gb: "float | None" = None) -> list:
     """Quantize the denoiser (transformer/unet) on `device` and move the small
     full-precision components (VAE) to the GPU.
 
@@ -1261,8 +1307,8 @@ def encode_then_quantize(pipe, prompts, bits: "int | str" = "fp8",
                          group_size: int = 64, verbose: bool = True,
                          quality: "Optional[str]" = "near_lossless",
                          model_id: str = "model",
-                         t1_budget_gb: float = 11.0,
-                         t2_budget_gb: float = 8.0) -> list:
+                         t1_budget_gb: "float | None" = None,
+                         t2_budget_gb: "float | None" = None) -> list:
     """One-call sequential recipe: quantize encoders -> encode all prompts ->
     free encoders -> quantize denoiser (+ move VAE). Returns CPU embeds list
     in prompt order. After this the pipe is ready for `prompt_embeds=` calls.
@@ -1289,7 +1335,7 @@ def maybe_quantize_from_env(obj, default_budget_gb: "float | None" = None,
     """Opt-in env hook for pipelines we don't own (ai-forge runners, LTX-2,
     third-party inference scripts): call this right after the pipeline loads.
 
-      GB_QUANT_BUDGET_GB=11     -> quantize_to_fit(obj, 11.0)  [compact path]
+      GB_QUANT_BUDGET_GB=<gb>   -> quantize_to_fit(obj, <gb>)  [compact path]
       GB_QUANT_BUDGET_GB=fit    -> use `default_budget_gb` (or free VRAM * 0.92)
       unset / 0 / off           -> no-op, returns None
       GB_QUANT_BITS=tq3|tq2|8   -> precision floor for the compact plan (default int4)
@@ -1297,7 +1343,8 @@ def maybe_quantize_from_env(obj, default_budget_gb: "float | None" = None,
       GB_QUALITY=near_lossless  -> quality-first per-layer path (overrides BUDGET_GB)
       GB_QUALITY=balanced
       GB_QUALITY=compact        -> same as BUDGET_GB path
-      GB_T2_BUDGET_GB=8         -> T2 budget for quality tier (default 8.0 GiB)
+      GB_T2_BUDGET_GB=8         -> T2 budget for quality tier (default: auto
+                                   from the live kernel T2 pool, not a literal)
 
     Returns the FitReport / QualityFitReport when quantization ran, else None.
     """
@@ -1308,11 +1355,14 @@ def maybe_quantize_from_env(obj, default_budget_gb: "float | None" = None,
             # compact routes back to the footprint-greedy plan_fit path.
             pass  # fall through to BUDGET_GB logic below
         else:
-            t1_budget = _gb_init.auto_budget_gb() if _gb_init else 11.0
+            # Rule: fallbacks derive from the executing node (_auto_budgets),
+            # not the reference box's 11.0/8.0 literals.
+            t1_budget = _gb_init.auto_budget_gb() if _gb_init else _auto_budgets()[0]
             if t1_budget <= 0.0 and torch.cuda.is_available():
                 free_b, _ = torch.cuda.mem_get_info()
                 t1_budget = free_b / 2**30 * 0.92
-            t2_budget = float(os.environ.get("GB_T2_BUDGET_GB", "8.0"))
+            _t2_env = os.environ.get("GB_T2_BUDGET_GB", "").strip()
+            t2_budget = float(_t2_env) if _t2_env else _auto_budgets()[1]
             if verbose:
                 print(f"[gb_quant] env: GB_QUALITY={raw_quality}  "
                       f"T1={t1_budget:.1f} GiB  T2={t2_budget:.1f} GiB",

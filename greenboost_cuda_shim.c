@@ -3635,6 +3635,12 @@ static void gb_write_stats(void)
                 fprintf(jf, "  \"feeders\": [\n");
                 for (int _fi = 0; _fi < _nr; _fi++) {
                     const char *_fname = gb_netc_feeder_addr(_fi);
+                    /* Telemetry P0-A: full per-feeder resource matrix.
+                     * vram_total_mb comes from the cached handshake value
+                     * (gb_netc_remote_vram).  Free VRAM is NOT cached
+                     * host-side (heartbeat carries it but netc does not
+                     * store it), so vram_free_mb is intentionally absent -
+                     * readers must treat it as unknown, not 0. */
                     fprintf(jf, "    {\"feeder\": \"%s\","
                             " \"bw_measured_mbs\": %u,"
                             " \"heartbeat_miss_total\": %u,"
@@ -3644,7 +3650,16 @@ static void gb_write_stats(void)
                             " \"gpu_util_pct\": %u,"
                             " \"gpu_mem_util_pct\": %u,"
                             " \"gpu_temp_c\": %u,"
-                            " \"gpu_power_w\": %u}%s\n",
+                            " \"gpu_power_w\": %u,"
+                            " \"vram_total_mb\": %llu,"
+                            " \"vram_free_mb\": %llu,"
+                            " \"t2_speed_mts\": %d,"
+                            " \"t3_speed_mbs\": %d,"
+                            " \"pcie_link_gen\": %u,"
+                            " \"pcie_link_width\": %u,"
+                            " \"pcie_effective_bw_mbs\": %u,"
+                            " \"throttle_reasons\": %u,"
+                            " \"ecc_dbe_count\": %u}%s\n",
                             _fname ? _fname : "unknown",
                             gb_netc_feeder_pcie_bw_mbs(_fi),
                             gb_netc_heartbeat_miss_count(_fi),
@@ -3655,6 +3670,15 @@ static void gb_write_stats(void)
                             gb_netc_feeder_gpu_mem_util_pct(_fi),
                             (unsigned)gb_netc_feeder_gpu_temp_c(_fi),
                             (unsigned)gb_netc_feeder_gpu_power_w(_fi),
+                            (unsigned long long)(gb_netc_remote_vram(_fi) >> 20),
+                            (unsigned long long)(gb_netc_feeder_vram_free_bytes(_fi) >> 20),
+                            gb_netc_t2_speed_mts(_fi),
+                            gb_netc_t3_speed_mbs(_fi),
+                            gb_netc_feeder_pcie_link_gen(_fi),
+                            gb_netc_feeder_pcie_link_width(_fi),
+                            gb_netc_feeder_pcie_bw_mbs(_fi),
+                            gb_netc_feeder_throttle_reasons(_fi),
+                            gb_netc_feeder_ecc_dbe_count(_fi),
                             (_fi < _nr - 1) ? "," : "");
                 }
                 fprintf(jf, "  ]\n}\n");

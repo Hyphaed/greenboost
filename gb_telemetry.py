@@ -176,6 +176,13 @@ class GbPoolInfo:
     total_ram_mb: int    = 0
     free_ram_mb: int     = 0
     nvme_t3_allocated_mb: int = 0
+    # Telemetry P0-B , feeder link/speed characteristics (RemoteFeederProvider,
+    # from the shim's metrics.json; 0 = unknown / old shim / host-local pool).
+    t2_speed_mts: int    = 0   # feeder DDR speed MT/s
+    t3_speed_mbs: int    = 0   # feeder NVMe speed MB/s
+    pcie_link_gen: int   = 0   # negotiated PCIe gen on the feeder link
+    pcie_link_width: int = 0   # negotiated PCIe width on the feeder link
+    pcie_effective_bw_mbs: int = 0  # measured effective feeder link BW MB/s
 
 
 # PCIe encoding efficiency per generation (GB/s per lane, one direction).
@@ -221,6 +228,13 @@ class GpuTopology:
 
     # Device indices with P2P read access (NVML_P2P_CAPS_INDEX_READ).
     p2p_device_ids: Tuple[int, ...] = ()
+
+    # Telemetry P1-A , VRAM bandwidth characterization (0 = probe unavailable).
+    mem_clock_max_mhz: int  = 0    # max memory clock (NVML_CLOCK_MEM)
+    mem_bus_width_bits: int = 0    # memory bus width in bits
+    # Theoretical peak VRAM bandwidth in GB/s:
+    #   mem_clock_max_MHz × bus_width_bits/8 × 2 (DDR) / 1000
+    vram_bw_gbps: float     = 0.0
 
     # ── derived properties ────────────────────────────────────────────────────
 
@@ -379,6 +393,26 @@ def _probe_gpu_topology(pynvml_mod: object, handle: object, device: int) -> Opti
     except Exception:
         pass
 
+    # ── VRAM bandwidth (P1-A) ────────────────────────────────────────────────
+    # Peak mem clock × bus width → theoretical VRAM bandwidth.  Both probes
+    # guarded: nvmlDeviceGetMemoryBusWidth is absent on some driver builds.
+    mem_clock_max_mhz = 0
+    mem_bus_width_bits = 0
+    vram_bw_gbps = 0.0
+    try:
+        mem_clock_max_mhz = int(nv.nvmlDeviceGetMaxClockInfo(
+            handle, getattr(nv, "NVML_CLOCK_MEM", 2)))
+    except Exception:
+        pass
+    try:
+        mem_bus_width_bits = int(nv.nvmlDeviceGetMemoryBusWidth(handle))
+    except Exception:
+        pass
+    if mem_clock_max_mhz and mem_bus_width_bits:
+        # MHz × bytes/transfer × 2 (DDR) / 1000 → GB/s
+        vram_bw_gbps = round(
+            mem_clock_max_mhz * (mem_bus_width_bits / 8.0) * 2.0 / 1000.0, 1)
+
     # ── P2P access ───────────────────────────────────────────────────────────
     p2p_device_ids: List[int] = []
     try:
@@ -410,7 +444,26 @@ def _probe_gpu_topology(pynvml_mod: object, handle: object, device: int) -> Opti
         nvlink_count=nvlink_count,
         nvlink_peer_ids=tuple(nvlink_peer_ids),
         p2p_device_ids=tuple(p2p_device_ids),
+        mem_clock_max_mhz=mem_clock_max_mhz,
+        mem_bus_width_bits=mem_bus_width_bits,
+        vram_bw_gbps=vram_bw_gbps,
     )
+
+
+def _host_ddr_speed_mts() -> int:
+    """Host DDR speed in MT/s from the installer-written profile (P1-C).
+
+    ``greenboost_setup.sh`` records ``ram_speed_mt: <N>`` in
+    /etc/greenboost/profiles/default.md at install time (dmidecode needs
+    root, so we can't probe it live here).  Returns 0 when the profile is
+    absent/unreadable or the key is missing.
+    """
+    try:
+        text = Path("/etc/greenboost/profiles/default.md").read_text()
+        match = re.search(r"ram_speed_mt:\s*(\d+)", text)
+        return int(match.group(1)) if match else 0
+    except Exception:
+        return 0
 
 
 @dataclass
@@ -455,6 +508,12 @@ class GpuMetrics:
     gpu_util_pct: float    = 0.0   # SM compute utilization 0-100% (NVML util.gpu / heartbeat)
     # Memory subsystem (DCGM FI 204)
     mem_copy_util_pct: float = 0.0
+    # Current memory clock MHz (NVML_CLOCK_MEM) , P1-A VRAM-bandwidth signal
+    mem_clock_mhz: int     = 0
+    # NVML clock-throttle reason bitmask (0 = not throttled / unknown) , P1-B
+    throttle_reasons: int  = 0
+    # Host (or feeder) DDR speed in MT/s , P1-C; 0 = unknown
+    ddr_speed_mts: int     = 0
     # Thermal / power (DCGM FI 150/155/157)
     temp_c: float          = 0.0
     power_w: float         = 0.0
@@ -710,6 +769,20 @@ class NVMLProvider(_Provider):
             pass
         try:
             m.sm_clock_mhz = int(pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_SM))
+        except Exception:
+            pass
+        try:
+            m.mem_clock_mhz = int(pynvml.nvmlDeviceGetClockInfo(
+                h, getattr(pynvml, "NVML_CLOCK_MEM", 2)))
+        except Exception:
+            pass
+        # P1-B: clock-throttle reason bitmask.  Renamed upstream (R550+) to
+        # "ClocksEventReasons" , try the old symbol first, then the new one.
+        try:
+            _get_thr = getattr(pynvml, "nvmlDeviceGetCurrentClocksThrottleReasons", None) \
+                or getattr(pynvml, "nvmlDeviceGetCurrentClocksEventReasons", None)
+            if _get_thr is not None:
+                m.throttle_reasons = int(_get_thr(h))
         except Exception:
             pass
         try:
@@ -1325,6 +1398,31 @@ class RemoteFeederProvider(_Provider):
             m.mem_copy_util_pct = float(fd.get("gpu_mem_util_pct", 0))
             m.temp_c            = float(fd.get("gpu_temp_c", 0))
             m.power_w           = float(fd.get("gpu_power_w", 0))
+            # ── P0-B: feeder resource matrix (fields absent on old shims → 0,
+            # never raise).  vram_free_mb comes from the heartbeat's
+            # gpu_load[0].vram_free_bytes, cached in netc since 2026-07-13
+            # (gb_netc_feeder_vram_free_bytes) — 0 until the first heartbeat.
+            m.fb_total_mb = int(fd.get("vram_total_mb", 0))
+            m.fb_free_mb  = int(fd.get("vram_free_mb", 0))
+            if m.fb_total_mb and m.fb_free_mb:
+                m.fb_used_mb  = max(0, m.fb_total_mb - m.fb_free_mb)
+                m.fb_used_pct = 100.0 * m.fb_used_mb / m.fb_total_mb
+            m.throttle_reasons = int(fd.get("throttle_reasons", 0))
+            m.ddr_speed_mts    = int(fd.get("t2_speed_mts", 0))
+            # Feeder link/speed characteristics → GbPoolInfo (T2/T3 SPEED axis)
+            t2_mts = int(fd.get("t2_speed_mts", 0))
+            t3_mbs = int(fd.get("t3_speed_mbs", 0))
+            p_gen  = int(fd.get("pcie_link_gen", 0))
+            p_wid  = int(fd.get("pcie_link_width", 0))
+            p_bw   = int(fd.get("pcie_effective_bw_mbs", fd.get("bw_measured_mbs", 0)))
+            if t2_mts or t3_mbs or p_gen or p_bw:
+                if m.gb is None:
+                    m.gb = GbPoolInfo()
+                m.gb.t2_speed_mts          = t2_mts
+                m.gb.t3_speed_mbs          = t3_mbs
+                m.gb.pcie_link_gen         = p_gen
+                m.gb.pcie_link_width       = p_wid
+                m.gb.pcie_effective_bw_mbs = p_bw
             # Health: health_state 0=HEALTHY, >0=degraded/quarantined/disabled
             health_st = int(fd.get("health_state", 0))
             if health_st >= 2:          # UNHEALTHY or worse
@@ -1374,6 +1472,10 @@ class TelemetryManager:
         self._thread: Optional[threading.Thread] = None
         self._stop    = threading.Event()
         self._dcgm: Optional[DCGMProvider] = None
+        # P1-C: host DDR speed, parsed once from the install-time profile.
+        # Only meaningful for the local host (device 0); feeder-backed
+        # managers get theirs from metrics.json (t2_speed_mts).
+        self.ddr_speed_mts: int = _host_ddr_speed_mts() if device == 0 else 0
 
         # Build provider chain
         self._providers: List[_Provider] = []
@@ -1494,6 +1596,10 @@ class TelemetryManager:
             for p in self._providers:
                 with _nvtx_range(f"gb:telemetry:{p.name}", color="gray"):
                     p.fill(m)
+            # P1-C: attach host DDR speed unless a provider already set it
+            # (RemoteFeederProvider fills the feeder's own DDR speed).
+            if not m.ddr_speed_mts and self.ddr_speed_mts:
+                m.ddr_speed_mts = self.ddr_speed_mts
             # Atomic snapshot replacement (GIL ensures reference store is atomic)
             self._snapshot = m
             for cb in self._cbs:

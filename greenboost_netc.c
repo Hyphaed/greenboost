@@ -417,6 +417,10 @@ struct netc_feeder {
     uint32_t gpu_mem_util_pct;      /* 0-100 memory controller utilization */
     uint16_t gpu_temp_c;            /* GPU temperature °C; 0 until first heartbeat */
     uint16_t gpu_power_draw_w;      /* current power draw Watts; 0 until first heartbeat */
+    uint64_t gpu_vram_free_bytes;   /* gpu_load[0] live free VRAM; 0 until first
+                                     * heartbeat. Crossed the wire since netd v1089
+                                     * but was never cached — dataflux feeder VRAM
+                                     * used/free was structurally blind (2026-07-13). */
     /* U4: unified health state machine */
     gb_feeder_health_state_t health_state;
     uint64_t health_state_since_ms;  /* mono_ms() when current state was entered */
@@ -3001,10 +3005,11 @@ void gb_netc_poll_health(void)
                 if (hb->gpu_load[g].ecc_sbe_delta > 8)
                     sbe_elevated = 1;
             }
-            nf->gpu_util_pct     = hb->gpu_load[0].gpu_util_pct;
-            nf->gpu_mem_util_pct = hb->gpu_load[0].mem_util_pct;
-            nf->gpu_temp_c       = hb->gpu_load[0].gpu_temp_c;
-            nf->gpu_power_draw_w = hb->gpu_load[0].power_draw_w;
+            nf->gpu_util_pct        = hb->gpu_load[0].gpu_util_pct;
+            nf->gpu_mem_util_pct    = hb->gpu_load[0].mem_util_pct;
+            nf->gpu_temp_c          = hb->gpu_load[0].gpu_temp_c;
+            nf->gpu_power_draw_w    = hb->gpu_load[0].power_draw_w;
+            nf->gpu_vram_free_bytes = hb->gpu_load[0].vram_free_bytes;
         }
         nf->throttle_reasons  = throttle_any;
         nf->ecc_dbe_count     = dbe_total;
@@ -3275,4 +3280,51 @@ uint16_t gb_netc_feeder_gpu_power_w(int remote_idx)
     if (remote_idx < 0 || remote_idx >= g_remote_gpu_count) return 0;
     int fi = g_remote_gpus[remote_idx].feeder_idx;
     return g_feeders[fi].gpu_power_draw_w;
+}
+
+/* Telemetry P0-A: raw NVML clock-throttle bitmask cached from the last
+ * heartbeat.  Unlike gb_netc_feeder_throttled() this does NOT fold in the
+ * health state - it is the verbatim nvmlDeviceGetCurrentClocksThrottleReasons
+ * value from the feeder, for dataflux/metrics attribution. */
+uint32_t gb_netc_feeder_throttle_reasons(int remote_idx)
+{
+    if (remote_idx < 0 || remote_idx >= g_remote_gpu_count) return 0;
+    int fi = g_remote_gpus[remote_idx].feeder_idx;
+    return g_feeders[fi].throttle_reasons;
+}
+
+/* Telemetry P0-A: cumulative double-bit ECC error count cached from the
+ * last heartbeat (sum across the feeder's GPUs). */
+uint32_t gb_netc_feeder_ecc_dbe_count(int remote_idx)
+{
+    if (remote_idx < 0 || remote_idx >= g_remote_gpu_count) return 0;
+    int fi = g_remote_gpus[remote_idx].feeder_idx;
+    return g_feeders[fi].ecc_dbe_count;
+}
+
+/* Telemetry P0-A: negotiated PCIe link generation from the handshake
+ * (0 = unknown / old feeder that sent a short handshake reply). */
+uint32_t gb_netc_feeder_pcie_link_gen(int remote_idx)
+{
+    if (remote_idx < 0 || remote_idx >= g_remote_gpu_count) return 0;
+    int fi = g_remote_gpus[remote_idx].feeder_idx;
+    return g_feeders[fi].pcie_link_gen;
+}
+
+/* Telemetry P0-A: negotiated PCIe link width from the handshake (0 = unknown). */
+uint32_t gb_netc_feeder_pcie_link_width(int remote_idx)
+{
+    if (remote_idx < 0 || remote_idx >= g_remote_gpu_count) return 0;
+    int fi = g_remote_gpus[remote_idx].feeder_idx;
+    return g_feeders[fi].pcie_link_width;
+}
+
+/* Telemetry P0-A follow-up: live free VRAM (bytes) from the last heartbeat's
+ * gpu_load[0] (0 = unknown / pre-heartbeat). Completes feeder VRAM used/free
+ * visibility in metrics.json → dataflux snapshots. */
+uint64_t gb_netc_feeder_vram_free_bytes(int remote_idx)
+{
+    if (remote_idx < 0 || remote_idx >= g_remote_gpu_count) return 0;
+    int fi = g_remote_gpus[remote_idx].feeder_idx;
+    return g_feeders[fi].gpu_vram_free_bytes;
 }

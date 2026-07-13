@@ -668,6 +668,9 @@ def test_do_kv_grow_clamp_path_fires_when_headroom_partial(orch):
     """
     orch._total_vram_mb = 12000
     orch._ws_reserve_mb = 6600   # headroom = 12000-6600-3072-2048 = 280 MiB < 512
+    # weights floor is now %-of-VRAM derived (18%) — pin it so the arithmetic
+    # in this test stays machine-independent.
+    orch._weights_floor_mb = 2048
     orch._ctrl._last["kv_reserve_mb"] = (3072, 0)
 
     for _ in range(25):

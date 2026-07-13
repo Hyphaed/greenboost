@@ -127,7 +127,7 @@ class SnapshotRecorder:
         sys_m = getattr(m, "sys", None)
         node = self._node if self._node is not None else (
             "host" if getattr(m, "device", 0) == 0 else f"gpu{m.device}")
-        emit({
+        ev = {
             "node": node,
             "label": "system_snapshot", "kind": "snapshot",
             "n_items": 0, "items": [], "duration_s": 0.0, "status": "ok",
@@ -148,7 +148,33 @@ class SnapshotRecorder:
             "t3_used_mb": gb.t3_used_mb if gb else 0,
             "t3_pressure": gb.t3_pressure if gb else 0,
             "shim_phase": getattr(m, "shim_phase", ""),
-        })
+        }
+        # P0-C: compute/bandwidth/speed axes , added only when non-zero so
+        # the event stays small and old consumers (summarize/critic use
+        # .get()) keep working against pre-widening snapshots.
+        topo = getattr(m, "topology", None)
+        for key, val in (
+            ("sm_clock_mhz", getattr(m, "sm_clock_mhz", 0)),
+            ("mem_clock_mhz", getattr(m, "mem_clock_mhz", 0)),
+            ("mem_copy_util_pct", round(getattr(m, "mem_copy_util_pct", 0.0), 1)),
+            ("power_limit_w", round(getattr(m, "power_limit_w", 0.0), 1)),
+            ("pcie_tx_mb_s", round(getattr(m, "pcie_tx_mb_s", 0.0), 1)),
+            ("pcie_rx_mb_s", round(getattr(m, "pcie_rx_mb_s", 0.0), 1)),
+            ("throttle_reasons", getattr(m, "throttle_reasons", 0)),
+            ("ddr_speed_mts", getattr(m, "ddr_speed_mts", 0)),
+            # Static-ish link identity: host from topology, feeder from the
+            # GbPoolInfo filled out of metrics.json.
+            ("pcie_gen", getattr(topo, "pcie_gen_current", 0) if topo
+             else getattr(gb, "pcie_link_gen", 0) if gb else 0),
+            ("pcie_width", getattr(topo, "pcie_width_current", 0) if topo
+             else getattr(gb, "pcie_link_width", 0) if gb else 0),
+            ("t2_speed_mts", getattr(gb, "t2_speed_mts", 0) if gb else 0),
+            ("t3_speed_mbs", getattr(gb, "t3_speed_mbs", 0) if gb else 0),
+            ("vram_bw_gbps", getattr(topo, "vram_bw_gbps", 0.0) if topo else 0.0),
+        ):
+            if val:
+                ev[key] = val
+        emit(ev)
 
 
 def _feeder_node_label(feeder_idx: int) -> str:
@@ -257,8 +283,15 @@ def summarize(events: list[dict]) -> dict:
     total_duration = 0.0
 
     for ev in events:
+        # P1-D per-node attribution: feeder events key tok_s/stages as
+        # "<node>:<model>" / "<node>:<stage>" so host and feeder rates never
+        # blend.  Host events ("", "host", None node) keep their unprefixed
+        # keys , existing host dashboards are unaffected.
+        _ev_node = ev.get("node")
+        _node_prefix = f"{_ev_node}:" if _ev_node not in ("", "host", None) else ""
+
         if ev.get("kind") == "tok_s_measured":
-            model = ev.get("model", "?")
+            model = _node_prefix + ev.get("model", "?")
             t = tok_s.setdefault(model, {"latest": 0.0, "samples": 0, "_sum": 0.0, "last_ts": 0})
             t["latest"] = ev.get("tok_s", 0.0)
             t["samples"] += 1
@@ -266,7 +299,7 @@ def summarize(events: list[dict]) -> dict:
             t["last_ts"] = ev.get("ts", 0)
 
         if ev.get("kind") == "stage_profile":
-            stage = ev.get("stage", "?")
+            stage = _node_prefix + ev.get("stage", "?")
             s = stages.setdefault(stage, {"count": 0, "_walls": [],
                                           "last_status": "", "last_ts": 0})
             s["count"] += 1
