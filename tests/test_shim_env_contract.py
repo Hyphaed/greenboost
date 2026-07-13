@@ -16,7 +16,6 @@ _REQUIRED_DIFFUSION_KEYS = {
     "GREENBOOST_ACTIVE": "1",
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
     "GREENBOOST_KV_RESERVE_MB": "0",
-    "GREENBOOST_HOST_RAM_SAFETY_MB": "2048",
     "GREENBOOST_A0_DISABLE": "1",
     "GREENBOOST_DISABLE_T2_ON_BLACKWELL": "0",
     "GREENBOOST_CLUSTER": "0",
@@ -43,6 +42,13 @@ def test_diffusion_profile_complete():
     for k, v in _REQUIRED_DIFFUSION_KEYS.items():
         assert env.get(k) == v, f"diffusion profile lost {k}"
     assert env["LD_PRELOAD"].startswith("/usr/local/lib/libgreenboost_cuda.so")
+
+
+def test_host_ram_safety_dynamic():
+    # No longer a static "2048" literal: %-derived from MemTotal at call time
+    # (max(2048, 3%)), so assert presence + the formula's floor, not a value.
+    env = gc.shim_env("diffusion", base_env=_clean_base())
+    assert int(env["GREENBOOST_HOST_RAM_SAFETY_MB"]) >= 2048
 
 
 def test_torch_alias_matches_diffusion():

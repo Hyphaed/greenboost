@@ -94,19 +94,28 @@ def test_parse_cpu_lists(tmp_path):
     assert t.e_core_cpus[0] == 16
 
 
-def test_parse_missing_file_returns_defaults():
+def test_parse_missing_file_returns_defaults(monkeypatch):
+    # Hardware fields no longer inherit reference-box literals: missing file →
+    # live detection → sentinel 0 (patched here so the test is machine-independent).
+    import gb_topology as gt
+    for det in ("_detect_vram_gb", "_detect_ram_total_gb", "_detect_pcie_gen",
+                "_detect_ram_speed_mt", "_detect_virtual_vram_gb"):
+        monkeypatch.setattr(gt, det, lambda: 0)
+    monkeypatch.setattr(gt, "_detect_compute_capability", lambda: "")
+    monkeypatch.delenv("GREENBOOST_KV_RESERVE_MB", raising=False)
     t = _parse_profile(Path("/nonexistent/path/profile.md"))
-    # All defaults
-    assert t.vram_gb == 12
-    assert t.pcie_gen == 4
+    assert t.vram_gb == 0            # sentinel, never the reference 12
+    assert t.pcie_gen == 0           # sentinel
     assert t.pcie_lanes == 16
-    assert t.kv_reserve_mb == 2048
+    assert t.kv_reserve_mb == 512    # %-derived floor (VRAM unknown)
+    assert t.safety_reserve_gb == 2  # %-derived floor (RAM unknown)
     assert t.p_core_cpus == []
     assert t.golden_cpu_min == -1
 
 
-def test_parse_partial_profile(tmp_path):
+def test_parse_partial_profile(tmp_path, monkeypatch):
     """Only GPU section present , CPU fields fall back to defaults."""
+    monkeypatch.delenv("GREENBOOST_KV_RESERVE_MB", raising=False)
     p = _write_profile(tmp_path, "vram_gb: 8\npcie_gen: 3\npcie_lanes: 8\n")
     t = _parse_profile(p)
 
@@ -114,7 +123,8 @@ def test_parse_partial_profile(tmp_path):
     assert t.pcie_gen == 3
     assert t.pcie_lanes == 8
     assert t.p_core_cpus == []  # not in file → default
-    assert t.kv_reserve_mb == 2048  # not in file → default
+    # kv reserve is %-derived from this profile's VRAM, not a 2048 literal
+    assert t.kv_reserve_mb == max(512, 8 * 1024 // 6)
 
 
 def test_parse_quoted_strings(tmp_path):

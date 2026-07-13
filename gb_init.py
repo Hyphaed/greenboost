@@ -133,6 +133,43 @@ def _bootstrap():
         except Exception as exc:
             print(f"[gb_init] dataflux recorder unavailable: {exc}", file=sys.stderr)
 
+        # 3c. One-time node_capabilities inventory event (P1-E): static host
+        # hardware matrix (GPU name, VRAM capacity/bandwidth, DDR speed, PCIe
+        # link, CUDA cc) so dataflux consumers can normalise usage against
+        # capacity without re-probing NVML. Fully guarded , never delays init.
+        try:
+            import gb_dataflux
+            m = telemetry.poll_once()
+            topo = getattr(m, "topology", None)
+            gpu_name = ""
+            try:
+                prov = telemetry._providers[0]
+                if getattr(prov, "_ok", False):
+                    raw = prov._pynvml.nvmlDeviceGetName(prov._handle)
+                    gpu_name = raw.decode() if isinstance(raw, bytes) else str(raw)
+            except Exception:
+                pass
+            ev = {
+                "kind": "node_capabilities", "node": "host",
+                "label": "inventory", "n_items": 0, "items": [],
+                "duration_s": 0.0, "status": "ok",
+                "gpu_name": gpu_name,
+                "vram_total_mb": getattr(m, "fb_total_mb", 0),
+            }
+            if getattr(topo, "vram_bw_gbps", 0.0):
+                ev["vram_bw_gbps"] = topo.vram_bw_gbps
+            if getattr(m, "ddr_speed_mts", 0):
+                ev["ddr_speed_mts"] = m.ddr_speed_mts
+            if getattr(topo, "pcie_gen_current", 0):
+                ev["pcie_gen"] = topo.pcie_gen_current
+                ev["pcie_width"] = getattr(topo, "pcie_width_current", 0)
+            cc = getattr(topo, "compute_capability", (0, 0))
+            if cc and cc[0]:
+                ev["cuda_cc"] = f"{cc[0]}.{cc[1]}"
+            gb_dataflux.emit(ev)
+        except Exception:
+            pass
+
     # 4. ECC DBE callback , loud stderr warning on hardware memory errors.
     # Registered on the local manager AND each feeder manager so both local
     # and remote double-bit errors are caught (Phase 3d: feeder ECC guard).
@@ -164,7 +201,9 @@ def _bootstrap():
     # 6. ModelTierManager singleton.
     try:
         from gb_model_tier import ModelTierManager
-        _tier_manager = ModelTierManager(hbm_headroom_mb=1500)
+        # Headroom auto-derives from this card's VRAM (gb_topology.hbm_headroom_mb,
+        # 10% floor 512) — rule: no reference-box 1500 MB literal.
+        _tier_manager = ModelTierManager()
     except PermissionError:
         # Expected when running as non-root , model_pages is a privileged path.
         pass

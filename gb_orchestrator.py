@@ -101,7 +101,7 @@ _WS_FRACTION_EXIT    = 0.07   # exit when non_gb_mb < 7% of total VRAM
 _TEMP_ENTER_C        = 83.0   # thermal governor enter threshold
 _TEMP_EXIT_C         = 75.0   # thermal governor exit threshold
 _TEMP_CONFIRM        = 3      # sustained polls before thermal fires
-_WEIGHTS_FLOOR_MB    = 2048   # minimum T1 VRAM reserved for weights
+_WEIGHTS_FLOOR_MB    = 2048   # LAST-RESORT weights floor; runtime derives 18% of VRAM (rule)
 _VRAM_DEMOTE_ENTER   = 87.0   # Loop E: fb_used_pct enter threshold
 _VRAM_DEMOTE_EXIT    = 70.0   # Loop E: fb_used_pct exit threshold
 _VRAM_CONFIRM        = 3      # sustained polls before Loop E fires
@@ -180,7 +180,11 @@ class ReactiveOrchestrator:
             self._kv_step_mb      = _topo.kv_step_mb       # kv_reserve_mb // 4
             self._safety_max_gb   = _topo.safety_max_gb    # safety_reserve_gb + 2
             self._kv_floor_mb     = _topo.kv_reserve_mb    # shrink floor = topology baseline
-            self._weights_floor_mb = _WEIGHTS_FLOOR_MB
+            # 18% of THIS card's VRAM (≈2 GB on the 11.3 GB reference), not an
+            # absolute 2048 literal (rule) — literal only if VRAM undetected.
+            self._weights_floor_mb = (max(512, int(_topo.physical_vram_mb * 0.18))
+                                      if _topo.physical_vram_mb > 0
+                                      else _WEIGHTS_FLOOR_MB)
         except Exception:
             self._kv_step_mb      = _KV_STEP_MB
             self._safety_max_gb   = _SAFETY_MAX_GB

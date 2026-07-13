@@ -1021,9 +1021,66 @@ def _measured_tok_s(model: str) -> "float | None":
     return round(sum(history) / len(history), 1)
 
 
-_VRAM_BW_GB_S = 670.0   # local GDDR7 read bandwidth, cc12.0 cards (workflow/architecture.md)
-_PCIE_BW_GB_S = 25.0    # PCIe4 x16 host<->pinned-DDR streaming floor
+# Rule: link bandwidths derive from the EXECUTING node, never reference-box
+# literals. The two constants below are LAST-resort fallbacks only (used with
+# a loud warning when both NVML and nvidia-smi detection fail).
+_VRAM_BW_FALLBACK_GB_S = 670.0   # GDDR7 read BW of the reference cc12.0 card
+_PCIE_BW_FALLBACK_GB_S = 25.0    # PCIe4 x16 streaming floor (reference box)
+_PCIE_STREAM_EFF = 0.78          # observed streaming vs theoretical peak (≈25/32 on gen4 x16)
 _TOKS_FLOOR = 0.5
+_link_bw_cache: "tuple[float, float] | None" = None
+
+
+def _link_bandwidths() -> "tuple[float, float]":
+    """(vram_bw_gb_s, pcie_bw_gb_s) for the LOCAL device, detected once and cached.
+
+    VRAM: NVML max mem clock × memory bus width; the effective GDDR data rate
+    is approximated as mem_clock × 2 (DDR) — a deliberate approximation, fine
+    for the order-of-magnitude tok/s heuristic this feeds. PCIe: detected
+    gen × lanes via gb_topology's per-lane table, scaled by the observed
+    streaming efficiency."""
+    global _link_bw_cache
+    if _link_bw_cache is not None:
+        return _link_bw_cache
+    vram_bw = 0.0
+    try:
+        try:
+            import pynvml
+        except ImportError:            # vendored ctypes binding, as gb_telemetry
+            import gb_nvml_ctypes as pynvml
+        pynvml.nvmlInit()
+        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        mem_clock_mhz = pynvml.nvmlDeviceGetMaxClockInfo(h, pynvml.NVML_CLOCK_MEM)
+        bus_width_bits = pynvml.nvmlDeviceGetMemoryBusWidth(h)
+        vram_bw = mem_clock_mhz * 2 * bus_width_bits / 8 / 1000.0   # ×2: DDR
+    except Exception:
+        try:   # pynvml unavailable — one nvidia-smi probe, cached for the process
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=clocks.max.memory,memory.bus_width",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10)
+            clk, bus = (float(x) for x in out.stdout.splitlines()[0].split(","))
+            vram_bw = clk * 2 * bus / 8 / 1000.0
+        except Exception:
+            pass
+    if vram_bw <= 0:
+        print(f"  [gb-synapse] WARNING: VRAM bandwidth undetectable — falling back "
+              f"to the reference-box {_VRAM_BW_FALLBACK_GB_S:.0f} GB/s", flush=True)
+        vram_bw = _VRAM_BW_FALLBACK_GB_S
+    pcie_bw = 0.0
+    try:
+        from gb_topology import get_topology, _PCIE_BW_PER_LANE_GBS
+        topo = get_topology()
+        pcie_bw = (_PCIE_BW_PER_LANE_GBS.get(topo.pcie_gen, 0.0)
+                   * topo.pcie_lanes * _PCIE_STREAM_EFF)
+    except Exception:
+        pass
+    if pcie_bw <= 0:
+        print(f"  [gb-synapse] WARNING: PCIe gen/lanes undetectable — falling back "
+              f"to the reference-box {_PCIE_BW_FALLBACK_GB_S:.0f} GB/s", flush=True)
+        pcie_bw = _PCIE_BW_FALLBACK_GB_S
+    _link_bw_cache = (vram_bw, pcie_bw)
+    return _link_bw_cache
 
 
 def _estimate_tok_s(active_gb: float, budget_gb: float) -> float:
@@ -1038,11 +1095,12 @@ def _estimate_tok_s(active_gb: float, budget_gb: float) -> float:
     """
     if active_gb <= 0:
         return 0.0
+    vram_bw, pcie_bw = _link_bandwidths()   # node-derived, not literals (rule)
     if active_gb <= budget_gb:
-        eff_bw = _VRAM_BW_GB_S
+        eff_bw = vram_bw
     else:
         overflow_frac = min(1.0, (active_gb - budget_gb) / active_gb)
-        eff_bw = _VRAM_BW_GB_S * (1 - overflow_frac) + _PCIE_BW_GB_S * overflow_frac
+        eff_bw = vram_bw * (1 - overflow_frac) + pcie_bw * overflow_frac
     return max(_TOKS_FLOOR, round(eff_bw / active_gb, 1))
 
 
@@ -1273,11 +1331,31 @@ def ensure_feeder_rpc(feeder, rpc_port: int = RPC_PORT_BASE, device: int = 0) ->
 
 MTP_DRAFT_N = int(os.environ.get("GB_SYNAPSE_MTP_DRAFT_N", "3"))
 
-# llama.cpp's graph/compute workspace per CUDA device, on top of the weights
-# and KV it holds. Measured against the observed feeder OOM, not guessed low:
-# undershooting this is a failed load, overshooting only costs a layer.
-GPU_COMPUTE_RESERVE_GB = float(os.environ.get("GB_SYNAPSE_COMPUTE_RESERVE_GB", "1.5"))
 GPU_FIT_MARGIN = float(os.environ.get("GB_SYNAPSE_FIT_MARGIN", "0.85"))
+
+
+def _compute_reserve_gb(physical_vram_mb: float) -> float:
+    """llama.cpp's graph/compute workspace per CUDA device, on top of the
+    weights and KV it holds. Undershooting is a failed load, overshooting only
+    costs a layer.
+
+    GB_SYNAPSE_COMPUTE_RESERVE_GB is absolute and wins; otherwise %-derived
+    per device — max(0.75 GiB, 8% of that device's VRAM) via the shared
+    gb_topology.compute_reserve_gb (rule: no reference-box 1.5 GiB literal;
+    gb_cluster.feeder_env uses the same formula)."""
+    env = os.environ.get("GB_SYNAPSE_COMPUTE_RESERVE_GB")
+    if env:
+        try:
+            return float(env)
+        except ValueError:
+            pass
+    try:
+        from gb_topology import compute_reserve_gb
+        return compute_reserve_gb(physical_vram_mb)
+    except Exception:
+        print("  [gb-synapse] WARNING: gb_topology unavailable — compute reserve "
+              "falls back to the reference-box 1.5 GiB", flush=True)
+        return 1.5
 
 # Architectures whose CUDA backend cannot survive a CPU/GPU split (upstream
 # llama.cpp regression — see the cpu_quirk branch in serve() for the verified
@@ -1321,7 +1399,10 @@ def _fit_cpu_moe_layers(entry: ModelEntry, budget_gb: float, kv_gb: float,
     if per_layer <= 0 or n_layers <= 0:
         return 0
     weights_gb = entry.n_bytes / (1024 ** 3)
-    room = budget_gb - kv_gb - GPU_COMPUTE_RESERVE_GB * max(1, n_devices)
+    n_dev = max(1, n_devices)
+    # Per-device %-derived reserve; budget/n_dev is the per-device VRAM proxy
+    # (callers pass aggregate free VRAM — rule: no flat per-device literal).
+    room = budget_gb - kv_gb - _compute_reserve_gb(budget_gb * 1024.0 / n_dev) * n_dev
     deficit = weights_gb - room * GPU_FIT_MARGIN
     if deficit <= 0:
         return 0
@@ -1348,7 +1429,9 @@ def _fit_gpu_layers(entry: ModelEntry, budget_gb: float, kv_gb: float,
     # workspace on top of the weights it holds. Counting that once (or not at
     # all) overshoots the smallest GPU, and on a GPU an overshoot is a hard OOM,
     # not a spill: the feeder was handed a 9.5 GB share of a 7.5 GB card.
-    usable = budget_gb - kv_gb - GPU_COMPUTE_RESERVE_GB * max(1, n_devices)
+    # %-derived per device, budget/n_dev as the per-device VRAM proxy (rule).
+    n_dev = max(1, n_devices)
+    usable = budget_gb - kv_gb - _compute_reserve_gb(budget_gb * 1024.0 / n_dev) * n_dev
     if usable <= 0:
         return 0
     # An MoE's layers are not uniform: the expert-carrying ones are far larger
@@ -1459,9 +1542,13 @@ def _compute_tensor_split(host_free_mb: int, online_feeders: list,
     # can hold are its free VRAM minus that reserve. Splitting on raw free VRAM
     # over-serves the smallest card — a 7.5 GB feeder was handed an 8.4 GB share
     # and the load died there, not on the host that had room to spare.
-    reserve_mb = GPU_COMPUTE_RESERVE_GB * 1024.0
-    free = [max(int(host_free_mb - reserve_mb), 1)] + \
-           [max(int(f.t1_free_mb - reserve_mb), 1) for f in online_feeders]
+    # Reserve is %-derived PER DEVICE (rule): feeders report t1_total_mb; the
+    # host's free VRAM stands in for its total here (conservative, never over).
+    free = [max(int(host_free_mb - _compute_reserve_gb(host_free_mb) * 1024.0), 1)] + \
+           [max(int(f.t1_free_mb
+                    - _compute_reserve_gb(getattr(f, "t1_total_mb", 0)
+                                          or f.t1_free_mb) * 1024.0), 1)
+            for f in online_feeders]
     v2 = os.environ.get("GB_SYNAPSE_SPLIT_V2", "") == "1"
     try:
         host_bias = float(os.environ.get("GB_SYNAPSE_HOST_BIAS", "1.0"))

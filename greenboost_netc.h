@@ -296,6 +296,16 @@ uint32_t gb_netc_feeder_gpu_mem_util_pct(int remote_idx);
 uint16_t gb_netc_feeder_gpu_temp_c(int remote_idx);
 /* Return GPU power draw (Watts) cached from the last heartbeat; 0 = no data yet. */
 uint16_t gb_netc_feeder_gpu_power_w(int remote_idx);
+/* Raw NVML clock-throttle bitmask cached from the last heartbeat (verbatim,
+ * no health-state folding - see gb_netc_feeder_throttled for the policy view). */
+uint32_t gb_netc_feeder_throttle_reasons(int remote_idx);
+/* Cumulative double-bit ECC error count cached from the last heartbeat. */
+uint32_t gb_netc_feeder_ecc_dbe_count(int remote_idx);
+/* Negotiated PCIe link gen/width from the handshake (0 = unknown/old feeder). */
+uint32_t gb_netc_feeder_pcie_link_gen(int remote_idx);
+uint32_t gb_netc_feeder_pcie_link_width(int remote_idx);
+/* Live free VRAM bytes from the last heartbeat (0 = unknown). */
+uint64_t gb_netc_feeder_vram_free_bytes(int remote_idx);
 
 /* N7: Query live feeder stats (T1/T2/T3 free/total, kernel count, MPS SM%).
  * Returns 0 on success, -1 if feeder is disconnected or the query failed. */

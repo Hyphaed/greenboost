@@ -18,7 +18,7 @@ Also uses GB_IOCTL_SESSION_ACTIVE / SESSION_IDLE for pipeline stage transitions.
 Usage:
     from gb_model_tier import ModelTierManager
 
-    tm = ModelTierManager(hbm_headroom_mb=1024)
+    tm = ModelTierManager()   # headroom auto-derived: 10% of VRAM (gb_topology)
     tm.register("unet",      pipe.unet)
     tm.register("vae",       pipe.vae)
     tm.register("encoder",   pipe.text_encoder)
@@ -223,9 +223,10 @@ class ModelTierManager:
 
     Parameters
     ----------
-    hbm_headroom_mb : int
+    hbm_headroom_mb : int | None
         Keep at least this many MB free in T1 before promoting.
-        Default: 1024 (1 GB headroom for activations/latents).
+        Default None: derived from this card's VRAM — max(512, 10%) via
+        gb_topology.hbm_headroom_mb (rule: no absolute reference literal).
     t3_dir : str
         Directory for NVMe-evicted model checkpoints.
     async_transfers : bool
@@ -234,10 +235,18 @@ class ModelTierManager:
 
     def __init__(
         self,
-        hbm_headroom_mb: int = 1024,
+        hbm_headroom_mb: "int | None" = None,
         t3_dir: str = "/var/lib/greenboost/model_pages",
         async_transfers: bool = True,
     ):
+        if hbm_headroom_mb is None:
+            # %-derived default (10% of VRAM, floor 512) shared with gb_init
+            # via gb_topology — replaces the flat 1024/1500 MB literals (rule).
+            try:
+                from gb_topology import hbm_headroom_mb as _derive_headroom_mb
+                hbm_headroom_mb = _derive_headroom_mb()
+            except Exception:
+                hbm_headroom_mb = 1024   # last resort: gb_topology unavailable
         self.hbm_headroom_mb = hbm_headroom_mb
         self.t3_dir = t3_dir
         self.async_transfers = async_transfers

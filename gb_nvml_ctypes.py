@@ -214,6 +214,22 @@ def nvmlDeviceGetClockInfo(handle, clock_type: int) -> int:
     return mhz.value
 
 
+def nvmlDeviceGetMaxClockInfo(handle, clock_type: int) -> int:
+    # Needed by gb_topology/gb_synapse hardware detection (rule: derive
+    # bandwidths from the executing node, never reference-box literals).
+    mhz = c_uint()
+    _call(_sym("nvmlDeviceGetMaxClockInfo"), handle, c_uint(clock_type), byref(mhz),
+          func="nvmlDeviceGetMaxClockInfo")
+    return mhz.value
+
+
+def nvmlDeviceGetMemoryBusWidth(handle) -> int:
+    bits = c_uint()
+    _call(_sym("nvmlDeviceGetMemoryBusWidth"), handle, byref(bits),
+          func="nvmlDeviceGetMemoryBusWidth")
+    return bits.value
+
+
 def nvmlDeviceGetPcieThroughput(handle, counter: int) -> int:
     kbs = c_uint()
     _call(_sym("nvmlDeviceGetPcieThroughput"), handle, c_uint(counter), byref(kbs),
