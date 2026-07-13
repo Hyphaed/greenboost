@@ -163,33 +163,60 @@ GreenBoost auto-falls back to **Path B** (no-kmod mode). See
 
 ## 🔧 How it works
 
-GreenBoost stitches three physical storage tiers into one "virtual VRAM"
-that CUDA applications see as a single huge GPU:
+GreenBoost is seven subsystems sharing one stack, not just a memory
+extender. Requests arrive through **GB-CLI** / **GB-Synapse**, weights and
+KV get squeezed by **GB-Quant**, the **GB-Tiering** shim + kernel module
+place every byte in the fastest tier that has room, **GB-Cluster** mirrors
+that same tier ladder onto any idle LAN machine, **GB-Dataflux** logs every
+layer above, and the **Central MCP** (`greenboost-orchestrator`) gives an
+LLM assistant one query surface over all of it:
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│   What your application sees: ONE giant CUDA device          │
-└──────────────────────────────────────────────────────────────┘
-   ▲ cudaMalloc / cuMemAlloc / cuLaunchKernel
-   │
-┌──┴────────────────────────────────────────────────────────────┐
-│ libgreenboost_cuda.so   (LD_PRELOAD shim)                     │
-│  • small allocs → pass through to the NVIDIA driver           │
-│  • large allocs → overflow handler                            │
-└──┬────────────────────────────────────────────────────────────┘
-   │
-   ▼
- ┌─────────────┐   ┌────────────────────────┐   ┌────────────┐
- │  T1: VRAM   │ → │  T2: System DDR RAM    │ → │  T3: NVMe  │
- │  (cudaMalloc│   │ (DMA-BUF pinned pages, │   │ (swap as a │
- │   real)     │   │  GPU reads over PCIe)  │   │  last fall-│
- └─────────────┘   └────────────────────────┘   └────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  Your app , gb CLI, or any Ollama / OpenAI / HF-TGI client        │
+└───────────────────────────────┬──────────────────────────────────┘
+                                 │  :11434
+                    ┌────────────┴─────────────┐
+                    │  GB-Synapse  +  GB-CLI     │── tok/s, requests ──┐
+                    │  (Ollama/OpenAI/TGI proxy)  │                     │
+                    └────────────┬─────────────┘                     │
+                                 │  cudaMalloc / cuMemAlloc /           │
+                                 │  cuLaunchKernel                      │
+                    ┌────────────┴─────────────┐                     │
+                    │  GB-Quant                   │── quantize events ──┤
+                    │  (weight + KV compression)   │                     │
+                    └────────────┬─────────────┘                     │
+                                 │                                     │
+                    ┌────────────┴─────────────┐                     │
+                    │  libgreenboost_cuda.so       │── tier moves,  ─────┤
+                    │  the GB-Tiering shim + kmod   │  phase transitions   │
+                    └────────────┬─────────────┘                     │
+                                 ▼                                     │
+      ┌─────────────┐   ┌────────────────────┐   ┌────────────┐       │
+      │ T1: VRAM    │ → │ T2: System DDR      │ → │ T3: NVMe   │       │
+      │ (local GPU) │   │ (DMA-BUF pinned)     │   │ (swap)     │       │
+      └──────┬──────┘   └──────────┬──────────┘   └─────┬──────┘       │
+             │     GB-Cluster mirrors this same ladder    │              │
+             │     onto every connected feeder over LAN    │              │
+             ▼                     ▼                       ▼              │
+      ┌─────────────┐   ┌────────────────────┐   ┌────────────┐       │
+      │ feeder T1   │   │ feeder T2           │   │ feeder T3  │       │
+      │ (remote GPU)│   │ (remote DDR)        │   │ (remote NVMe)│      │
+      └─────────────┘   └────────────────────┘   └────────────┘       │
+                                                                        │
+   Every box above emits into GB-Dataflux (log + web UI + MCP) ◄───────┘
+                                 │
+                                 ▼
+        Central MCP  `greenboost-orchestrator`  , one query + control
+        surface for an LLM assistant across every subsystem above
 ```
 
-The kernel module (`greenboost.ko`) is the trick: it pins 2 MB hugepages
-of system RAM and hands them to CUDA via `cuImportExternalMemory`
-(zero-copy) or `cuMemHostRegister` (host-mapped). The GPU's PCIe engine
-reads tensors straight from DDR; the CPU never touches the data.
+The kernel module (`greenboost.ko`) is the trick behind GB-Tiering: it pins
+2 MB hugepages of system RAM and hands them to CUDA via
+`cuImportExternalMemory` (zero-copy) or `cuMemHostRegister` (host-mapped).
+The GPU's PCIe engine reads tensors straight from DDR; the CPU never touches
+the data. GB-Cluster reuses the identical tier ladder over the network, so
+a feeder's VRAM/DDR/NVMe are just T1/T2/T3 one hop further away.
 
 **Two big things make this practical:**
 1. The shim has a *phase detector* (`INIT → MODEL_LOAD → INFERENCE → STEADY`)
@@ -199,6 +226,10 @@ reads tensors straight from DDR; the CPU never touches the data.
    compute. CPU offload is what other tools do; CPU offload turns a 50
    tok/s setup into a 2 tok/s setup. GreenBoost stays at ~95 % of native
    GPU speed for the parts that fit, and degrades gracefully for the rest.
+
+Jump to a subsystem's own section for the details: [GB-Tiering](#-gb-tiering) ·
+[GB-Quant](#️-gb-quant) · [GB-Dataflux](#-gb-dataflux) · [GB-Cluster](#-gb-cluster) ·
+[GB-Synapse](#-gb-synapse) · [GB-CLI](#️-gb-cli).
 
 ### Containers, VMs, WSL2: Path B
 
