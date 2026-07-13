@@ -93,6 +93,13 @@ _WORKLOAD_PROFILES: dict[str, dict[str, str]] = {
         # workload since. Required, not optional, for "diffusion" on any
         # cluster-fabric-reachable host.
         "GREENBOOST_REPORT_PHYSICAL_VRAM": "1",
+        # Rule #1 (~90% VRAM fill during inference — owner directive
+        # 2026-07-13, mirrored in ai-forge forge/gpu.py the same day): let
+        # the shim split a large overflow buffer so its first portion backs
+        # onto physical VRAM up to GB_VRAM_FRONTLOAD_PCT (default 90) instead
+        # of dropping the whole buffer into T2 DDR while T1 sits part-empty.
+        # Shim-guarded: split errors unwind to the legacy placement.
+        "GB_VRAM_FRONTLOAD": "1",
     },
     "llm": {
         "GREENBOOST_ACTIVE": "1",
