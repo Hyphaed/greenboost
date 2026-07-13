@@ -35,6 +35,12 @@
 set -euo pipefail
 
 DRIVER_NAME="greenboost"
+
+# Module-presence check. MUST NOT pipe `lsmod | grep -q`: under `set -o
+# pipefail`, grep -q closes the pipe on first match, lsmod gets SIGPIPE (141),
+# and a freshly-loaded module (top of lsmod) is falsely reported absent.
+gb_module_loaded() { grep -q "^${DRIVER_NAME} " <<< "$(lsmod)"; }
+
 SHIM_LIB="libgreenboost_cuda.so"
 AUDIT_LIB="libgreenboost_audit.so"
 AUDIT_LIB32="libgreenboost_audit32.so"
@@ -4510,7 +4516,7 @@ _gb_install_ebpf_tracer() {
     gb_ok "Installed ${_dst}"
 
     # Only start when greenboost.ko is already loaded (kprobes need the symbols)
-    if lsmod | grep -q '^greenboost '; then
+    if gb_module_loaded; then
         mkdir -p /run/greenboost /var/log/greenboost
         nohup "$_dst" >>/var/log/greenboost/ebpf-trace.log 2>&1 &
         local _bpf_bg_pid=$!
@@ -4533,27 +4539,70 @@ _gb_install_ebpf_tracer() {
 # libs + unloaded the module under it).  Interactive: require confirmation.
 # Non-interactive: warn loudly and continue after a short grace period.
 _gb_check_live_gpu_users() {
-    local _live=""
+    local _risk="" _info=""
+    local -A _shim_pids=()
+
     if [[ -f "$SHIM_DEST/$SHIM_LIB" ]] && command -v fuser &>/dev/null; then
         local _fu; _fu=$(fuser "$SHIM_DEST/$SHIM_LIB" 2>/dev/null | tr -s ' ' || true)
-        [[ -n "${_fu// /}" ]] && _live+="shim mmapped by PID(s):${_fu}"$'\n'
+        if [[ -n "${_fu// /}" ]]; then
+            _risk+="shim mmapped by PID(s):${_fu}"$'\n'
+            local _p; for _p in $_fu; do _shim_pids["$_p"]=1; done
+        fi
     fi
+
+    # nvidia-smi lists EVERY GPU-compute context on the box (Slack's GPU
+    # process, Nautilus/Loupe thumbnailers, gnome-software, etc.) - only
+    # those that also hold the GreenBoost shim open are actually at risk
+    # from this install (lib swap / module unload). The rest are unrelated
+    # desktop GPU users that this install does not touch - report them
+    # separately so the warning doesn't wrongly claim they'll be killed
+    # (confirmed false alarm 2026-07-13: Slack/Nautilus/Loupe/gnome-software
+    # listed as "WILL kill" when none of them use the shim).
     if command -v nvidia-smi &>/dev/null; then
         local _ca; _ca=$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null || true)
-        [[ -n "$_ca" ]] && _live+=$(echo "$_ca" | sed 's/^/GPU compute: /')$'\n'
+        if [[ -n "$_ca" ]]; then
+            local _cpid _cname
+            while IFS=, read -r _cpid _cname; do
+                _cpid="${_cpid// /}"
+                [[ -z "$_cpid" ]] && continue
+                if [[ -n "${_shim_pids[$_cpid]:-}" ]]; then
+                    _risk+="GPU compute (shim-linked): ${_cpid},${_cname}"$'\n'
+                else
+                    _info+="GPU compute (unrelated to GreenBoost - not touched by this install): ${_cpid},${_cname}"$'\n'
+                fi
+            done <<< "$_ca"
+        fi
     fi
-    local _inf; _inf=$(pgrep -af 'gen_image|llama-server|ollama runner' 2>/dev/null | cut -c1-110 || true)
-    [[ -n "$_inf" ]] && _live+=$(echo "$_inf" | sed 's/^/inference proc: /')$'\n'
-    [[ -z "$_live" ]] && return 0
+
+    # Known GreenBoost/ai-forge inference process names. Anchored to the
+    # actual invoked binary/script (argv[0], or argv[1] for an interpreter),
+    # never scanning the full argument text - a process whose ARGUMENTS
+    # merely contain these words (e.g. an AI CLI agent whose system-prompt
+    # argument documents "llama-server") must never match (confirmed
+    # false positive 2026-07-13: the unanchored version flagged the running
+    # Claude Code session itself as an in-flight inference job).
+    local _inf
+    _inf=$(pgrep -af '^([^[:space:]]*/)?llama-server([[:space:]]|$)|^([^[:space:]]*/)?ollama[[:space:]]+runner([[:space:]]|$)|^[^[:space:]]+[[:space:]]+[^[:space:]]*gen_image[^[:space:]]*([[:space:]]|$)' 2>/dev/null | cut -c1-110 || true)
+    [[ -n "$_inf" ]] && _risk+=$(echo "$_inf" | sed 's/^/inference proc: /')$'\n'
+
+    [[ -z "$_risk" && -z "$_info" ]] && return 0
     echo ""
-    gb_warn_ui "${C_BOLD}Live GPU / shim activity detected , installing now WILL kill these in-flight jobs:${C_RESET}"
-    while IFS= read -r _l; do [[ -n "$_l" ]] && gb_warn_ui "  $_l"; done <<< "$_live"
-    if [[ -t 0 ]]; then
-        gb_confirm "Proceed anyway (kills the jobs above)?" \
-            || die "Install cancelled , wait for GPU jobs to finish, then re-run."
-    else
-        gb_warn_ui "Non-interactive run , continuing in 5s (Ctrl+C to abort)…"
-        sleep 5
+    if [[ -n "$_risk" ]]; then
+        gb_warn_ui "${C_BOLD}Live GPU / shim activity detected , installing now WILL kill these in-flight jobs:${C_RESET}"
+        while IFS= read -r _l; do [[ -n "$_l" ]] && gb_warn_ui "  $_l"; done <<< "$_risk"
+    fi
+    if [[ -n "$_info" ]]; then
+        gb_info "Other GPU activity detected (unrelated to GreenBoost, NOT affected by this install):"
+        while IFS= read -r _l; do [[ -n "$_l" ]] && gb_info "  $_l"; done <<< "$_info"
+    fi
+    if [[ -n "$_risk" ]]; then
+        if [[ -t 0 ]]; then
+            gb_confirm "Proceed anyway (kills the jobs above)?" \
+                || die "Install cancelled , wait for GPU jobs to finish, then re-run."
+        else
+            gb_warn_ui "Non-interactive run , continuing in 5s (Ctrl+C to abort)…"
+            sleep 5
+        fi
     fi
     return 0
 }
@@ -4572,7 +4621,7 @@ _gb_install_abort_recover() {
     gb_warn_ui "${C_BOLD}Install aborted (exit ${_rc}) , restoring pre-install runtime state…${C_RESET}"
     # Module: if this run already wrote modprobe.conf + DKMS-installed the
     # module, load it now so T2 spill doesn't silently degrade to OS swap.
-    if ! lsmod | grep -q '^greenboost ' && [[ -f /etc/modprobe.d/greenboost.conf ]]; then
+    if ! gb_module_loaded && [[ -f /etc/modprobe.d/greenboost.conf ]]; then
         if modprobe greenboost 2>/dev/null && [[ -e /dev/greenboost ]]; then
             gb_ok "Kernel module loaded (recovery)"
         else
@@ -4711,7 +4760,7 @@ MODEOF
     # follow-up) still needs this block , same GB_SKIP_INSTALL_PURGE pattern.
     if [[ "${GB_SKIP_INSTALL_LOAD:-0}" -ne 1 ]]; then
         depmod -a 2>/dev/null || true
-        if lsmod | grep -q '^greenboost '; then
+        if gb_module_loaded; then
             modprobe -r greenboost 2>/dev/null || _rmmod_with_retry || true
         fi
         modprobe greenboost \
@@ -4719,7 +4768,7 @@ MODEOF
         udevadm settle 2>/dev/null || true
         # Verify , never end this step believing the module is up when it
         # isn't (an unloaded module silently degrades T2 spill to OS swap).
-        lsmod | grep -q '^greenboost ' && [[ -e /dev/greenboost ]] \
+        gb_module_loaded && [[ -e /dev/greenboost ]] \
             || die "greenboost modprobe'd but lsmod//dev/greenboost check failed , check: dmesg | tail -20"
         gb_ok "Kernel module loaded + verified (/dev/greenboost present, virtual_vram_gb=${GB_VIRT}, reserve=${GB_RESERVE} GB)"
     fi
@@ -4869,14 +4918,21 @@ WRAPEOF
         gb_ok "Installed lib/ helpers to /usr/local/share/greenboost/lib/"
     fi
 
-    # Install GreenBoost Python orchestration files (gb_*.py) so they are
-    # importable from any CUDA env on PYTHONPATH=/usr/local/lib/greenboost.
-    cmd_install_python_files || gb_warn "Python file install had failures , re-run: sudo greenboost install-python"
-    # Install greenboost-cli (`gb`) into its venv , best-effort, never aborts.
-    cmd_install_cli || gb_warn "greenboost-cli install failed , continuing"
-    # Provision ai-forge pipeline deps (PaddleOCR etc.) , best-effort, never aborts.
-    # Deliberately NOT reversed by Full Uninstall (see cmd_install_pipelines).
-    cmd_install_pipelines || gb_warn "pipeline dep provisioning failed , continuing"
+    # GB_SKIP_INSTALL_PY_CLI=1: cmd_full_install's step 4/5 (cmd_install_python_files
+    # + cmd_install_cli, right below in that function) does this for real , skip
+    # it here when this run is just full-install's step-2 kernel/shim sub-call, so
+    # greenboost-cli isn't built into its venv twice per install (was also
+    # duplicating the Python orchestration file install).
+    if [[ "${GB_SKIP_INSTALL_PY_CLI:-0}" -ne 1 ]]; then
+        # Install GreenBoost Python orchestration files (gb_*.py) so they are
+        # importable from any CUDA env on PYTHONPATH=/usr/local/lib/greenboost.
+        cmd_install_python_files || gb_warn "Python file install had failures , re-run: sudo greenboost install-python"
+        # Install greenboost-cli (`gb`) into its venv , best-effort, never aborts.
+        cmd_install_cli || gb_warn "greenboost-cli install failed , continuing"
+    fi
+    # ai-forge pipeline deps (PaddleOCR etc.) are NOT provisioned by Full
+    # Install , they belong to ai-forge, not greenboost core. Run explicitly:
+    # sudo greenboost install-pipelines
 
     # Ensure 'greenboost' group exists and the invoking user is a member so
     # non-root processes can read cluster.key (mode 0640 root:greenboost).
@@ -4989,7 +5045,7 @@ cmd_load() {
         info "KV reserve auto-set to ${GB_KV_RESERVE_MB} MB (OLLAMA_NUM_CTX=${_ctx})"
     fi
 
-    if grep -q "^${DRIVER_NAME} " <<< "$(lsmod)"; then
+    if gb_module_loaded; then
         warn "Module already loaded - reloading..."
         # Stop consumers before rmmod to avoid EBUSY
         for svc in ollama llama-server; do
@@ -5002,6 +5058,18 @@ cmd_load() {
     local ko="$MODULE_DIR/greenboost.ko"
     [[ -f "$ko" ]] || die "greenboost.ko not found - run: make  or  $0 build"
 
+    # Diagnostic snapshot BEFORE insmod. (2026-07-13: the "missing from lsmod
+    # after insmod" reports were traced to a shell bug, not a kernel rejection
+    # - see gb_module_loaded() above - but this snapshot remains a useful
+    # safety net for the genuinely-rare case of a real load failure.)
+    local _ko_sha _ko_vermagic _kver
+    _ko_sha=$(sha256sum "$ko" 2>/dev/null | cut -d' ' -f1)
+    _ko_vermagic=$(modinfo -F vermagic "$ko" 2>/dev/null)
+    _kver=$(uname -r)
+    local _dmesg_before
+    _dmesg_before=$(dmesg 2>/dev/null | tail -1 || journalctl -k -n1 --no-pager -o cat 2>/dev/null)
+
+    local _insmod_rc=0
     insmod "$ko" \
         physical_vram_gb="$phys"  \
         virtual_vram_gb="$virt"   \
@@ -5014,7 +5082,13 @@ cmd_load() {
         ecores_only="$ecores_only" \
         kv_reserve_mb="${GB_KV_RESERVE_MB:-2048}" \
         active_profile_name="${PROF_NAME:-autodetect}" \
-        || die "insmod failed - check: dmesg | tail -20  (params this .ko accepts: $(modinfo -F parm "$ko" 2>/dev/null | cut -d: -f1 | tr '\n' ' '))"
+        2>/tmp/gb_insmod_stderr.$$ || _insmod_rc=$?
+    if (( _insmod_rc != 0 )); then
+        local _insmod_err; _insmod_err=$(cat /tmp/gb_insmod_stderr.$$ 2>/dev/null)
+        rm -f /tmp/gb_insmod_stderr.$$
+        die "insmod failed (rc=${_insmod_rc}): ${_insmod_err} - check: dmesg | tail -20  (params this .ko accepts: $(modinfo -F parm "$ko" 2>/dev/null | cut -d: -f1 | tr '\n' ' '))"
+    fi
+    rm -f /tmp/gb_insmod_stderr.$$
 
     # Ensure /dev/greenboost has correct group permission immediately after insmod.
     # The .devnode kernel callback sets mode 0660 at creation, but run udevadm
@@ -5029,8 +5103,20 @@ cmd_load() {
     # rest of the install continue believing the module is up (2026-07-13: an
     # install ended with the module unloaded and nothing noticed until T2
     # spill degraded to OS swap under inference).
-    lsmod | grep -q "^${DRIVER_NAME} " \
-        || die "greenboost missing from lsmod after insmod - check: dmesg | tail -20"
+    if ! gb_module_loaded; then
+        local _dmesg_after
+        _dmesg_after=$(dmesg 2>/dev/null | tail -20 || journalctl -k -n20 --no-pager -o cat 2>/dev/null)
+        gb_warn_ui "insmod returned rc=0 but ${DRIVER_NAME} is absent from /proc/modules , diagnostic dump:"
+        gb_warn_ui "  .ko path     : $ko"
+        gb_warn_ui "  .ko sha256   : ${_ko_sha}"
+        gb_warn_ui "  .ko vermagic : ${_ko_vermagic}"
+        gb_warn_ui "  running kver : ${_kver}"
+        gb_warn_ui "  taint        : $(cat /proc/sys/kernel/tainted 2>/dev/null)"
+        gb_warn_ui "  last dmesg line BEFORE insmod : ${_dmesg_before}"
+        gb_warn_ui "  dmesg AFTER insmod (last 20 lines):"
+        while IFS= read -r _l; do [[ -n "$_l" ]] && gb_warn_ui "    ${_l}"; done <<< "$_dmesg_after"
+        die "greenboost missing from lsmod after insmod (see diagnostic dump above)"
+    fi
     [[ -e /dev/greenboost ]] \
         || die "/dev/greenboost missing after insmod - check: dmesg | tail -20"
 
@@ -5108,7 +5194,7 @@ cmd_uninstall() {
     info "  - Any user data, models, or application configs"
     info "  - System swap (/swap.img, swap partitions) - system swap is never touched"
     info "  - /swap_nvme.img (old GreenBoost swap) - removed if present"
-    info "  - ai-forge pipeline deps (PaddleOCR etc.) - left intact in the forge env; remove manually if desired"
+    info "  - ai-forge pipeline deps (PaddleOCR etc.) - opt-in via 'greenboost install-pipelines', never touched by uninstall; remove manually if desired"
     info ""
     info "Starting purge..."
     info ""
@@ -5434,7 +5520,11 @@ cmd_tune_grub() {
         && new_flags="$new_flags workqueue.power_efficient=0"
 
     # ── Fix: deduplicate nvidia-drm.modeset=1 ──────────────────────────
-    local count; count=$(echo "$current_line" | grep -o "nvidia-drm.modeset=1" | wc -l)
+    # `|| true` is required: under `set -o pipefail`, a zero-match grep (the
+    # common case - most cmdlines have exactly one or zero occurrences) makes
+    # the whole pipeline exit non-zero even though `wc -l` correctly printed
+    # "0", which trips `set -e` and aborts the entire install right here.
+    local count; count=$(echo "$current_line" | grep -o "nvidia-drm.modeset=1" | wc -l || true)
     if [[ "$count" -gt 1 ]]; then
         info "  [fix]     nvidia-drm.modeset=1 appears ${count}× - deduplicating"
         # Remove all occurrences then add one back
@@ -11845,8 +11935,16 @@ cmd_full_install() {
     # load , skip cmd_install's own bare-modprobe load so it isn't loaded
     # twice (was causing "Module already loaded - reloading..." + a spurious
     # extra unload/reload cycle, stopping ollama/llama-server twice per install).
+    # GB_SKIP_INSTALL_PY_CLI=1: only in "full" mode , step 4 (right below)
+    # installs the Python orchestration files + greenboost-cli for real, so
+    # skip cmd_install's own copy of that here to avoid building
+    # greenboost-cli into its venv twice per install. "module" mode returns
+    # before reaching step 4 (see GB_INSTALL_MODE check below), so it still
+    # needs cmd_install's copy , don't skip it there.
     gb_step 2 5 "Building and installing kernel module + CUDA shim..."
-    GB_SKIP_INSTALL_PURGE=1 GB_SKIP_INSTALL_LOAD=1 cmd_install
+    local _skip_py_cli=0
+    [[ "$GB_INSTALL_MODE" == "full" ]] && _skip_py_cli=1
+    GB_SKIP_INSTALL_PURGE=1 GB_SKIP_INSTALL_LOAD=1 GB_SKIP_INSTALL_PY_CLI=$_skip_py_cli cmd_install
     gb_ok "Kernel module + CUDA shim installed"
 
     # 3 - Load kernel module (cmd_load verifies lsmod + /dev/greenboost and
@@ -11967,7 +12065,7 @@ cmd_full_install() {
         cmd_install_supervisor \
             || gb_fail "greenboost-supervisor is NOT running , run: sudo systemctl enable --now greenboost-supervisor"
     fi
-    if lsmod | grep -q '^greenboost ' && [[ -e /dev/greenboost ]]; then
+    if gb_module_loaded && [[ -e /dev/greenboost ]]; then
         gb_ok "Verified: module loaded, /dev/greenboost present, supervisor $(systemctl is-active greenboost-supervisor.service 2>/dev/null || echo unknown)"
     else
         gb_fail "Kernel module NOT loaded at end of install , T2 spill will degrade to OS swap. Run: sudo modprobe greenboost"
