@@ -1018,6 +1018,12 @@ static int handle_handshake(struct client *cli, const void *payload, uint32_t le
     (void)req_feature_flags;
 #endif
 
+    /* T1: advertise topology-report support when this node's hardware profile
+     * exists on disk (Full Install always writes it). The host then fetches it
+     * over GB_MSG_TOPOLOGY instead of falling back to SSH. */
+    if (access("/etc/greenboost/profiles/default.md", R_OK) == 0)
+        resp.feature_flags |= GB_NET_FEAT_TOPOLOGY;
+
     /* D1: PCIe link info - read from sysfs for GPU 0 */
     {
         /* /sys/bus/pci/devices/ path can be discovered via /proc/driver/nvidia/gpus/
@@ -3544,6 +3550,54 @@ static int handle_feeder_status(struct client *cli)
     return send_msg(cli, GB_MSG_RESPONSE, GB_NET_FLAG_RESPONSE, &resp, sizeof(resp));
 }
 
+/* T1: ship this node's hardware profile (/etc/greenboost/profiles/default.md)
+ * so the host can build its cluster topology registry. No JSON generation in C
+ * , the profile the setup script already wrote is the payload. */
+static int handle_topology(struct client *cli)
+{
+    struct gb_net_topology_resp rhdr;
+    memset(&rhdr, 0, sizeof(rhdr));
+
+    char  *data = NULL;
+    size_t plen = 0;
+    FILE  *fp = fopen("/etc/greenboost/profiles/default.md", "rb");
+    if (fp) {
+        data = malloc(GB_NET_TOPOLOGY_MAX_BYTES);
+        if (data)
+            plen = fread(data, 1, GB_NET_TOPOLOGY_MAX_BYTES, fp);
+        fclose(fp);
+    }
+
+    if (!data || plen == 0) {
+        free(data);
+        rhdr.status      = GB_STATUS_ERR_INVALID;
+        rhdr.profile_len = 0;
+        NETD_EVT("TOPOLOGY_UNAVAILABLE", "NET", 0, cli->feeder_id, "profile_unreadable");
+        return send_msg(cli, GB_MSG_TOPOLOGY, GB_NET_FLAG_RESPONSE, &rhdr, sizeof(rhdr));
+    }
+
+    rhdr.status      = GB_STATUS_OK;
+    rhdr.profile_len = (gb_u32)plen;
+
+    /* Single framed payload: fixed struct followed by the profile bytes. */
+    size_t total = sizeof(rhdr) + plen;
+    char  *msg = malloc(total);
+    if (!msg) {
+        free(data);
+        rhdr.status      = GB_STATUS_ERR_OOM;
+        rhdr.profile_len = 0;
+        return send_msg(cli, GB_MSG_TOPOLOGY, GB_NET_FLAG_RESPONSE, &rhdr, sizeof(rhdr));
+    }
+    memcpy(msg, &rhdr, sizeof(rhdr));
+    memcpy(msg + sizeof(rhdr), data, plen);
+    free(data);
+
+    NETD_EVT("TOPOLOGY_SERVED", "NET", (unsigned)(plen >> 10), cli->feeder_id, "profile_ok");
+    int rc = send_msg(cli, GB_MSG_TOPOLOGY, GB_NET_FLAG_RESPONSE, msg, (uint32_t)total);
+    free(msg);
+    return rc;
+}
+
 /*  Message dispatch                                                   */
 /* ------------------------------------------------------------------ */
 
@@ -3676,6 +3730,9 @@ static int dispatch_message(struct client *cli, const struct gb_net_header *hdr,
 
     case GB_MSG_FEEDER_STATUS:
         return handle_feeder_status(cli);
+
+    case GB_MSG_TOPOLOGY:
+        return handle_topology(cli);
 
     case GB_MSG_CUDA_MPS_SET: {
         /* U19: Dynamic MPS SM% control - adjust CUDA_MPS_ACTIVE_THREAD_PERCENTAGE.

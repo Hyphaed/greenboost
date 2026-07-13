@@ -1228,6 +1228,25 @@ class ReactiveOrchestrator:
             self._decisions = self._decisions[-64:]
         # Write state file for vitals --json and other short-lived observers
         self._write_state_file()
+        # Observability gap B2: the reactive orchestrator is the ONE true
+        # telemetry→decision→actuation loop, but it left no dataflux trace , so
+        # an actuation could never be correlated with the snapshot that
+        # triggered it. Emit every decision as an `actuation` event
+        # (best-effort, never raises). `lever` = the loop name; the loop's own
+        # fields (direction/action/reason/result/psi_*) ride along verbatim.
+        try:
+            import gb_dataflux
+            gb_dataflux.emit({
+                "node": "host", "label": "orchestrator", "kind": "actuation",
+                "stage": decision.get("loop", "?"),
+                "lever": decision.get("loop", "?"),
+                "status": "ok", "n_items": 0, "items": [], "duration_s": 0.0,
+                "gated": bool(getattr(self, "_actuate", False)),
+                **{k: v for k, v in decision.items()
+                   if k not in ("loop",) and isinstance(v, (int, float, str, bool))},
+            })
+        except Exception:
+            pass
 
     def _write_state_file(self) -> None:
         state = self.dump()

@@ -747,7 +747,7 @@ cmd_install_build_deps() {
 
     (( _idx++ )); _dep_bar $_idx "${_groups[$_idx-1]}"
     pacman -S --noconfirm --needed -q \
-        base-devel "${headers_pkg}" git curl wget pkg-config sysfsutils kmod 2>/dev/null
+        base-devel cmake "${headers_pkg}" git curl wget pkg-config sysfsutils kmod 2>/dev/null
 
     (( _idx++ )); _dep_bar $_idx "${_groups[$_idx-1]}"
     pacman -S --noconfirm --needed -q dkms liburing 2>/dev/null || true

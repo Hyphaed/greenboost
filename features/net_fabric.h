@@ -189,6 +189,14 @@ enum gb_net_msg_type {
      * Used by cmd_cluster, gb_feeder_diag.py, and the health monitor. */
     GB_MSG_FEEDER_STATUS    = 0x34,
 
+    /* T1: Query feeder hardware topology - no request payload. Feeder replies
+     * with gb_net_topology_resp followed by profile_len raw bytes of its local
+     * /etc/greenboost/profiles/default.md (the same rich per-node hardware sheet
+     * gb_topology.py parses). Advertised via GB_NET_FEAT_TOPOLOGY; a feeder that
+     * predates this message never sets the flag and the host uses its SSH
+     * fallback instead. Consumed by gb_cluster.py's cluster topology registry. */
+    GB_MSG_TOPOLOGY         = 0x35,
+
     /* Response wrapper */
     GB_MSG_RESPONSE         = 0x40,
 };
@@ -237,6 +245,7 @@ enum gb_net_status {
  * fields): peers that predate a feature send a short message and the field
  * reads as 0. A feature is used only when BOTH sides advertise its bit. */
 #define GB_NET_FEAT_ZSTD      (1u << 0)  /* transparent zstd payload compression */
+#define GB_NET_FEAT_TOPOLOGY  (1u << 1)  /* feeder can serve GB_MSG_TOPOLOGY      */
 
 /* ------------------------------------------------------------------ */
 /*  Wire header - precedes every message                               */
@@ -598,6 +607,23 @@ struct gb_feeder_status_resp {
  * Host should check: hdr.payload_len >= GB_FEEDER_STATUS_V31_SIZE */
 #define GB_FEEDER_STATUS_V31_SIZE  \
     (offsetof(struct gb_feeder_status_resp, _pad2) + sizeof(gb_u32))
+
+/* ------------------------------------------------------------------ */
+/*  T1: Feeder hardware-topology response (GB_MSG_TOPOLOGY)            */
+/* ------------------------------------------------------------------ */
+
+/* Cap on the profile text the feeder ships (its default.md is a few KB). */
+#define GB_NET_TOPOLOGY_MAX_BYTES  (64u * 1024u)
+
+/* Host → feeder: no payload (just the header with msg_type=GB_MSG_TOPOLOGY).
+ * Feeder replies GB_MSG_TOPOLOGY|GB_NET_FLAG_RESPONSE with this struct followed
+ * by `profile_len` raw UTF-8 bytes of /etc/greenboost/profiles/default.md.
+ * status=GB_STATUS_ERR_INVALID with profile_len=0 if the profile is unreadable. */
+struct gb_net_topology_resp {
+    gb_u32 status;        /* gb_net_status                                  */
+    gb_u32 profile_len;   /* bytes of profile text following this struct    */
+    /* Followed by: char profile[profile_len]                               */
+} __attribute__((packed));
 
 /* ------------------------------------------------------------------ */
 /*  Keyfile permission check (shared by netc and netd)                 */

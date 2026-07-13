@@ -13,6 +13,7 @@ Tools:
     dataflux_events         , raw events, filterable by node/label/kind/status
     dataflux_errors         , failed dispatches only
     dataflux_critic         , snapshot-correlated incident diagnosis + recommendations
+    dataflux_topology       , per-node hardware topology events (deduped latest)
     dataflux_kinds          , event-kind breakdown (what actually happened)
     dataflux_tier_moves     , T1/T2/T3 promote/demote/evict events
     dataflux_quantization   , quantize / quantize_to_fit decisions
@@ -91,6 +92,86 @@ def dataflux_errors(days: float = 5.0, limit: int = 50) -> list[dict]:
     events = gdf.read_events(since_hours=days * 24)
     errors = [e for e in events if e.get("status") == "error"]
     return list(reversed(errors))[:limit]
+
+
+@mcp.tool()
+def dataflux_decisions(days: float = 2.0, limit: int = 100) -> list[dict]:
+    """Per-decision SHIM placement events (`shim_decision`) , every time the
+    CUDA shim placed bytes off the fastest tier (T2 DDR spill, T3 NVMe spill,
+    feeder T1, host-VMM fallback, path-B host-register), with the tier chosen,
+    bytes, reason, and the physical VRAM fill % at that moment. Closes the
+    former blind spot where shim allocation decisions were NVTX/log-only and
+    invisible to the MCP. Most recent first."""
+    events = gdf.read_events(since_hours=days * 24)
+    decs = [e for e in events if e.get("kind") == "shim_decision"]
+    return list(reversed(decs))[:limit]
+
+
+@mcp.tool()
+def dataflux_actuations(days: float = 2.0, limit: int = 100) -> list[dict]:
+    """Reactive-orchestrator ACTUATION events (`actuation`) , every lever the
+    orchestrator moved (kv_grow, tier auto-evict, clock/power cap, VM/PSI
+    tuning), with the loop name (`lever`), the loop's fields, and whether it
+    was gated (`GB_ORCH_ACTUATE`). This is the one true telemetry→decision
+    loop, now correlatable with the snapshot that triggered it. Most recent
+    first."""
+    events = gdf.read_events(since_hours=days * 24)
+    acts = [e for e in events if e.get("kind") == "actuation"]
+    return list(reversed(acts))[:limit]
+
+
+@mcp.tool()
+def a2a_status(days: float = 1.0) -> dict:
+    """GreenBoost A2A gateway state: whether the AgentCard/JSON-RPC endpoint is
+    listening (GB_A2A_BIND, default 127.0.0.1:8790), the advertised skills, and
+    a summary of recent `a2a_request` events (verb, gated/dry-run, outcome).
+    Keeps the A2A control plane observable like every other subsystem."""
+    import os
+    import socket
+    bind = os.environ.get("GB_A2A_BIND", "127.0.0.1:8790")
+    host, _, port = bind.rpartition(":")
+    listening = False
+    try:
+        with socket.create_connection((host or "127.0.0.1", int(port or "8790")),
+                                      timeout=0.5):
+            listening = True
+    except OSError:
+        pass
+    skills = []
+    try:
+        import gb_actuation
+        skills = list(gb_actuation.VERBS)
+    except Exception:
+        pass
+    events = gdf.read_events(since_hours=days * 24)
+    reqs = [e for e in events if e.get("kind") == "a2a_request"]
+    by_outcome: dict[str, int] = {}
+    for e in reqs:
+        by_outcome[e.get("outcome", "?")] = by_outcome.get(e.get("outcome", "?"), 0) + 1
+    return {"bind": bind, "listening": listening, "skills": skills,
+            "requests_window": len(reqs), "by_outcome": by_outcome,
+            "recent": list(reversed(reqs))[:20]}
+
+
+@mcp.tool()
+def dataflux_topology(days: float = 30.0, node: str | None = None) -> list[dict]:
+    """node_topology events , the STATIC hardware identity of every node that
+    has connected or (re)generated its profile: GPU model, VRAM GB, compute
+    capability, P/E-core counts, RAM total/speed, PCIe gen/lanes, NVMe. Deduped
+    to the latest event per node, most recent first. This is the event-LOG view
+    (history of what hardware was seen, and when); for the live current-state
+    view use the greenboost-cluster MCP's `cluster_topology` tool. Filter to one
+    node with `node`. Default window is 30 days since topology changes rarely."""
+    events = gdf.read_events(since_hours=days * 24)
+    topo = [e for e in events if e.get("kind") == "node_topology"]
+    if node:
+        topo = [e for e in topo if e.get("node") == node]
+    latest: dict[str, dict] = {}
+    for e in topo:
+        n = e.get("node", "?")
+        if n not in latest or e.get("ts", 0.0) >= latest[n].get("ts", 0.0):
+            latest[n] = e
+    return sorted(latest.values(), key=lambda e: -e.get("ts", 0.0))
 
 
 @mcp.tool()

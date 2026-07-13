@@ -71,7 +71,42 @@ class SnapshotRecorder:
         self._prev_phase = None
         self._prev_t3_active = None
         self._prev_t2_bucket = None
+        self._prev_rule1_underfill = None
+        # Per-tier decision tracking , the shim already exports monotonic
+        # per-tier alloc counts + lifetime bytes to /run/greenboost/shim_stats.
+        # We diff them each poll and emit one `shim_decision` event per tier
+        # placement, closing the "shim decisions are dataflux-silent" gap (B1)
+        # with real bytes/counts and NO shim change.
+        self._prev_tier = {}
+        # One static node_topology event per process (this node's hardware
+        # identity), joinable by `node` with the snapshot time-series. Emitting
+        # it once here keeps the 5s snapshots lean instead of fattening each one.
+        self._topo_emitted = False
         telemetry_manager.add_callback(self._on_metrics)
+
+    def _emit_local_topology(self, node: str) -> None:
+        if self._topo_emitted:
+            return
+        self._topo_emitted = True
+        try:
+            import gb_topology
+            d = gb_topology.topology_dict(gb_topology.get_topology())
+            emit({
+                "node": node, "label": "cluster", "kind": "node_topology",
+                "status": "ok", "source": "local_profile",
+                "gpu": d.get("gpu_model", ""), "vram_gb": d.get("vram_gb", 0),
+                "cc": d.get("compute_capability", ""),
+                "p_cores": d.get("p_core_count", 0),
+                "e_cores": d.get("e_core_count", 0),
+                "ram_total_gb": d.get("ram_total_gb", 0),
+                "ram_speed_mt": d.get("ram_speed_mt", 0),
+                "vram_bw_gb_s": d.get("vram_bw_gb_s", 0),
+                "net_link_mbps": d.get("net_link_mbps", 0),
+                "pcie_gen": d.get("pcie_gen", 0),
+                "pcie_lanes": d.get("pcie_lanes", 0),
+            })
+        except Exception:
+            pass
 
     def _bucket(self, pressure) -> str:
         try:
@@ -87,6 +122,16 @@ class SnapshotRecorder:
         phase = (getattr(m, "shim_phase", "") or "").strip()
         t3_active = bool(gb.t3_used_mb) if gb else False
         t2_bucket = self._bucket(gb.t2_pressure if gb else 0)
+        # RULE #1 tripwire: physical VRAM under-filled while overflow to T2/T3 is
+        # active means GreenBoost is spilling to slower tiers with fast VRAM
+        # still free , a Rule #1 violation. Only evaluable when the shim
+        # supplies a physical fill %; None → skip (seeded/ignored by the loop).
+        _phys_total = getattr(m, "fb_phys_total_mb", 0)
+        _overflow_active = bool((gb.t2_allocated_mb if gb else 0)
+                                or (gb.t3_used_mb if gb else 0))
+        rule1_underfill = (
+            (getattr(m, "fb_phys_used_pct", 0.0) < 85.0 and _overflow_active)
+            if _phys_total else None)
         for field, prev_attr, frm, to, status in (
             ("shim_phase", "_prev_phase", self._prev_phase, phase, "ok"),
             ("t3_spill", "_prev_t3_active",
@@ -95,6 +140,9 @@ class SnapshotRecorder:
             ("t2_pressure", "_prev_t2_bucket", self._prev_t2_bucket, t2_bucket,
              "error" if t2_bucket == "critical" else
              "warn" if t2_bucket == "warn" else "ok"),
+            ("rule1_underfill", "_prev_rule1_underfill",
+             self._prev_rule1_underfill, rule1_underfill,
+             "warn" if rule1_underfill else "ok"),
         ):
             if to == "" or to is None:
                 continue
@@ -111,15 +159,84 @@ class SnapshotRecorder:
                     "t2_pressure": (gb.t2_pressure if gb else 0),
                     "t3_used_mb": (gb.t3_used_mb if gb else 0),
                     "fb_used_pct": round(getattr(m, "fb_used_pct", 0.0), 1),
+                    "fb_phys_used_pct": round(getattr(m, "fb_phys_used_pct", 0.0), 1),
                 })
+
+    # Tier key → (event tier label, reason, status). t1_local (the desired
+    # in-VRAM case) is intentionally excluded , we only trace the spill/overflow
+    # DECISIONS that move bytes off the fastest tier. status warn = slower-tier
+    # placement worth noticing (T3 NVMe, host-VMM fallback).
+    _DECISION_TIERS = {
+        "t1_feeder": ("t1_feeder", "feeder_t1", "ok"),
+        "t2_local":  ("t2_local", "t2_spill", "ok"),
+        "t2_feeder": ("t2_feeder", "t2_spill_feeder", "ok"),
+        "t3_local":  ("t3_local", "t3_spill", "warn"),
+        "t3_feeder": ("t3_feeder", "t3_spill_feeder", "warn"),
+        "vmm":       ("vmm_host", "vmm_host_fallback", "warn"),
+        "path_b":    ("path_b", "path_b_hostreg", "ok"),
+    }
+
+    def _detect_shim_decisions(self, m, gb, node: str) -> None:
+        """Emit one `shim_decision` event per tier placement by diffing the
+        shim's monotonic per-tier alloc counters (shim_stats). Best-effort;
+        never raises. Closes observability gap B1 with real bytes/counts."""
+        try:
+            stats_path = "/run/greenboost/shim_stats"
+            kv: dict[str, str] = {}
+            with open(stats_path) as _f:
+                for _line in _f:
+                    if "=" in _line:
+                        _k, _, _v = _line.strip().partition("=")
+                        kv[_k.strip()] = _v.strip()
+            if not kv:
+                return
+            # Freshness-gate identically to gb_telemetry (30s) so a dead
+            # process's stale file never emits phantom decisions.
+            try:
+                if (time.time() - float(kv.get("timestamp", "0"))) > 30.0:
+                    return
+            except ValueError:
+                return
+
+            def _i(key: str) -> int:
+                try:
+                    return int(float(kv.get(key, "0")))
+                except ValueError:
+                    return 0
+            for tkey, (tier, reason, status) in self._DECISION_TIERS.items():
+                count = _i(f"tier_{tkey}_alloc_count")
+                life_mb = _i(f"tier_{tkey}_lifetime_mb")
+                pc, pl = self._prev_tier.get(tkey, (None, None))
+                self._prev_tier[tkey] = (count, life_mb)
+                if pc is None:            # first observation , seed, no event
+                    continue
+                if count > pc:            # one or more new placements in this tier
+                    emit({
+                        "node": node, "label": "shim", "kind": "shim_decision",
+                        "stage": tkey, "tier": tier, "reason": reason,
+                        "status": status,
+                        "n_items": count - pc, "items": [], "duration_s": 0.0,
+                        "bytes_mb": max(0, life_mb - (pl or 0)),
+                        "fb_phys_used_pct": round(getattr(m, "fb_phys_used_pct", 0.0), 1),
+                        "t2_pressure": (gb.t2_pressure if gb else 0),
+                        "t3_used_mb": (gb.t3_used_mb if gb else 0),
+                    })
+        except (OSError, ValueError):
+            pass
 
     def _on_metrics(self, m) -> None:
         now = time.time()
         gb = getattr(m, "gb", None)
         node = self._node if self._node is not None else (
             "host" if getattr(m, "device", 0) == 0 else f"gpu{m.device}")
+        self._emit_local_topology(node)
         # Discrete orchestration transitions , every poll, unthrottled.
         self._detect_transitions(m, gb, node)
+        # Per-tier placement decisions , every poll, unthrottled (only the host
+        # recorder reads the local shim_stats; feeder recorders have no local
+        # shim, the read simply finds nothing new).
+        if self._node in (None, "host"):
+            self._detect_shim_decisions(m, gb, node)
         # Continuous flight-recorder snapshot , throttled to interval_s.
         if now - self._last_emit < self._interval_s:
             return
@@ -135,6 +252,13 @@ class SnapshotRecorder:
             "fb_free_mb": getattr(m, "fb_free_mb", 0),
             "fb_total_mb": getattr(m, "fb_total_mb", 0),
             "fb_used_pct": round(getattr(m, "fb_used_pct", 0.0), 1),
+            # RULE #1 fill signal , real physical VRAM (the virtual fb_* above
+            # is the inflated device view). Emitted only when the shim supplies
+            # a physical total, so old/no-shim consumers fall back to fb_used_pct.
+            **({"fb_phys_total_mb": getattr(m, "fb_phys_total_mb", 0),
+                "fb_phys_used_mb": getattr(m, "fb_phys_used_mb", 0),
+                "fb_phys_used_pct": round(getattr(m, "fb_phys_used_pct", 0.0), 1)}
+               if getattr(m, "fb_phys_total_mb", 0) else {}),
             "gpu_util_pct": round(getattr(m, "gpu_util_pct", 0.0), 1),
             "temp_c": round(getattr(m, "temp_c", 0.0), 1),
             "power_w": round(getattr(m, "power_w", 0.0), 1),
@@ -418,11 +542,18 @@ def _diagnosis_hints(ev: dict, before: dict | None, after: dict | None,
                 f", NVMe-tier reads are orders slower than T1/T2; re-run "
                 f"quantize_to_fit with a tighter budget (never below fp8) or "
                 f"enable TurboQuant KV so the working set fits T1/T2")
-        fb = snap.get("fb_used_pct")
+        # Prefer PHYSICAL fill (fb_phys_used_pct) , the virtual fb_used_pct is
+        # the inflated device view (phys+T2+T3) and understates real fill.
+        # Threshold 85% matches the recorder's rule1_underfill tripwire; fall
+        # back to fb_used_pct only for pre-physical (old) snapshots.
+        fb_phys = snap.get("fb_phys_used_pct")
+        fb = fb_phys if fb_phys is not None else snap.get("fb_used_pct")
+        _thresh = 85 if fb_phys is not None else 70
+        _base = "physical VRAM" if fb_phys is not None else "T1 VRAM"
         t2 = snap.get("t2_allocated_mb") or 0
-        if fb is not None and fb < 70 and t2 > 0:
+        if fb is not None and fb < _thresh and t2 > 0:
             hints.append(
-                f"Rule#1 underfill: T1 VRAM only {fb:.0f}% full while T2 DDR "
+                f"Rule#1 underfill: {_base} only {fb:.0f}% full while T2 DDR "
                 f"held {t2} MB , weights that could live in VRAM are crossing "
                 f"PCIe every access; front-load real VRAM chunks or use the "
                 f"llama.cpp --rpc split so T1 fills first")

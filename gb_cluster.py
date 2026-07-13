@@ -168,10 +168,31 @@ class Feeder:
     gpu_temp_c: int = 0
     gpu_power_w: int = 0
     mps_sm_pct: int = 0
+    # GPU model string (SSH nvidia-smi `name`); "" when unavailable. Used by the
+    # A2A gateway's per-node AgentCard so delegating agents can see the hardware.
+    gpu_name: str = ""
+    # (see __post_init__ below for hostname coercion , keeps the field a plain
+    # str so cluster_snapshot/cluster_feeders never leak a tuple to the MCP.)
     # Adaptive placement inputs, updated by cluster_map()/ClusterJobQueue from
     # real completed work , 0.0 until at least one chunk has run on this node.
     throughput_ewma: float = 0.0   # items/second
     link_mbps_ewma: float = 0.0    # measured rsync/scp transfer speed
+    # Static hardware topology (this node's parsed profile: GPU/VRAM/CC, P/E
+    # cores, RAM total/speed, PCIe gen/lanes, NVMe). {} = unknown (old netd
+    # without GB_MSG_TOPOLOGY and no SSH access). Fetched once per process, not
+    # on every 1s snapshot. topology_source: "fabric" | "ssh" | "cache" | "".
+    topology: dict = field(default_factory=dict)
+    topology_source: str = ""
+
+    def __post_init__(self):
+        # Coerce hostname to a plain str. A stale/older probe path that assigned
+        # the whole do_handshake() return `(hostname, feature_flags)` without
+        # unpacking left hostname as a tuple, which asdict() then serialized to
+        # the MCP as `["omen", 2]`. Normalize defensively so cluster_snapshot /
+        # cluster_feeders always emit a clean string regardless of caller.
+        if isinstance(self.hostname, (tuple, list)):
+            self.hostname = self.hostname[0] if self.hostname else ""
+        self.hostname = str(self.hostname or "")
 
 
 CLUSTER_CONF = "/etc/greenboost/cluster.conf"
@@ -311,23 +332,167 @@ def _ssh_gpu_telemetry(feeder: Feeder, timeout_s: float = 3.0) -> dict | None:
     try:
         out = subprocess.run(
             ["ssh", *_ssh_opts(connect_timeout=int(timeout_s)), tgt,
-             "nvidia-smi --query-gpu=utilization.gpu,temperature.gpu,power.draw "
+             "nvidia-smi --query-gpu=name,utilization.gpu,temperature.gpu,power.draw "
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=timeout_s + 2)
         if out.returncode != 0 or not out.stdout.strip():
             return None
+        # name is first and never contains a comma → safe to split on ",".
         parts = [p.strip() for p in out.stdout.strip().splitlines()[0].split(",")]
         return {
-            "gpu_util_pct": int(float(parts[0])),
-            "gpu_temp_c": int(float(parts[1])),
-            "gpu_power_w": int(float(parts[2])),
+            "gpu_name": parts[0],
+            "gpu_util_pct": int(float(parts[1])),
+            "gpu_temp_c": int(float(parts[2])),
+            "gpu_power_w": int(float(parts[3])),
         }
     except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
         return None
 
 
+# ── Cluster topology registry ────────────────────────────────────────────────
+# Per-node static hardware topology is fetched once per process (it does not
+# change) and cached; the 1s snapshot loop must NOT re-probe it. Persisted to a
+# tmpfs JSON so the shim and other consumers can read it without a fabric probe.
+_TOPOLOGY_CACHE_PATH = "/run/greenboost/cluster_topology.json"
+_topology_cache: dict[str, dict] = {}   # "ip:port" -> {"source","ts",**topology}
+_topology_lock = threading.Lock()
+_topology_warm = False
+
+
+def _warm_topology_cache() -> None:
+    """Load the persisted per-feeder topology once, so an offline feeder still
+    reports its last-known hardware (topology_source='cache')."""
+    global _topology_warm
+    if _topology_warm:
+        return
+    _topology_warm = True
+    try:
+        data = json.loads(Path(_TOPOLOGY_CACHE_PATH).read_text())
+        for key, entry in (data.get("feeders") or {}).items():
+            if isinstance(entry, dict):
+                _topology_cache.setdefault(key, entry)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _emit_node_topology(node: str, addr: str, source: str, topo: dict) -> None:
+    """dataflux node_topology event (best-effort) , the static hardware identity
+    of a node, joinable by `node` with the live snapshot time-series."""
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({
+            "node": node or addr, "label": "cluster",
+            "kind": "node_topology", "status": "ok", "source": source, "addr": addr,
+            "gpu": topo.get("gpu_model") or topo.get("gpu_name") or "",
+            "vram_gb": topo.get("vram_gb", 0),
+            "cc": topo.get("compute_capability", ""),
+            "p_cores": topo.get("p_core_count", 0),
+            "e_cores": topo.get("e_core_count", 0),
+            "ram_total_gb": topo.get("ram_total_gb", 0),
+            "ram_speed_mt": topo.get("ram_speed_mt", 0),
+            "vram_bw_gb_s": topo.get("vram_bw_gb_s", 0),
+            "net_link_mbps": topo.get("net_link_mbps", 0),
+            "pcie_gen": topo.get("pcie_gen", 0),
+            "pcie_lanes": topo.get("pcie_lanes", 0),
+            "nvme_gb": topo.get("nvme_0_capacity_tb", 0),
+        })
+    except Exception:
+        pass
+
+
+def _write_topology_cache() -> None:
+    """Atomically persist the current topology cache to tmpfs. Best-effort."""
+    try:
+        Path(_TOPOLOGY_CACHE_PATH).parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps({"feeders": _topology_cache, "generated_ts": time.time()})
+        tmp = _TOPOLOGY_CACHE_PATH + f".tmp.{os.getpid()}"
+        Path(tmp).write_text(payload)
+        os.replace(tmp, _TOPOLOGY_CACHE_PATH)
+    except OSError:
+        pass
+
+
+def _parse_topology_text(text: str, src: str) -> dict:
+    """Parse a feeder's profile .md text into a topology dict (no host-side live
+    detection , see gb_topology.parse_profile_text). {} on any failure."""
+    try:
+        import gb_topology
+        return gb_topology.topology_dict(gb_topology.parse_profile_text(text, src=src))
+    except Exception:
+        return {}
+
+
+def _ssh_fetch_topology(feeder: Feeder, timeout_s: float = 5.0) -> dict | None:
+    """Old-feeder fallback: SSH-cat the feeder's profile .md. Best-effort."""
+    import subprocess
+    user = feeder.ssh_user or os.environ.get("USER", "root")
+    tgt = f"{user}@{feeder.ip}"
+    try:
+        out = subprocess.run(
+            ["ssh", *_ssh_opts(connect_timeout=int(timeout_s)), tgt,
+             "cat /etc/greenboost/profiles/default.md"],
+            capture_output=True, text=True, timeout=timeout_s + 2)
+        if out.returncode != 0 or not out.stdout.strip():
+            return None
+        return _parse_topology_text(out.stdout, src=f"ssh:{feeder.ip}") or None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def _resolve_feeder_topology(feeder: Feeder, sock, feature_flags: int, fd) -> None:
+    """Populate feeder.topology / topology_source, fetching once per process.
+    Fabric (GB_MSG_TOPOLOGY) first when the feeder advertised it, else SSH.
+    Sets topology_source='cache' from the last-known entry if a live fetch
+    can't be done. Emits node_topology on a fresh fetch or a change."""
+    key = f"{feeder.ip}:{feeder.port}"
+    with _topology_lock:
+        _warm_topology_cache()
+        cached = _topology_cache.get(key)
+        if cached and cached.get("_fetched_this_proc"):
+            feeder.topology = {k: v for k, v in cached.items()
+                               if not k.startswith("_") and k not in ("source", "ts")}
+            feeder.topology_source = cached.get("source", "cache")
+            return
+
+    topo, source = {}, ""
+    try:
+        if feature_flags & getattr(fd, "GB_NET_FEAT_TOPOLOGY", 0):
+            text = fd.query_topology(sock)
+            if text:
+                topo = _parse_topology_text(text, src=f"fabric:{feeder.ip}")
+                source = "fabric"
+    except (OSError, ValueError, EOFError, struct.error):
+        topo = {}
+    if not topo:
+        ssh_topo = _ssh_fetch_topology(feeder)
+        if ssh_topo:
+            topo, source = ssh_topo, "ssh"
+
+    with _topology_lock:
+        prev = _topology_cache.get(key, {})
+        prev_core = {k: v for k, v in prev.items()
+                     if not k.startswith("_") and k not in ("source", "ts")}
+        if topo:
+            changed = topo != prev_core
+            entry = dict(topo)
+            entry.update(source=source, ts=time.time(), _fetched_this_proc=True)
+            _topology_cache[key] = entry
+            feeder.topology, feeder.topology_source = dict(topo), source
+        elif prev_core:
+            feeder.topology = prev_core
+            feeder.topology_source = "cache"
+            changed = False
+        else:
+            feeder.topology, feeder.topology_source = {}, ""
+            changed = False
+    if topo and changed:
+        _emit_node_topology(feeder.hostname, key, source, topo)
+        _write_topology_cache()
+
+
 def feeders(probe: bool = True, timeout_s: float = 2.0,
-            ssh_fallback_telemetry: bool = False) -> list[Feeder]:
+            ssh_fallback_telemetry: bool = False,
+            fetch_topology: bool = True) -> list[Feeder]:
     """Feeders from /etc/greenboost/cluster.conf, optionally probed live.
 
     Returns [] when no cluster is configured , callers need no special case.
@@ -354,7 +519,7 @@ def feeders(probe: bool = True, timeout_s: float = 2.0,
                 fd._reset_seq()
                 if not fd._do_psk_auth(sock):
                     raise ValueError("PSK auth failed (cluster.key mismatch/missing)")
-                f.hostname = fd.do_handshake(sock)
+                f.hostname, _feat = fd.do_handshake(sock)
                 mi = fd.query_mem_info(sock)
                 if mi:
                     f.t1_free_mb  = mi["t1_free"]  >> 20
@@ -373,22 +538,47 @@ def feeders(probe: bool = True, timeout_s: float = 2.0,
                     f.gpu_temp_c   = fs["gpu_temp_c"]
                     f.gpu_power_w  = fs["gpu_power_w"]
                     f.mps_sm_pct   = fs["mps_sm_pct"]
+                # Static hardware topology , once per process (see registry above).
+                if fetch_topology:
+                    try:
+                        _resolve_feeder_topology(f, sock, _feat, fd)
+                    except Exception:
+                        pass
                 f.online = True
                 sock.close()
             except (OSError, ValueError, EOFError) as e:
                 f.error = str(e)
-            if f.online and ssh_fallback_telemetry and f.gpu_util_pct == 0 \
-               and f.gpu_temp_c == 0 and f.gpu_power_w == 0:
+            # SSH nvidia-smi fallback when the fabric telemetry is missing OR
+            # PARTIAL. A live GPU is never 0 C, so gpu_temp_c == 0 alone means
+            # the netd FEEDER_STATUS telemetry is incomplete (observed on omen:
+            # power reads 9 W but temp/util come back 0 , a partial-NVML
+            # condition). The old guard required ALL of util/temp/power to be 0,
+            # so a working power reading suppressed the fallback and left temp+
+            # util stuck at 0 forever. Trigger on any missing core signal.
+            if f.online and ssh_fallback_telemetry and (
+                    f.gpu_temp_c == 0 or (f.gpu_util_pct == 0 and f.gpu_power_w == 0)):
                 ssh_tel = _ssh_gpu_telemetry(f)
                 if ssh_tel:
-                    f.gpu_util_pct = ssh_tel["gpu_util_pct"]
-                    f.gpu_temp_c   = ssh_tel["gpu_temp_c"]
-                    f.gpu_power_w  = ssh_tel["gpu_power_w"]
+                    # Only overwrite a fabric value with the SSH value when the
+                    # fabric value was missing , keep any good fabric reading.
+                    f.gpu_util_pct = f.gpu_util_pct or ssh_tel["gpu_util_pct"]
+                    f.gpu_temp_c   = f.gpu_temp_c   or ssh_tel["gpu_temp_c"]
+                    f.gpu_power_w  = f.gpu_power_w  or ssh_tel["gpu_power_w"]
+                    f.gpu_name     = f.gpu_name     or ssh_tel.get("gpu_name", "")
         # Adaptive placement history persists across feeders() calls (a fresh
         # Feeder is built above; the EWMA lives in module-level state keyed
         # by ip:port so repeated dispatches keep learning per node).
         f.throughput_ewma = _throughput_ewma.get(f"{ip}:{port}", 0.0)
         f.link_mbps_ewma  = _link_mbps_ewma.get(f"{ip}:{port}", 0.0)
+        # Offline / un-probed feeder: report last-known topology from the cache.
+        if fetch_topology and not f.topology:
+            with _topology_lock:
+                _warm_topology_cache()
+                cached = _topology_cache.get(f"{ip}:{port}")
+            if cached:
+                f.topology = {k: v for k, v in cached.items()
+                              if not k.startswith("_") and k not in ("source", "ts")}
+                f.topology_source = "cache"
         out.append(f)
     return out
 
@@ -905,6 +1095,46 @@ def cluster_snapshot(force: bool = False, ssh_fallback_telemetry: bool = True) -
     return data
 
 
+def cluster_topology(force: bool = False) -> dict:
+    """Full static hardware topology of every cluster node , the complement to
+    cluster_snapshot's live telemetry. Host topology comes from this node's own
+    gb_topology; each feeder's comes over the fabric (GB_MSG_TOPOLOGY) with an
+    SSH fallback, cached per process. force=True clears the cache and re-probes.
+
+    Shape: {"host": {...}, "feeders": {"ip:port": {hostname, source, ts, **topo}},
+            "generated_ts": ...}. A feeder with no reachable topology reports {}.
+    """
+    if force:
+        with _topology_lock:
+            _topology_cache.clear()
+            global _topology_warm
+            _topology_warm = False
+
+    host_topo: dict = {}
+    try:
+        import gb_topology
+        host_topo = gb_topology.topology_dict(gb_topology.get_topology())
+    except Exception:
+        pass
+
+    out_feeders: dict[str, dict] = {}
+    for f in feeders(probe=True, fetch_topology=True):
+        key = f"{f.ip}:{f.port}"
+        entry = {"hostname": f.hostname, "online": f.online,
+                 "source": f.topology_source}
+        with _topology_lock:
+            cached = _topology_cache.get(key, {})
+        entry["ts"] = cached.get("ts", 0)
+        entry.update(f.topology or {})
+        # net_link_mbps (in topology) is the NIC's physical ceiling; this is the
+        # MEASURED end-to-end transfer rate from real rsync/scp work , the number
+        # that actually answers "how long to fetch/pull N bytes to this feeder"
+        # (0.0 until the first transfer builds history).
+        entry["measured_link_mbps"] = round(f.link_mbps_ewma, 1)
+        out_feeders[key] = entry
+    return {"host": host_topo, "feeders": out_feeders, "generated_ts": time.time()}
+
+
 # A feeder whose MEASURED transfer link is this slow or slower isn't worth
 # dispatching to , the rsync/scp round-trip would cost more than the compute
 # it saves. A feeder that has never been measured yet (link_mbps_ewma==0.0)
@@ -958,9 +1188,18 @@ def feeder_env(feeder: Feeder, workload: str = "diffusion",
                          f"one of {sorted(_WORKLOAD_PROFILES)}")
     env = dict(profile)
     if workload in _T2_POOL_WORKLOADS:
-        # Feeder MemTotal is unknown host-side: ship the safety formula's
-        # floor; a feeder-local shim_env() derivation overrides it (rule).
-        env.setdefault("GREENBOOST_HOST_RAM_SAFETY_MB", "2048")
+        # Derive the feeder's RAM-safety reserve from ITS OWN RAM when topology
+        # is known (max(2048 MB, 3% of that node's RAM), the _host_ram_safety_mb
+        # formula applied per node); else ship the floor and let the feeder-local
+        # shim_env() derivation override it (rule: no host-shaped literal).
+        ram_gb = int(feeder.topology.get("ram_total_gb", 0)) if feeder.topology else 0
+        safety_mb = max(2048, ram_gb * 1024 * 3 // 100) if ram_gb > 0 else 2048
+        env.setdefault("GREENBOOST_HOST_RAM_SAFETY_MB", str(safety_mb))
+    # Thread hints from THIS feeder's P-core count (topology), not the host's.
+    p_cores = int(feeder.topology.get("p_core_count", 0)) if feeder.topology else 0
+    if p_cores > 0:
+        env.setdefault("OMP_NUM_THREADS", str(p_cores))
+        env.setdefault("GB_FEEDER_THREADS", str(p_cores))
     if feeder.t1_free_mb > 0:
         # CUDA-context + activation headroom on the feeder: %-derived from
         # THAT node's VRAM via the shared gb_topology.compute_reserve_gb

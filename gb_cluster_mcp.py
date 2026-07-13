@@ -53,10 +53,45 @@ def cluster_feeders(probe: bool = True) -> list[dict]:
 
 
 @mcp.tool()
+def cluster_ensure_feeder_ready(feeder_ip: str, confirm: bool = False) -> dict:
+    """ACTUATE (double-gated): provision + verify a feeder so a visibly-idle one
+    can be put to work , rsyncs the pipeline code, ensures the model, import-
+    checks deps. DRY-RUN (returns the plan) unless confirm=True AND the server
+    has GB_ORCH_ACTUATE=1. Emits an `actuation` dataflux event when applied.
+    The remediation counterpart to seeing an idle feeder in cluster_feeders."""
+    import gb_actuation
+    return gb_actuation.cluster_ensure_feeder_ready(feeder_ip, confirm=confirm)
+
+
+@mcp.tool()
+def cluster_dispatch(confirm: bool = False) -> dict:
+    """ACTUATE (double-gated): prepare the cluster for dispatch , report which
+    online feeders are eligible (not busy, link fast enough) and, when applied,
+    provision them so the next pipeline fan-out uses them. DRY-RUN unless
+    confirm=True AND GB_ORCH_ACTUATE=1. (Item-level dispatch needs the caller's
+    own run_local/run_remote callables via gb_cluster.cluster_map; this readies
+    the cluster, it does not fabricate work.)"""
+    import gb_actuation
+    return gb_actuation.cluster_dispatch_plan(confirm=confirm)
+
+
+@mcp.tool()
 def cluster_available() -> bool:
     """True when at least one feeder is online and reachable right now , the
     fast yes/no gate before deciding to dispatch cluster work."""
     return gc.cluster_available()
+
+
+@mcp.tool()
+def cluster_topology(force: bool = False) -> dict:
+    """Full STATIC hardware topology of every cluster node (host + feeders) ,
+    the complement to cluster_snapshot's live telemetry: GPU model/VRAM/compute
+    capability, PCIe gen+lanes, CPU P/E-core counts, RAM total/speed/type, NVMe,
+    NUMA nodes. Feeder topology arrives over the fabric (GB_MSG_TOPOLOGY) with an
+    SSH fallback for older feeders; a node with no reachable topology reports {}.
+    Cached per process (topology is static); force=True re-probes. Use it to make
+    topology-aware placement/threading/budget decisions per node."""
+    return gc.cluster_topology(force=force)
 
 
 if __name__ == "__main__":

@@ -178,6 +178,16 @@ GB_GPU_INFO_SIZE      = 100
 # GB_NET_FEAT_ZSTD (net_fabric.h): host advertises transparent zstd payload
 # compression; feeder echoes it when built with libzstd.
 GB_NET_FEAT_ZSTD = 1 << 0
+# GB_NET_FEAT_TOPOLOGY: feeder can serve GB_MSG_TOPOLOGY (its hardware profile).
+GB_NET_FEAT_TOPOLOGY = 1 << 1
+
+# GB_MSG_TOPOLOGY (net_fabric.h): request the feeder's /etc/greenboost/profiles/
+# default.md. Reply is gb_net_topology_resp{status(4) profile_len(4)} + bytes.
+GB_MSG_TOPOLOGY       = 0x35
+# Byte offset of the trailing feature_flags in gb_net_handshake_resp:
+#   status(4)+feeder_id(4)+proto(4)+gpu_count(4) + hostname(64) + gpus[8]*100
+#   + pcie_gen/width/bw/replay(16) = 896
+_HS_RESP_FEATURE_FLAGS_OFF = 16 + GB_NET_MAX_HOSTNAME + GB_NET_MAX_GPUS * GB_GPU_INFO_SIZE + 16
 
 
 def _build_handshake_req(feature_flags: int = 0):
@@ -195,7 +205,12 @@ def _build_handshake_req(feature_flags: int = 0):
     return req
 
 def do_handshake(sock):
-    payload = _build_handshake_req()
+    """Returns (feeder_hostname, feature_flags). feature_flags is the feeder's
+    advertised GB_NET_FEAT_* bitmask (0 on old feeders that send a short reply)
+    , used by the host to decide whether to fetch topology over the fabric."""
+    # Advertise topology support so the feeder knows the host can consume it
+    # (symmetric with zstd; harmless to feeders that ignore the bit).
+    payload = _build_handshake_req(feature_flags=GB_NET_FEAT_TOPOLOGY)
     _send_msg(sock, GB_MSG_HANDSHAKE_REQ, payload)
     msg_type, flags, resp = _recv_msg(sock)
     if msg_type not in (GB_MSG_HANDSHAKE_RESP, GB_MSG_RESPONSE):
@@ -213,7 +228,12 @@ def do_handshake(sock):
         if "�" in raw_str:
             print(f"[warn] feeder hostname contains non-UTF-8 bytes - replacement chars used: {raw_str!r}", file=sys.stderr)
         feeder_hostname = raw_str
-    return feeder_hostname
+    # Trailing feature_flags (proto v3): present only when the reply is long
+    # enough; old feeders send a short reply and it reads as 0.
+    feature_flags = 0
+    if len(resp) >= _HS_RESP_FEATURE_FLAGS_OFF + 4:
+        feature_flags = struct.unpack_from("<I", resp, _HS_RESP_FEATURE_FLAGS_OFF)[0]
+    return feeder_hostname, feature_flags
 
 
 # ── MEM_INFO query ────────────────────────────────────────────────────────────
@@ -286,6 +306,43 @@ def query_feeder_status(sock):
                    gpu_util_pct=gpu_util_pct, ecc_dbe_count=ecc_dbe_count,
                    throttle_reasons=throttle_reasons)
     return out
+
+
+# ── TOPOLOGY query (feeder hardware profile) ─────────────────────────────────
+
+def query_topology(sock):
+    """Send GB_MSG_TOPOLOGY (no payload) and return the feeder's profile .md
+    text, or None if the feeder doesn't support it / has no profile.
+
+    An old netd that predates this message never replies to 0x35, so a recv
+    timeout here MEANS 'not supported' , treat it as None (graceful), not an
+    error. Same for a truncated/short reply."""
+    _send_msg(sock, GB_MSG_TOPOLOGY)
+    try:
+        msg_type, flags, resp = _recv_msg(sock)
+    except (socket.timeout, TimeoutError):
+        return None
+    if len(resp) < 8:
+        return None
+    status, profile_len = struct.unpack_from("<II", resp, 0)
+    if status != GB_STATUS_OK or profile_len == 0:
+        return None
+    body = resp[8:8 + profile_len]
+    return body.decode("utf-8", errors="replace")
+
+
+def test_topology(sock):
+    _head("Feeder hardware topology (GB_MSG_TOPOLOGY)")
+    text = query_topology(sock)
+    if not text:
+        _info("topology not served by this feeder (older netd or no profile) - "
+              "host falls back to SSH")
+        return True  # not a hard failure; optional capability
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    _ok(f"topology received ({len(text)} bytes, {len(lines)} profile lines)")
+    for ln in lines[:15]:
+        _info(f"  {ln.strip()}")
+    return True
 
 
 def test_feeder_status(sock):
@@ -711,7 +768,7 @@ def test_local() -> bool:
 def main():
     parser = argparse.ArgumentParser(description="GreenBoost feeder diagnostic tool")
     parser.add_argument("command", nargs="?", default="all",
-                        choices=["t1", "t2", "t3", "compute", "telemetry", "all", "info"],
+                        choices=["t1", "t2", "t3", "compute", "telemetry", "topology", "all", "info"],
                         help="Which test to run (default: all)")
     parser.add_argument("--ip",   default=None, help="Feeder IP (overrides cluster.conf)")
     parser.add_argument("--port", type=int, default=None, help="Feeder port (default: 9740)")
@@ -774,8 +831,9 @@ def main():
     _reset_seq()
 
     try:
-        feeder_host = do_handshake(sock)
-        _ok(f"Handshake OK  (feeder hostname: {feeder_host or '?'})")
+        feeder_host, feat = do_handshake(sock)
+        _ok(f"Handshake OK  (feeder hostname: {feeder_host or '?'}"
+            f"{', topology-capable' if feat & GB_NET_FEAT_TOPOLOGY else ''})")
     except Exception as e:
         _fail(f"Handshake failed: {e}")
         sock.close()
@@ -813,6 +871,8 @@ def main():
                 _run_check("GPU Compute", test_compute, sock)
             if args.command in ("telemetry", "all"):
                 _run_check("Telemetry", test_feeder_status, sock)
+            if args.command in ("topology", "all"):
+                _run_check("Topology", test_topology, sock)
     finally:
         sock.close()
 

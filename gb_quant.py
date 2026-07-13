@@ -196,23 +196,55 @@ class GpuProfile:
     floor_default: Union[int, str]    # compact-tier precision floor (e.g. 4 or "nvfp4")
     quality_default: Union[int, str]  # best non-BF16 precision (fp8/nvfp4)
     t2_tolerance_gb: float            # GB of T2 DDR the quality tier may reserve
+                                      # (DERIVED at runtime = family fraction ×
+                                      # this node's real T2 pool; see gpu_profile)
 
 
-# Family table: (cc_min, cc_max) → (family, precisions, floor, quality_default, t2_tol).
+# Family table: (cc_min, cc_max) → (family, precisions, floor, quality_default, t2_tol_frac).
 # Precision sets are ordered highest-quality-first and include only precisions that have
 # hardware acceleration on that family.  fp8 tensor cores: Ada(8.9)/Hopper(9.x)/Blackwell(12.x).
 # nvfp4: Blackwell only (sm_120 PTX FP4).
+#
+# t2_tol_frac (owner rule 2026-07-13: NO absolute hardware-shaped GB literal):
+# the FRACTION of THIS node's real T2 DDR pool the quality tier may lean on ,
+# newer fp8-capable families lean harder because their compact tiers are
+# higher quality. gpu_profile() multiplies it by the node's actual T2 pool
+# (pool_brief), so an 8 GB feeder and a 256 GB-RAM host derive different GB.
 _GPU_FAMILIES: List[Tuple] = [
-    # (cc_min, cc_max,   family,      precisions,                            floor,  q_def,    t2_tol)
-    ((12, 0), (12, 99), "blackwell", (16, "fp8", "nvfp4", 8, 4, "tq3", "tq2"), 4, "nvfp4",  8.0),
-    (( 9, 0), ( 9, 99), "hopper",   (16, "fp8", 8, 4, "tq3", "tq2"),           4, "fp8",    8.0),
-    (( 8, 9), ( 8, 99), "ada",      (16, "fp8", 8, 4, "tq3", "tq2"),           4, "fp8",    6.0),
-    (( 8, 0), ( 8,  8), "ampere",   (16, 8, 4, "tq3", "tq2"),                  4,  8,       6.0),
-    (( 7, 5), ( 7, 99), "turing",   (16, 8, 4, "tq3", "tq2"),                  4,  8,       4.0),
-    (( 7, 0), ( 7,  4), "volta",    (16, 8, 4, "tq3", "tq2"),                  4,  8,       4.0),
+    # (cc_min, cc_max,   family,      precisions,                            floor,  q_def,    t2_frac)
+    ((12, 0), (12, 99), "blackwell", (16, "fp8", "nvfp4", 8, 4, "tq3", "tq2"), 4, "nvfp4",  0.30),
+    (( 9, 0), ( 9, 99), "hopper",   (16, "fp8", 8, 4, "tq3", "tq2"),           4, "fp8",    0.30),
+    (( 8, 9), ( 8, 99), "ada",      (16, "fp8", 8, 4, "tq3", "tq2"),           4, "fp8",    0.22),
+    (( 8, 0), ( 8,  8), "ampere",   (16, 8, 4, "tq3", "tq2"),                  4,  8,       0.22),
+    (( 7, 5), ( 7, 99), "turing",   (16, 8, 4, "tq3", "tq2"),                  4,  8,       0.15),
+    (( 7, 0), ( 7,  4), "volta",    (16, 8, 4, "tq3", "tq2"),                  4,  8,       0.15),
 ]
 
 _GPU_PROFILE_CACHE: Optional[GpuProfile] = None
+
+
+def _t2_pool_total_gb() -> float:
+    """This node's real T2 DDR pool total in GB (0.0 if unknown). Reads the
+    kmod pool_brief (same source as _auto_budgets), falling back to a % of
+    MemTotal (the kmod auto-sizes the pool at ~70% of RAM). Never a
+    host-shaped literal , scales to whatever this machine actually has."""
+    try:
+        import re as _re
+        with open("/sys/class/greenboost/greenboost/pool_brief") as f:
+            m = _re.search(r"T2:(\d+)/(\d+)GB", f.read())
+        if m:
+            return float(int(m.group(2)))          # total GB
+    except Exception:
+        pass
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    kb = int(line.split()[1])
+                    return round(kb / (1024.0 * 1024.0) * 0.70, 1)  # ~kmod autosize
+    except Exception:
+        pass
+    return 0.0
 
 
 def gpu_profile(device: int = 0) -> GpuProfile:
@@ -234,21 +266,26 @@ def gpu_profile(device: int = 0) -> GpuProfile:
         )
         return _GPU_PROFILE_CACHE
 
+    # Derive the absolute T2 tolerance from THIS node's real pool (owner rule:
+    # no host-shaped GB literal). 0.0 when the pool is unknown , a safe sentinel
+    # (the quality tier simply won't lean on T2 it can't confirm exists).
+    pool_gb = _t2_pool_total_gb()
     cc = torch.cuda.get_device_capability(device)
-    for (cc_min, cc_max, family, precisions, floor, q_def, t2_tol) in _GPU_FAMILIES:
+    for (cc_min, cc_max, family, precisions, floor, q_def, t2_frac) in _GPU_FAMILIES:
         if cc_min <= cc <= cc_max:
             _GPU_PROFILE_CACHE = GpuProfile(
                 family=family, cc=cc, precisions=precisions,
                 floor_default=floor, quality_default=q_def,
-                t2_tolerance_gb=t2_tol,
+                t2_tolerance_gb=round(t2_frac * pool_gb, 1),
             )
             return _GPU_PROFILE_CACHE
 
-    # Unknown/future architecture: conservative safe fallback
+    # Unknown/future architecture: conservative safe fallback (0.15 fraction)
     _GPU_PROFILE_CACHE = GpuProfile(
         family="unknown", cc=cc,
         precisions=(16, 8, 4, "tq3", "tq2"),
-        floor_default=4, quality_default=8, t2_tolerance_gb=4.0,
+        floor_default=4, quality_default=8,
+        t2_tolerance_gb=round(0.15 * pool_gb, 1),
     )
     return _GPU_PROFILE_CACHE
 
@@ -1058,8 +1095,12 @@ def _auto_budgets() -> "tuple[float, float]":
     the transformer load OOM'd and the runner escalated to shimless bf16
     (which can never fit) — the whole cluster job failed. Under the
     diffusion profile GREENBOOST_REPORT_PHYSICAL_VRAM=1 makes
-    torch.cuda.mem_get_info report the real card, not the pooled figure."""
-    t1, t2 = 11.0, 8.0                      # legacy fallback (host-shaped)
+    torch.cuda.mem_get_info report the real card, not the pooled figure.
+
+    When both live probes fail the fallback is topology-derived (this node's
+    own card/RAM), never the reference box's numbers — a 0.0 sentinel means
+    "unknown" so a loud 2 GiB floor is used and a warn event emitted."""
+    t1 = t2 = 0.0                           # 0 = not yet resolved
     try:
         free_b, total_b = torch.cuda.mem_get_info()
         used_gb = (total_b - free_b) / 2 ** 30
@@ -1074,6 +1115,30 @@ def _auto_budgets() -> "tuple[float, float]":
             t2 = max(1.0, float(int(m.group(2)) - int(m.group(1))))
     except Exception:
         pass
+    if t1 <= 0 or t2 <= 0:
+        try:
+            import gb_topology
+            _tp = gb_topology.get_topology()
+        except Exception:
+            _tp = None
+        if t1 <= 0:
+            if _tp is not None and _tp.vram_gb > 0:
+                t1 = max(2.0, round(_tp.vram_gb * 0.90
+                                    - gb_topology.compute_reserve_gb(_tp.physical_vram_mb), 1))
+            else:
+                t1 = 2.0
+                try:
+                    import gb_dataflux
+                    gb_dataflux.emit({"node": "host", "label": "quant",
+                                      "kind": "quant_budget_fallback", "status": "warn",
+                                      "reason": "VRAM undetectable", "t1_gb": t1})
+                except Exception:
+                    pass
+        if t2 <= 0:
+            if _tp is not None and (_tp.virtual_vram_gb > 0 or _tp.ram_total_gb > 0):
+                t2 = max(2.0, float(_tp.virtual_vram_gb or _tp.ram_total_gb * 25 // 100))
+            else:
+                t2 = 2.0
     return t1, t2
 
 

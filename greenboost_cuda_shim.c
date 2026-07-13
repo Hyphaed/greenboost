@@ -2106,8 +2106,13 @@ static size_t vram_headroom_bytes    = 512ULL * 1024 * 1024;  /* 512 MB default 
  * gaming_mode=1 automatically doubles the effective reserve. */
 static size_t g_workstation_reserve_bytes = 1024ULL * 1024 * 1024; /* fallback only; used verbatim when env override is set */
 static int    g_workstation_reserve_from_env = 0;
-#define GB_WS_RESERVE_MIN_BYTES   (256ULL * 1024 * 1024)   /* floor: always leave a small cushion */
-#define GB_WS_RESERVE_MAX_BYTES   (2048ULL * 1024 * 1024)  /* ceiling: avoid over-reserving if some other GPU client spikes */
+#define GB_WS_RESERVE_MIN_BYTES   (256ULL * 1024 * 1024)   /* small floor: always leave a cushion */
+/* Ceiling is %-of-physical-VRAM (owner rule 2026-07-13: no flat GB literal , a
+ * 2 GB cap is 25% of an 8 GB card but only 2.5% of an 80 GB card). 20% keeps a
+ * competing client from ever locking >1/5 of VRAM that inference will never
+ * use. Falls back to the old absolute only if physical VRAM is unknown. */
+#define GB_WS_RESERVE_MAX_PCT      20ULL
+#define GB_WS_RESERVE_MAX_FALLBACK_BYTES (2048ULL * 1024 * 1024)
 #define GB_WS_RESERVE_MARGIN_BYTES (256ULL * 1024 * 1024)  /* burst margin added on top of measured desktop usage */
 /* ENH-05: Stats write interval in ms. Default 250 ms; override with
  * GREENBOOST_STATS_INTERVAL_MS env var for finer resolution during debugging. */
@@ -2151,8 +2156,11 @@ static size_t gb_effective_workstation_reserve_bytes(size_t real_free, size_t re
     size_t desktop_used = (other_used > our_used) ? (other_used - our_used) : 0;
 
     size_t reserve = desktop_used + GB_WS_RESERVE_MARGIN_BYTES;
+    size_t max_reserve = real_total
+        ? (size_t)((unsigned long long)real_total * GB_WS_RESERVE_MAX_PCT / 100ULL)
+        : GB_WS_RESERVE_MAX_FALLBACK_BYTES;
     if (reserve < GB_WS_RESERVE_MIN_BYTES) reserve = GB_WS_RESERVE_MIN_BYTES;
-    if (reserve > GB_WS_RESERVE_MAX_BYTES) reserve = GB_WS_RESERVE_MAX_BYTES;
+    if (reserve > max_reserve) reserve = max_reserve;
     return reserve;
 }
 
@@ -3500,6 +3508,22 @@ static void gb_write_stats(void)
     size_t _kv_rsv   = atomic_load_explicit(&g_kv_reserve_bytes,      memory_order_relaxed);
     size_t _kv_t1    = atomic_load_explicit(&g_kv_allocated_t1_bytes,  memory_order_relaxed);
     size_t _kv_eff   = (_kv_t1 >= _kv_rsv) ? 0 : (_kv_rsv - _kv_t1);
+    /* Read-only KV-in-T1 estimate for telemetry ONLY. Does NOT mutate the
+     * allocation-control counter g_kv_allocated_t1_bytes (that stays governed
+     * by the quiet-gap heuristic + auto-collapse so allocation behavior is
+     * unchanged). When the tracked value is 0 during INFERENCE/STEADY , KV was
+     * allocated directly by the CUDA runtime, bypassing the overflow path , so
+     * kv_t1_tracked_mb reports 0 even though KV occupies T1. Infer real KV
+     * occupancy from physical free VRAM (same math as gb_needs_overflow's
+     * auto-collapse) so kv_used telemetry reflects real decode-time KV. */
+    size_t _kv_t1_eff = _kv_t1;
+    if (_kv_t1_eff == 0 && (_phase_idx == (int)GB_PHASE_INFERENCE ||
+                            _phase_idx == (int)GB_PHASE_STEADY)) {
+        size_t _pf = atomic_load_explicit(&g_cached_free_vram, memory_order_relaxed);
+        size_t _expected_free = vram_headroom_bytes + _kv_rsv;
+        if (_pf && _pf < _expected_free)
+            _kv_t1_eff = _expected_free - _pf;
+    }
 
     static const char *const _tier_names[GB_TIER_COUNT] = {
         "t1_local", "t1_feeder", "t2_local", "t2_feeder",
@@ -3520,6 +3544,7 @@ static void gb_write_stats(void)
     fprintf(f, "kv_reserve_nominal_mb=%zu\n", _kv_rsv >> 20);
     fprintf(f, "kv_reserve_effective_mb=%zu\n", _kv_eff >> 20);
     fprintf(f, "kv_t1_tracked_mb=%zu\n",      _kv_t1 >> 20);
+    fprintf(f, "kv_t1_effective_mb=%zu\n",    _kv_t1_eff >> 20);
     fprintf(f, "kv_prefetch_mode=%d\n",       g_kv_prefetch_mode);
     fprintf(f, "kv_prefetch_ticks=%llu\n",
             (unsigned long long)atomic_load_explicit(&g_kv_prefetch_ticks, memory_order_relaxed));
@@ -3554,6 +3579,10 @@ static void gb_write_stats(void)
         size_t _ws_base = gb_effective_workstation_reserve_bytes(_cached_free, _cached_total);
         fprintf(f, "workstation_reserve_mb=%zu\n",     _ws_base >> 20);
         fprintf(f, "workstation_reserve_eff_mb=%zu\n", (_gm ? _ws_base * 2 : _ws_base) >> 20);
+        /* RULE #1 telemetry truth: real PHYSICAL free VRAM (from the un-hooked
+         * real_cuMemGetInfo cache), so fill-% can be measured against physical
+         * VRAM instead of the inflated virtual device total. */
+        fprintf(f, "physical_vram_free_mb=%zu\n", _cached_free >> 20);
     }
     fprintf(f, "local_t1_alloc_mb=%zu\n",     atomic_load_explicit(&g_local_t1_alloc_bytes, memory_order_relaxed) >> 20);
     fprintf(f, "remote_alloc_count=%zu\n",    atomic_load_explicit(&g_remote_alloc_count, memory_order_relaxed));
@@ -3953,6 +3982,27 @@ static int read_sysfs_int(const char *path)
     }
     fclose(f);
     return atoi(buf);
+}
+
+/* Total host RAM in bytes from /proc/meminfo MemTotal, or 0 if unreadable.
+ * Shared by the topology-derived pool pre-reg cap and the no-kmod safety
+ * reserve so neither has to hardcode a host-shaped GB literal (owner rule
+ * 2026-07-13: values scale to THIS node's RAM). */
+static size_t gb_host_ram_bytes(void)
+{
+    FILE *mf = fopen("/proc/meminfo", "r");
+    if (!mf) return 0;
+    char mline[128];
+    size_t ram = 0;
+    while (fgets(mline, sizeof(mline), mf)) {
+        unsigned long long kb = 0;
+        if (sscanf(mline, "MemTotal: %llu kB", &kb) == 1 && kb > 0) {
+            ram = (size_t)(kb * 1024ULL);
+            break;
+        }
+    }
+    fclose(mf);
+    return ram;
 }
 
 /* Returns 1 if sysfs value == 1, 0 otherwise */
@@ -4883,14 +4933,39 @@ static void gb_shim_init(void)
      * Must run after gb_t2_pool_bytes is fully populated above. */
     /* cuMemHostRegister blocks cudaMalloc synchronously during gb_pool_init().
      * Pinning 30+ GB takes 3-10+ minutes on a cold DDR5 system - effectively
-     * hanging Ollama.  Cap the default to 8 GB so the worst-case init delay is
-     * ~10-30 s.  Allocs larger than the pool use per-alloc Path A/B;
+     * hanging Ollama.  Cap the synchronously pre-registered pool so worst-case
+     * init stays bounded.  Allocs larger than the pool use per-alloc Path A/B;
      * if T2 is exhausted, CUDA_ERROR_OUT_OF_MEMORY is returned.
-     * Users who want a larger pool can set GREENBOOST_T2_POOL_MB explicitly. */
-#define GB_POOL_MAX_PRE_REG_BYTES (8ULL * 1024ULL * 1024ULL * 1024ULL)
+     *
+     * Owner rule 2026-07-13 (no host-shaped literal): the cap is derived from
+     * THIS node's RAM, not a flat 8 GB that a 256 GB box hits instantly and an
+     * 8 GB box overshoots.  Default = GB_POOL_PREREG_PCT (25%) of MemTotal,
+     * floored at GB_POOL_PREREG_FLOOR (4 GB) so small nodes still get a usable
+     * pool.  Overrides: GREENBOOST_T2_POOL_MB (explicit pool),
+     * GREENBOOST_POOL_PREREG_MB (explicit cap), GREENBOOST_POOL_PREREG_PCT. */
+#define GB_POOL_PREREG_PCT_DEFAULT   25ULL
+#define GB_POOL_PREREG_FLOOR_BYTES   (4ULL * 1024ULL * 1024ULL * 1024ULL)
+    size_t gb_pool_prereg_cap_bytes;
+    {
+        const char *cap_mb_env = getenv("GREENBOOST_POOL_PREREG_MB");
+        if (cap_mb_env && atoll(cap_mb_env) > 0) {
+            gb_pool_prereg_cap_bytes = (size_t)atoll(cap_mb_env) * 1024ULL * 1024ULL;
+        } else {
+            unsigned long long pct = GB_POOL_PREREG_PCT_DEFAULT;
+            const char *pct_env = getenv("GREENBOOST_POOL_PREREG_PCT");
+            if (pct_env && atoll(pct_env) > 0 && atoll(pct_env) <= 100)
+                pct = (unsigned long long)atoll(pct_env);
+            size_t ram = gb_host_ram_bytes();
+            gb_pool_prereg_cap_bytes = ram
+                ? (size_t)((unsigned long long)ram * pct / 100ULL)
+                : GB_POOL_PREREG_FLOOR_BYTES;
+            if (gb_pool_prereg_cap_bytes < GB_POOL_PREREG_FLOOR_BYTES)
+                gb_pool_prereg_cap_bytes = GB_POOL_PREREG_FLOOR_BYTES;
+        }
+    }
     if (gb_pool_configured_bytes == SIZE_MAX) {
         gb_pool_configured_bytes = gb_t2_pool_bytes * 85 / 100;
-        if (gb_pool_configured_bytes > GB_POOL_MAX_PRE_REG_BYTES) {
+        if (gb_pool_configured_bytes > gb_pool_prereg_cap_bytes) {
             /* Suppress duplicate messages from sibling Ollama runner processes:
              * only print if no other process printed this within the last 5 s. */
             int _cap_warned = 0;
@@ -4902,15 +4977,22 @@ static void gb_shim_init(void)
                 }
             }
             if (!_cap_warned) {
-                fprintf(stderr, "[GreenBoost] T2 pool capped at 8 GB (full %zu MB would "
-                        "block cudaMalloc at init; set GREENBOOST_T2_POOL_MB to override)\n",
+                fprintf(stderr, "[GreenBoost] T2 pool pre-reg capped at %zu MB "
+                        "(%zu%% of %zu MB RAM; full %zu MB would block cudaMalloc "
+                        "at init; set GREENBOOST_T2_POOL_MB / GREENBOOST_POOL_PREREG_MB "
+                        "to override)\n",
+                        gb_pool_prereg_cap_bytes >> 20,
+                        (size_t)((gb_host_ram_bytes() ?
+                            (unsigned long long)gb_pool_prereg_cap_bytes * 100ULL
+                            / gb_host_ram_bytes() : 0)),
+                        gb_host_ram_bytes() >> 20,
                         gb_pool_configured_bytes >> 20);
                 /* Touch sentinel - best-effort, failure is non-fatal */
                 int _sfd = open("/run/greenboost/pool_cap_warned",
                                 O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
                 if (_sfd >= 0) close(_sfd);
             }
-            gb_pool_configured_bytes = GB_POOL_MAX_PRE_REG_BYTES;
+            gb_pool_configured_bytes = gb_pool_prereg_cap_bytes;
         }
     }
 
@@ -4918,12 +5000,24 @@ static void gb_shim_init(void)
      * and gb_pin_user_buf().  Used by Path B / cuMemCreate VMM guards below. */
     {
         int res_gb = read_sysfs_int("/sys/module/greenboost/parameters/safety_reserve_gb");
-        gb_safety_reserve_bytes = (res_gb > 0)
-            ? (size_t)res_gb * 1024ULL * 1024ULL * 1024ULL
-            : 8ULL  * 1024ULL * 1024ULL * 1024ULL; /* default: 8 GB when no kernel module */
+        const char *src;
+        if (res_gb > 0) {
+            gb_safety_reserve_bytes = (size_t)res_gb * 1024ULL * 1024ULL * 1024ULL;
+            src = "sysfs";
+        } else {
+            /* No kernel module (container/WSL2/kmod not loaded): mirror the
+             * kmod's OWN autosize rule instead of a flat 8 GB host-shaped
+             * literal (owner rule 2026-07-13) , 8% of this node's RAM clamped
+             * to [6, 32] GB, identical to greenboost.c:3413-3416. */
+            size_t ram = gb_host_ram_bytes();
+            size_t rsv_gb = ram ? (ram >> 30) * 8ULL / 100ULL : 8ULL;
+            if (rsv_gb < 6ULL)  rsv_gb = 6ULL;
+            if (rsv_gb > 32ULL) rsv_gb = 32ULL;
+            gb_safety_reserve_bytes = rsv_gb * 1024ULL * 1024ULL * 1024ULL;
+            src = "no-kmod 8%-RAM autosize";
+        }
         gb_log("safety_reserve: %zu MB (from %s)",
-               gb_safety_reserve_bytes >> 20,
-               res_gb > 0 ? "sysfs" : "default");
+               gb_safety_reserve_bytes >> 20, src);
     }
 
     /* Add T3 (kernel module NVMe pool) to the reported virtual VRAM.
@@ -4945,11 +5039,14 @@ static void gb_shim_init(void)
      * 2% = 98% VRAM cap: keeps the GPU from hitting 100% and triggering driver stalls.
      * Previous 5% (~95% cap) was unnecessarily conservative on large GPUs. */
     if (!headroom_from_env && gb_physical_vram_bytes > 0) {
+        /* 2% of physical VRAM = 98% T1 cap (keeps the GPU off 100% so the
+         * driver never stalls). Owner rule 2026-07-13: keep only the small
+         * floor (max(small_floor, pct*capacity) is the sanctioned form); drop
+         * the old absolute 512 MB ceiling, which over-capped large cards to a
+         * flat value instead of letting headroom scale with VRAM. */
         size_t pct2 = gb_physical_vram_bytes / 50;  /* 2% - 98% T1 VRAM cap */
         size_t floor_bytes  = 128ULL * 1024ULL * 1024ULL;
-        size_t ceil_bytes   = 512ULL * 1024ULL * 1024ULL;
         if (pct2 < floor_bytes) pct2 = floor_bytes;
-        if (pct2 > ceil_bytes)  pct2 = ceil_bytes;
         vram_headroom_bytes = pct2;
     }
 
@@ -4995,9 +5092,17 @@ static void gb_shim_init(void)
         if (gb_physical_vram_bytes > 0) {
             auto_kv_mb = (gb_physical_vram_bytes >> 20) * 25 / 100;
         } else {
-            /* Conservative fallback until cuMemGetInfo populates gb_physical_vram_bytes
-             * (happens on first CUDA context call via gb_refresh_meminfo_cache). */
-            auto_kv_mb = 3072;
+            /* VRAM not yet known via NVML. Owner rule 2026-07-13: keep the
+             * reserve %-of-VRAM instead of the old flat 3072 MB literal (which
+             * is 37% of an 8 GB feeder). Query the real cuMemGetInfo directly
+             * so we still scale to THIS card; fall back to a small 512 MB floor
+             * only if even that fails. gb_refresh_meminfo_cache re-scales once a
+             * CUDA context exists. */
+            size_t _fv = 0, _tv = 0;
+            if (real_cuMemGetInfo && real_cuMemGetInfo(&_fv, &_tv) == CUDA_SUCCESS && _tv > 0)
+                auto_kv_mb = (_tv >> 20) * 25 / 100;
+            else
+                auto_kv_mb = 512;
         }
         atomic_store_explicit(&g_kv_reserve_bytes,
                               auto_kv_mb * 1024ULL * 1024ULL,
