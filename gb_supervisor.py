@@ -587,6 +587,28 @@ class GreenBoostSupervisor:
         except Exception as exc:
             log.debug("Supplemental telemetry providers unavailable: %s", exc)
 
+        # Always-on dataflux flight recorder. gb_init's SnapshotRecorder lives
+        # inside transient INFERENCE processes, so system_snapshot history had
+        # holes whenever no shim process was alive (verified 2026-07-13:
+        # snapshots stopped at 05:13 with the supervisor healthy — dataflux
+        # was blind for 7 h of active work). The supervisor already builds an
+        # enriched GpuMetrics every tick; feed the same object to a recorder
+        # so the baseline time-series never stops. Inference processes still
+        # layer their own 500ms-poll recorder for fine-grained transitions.
+        self._snap_recorder = None
+        if os.environ.get("GREENBOOST_DATAFLUX", "1") != "0":
+            try:
+                import gb_dataflux
+
+                class _NoSub:                      # recorder pulls, we push
+                    def add_callback(self, cb):    # noqa: D401
+                        pass
+
+                self._snap_recorder = gb_dataflux.SnapshotRecorder(
+                    _NoSub(), interval_s=float(POLL_SECS), node="host")
+            except Exception as exc:
+                log.debug("dataflux recorder unavailable: %s", exc)
+
     def run(self) -> None:
         # Phase 0: ensure state directories exist
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -646,8 +668,9 @@ class GreenBoostSupervisor:
             )
             self._ecc_dbe_seen = ecc_dbe
 
-        # 3c'. Feed reactive orchestrator with this tick's signals
-        if self._orch is not None:
+        # 3c'. Build this tick's enriched metrics once; feed the reactive
+        # orchestrator AND the always-on dataflux recorder from it.
+        if self._orch is not None or self._snap_recorder is not None:
             try:
                 GpuMetrics = _import_gpu_metrics()
                 m = GpuMetrics(
@@ -664,8 +687,14 @@ class GreenBoostSupervisor:
                     self._sys_provider.fill(m)
                 if self._nvml_provider is not None:
                     self._nvml_provider.fill(m)
-                self._orch.on_metrics(m)
-                self._orch.feed_vram_state(_non_gb_mb, self._vram_mon._total_mb)
+                if self._orch is not None:
+                    self._orch.on_metrics(m)
+                    self._orch.feed_vram_state(_non_gb_mb, self._vram_mon._total_mb)
+                if self._snap_recorder is not None:
+                    try:
+                        self._snap_recorder._on_metrics(m)
+                    except Exception:
+                        pass
             except Exception as exc:
                 log.debug("Orchestrator feed error: %s", exc)
 
