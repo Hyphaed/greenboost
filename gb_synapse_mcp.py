@@ -150,6 +150,22 @@ def synapse_stop(model: str, confirm: bool = False) -> dict:
 
 
 @mcp.tool()
+def serve_and_repoint(model: str, port: int = 11434,
+                      forge_url_target: str | None = None,
+                      confirm: bool = False) -> dict:
+    """ACTUATE (double-gated): the one-step "prefer gb-synapse" action , serve
+    `model` via gb-synapse AND repoint FORGE_OLLAMA_URL (in the shared
+    inference.env) so ai-forge pipelines route through the gb-synapse proxy
+    (cross-GPU --rpc split + gb-quant + dataflux tok/s) instead of raw ollama.
+    DRY-RUN unless confirm=True AND GB_ORCH_ACTUATE=1. Replaces the old
+    two-step dance (synapse_serve on one server + an out-of-band env edit)."""
+    import gb_actuation
+    return gb_actuation.serve_and_repoint(model, port=port,
+                                          forge_url_target=forge_url_target,
+                                          confirm=confirm)
+
+
+@mcp.tool()
 def cli_run(subcommand: str, args: list[str] = [], timeout: int = 120) -> dict:
     """Run an allowlisted READ-ONLY greenboost-cli headless subcommand and
     return its JSON. Allowlist: rag-search, rag-status, crag-search,

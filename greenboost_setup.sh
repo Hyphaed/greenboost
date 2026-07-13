@@ -120,6 +120,30 @@ info()  { echo -e "${GRN}[GreenBoost]${NC} $*"; }
 warn()  { echo -e "${YLW}[GreenBoost] WARN:${NC} $*"; }
 die()   { echo -e "${RED}[GreenBoost] ERROR:${NC} $*" >&2; exit 1; }
 
+# gb_dataflux_emit <json-object> - append one dataflux event line (best-effort,
+# never fails the caller). Under sudo, resolves the log to the invoking user's
+# home (SUDO_USER) so install-time events land in the log the MCP reads, not
+# root's. Mirrors gb_dataflux.py's per-call GREENBOOST_DATAFLUX_LOG resolution.
+gb_dataflux_emit() {
+    local _obj="$1" _home _log
+    _log="${GREENBOOST_DATAFLUX_LOG:-}"
+    if [[ -z "$_log" ]]; then
+        if [[ -n "${SUDO_USER:-}" ]]; then
+            _home=$(eval echo "~${SUDO_USER}" 2>/dev/null)
+        else
+            _home="$HOME"
+        fi
+        _log="${_home}/.local/share/greenboost/dataflux.jsonl"
+    fi
+    mkdir -p "$(dirname "$_log")" 2>/dev/null || return 0
+    printf '%s\n' "$_obj" >> "$_log" 2>/dev/null || true
+    # Keep the file owned by the user, not root, when running under sudo.
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        chown "${SUDO_USER}:" "$_log" 2>/dev/null || true
+    fi
+    return 0
+}
+
 # ── Distro / kernel helpers ────────────────────────────────────────────────────
 
 # Semantic kernel version comparison - true when running kernel ≥ want_major.want_minor
@@ -1278,6 +1302,64 @@ gb_calc_ddr_cap_gb() {
 # PCIE_GEN, PCIE_WIDTH, PCIE_BW_GBS, PCIE_MAX_GEN, PCIE_MAX_BW_GBS.
 # Safe to call multiple times - idempotent.
 
+# _probe_vram_gb_sysfs - VRAM in GB from PCI BAR apertures, no NVML/nvidia-smi.
+# Largest memory BAR of any NVIDIA (0x10de) display-class (0x03xx) device. With
+# Resizable BAR (the norm on this project's Blackwell host + feeder) BAR1 maps
+# the full VRAM aperture, so its size is the physical VRAM. Non-ReBAR boxes
+# expose a 256 MB aperture that is useless as a VRAM estimate, so anything below
+# a 4 GiB floor returns 0 (caller then fails loud). NEVER a machine-shaped
+# guess: this replaces the old GB_PHYS=12/8 fallbacks that silently planned an
+# unknown card as the dev box (no-hardcode rule).
+_probe_vram_gb_sysfs() {
+    local best=0 dev ven cls sz
+    for dev in /sys/bus/pci/devices/*; do
+        ven=$(cat "$dev/vendor" 2>/dev/null) || continue
+        cls=$(cat "$dev/class" 2>/dev/null) || continue
+        [[ "$ven" == "0x10de" && "$cls" == 0x03* ]] || continue
+        # resource file: "start end flags" per BAR (hex). Largest BAR size wins.
+        while read -r start end _; do
+            [[ "$start" == 0x* ]] || continue
+            sz=$(( (end - start + 1) / 1073741824 ))
+            (( sz > best )) && best=$sz
+        done < "$dev/resource" 2>/dev/null
+    done
+    (( best >= 4 )) && echo "$best" || echo 0
+}
+
+# _resolve_gb_phys - VRAM GB when nvidia-smi is unavailable/wedged. Real probe
+# chain, never a hardcoded card size: sysfs BAR -> existing profile vram_gb ->
+# GB_PHYS_OVERRIDE env -> fail. Sentinel 0 is unsafe (it would write vram_gb:0
+# into the profile and load the kmod with physical_vram_gb=0, breaking its KV
+# clamp), so undetectable VRAM is a hard install-time failure. Prints the
+# resolved value to stdout and returns 0; on total failure prints the error to
+# stderr and returns 1 (the caller must abort - a `die` here would only exit the
+# $() subshell, not the installer). $1=reason, $2=driver-fix hint.
+_resolve_gb_phys() {
+    local why="$1" v
+    # 1) An explicit operator override always wins.
+    if [[ -n "${GB_PHYS_OVERRIDE:-}" && "${GB_PHYS_OVERRIDE}" -gt 0 ]]; then
+        warn "  Using GB_PHYS_OVERRIDE=${GB_PHYS_OVERRIDE} GB"
+        echo "$GB_PHYS_OVERRIDE"; return 0
+    fi
+    # 2) A prior profile holds a REAL nvidia-smi VRAM figure - preferred over the
+    #    BAR aperture (below), which rounds up to a power of two and would
+    #    over-report a 12 GB card as 16 GB (RULE #1 90%-fill would then OOM).
+    v=$(grep -m1 -E '^\s*vram_gb:' /etc/greenboost/profiles/default.md 2>/dev/null \
+        | grep -oE '[0-9]+' | head -1)
+    if [[ -n "$v" && "$v" -gt 0 ]]; then
+        warn "  Reusing VRAM from existing profile: ${v} GB"
+        echo "$v"; return 0
+    fi
+    # 3) Coarse last resort: PCI BAR aperture (power-of-two, may over-report).
+    v=$(_probe_vram_gb_sysfs)
+    if (( v > 0 )); then
+        warn "  Approximate VRAM from PCI BAR aperture: ${v} GB (rounds up to a power of two; set GB_PHYS_OVERRIDE for the exact size)"
+        echo "$v"; return 0
+    fi
+    echo -e "${RED}[GreenBoost] ERROR:${NC} GPU VRAM undetectable (${why}) and no prior profile / ReBAR sysfs aperture. Fix the driver (${2:-sudo systemctl restart nvidia-persistenced}) or export GB_PHYS_OVERRIDE=<GB> and re-run." >&2
+    return 1
+}
+
 detect_hardware() {
     [[ "${_GB_HW_DETECTED:-0}" -eq 1 ]] && return 0
     # ── GPU ──────────────────────────────────────────────────────────────
@@ -1294,11 +1376,11 @@ detect_hardware() {
             warn "nvidia-smi timed out (>30 s) - GPU driver may be wedged."
             warn "  Try: sudo systemctl restart nvidia-persistenced && sudo nvidia-smi"
             GPU_NAME="Unknown (nvidia-smi timeout)"
-            GB_PHYS=12
+            GB_PHYS=$(_resolve_gb_phys "nvidia-smi timed out") || exit 1
         elif [[ -z "$smi_line" ]]; then
             warn "nvidia-smi returned no output - check: sudo nvidia-smi"
             GPU_NAME="Unknown (nvidia-smi no output)"
-            GB_PHYS=12
+            GB_PHYS=$(_resolve_gb_phys "nvidia-smi returned no output") || exit 1
         else
             GPU_NAME=$(echo "$smi_line" | cut -d, -f1 | sed 's/^[[:space:]]*//')
             local gpu_mem_mib; gpu_mem_mib=$(echo "$smi_line" | cut -d, -f2 | tr -d ' ')
@@ -1307,8 +1389,8 @@ detect_hardware() {
         fi
     else
         GPU_NAME="Unknown (nvidia-smi not found)"
-        GB_PHYS=8
-        warn "nvidia-smi not found - assuming 8 GB VRAM. Install NVIDIA driver."
+        warn "nvidia-smi not found - probing VRAM from PCI BAR instead."
+        GB_PHYS=$(_resolve_gb_phys "nvidia-smi not found" "install the NVIDIA driver") || exit 1
     fi
 
     # ── System RAM ───────────────────────────────────────────────────────
@@ -1678,6 +1760,39 @@ write_profile() {
     local _total_gb=$(( _ram_kb / 1024 / 1024 ))
     GB_VIRT=$(gb_calc_ddr_cap_gb "$_total_gb")
 
+    # T1 VRAM bandwidth GB/s = mem clock (MHz) × 2 (DDR) × bus width (bit) / 8 /
+    # 1000. So a remote feeder's profile carries its own VRAM speed (host-side
+    # NVML can't see the feeder). 0 when nvidia-smi lacks the fields.
+    local _vram_bw_gbs=0
+    if command -v nvidia-smi &>/dev/null; then
+        local _smi_bw; _smi_bw=$(timeout 15 nvidia-smi \
+            --query-gpu=clocks.max.memory,memory.bus_width \
+            --format=csv,noheader,nounits 2>/dev/null | head -1)
+        local _clk _bus
+        _clk=$(echo "$_smi_bw" | cut -d, -f1 | tr -dc '0-9')
+        _bus=$(echo "$_smi_bw" | cut -d, -f2 | tr -dc '0-9')
+        if [[ -n "$_clk" && -n "$_bus" && "$_bus" -gt 0 ]]; then
+            _vram_bw_gbs=$(awk "BEGIN {printf \"%.1f\", $_clk * 2 * $_bus / 8 / 1000}")
+        fi
+    fi
+    # Primary NIC link speed (Mbps): the ethernet link that carries cluster
+    # transfers. Default-route interface first, else fastest carrier-up NIC.
+    local _net_mbps=0 _dev _rt_if
+    _rt_if=$(awk '$2=="00000000"{print $1; exit}' /proc/net/route 2>/dev/null)
+    if [[ -n "$_rt_if" && -r "/sys/class/net/${_rt_if}/speed" ]]; then
+        _net_mbps=$(cat "/sys/class/net/${_rt_if}/speed" 2>/dev/null)
+    fi
+    if [[ ! "${_net_mbps:-0}" -gt 0 ]]; then
+        _net_mbps=0
+        for _dev in /sys/class/net/*; do
+            [[ "$(basename "$_dev")" == "lo" || ! -e "$_dev/device" ]] && continue
+            [[ "$(cat "$_dev/carrier" 2>/dev/null)" == "1" ]] || continue
+            local _s; _s=$(cat "$_dev/speed" 2>/dev/null)
+            [[ "${_s:-0}" -gt "${_net_mbps:-0}" ]] && _net_mbps=$_s
+        done
+    fi
+    [[ "${_net_mbps:-0}" -gt 0 ]] || _net_mbps=0
+
     mkdir -p "$(dirname "$out")"
     cat > "$out" << PROFILE_EOF
 ---
@@ -1710,6 +1825,7 @@ has_pe_split: ${DET_HAS_PE_SPLIT:-false}
 gpu_count: ${DET_GPU_COUNT:-1}
 gpu_model: "${GPU_NAME:-Unknown}"
 vram_gb: ${GB_PHYS:-0}
+vram_bandwidth_gb_s: ${_vram_bw_gbs:-0}
 compute_capability: "${DET_CC:-}"
 pcie_gen: ${DET_PCIE_GEN_SMI:-${PCIE_MAX_GEN:-4}}
 pcie_lanes: ${DET_PCIE_LANES_SMI:-16}
@@ -1727,6 +1843,9 @@ ram_ecc: ${DET_RAM_ECC:-false}
 nvme_count: ${DET_NVME_COUNT:-0}
 nvme_0_model: "${DET_NVME_0_MODEL:-}"
 nvme_0_capacity_tb: $(awk "BEGIN {printf \"%.1f\", ${NVME_SIZE_GB:-0}/1000}")
+
+### Network
+net_link_mbps: ${_net_mbps:-0}
 
 ### OS
 os_distro: "${DET_OS:-}"
@@ -1768,6 +1887,16 @@ NET_EOF
     fi
 
     info "Profile written: $out"
+
+    # Observability Must-Rule: a node_topology event on every profile (re)gen so
+    # this node's hardware identity is followable in the greenboost-dataflux MCP
+    # (dataflux_topology), joinable with the live snapshot time-series by `node`.
+    gb_dataflux_emit "$(printf '{"ts":%s,"node":"%s","label":"cluster","kind":"node_topology","status":"ok","source":"local_profile","gpu":"%s","vram_gb":%s,"vram_bw_gb_s":%s,"cc":"%s","p_cores":%s,"ram_total_gb":%s,"ram_speed_mt":%s,"net_link_mbps":%s,"pcie_gen":%s,"pcie_lanes":%s}' \
+        "$(date +%s)" "${profile_name}" "${GPU_NAME:-Unknown}" "${GB_PHYS:-0}" \
+        "${_vram_bw_gbs:-0}" "${DET_CC:-}" "${DET_P_CORES:-0}" \
+        "$(($(grep MemTotal /proc/meminfo | awk '{print $2}') / 1024 / 1024))" \
+        "${RAM_SPEED_MT:-0}" "${_net_mbps:-0}" "${DET_PCIE_GEN_SMI:-${PCIE_MAX_GEN:-0}}" \
+        "${DET_PCIE_LANES_SMI:-0}")"
 }
 
 # parse_profile_field <file> <field>
@@ -2417,6 +2546,44 @@ SUPEOF
     systemctl enable --now greenboost-supervisor.service 2>/dev/null \
         && gb_ok "greenboost-supervisor.service enabled and started (auto-enabled)" \
         || gb_warn "supervisor enable failed , run: sudo systemctl enable --now greenboost-supervisor.service"
+
+    # 5. A2A gateway (agent-to-agent AgentCard + JSON-RPC over gb_actuation's
+    #    gated verbs). Loopback-bound; actuation gate (GB_ORCH_ACTUATE) is OFF
+    #    by default so the network-facing surface is observe/dry-run until the
+    #    operator opts in via override.conf. a2a_status (greenboost-dataflux
+    #    MCP) reports whether it's listening. Gated + non-fatal.
+    if [[ -f "$LIB_DIR/gb_a2a.py" ]]; then
+        cat > /etc/systemd/system/greenboost-a2a.service << 'A2AEOF'
+[Unit]
+Description=GreenBoost A2A gateway (AgentCard + JSON-RPC agent surface)
+Documentation=https://gitlab.com/IsolatedOctopi/greenboost
+After=network.target greenboost-supervisor.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 /usr/local/lib/greenboost/gb_a2a.py serve
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gb-a2a
+Environment=GB_PY_ROOT=/usr/local/lib/greenboost
+# Loopback by default. For LAN access set a bind + a REQUIRED token:
+#   Environment=GB_A2A_BIND=0.0.0.0:8790
+#   Environment=GB_A2A_TOKEN=<secret>   # refuses non-loopback bind without this
+Environment=GB_A2A_BIND=127.0.0.1:8790
+# Actuation OFF by default (observe/dry-run). Opt in to real lever moves via:
+#   Environment=GB_ORCH_ACTUATE=1
+[Install]
+WantedBy=multi-user.target
+A2AEOF
+        systemctl daemon-reload
+        systemctl enable --now greenboost-a2a.service 2>/dev/null \
+            && gb_ok "greenboost-a2a.service enabled (loopback :8790, actuation gated OFF)" \
+            || gb_warn "a2a enable failed , run: sudo systemctl enable --now greenboost-a2a.service"
+    else
+        gb_warn "gb_a2a.py not installed , skipping A2A gateway unit"
+    fi
 }
 
 # Legacy entry-point kept so any external scripts that call cmd_install_recovery
@@ -3952,6 +4119,8 @@ do_purge() {
           /var/lib/greenboost/last_clean_boot \
           /var/lib/greenboost/vram_pressure
     rmdir /var/lib/greenboost 2>/dev/null || true
+    # Cluster topology registry cache (tmpfs; Full Install's gb_cluster writes it)
+    rm -f /run/greenboost/cluster_topology.json
     systemctl daemon-reload 2>/dev/null || true
 
     # 7. Strip GreenBoost env lines from service unit files
@@ -4122,6 +4291,11 @@ cmd_install_python_files() {
         gb_synapse_mcp.py gb_synapse_tools.py
         gb_dataflux_mcp.py
         gb_cluster_mcp.py
+        # Agent surface (2026-07-13): shared gated-actuation verbs + A2A gateway.
+        # gb_mcp/gb_cluster_mcp/gb_synapse_mcp import gb_actuation; gb_a2a serves
+        # the AgentCard + JSON-RPC over the same VERBS table.
+        gb_actuation.py
+        gb_a2a.py
         # Modules previously MISSING from this list although installed modules
         # import them at runtime (audit 2026-07-13): gb_prefetch (gb_init),
         # gb_topology (gb_orchestrator/gb_telemetry), gb_diffcache
@@ -9452,6 +9626,12 @@ install -m 755 greenboost-netd /usr/local/bin/greenboost-netd
 [ -f libgreenboost_netd_capture.so ] && install -m 755 libgreenboost_netd_capture.so /usr/local/lib/libgreenboost_netd_capture.so
 mkdir -p /etc/greenboost /run/greenboost /var/log/greenboost
 [ -f build_info ] && cp build_info /etc/greenboost/build_info
+# Regenerate this feeder's hardware profile from the just-pushed source so new
+# topology fields (VRAM bandwidth, net link speed, ...) propagate to the host
+# over GB_MSG_TOPOLOGY. Best-effort , a profile hiccup must not fail the netd
+# upgrade. This is what makes a feeder update fully propagate topology, not just
+# the netd binary.
+bash /tmp/gb_src/greenboost_setup.sh profile create >/tmp/gb_src/profile.log 2>&1 || true
 rm -f /run/greenboost/netd.pid
 setsid bash -c "nohup /usr/local/bin/greenboost-netd -d -p $PORT >>/var/log/greenboost/netd.log 2>&1 </dev/null &"
 for i in $(seq 1 25); do sleep 0.5; p=$(cat /run/greenboost/netd.pid 2>/dev/null); [ -n "$p" ] && kill -0 "$p" 2>/dev/null && { echo STARTED; exit 0; }; done
@@ -11675,6 +11855,12 @@ cmd_install_build_deps() {
         build-essential gcc gcc-multilib make git curl wget
         "linux-headers-$(uname -r)"
         kmod dkms
+        # cmake: required by the gb-synapse engine build (llama.cpp CMake).
+        # Previously absent from every dep path, so a fresh feeder Full Install
+        # crashed at the "Building gb-synapse engine" step with
+        # FileNotFoundError: 'cmake' (verified 2026-07-13, RTX 5070 laptop
+        # feeder). Required, not optional, so build-engine has its toolchain.
+        cmake
         # eBPF tracer build deps (clang/bpftool/libbpf , see
         # _gb_install_ebpf_tracer / `make BPF=1 ebpf`). Previously absent from
         # every install path, so the tracer silently skipped itself with a

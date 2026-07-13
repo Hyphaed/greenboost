@@ -427,6 +427,42 @@ def optimize_inference(model: str | None = None, ctx: int = 65536,
     return result
 
 
+# ── gated actuation (shared impl in gb_actuation; A2A uses the same funcs) ──
+
+@mcp.tool()
+def set_quant_policy(budget_gb: float | None = None, quality: str | None = None,
+                     confirm: bool = False) -> dict:
+    """ACTUATE (double-gated): set the quant policy the NEXT pipeline run reads
+    , GB_QUANT_BUDGET_GB and/or GB_QUALITY in the shared inference.env. Enforces
+    the fp8 floor (below-fp8 quality is surfaced as an explicit tradeoff, never
+    silent). This is the actuatable counterpart to quant_advisor's read-only
+    recommendation. DRY-RUN unless confirm=True AND GB_ORCH_ACTUATE=1."""
+    import gb_actuation
+    return gb_actuation.set_quant_policy(budget_gb=budget_gb, quality=quality,
+                                         confirm=confirm)
+
+
+@mcp.tool()
+def tier_actuate(lever: str, value: int, confirm: bool = False) -> dict:
+    """ACTUATE (double-gated): move a GB-Tiering lever via GbControl , one of
+    kv_reserve_mb, safety_reserve_gb, workstation_reserve_mb, virtual_vram_gb,
+    pool_cap_mb. DRY-RUN unless confirm=True AND GB_ORCH_ACTUATE=1; emits an
+    `actuation` event when applied. (Per-buffer promote/demote/evict is
+    in-process only and not remotable.)"""
+    import gb_actuation
+    return gb_actuation.tier_actuate(lever, value, confirm=confirm)
+
+
+@mcp.tool()
+def shim_env(workload: str = "diffusion", enabled: bool = True) -> dict:
+    """QUERY (no gate): the LD_PRELOAD env overlay that turns GreenBoost on for a
+    subprocess of `workload` type ("diffusion"|"llm"|...). Lets an agent obtain
+    the exact env to launch a GreenBoost-accelerated run without a Python
+    import , the missing "turn it on" surface for pipelines."""
+    import gb_actuation
+    return gb_actuation.shim_env(workload=workload, enabled=enabled)
+
+
 # ── selective re-exports: one server suffices day-to-day ────────────────────
 
 @mcp.tool()

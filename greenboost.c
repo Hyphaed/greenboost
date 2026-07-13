@@ -97,11 +97,11 @@ static int physical_vram_gb  =  0;  /* Physical GPU VRAM in GB (0 = auto-detecte
 
 /* Tier 2 */
 static int virtual_vram_gb   =  0;  /* System RAM pool cap in GB (0 = auto-detect: 70% if < 64 GB RAM, 80% if >= 64 GB) */
-static int safety_reserve_gb =  4;  /* Always keep ≥N GB free in system RAM (safe minimum) */
+static int safety_reserve_gb =  0;  /* Always keep ≥N GB free in system RAM. 0 = derive at init (8% of RAM, 6..32 GB) */
 
 /* Tier 3 - GreenBoost-managed backing file (replaces kernel swap for T3) */
 static int nvme_swap_gb      = 128; /* DEPRECATED: display-only. Functional T3 cap is nvme_pool_gb / t3_max_gb */
-static int nvme_pool_gb      = 120; /* Backward-compat alias for t3_max_gb; default 120 GB for 120B-class models */
+static int nvme_pool_gb      =   0; /* Backward-compat alias for t3_max_gb. 0 = T3 disabled until setup/ioctl configures a disk-derived cap (no hardcoded capacity) */
 static char *t3_file_path    = "/var/lib/greenboost/t3_store";
 static int   t3_max_gb       =   0; /* Max backing file size in GB (0=disk-limited) */
 
@@ -123,7 +123,7 @@ static int use_hugepages     =  1;  /* 2 MB compound pages (T2 only)    */
  * as additional headroom in gb_needs_overflow() so weights spill to T2
  * before consuming the reserved window.
  * Runtime writes: GB_IOCTL_SET_KV_RESERVE (Synapse CLI) or sysfs. */
-static int kv_reserve_mb     = 2048; /* default: 2 GB */
+static int kv_reserve_mb     =    0; /* 0 = derive at init from physical_vram_gb (VRAM*1024/6, min 512 MB) */
 
 /* Active profile name - set by greenboost_setup.sh at insmod time;
  * exposed via /sys/class/greenboost/greenboost/active_profile so Synapse
@@ -142,7 +142,8 @@ MODULE_PARM_DESC(virtual_vram_gb,
 
 module_param(safety_reserve_gb, int, 0644);
 MODULE_PARM_DESC(safety_reserve_gb,
-	"Tier 2: Minimum free system RAM in GB to always keep reserved (default: 4). "
+	"Tier 2: Minimum free system RAM in GB to always keep reserved. "
+	"0 = derive at init (8%% of total RAM, clamped 6..32 GB). "
 	"Writable: echo N > /sys/module/greenboost/parameters/safety_reserve_gb");
 
 module_param(nvme_swap_gb,      int, 0444);
@@ -152,7 +153,8 @@ MODULE_PARM_DESC(nvme_swap_gb,
 
 module_param(nvme_pool_gb,      int, 0444);
 MODULE_PARM_DESC(nvme_pool_gb,
-	"Tier 3: backward-compat alias for t3_max_gb (default: 120) - sized for 120B-class model support");
+	"Tier 3: backward-compat alias for t3_max_gb. 0 = T3 disabled until setup/ioctl "
+	"configures a disk-derived cap (no hardcoded capacity)");
 
 module_param(t3_file_path, charp, 0444);
 MODULE_PARM_DESC(t3_file_path,
@@ -201,7 +203,8 @@ MODULE_PARM_DESC(active_profile_name,
 
 module_param(kv_reserve_mb, int, 0644);
 MODULE_PARM_DESC(kv_reserve_mb,
-	"MB of T1 VRAM reserved for KV cache (default: 2048). "
+	"MB of T1 VRAM reserved for KV cache. 0 = derive at init from physical_vram_gb "
+	"(VRAM*1024/6, min 512 MB; reproduces 2048 on a 12 GB card). "
 	"The CUDA shim adds this to vram_headroom so weights overflow to T2 sooner, "
 	"keeping VRAM free for the KV cache which runs on every generation step. "
 	"Update at runtime: GB_IOCTL_SET_KV_RESERVE (Synapse CLI) or sysfs.");
@@ -3395,28 +3398,41 @@ static char *gb_devnode(struct device *dev, umode_t *mode)
 static int __init gb_init(void)
 {
 	int ret;
+	struct sysinfo _si;
+	u64 total_gb;
+
+	si_meminfo(&_si);
+	total_gb = ((u64)_si.totalram * _si.mem_unit) >> 30;
+
+	/* Derive safety_reserve_gb whenever it is unset (0), INDEPENDENT of whether
+	 * virtual_vram_gb was passed explicitly - a flat host-shaped default (was 4)
+	 * defeated this on any node whose T2 cap was set by modprobe.conf. Scale to
+	 * 8% of total RAM (min 6 GB, max 32 GB). Flat 4 GB was insufficient on
+	 * 64 GB+ systems - a 9 GB alloc with 13 GB MemAvailable passed the guard
+	 * (13-9=4≥4) while UVM had silently consumed more. */
+	if (safety_reserve_gb <= 0) {
+		safety_reserve_gb = (int)((total_gb * 8 + 99) / 100);
+		if (safety_reserve_gb < 6)  safety_reserve_gb = 6;
+		if (safety_reserve_gb > 32) safety_reserve_gb = 32;
+	}
+
+	/* Derive kv_reserve_mb from the card's own VRAM when unset (0), so a bare
+	 * `insmod` never reserves a fixed host-shaped 2 GB on a small card. VRAM is
+	 * knowable in-kmod via the physical_vram_gb param passed at load. Same
+	 * formula as gb_topology._parse_profile: max(512, VRAM*1024/6) - reproduces
+	 * the old 2048 exactly on the 12 GB reference card. */
+	if (kv_reserve_mb <= 0) {
+		kv_reserve_mb = physical_vram_gb > 0
+			? (int)((u64)physical_vram_gb * 1024 / 6)
+			: 512;
+		if (kv_reserve_mb < 512)
+			kv_reserve_mb = 512;
+	}
 
 	/* Auto-detect T2 pool cap when virtual_vram_gb == 0 (no modprobe.conf or
-	 * explicit override). Adaptive DDR limit:
-	 *   total RAM <  64 GB  ->  70% of total RAM
-	 *   total RAM >= 64 GB  ->  80% of total RAM
+	 * explicit override). Adaptive DDR limit: 74% for >=64 GB RAM, 68% below.
 	 * safety_reserve_gb is enforced at alloc time by gb_alloc_buf(). */
 	if (virtual_vram_gb == 0) {
-		struct sysinfo _si;
-		u64 total_gb;
-
-		si_meminfo(&_si);
-		total_gb = ((u64)_si.totalram * _si.mem_unit) >> 30;
-
-		/* Auto-adjust safety_reserve_gb: scale to 8% of total RAM (min 6 GB, max 32 GB).
-		 * Flat 4 GB was insufficient on 64 GB+ systems - a 9 GB alloc with 13 GB
-		 * MemAvailable passed the guard (13-9=4≥4) while UVM had silently consumed more. */
-		if (safety_reserve_gb <= 0) {
-			safety_reserve_gb = (int)((total_gb * 8 + 99) / 100);
-			if (safety_reserve_gb < 6)  safety_reserve_gb = 6;
-			if (safety_reserve_gb > 32) safety_reserve_gb = 32;
-		}
-
 		/* Pool sizing: 74% for ≥64 GB, 68% for <64 GB.
 		 * Previous 80/70% left too little headroom for the OS and UVM demand-paging,
 		 * causing DDR to hit 100% under large model loads. */

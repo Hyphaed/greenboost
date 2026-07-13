@@ -2068,7 +2068,7 @@ cmd_install_build_deps() {
 
     (( _idx++ )); _dep_bar $_idx "${_groups[$_idx-1]}"
     dnf install -y -q \
-        gcc make git curl wget \
+        gcc gcc-c++ make cmake git curl wget \
         "kernel-headers-$(uname -r)" \
         pkg-config sysfsutils kmod 2>/dev/null || true
 

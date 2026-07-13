@@ -20,23 +20,6 @@
 
 ## v3.2 : 2026-07-12
 
-I want to explain the thinking behind this release before listing what's in
-it, because it's the reason GreenBoost exists at all. I don't like accepting
-hardware limits as a fact of life. When a GPU runs out of VRAM, the "normal"
-answer is to buy a bigger GPU. My answer has always been: find the memory
-somewhere else first, and keep using the card I already have. That's what T2
-(system RAM) and T3 (NVMe) already do. v3.2's big theme is doing the same
-thing one level further out: if there's a second machine with a GPU sitting
-idle on the network, that's more VRAM and more compute too, not a separate
-box you have to manage by hand.
-
-If that sounds like an odd thing to insist on, look at DLSS. DLSS doesn't add
-a single transistor to a GPU, yet a card from three years ago suddenly renders
-like a newer one because the software got smarter about using the silicon
-that's already there. That's not a gimmick, it's proof that software can be
-enhnace/improve the output of already owned hardware. GreenBoost is built
-on the same bet, applied to memory and compute.
-
 ### Polished through real use, not just benchmarks
 
 Almost everything released came out of running GreenBoost on

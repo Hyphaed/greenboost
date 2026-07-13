@@ -503,6 +503,13 @@ class GpuMetrics:
     fb_free_mb: int        = 0
     fb_total_mb: int       = 0
     fb_used_pct: float     = 0.0
+    # RULE #1 truth: real PHYSICAL VRAM (not the inflated virtual device total
+    # NVML/torch report under the shim). fb_phys_used_pct is the ~90%-fill
+    # signal; the virtual fb_* above stay as-is for Ollama device-view consumers.
+    fb_phys_total_mb: int  = 0
+    fb_phys_free_mb: int   = 0
+    fb_phys_used_mb: int   = 0
+    fb_phys_used_pct: float = 0.0
     # Compute (DCGM FI 100)
     sm_clock_mhz: int      = 0
     gpu_util_pct: float    = 0.0   # SM compute utilization 0-100% (NVML util.gpu / heartbeat)
@@ -1181,11 +1188,32 @@ class GreenBoostProvider(_Provider):
                 if fresh:
                     if kv.get("phase"):
                         m.shim_phase = kv["phase"]
+                    # RULE #1 truth: physical VRAM fill from the shim's real
+                    # (un-hooked) cuMemGetInfo cache. Under the shim, NVML/torch
+                    # report the inflated virtual total, so the virtual fb_*
+                    # percentage is meaningless for the ~90%-fill target. Prefer
+                    # these physical fields for any fill-based decision.
+                    _phys_total = int(_sf("physical_vram_mb"))
+                    _phys_free  = int(_sf("physical_vram_free_mb"))
+                    if _phys_total:
+                        m.fb_phys_total_mb = _phys_total
+                        m.fb_phys_free_mb  = _phys_free
+                        m.fb_phys_used_mb  = max(0, _phys_total - _phys_free)
+                        m.fb_phys_used_pct = 100.0 * m.fb_phys_used_mb / _phys_total
                     if m.gb is not None:
-                        if not m.gb.kv_reserve_mb:
-                            m.gb.kv_reserve_mb = int(_sf("kv_reserve_effective_mb"))
+                        # kv_reserve: the shim's EFFECTIVE reserve is
+                        # authoritative (reconciles the status-vs-shim_stats
+                        # 2048-vs-704 disagreement); always trust it when fresh.
+                        _kv_rsv = int(_sf("kv_reserve_effective_mb"))
+                        if _kv_rsv:
+                            m.gb.kv_reserve_mb = _kv_rsv
                         if not m.gb.kv_used_mb:
-                            m.gb.kv_used_mb = int(_sf("kv_t1_tracked_mb"))
+                            # Prefer the shim's read-only effective estimate
+                            # (real decode-time KV inferred from physical free
+                            # VRAM when the tracked counter is a stuck 0); fall
+                            # back to the tracked counter on older shims.
+                            m.gb.kv_used_mb = int(_sf("kv_t1_effective_mb")
+                                                  or _sf("kv_t1_tracked_mb"))
                         if not m.gb.t2_allocated_mb:
                             m.gb.t2_allocated_mb = int(_sf("tier_t2_local_cur_mb"))
         except Exception:

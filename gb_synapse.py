@@ -163,6 +163,9 @@ def fetch_engine_source(remote: str = LLAMA_CPP_REMOTE, src_dir: Path = ENGINE_S
     function is how `greenboost synapse update-engine` tracks upstream
     github.com/ggml-org/llama.cpp going forward.
     """
+    if not shutil.which("git"):
+        raise RuntimeError("gb-synapse engine fetch needs git: "
+                           + _install_hint("git") + "   (or: sudo greenboost install-deps)")
     src_dir = Path(src_dir)
     if not (src_dir / ".git").exists():
         src_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -177,6 +180,66 @@ def fetch_engine_source(remote: str = LLAMA_CPP_REMOTE, src_dir: Path = ENGINE_S
         _run(["git", "-C", str(src_dir), "reset", "--hard", f"origin/{branch}"])
     return _run(["git", "-C", str(src_dir), "describe", "--always", "--dirty"],
                 capture=True).stdout.strip()
+
+
+def _install_hint(pkgs: str) -> str:
+    """Distro-appropriate one-liner to install `pkgs` (space-separated).
+    Mirrors the per-distro logic in greenboost_setup.sh check_deps()."""
+    distro_id = ""
+    try:
+        for line in Path("/etc/os-release").read_text().splitlines():
+            if line.startswith("ID="):
+                distro_id = line.split("=", 1)[1].strip().strip('"').lower()
+                break
+    except Exception:
+        pass
+    if distro_id in ("arch", "manjaro", "endeavouros"):
+        return f"sudo pacman -S {pkgs}"
+    if distro_id in ("fedora", "rhel", "rocky", "almalinux", "centos"):
+        return f"sudo dnf install {pkgs}"
+    if distro_id in ("opensuse", "opensuse-leap", "opensuse-tumbleweed", "sles"):
+        return f"sudo zypper install {pkgs}"
+    return f"sudo apt install {pkgs}"  # debian/ubuntu default
+
+
+def _preflight_build_tools(need_nvcc: bool = True) -> None:
+    """Verify the gb-synapse engine build toolchain is present BEFORE invoking
+    cmake, so a missing tool produces one actionable line instead of a raw
+    Python traceback. Fresh feeder Full Install crashed here with
+    FileNotFoundError: 'cmake' (2026-07-13) because cmake was in no dep path.
+
+    Collects ALL missing tools before raising. Emits a dataflux
+    synapse_build_preflight error (best-effort) so the gap is visible in the
+    greenboost-dataflux MCP (Observability Must-Rule)."""
+    missing: list[str] = []
+    hints: list[str] = []
+    if not shutil.which("cmake"):
+        missing.append("cmake")
+        hints.append(_install_hint("cmake") + "   (or: sudo greenboost install-deps)")
+    if not shutil.which("git"):
+        missing.append("git")
+        hints.append(_install_hint("git"))
+    if not (shutil.which("g++") or shutil.which("c++") or shutil.which("clang++")):
+        missing.append("C++ compiler (g++)")
+        cxx_pkg = "gcc-c++" if "dnf" in _install_hint("") else "build-essential"
+        hints.append(_install_hint(cxx_pkg))
+    if need_nvcc:
+        nvcc = _find_nvcc()
+        if not (Path(nvcc).exists() or shutil.which(nvcc)):
+            missing.append("nvcc")
+            hints.append("install the CUDA toolkit, or set GB_SYNAPSE_NVCC=/path/to/nvcc")
+    if not missing:
+        return
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({"node": "host", "label": "synapse",
+                          "kind": "synapse_build_preflight", "status": "error",
+                          "missing": missing})
+    except Exception:
+        pass
+    raise RuntimeError(
+        "gb-synapse engine build prerequisites missing: " + ", ".join(missing)
+        + "\n  " + "\n  ".join(hints))
 
 
 def build_engine(src_dir: Path = ENGINE_SRC_DIR, install_dir: Path = ENGINE_DIR,
@@ -194,6 +257,7 @@ def build_engine(src_dir: Path = ENGINE_SRC_DIR, install_dir: Path = ENGINE_DIR,
     llama-quantize is what lets pull() serve HF repos with no GGUF release —
     see _pull_and_convert().
     """
+    _preflight_build_tools(need_nvcc=True)
     src_dir = Path(src_dir)
     if not src_dir.exists():
         raise RuntimeError(f"llama.cpp source not found at {src_dir}; "
@@ -1184,6 +1248,12 @@ def _pcore_threads() -> int:
     greenboost_setup.sh autodetect); falls back to half of os.cpu_count()
     (a reasonable P-core approximation on heterogeneous CPUs) if the profile
     is absent or unparseable.
+
+    HOST-only by design: this sets llama-server's own --threads, which runs on
+    the host. The feeder's rpc-server has no upstream thread flag, so per-feeder
+    P-core counts (now in the cluster topology registry) are applied via
+    gb_cluster.feeder_env's OMP_NUM_THREADS/GB_FEEDER_THREADS for torch stages,
+    not here. Don't "fix" this to read a feeder's topology.
     """
     try:
         profile = Path("/etc/greenboost/profiles/default.md")
@@ -1544,10 +1614,21 @@ def _compute_tensor_split(host_free_mb: int, online_feeders: list,
     # and the load died there, not on the host that had room to spare.
     # Reserve is %-derived PER DEVICE (rule): feeders report t1_total_mb; the
     # host's free VRAM stands in for its total here (conservative, never over).
+    def _feeder_vram_mb(f) -> int:
+        """A feeder's free-VRAM figure for the split. Prefers live t1_free_mb;
+        when that's 0 (older mem_info reply that carried no per-tier bytes),
+        fall back to the node's topology vram_gb so it still gets a real share
+        instead of being handed a share=1 sliver."""
+        if f.t1_free_mb > 0:
+            return f.t1_free_mb
+        topo = getattr(f, "topology", None) or {}
+        vram_gb = topo.get("vram_gb", 0)
+        return int(vram_gb) * 1024 if vram_gb else 0
+
     free = [max(int(host_free_mb - _compute_reserve_gb(host_free_mb) * 1024.0), 1)] + \
-           [max(int(f.t1_free_mb
+           [max(int(_feeder_vram_mb(f)
                     - _compute_reserve_gb(getattr(f, "t1_total_mb", 0)
-                                          or f.t1_free_mb) * 1024.0), 1)
+                                          or _feeder_vram_mb(f)) * 1024.0), 1)
             for f in online_feeders]
     v2 = os.environ.get("GB_SYNAPSE_SPLIT_V2", "") == "1"
     try:
