@@ -557,3 +557,55 @@ class ScanSignal(Signal):
 def scan(fn: Callable[[Any, Any], Any], seed: Any) -> Callable[[Signal], ScanSignal]:
     """Rx scan operator factory , use with Signal.pipe()."""
     return lambda source: ScanSignal(source, fn, seed)
+
+
+class PidController:
+    """Standard clamped PID controller (MuxFlow port — DI-6, see
+    workflow/porting-reference.md §DI-6). Continuous, proportional-response
+    complement to Signal's discrete enter/exit hysteresis: where a Signal
+    decides WHETHER a loop reacts at all (bang-bang, debounced), a
+    PidController decides HOW MUCH — e.g. scaling a KV-grow step or a
+    prefetch-throttle duty cycle smoothly toward a setpoint instead of a
+    fixed halve/restore jump.
+
+    setpoint and every gain must be derived from MEASURED state at the call
+    site (e.g. gb_orchestrator's `_sm_clock_max` ratchet), never a hardcoded
+    absolute value (rule) — this class itself has no hardware knowledge, it
+    only does the arithmetic.
+
+    Anti-windup: the integral term is clamped to [out_min, out_max] / max(ki,
+    epsilon) so a long-saturated error can't leave a huge integral that then
+    overshoots once the process recovers (the classic PID windup failure).
+    """
+
+    def __init__(self, kp: float, ki: float, kd: float, setpoint: float,
+                out_min: float = 0.0, out_max: float = 1.0) -> None:
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.setpoint = setpoint
+        self.out_min, self.out_max = out_min, out_max
+        self._integral = 0.0
+        self._prev_error: Optional[float] = None
+        self._lock = threading.Lock()
+
+    def reset(self) -> None:
+        with self._lock:
+            self._integral = 0.0
+            self._prev_error = None
+
+    def update(self, measured: float, dt: float) -> float:
+        """One control step. dt in seconds (must be > 0 — the caller's poll
+        interval). Returns the clamped control output in [out_min, out_max]."""
+        if dt <= 0:
+            dt = 1e-6
+        with self._lock:
+            error = self.setpoint - measured
+            self._integral += error * dt
+            # Anti-windup clamp: bound the integral's own contribution to the
+            # output range so it can never alone exceed [out_min, out_max].
+            if self.ki > 0:
+                i_bound = (self.out_max - self.out_min) / self.ki
+                self._integral = max(-i_bound, min(i_bound, self._integral))
+            derivative = 0.0 if self._prev_error is None else (error - self._prev_error) / dt
+            self._prev_error = error
+            output = self.kp * error + self.ki * self._integral + self.kd * derivative
+            return max(self.out_min, min(self.out_max, output))

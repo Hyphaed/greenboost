@@ -183,6 +183,28 @@ class GbPoolInfo:
     pcie_link_gen: int   = 0   # negotiated PCIe gen on the feeder link
     pcie_link_width: int = 0   # negotiated PCIe width on the feeder link
     pcie_effective_bw_mbs: int = 0  # measured effective feeder link BW MB/s
+    # D-PCIE-CEIL , real slot ceiling on the FEEDER side (parent PCI bridge,
+    # not the feeder GPU's silicon max , same false-"degraded" trap as the
+    # local GpuTopology, fixed there 2026-07-14). 0 = unknown (feeder predates
+    # this fix); RemoteFeederProvider falls back to max=current in that case,
+    # never fabricates a ceiling.
+    pcie_link_gen_max: int   = 0
+    pcie_link_width_max: int = 0
+
+    @property
+    def pcie_degraded(self) -> bool:
+        """True when the FEEDER's link runs narrower than its slot ceiling.
+
+        Width-only (unlike GpuTopology.pcie_degraded): GbPoolInfo carries no
+        GPU-activity signal to gate a gen comparison against ASPM idle
+        downclock, so , to stay biased away from false alarms , only the
+        width axis (which does not fluctuate with power state) is checked.
+        False whenever the ceiling is unknown (0), never a false positive.
+        """
+        return bool(
+            self.pcie_link_width_max
+            and self.pcie_link_width < self.pcie_link_width_max
+        )
 
 
 # PCIe encoding efficiency per generation (GB/s per lane, one direction).
@@ -213,13 +235,29 @@ class GpuTopology:
     # CUDA compute capability (major, minor).
     compute_capability: Tuple[int, int] = (0, 0)
 
-    # Negotiated PCIe link (what the slot actually runs at).
+    # Negotiated PCIe link (what the slot actually runs at, sampled once at
+    # probe time , see pcie_active below for why this is idle-biased).
     pcie_gen_current: int     = 4
     pcie_width_current: int   = 16
 
-    # Device-maximum PCIe link (what the GPU silicon supports).
+    # Achievable PCIe ceiling: min(GPU silicon max, physical slot max).  NVML's
+    # Max* calls report what the GPU CHIP supports (nvml.h: MaxPcieLinkGeneration
+    # already accounts for the bus's link *speed*, but MaxPcieLinkWidth does NOT
+    # account for the slot's *lane count* , a x16-capable chip wired into a x8
+    # slot, e.g. most laptop dGPUs, still reports width_max=16). Clamped against
+    # the parent PCI bridge's real max_link_speed/max_link_width in
+    # _probe_gpu_topology so this is the true ceiling, not a silicon fantasy.
     pcie_gen_max: int         = 4
     pcie_width_max: int       = 16
+
+    # Was the GPU doing compute work (util.gpu > 0) at the moment this topology
+    # was probed?  PCIe *gen* (not width) legitimately downtrains to Gen1/Gen2
+    # under ASPM idle power states (P5/P8) and only retrains to the real
+    # ceiling under load. Since probing happens exactly ONCE at NVMLProvider
+    # init , almost always before any inference workload starts , a gen
+    # mismatch caught here is overwhelmingly an idle-downclock artifact, not a
+    # fault. pcie_degraded only trusts the gen comparison when this is True.
+    pcie_active: bool         = True
 
     # Active NVLink connections.
     nvlink_count: int         = 0
@@ -267,14 +305,19 @@ class GpuTopology:
 
     @property
     def pcie_degraded(self) -> bool:
-        """True when the slot is running below device maximum.
+        """True when the slot is running below its real achievable ceiling.
 
-        Common causes: x8 slot, PCIe gen mismatch, or bifurcation.
-        Logged as a one-time advisory; does not block inference.
+        Width is the reliable signal: unlike gen, it does not change with GPU
+        power state, so any width_current < width_max (against the slot-clamped
+        ceiling, see pcie_width_max) is a genuine wiring/bifurcation issue.
+        Gen is only trusted when the GPU was active at probe time (pcie_active)
+        , otherwise a gen mismatch is just ASPM idle downclock (P5/P8), not a
+        fault, and must not be flagged.  Logged as a one-time advisory; never
+        blocks inference.
         """
         return (
-            self.pcie_gen_current < self.pcie_gen_max
-            or self.pcie_width_current < self.pcie_width_max
+            self.pcie_width_current < self.pcie_width_max
+            or (self.pcie_gen_current < self.pcie_gen_max and self.pcie_active)
         )
 
     @property
@@ -294,6 +337,58 @@ def _sysfs_bdf(bdf: str) -> str:
         # Strip leading 4 hex chars from the 8-char domain
         return m.group(1)[4:] + ":" + m.group(2)
     return bdf
+
+
+# GT/s → PCIe generation thresholds, read off the low end of each generation's
+# encoding rate. Mirrors greenboost_setup.sh's `_gts_to_gen()` bash helper
+# (search "PCIe link (GPU slot)" in that file) , ONE shared mapping, kept in
+# sync deliberately; update both places together if a new PCIe gen ships.
+_PCIE_GTS_TO_GEN: Tuple[Tuple[float, int], ...] = (
+    (64.0, 6), (32.0, 5), (16.0, 4), (8.0, 3), (5.0, 2), (1.0, 1),
+)
+
+
+def _gts_to_pcie_gen(speed_str: str) -> int:
+    """Map a sysfs '<N>.0 GT/s PCIe' string to a PCIe generation number.
+
+    Returns 0 when the string is empty/unparsable (never raises).
+    """
+    m = re.match(r'\s*([\d.]+)', speed_str or "")
+    if not m:
+        return 0
+    gts = float(m.group(1))
+    for threshold, gen in _PCIE_GTS_TO_GEN:
+        if gts >= threshold:
+            return gen
+    return 0
+
+
+def _slot_pcie_ceiling(sysfs_bdf: str) -> Optional[Tuple[int, int]]:
+    """Read the (gen, width) ceiling of the PHYSICAL SLOT the GPU is wired
+    into, from the parent PCI bridge's max_link_speed/max_link_width.
+
+    This is the real achievable ceiling , distinct from the GPU SILICON's own
+    max (NVML Max* calls), which per nvml.h accounts for the bus's link
+    *speed* ceiling but NOT its *lane count*: a x16-capable chip physically
+    wired into a x8 slot (the common laptop dGPU layout) still reports
+    MaxPcieLinkWidth=16, which manufactures a permanent false "degraded"
+    reading. Mirrors the parent-bridge read greenboost_setup.sh already
+    performs at install time for the same reason.
+
+    Returns None when sysfs is unreadable (container, non-Linux, permissions,
+    unknown BDF) , callers must fail soft and keep the NVML-reported max.
+    """
+    try:
+        parent = Path(f"/sys/bus/pci/devices/{sysfs_bdf}").resolve().parent
+        speed = (parent / "max_link_speed").read_text().strip()
+        width_txt = (parent / "max_link_width").read_text().strip()
+    except Exception:
+        return None
+    gen = _gts_to_pcie_gen(speed)
+    width = int(re.sub(r"[^\d]", "", width_txt) or 0)
+    if gen <= 0 or width <= 0:
+        return None
+    return gen, width
 
 
 def _probe_gpu_topology(pynvml_mod: object, handle: object, device: int) -> Optional[GpuTopology]:
@@ -361,6 +456,29 @@ def _probe_gpu_topology(pynvml_mod: object, handle: object, device: int) -> Opti
         width_max = int(nv.nvmlDeviceGetMaxPcieLinkWidth(handle))
     except Exception:
         width_max = width_cur
+
+    # Clamp against the PHYSICAL SLOT's ceiling (see _slot_pcie_ceiling
+    # docstring) , fixes the false "gen4x16" target on any GPU wired into a
+    # narrower slot than its silicon supports (laptops, risers, bifurcated
+    # boards). Fails soft to the NVML-reported max when sysfs is unreadable.
+    if bdf:
+        ceiling = _slot_pcie_ceiling(_sysfs_bdf(bdf))
+        if ceiling is not None:
+            slot_gen_max, slot_width_max = ceiling
+            gen_max = min(gen_max, slot_gen_max)
+            width_max = min(width_max, slot_width_max)
+
+    # Was the GPU active (doing compute) at probe time?  See GpuTopology.
+    # pcie_active docstring , gen_cur legitimately idles below gen_max under
+    # ASPM power saving, so a mismatch caught while idle must not be trusted.
+    # Default False (no gen flag) when utilization can't be read , bias away
+    # from false alarms, never toward them.
+    pcie_active = False
+    try:
+        util = nv.nvmlDeviceGetUtilizationRates(handle)
+        pcie_active = int(util.gpu) > 0
+    except Exception:
+        pass
 
     # ── NVLink ───────────────────────────────────────────────────────────────
     nvlink_count = 0
@@ -441,6 +559,7 @@ def _probe_gpu_topology(pynvml_mod: object, handle: object, device: int) -> Opti
         pcie_gen_max=gen_max,
         pcie_width_current=width_cur,
         pcie_width_max=width_max,
+        pcie_active=pcie_active,
         nvlink_count=nvlink_count,
         nvlink_peer_ids=tuple(nvlink_peer_ids),
         p2p_device_ids=tuple(p2p_device_ids),
@@ -486,8 +605,80 @@ class SystemMetrics:
     psi_mem_some_avg10: float = 0.0
     psi_mem_full_avg10: float = 0.0
     psi_io_some_avg10: float  = 0.0
+    mem_total_mb: int         = 0     # /proc/meminfo MemTotal
     mem_available_mb: int     = 0     # /proc/meminfo MemAvailable
+    swap_total_mb: int        = 0     # /proc/meminfo SwapTotal
     swap_used_mb: int         = 0
+
+
+def read_meminfo_mb() -> tuple[int, int, int, int]:
+    """
+    Read (mem_total_mb, mem_available_mb, swap_total_mb, swap_used_mb) from
+    /proc/meminfo. Zeros on any error (containers without the file, etc.).
+
+    Shared by SystemProvider.fill() (per-tick GpuMetrics.sys) and
+    gb_supervisor's system-RAM-pressure monitor (which reads this directly ,
+    it runs before any inference process may exist to populate telemetry).
+
+    NOTE: this is system-wide RAM/swap, distinct from GreenBoost's own T2 DDR
+    pool accounting (GbPoolInfo.t2_*) , CPU-offloaded PyTorch processes
+    (e.g. `--offload cpu` streaming) consume ordinary host RAM/swap without
+    ever going through the shim's T2 cudaMallocManaged path, so GreenBoost's
+    T2 pool can read 0 while system swap is heavily used. Do NOT apply a
+    MemAvailable guard to the T2 pool itself (pre-committed by greenboost.ko,
+    not reflected in /proc/meminfo) , this function is only for the separate
+    "is the whole machine under RAM pressure" signal.
+    """
+    mem_total_kb = mem_avail_kb = swap_total_kb = swap_free_kb = 0
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    mem_total_kb = int(line.split()[1])
+                elif line.startswith("MemAvailable:"):
+                    mem_avail_kb = int(line.split()[1])
+                elif line.startswith("SwapTotal:"):
+                    swap_total_kb = int(line.split()[1])
+                elif line.startswith("SwapFree:"):
+                    swap_free_kb = int(line.split()[1])
+    except Exception:
+        return 0, 0, 0, 0
+    swap_used_kb = max(0, swap_total_kb - swap_free_kb)
+    return (mem_total_kb // 1024, mem_avail_kb // 1024,
+            swap_total_kb // 1024, swap_used_kb // 1024)
+
+
+# ── NVML clock-throttle-reason bitmask (official values, NVML API Reference
+# Guide vR595 §nvmlClocksThrottleReasons*) ───────────────────────────────────
+# GpuIdle/ApplicationsClocksSetting/SyncBoost/DisplayClockSetting are NORMAL,
+# expected states (a GPU idling between bursts is supposed to downclock) ,
+# they are not evidence of anything holding the GPU back from doing more
+# work.  Only the four bits below indicate the GPU actually being slowed by
+# thermal/power constraints; that is the ground truth "is this GPU really
+# throttled right now" signal , read it directly instead of inferring
+# throttling from a clock-vs-observed-peak ratio (which is unreliable at low
+# utilization: an idle GPU legitimately runs well below its peak clock with
+# no throttling involved at all).
+NVML_CLOCKS_THROTTLE_REASON_SW_POWER_CAP           = 0x0000000000000004
+NVML_CLOCKS_THROTTLE_REASON_HW_SLOWDOWN            = 0x0000000000000008
+NVML_CLOCKS_THROTTLE_REASON_SW_THERMAL_SLOWDOWN    = 0x0000000000000020
+NVML_CLOCKS_THROTTLE_REASON_HW_THERMAL_SLOWDOWN    = 0x0000000000000040
+NVML_CLOCKS_THROTTLE_REASON_HW_POWER_BRAKE_SLOWDOWN = 0x0000000000000080
+NVML_CLOCKS_THROTTLE_REASON_REAL_MASK = (
+    NVML_CLOCKS_THROTTLE_REASON_SW_POWER_CAP
+    | NVML_CLOCKS_THROTTLE_REASON_HW_SLOWDOWN
+    | NVML_CLOCKS_THROTTLE_REASON_SW_THERMAL_SLOWDOWN
+    | NVML_CLOCKS_THROTTLE_REASON_HW_THERMAL_SLOWDOWN
+    | NVML_CLOCKS_THROTTLE_REASON_HW_POWER_BRAKE_SLOWDOWN
+)
+
+
+def is_real_throttle(throttle_reasons: int) -> bool:
+    """True iff NVML reports a genuine thermal/power throttle reason , never
+    true for GpuIdle/ApplicationsClocksSetting/SyncBoost/DisplayClockSetting,
+    which are normal states, not throttling.  0 (unset/unsupported) → False,
+    the conservative default when the bitmask can't be read at all."""
+    return bool(throttle_reasons & NVML_CLOCKS_THROTTLE_REASON_REAL_MASK)
 
 
 @dataclass
@@ -659,6 +850,27 @@ class GpuMetrics:
         memory users.  Loop Q uses this to tighten vm.* tunables.
         """
         return bool(self.sys and self.sys.psi_mem_some_avg10 > 10.0)
+
+    @property
+    def ram_available_pct(self) -> float:
+        """% of total system RAM currently available (MemAvailable/MemTotal).
+
+        0.0 when unknown (SystemProvider absent, e.g. containers without
+        /proc/meminfo). Raw data only , see gb_supervisor.py's _RamMonitor
+        for the WARN/CRITICAL policy thresholds and the persisted
+        /var/lib/greenboost/ram_pressure file consumers should check before
+        launching new CPU-offload-heavy work.
+        """
+        if not self.sys or self.sys.mem_total_mb <= 0:
+            return 0.0
+        return 100.0 * self.sys.mem_available_mb / self.sys.mem_total_mb
+
+    @property
+    def swap_used_pct(self) -> float:
+        """% of total swap currently used. 0.0 when unknown or no swap configured."""
+        if not self.sys or self.sys.swap_total_mb <= 0:
+            return 0.0
+        return 100.0 * self.sys.swap_used_mb / self.sys.swap_total_mb
 
     @property
     def io_pressure_high(self) -> bool:
@@ -1344,21 +1556,10 @@ class SystemProvider(_Provider):
         sys_m.psi_mem_full_avg10 = _psi_avg10("/proc/pressure/memory", "full")
         sys_m.psi_io_some_avg10  = _psi_avg10("/proc/pressure/io", "some")
 
-        # ── MemAvailable / swap used ──────────────────────────────────────────
-        try:
-            mem_total_kb = mem_avail_kb = swap_total_kb = swap_free_kb = 0
-            with open("/proc/meminfo") as f:
-                for line in f:
-                    if line.startswith("MemAvailable:"):
-                        mem_avail_kb = int(line.split()[1])
-                    elif line.startswith("SwapTotal:"):
-                        swap_total_kb = int(line.split()[1])
-                    elif line.startswith("SwapFree:"):
-                        swap_free_kb = int(line.split()[1])
-            sys_m.mem_available_mb = mem_avail_kb // 1024
-            sys_m.swap_used_mb = max(0, swap_total_kb - swap_free_kb) // 1024
-        except Exception:
-            pass
+        # ── MemAvailable / swap , shared reader (also used by gb_supervisor's
+        # RAM-pressure monitor) ────────────────────────────────────────────
+        (sys_m.mem_total_mb, sys_m.mem_available_mb,
+         sys_m.swap_total_mb, sys_m.swap_used_mb) = read_meminfo_mb()
 
         m.sys = sys_m
 
@@ -1443,6 +1644,12 @@ class RemoteFeederProvider(_Provider):
             p_gen  = int(fd.get("pcie_link_gen", 0))
             p_wid  = int(fd.get("pcie_link_width", 0))
             p_bw   = int(fd.get("pcie_effective_bw_mbs", fd.get("bw_measured_mbs", 0)))
+            # D-PCIE-CEIL: real slot ceiling from the feeder's parent PCI
+            # bridge (0 = feeder predates 2026-07-14 → fall back to
+            # max=current, i.e. "assume no degradation" rather than fabricate
+            # a silicon-max ceiling that was never the true achievable limit).
+            p_gen_max = int(fd.get("pcie_link_gen_max", 0)) or p_gen
+            p_wid_max = int(fd.get("pcie_link_width_max", 0)) or p_wid
             if t2_mts or t3_mbs or p_gen or p_bw:
                 if m.gb is None:
                     m.gb = GbPoolInfo()
@@ -1451,6 +1658,8 @@ class RemoteFeederProvider(_Provider):
                 m.gb.pcie_link_gen         = p_gen
                 m.gb.pcie_link_width       = p_wid
                 m.gb.pcie_effective_bw_mbs = p_bw
+                m.gb.pcie_link_gen_max     = p_gen_max
+                m.gb.pcie_link_width_max   = p_wid_max
             # Health: health_state 0=HEALTHY, >0=degraded/quarantined/disabled
             health_st = int(fd.get("health_state", 0))
             if health_st >= 2:          # UNHEALTHY or worse

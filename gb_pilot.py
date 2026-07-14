@@ -33,6 +33,8 @@ import time
 # drops below (1 - REGRESSION_PCT) of its average.
 REGRESSION_PCT = 0.20
 MIN_SAMPLES = 3          # below this, trends are noise — report, don't flag
+REBALANCE_DROP_PCT = 25.0  # DI-13: stricter than REGRESSION_PCT — a rebalance
+                           # advisory is a bigger ask (re-serve) than a generic warn
 
 
 # ── analysis (pure functions over event lists — the testable core) ──────────
@@ -51,12 +53,16 @@ def analyze(events: list) -> dict:
     stages: dict = {}
     models: dict = {}
     last_snap: dict = {}
+    last_split: dict = {}
     errors: list = []
 
     for ev in events:
         if not isinstance(ev, dict):
             continue
         kind = ev.get("kind")
+        if kind == "tensor_split":
+            if ev.get("ts", 0) >= last_split.get("ts", 0):
+                last_split = ev
         if kind == "stage_profile":
             st = ev.get("stage", "?")
             s = stages.setdefault(st, {"walls": [], "last_status": "",
@@ -124,6 +130,12 @@ def analyze(events: list) -> dict:
             "shim_phase": last_snap.get("shim_phase", ""),
             "snapshot_ts": last_snap.get("ts", 0),
         },
+        "last_split": {
+            "nodes": last_split.get("nodes", 1),
+            "split": last_split.get("split", ""),
+            "v3": last_split.get("v3", False),
+            "ts": last_split.get("ts", 0),
+        },
         "errors": errors[-10:],
         "event_count": len(events),
     }
@@ -131,9 +143,15 @@ def analyze(events: list) -> dict:
 
 def advise(analysis: dict) -> list:
     """Map analysis findings to concrete, evidence-backed actions. Each item:
-    {severity, topic, evidence, action, lever} — `lever` is the exact
-    (read-only-quoted) GbControl call a pilot would make, or None when the
-    action is a config/env change instead."""
+    {severity, topic, evidence, action, lever} — `lever` is either None (the
+    action is a config/env change, not a GbControl call) or a structured
+    dict `{"call": "<GbControl method name>", "args": [...] | None,
+    "kwargs": {...}}`. `args is None` means the lever names the right method
+    but this v1 analysis doesn't have enough state (e.g. the CURRENT reserve
+    value, needed to compute a bounded relative bump) to compute safe
+    arguments — gb_mcp.optimize_inference's apply loop treats that as
+    NOT auto-appliable, not as a string to exec. Never build a lever whose
+    `args` looks plausible but isn't grounded in read state."""
     out: list = []
     press = analysis.get("pressure", {})
 
@@ -153,10 +171,15 @@ def advise(analysis: dict) -> list:
             "severity": "warn", "topic": "t2_pressure",
             "evidence": "T2 DDR pressure CRITICAL in latest snapshot",
             "action": ("Free host headroom for the pool: raise the workstation "
-                       "reserve so desktop apps stop competing, and throttle "
-                       "prefetch while pressure holds."),
-            "lever": "GbControl().set_workstation_reserve_mb(+256); "
-                     "GbControl().set_prefetch_throttle(1)",
+                       "reserve so desktop apps stop competing (manual — needs "
+                       "the current reserve value, not auto-appliable here), "
+                       "and throttle prefetch while pressure holds (auto)."),
+            # set_prefetch_throttle is a plain boolean toggle — no current-value
+            # read needed, so this one IS safely auto-appliable, unlike the
+            # workstation-reserve bump above (which stays prose-only: it needs
+            # the CURRENT reserve to compute a bounded step, not an exec'd guess).
+            "lever": {"call": "set_prefetch_throttle", "args": [True],
+                      "kwargs": {"reason": "t2_pressure_critical"}},
         })
 
     for st, s in sorted(analysis.get("stages", {}).items()):
@@ -189,9 +212,32 @@ def advise(analysis: dict) -> list:
                 "action": (f"Decode speed for {m} degraded. Check for a competing "
                            "GPU load or KV spill to T2; gb_synapse recommend() "
                            "now has measured history to re-pick quant/split."),
-                "lever": "GbControl().set_kv_size_threshold_mb(...) after "
-                         "confirming KV misclassification in vitals",
+                # args=None: the right threshold depends on confirming KV
+                # misclassification in vitals first — a judgment call, not
+                # something this analysis can compute safely on its own.
+                "lever": {"call": "set_kv_size_threshold_mb", "args": None,
+                          "kwargs": {"reason": "tok_s_drop"}},
             })
+            # DI-13 rebalance advisory (petals should_rebalance gate — see
+            # gb_placement.should_rebalance): only worth surfacing when the
+            # drop clears a STRICTER threshold than the generic tok_s_drop
+            # warn above, AND a multi-node cluster split is actually active
+            # (nodes>1) — single-node degradation isn't a rebalance question.
+            split = analysis.get("last_split", {})
+            if d["drop_pct"] > REBALANCE_DROP_PCT and split.get("nodes", 1) > 1:
+                out.append({
+                    "severity": "warn", "topic": "rebalance_advice",
+                    "evidence": (f"{m}: {d['drop_pct']:.0f}% tok/s drop with a "
+                                f"{split.get('nodes')}-node split active "
+                                f"({split.get('split', '?')})"),
+                    "action": (f"Live tok/s for {m} diverged from its own history by "
+                              f"more than the cluster's placement-time estimate would "
+                              f"predict — the current tensor-split may no longer match "
+                              f"each node's real throughput. Re-serve with "
+                              f"GB_SYNAPSE_SPLIT_V3=1 (link-quality-weighted split) "
+                              f"and compare via optimize_inference(measure=true)."),
+                    "lever": None,  # re-serving needs an explicit model choice, not auto-appliable
+                })
 
     if not out:
         n = analysis.get("event_count", 0)
@@ -247,7 +293,11 @@ def _cmd_pilot_snapshot(days: float) -> str:
         lines.append(f"  [{item['severity']:<8s}] {item['action']}")
         lines.append(f"             evidence: {item['evidence']}")
         if item["lever"]:
-            lines.append(f"             lever:    {item['lever']}   (NOT applied — v1 is read-only)")
+            lv = item["lever"]
+            appliable = lv.get("args") is not None
+            call_str = f"{lv['call']}({', '.join(map(repr, lv.get('args') or []))})"
+            tag = "auto-appliable" if appliable else "manual — needs current state first"
+            lines.append(f"             lever:    {call_str}   ({tag}; NOT applied here — v1 is read-only)")
     return "\n".join(lines)
 
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 import http.server
 import json
 import os
+import re
 import socketserver
 import sys
 import time
@@ -36,6 +37,77 @@ _DEFAULT_LOG_PATH = str(Path.home() / ".local" / "share" / "greenboost" / "dataf
 
 DEFAULT_PORT = 8799
 DEFAULT_DAYS = 5.0
+
+_CLUSTER_CONF_PATH = "/etc/greenboost/cluster.conf"
+_host_node_aliases_cache: "set[str] | None" = None
+_feeder_nicknames_cache: "list[str] | None" = None
+_FEEDER_IDX_RE = re.compile(r"^feeder(\d+)$")
+
+
+def _local_node_aliases() -> "set[str]":
+    """Names that all refer to THIS machine in dataflux events: the generic
+    'host' literal every pipeline script/emitter uses, plus this machine's
+    own short hostname (some emitters , node_topology/node_capabilities ,
+    use the real hostname instead of the literal 'host')."""
+    global _host_node_aliases_cache
+    if _host_node_aliases_cache is None:
+        aliases = {"host"}
+        try:
+            import socket
+            aliases.add(socket.gethostname().split(".")[0])
+        except Exception:
+            pass
+        _host_node_aliases_cache = aliases
+    return _host_node_aliases_cache
+
+
+def _feeder_nicknames() -> "list[str]":
+    """Ordered feeder nicknames from cluster.conf ('ip:port nickname
+    ssh_user' per line), so a positional 'feeder<N>' label
+    (SnapshotRecorder's generic name for a RemoteFeederProvider-backed
+    manager , see gb_telemetry.ClusterTelemetryManager) can be resolved to
+    the same hostname other emitters (cluster_map, node_topology) already
+    use for that machine."""
+    global _feeder_nicknames_cache
+    if _feeder_nicknames_cache is None:
+        names: list[str] = []
+        try:
+            for line in Path(_CLUSTER_CONF_PATH).read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    names.append(parts[1])
+        except Exception:
+            pass
+        _feeder_nicknames_cache = names
+    return _feeder_nicknames_cache
+
+
+def canonical_node(node: "str | None") -> str:
+    """Fold the several node names ONE physical machine can appear under
+    in dataflux events into a single canonical key, so summarize()/
+    critic_report() (and every MCP tool built on them) never fragment one
+    node's activity across two rows. Found live 2026-07-14: a single 10min
+    window showed BOTH 'host' (3533 events, the literal every pipeline
+    script emits) AND 'ncore' (6 events, this host's real hostname , used
+    by node_topology/node_capabilities) for the SAME host, and BOTH
+    'feeder0' (1753 events, SnapshotRecorder's generic positional label)
+    AND 'omen' (3 events, its real hostname , used by cluster_map) for the
+    ONE configured feeder. Every per-node aggregate in the system was
+    silently undercounting both nodes by splitting their activity in two."""
+    if not node or node == "?":
+        return node or "?"
+    if node in _local_node_aliases():
+        return "host"
+    m = _FEEDER_IDX_RE.match(node)
+    if m:
+        names = _feeder_nicknames()
+        idx = int(m.group(1))
+        if idx < len(names):
+            return names[idx]
+    return node
 
 
 def _log_path() -> Path:
@@ -366,6 +438,15 @@ def emit(event: dict) -> None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         event = dict(event)
         event.setdefault("ts", time.time())
+        # pid: every gb_init-importing process gets its OWN SnapshotRecorder/
+        # ReactiveOrchestrator, all reading the same shared shim state , so
+        # concurrent processes can each correctly emit their own copy of the
+        # same real event within milliseconds of each other (observed live
+        # 2026-07-14: shim_decision triplicated, orchestrator actuations
+        # duplicated). One canonical stamp here (not per call site) covers
+        # every event kind, so grouping by pid always disambiguates
+        # single-process-bug from multi-process-normal.
+        event.setdefault("pid", os.getpid())
         with open(log_path, "a") as f:
             f.write(json.dumps(event) + "\n")
     except (OSError, TypeError, ValueError):
@@ -411,8 +492,8 @@ def summarize(events: list[dict]) -> dict:
         # "<node>:<model>" / "<node>:<stage>" so host and feeder rates never
         # blend.  Host events ("", "host", None node) keep their unprefixed
         # keys , existing host dashboards are unaffected.
-        _ev_node = ev.get("node")
-        _node_prefix = f"{_ev_node}:" if _ev_node not in ("", "host", None) else ""
+        _ev_node = canonical_node(ev.get("node"))
+        _node_prefix = f"{_ev_node}:" if _ev_node not in ("", "host", None, "?") else ""
 
         if ev.get("kind") == "tok_s_measured":
             model = _node_prefix + ev.get("model", "?")
@@ -431,7 +512,7 @@ def summarize(events: list[dict]) -> dict:
             s["last_status"] = ev.get("status", "")
             s["last_ts"] = ev.get("ts", 0)
 
-        node = ev.get("node", "?")
+        node = canonical_node(ev.get("node", "?"))
         n = nodes.setdefault(node, {"items": 0, "duration_s": 0.0, "events": 0, "errors": 0})
         n["items"] += ev.get("n_items", 0)
         n["duration_s"] += ev.get("duration_s", 0.0)
@@ -495,6 +576,9 @@ _SNAP_VIEW_KEYS = ("node", "fb_used_mb", "fb_free_mb", "fb_total_mb",
                    "kv_used_mb", "kv_reserve_mb", "t2_allocated_mb",
                    "t2_available_mb", "t2_pressure", "t3_used_mb", "t3_pressure")
 _DISPATCH_KINDS = ("chunk_remote", "chunk_local", "job_remote", "job_local")
+# feeder_active liveness floor (gpu_util_pct) — see critic_report()'s
+# feeder_active comment for the real incident this fixes (2026-07-14).
+_FEEDER_SNAPSHOT_ACTIVE_UTIL_PCT = 5.0
 
 
 def _snap_view(snap: dict | None, incident_ts: float) -> dict | None:
@@ -650,9 +734,35 @@ def critic_report(days: float = 1.0) -> dict:
             if k in _DISPATCH_KINDS:
                 ctx[k] += 1
                 if k in ("chunk_remote", "job_remote"):
-                    ctx["feeder_nodes"].add(w.get("node", "?"))
+                    ctx["feeder_nodes"].add(canonical_node(w.get("node", "?")))
+        # Real incident (2026-07-14): feeder_active was ALWAYS false across
+        # a full day of production events, even in incidents where a
+        # feeder's own snapshot_before/after (right there in the same
+        # incident) showed real fb_used_mb/gpu_util_pct — because this flag
+        # only ever looked at co-occurring DISPATCH-kind log rows (did WE
+        # push work in this exact ±60s slice), never at the feeder's own
+        # self-reported telemetry, which the snapshot filter above
+        # explicitly excludes from `window`. That made the flag blind to
+        # the common case (a host-side OOM/quantize incident with no
+        # temporally-coincident dispatch) even when the feeder was
+        # genuinely alive and busy at that exact moment. Broadened here to
+        # ALSO count a feeder as active from its own snapshot telemetry —
+        # gpu_util_pct above a small noise-floor threshold in a snapshot
+        # from a non-host node within the same window is real evidence of
+        # feeder compute, independent of whether THIS host dispatched to it.
+        window_snaps = [e for e in events
+                        if abs(e.get("ts", 0) - ts) <= _CRITIC_WINDOW_S
+                        and e.get("kind") == "snapshot"]
+        for s in window_snaps:
+            node = canonical_node(s.get("node", "?"))
+            if node not in ("host", "?"):
+                ctx["feeder_nodes"].add(node)
         ctx["feeder_nodes"] = sorted(ctx["feeder_nodes"])
-        ctx["feeder_active"] = bool(ctx["chunk_remote"] + ctx["job_remote"])
+        ctx["feeder_active"] = bool(
+            ctx["chunk_remote"] + ctx["job_remote"]
+            or any(canonical_node(s.get("node", "?")) not in ("host", "?")
+                  and s.get("gpu_util_pct", 0.0) >= _FEEDER_SNAPSHOT_ACTIVE_UTIL_PCT
+                  for s in window_snaps))
 
         incidents.append({
             "event": {k: ev.get(k) for k in
@@ -681,8 +791,11 @@ def critic_report(days: float = 1.0) -> dict:
             if item.get("severity") == "ok":
                 continue
             rec = f"[pilot:{item['severity']}] {item['action']} (evidence: {item['evidence']})"
-            if item.get("lever"):
-                rec += f" [lever: {item['lever']}]"
+            lv = item.get("lever")
+            if lv:
+                args = lv.get("args")
+                call_str = f"{lv['call']}({', '.join(map(repr, args))})" if args is not None else f"{lv['call']}(?)"
+                rec += f" [lever: {call_str}]"
             recommendations.append(rec)
     except Exception:
         pass

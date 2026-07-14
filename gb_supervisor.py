@@ -19,6 +19,11 @@ Key design improvements over the four-daemon design:
   - Process kill is opt-in (GB_SUPERVISOR_AGGRESSIVE_RECLAIM=1).  Default is
     Ollama-graceful-only (REST DELETE /api/delete with keep_alive:0).
   - The sentinel lifecycle is managed here; no separate unit needed.
+  - System-wide RAM/swap pressure (/proc/meminfo , distinct from GreenBoost's
+    own T2 DDR pool, which a CPU-offloaded PyTorch process bypasses entirely)
+    is polled every tick and written to /var/lib/greenboost/ram_pressure ,
+    visibility only, GreenBoost cannot stop an unrelated process from
+    allocating RAM; see _RamMonitor.
 
 Architecture: this is NOT imported by inference processes.  It is a standalone
 daemon run as root by systemd.  It does not activate GREENBOOST_ACTIVE because
@@ -38,6 +43,10 @@ Usage (run by systemd as root):
         GB_SUPERVISOR_AGGRESSIVE_RECLAIM   1 to also SIGTERM non-Ollama processes
         GB_SUPERVISOR_OLLAMA_URL           default http://127.0.0.1:11434
         GB_SUPERVISOR_IDLE_CONFIRM_POLLS   consecutive DEEP_IDLE polls required, default 3
+        GB_SUPERVISOR_RAM_WARN_AVAIL_PCT   % MemAvailable/MemTotal below which system RAM is "warn", default 20
+        GB_SUPERVISOR_RAM_CRIT_AVAIL_PCT   % MemAvailable/MemTotal below which system RAM is "critical", default 8
+        GB_SUPERVISOR_RAM_WARN_SWAP_PCT    % swap used above which system RAM is "warn", default 40
+        GB_SUPERVISOR_RAM_CRIT_SWAP_PCT    % swap used above which system RAM is "critical", default 65
 """
 from __future__ import annotations
 
@@ -64,6 +73,10 @@ def _import_gpu_metrics():
     from gb_telemetry import GpuMetrics
     return GpuMetrics
 
+def _import_meminfo_reader():
+    from gb_telemetry import read_meminfo_mb
+    return read_meminfo_mb
+
 # ── Constants ────────────────────────────────────────────────────────────────
 
 STATE_DIR       = Path("/var/lib/greenboost")
@@ -71,6 +84,7 @@ RUN_DIR         = Path("/run/greenboost")
 SENTINEL_FILE   = STATE_DIR / "sentinel"
 RUNNING_FILE    = STATE_DIR / "running"
 PRESSURE_FILE   = STATE_DIR / "vram_pressure"
+RAM_PRESSURE_FILE = STATE_DIR / "ram_pressure"
 PHASE_FILE      = RUN_DIR / "phase"
 RECOVERY_CLASS  = RUN_DIR / "recovery_class"
 ECC_DBE_FLAG    = RUN_DIR / "ecc_dbe_flag"
@@ -85,6 +99,19 @@ CRIT_FREE_PCT = int(os.environ.get("GB_SUPERVISOR_VRAM_CRIT_FREE_PCT",    "8"))
 AGGRESSIVE    = os.environ.get("GB_SUPERVISOR_AGGRESSIVE_RECLAIM", "0") == "1"
 OLLAMA_URL    = os.environ.get("GB_SUPERVISOR_OLLAMA_URL", "http://127.0.0.1:11434")
 CONFIRM_POLLS = int(os.environ.get("GB_SUPERVISOR_IDLE_CONFIRM_POLLS", "3"))
+
+# System-RAM pressure thresholds , %-of-node's-own-total, never absolute MB
+# (this box's total RAM varies host vs feeder; see CLAUDE.md "no hardcoded
+# hardware values" rule). Two independent signals, either one trips the
+# state: MemAvailable falling low, or swap filling up , the 2026-07-14
+# incident (two concurrent CPU-offloaded 22B-model runs) showed swap at
+# ~68% used while GreenBoost's own T2 pool read 0 , CPU-offload streaming
+# never goes through the shim's T2 cudaMallocManaged path, so this is a
+# genuinely separate signal from vram_pressure/T2 pool pressure.
+RAM_WARN_AVAIL_PCT  = int(os.environ.get("GB_SUPERVISOR_RAM_WARN_AVAIL_PCT",  "20"))
+RAM_CRIT_AVAIL_PCT  = int(os.environ.get("GB_SUPERVISOR_RAM_CRIT_AVAIL_PCT",  "8"))
+RAM_WARN_SWAP_PCT   = int(os.environ.get("GB_SUPERVISOR_RAM_WARN_SWAP_PCT",   "40"))
+RAM_CRIT_SWAP_PCT   = int(os.environ.get("GB_SUPERVISOR_RAM_CRIT_SWAP_PCT",   "65"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -551,6 +578,85 @@ class _VramMonitor:
         return state, util_pct, non_gb_mb
 
 
+# ── System RAM pressure monitor ──────────────────────────────────────────────
+
+class _RamMonitor:
+    """
+    Tracks system-wide RAM/swap pressure , NOT GreenBoost's own T2 DDR pool
+    (that is pre-committed by greenboost.ko and tracked separately via
+    _read_gb_t1_mb-style sysfs/GbInfo reads). This monitor exists because a
+    CPU-offloaded PyTorch process (e.g. `--offload cpu` streaming weights
+    through host RAM) consumes ordinary system RAM/swap without the shim
+    ever seeing it , GreenBoost's T2 pool accounting reads 0 while the box
+    is genuinely under RAM pressure from that process (confirmed real
+    incident 2026-07-14: two concurrent CPU-offloaded 22B-model runs drove
+    swap to ~68% used with tier_t2_local_cur_mb=0 the whole time).
+
+    This monitor gives GreenBoost (and any external caller , ai-forge or a
+    human) VISIBILITY into that pressure so a NEW heavy job can check before
+    launching. GreenBoost has no authority to stop an unrelated process from
+    allocating RAM , this is a signal, not an admission-control enforcement
+    mechanism.
+
+    Writes /var/lib/greenboost/ram_pressure on state change (mirrors the
+    vram_pressure file precedent).
+    """
+    def __init__(self, warn_avail_pct: int = 20, crit_avail_pct: int = 8,
+                 warn_swap_pct: int = 40, crit_swap_pct: int = 65) -> None:
+        self._warn_avail_pct = warn_avail_pct
+        self._crit_avail_pct = crit_avail_pct
+        self._warn_swap_pct  = warn_swap_pct
+        self._crit_swap_pct  = crit_swap_pct
+        self._prev_state     = "ok"
+        self._read_meminfo   = _import_meminfo_reader()
+
+    def poll(self) -> str:
+        """Poll /proc/meminfo. Returns state ∈ {'ok', 'warn', 'critical', 'unknown'}."""
+        mem_total_mb, mem_avail_mb, swap_total_mb, swap_used_mb = self._read_meminfo()
+        if mem_total_mb <= 0:
+            return "unknown"
+
+        avail_pct = 100.0 * mem_avail_mb / mem_total_mb
+        swap_pct  = (100.0 * swap_used_mb / swap_total_mb) if swap_total_mb > 0 else 0.0
+
+        if avail_pct < self._crit_avail_pct or swap_pct > self._crit_swap_pct:
+            state = "critical"
+        elif avail_pct < self._warn_avail_pct or swap_pct > self._warn_swap_pct:
+            state = "warn"
+        else:
+            state = "ok"
+
+        if state != self._prev_state:
+            if state in ("critical", "warn"):
+                log.log(
+                    logging.CRITICAL if state == "critical" else logging.WARNING,
+                    "%s: system RAM available %.1f%% (< %d%%?) , swap used %.1f%% (> %d%%?). "
+                    "Non-GreenBoost RAM/swap consumer (e.g. CPU-offloaded inference) , "
+                    "consider not starting another heavy CPU-offload job right now.",
+                    state.upper(), avail_pct, self._warn_avail_pct, swap_pct, self._warn_swap_pct,
+                )
+            else:
+                log.info("OK: system RAM pressure cleared , available %.1f%%, swap used %.1f%%",
+                         avail_pct, swap_pct)
+            self._prev_state = state
+
+        try:
+            RAM_PRESSURE_FILE.write_text(
+                f"state={state}\n"
+                f"mem_total_mib={mem_total_mb}\n"
+                f"mem_available_mib={mem_avail_mb}\n"
+                f"mem_available_pct={avail_pct:.1f}\n"
+                f"swap_total_mib={swap_total_mb}\n"
+                f"swap_used_mib={swap_used_mb}\n"
+                f"swap_used_pct={swap_pct:.1f}\n"
+                f"timestamp={time.strftime('%Y-%m-%dT%H:%M:%S')}\n"
+            )
+        except Exception:
+            pass
+
+        return state
+
+
 # ── Main supervisor loop ──────────────────────────────────────────────────────
 
 class GreenBoostSupervisor:
@@ -559,6 +665,8 @@ class GreenBoostSupervisor:
         self._idle_count    = 0   # consecutive DEEP_IDLE polls confirmed
         self._nvml          = _NVMLSampler(device=0)
         self._vram_mon      = _VramMonitor(self._nvml, WARN_PCT, CRIT_FREE_PCT)
+        self._ram_mon       = _RamMonitor(RAM_WARN_AVAIL_PCT, RAM_CRIT_AVAIL_PCT,
+                                           RAM_WARN_SWAP_PCT, RAM_CRIT_SWAP_PCT)
         self._ecc_dbe_seen  = 0   # last known volatile DBE count (detect new errors)
         # Reactive orchestrator , closes dead feedback loops (ECC, workstation, thermal)
         try:
@@ -651,6 +759,10 @@ class GreenBoostSupervisor:
 
         # 3b. VRAM pressure (NVML, no nvidia-smi)
         _vram_state, _gpu_util, _non_gb_mb = self._vram_mon.poll(gaming_mode=gaming)
+
+        # 3b'. System RAM/swap pressure , independent of GreenBoost's own T2
+        # pool (see _RamMonitor docstring: CPU-offload streaming bypasses it).
+        self._ram_mon.poll()
 
         # 3c. ECC double-bit error monitoring (hardware-critical)
         ecc_dbe = _read_ecc_dbe_volatile()

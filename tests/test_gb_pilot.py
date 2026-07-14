@@ -92,9 +92,31 @@ def test_advise_t3_spill_is_critical():
 def test_advise_t2_critical_names_safe_levers():
     a = gp.analyze([_snap(ts=1, t2_pressure=2)])
     adv = gp.advise(a)
-    lever = {x["topic"]: x for x in adv}["t2_pressure"]["lever"]
-    assert "set_workstation_reserve_mb" in lever
-    assert "set_prefetch_throttle" in lever
+    item = {x["topic"]: x for x in adv}["t2_pressure"]
+    lever = item["lever"]
+    assert lever["call"] == "set_prefetch_throttle"
+    assert lever["args"] == [True]   # boolean toggle needs no current-state read , auto-appliable
+    assert "workstation reserve" in item["action"]  # named in prose, not exec'd (needs current value)
+
+
+def test_every_advice_lever_names_a_real_gbcontrol_method():
+    import gb_control
+    tok_events = [_tok("m", 100, ts=i) for i in range(4)] + [_tok("m", 40, ts=4)]
+    scenarios = [
+        [_snap(ts=1, t3_used_mb=4096)],
+        [_snap(ts=1, t2_pressure=2)],
+        tok_events,   # drives the tok_s_drop / set_kv_size_threshold_mb lever
+    ]
+    for events in scenarios:
+        a = gp.analyze(events)
+        for item in gp.advise(a):
+            lever = item.get("lever")
+            if lever is None:
+                continue
+            assert hasattr(gb_control.GbControl, lever["call"]), (
+                f"lever names {lever['call']!r}, not a real GbControl method")
+            if lever["args"] is not None:
+                assert isinstance(lever["args"], list)
 
 
 def test_advise_stage_regression_evidence():
@@ -116,6 +138,48 @@ def test_advise_stage_error_surfaces():
     evs = [_stage("mesh:bake", 10.0, status="error", ts=5)]
     adv = gp.advise(gp.analyze(evs))
     assert any(x["topic"] == "stage_error" for x in adv)
+
+
+# ── DI-13: rebalance advisory (petals should_rebalance gate) ────────────────
+
+def _split(nodes, ts=0, v3=False):
+    return {"kind": "tensor_split", "split": ",".join(["1000"] * nodes),
+            "nodes": nodes, "v3": v3, "ts": ts, "node": "host", "label": "gb_synapse"}
+
+
+def test_rebalance_advisory_fires_on_severe_drop_with_multinode_split():
+    evs = [_split(2, ts=0)] + [_tok("m", t, ts=i) for i, t in
+                               enumerate([100.0, 100.0, 100.0, 100.0, 40.0])]
+    a = gp.analyze(evs)
+    assert a["last_split"]["nodes"] == 2
+    adv = gp.advise(a)
+    assert any(x["topic"] == "rebalance_advice" for x in adv)
+
+
+def test_rebalance_advisory_silent_on_single_node():
+    evs = [_split(1, ts=0)] + [_tok("m", t, ts=i) for i, t in
+                               enumerate([100.0, 100.0, 100.0, 100.0, 40.0])]
+    adv = gp.advise(gp.analyze(evs))
+    assert not any(x["topic"] == "rebalance_advice" for x in adv)
+
+
+def test_rebalance_advisory_silent_below_threshold():
+    # Drop clears the generic tok_s_drop bar (20%) but not the stricter
+    # rebalance bar (25%): avg=(100*4+74)/5=94.8, drop=(94.8-74)/94.8~=21.9%.
+    evs = [_split(2, ts=0)] + [_tok("m", t, ts=i) for i, t in
+                               enumerate([100.0, 100.0, 100.0, 100.0, 74.0])]
+    a = gp.analyze(evs)
+    adv = gp.advise(a)
+    assert any(x["topic"] == "tok_s_drop" for x in adv)
+    assert not any(x["topic"] == "rebalance_advice" for x in adv)
+
+
+def test_rebalance_advisory_silent_without_split_history():
+    evs = [_tok("m", t, ts=i) for i, t in enumerate([100.0, 100.0, 100.0, 100.0, 40.0])]
+    a = gp.analyze(evs)
+    assert a["last_split"]["nodes"] == 1   # default when no tensor_split event seen
+    adv = gp.advise(a)
+    assert not any(x["topic"] == "rebalance_advice" for x in adv)
 
 
 # ── panel rendering smoke (no TTY, no real log) ─────────────────────────────

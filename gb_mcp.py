@@ -39,6 +39,20 @@ SHIM_STATS = "/run/greenboost/shim_stats"
 # Precisions that satisfy the quality floor ("at least fp8").
 _FLOOR_OK = {"16", "bf16", "fp16", "fp8"}
 
+# GbControl methods optimize_inference's apply loop may dispatch a pilot lever
+# to. Allowlist, not exec(): a lever names one of these by string, never an
+# arbitrary Python expression. Keep in sync with gb_control.GbControl's public
+# set_*/restore_baseline methods.
+_GBCONTROL_LEVER_ALLOWLIST = {
+    "set_kv_reserve_mb", "set_safety_reserve_gb", "set_workstation_reserve_mb",
+    "set_virtual_vram_gb", "set_gaming_mode", "set_pool_cap_mb", "set_t3_cap_mb",
+    "set_idle_cleanup_sec", "set_debug_mode", "set_kv_size_threshold_mb",
+    "set_swa_window_mb", "set_prefetch_throttle", "set_phase_detect",
+    "set_cpu_governor", "set_energy_perf_pref", "set_numa_balancing",
+    "set_swappiness", "set_dirty_background_ratio", "set_watermark_scale_factor",
+    "set_gpu_persistence", "set_gpu_power_limit", "set_proc_priority",
+}
+
 _RULES = {
     "rule_1_vram": "Fill every GPU's physical VRAM to ~90% (10% headroom so the "
                    "system never collapses under pressure). GPU VRAM is the "
@@ -65,9 +79,11 @@ _TAXONOMY = {
                    "mcp": "greenboost-orchestrator: tiering via greenboost_status; "
                           "greenboost-dataflux: tiering_status, dataflux_tier_moves"},
     "GB-Quant": {"does": "weights (gb_quant) + KV cache (TurboQuant/gb_attn) "
-                         "compression so models fit VRAM at quality",
-                 "module": "gb_quant.py + gb_attn.py",
-                 "mcp": "greenboost-orchestrator: quant_advisor; "
+                         "compression so models fit VRAM at quality; "
+                         "gb_placement.plan_experts (CB-3) plans the MoE "
+                         "dense/hot-expert/warm-expert/cold-expert tier split",
+                 "module": "gb_quant.py + gb_attn.py + gb_placement.py",
+                 "mcp": "greenboost-orchestrator: quant_advisor, gb_plan; "
                         "greenboost-dataflux: dataflux_quantization"},
     "GB-Dataflux": {"does": "flight recorder: every subsystem emits events; "
                             "web UI via `greenboost dataflux-ui`",
@@ -112,6 +128,17 @@ def _read_shim_stats() -> dict:
     except Exception as e:
         out["error"] = str(e)
     return out
+
+
+def _read_orch_state() -> dict:
+    """Parsed ReactiveOrchestrator.dump() JSON from its state file (DI-6:
+    health_state/admits_overcommit live here — the orchestrator runs in the
+    supervisor process, this MCP server can't read its in-memory state
+    directly). Never raises; {} when absent/stale-format."""
+    try:
+        return json.loads(Path("/run/greenboost/orch_state.json").read_text())
+    except Exception:
+        return {}
 
 
 @mcp.tool()
@@ -195,6 +222,13 @@ def flux_health() -> dict:
     checks["actuation_gate"] = {
         "GB_ORCH_ACTUATE": os.environ.get("GB_ORCH_ACTUATE", "unset"),
         "levers_enabled": os.environ.get("GB_ORCH_ACTUATE") == "1"}
+    # DI-6: GpuHealth composite admission-gate state (INIT/HEALTHY/UNHEALTHY/
+    # OVERLIMIT/DISABLED) — read from the orchestrator's own state file since
+    # it runs in the supervisor process, not this MCP server's.
+    orch = _read_orch_state()
+    checks["gpu_health"] = {"ok": orch.get("health_state") in (None, "HEALTHY"),
+                            "state": orch.get("health_state", "unknown"),
+                            "admits_overcommit": orch.get("admits_overcommit")}
     checks["loop_closed"] = all(
         c.get("ok") for k, c in checks.items()
         if k in ("shim_stats", "dataflux", "kmod", "endpoint_11434"))
@@ -255,6 +289,39 @@ def quant_advisor(model: str | None = None, ctx: int = 65536,
             "guidance": "quality-first env: GB_QUALITY=near_lossless (3.0% "
                         "rel-err ceiling); per-node budgets on cluster runs; "
                         "weights never on T3."}
+
+
+@mcp.tool()
+def gb_plan(model: str, vram_fill_pct: float | None = None) -> dict:
+    """Colibri-style tier-plan JSON for a GGUF MoE model (mirrors `coli plan`):
+    parses the model's dense-vs-routed-expert byte split (gb_synapse.gguf_summary)
+    and this node's live topology, and reports how the routed-expert bytes
+    split across VRAM (hot) / T2 DDR (warm, --n-cpu-moe) / T3 (cold — never
+    for speed-critical data, quality-first rule). Read-only: parses headers
+    and reads topology only, allocates and starts nothing. Every budget term
+    is %-derived from THIS node's real hardware (gb_topology), never a
+    reference-box literal. Emits a `placement` dataflux event
+    (kind=placement, runtime=expert_plan) on every call."""
+    import gb_placement
+    import gb_synapse
+    try:
+        entries = [e for e in gb_synapse.list_models() if model.lower() in e.name.lower()]
+        if not entries:
+            return {"error": f"no model matching {model!r} in the manifest"}
+        entry = entries[0]
+        summary = gb_synapse.gguf_summary(entry.path)
+    except Exception as e:
+        return {"error": f"gguf_summary failed: {e}"}
+    dense_gb = summary.get("dense_bytes", 0) / (1024 ** 3)
+    expert_gb = summary.get("expert_bytes", 0) / (1024 ** 3)
+    kv_gb = gb_synapse.estimate_kv_gb(
+        65536, entry.n_bytes, entry.quant, n_layers=summary.get("n_layers", 0),
+        n_kv_heads=summary.get("n_kv_heads", 0), head_dim=summary.get("head_dim", 0))
+    plan = gb_placement.plan_experts_and_emit(dense_gb=dense_gb, expert_gb=expert_gb,
+                                              kv_gb=kv_gb, vram_fill_pct=vram_fill_pct)
+    plan["model_name"] = entry.name
+    plan["is_moe"] = summary.get("is_moe", False)
+    return plan
 
 
 @mcp.tool()
@@ -344,10 +411,15 @@ def optimize_inference(model: str | None = None, ctx: int = 65536,
                            "models": analysis.get("models"),
                            "event_count": analysis.get("event_count")}
         for a in advice:
+            lv = a.get("lever")
             plan.append({"action": a.get("action"), "why": a.get("topic"),
                          "evidence": a.get("evidence"),
-                         "lever": a.get("lever"),
-                         "auto_appliable": bool(a.get("lever"))})
+                         "lever": lv,
+                         # a structured lever is only auto-appliable when its
+                         # args are concretely known (args is not None) — see
+                         # gb_pilot.advise()'s docstring for why some levers
+                         # deliberately carry args=None instead of a guess.
+                         "auto_appliable": bool(lv) and lv.get("args") is not None})
         # 3 · quant floor audit over recent quantize decisions
         breaches = []
         for e in events:
@@ -402,11 +474,18 @@ def optimize_inference(model: str | None = None, ctx: int = 65536,
                 lever = p.get("lever")
                 if not lever or not p.get("auto_appliable"):
                     continue
+                call = lever.get("call") if isinstance(lever, dict) else None
+                args = lever.get("args") or [] if isinstance(lever, dict) else []
+                kwargs = lever.get("kwargs") or {} if isinstance(lever, dict) else {}
+                call_str = f"{call}({', '.join(map(repr, args))})"
+                if call not in _GBCONTROL_LEVER_ALLOWLIST:
+                    result["applied"].append(f"REFUSED {call_str}: not an allowlisted GbControl method")
+                    continue
                 try:
-                    exec(lever, {"GbControl": lambda: ctl})  # noqa: S102 — pilot-authored lever strings
-                    result["applied"].append(lever)
+                    getattr(ctl, call)(*args, **kwargs)
+                    result["applied"].append(call_str)
                 except Exception as e:
-                    result["applied"].append(f"FAILED {lever}: {e}")
+                    result["applied"].append(f"FAILED {call_str}: {e}")
             if measure and result["applied"]:
                 time.sleep(min(max(settle_s, 5), 60))
                 after = gb_dataflux.summarize(
@@ -463,77 +542,130 @@ def shim_env(workload: str = "diffusion", enabled: bool = True) -> dict:
     return gb_actuation.shim_env(workload=workload, enabled=enabled)
 
 
+@mcp.tool()
+def run_under_greenboost(command: "list[str] | str", workload: str = "llm",
+                         cwd: str = "", timeout_s: int = 900,
+                         confirm: bool = False) -> dict:
+    """ACTUATE (double-gated): run `command` as a subprocess with the
+    shim_env(workload) overlay applied , closes discover -> configure ->
+    execute -> observe entirely through MCP, no separate shell step needed.
+    `command` always runs as an argv list (never through a shell , a string
+    is tokenized with shlex, so pipes/redirects/`&&` have no special
+    meaning). DRY-RUN unless confirm=True AND GB_ORCH_ACTUATE=1; emits
+    kind="agent_run" (start + completion) either way for audit."""
+    import gb_actuation
+    return gb_actuation.run_under_greenboost(command, workload=workload, cwd=cwd,
+                                             timeout_s=timeout_s, confirm=confirm)
+
+
+@mcp.tool()
+def a2a_gateway(action: str = "status", confirm: bool = False) -> dict:
+    """A6: control the greenboost-a2a systemd unit (AgentCard + JSON-RPC
+    actuation gateway). action="status" (default, always allowed): whether
+    the unit is enabled/active per systemd, plus the same liveness probe as
+    greenboost-dataflux's a2a_status (use that tool for the full recent-
+    request rollup — this is a thin systemd-state complement, not a
+    duplicate). action="restart" is DOUBLE-GATED (confirm=True AND
+    GB_ORCH_ACTUATE=1) since it's a service-lifecycle action, not a policy
+    write — deliberately NOT routed through gb_actuation.VERBS: restarting
+    the A2A gateway FROM an A2A JSON-RPC call would kill the request's own
+    connection mid-response, so this control only makes sense from MCP."""
+    import subprocess
+    unit = "greenboost-a2a.service"
+    if action not in ("status", "restart"):
+        return {"error": f"unknown action {action!r}; use 'status' or 'restart'"}
+    if action == "restart":
+        import gb_actuation
+        gate = gb_actuation.actuation_gate(confirm)
+        if not gate["allowed"]:
+            return {"action": "restart", "unit": unit, "gate": gate,
+                    "dry_run": f"would systemctl restart {unit}"}
+        try:
+            r = subprocess.run(["systemctl", "restart", unit],
+                              capture_output=True, text=True, timeout=15)
+            result = {"action": "restart", "unit": unit, "gate": gate,
+                     "ok": r.returncode == 0, "stderr": r.stderr.strip()[:500]}
+        except Exception as e:
+            result = {"action": "restart", "unit": unit, "gate": gate, "ok": False, "error": str(e)}
+        try:
+            import gb_dataflux
+            gb_dataflux.emit({"node": "host", "label": "a2a", "kind": "actuation",
+                              "stage": "a2a_gateway_restart", "lever": "a2a_gateway",
+                              "gated": True, "status": "ok" if result.get("ok") else "error"})
+        except Exception:
+            pass
+        return result
+    # action == "status"
+    try:
+        r = subprocess.run(["systemctl", "is-active", unit], capture_output=True, text=True, timeout=5)
+        active = r.stdout.strip() == "active"
+    except Exception:
+        active = None
+    try:
+        r2 = subprocess.run(["systemctl", "is-enabled", unit], capture_output=True, text=True, timeout=5)
+        enabled = r2.stdout.strip() == "enabled"
+    except Exception:
+        enabled = None
+    return {"action": "status", "unit": unit, "active": active, "enabled": enabled,
+           "note": "see greenboost-dataflux's a2a_status for the liveness probe + recent request rollup"}
+
+
 # ── selective re-exports: one server suffices day-to-day ────────────────────
 
 @mcp.tool()
 def greenboost_status() -> dict:
     """Live GreenBoost snapshot (kmod, GPU, T1/T2/T3 pools, pressure, phase) —
-    same data as `greenboost status --llm`. Canonical drill-down owner:
-    greenboost-dataflux MCP."""
-    try:
-        import gb_monitor
-        return gb_monitor.snapshot().as_dict()
-    except Exception as e:
-        return {"error": str(e)}
+    same data as `greenboost status --llm`. Canonical: greenboost-dataflux.
+    Mirrored here (identical shape, shared impl in gb_mcp_common.py) so this
+    server alone suffices."""
+    import gb_mcp_common
+    return gb_mcp_common.greenboost_status()
 
 
 @mcp.tool()
 def greenboost_capabilities() -> dict:
     """Installed/running shim capability manifest (features the deployed
-    GreenBoost actually supports)."""
-    try:
-        import gb_monitor
-        return gb_monitor.capabilities()
-    except Exception as e:
-        return {"error": str(e)}
+    GreenBoost actually supports). Canonical: greenboost-dataflux. Mirrored
+    here (shared impl in gb_mcp_common.py)."""
+    import gb_mcp_common
+    return gb_mcp_common.greenboost_capabilities()
 
 
 @mcp.tool()
 def greenboost_pilot(days: float = 5.0) -> dict:
     """Pilot instrument panel: per-stage wall-time trends, measured tok/s per
     model, pressure picture, and evidence-backed advice (levers quoted, never
-    auto-applied)."""
-    try:
-        import gb_dataflux
-        import gb_pilot
-        analysis = gb_pilot.analyze(gb_dataflux.read_events(since_hours=days * 24))
-        analysis["advice"] = gb_pilot.advise(analysis)
-        return analysis
-    except Exception as e:
-        return {"error": str(e)}
+    auto-applied). Canonical: greenboost-dataflux. Mirrored here (shared impl
+    in gb_mcp_common.py)."""
+    import gb_mcp_common
+    return gb_mcp_common.greenboost_pilot(days=days)
 
 
 @mcp.tool()
 def cluster_status(probe: bool = True) -> dict:
     """Gb-Cluster headline: feeders online, per-node T1/T2/T3 + GPU telemetry.
-    Canonical live-state owner: greenboost-cluster MCP."""
-    try:
-        import gb_cluster
-        return gb_cluster.status(probe=probe)
-    except Exception as e:
-        return {"error": str(e)}
+    Canonical: greenboost-cluster. Mirrored here (shared impl in
+    gb_mcp_common.py)."""
+    import gb_mcp_common
+    return gb_mcp_common.cluster_status(probe=probe)
 
 
 @mcp.tool()
 def dataflux_summary(days: float = 5.0) -> dict:
     """GB-Dataflux headline rollup (events, per-node throughput, errors,
-    tok/s). Canonical drill-down owner: greenboost-dataflux MCP."""
-    try:
-        import gb_dataflux
-        return gb_dataflux.summarize(gb_dataflux.read_events(since_hours=days * 24))
-    except Exception as e:
-        return {"error": str(e)}
+    tok/s). Canonical: greenboost-dataflux. Mirrored here (shared impl in
+    gb_mcp_common.py)."""
+    import gb_mcp_common
+    return gb_mcp_common.dataflux_summary(days=days)
 
 
 @mcp.tool()
 def synapse_status() -> dict:
     """Gb-Synapse engine/proxy status (built?, version, server + :11434 proxy
-    running?). Serving control lives in the greenboost-synapse MCP."""
-    try:
-        import gb_synapse
-        return gb_synapse.status()
-    except Exception as e:
-        return {"error": str(e)}
+    running?). Canonical: greenboost-synapse. Mirrored here (shared impl in
+    gb_mcp_common.py)."""
+    import gb_mcp_common
+    return gb_mcp_common.synapse_status()
 
 
 # ── live kernel⇄LLM resources (cheap polling surface) ───────────────────────

@@ -792,6 +792,7 @@ parse_shim_stats() {
 #       GPU_UTIL_PCT GPU_MEM_UTIL_PCT GPU_TEMP_C GPU_POWER_W GPU_POWER_LIMIT_W
 #       GPU_SM_CLOCK_MHZ GPU_MEM_CLOCK_MHZ GPU_ECC_DBE GPU_ECC_DBE_AGG GPU_ECC_SBE
 #       GPU_PCIE_TX_MB_S GPU_PCIE_RX_MB_S GPU_GAMING_MODE GB_PRESSURE_STATE
+#       GB_RAM_PRESSURE_STATE GB_RAM_AVAILABLE_PCT GB_SWAP_USED_PCT
 #       SHIM_PHASE SHIM_ACTIVE_PATH SHIM_T1_LOCAL_MB SHIM_T2_LOCAL_MB SHIM_T3_LOCAL_MB
 #       SHIM_WS_RESERVE_MB SHIM_WS_RESERVE_EFF_MB SHIM_KV_RESERVE_MB
 #       SHIM_VIRTUAL_VRAM_MB SHIM_CLUSTER_REMOTE_MB
@@ -805,6 +806,7 @@ _gb_vitals_init_vars() {
     GPU_UTIL_PCT=0; GPU_MEM_UTIL_PCT=0; GPU_TEMP_C=0
     GPU_POWER_W=0; GPU_POWER_LIMIT_W=0; GPU_SM_CLOCK_MHZ=0; GPU_MEM_CLOCK_MHZ=0
     GPU_ECC_DBE=0; GPU_ECC_DBE_AGG=0; GPU_ECC_SBE=0; GPU_GAMING_MODE=0; GB_PRESSURE_STATE=""
+    GB_RAM_PRESSURE_STATE=""; GB_RAM_AVAILABLE_PCT=""; GB_SWAP_USED_PCT=""
     GPU_PCIE_TX_MB_S=0; GPU_PCIE_RX_MB_S=0
     SHIM_PHASE=""; SHIM_ACTIVE_PATH=""; SHIM_T1_LOCAL_MB=""; SHIM_T2_LOCAL_MB=""; SHIM_T3_LOCAL_MB=""
     SHIM_WS_RESERVE_MB=""; SHIM_WS_RESERVE_EFF_MB=""; SHIM_KV_RESERVE_MB=""
@@ -855,6 +857,9 @@ query_gpu_vram() {
             GPU_PCIE_RX_MB_S)       GPU_PCIE_RX_MB_S="$_v" ;;
             GPU_GAMING_MODE)        GPU_GAMING_MODE="$_v" ;;
             GB_PRESSURE_STATE)      GB_PRESSURE_STATE="$_v" ;;
+            GB_RAM_PRESSURE_STATE)  GB_RAM_PRESSURE_STATE="$_v" ;;
+            GB_RAM_AVAILABLE_PCT)   GB_RAM_AVAILABLE_PCT="$_v" ;;
+            GB_SWAP_USED_PCT)       GB_SWAP_USED_PCT="$_v" ;;
             SHIM_PHASE)             SHIM_PHASE="$_v" ;;
             SHIM_ACTIVE_PATH)       SHIM_ACTIVE_PATH="$_v" ;;
             SHIM_T1_LOCAL_MB)       SHIM_T1_LOCAL_MB="$_v" ;;
@@ -4107,7 +4112,8 @@ do_purge() {
         if "${_mcp_run[@]}" bash -lc 'command -v claude' &>/dev/null; then
             local _mcp_name
             for _mcp_name in greenboost-dataflux greenboost-cluster \
-                             greenboost-orchestrator greenboost-synapse; do
+                             greenboost-orchestrator greenboost-synapse \
+                             greenboost-cli; do
                 "${_mcp_run[@]}" bash -lc "claude mcp remove '$_mcp_name'" &>/dev/null || true
             done
             gb_ok "Claude MCP registrations removed"
@@ -4117,7 +4123,8 @@ do_purge() {
     rm -f /var/lib/greenboost/sentinel \
           /var/lib/greenboost/running \
           /var/lib/greenboost/last_clean_boot \
-          /var/lib/greenboost/vram_pressure
+          /var/lib/greenboost/vram_pressure \
+          /var/lib/greenboost/ram_pressure
     rmdir /var/lib/greenboost 2>/dev/null || true
     # Cluster topology registry cache (tmpfs; Full Install's gb_cluster writes it)
     rm -f /run/greenboost/cluster_topology.json
@@ -4291,6 +4298,12 @@ cmd_install_python_files() {
         gb_synapse_mcp.py gb_synapse_tools.py
         gb_dataflux_mcp.py
         gb_cluster_mcp.py
+        # Shared impl behind cluster_status/dataflux_summary/synapse_status/
+        # greenboost_status/greenboost_capabilities across gb_mcp/gb_cluster_mcp/
+        # gb_dataflux_mcp/gb_synapse_mcp (audit 2026-07-14: missing from this
+        # manifest broke those tools post-install with "No module named
+        # 'gb_mcp_common'" despite the file existing in the repo).
+        gb_mcp_common.py
         # Agent surface (2026-07-13): shared gated-actuation verbs + A2A gateway.
         # gb_mcp/gb_cluster_mcp/gb_synapse_mcp import gb_actuation; gb_a2a serves
         # the AgentCard + JSON-RPC over the same VERBS table.
@@ -4617,6 +4630,25 @@ cmd_register_mcp() {
             gb_warn "MCP registration failed: $_name — continuing (${_err//$'\n'/ })"
         fi
     done
+
+    # 5th server: greenboost-cli (installed into its own venv by cmd_install_cli,
+    # not a bare $GB_PY_DEST/*.py script) — different invocation, so it's
+    # registered separately rather than forced into the _servers array above.
+    # `pip install "$_src[mcp]"` (cmd_install_cli) makes greenboost_cli a real
+    # importable package inside cli-venv's site-packages, so `-m` module
+    # invocation with that venv's own python is correct , no PYTHONPATH needed.
+    local _cli_py="$GB_PY_DEST/cli-venv/bin/python3"
+    if [[ -x "$_cli_py" ]]; then
+        "${_run[@]}" bash -c "$_prelude claude mcp remove 'greenboost-cli'" &>/dev/null || true
+        if _err=$("${_run[@]}" bash -c "$_prelude claude mcp add --scope user 'greenboost-cli' -- '$_cli_py' -m greenboost_cli.mcp.server" 2>&1); then
+            (( _ok++ )) || true
+        else
+            gb_warn "MCP registration failed: greenboost-cli — continuing (${_err//$'\n'/ })"
+        fi
+    else
+        gb_warn "cli-venv not found ($_cli_py) — skipping greenboost-cli MCP registration (run install-cli first)"
+    fi
+
     [[ $_ok -gt 0 ]] && gb_ok "Registered $_ok MCP server(s) with Claude CLI (user: $_u)"
     return 0
 }
@@ -7755,6 +7787,19 @@ _cmd_vitals_snapshot() {
         _diag_ok+=("DCGM health PASS")
     fi
 
+    # System RAM/swap pressure (gb_supervisor's _RamMonitor , distinct from
+    # GreenBoost's own T2 DDR pool: a CPU-offloaded inference process
+    # consumes ordinary host RAM/swap without ever touching T2, so this can
+    # fire while T2 pressure reads clean. Visibility only , check this
+    # before starting another heavy CPU-offload job.)
+    if [[ "$GB_RAM_PRESSURE_STATE" == "critical" ]]; then
+        _sys_lines+=("  ${C_RED}✗${C_RESET}  ${C_RED}System RAM critical (avail ${GB_RAM_AVAILABLE_PCT:-?}%, swap ${GB_SWAP_USED_PCT:-?}%)${C_RESET}")
+        _diag_errors+=("System RAM/swap pressure critical (avail ${GB_RAM_AVAILABLE_PCT:-?}%, swap ${GB_SWAP_USED_PCT:-?}%) , likely a CPU-offloaded process outside GreenBoost's T2 pool; do not start another heavy CPU-offload job")
+    elif [[ "$GB_RAM_PRESSURE_STATE" == "warn" ]]; then
+        _sys_lines+=("  ${C_AMBER}⚠${C_RESET}  ${C_AMBER}System RAM pressure (avail ${GB_RAM_AVAILABLE_PCT:-?}%, swap ${GB_SWAP_USED_PCT:-?}%)${C_RESET}")
+        _diag_warns+=("System RAM/swap pressure elevated (avail ${GB_RAM_AVAILABLE_PCT:-?}%, swap ${GB_SWAP_USED_PCT:-?}%) , check before launching another CPU-offload-heavy job")
+    fi
+
     # Right: AI Inference
     local _phase_label="${SS_PHASE:--}"
     local _gpu_hw_str=""
@@ -10006,9 +10051,9 @@ _cmd_cluster_snapshot() {
 
     gb_section "GreenBoost Cluster Status  (${_ts})"
 
-    printf "  ${C_BOLD}%-8s %-16s %-23s %-9s %-9s %-9s %-9s %-9s %-16s${C_RESET}\n" \
-           "ROLE" "HOST" "GPU" "T1 VRAM" "T2 DDR" "T3 NVMe" "HEALTH" "BW" "STATUS"
-    echo -e "  ${C_DIM}$(printf '─%.0s' $(seq 1 115))${C_RESET}"
+    printf "  ${C_BOLD}%-8s %-16s %-23s %-9s %-9s %-9s %-6s %-9s %-9s %-16s${C_RESET}\n" \
+           "ROLE" "HOST" "GPU" "T1 VRAM" "T2 DDR" "T3 NVMe" "UTIL" "HEALTH" "BW" "STATUS"
+    echo -e "  ${C_DIM}$(printf '─%.0s' $(seq 1 122))${C_RESET}"
 
     # Read per-feeder BW and health from shim metrics JSON (shared helper)
     declare -A _fdr_bw _fdr_health _fdr_gpu_util _fdr_gpu_mem_util _fdr_gpu_temp _fdr_gpu_power
@@ -10028,17 +10073,19 @@ _cmd_cluster_snapshot() {
 
     # Local GPU info
     local local_gpu="(unknown)"
-    local local_vram=0 local_temp="" local_power="" local_throttle=""
+    local local_vram=0 local_temp="" local_power="" local_throttle="" local_util=""
     if command -v nvidia-smi &>/dev/null; then
         local_gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | xargs)
         local_vram=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs)
         local_vram=$(( (local_vram + 512) / 1024 ))
-        local _tmp _pwr _clk
+        local _tmp _pwr _clk _util
         _tmp=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs || echo "")
         _pwr=$(nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs || echo "")
+        _util=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs || echo "")
         _clk=$(nvidia-smi --query-gpu=clocks_throttle_reasons.active --format=csv,noheader 2>/dev/null | head -1 | xargs || echo "")
         [[ -n "$_tmp" && "$_tmp" =~ ^[0-9]+$ ]] && local_temp="${_tmp}°C"
         [[ -n "$_pwr" && "$_pwr" =~ ^[0-9] ]] && local_power="${_pwr%.*}W"
+        [[ -n "$_util" && "$_util" =~ ^[0-9]+$ ]] && local_util="${_util}%"
         [[ "$_clk" != "Not Active" && -n "$_clk" ]] && local_throttle=" ${C_RED}[T]${C_RESET}"
     fi
     local_gpu=$(_trunc "$local_gpu" 22)
@@ -10074,9 +10121,15 @@ _cmd_cluster_snapshot() {
     local _local_info=""
     [[ -n "$local_temp" ]] && _local_info+=" ${local_temp}"
     [[ -n "$local_power" ]] && _local_info+=" ${local_power}"
+    local _util_disp="-" _util_c="${C_GRAY}"
+    if [[ -n "$local_util" ]]; then
+        _util_disp="$local_util"
+        _util_c="${C_LIME}"
+        [[ "${local_util%\%}" -ge 90 ]] && _util_c="${C_AMBER}"
+    fi
 
-    printf "  ${C_CYAN}%-8s${C_RESET} ${C_GRAY}%-16s${C_RESET} ${C_GRAY}%-23s${C_RESET} ${C_LIME}%5s GB${C_RESET}  ${C_AMBER}%5s GB${C_RESET}  ${C_GRAY}%5s GB${C_RESET}  ${C_LIME}%-9s${C_RESET} ${C_DIM}%-9s${C_RESET} ${C_LIME}%-10s${C_RESET}%s\n" \
-           "host" "$(_trunc "$(hostname -s)" 16)" "$local_gpu" "$local_vram" "$local_t2" "$local_t3" "HEALTHY" "local" "active" "$_local_info"
+    printf "  ${C_CYAN}%-8s${C_RESET} ${C_GRAY}%-16s${C_RESET} ${C_GRAY}%-23s${C_RESET} ${C_LIME}%5s GB${C_RESET}  ${C_AMBER}%5s GB${C_RESET}  ${C_GRAY}%5s GB${C_RESET}  ${_util_c}%-6s${C_RESET} ${C_LIME}%-9s${C_RESET} ${C_DIM}%-9s${C_RESET} ${C_LIME}%-10s${C_RESET}%s\n" \
+           "host" "$(_trunc "$(hostname -s)" 16)" "$local_gpu" "$local_vram" "$local_t2" "$local_t3" "$_util_disp" "HEALTHY" "local" "active" "$_local_info"
 
     # Remote feeders from cluster.conf
     local total_gpus=1 total_t1=$local_vram total_t2=$local_t2 total_t3=$local_t3
@@ -10116,6 +10169,7 @@ _cmd_cluster_snapshot() {
                 local _feeder_t2=0 _feeder_t3=0
                 # D2/3e: feeder GPU health from GB_MSG_FEEDER_STATUS v3.1 (no SSH needed)
                 local _feeder_throttle="" _feeder_temp="" _feeder_ecc="" _feeder_util=""
+                local _feeder_util_disp="-" _feeder_util_c="${C_GRAY}"
                 local _gh_line
                 _gh_line=$(echo "$probe_out" | grep "^GPU_HEALTH:" | head -1)
                 if [[ -n "$_gh_line" ]]; then
@@ -10123,7 +10177,11 @@ _cmd_cluster_snapshot() {
                     IFS=: read -r _ _gh_temp _gh_pwr _gh_util _gh_ecc _gh_thr <<< "$_gh_line"
                     [[ "$_gh_temp" =~ ^[0-9]+$ && $_gh_temp -gt 0 ]] && _feeder_temp=" ${_gh_temp}°C"
                     [[ "$_gh_pwr" =~ ^[0-9]+$ && $_gh_pwr -gt 0 ]] && _feeder_util="${_feeder_util} ${_gh_pwr}W"
-                    [[ "$_gh_util" =~ ^[0-9]+$ && $_gh_util -gt 0 ]] && _feeder_util="${_feeder_util} ${_gh_util}%SM"
+                    if [[ "$_gh_util" =~ ^[0-9]+$ ]]; then
+                        _feeder_util_disp="${_gh_util}%"
+                        _feeder_util_c="${C_LIME}"
+                        (( _gh_util >= 90 )) && _feeder_util_c="${C_AMBER}"
+                    fi
                     [[ "$_gh_ecc" =~ ^[1-9] ]] && _feeder_ecc=" ${C_RED}[ECC!]${C_RESET}"
                     [[ "$_gh_thr" =~ ^[1-9] ]] && _feeder_throttle=" ${C_RED}[T]${C_RESET}"
                 fi
@@ -10144,8 +10202,9 @@ _cmd_cluster_snapshot() {
                             fnvme="${_feeder_t3}"
                             _ft3_done=1
                         fi
-                        printf "  ${C_PURPLE}%-8s${C_RESET} ${C_GRAY}%-16s${C_RESET} ${C_GRAY}%-23s${C_RESET} ${C_LIME}%5s GB${C_RESET}  ${C_AMBER}%5s GB${C_RESET}  ${C_GRAY}%5s GB${C_RESET}  ${C_CYAN}%-9s${C_RESET} ${C_DIM}%-9s${C_RESET} ${C_LIME}%-10s${C_RESET}%s%s%s%s\n" \
+                        printf "  ${C_PURPLE}%-8s${C_RESET} ${C_GRAY}%-16s${C_RESET} ${C_GRAY}%-23s${C_RESET} ${C_LIME}%5s GB${C_RESET}  ${C_AMBER}%5s GB${C_RESET}  ${C_GRAY}%5s GB${C_RESET}  ${_feeder_util_c}%-6s${C_RESET} ${C_CYAN}%-9s${C_RESET} ${C_DIM}%-9s${C_RESET} ${C_LIME}%-10s${C_RESET}%s%s%s%s\n" \
                                "feeder" "$(_trunc "${nickname:-$ip}" 16)" "$fgpu" "$fvram" "$fddr" "$fnvme" \
+                               "$_feeder_util_disp" \
                                "$_fhealth_str" "$_fbw_str" "$fstatus" \
                                "$_feeder_throttle" "$_feeder_ecc" "$_feeder_temp" "$_feeder_util"
                         total_gpus=$((total_gpus + 1))
@@ -10155,8 +10214,8 @@ _cmd_cluster_snapshot() {
                 total_t2=$((total_t2 + _feeder_t2))
                 total_t3=$((total_t3 + _feeder_t3))
             else
-                printf "  ${C_PURPLE}%-8s${C_RESET} ${C_GRAY}%-16s${C_RESET} ${C_DIM}%-23s${C_RESET} ${C_DIM}%9s${C_RESET} ${C_DIM}%9s${C_RESET} ${C_DIM}%9s${C_RESET}  ${C_DIM}%-9s${C_RESET} ${C_DIM}%-9s${C_RESET} ${C_RED}%-10s${C_RESET}\n" \
-                       "feeder" "$(_trunc "${nickname:-$ip}" 16)" "-" "-" "-" "-" "-" "-" "offline"
+                printf "  ${C_PURPLE}%-8s${C_RESET} ${C_GRAY}%-16s${C_RESET} ${C_DIM}%-23s${C_RESET} ${C_DIM}%9s${C_RESET} ${C_DIM}%9s${C_RESET} ${C_DIM}%9s${C_RESET}  ${C_DIM}%-6s${C_RESET} ${C_DIM}%-9s${C_RESET} ${C_DIM}%-9s${C_RESET} ${C_RED}%-10s${C_RESET}\n" \
+                       "feeder" "$(_trunc "${nickname:-$ip}" 16)" "-" "-" "-" "-" "-" "-" "-" "offline"
             fi
         done < "$GB_CLUSTER_CONF"
     fi
@@ -10170,6 +10229,109 @@ _cmd_cluster_snapshot() {
         local _phys_gb=$(( (_phys_vram_mb + 512) / 1024 ))
         local _rem_gb=$(( (_remote_vram_mb + 512) / 1024 ))
         echo -e "  ${C_BOLD}Virtual VRAM:${C_RESET} ${C_LIME}${_virt_gb} GB${C_RESET}  ${C_DIM}(${_phys_gb} GB local + ${_rem_gb} GB feeder)${C_RESET}"
+    fi
+
+    # GPU Compute & Tier Detail , full T1/T2/T3 used/free + GPU compute
+    # (SM util, clocks, power) for host AND feeder side by side, via
+    # gb_cluster.cluster_snapshot() (host telemetry enriched 2026-07-14 to
+    # match the feeder's field set , previously host reported only 3 fields
+    # here while a feeder reported a dozen).
+    if command -v python3 &>/dev/null; then
+        local _detail_out
+        _detail_out=$(python3 -c "
+import sys, io, contextlib
+sys.path.insert(0, '${MODULE_DIR}')
+try:
+    # gb_init/gb_telemetry print init banners straight to stdout (no
+    # file=sys.stderr), which would otherwise interleave with and corrupt
+    # this script's own pipe-delimited data lines below , swallow only
+    # THEIR output, not ours.
+    with contextlib.redirect_stdout(io.StringIO()):
+        import gb_cluster as gc
+        snap = gc.cluster_snapshot(force=True)
+
+    def row(node, d):
+        def g(k):
+            v = d.get(k)
+            return '' if v is None else v
+        print(f\"{node}|{g('t1_free_mb')}|{g('t1_total_mb')}|{g('t2_free_mb')}|\"
+              f\"{g('t2_total_mb')}|{g('t3_free_mb')}|{g('t3_total_mb')}|\"
+              f\"{g('gpu_util_pct')}|{g('sm_clock_mhz')}|{g('mem_clock_mhz')}|\"
+              f\"{g('gpu_power_w')}|{g('power_limit_w')}|{g('temp_c')}\")
+
+    row('host', snap['host'])
+    for f in snap['feeders']:
+        if f.get('online'):
+            row(f.get('hostname') or f.get('ip', 'feeder'), f)
+except Exception as e:
+    print(f'DETAILERR|{e}')
+" 2>/dev/null)
+
+        echo ""
+        echo -e "  ${C_DIM}GPU compute & tier detail:${C_RESET}"
+        while IFS='|' read -r _n _t1f _t1t _t2f _t2t _t3f _t3t _u _smc _mc _pw _pl _tc; do
+            [[ -z "$_n" || "$_n" == "DETAILERR" ]] && continue
+            local _t1u="?" _t2u="?" _t3u="?"
+            [[ "$_t1f" =~ ^[0-9.]+$ && "$_t1t" =~ ^[0-9.]+$ ]] && _t1u=$(awk -v f="$_t1f" -v t="$_t1t" 'BEGIN{printf "%.1f", t-f}')
+            [[ "$_t2f" =~ ^[0-9.]+$ && "$_t2t" =~ ^[0-9.]+$ ]] && _t2u=$(awk -v f="$_t2f" -v t="$_t2t" 'BEGIN{printf "%.1f", t-f}')
+            [[ "$_t3f" =~ ^[0-9.]+$ && "$_t3t" =~ ^[0-9.]+$ ]] && _t3u=$(awk -v f="$_t3f" -v t="$_t3t" 'BEGIN{printf "%.1f", t-f}')
+            printf "    ${C_CYAN}%-14s${C_RESET}\n" "$_n"
+            printf "      ${C_GRAY}T1 VRAM${C_RESET}  ${C_LIME}%6s${C_RESET} / %-8s MB used   ${C_GRAY}T2 DDR${C_RESET}  ${C_AMBER}%6s${C_RESET} / %-8s MB used   ${C_GRAY}T3 NVMe${C_RESET}  %6s / %-8s MB used\n" \
+                "${_t1u}" "${_t1t:-?}" "${_t2u}" "${_t2t:-?}" "${_t3u}" "${_t3t:-?}"
+            printf "      ${C_GRAY}compute${C_RESET}  util=${C_LIME}%-5s${C_RESET} sm_clk=%-8s mem_clk=%-9s pwr=%-6s/%-6s temp=%s\n" \
+                "${_u:+${_u}%}" "${_smc:+${_smc}MHz}" "${_mc:+${_mc}MHz}" "${_pw:+${_pw}W}" "${_pl:+${_pl}W}" "${_tc:+${_tc}°C}"
+        done <<< "$_detail_out"
+    fi
+
+    # Cluster activity , the actual "what is happening" view via greenboost
+    # dataflux (the flight recorder), not just static topology: per-node
+    # item throughput + event/error counts over a short recent window, plus
+    # the most recent error as a prominent banner. 10min window: long enough
+    # to show real activity between 5s refreshes, short enough to stay "now".
+    if command -v python3 &>/dev/null; then
+        local _activity_out
+        _activity_out=$(python3 -c "
+import sys
+sys.path.insert(0, '${MODULE_DIR}')
+try:
+    import gb_dataflux as df
+    window_s = 600.0
+    events = df.read_events(since_hours=window_s / 3600)
+    s = df.summarize(events)
+    for node, d in sorted(s['nodes'].items()):
+        # items/min over the wall-clock window, not items/duration_s , most
+        # events (snapshots, decisions) carry duration_s=0.0, which would
+        # make a duration-based rate misleadingly read as 0 even when the
+        # node processed real work in this window.
+        rate = d['items'] / (window_s / 60.0)
+        print(f\"NODE|{node}|{d['items']}|{d['events']}|{rate:.2f}|{d['errors']}\")
+    errs = [e for e in events if e.get('status') == 'error']
+    if errs:
+        le = errs[-1]
+        msg = str(le.get('error', le.get('why', ''))).replace('|', '/')[:70]
+        print(f\"ERR|{le.get('node', '?')}|{le.get('stage', le.get('label', '?'))}|{msg}\")
+except Exception as e:
+    print(f'DFERR|{e}')
+" 2>/dev/null)
+
+        echo ""
+        echo -e "  ${C_DIM}Cluster activity (last 10min, via greenboost dataflux):${C_RESET}"
+        local _has_activity=0
+        while IFS='|' read -r _kind _f1 _f2 _f3 _f4 _f5; do
+            case "$_kind" in
+                NODE)
+                    _has_activity=1
+                    local _err_c="${C_DIM}"
+                    [[ "$_f5" =~ ^[1-9] ]] && _err_c="${C_RED}"
+                    printf "    ${C_CYAN}%-16s${C_RESET} items=${C_LIME}%-6s${C_RESET} events=%-6s rate=${C_LIME}%-13s${C_RESET} errors=${_err_c}%s${C_RESET}\n" \
+                        "$_f1" "$_f2" "$_f3" "${_f4}/min" "$_f5"
+                    ;;
+                ERR)
+                    echo -e "    ${C_RED}⚠ last error${C_RESET} ${C_DIM}[${_f1}/${_f2}]${C_RESET} ${_f3}"
+                    ;;
+            esac
+        done <<< "$_activity_out"
+        (( _has_activity == 0 )) && echo -e "    ${C_DIM}(no cluster dispatch activity in this window)${C_RESET}"
     fi
 
     # Build stamp summary - local + each feeder
@@ -10241,16 +10403,22 @@ _cmd_cluster_snapshot() {
 }
 
 cmd_cluster() {
-    local _llm_mode=0
-    for _a in "$@"; do [[ "$_a" == "--llm" ]] && _llm_mode=1; done
+    local _llm_mode=0 _live_mode=0
+    for _a in "$@"; do
+        [[ "$_a" == "--llm" ]] && _llm_mode=1
+        [[ "$_a" == "--live" ]] && _live_mode=1
+    done
     if (( _llm_mode )); then
         local _strip='s/\x1b\[[0-9;]*[mKHJsu]//g'
         _cmd_cluster_snapshot | sed "$_strip" | sed 's/^[[:space:]]*//' | grep -v '^─'
         return
     fi
 
-    # Non-interactive: single snapshot, no prompts, no infinite loop
-    if [[ ! -t 0 ]]; then
+    # Non-interactive: single snapshot, no prompts, no infinite loop , UNLESS
+    # --live was explicitly requested (e.g. run inside tmux/screen/a piped
+    # terminal where `[[ -t 0 ]]` misdetects but the user still wants the
+    # auto-refreshing view; plain interactive runs already loop by default).
+    if [[ ! -t 0 ]] && (( ! _live_mode )); then
         _cmd_cluster_snapshot
         return
     fi
@@ -12391,7 +12559,7 @@ case "$COMMAND" in
     feed)                cmd_feed "${@:2}"      ;;
     connect)             cmd_connect "${@:2}"   ;;
     disconnect)          cmd_disconnect "${@:2}" ;;
-    cluster)             cmd_cluster            ;;
+    cluster)             cmd_cluster "${@:2}"   ;;
     dataflux-ui)         cmd_dataflux_ui "${@:2}" ;;
     update)
         case "${2:-}" in

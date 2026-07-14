@@ -950,6 +950,23 @@ static int send_msg(struct client *cli, uint16_t msg_type, uint16_t flags,
     return rc;
 }
 
+/* GT/s -> PCIe generation.  Mirrors gb_telemetry.py's _gts_to_pcie_gen() and
+ * greenboost_setup.sh's _gts_to_gen() bash helper (search "PCIe link (GPU
+ * slot)" in that file) - ONE shared mapping across C/Python/bash, kept in
+ * sync deliberately.  Parses a sysfs "<N>[.0] GT/s PCIe" string. */
+static gb_u32 gts_to_gen(const char *speed_str)
+{
+    float gts = 0;
+    sscanf(speed_str, "%f", &gts);
+    if      (gts >= 64.0f) return 6;
+    else if (gts >= 32.0f) return 5;
+    else if (gts >= 16.0f) return 4;
+    else if (gts >= 8.0f)  return 3;
+    else if (gts >= 5.0f)  return 2;
+    else if (gts >= 1.0f)  return 1;
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Message handlers                                                   */
 /* ------------------------------------------------------------------ */
@@ -1024,32 +1041,29 @@ static int handle_handshake(struct client *cli, const void *payload, uint32_t le
     if (access("/etc/greenboost/profiles/default.md", R_OK) == 0)
         resp.feature_flags |= GB_NET_FEAT_TOPOLOGY;
 
-    /* D1: PCIe link info - read from sysfs for GPU 0 */
+    /* D1: PCIe link info - read from sysfs for GPU 0
+     *
+     * gts_to_gen() thresholds mirror gb_telemetry.py's _gts_to_pcie_gen() /
+     * greenboost_setup.sh's _gts_to_gen() - ONE shared mapping across
+     * Python/bash/C, kept in sync deliberately (the old inline thresholds
+     * here were off by one full generation: gts>=16 was mapped to gen5
+     * instead of gen4, systematically overstating every feeder's reported
+     * link by one generation once at Gen3+ speeds - fixed 2026-07-14). */
     {
-        /* /sys/bus/pci/devices/ path can be discovered via /proc/driver/nvidia/gpus/
-         * or by scanning /sys/class/drm/cardN/device. Try common paths. */
         const char *pcie_dirs[] = {
             "/sys/class/drm/card0/device",
             "/sys/class/drm/card1/device",
             NULL
         };
         for (int _pi = 0; pcie_dirs[_pi]; _pi++) {
-            char buf[128];
+            char buf[160];
             FILE *fp;
             snprintf(buf, sizeof(buf), "%s/current_link_speed", pcie_dirs[_pi]);
             fp = fopen(buf, "r");
             if (!fp) continue;
             char speed_str[32] = {0};
-            if (fgets(speed_str, sizeof(speed_str), fp)) {
-                /* e.g. "16 GT/s PCIe" or "8.0 GT/s PCIe" */
-                float gts = 0;
-                sscanf(speed_str, "%f", &gts);
-                if (gts >= 16.0f)       resp.pcie_link_gen = 5;
-                else if (gts >= 8.0f)   resp.pcie_link_gen = 4;
-                else if (gts >= 4.0f)   resp.pcie_link_gen = 3;
-                else if (gts >= 2.0f)   resp.pcie_link_gen = 2;
-                else                    resp.pcie_link_gen = 1;
-            }
+            if (fgets(speed_str, sizeof(speed_str), fp))
+                resp.pcie_link_gen = gts_to_gen(speed_str);
             fclose(fp);
             snprintf(buf, sizeof(buf), "%s/current_link_width", pcie_dirs[_pi]);
             fp = fopen(buf, "r");
@@ -1058,11 +1072,43 @@ static int handle_handshake(struct client *cli, const void *payload, uint32_t le
                     resp.pcie_link_width = 0;
                 fclose(fp);
             }
-            /* Effective BW: gen5_x16=64 gen4_x16=32 gen3_x16=16 gen3_x8=8 gen4_x4=8 etc.
-             * Approximation: (gen_bw_gbs_per_lane × width × 1000) / 8 bytes = MB/s */
+
+            /* D-PCIE-CEIL: real slot ceiling from the PARENT PCI bridge, not
+             * the GPU's own device-level max (which, like NVML's
+             * MaxPcieLinkWidth, reports what the SILICON can do regardless of
+             * how many lanes the slot actually wires - a x16-capable chip in
+             * a x8 laptop slot still reports a x16 device max). "current"
+             * also idles at Gen1/Gen2 under ASPM power saving, so neither
+             * current_link_* nor the GPU's own max_link_* is trustworthy as
+             * the achievable ceiling; the parent bridge is. */
+            snprintf(buf, sizeof(buf), "%s/../max_link_speed", pcie_dirs[_pi]);
+            fp = fopen(buf, "r");
+            if (fp) {
+                char slot_speed_str[32] = {0};
+                if (fgets(slot_speed_str, sizeof(slot_speed_str), fp))
+                    resp.pcie_link_gen_max = gts_to_gen(slot_speed_str);
+                fclose(fp);
+            }
+            snprintf(buf, sizeof(buf), "%s/../max_link_width", pcie_dirs[_pi]);
+            fp = fopen(buf, "r");
+            if (fp) {
+                if (fscanf(fp, "%u", &resp.pcie_link_width_max) != 1)
+                    resp.pcie_link_width_max = 0;
+                fclose(fp);
+            }
+            if (!resp.pcie_link_gen_max)   resp.pcie_link_gen_max   = resp.pcie_link_gen;
+            if (!resp.pcie_link_width_max) resp.pcie_link_width_max = resp.pcie_link_width;
+
+            /* Effective BW computed against the CEILING, not the (possibly
+             * idle-downtrained) current link, so feeder scoring/placement
+             * reflects real achievable bandwidth: gen5_x16=64 gen4_x16=32
+             * gen3_x16=16 gen3_x8=8 gen4_x4=8 etc. Approximation:
+             * (gen_bw_gbs_per_lane × width × 1000) / 8 bytes = MB/s */
             static const float lane_gbs[] = {0, 0.25f, 0.5f, 1.0f, 2.0f, 4.0f};
-            float gen = (resp.pcie_link_gen < 6) ? resp.pcie_link_gen : 5;
-            resp.pcie_effective_bw_mbs = (gb_u32)(lane_gbs[(int)gen] * resp.pcie_link_width * 1000.0f);
+            gb_u32 gen = (resp.pcie_link_gen_max > 0 && resp.pcie_link_gen_max < 6)
+                         ? resp.pcie_link_gen_max : 5;
+            resp.pcie_effective_bw_mbs =
+                (gb_u32)(lane_gbs[gen] * resp.pcie_link_width_max * 1000.0f);
             break;
         }
     }

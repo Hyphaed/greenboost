@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch, call
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
-from gb_orchestrator import ReactiveOrchestrator
+from gb_orchestrator import ReactiveOrchestrator, GpuHealth
 from gb_telemetry import GpuMetrics, GbPoolInfo
 
 
@@ -100,6 +100,11 @@ class _MockGbControl:
     def set_prefetch_throttle(self, v, *, reason=""):
         self._last["prefetch_throttle"] = (v, 0)
         self.calls.append(("set_prefetch_throttle", v, reason))
+        return _Result(f"set={v}")
+
+    def set_t3_cap_mb(self, v, *, reason=""):
+        self._last["t3_cap_mb"] = (v, 0)
+        self.calls.append(("set_t3_cap_mb", v, reason))
         return _Result(f"set={v}")
 
     def restore_baseline(self):
@@ -1408,6 +1413,36 @@ def test_loop_i_mild_zone_halves_kv_step():
     assert applied_kv >= 512 + 128            # at least the floor half-step
 
 
+def test_loop_i_pid_off_by_default_is_none():
+    """GB_SM_PID unset (the common case) — _sm_pid must be None so
+    _do_kv_grow's discrete halve/full path (pre-DI-6 behavior) is used,
+    never the continuous PID path."""
+    o = _make_orch_no_io()
+    assert o._sm_pid is None
+
+
+def test_loop_i_pid_scales_step_continuously_when_enabled(monkeypatch):
+    monkeypatch.setenv("GB_SM_PID", "1")
+    monkeypatch.setenv("GB_PID_KP", "0.05")
+    monkeypatch.setenv("GB_PID_KI", "0.0")
+    monkeypatch.setenv("GB_PID_KD", "0.0")
+    ctrl = _MockGbControl()
+    ctrl._last["kv_reserve_mb"] = (512, 0.0)
+    ctrl._last["safety_reserve_gb"] = (4, 0.0)
+    o = _make_orch_no_io(ctrl=ctrl)
+    assert o._sm_pid is not None
+    o._total_vram_mb = 12288
+    for _ in range(30):
+        o._clock_drop_sig.set(9.5)   # same mild-zone drop as the discrete test above
+    decision = {"loop": "test", "ts": 0}
+    o._do_kv_grow("test_pid", decision)
+    applied_kv = ctrl._last["kv_reserve_mb"][0]
+    # PID output is continuous, not the fixed 50% halve — just confirm it
+    # reacted (some step taken, but not necessarily the full step) rather
+    # than asserting an exact scale (depends on integral history/dt).
+    assert 512 <= applied_kv <= 512 + o._kv_step_mb
+
+
 def test_loop_i_in_dump():
     """dump() includes clock_throttled and sm_clock_max_mhz."""
     o = _make_orch_no_io()
@@ -2075,15 +2110,18 @@ def test_loop_r_cpu_psi_high_outside_perf_phase_is_noop(monkeypatch):
     assert "cpu_governor" not in ctrl._last
 
 
-def test_loop_r_io_psi_high_during_t3_spill_is_advisory(monkeypatch):
-    """No GbControl lever exists yet for NVMe tuning , must not raise, must record."""
+def test_loop_r_io_psi_high_with_zero_t3_telemetry_is_advisory(monkeypatch):
+    """Edge case: t3_used_mb/t3_free_mb both 0 (no real capacity learned yet)
+    -> baseline collapses to the floor immediately -> advisory, no lever call.
+    Distinct from the DI-12 engaged-lever path below, which needs a real
+    (non-zero) T3 capacity to step down from."""
     o, ctrl = _make_supervisor_orch(monkeypatch)
     gb = GbPoolInfo()
     gb.t3_pressure = 2
     o._last_metrics = _make_metrics()
     o._last_metrics.gb = gb
     o._on_io_psi_high(25.0)   # must not raise
-    assert ctrl.calls == []   # advisory only , no lever exists
+    assert ctrl.calls == []
 
 
 def test_loop_r_io_psi_high_without_t3_pressure_is_noop(monkeypatch):
@@ -2091,6 +2129,75 @@ def test_loop_r_io_psi_high_without_t3_pressure_is_noop(monkeypatch):
     o._last_metrics = _make_metrics()
     o._on_io_psi_high(25.0)
     assert ctrl.calls == []
+
+
+# ── DI-12: reactive NVMe/T3 lever ────────────────────────────────────────────
+
+def _make_t3_pressured_orch(monkeypatch, t3_used_mb=4096, t3_free_mb=6144):
+    o, ctrl = _make_supervisor_orch(monkeypatch)
+    gb = GbPoolInfo()
+    gb.t3_pressure = 2
+    gb.t3_used_mb = t3_used_mb
+    gb.t3_free_mb = t3_free_mb
+    o._last_metrics = _make_metrics()
+    o._last_metrics.gb = gb
+    return o, ctrl
+
+
+def test_di12_steps_t3_cap_down_on_real_pressure(monkeypatch):
+    monkeypatch.delenv("GB_NVME_LEVER", raising=False)
+    o, ctrl = _make_t3_pressured_orch(monkeypatch)
+    o._on_io_psi_high(25.0)
+    assert "t3_cap_mb" in ctrl._last
+    new_cap = ctrl._last["t3_cap_mb"][0]
+    baseline = 4096 + 6144
+    assert new_cap < baseline   # stepped down from the learned baseline
+    assert new_cap >= int(baseline * 0.10)   # never below the 10% floor
+    assert o._t3_lever_active is True
+
+
+def test_di12_escape_hatch_disables_lever(monkeypatch):
+    monkeypatch.setenv("GB_NVME_LEVER", "0")
+    o, ctrl = _make_t3_pressured_orch(monkeypatch)
+    o._on_io_psi_high(25.0)
+    assert ctrl.calls == []   # advisory only, exact pre-DI-12 behavior
+    assert o._t3_lever_active is False
+
+
+def test_di12_restores_cap_when_pressure_clears(monkeypatch):
+    monkeypatch.delenv("GB_NVME_LEVER", raising=False)
+    # Sustained pressure -> multiple step-downs, so ONE restore call can only
+    # partially recover (a single down-step and up-step of the same
+    # percentage always exactly cancel — this needs at least two step-downs
+    # for a single restore to land strictly between the two).
+    o, ctrl = _make_t3_pressured_orch(monkeypatch)
+    o._on_io_psi_high(25.0)
+    o._on_io_psi_high(25.0)
+    stepped_down = ctrl._last["t3_cap_mb"][0]
+    assert o._t3_lever_active is True
+    o._on_io_psi_ok(5.0)
+    restored = ctrl._last["t3_cap_mb"][0]
+    assert restored > stepped_down   # geometric step back up
+    assert restored < 10240          # but not fully restored to baseline yet
+
+
+def test_di12_fully_restores_to_zero_cap_after_enough_recoveries(monkeypatch):
+    monkeypatch.delenv("GB_NVME_LEVER", raising=False)
+    o, ctrl = _make_t3_pressured_orch(monkeypatch)
+    o._on_io_psi_high(25.0)
+    assert o._t3_lever_active is True
+    for _ in range(200):   # geometric 2%/step converges back to baseline
+        o._on_io_psi_ok(5.0)
+        if not o._t3_lever_active:
+            break
+    assert o._t3_lever_active is False
+    assert ctrl._last["t3_cap_mb"][0] == 0   # 0 = disk-limited/no cap, fully restored
+
+
+def test_di12_restore_noop_when_lever_never_engaged(monkeypatch):
+    o, ctrl = _make_supervisor_orch(monkeypatch)
+    o._on_io_psi_ok(5.0)   # must not raise, must not call set_t3_cap_mb
+    assert "t3_cap_mb" not in ctrl._last
 
 
 def test_loop_r_noop_in_process_mode(orch):
@@ -2158,3 +2265,66 @@ def test_dump_includes_os_tune_state(monkeypatch):
     assert any(s["name"] == "psi_cpu_some" for s in d["signals"])
     assert any(s["name"] == "psi_io_some" for s in d["signals"])
     assert any(s["name"] == "pcie_saturated" for s in d["signals"])
+
+
+# ── GpuHealth (DI-6, MuxFlow SysMonitor port) ────────────────────────────────
+
+def test_gpu_health_starts_init():
+    h = GpuHealth()
+    assert h.state == GpuHealth.INIT
+    assert not h.admits_overcommit()
+
+
+def test_gpu_health_no_stress_becomes_healthy():
+    h = GpuHealth()
+    new = h.feed(ecc_degraded=False, thermal_stress=False,
+                clock_throttled=False, mem_bw_stress=False)
+    assert new == GpuHealth.HEALTHY
+    assert h.admits_overcommit()
+
+
+def test_gpu_health_single_stress_is_unhealthy():
+    h = GpuHealth()
+    h.feed(ecc_degraded=False, thermal_stress=False, clock_throttled=False, mem_bw_stress=False)
+    new = h.feed(ecc_degraded=False, thermal_stress=True, clock_throttled=False, mem_bw_stress=False)
+    assert new == GpuHealth.UNHEALTHY
+    assert not h.admits_overcommit()
+
+
+def test_gpu_health_two_simultaneous_stresses_is_overlimit():
+    h = GpuHealth()
+    new = h.feed(ecc_degraded=False, thermal_stress=True, clock_throttled=True, mem_bw_stress=False)
+    assert new == GpuHealth.OVERLIMIT
+    assert not h.admits_overcommit()
+
+
+def test_gpu_health_ecc_degraded_forces_disabled_even_with_no_other_stress():
+    h = GpuHealth()
+    new = h.feed(ecc_degraded=True, thermal_stress=False, clock_throttled=False, mem_bw_stress=False)
+    assert new == GpuHealth.DISABLED
+    assert not h.admits_overcommit()
+
+
+def test_gpu_health_recovers_from_unhealthy_to_healthy():
+    h = GpuHealth()
+    h.feed(ecc_degraded=False, thermal_stress=True, clock_throttled=False, mem_bw_stress=False)
+    assert h.state == GpuHealth.UNHEALTHY
+    new = h.feed(ecc_degraded=False, thermal_stress=False, clock_throttled=False, mem_bw_stress=False)
+    assert new == GpuHealth.HEALTHY
+    assert h.admits_overcommit()
+
+
+def test_gpu_health_feed_returns_none_when_state_unchanged():
+    h = GpuHealth()
+    h.feed(ecc_degraded=False, thermal_stress=False, clock_throttled=False, mem_bw_stress=False)
+    same = h.feed(ecc_degraded=False, thermal_stress=False, clock_throttled=False, mem_bw_stress=False)
+    assert same is None   # no transition -> no event, matches Signal's on_enter/on_exit convention
+
+
+def test_dump_includes_di6_health_state(monkeypatch):
+    o, ctrl = _make_supervisor_orch(monkeypatch)
+    o.on_metrics(_make_metrics())
+    d = o.dump()
+    assert d["health_state"] in (GpuHealth.HEALTHY, GpuHealth.UNHEALTHY,
+                                 GpuHealth.OVERLIMIT, GpuHealth.DISABLED)
+    assert isinstance(d["admits_overcommit"], bool)

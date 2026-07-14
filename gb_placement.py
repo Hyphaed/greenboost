@@ -145,6 +145,47 @@ def plan_placement(kind: str, *, weights_fp8_gb: float, kv_gb: float,
                      "(hot fp8, cold nvfp4/int4) is the fallback")
 
 
+def proportional_split(total_units: int, weights: List[float],
+                       mins: Optional[List[int]] = None) -> List[int]:
+    """Apportion `total_units` integer units across len(weights) nodes in
+    proportion to `weights`, with an exact-sum guarantee (largest-remainder /
+    Hamilton method — port of exo's placement_utils.py). Each node gets
+    floor(share), then the leftover units go to the nodes with the largest
+    fractional remainder first. `mins[i]`, if given, is a floor for node i
+    (e.g. every node gets >=1 layer); satisfied by stealing units from the
+    node with the most units. Foundation for the Phase 3 cluster-placement
+    tasks (capacity_fit, min_throughput_placement, cluster_map chunk sizing)
+    — do not duplicate this arithmetic at those call sites.
+    """
+    n = len(weights)
+    if n == 0 or total_units <= 0:
+        return [0] * n
+    total_w = sum(w for w in weights if w > 0) or 1.0
+    shares = [total_units * max(w, 0.0) / total_w for w in weights]
+    result = [int(math.floor(s)) for s in shares]
+    remainders = [s - r for s, r in zip(shares, result)]
+    leftover = total_units - sum(result)
+    order = sorted(range(n), key=lambda i: remainders[i], reverse=True)
+    for i in order[:max(0, leftover)]:
+        result[i] += 1
+    if mins:
+        for i, m in enumerate(mins):
+            while result[i] < m:
+                donor = max(range(n), key=lambda j: result[j])
+                if result[donor] <= m:
+                    break  # nothing left to steal without going negative
+                result[donor] -= 1
+                result[i] += 1
+    return result
+
+
+def fits(assignment_gb: List[float], capacity_gb: List[float],
+        reserve_gb: Optional[List[float]] = None) -> bool:
+    """True iff every node's assignment fits its capacity minus reserve."""
+    reserve_gb = reserve_gb or [0.0] * len(capacity_gb)
+    return all(a <= c - r for a, c, r in zip(assignment_gb, capacity_gb, reserve_gb))
+
+
 def plan_and_emit(kind: str, **kw) -> PlacementPlan:
     """plan_placement + best-effort dataflux emit (never raises)."""
     plan = plan_placement(kind, **kw)
@@ -160,3 +201,231 @@ def plan_and_emit(kind: str, **kw) -> PlacementPlan:
     except Exception:
         pass
     return plan
+
+
+def _t2_pool_total_gb() -> float:
+    """This node's real T2 DDR pool total in GB (0.0 if unknown). Same
+    kmod pool_brief source + MemTotal*0.70 fallback as gb_quant._t2_pool_total_gb
+    — duplicated here (not imported) because gb_placement must stay import-
+    independent of gb_quant (see module docstring)."""
+    try:
+        import re as _re
+        with open("/sys/class/greenboost/greenboost/pool_brief") as f:
+            m = _re.search(r"T2:(\d+)/(\d+)GB", f.read())
+        if m:
+            return float(int(m.group(2)))
+    except Exception:
+        pass
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    kb = int(line.split()[1])
+                    return round(kb / (1024.0 * 1024.0) * 0.70, 1)
+    except Exception:
+        pass
+    return 0.0
+
+
+def plan_experts(*, dense_gb: float, expert_gb: float, kv_gb: float = 0.0,
+                 vram_gb: Optional[float] = None, t2_gb: Optional[float] = None,
+                 vram_fill_pct: Optional[float] = None) -> dict:
+    """Colibri-style versioned tier plan for an MoE model's routed-expert
+    weight bytes: how much lives hot in VRAM vs warm in T2 DDR vs stays cold
+    (T3/disk), given THIS node's real topology. Read-only — allocates
+    nothing, mirrors colibri's resource_plan.build_plan() output shape
+    (tiers.{disk,ram,vram}, expected_bottleneck, decisions, warnings) for
+    direct comparability, but every budget term is %-derived from
+    gb_topology (never colibri's flat 1.2GB/2.5GB literals — see
+    workflow/porting-reference.md §CB-3).
+
+    Placement follows the Immutable Design Rules: dense weights + KV are
+    resident in T1 FIRST (dense stays entirely in VRAM per the Reference
+    Workload Rule's "-ngl 999"; KV is re-read every decode step); only the
+    LEFTOVER VRAM after that is the routed-expert hot budget. `vram_gb`/
+    `t2_gb` are injectable for tests; None probes gb_topology live.
+    """
+    try:
+        import gb_topology
+        topo = gb_topology.get_topology()
+    except Exception:
+        topo = None
+
+    if vram_gb is None:
+        vram_gb = float(topo.vram_gb) if topo and topo.vram_gb > 0 else 0.0
+    if t2_gb is None:
+        t2_gb = _t2_pool_total_gb()
+    fill_pct = vram_fill_pct if vram_fill_pct is not None else 90.0  # Rule #1
+    compute_reserve_gb = (gb_topology.compute_reserve_gb(vram_gb * 1024.0)
+                          if topo and vram_gb > 0 else max(0.75, 0.08 * vram_gb))
+
+    warnings: List[str] = []
+    if vram_gb <= 0:
+        warnings.append("VRAM undetectable on this node — plan is a 0-budget floor, not a real estimate")
+
+    vram_for_experts = max(0.0, vram_gb * fill_pct / 100.0 - compute_reserve_gb - kv_gb - dense_gb)
+    if dense_gb > vram_gb * fill_pct / 100.0:
+        warnings.append(f"dense weights alone ({dense_gb:.1f} GB) exceed the VRAM fill target — "
+                        f"KV and every routed expert will overflow")
+
+    hot_gb = min(expert_gb, vram_for_experts)
+    ram_for_experts = max(0.0, t2_gb)  # T2 is expert-cache-only here; KV/dense already accounted in T1
+    warm_gb = min(max(0.0, expert_gb - hot_gb), ram_for_experts)
+    cold_gb = max(0.0, expert_gb - hot_gb - warm_gb)
+
+    if cold_gb > 0:
+        bottleneck = "disk/NVMe expert misses (T3) — quality-first rule: T3 is never for speed-critical data"
+        warnings.append(f"{cold_gb:.1f} GB of routed experts do not fit VRAM+T2 — "
+                        f"raise T2 pool or use --n-cpu-moe / re-quantize before accepting T3 spill")
+    elif warm_gb > 0:
+        bottleneck = "CPU expert compute + DDR bandwidth (--n-cpu-moe offload)"
+    else:
+        bottleneck = "GPU compute and interconnect"
+
+    return {
+        "version": 1,
+        "vram_fill_pct": fill_pct,
+        "model": {"dense_gb": round(dense_gb, 2), "expert_gb": round(expert_gb, 2),
+                  "kv_gb": round(kv_gb, 2)},
+        "tiers": {
+            "vram": {"role": "dense+kv+hot-experts", "budget_gb": round(vram_gb, 2),
+                     "compute_reserve_gb": round(compute_reserve_gb, 2),
+                     "hot_expert_gb": round(hot_gb, 2)},
+            "t2": {"role": "warm-experts (--n-cpu-moe)", "budget_gb": round(t2_gb, 2),
+                   "warm_expert_gb": round(warm_gb, 2)},
+            "t3": {"role": "cold-backing (never speed-critical)", "cold_expert_gb": round(cold_gb, 2)},
+        },
+        "expected_bottleneck": bottleneck,
+        "decisions": [
+            {"target": "VRAM", "reason": "dense weights + KV resident first, then hottest routed experts"},
+            {"target": "T2 (DDR)", "reason": "warm experts run via --n-cpu-moe, no quality loss"},
+            {"target": "T3 (NVMe)", "reason": "last resort only — quality-first rule forbids T3 for speed-critical data"},
+        ],
+        "warnings": warnings,
+    }
+
+
+def plan_experts_and_emit(**kw) -> dict:
+    """plan_experts + best-effort dataflux emit (never raises)."""
+    plan = plan_experts(**kw)
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({
+            "kind": "placement", "runtime": "expert_plan",
+            "vram_fill_pct": plan["vram_fill_pct"],
+            "hot_expert_gb": plan["tiers"]["vram"]["hot_expert_gb"],
+            "warm_expert_gb": plan["tiers"]["t2"]["warm_expert_gb"],
+            "cold_expert_gb": plan["tiers"]["t3"]["cold_expert_gb"],
+            "expected_bottleneck": plan["expected_bottleneck"],
+        })
+    except Exception:
+        pass
+    return plan
+
+
+@dataclass
+class CapacityFit:
+    fraction: float                      # smallest f in (0,1] of free VRAM that fits n_offload layers
+    per_device_layers: List[int]         # layer count per device, in the CALLER's original device order
+    n_offload: int                       # total layers placed on GPUs (== all layers if everything fits)
+
+
+def capacity_fit(layer_sizes_gb: List[float], device_free_gb: List[float],
+                 device_reserve_gb: Optional[List[float]] = None,
+                 order: Optional[List[int]] = None, iters: int = 16) -> CapacityFit:
+    """Binary-search the smallest usable-VRAM fraction that still fits the
+    maximum number of layers across devices (ollama `llm/server.go`'s
+    findBestFit/greedyFit port — see workflow/porting-reference.md §DI-2).
+
+    Why binary-search a fraction instead of just greedily packing at 100%:
+    packing at the full free-VRAM figure lets one big device swallow almost
+    everything and leaves smaller devices nearly empty; searching for the
+    SMALLEST fraction that still achieves the maximum possible layer count
+    forces an even balance across devices (a small per-device budget spills
+    to the next device sooner), without giving up any offload capacity.
+
+    `order` is the perf-ranked device visitation order (index into
+    layer_sizes_gb/device_free_gb/device_reserve_gb) — default: as given.
+    Pure function; caller supplies real free-VRAM figures (host + feeders).
+    """
+    ndev = len(device_free_gb)
+    if ndev == 0 or not layer_sizes_gb:
+        return CapacityFit(fraction=0.0, per_device_layers=[0] * ndev, n_offload=0)
+    reserve = device_reserve_gb if device_reserve_gb is not None else [0.0] * ndev
+    order = order if order is not None else list(range(ndev))
+
+    def _greedy(frac: float) -> "tuple[int, List[int]]":
+        free = [max(0.0, device_free_gb[order[i]] * frac - reserve[order[i]]) for i in range(ndev)]
+        per_device = [0] * ndev
+        dev_idx = 0
+        remaining = free[0] if ndev else 0.0
+        count = 0
+        for size in layer_sizes_gb:
+            while dev_idx < ndev and size > remaining:
+                dev_idx += 1
+                remaining = free[dev_idx] if dev_idx < ndev else 0.0
+            if dev_idx >= ndev:
+                break
+            remaining -= size
+            per_device[dev_idx] += 1
+            count += 1
+        return count, per_device
+
+    max_count, max_per_device = _greedy(1.0)
+    lo, hi = 0.0, 1.0
+    best_frac, best_per_device = 1.0, max_per_device
+    for _ in range(max(1, iters)):
+        mid = (lo + hi) / 2.0
+        count, per_device = _greedy(mid)
+        if count >= max_count:
+            hi, best_frac, best_per_device = mid, mid, per_device
+        else:
+            lo = mid
+
+    result = [0] * ndev
+    for i, d in enumerate(order):
+        result[d] = best_per_device[i]
+    return CapacityFit(fraction=round(best_frac, 4), per_device_layers=result, n_offload=max_count)
+
+
+@dataclass
+class NodeThroughput:
+    key: str
+    compute_tok_s: float     # this node's own decode-speed estimate/measurement
+    network_tok_s: float     # 0.0 = no network hop needed (e.g. the host itself)
+
+    @property
+    def effective(self) -> float:
+        """min(compute, network) — petals' throughput model: a fast GPU behind
+        a slow link is still bottlenecked by the link. network_tok_s<=0 means
+        no network hop applies (skip the min, e.g. for the local host)."""
+        if self.network_tok_s > 0:
+            return min(self.compute_tok_s, self.network_tok_s)
+        return self.compute_tok_s
+
+
+def min_throughput_placement(n_units: int, nodes: List[NodeThroughput],
+                             mins: Optional[List[int]] = None) -> List[int]:
+    """Assign n_units integer units (layers, chunks) across nodes proportional
+    to each node's EFFECTIVE throughput (petals' block_selection port — see
+    workflow/porting-reference.md §DI-3): the node with the lowest min(compute,
+    network) throughput gets proportionally fewer units, so no single slow
+    node becomes the pipeline's bottleneck. Delegates the actual integer
+    apportionment to proportional_split (exact-sum guarantee)."""
+    weights = [max(nd.effective, 0.01) for nd in nodes]  # floor: never fully starve a node
+    return proportional_split(n_units, weights, mins=mins)
+
+
+def should_rebalance(current_min: float, candidate_min: float,
+                     balance_quality: float = 0.75) -> bool:
+    """Petals' rebalance gate: only worth moving load if the CANDIDATE
+    placement's min-throughput clears current_min / balance_quality (i.e.
+    improves by more than the (1 - balance_quality) margin — default 0.75,
+    petals' own default). Refuses non-improving or disconnecting candidates
+    (candidate_min <= 0). This is the guard against moving load for a
+    marginal, noise-level gain."""
+    if candidate_min <= 0:
+        return False
+    if current_min <= 0:
+        return True   # nothing currently placed usefully — any real throughput improves on that
+    return candidate_min > current_min / balance_quality

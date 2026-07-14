@@ -19,9 +19,12 @@ Sources (consumed in order; degrade gracefully when unavailable):
   1. gb_nvml.get_nvml()             , GPU hardware metrics via shared singleton
   2. /run/greenboost/shim_stats     , shim flow state (phase, tiers, ws_reserve)
   3. /sys/module/greenboost/…       , gaming_mode sysfs
-  4. /var/lib/greenboost/vram_pressure , supervisor pressure state
-  5. /run/greenboost/orch_state.json , orchestrator decisions (written by daemon)
-  6. GB_IOCTL_GET_INFO (ctypes)     , kernel module pool state (optional)
+  4. /var/lib/greenboost/vram_pressure , supervisor VRAM pressure state
+  5. /var/lib/greenboost/ram_pressure , supervisor system-RAM/swap pressure
+     state (distinct from VRAM/T2 , CPU-offloaded inference bypasses the
+     shim's T2 pool entirely; see gb_supervisor.py's _RamMonitor)
+  6. /run/greenboost/orch_state.json , orchestrator decisions (written by daemon)
+  7. GB_IOCTL_GET_INFO (ctypes)     , kernel module pool state (optional)
 
 Exit 0: success (pynvml available)
 Exit 1: pynvml unavailable , caller should fall back to nvidia-smi
@@ -189,6 +192,21 @@ def main() -> None:
     except Exception:
         pass
 
+    # System RAM/swap pressure , separate signal from VRAM/T2 above (a
+    # CPU-offloaded PyTorch process consumes ordinary host RAM/swap without
+    # ever touching GreenBoost's own T2 pool; see gb_supervisor.py's
+    # _RamMonitor and the 2026-07-14 incident it was added for)
+    ram_pressure: dict[str, str] = {}
+    try:
+        with open("/var/lib/greenboost/ram_pressure") as f:
+            for line in f:
+                if "=" in line:
+                    k, _, v = line.strip().partition("=")
+                    ram_pressure[k] = v
+    except Exception:
+        pass
+    ram_pressure_state = ram_pressure.get("state", "")
+
     # Shim flow state , zero-cost when shim is absent
     flow = sample_shim_flow()
 
@@ -226,6 +244,10 @@ def main() -> None:
             "ecc_dbe_agg":     ecc_dbe_agg,
             "gaming_mode":     gaming_mode,
             "pressure_state":  pressure_state,
+            # System RAM/swap pressure , see comment above at ram_pressure read
+            "ram_pressure_state": ram_pressure_state,
+            "ram_available_pct":  float(ram_pressure.get("mem_available_pct", 0) or 0),
+            "swap_used_pct":      float(ram_pressure.get("swap_used_pct", 0) or 0),
             # Shim flow fields (empty dict when shim inactive , no KeyError)
             "shim_flow":       flow,
         }
@@ -273,6 +295,9 @@ def main() -> None:
         f"GPU_PCIE_RX_MB_S={pcie_rx:.1f}",
         f"GPU_GAMING_MODE={gaming_mode}",
         f"GB_PRESSURE_STATE={pressure_state}",
+        f"GB_RAM_PRESSURE_STATE={ram_pressure_state}",
+        f"GB_RAM_AVAILABLE_PCT={ram_pressure.get('mem_available_pct', '')}",
+        f"GB_SWAP_USED_PCT={ram_pressure.get('swap_used_pct', '')}",
         # Shim flow keys (new; bash parser ignores unknowns , back-compat)
         f"SHIM_PHASE={flow.get('phase', '')}",
         f"SHIM_ACTIVE_PATH={flow.get('active_path', '')}",

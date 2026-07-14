@@ -50,12 +50,11 @@ def _gb_bin() -> str | None:
 @mcp.tool()
 def synapse_status() -> dict:
     """GB-Synapse status: engine built (llama-server + rpc-server) + version,
-    and whether the server and the :11434 Ollama/OpenAI proxy are running."""
-    try:
-        import gb_synapse
-        return gb_synapse.status()
-    except Exception as e:
-        return {"error": str(e), "engine_built": False}
+    and whether the server and the :11434 Ollama/OpenAI proxy are running.
+    Canonical owner (shared impl in gb_mcp_common.py — also mirrored on
+    greenboost-orchestrator and greenboost-dataflux)."""
+    import gb_mcp_common
+    return gb_mcp_common.synapse_status()
 
 
 @mcp.tool()

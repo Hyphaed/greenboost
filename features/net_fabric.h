@@ -301,6 +301,17 @@ struct gb_net_handshake_resp {
     /* Trailing feature bitmask (GB_NET_FEAT_*) - zero on old feeders that send
      * a short reply; host reads it only when the resp payload is long enough. */
     gb_u32 feature_flags;
+    /* D-PCIE-CEIL: real slot ceiling (parent PCI bridge max_link_speed/width),
+     * NOT the GPU silicon's own max - a x16-capable chip wired into a x8 slot
+     * (the common laptop dGPU layout) still has a x16 silicon max, which
+     * manufactured a permanent false "degraded: gen4x16 -> gen1x8" reading
+     * (fixed 2026-07-14). Zero on old feeders that send a shorter reply; host
+     * reads them length-gated (same idiom as pcie_link_gen above) and falls
+     * back to max=current when absent. Appended at the END of the struct -
+     * does NOT require a proto_version bump, matching the existing
+     * feature_flags/pcie_link_gen backward-compat pattern in this file. */
+    gb_u32 pcie_link_gen_max;
+    gb_u32 pcie_link_width_max;
 } __attribute__((packed));
 
 /* ------------------------------------------------------------------ */

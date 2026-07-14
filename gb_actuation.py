@@ -20,6 +20,9 @@ DO steer the next pipeline run.
 from __future__ import annotations
 
 import os
+import shlex
+import subprocess
+import time
 from pathlib import Path
 
 # Shared env file ai-forge / pipelines read at process start (FORGE_OLLAMA_URL,
@@ -241,6 +244,69 @@ def shim_env(workload: str = "diffusion", enabled: bool = True) -> dict:
         return {"verb": "shim_env", "error": str(e)}
 
 
+def run_under_greenboost(command: "list[str] | str", workload: str = "llm",
+                         cwd: str = "", timeout_s: int = 900,
+                         confirm: bool = False) -> dict:
+    """A8: closes "discover -> configure -> execute -> observe" entirely
+    through MCP/A2A, without a separate shell step. Runs `command` as a
+    subprocess with the `shim_env(workload)` overlay applied.
+
+    SECURITY NOTE — the one verb here that executes a command, unlike every
+    other verb (which only writes a policy/env value): `command` is ALWAYS
+    executed as an argv list (`shell=False`; a string is tokenized with
+    shlex, never handed to a shell), so pipes/redirects/globs/`&&` have no
+    special meaning — this preserves gb_a2a's "no shell passthrough" rule
+    even though this verb runs a real process. Still double-gated exactly
+    like every other verb; dry-run returns the resolved argv + env overlay
+    without executing anything.
+
+    Emits kind="agent_run" — one event at start (status=started) and one at
+    completion (status=ok/error, exit_code, duration_s) so every run is
+    auditable in the flight recorder like any other actuation.
+    """
+    gate = actuation_gate(confirm)
+    argv = command if isinstance(command, list) else shlex.split(command)
+    run_id = f"run_{int(time.time() * 1000)}"
+    plan = {"verb": "run_under_greenboost", "run_id": run_id, "command": argv,
+            "workload": workload, "cwd": cwd or None, "timeout_s": timeout_s,
+            "gate": gate}
+    if not gate["allowed"]:
+        plan["dry_run"] = f"would run {argv!r} under shim_env(workload={workload!r})"
+        return plan
+    try:
+        import gb_cluster
+        env_overlay = gb_cluster.shim_env(workload=workload, enabled=True, base_env={})
+    except Exception as e:
+        plan["error"] = f"shim_env failed: {e}"
+        return plan
+
+    run_env = {**os.environ, **env_overlay}
+    _emit("run_under_greenboost", True, run_id=run_id, status="started",
+          command=" ".join(argv), workload=workload)
+    t0 = time.monotonic()
+    try:
+        proc = subprocess.run(argv, cwd=cwd or None, env=run_env, shell=False,
+                              capture_output=True, text=True, timeout=timeout_s)
+        duration = time.monotonic() - t0
+        plan["exit_code"]   = proc.returncode
+        plan["duration_s"]  = round(duration, 2)
+        plan["stdout_tail"] = proc.stdout[-4000:]
+        plan["stderr_tail"] = proc.stderr[-4000:]
+        _emit("run_under_greenboost", True, run_id=run_id,
+              status="ok" if proc.returncode == 0 else "error",
+              exit_code=proc.returncode, duration_s=round(duration, 2))
+    except subprocess.TimeoutExpired:
+        duration = time.monotonic() - t0
+        plan["error"] = f"timed out after {timeout_s}s"
+        plan["duration_s"] = round(duration, 2)
+        _emit("run_under_greenboost", True, run_id=run_id, status="error",
+              error="timeout", duration_s=round(duration, 2))
+    except Exception as e:
+        plan["error"] = str(e)
+        _emit("run_under_greenboost", True, run_id=run_id, status="error", error=str(e))
+    return plan
+
+
 # ── AgentCard (for A2A) ───────────────────────────────────────────────────────
 
 def agent_card(bind: str = "127.0.0.1:8790") -> dict:
@@ -283,6 +349,40 @@ def agent_card(bind: str = "127.0.0.1:8790") -> dict:
     }
 
 
+def agent_card_v03(bind: str = "127.0.0.1:8790") -> dict:
+    """A2A protocol v0.3-shaped AgentCard (camelCase field names per the A2A
+    spec: https://google.github.io/A2A/), served at
+    /.well-known/agent-card.json — interop with ai-forge's
+    studio/server/a2a_gateway.py (a2a-sdk v0.3), which serves the same path.
+    See docs/a2a-interop.md for the full two-gateway split rationale: this
+    (gb_a2a.py) is the NODE-level actuation gateway (gated GbControl/cluster
+    levers), ai-forge's is the STUDIO task-delegation gateway (generation
+    jobs) — different concerns, same discovery convention. Same underlying
+    data as agent_card(); a different JSON shape, not a different verb set —
+    `run_under_greenboost` (JSON-RPC method) still dispatches through the
+    SAME gb_actuation.VERBS table via the legacy /  POST endpoint."""
+    legacy = agent_card(bind=bind)
+    return {
+        "protocolVersion": "0.3",
+        "name": "greenboost-node",
+        "description": legacy["description"],
+        "url": legacy["url"],
+        "version": legacy["version"],
+        "preferredTransport": "JSONRPC",
+        "capabilities": {"streaming": False,
+                         "extensions": [{"uri": "urn:greenboost:node",
+                                        "description": "GreenBoost node hardware + tier telemetry",
+                                        "params": {"nodes": legacy["nodes"]}}]},
+        "defaultInputModes": ["application/json"],
+        "defaultOutputModes": ["application/json"],
+        "skills": [{"id": s["id"], "name": s["name"], "description": s["description"],
+                   "tags": ["greenboost", "gpu", "cluster"],
+                   "inputModes": ["application/json"], "outputModes": ["application/json"]}
+                  for s in legacy["skills"]],
+        "provider": {"organization": "greenboost", "url": legacy["url"]},
+    }
+
+
 # Verb registry , the A2A JSON-RPC method table AND the MCP tool bodies both
 # resolve through this, so the two control planes can never drift.
 VERBS = {
@@ -292,4 +392,5 @@ VERBS = {
     "tier_actuate": tier_actuate,
     "serve_and_repoint": serve_and_repoint,
     "shim_env": shim_env,
+    "run_under_greenboost": run_under_greenboost,
 }

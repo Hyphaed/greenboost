@@ -304,6 +304,10 @@ uint32_t gb_netc_feeder_ecc_dbe_count(int remote_idx);
 /* Negotiated PCIe link gen/width from the handshake (0 = unknown/old feeder). */
 uint32_t gb_netc_feeder_pcie_link_gen(int remote_idx);
 uint32_t gb_netc_feeder_pcie_link_width(int remote_idx);
+/* Real slot ceiling (parent PCI bridge, not GPU silicon max) - 0 = unknown/
+ * feeder predates 2026-07-14; callers must fall back to max=current. */
+uint32_t gb_netc_feeder_pcie_link_gen_max(int remote_idx);
+uint32_t gb_netc_feeder_pcie_link_width_max(int remote_idx);
 /* Live free VRAM bytes from the last heartbeat (0 = unknown). */
 uint64_t gb_netc_feeder_vram_free_bytes(int remote_idx);
 

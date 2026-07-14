@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import pytest
 from gb_telemetry import (
     GpuMetrics, GpuTopology,
-    _probe_gpu_topology, _sysfs_bdf,
+    _probe_gpu_topology, _sysfs_bdf, _slot_pcie_ceiling, _gts_to_pcie_gen,
 )
 
 
@@ -26,6 +26,7 @@ def _make_pynvml(
     cc=(8, 9),
     gen_cur=4, gen_max=4,
     width_cur=16, width_max=16,
+    gpu_util=0,           # 0 = idle at probe time (the common case); >0 = active
     nvlink_states=None,   # list of (enabled, peer_idx) per link; None = no links
     n_devs=1,
     p2p_pairs=None,       # list of (peer_idx, status) , status 0 = OK
@@ -45,6 +46,9 @@ def _make_pynvml(
     nv.nvmlDeviceGetMaxPcieLinkGeneration.return_value  = gen_max
     nv.nvmlDeviceGetCurrPcieLinkWidth.return_value      = width_cur
     nv.nvmlDeviceGetMaxPcieLinkWidth.return_value       = width_max
+
+    # GPU activity at probe time (gates the gen-mismatch half of pcie_degraded)
+    nv.nvmlDeviceGetUtilizationRates.return_value = SimpleNamespace(gpu=gpu_util, memory=0)
 
     # NVLink , default: all links disabled
     nv.NVML_FEATURE_ENABLED           = 1
@@ -110,31 +114,110 @@ def test_sysfs_bdf_lowercased():
 
 
 # ── _probe_gpu_topology , PCIe ────────────────────────────────────────────────
+#
+# All tests below patch _slot_pcie_ceiling directly rather than relying on
+# real /sys/bus/pci/devices/<bdf> paths , the test BDFs are arbitrary and a
+# real sysfs entry can coincidentally exist at the same address on the host
+# running the suite (verified: "0000:01:00.0" resolves to a real device on
+# at least one dev machine), which would make these tests hardware-dependent
+# and non-hermetic otherwise.
 
 def test_probe_pcie_gen_width():
     nv = _make_pynvml(gen_cur=5, gen_max=5, width_cur=16, width_max=16)
     handle = MagicMock()
-    topo = _probe_gpu_topology(nv, handle, device=0)
+    with patch("gb_telemetry._slot_pcie_ceiling", return_value=None):
+        topo = _probe_gpu_topology(nv, handle, device=0)
     assert topo is not None
     assert topo.pcie_gen_current == 5
     assert topo.pcie_width_current == 16
 
 def test_probe_pcie_degraded_detected():
-    # Running at x8 in a x16 slot
+    # Running at x8 in a x16 slot , width is the reliable (power-state
+    # independent) signal, so this is flagged regardless of pcie_active.
     nv = _make_pynvml(gen_cur=4, gen_max=4, width_cur=8, width_max=16)
     handle = MagicMock()
-    topo = _probe_gpu_topology(nv, handle, device=0)
+    with patch("gb_telemetry._slot_pcie_ceiling", return_value=None):
+        topo = _probe_gpu_topology(nv, handle, device=0)
     assert topo.pcie_degraded is True
 
 def test_probe_pcie_not_degraded():
     nv = _make_pynvml(gen_cur=4, gen_max=4, width_cur=16, width_max=16)
-    topo = _probe_gpu_topology(nv, MagicMock(), device=0)
+    with patch("gb_telemetry._slot_pcie_ceiling", return_value=None):
+        topo = _probe_gpu_topology(nv, MagicMock(), device=0)
     assert topo.pcie_degraded is False
 
-def test_probe_pcie_gen_mismatch_degraded():
-    nv = _make_pynvml(gen_cur=3, gen_max=4, width_cur=16, width_max=16)
-    topo = _probe_gpu_topology(nv, MagicMock(), device=0)
+def test_probe_pcie_gen_mismatch_degraded_while_active():
+    # Gen mismatch is only trusted when the GPU was active at probe time.
+    nv = _make_pynvml(gen_cur=3, gen_max=4, width_cur=16, width_max=16, gpu_util=75)
+    with patch("gb_telemetry._slot_pcie_ceiling", return_value=None):
+        topo = _probe_gpu_topology(nv, MagicMock(), device=0)
+    assert topo.pcie_active is True
     assert topo.pcie_degraded is True
+
+def test_probe_pcie_gen_mismatch_not_degraded_while_idle():
+    # THE bug this fix targets: PCIe gen legitimately downtrains to Gen1/Gen2
+    # under ASPM idle power states (P5/P8) and only retrains under load.
+    # _probe_gpu_topology runs once at NVMLProvider init, almost always
+    # before any workload starts , catching that idle downtrain must NOT be
+    # reported as a hardware fault.
+    nv = _make_pynvml(gen_cur=1, gen_max=4, width_cur=16, width_max=16, gpu_util=0)
+    with patch("gb_telemetry._slot_pcie_ceiling", return_value=None):
+        topo = _probe_gpu_topology(nv, MagicMock(), device=0)
+    assert topo.pcie_active is False
+    assert topo.pcie_degraded is False
+
+def test_probe_pcie_laptop_x8_slot_not_degraded():
+    # THE real-world case that motivated this fix: an RTX 5070 Laptop GPU
+    # whose SILICON supports x16 (NVML MaxPcieLinkWidth=16) but is physically
+    # wired into an x8 slot (parent PCI bridge max_link_width=8). Running at
+    # x8 , its actual ceiling , must NOT be flagged as degraded.
+    nv = _make_pynvml(gen_cur=2, gen_max=5, width_cur=8, width_max=16, gpu_util=0)
+    with patch("gb_telemetry._slot_pcie_ceiling", return_value=(4, 8)):
+        topo = _probe_gpu_topology(nv, MagicMock(), device=0)
+    assert topo.pcie_width_max == 8          # clamped from silicon's 16
+    assert topo.pcie_gen_max == 4            # clamped from silicon's 5
+    assert topo.pcie_degraded is False
+
+def test_probe_pcie_genuine_width_fault_below_slot_ceiling():
+    # Width running BELOW the real slot ceiling (e.g. bifurcation, a bent
+    # riser) is a genuine fault and must still be flagged.
+    nv = _make_pynvml(gen_cur=4, gen_max=4, width_cur=4, width_max=16, gpu_util=0)
+    with patch("gb_telemetry._slot_pcie_ceiling", return_value=(4, 8)):
+        topo = _probe_gpu_topology(nv, MagicMock(), device=0)
+    assert topo.pcie_width_max == 8
+    assert topo.pcie_degraded is True
+
+
+# ── _slot_pcie_ceiling ────────────────────────────────────────────────────────
+
+def test_gts_to_pcie_gen_thresholds():
+    assert _gts_to_pcie_gen("2.5 GT/s PCIe") == 1
+    assert _gts_to_pcie_gen("5.0 GT/s PCIe") == 2
+    assert _gts_to_pcie_gen("8.0 GT/s PCIe") == 3
+    assert _gts_to_pcie_gen("16.0 GT/s PCIe") == 4
+    assert _gts_to_pcie_gen("32.0 GT/s PCIe") == 5
+    assert _gts_to_pcie_gen("") == 0
+    assert _gts_to_pcie_gen("garbage") == 0
+
+def test_slot_pcie_ceiling_reads_parent_bridge(tmp_path):
+    # Build a fake sysfs shape: devices/<bdf> -> ../../..(parent bridge dir)
+    parent = tmp_path / "pci0000:00" / "0000:00:03.1"
+    parent.mkdir(parents=True)
+    (parent / "max_link_speed").write_text("16.0 GT/s PCIe\n")
+    (parent / "max_link_width").write_text("8\n")
+    dev_dir = parent / "0000:04:00.0"
+    dev_dir.mkdir()
+    devices_dir = tmp_path / "devices_by_bdf"
+    devices_dir.mkdir()
+    (devices_dir / "0000:04:00.0").symlink_to(dev_dir, target_is_directory=True)
+
+    with patch("gb_telemetry.Path", side_effect=lambda p: Path(str(p).replace(
+            "/sys/bus/pci/devices", str(devices_dir)))):
+        ceiling = _slot_pcie_ceiling("0000:04:00.0")
+    assert ceiling == (4, 8)
+
+def test_slot_pcie_ceiling_none_when_unreadable():
+    assert _slot_pcie_ceiling("0000:ff:1f.7-does-not-exist") is None
 
 
 # ── GpuTopology properties ────────────────────────────────────────────────────

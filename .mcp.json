@@ -1,0 +1,27 @@
+{
+  "mcpServers": {
+    "greenboost-dataflux": {
+      "command": "python3",
+      "args": ["gb_dataflux_mcp.py"]
+    },
+    "greenboost-cluster": {
+      "command": "python3",
+      "args": ["gb_cluster_mcp.py"]
+    },
+    "greenboost-orchestrator": {
+      "command": "python3",
+      "args": ["gb_mcp.py"]
+    },
+    "greenboost-synapse": {
+      "command": "python3",
+      "args": ["gb_synapse_mcp.py"]
+    },
+    "greenboost-cli": {
+      "command": "python3",
+      "args": ["-m", "greenboost_cli.mcp.server"],
+      "env": {
+        "PYTHONPATH": "greenboost-cli"
+      }
+    }
+  }
+}

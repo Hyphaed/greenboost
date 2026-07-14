@@ -7,7 +7,7 @@ No GPU, no NVML, no daemon , pure dataclass tests with fake managers.
 """
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, mock_open
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -750,3 +750,71 @@ def test_detect_feeder_count_returns_0_on_exception():
          patch("builtins.open", side_effect=OSError("permission denied")):
         n = gb_telemetry._detect_feeder_count()
     assert n == 0
+
+
+# ── read_meminfo_mb / system RAM pressure (2026-07-14 incident) ──────────────
+# Real incident: two concurrent CPU-offloaded (--offload cpu) inference
+# processes drove system swap to ~68% used while GreenBoost's own T2 DDR
+# pool read 0 (CPU-offload streaming never goes through the shim's T2
+# cudaMallocManaged path). These tests cover the new system-wide RAM/swap
+# visibility added in response , NOT GreenBoost's own T2 pool accounting.
+
+_FAKE_MEMINFO = """MemTotal:       65803224 kB
+MemFree:         2107392 kB
+MemAvailable:    6580322 kB
+SwapTotal:      32505852 kB
+SwapFree:       10485760 kB
+"""
+
+
+def test_read_meminfo_mb_parses_real_fields():
+    import gb_telemetry
+    m = mock_open(read_data=_FAKE_MEMINFO)
+    with patch("builtins.open", m):
+        mem_total_mb, mem_avail_mb, swap_total_mb, swap_used_mb = gb_telemetry.read_meminfo_mb()
+    assert mem_total_mb == 65803224 // 1024
+    assert mem_avail_mb == 6580322 // 1024
+    assert swap_total_mb == 32505852 // 1024
+    assert swap_used_mb == (32505852 - 10485760) // 1024
+
+
+def test_read_meminfo_mb_returns_zeros_on_missing_file():
+    import gb_telemetry
+    with patch("builtins.open", side_effect=OSError("no such file")):
+        result = gb_telemetry.read_meminfo_mb()
+    assert result == (0, 0, 0, 0)
+
+
+def test_read_meminfo_mb_live_sanity():
+    """No mocks , exercises the real /proc/meminfo on this Linux test box.
+    Only asserts internal consistency, never exact values (would be flaky)."""
+    import gb_telemetry
+    mem_total_mb, mem_avail_mb, swap_total_mb, swap_used_mb = gb_telemetry.read_meminfo_mb()
+    assert mem_total_mb > 0        # real Linux box always has MemTotal
+    assert 0 <= mem_avail_mb <= mem_total_mb * 2  # generous bound, never negative
+    assert swap_used_mb <= swap_total_mb or swap_total_mb == 0
+
+
+def test_gpumetrics_ram_available_pct_and_swap_used_pct():
+    from gb_telemetry import GpuMetrics, SystemMetrics
+    m = GpuMetrics()
+    m.sys = SystemMetrics(mem_total_mb=10000, mem_available_mb=2000,
+                           swap_total_mb=4000, swap_used_mb=1000)
+    assert m.ram_available_pct == pytest.approx(20.0)
+    assert m.swap_used_pct == pytest.approx(25.0)
+
+
+def test_gpumetrics_ram_pct_properties_zero_when_sys_absent():
+    from gb_telemetry import GpuMetrics
+    m = GpuMetrics()
+    assert m.sys is None
+    assert m.ram_available_pct == 0.0
+    assert m.swap_used_pct == 0.0
+
+
+def test_gpumetrics_swap_used_pct_zero_when_no_swap_configured():
+    from gb_telemetry import GpuMetrics, SystemMetrics
+    m = GpuMetrics()
+    m.sys = SystemMetrics(mem_total_mb=10000, mem_available_mb=2000,
+                           swap_total_mb=0, swap_used_mb=0)
+    assert m.swap_used_pct == 0.0

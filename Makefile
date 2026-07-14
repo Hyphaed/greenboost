@@ -241,6 +241,26 @@ test:
 	@cd tests && python3 -m pytest -v 2>&1 | tail -10
 	@echo "[GreenBoost] regression suite passed"
 
+# Host-only C unit tests (gb_expert_tier.h's LFRU scoring, etc.) - plain C99,
+# no CUDA/kernel headers, no GPU needed. Fast: builds + runs in well under 1s.
+test-c: tests/c/test_gb_expert_tier.c gb_expert_tier.h
+	@$(CC) -std=c99 -Wall -Wextra -o /tmp/gb_test_expert_tier tests/c/test_gb_expert_tier.c
+	@/tmp/gb_test_expert_tier
+	@echo "[GreenBoost] C unit tests passed"
+
+# Mechanical invariant checks (golden-principles.md) - hardcoded-hardware-value
+# scan, dataflux telemetry coverage, MCP tool parity, installer/uninstaller
+# parity, secrets/IP/home-path scan, doc freshness. Blocking iff any check
+# reports a "blocking" finding; advisory findings are printed but don't fail.
+check:
+	@python3 checks/run_checks.py
+
+# End-to-end agent-legibility harness (Colibri doctor.py-schema check steps:
+# build artifact, health-check, shim smoke, dataflux, cluster snapshot, MCP
+# self-check). See checks/verify_greenboost.py.
+verify:
+	@python3 checks/verify_greenboost.py
+
 module:
 	$(MAKE) -C $(KDIR) M=$(PWD) $(KERNEL_LLVM) modules
 

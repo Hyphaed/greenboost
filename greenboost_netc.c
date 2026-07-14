@@ -407,6 +407,10 @@ struct netc_feeder {
     uint32_t pcie_link_gen;
     uint32_t pcie_link_width;
     uint32_t pcie_effective_bw_mbs; /* 0 = unknown, used for feeder scoring */
+    /* D-PCIE-CEIL: real slot ceiling (parent PCI bridge), 0 on feeders older
+     * than 2026-07-14 that don't send these trailing fields. */
+    uint32_t pcie_link_gen_max;
+    uint32_t pcie_link_width_max;
     /* D2: last throttle state from heartbeat */
     uint32_t throttle_reasons;      /* NVML bitmask; non-zero = throttled */
     /* D3: ECC health per GPU */
@@ -996,6 +1000,20 @@ static int connect_feeder(struct netc_feeder *f)
             netc_log("feeder %s: PCIe Gen%u×%u eff=%u MB/s replay=%u",
                      f->addr, f->pcie_link_gen, f->pcie_link_width,
                      f->pcie_effective_bw_mbs, resp->pcie_replay_count);
+        }
+    }
+
+    /* D-PCIE-CEIL: real slot ceiling (parent PCI bridge), sent by feeders
+     * built 2026-07-14+. Length-gated same as above; 0 (unknown) on older
+     * feeders - callers fall back to max=current, never fabricate a ceiling. */
+    {
+        size_t ceil_sz = offsetof(struct gb_net_handshake_resp, pcie_link_gen_max);
+        if (resp_hdr.payload_len >= (uint32_t)(ceil_sz + sizeof(gb_u32) * 2)) {
+            f->pcie_link_gen_max   = resp->pcie_link_gen_max;
+            f->pcie_link_width_max = resp->pcie_link_width_max;
+        } else {
+            f->pcie_link_gen_max   = 0;
+            f->pcie_link_width_max = 0;
         }
     }
 
@@ -3317,6 +3335,24 @@ uint32_t gb_netc_feeder_pcie_link_width(int remote_idx)
     if (remote_idx < 0 || remote_idx >= g_remote_gpu_count) return 0;
     int fi = g_remote_gpus[remote_idx].feeder_idx;
     return g_feeders[fi].pcie_link_width;
+}
+
+/* D-PCIE-CEIL: real slot ceiling (parent PCI bridge), NOT the GPU silicon's
+ * own max - see net_fabric.h's gb_net_handshake_resp comment. 0 = unknown
+ * (feeder predates 2026-07-14 or sysfs was unreadable on the feeder side);
+ * callers must fall back to max=current in that case, never assume 16/x16. */
+uint32_t gb_netc_feeder_pcie_link_gen_max(int remote_idx)
+{
+    if (remote_idx < 0 || remote_idx >= g_remote_gpu_count) return 0;
+    int fi = g_remote_gpus[remote_idx].feeder_idx;
+    return g_feeders[fi].pcie_link_gen_max;
+}
+
+uint32_t gb_netc_feeder_pcie_link_width_max(int remote_idx)
+{
+    if (remote_idx < 0 || remote_idx >= g_remote_gpu_count) return 0;
+    int fi = g_remote_gpus[remote_idx].feeder_idx;
+    return g_feeders[fi].pcie_link_width_max;
 }
 
 /* Telemetry P0-A follow-up: live free VRAM (bytes) from the last heartbeat's

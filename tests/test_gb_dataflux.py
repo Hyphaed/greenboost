@@ -258,3 +258,63 @@ def test_start_snapshot_recorder_fans_out_to_cluster_managers():
     result = gdf.start_snapshot_recorder(cluster, interval_s=5.0)
     assert isinstance(result, list)
     assert len(result) == 3
+
+
+def test_critic_report_feeder_active_from_snapshot_telemetry():
+    """Real incident (2026-07-14): feeder_active used to be computed ONLY
+    from co-occurring chunk_remote/job_remote dispatch-kind log rows within
+    the ±60s critic window , so a host-side incident with no temporally
+    coincident dispatch always showed feeder_active=False even when a
+    feeder's OWN snapshot (right there in the same window) proved it was
+    genuinely alive and computing. Fixed to also derive feeder_active from
+    a feeder-node snapshot's own gpu_util_pct."""
+    t0 = time.time()
+    gdf.emit({"ts": t0, "node": "host", "label": "jobqueue", "kind": "stage_profile",
+             "stage": "image:image", "status": "error", "error": "oom"})
+    gdf.emit({"ts": t0 + 10, "node": "omen", "kind": "snapshot", "gpu_util_pct": 95.0,
+             "fb_used_mb": 6000, "fb_free_mb": 2000, "fb_total_mb": 8000})
+
+    report = gdf.critic_report(days=1)
+    assert len(report["incidents"]) == 1
+    ctx = report["incidents"][0]["cluster_context"]
+    assert ctx["feeder_active"] is True
+    assert ctx["feeder_nodes"] == ["omen"]
+
+
+def test_critic_report_feeder_active_false_when_feeder_idle():
+    """A feeder snapshot seen nearby but genuinely idle (low gpu_util_pct)
+    must NOT flip feeder_active — only real compute counts as active. The
+    feeder should still be listed in feeder_nodes (it WAS seen, just idle)."""
+    t0 = time.time()
+    gdf.emit({"ts": t0, "node": "host", "label": "jobqueue", "kind": "stage_profile",
+             "stage": "sfx:sfx", "status": "error", "error": "oom"})
+    gdf.emit({"ts": t0 + 5, "node": "omen", "kind": "snapshot", "gpu_util_pct": 0.0,
+             "fb_used_mb": 500, "fb_free_mb": 7500, "fb_total_mb": 8000})
+
+    report = gdf.critic_report(days=1)
+    ctx = report["incidents"][0]["cluster_context"]
+    assert ctx["feeder_active"] is False
+    assert ctx["feeder_nodes"] == ["omen"]
+
+
+def test_dataflux_tier_moves_merges_tier_move_and_shim_decision():
+    """dataflux_tier_moves used to query ONLY `kind == "tier_move"` (emitted
+    by gb_model_tier.py's explicit Python-API moves, which nothing in
+    ai-forge actually calls) , so it silently returned [] even on a box with
+    thousands of real per-allocation `shim_decision` events (the CUDA shim's
+    own automatic tier-placement telemetry). Fixed to merge both real
+    sources, tagging each row with `source` so a caller can tell them apart."""
+    import gb_dataflux_mcp
+
+    gdf.emit({"node": "host", "label": "gb_model_tier", "kind": "tier_move",
+             "from_tier": "T1_HBM", "to_tier": "T3_NVME", "size_gb": 2.0,
+             "n_items": 1, "items": ["x"], "duration_s": 0.1, "status": "ok"})
+    gdf.emit({"node": "host", "label": "shim", "kind": "shim_decision",
+             "stage": "t2_local", "tier": "t2_local", "reason": "t2_spill",
+             "n_items": 1, "items": [], "duration_s": 0.0, "status": "ok",
+             "bytes_mb": 17523, "fb_phys_used_pct": 14.1})
+
+    moves = gb_dataflux_mcp.dataflux_tier_moves(days=1)
+    sources = {m["source"] for m in moves}
+    assert sources == {"tier_move", "shim_decision"}
+    assert len(moves) == 2

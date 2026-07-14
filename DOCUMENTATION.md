@@ -305,6 +305,41 @@ workflows, but plenty of fixes you'll notice in production:
 
 ---
 
+## MCP & A2A surface (current — supersedes tool counts quoted in per-version notes above)
+
+GreenBoost exposes five MCP servers (each registered in `.mcp.json` for a
+fresh clone, or via `greenboost register-mcp` for the installed path) plus
+one A2A gateway. Per-version bullets above (e.g. "grown from 3 tools to 8")
+describe that release's delta only — this section is the live count.
+
+| Server | Entry file | Tools |
+|---|---|---|
+| `greenboost-dataflux` | `gb_dataflux_mcp.py` | 19 — event-log queries (`dataflux_*`), plus mirrored `greenboost_status`/`greenboost_capabilities`/`greenboost_pilot`/`synapse_status`/`tiering_status` |
+| `greenboost-orchestrator` | `gb_mcp.py` | 16 — `greenboost_overview`, `optimize_inference`, `quant_advisor`, `gb_plan` (CB-3 tier-plan), gated actuation (`tier_actuate`, `set_quant_policy`, `run_under_greenboost`, `a2a_gateway`), `shim_env`, plus mirrors of the status/capabilities/pilot/synapse_status/cluster_status/dataflux_summary tools (shared impl in `gb_mcp_common.py`) for "one server suffices" |
+| `greenboost-cluster` | `gb_cluster_mcp.py` | 7 — live feeder/VRAM/T2/T3 state, gated `cluster_dispatch`/`cluster_ensure_feeder_ready` |
+| `greenboost-synapse` | `gb_synapse_mcp.py` | 10 — serving control, `synapse_recommend`, gated `serve_and_repoint`, CLI bridge |
+| `greenboost` (CLI) | `greenboost-cli/greenboost_cli/mcp/server.py` | 16 — RAG/goals/history/factory |
+
+**A2A gateway** (`gb_a2a.py`, installed + enabled by Full Install as the
+`greenboost-a2a.service` systemd unit — loopback-only, actuation gate off,
+until an operator opts in): JSON-RPC 2.0 over HTTP, `GET
+/.well-known/agent.json` (legacy AgentCard shape) AND `GET
+/.well-known/agent-card.json` (A2A protocol v0.3 shape — interop with
+ai-forge's `studio/server/a2a_gateway.py`, which serves the same path; see
+`docs/a2a-interop.md`). Loopback-bound by default (`GB_A2A_TOKEN` required
+for a LAN bind). Verbs map 1:1 to `gb_actuation.VERBS` (now including
+`run_under_greenboost`) so MCP and A2A share the same double-gated
+(`confirm=True` + `GB_ORCH_ACTUATE=1`) dispatch — A2A can never actuate
+anything an MCP tool couldn't. Liveness + recent requests queryable via the
+`a2a_status` tool on `greenboost-dataflux`; unit-level status/restart via
+`a2a_gateway` on `greenboost-orchestrator`.
+
+Keep this table current when a server's tool count changes — see
+`checks/check_mcp_parity.py` (once landed) for the mechanical version of this
+check.
+
+---
+
 ## Build compatibility
 
 GreenBoost builds without manual flags on all supported configurations.

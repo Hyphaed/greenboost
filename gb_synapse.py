@@ -846,12 +846,19 @@ def gguf_summary(path: str) -> dict:
     GGUFReader = _load_gguf_reader()
     reader = GGUFReader(path, mode="r")
     n_bytes = sum(int(t.n_bytes) for t in reader.tensors)
+    # dense (attention/shared/embedding) vs routed-expert byte split — same
+    # "_exps" tensor-name convention llama.cpp/ggml uses for MoE expert
+    # tensors, mirrors colibri's EXPERT_RE (c/resource_plan.py). Feeds
+    # gb_placement.plan_experts()'s tier-plan (CB-3): only the routed-expert
+    # bytes are eligible for T2/T3 overflow under Rule #1 — dense stays T1.
+    expert_bytes = sum(int(t.n_bytes) for t in reader.tensors if "_exps" in t.name)
+    dense_bytes = n_bytes - expert_bytes
     arch = _field_str(reader, "general.architecture") or "llama"
     n_layers = int(_field_scalar(reader, f"{arch}.block_count") or 0)
     ctx_length = int(_field_scalar(reader, f"{arch}.context_length") or 0)
     n_experts = int(_field_scalar(reader, f"{arch}.expert_count") or 0)
     n_experts_used = int(_field_scalar(reader, f"{arch}.expert_used_count") or 0)
-    is_moe = n_experts > 0 or any("_exps" in t.name for t in reader.tensors)
+    is_moe = n_experts > 0 or expert_bytes > 0
     # KV geometry: real GGUF attention metadata, so estimate_kv_gb doesn't rely
     # on the param-count bucket heuristic (wrong by ~100x on some GQA archs —
     # verified live OOM on Qwable-9B). head_count_kv falls back to head_count
@@ -868,6 +875,7 @@ def gguf_summary(path: str) -> dict:
     return {
         "n_bytes": n_bytes, "n_layers": n_layers, "is_moe": is_moe,
         "n_experts": n_experts, "n_experts_used": n_experts_used,
+        "dense_bytes": dense_bytes, "expert_bytes": expert_bytes,
         "ctx_length": ctx_length, "quant": quant, "arch": arch,
         "n_kv_heads": head_count_kv, "head_dim": head_dim,
     }
@@ -1086,63 +1094,49 @@ def _measured_tok_s(model: str) -> "float | None":
 
 
 # Rule: link bandwidths derive from the EXECUTING node, never reference-box
-# literals. The two constants below are LAST-resort fallbacks only (used with
-# a loud warning when both NVML and nvidia-smi detection fail).
-_VRAM_BW_FALLBACK_GB_S = 670.0   # GDDR7 read BW of the reference cc12.0 card
-_PCIE_BW_FALLBACK_GB_S = 25.0    # PCIe4 x16 streaming floor (reference box)
+# literals. When detection fails on both NVML and nvidia-smi, the 0.0
+# sentinel propagates honestly (gb_topology._detect_vram_bw_gb_s's own
+# convention) instead of assuming a reference card's numbers — a fabricated
+# 670 GB/s wildly over-estimates tok/s on e.g. an 8 GB feeder (the exact class
+# of bug _auto_budgets's own comment warns about for VRAM budgets).
 _PCIE_STREAM_EFF = 0.78          # observed streaming vs theoretical peak (≈25/32 on gen4 x16)
 _TOKS_FLOOR = 0.5
 _link_bw_cache: "tuple[float, float] | None" = None
 
 
-def _link_bandwidths() -> "tuple[float, float]":
-    """(vram_bw_gb_s, pcie_bw_gb_s) for the LOCAL device, detected once and cached.
+def _emit_bw_undetectable(reason: str) -> None:
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({"node": "host", "label": "synapse",
+                          "kind": "bw_undetectable", "status": "warn",
+                          "reason": reason})
+    except Exception:
+        pass
 
-    VRAM: NVML max mem clock × memory bus width; the effective GDDR data rate
-    is approximated as mem_clock × 2 (DDR) — a deliberate approximation, fine
-    for the order-of-magnitude tok/s heuristic this feeds. PCIe: detected
-    gen × lanes via gb_topology's per-lane table, scaled by the observed
-    streaming efficiency."""
+
+def _link_bandwidths() -> "tuple[float, float]":
+    """(vram_bw_gb_s, pcie_bw_gb_s) for the LOCAL device, detected once and
+    cached. Delegates VRAM bandwidth to gb_topology (single detection path ,
+    do not re-probe NVML here). PCIe: detected gen × lanes via gb_topology's
+    per-lane table, scaled by the observed streaming efficiency. Either term
+    is the 0.0 sentinel, never a reference-box constant, when undetectable —
+    callers must treat 0.0 as "unknown", not "no bandwidth"."""
     global _link_bw_cache
     if _link_bw_cache is not None:
         return _link_bw_cache
-    vram_bw = 0.0
-    try:
-        try:
-            import pynvml
-        except ImportError:            # vendored ctypes binding, as gb_telemetry
-            import gb_nvml_ctypes as pynvml
-        pynvml.nvmlInit()
-        h = pynvml.nvmlDeviceGetHandleByIndex(0)
-        mem_clock_mhz = pynvml.nvmlDeviceGetMaxClockInfo(h, pynvml.NVML_CLOCK_MEM)
-        bus_width_bits = pynvml.nvmlDeviceGetMemoryBusWidth(h)
-        vram_bw = mem_clock_mhz * 2 * bus_width_bits / 8 / 1000.0   # ×2: DDR
-    except Exception:
-        try:   # pynvml unavailable — one nvidia-smi probe, cached for the process
-            out = subprocess.run(
-                ["nvidia-smi", "--query-gpu=clocks.max.memory,memory.bus_width",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=10)
-            clk, bus = (float(x) for x in out.stdout.splitlines()[0].split(","))
-            vram_bw = clk * 2 * bus / 8 / 1000.0
-        except Exception:
-            pass
+    from gb_topology import get_topology, _PCIE_BW_PER_LANE_GBS
+    topo = get_topology()
+    vram_bw = topo.vram_bw_gb_s
     if vram_bw <= 0:
-        print(f"  [gb-synapse] WARNING: VRAM bandwidth undetectable — falling back "
-              f"to the reference-box {_VRAM_BW_FALLBACK_GB_S:.0f} GB/s", flush=True)
-        vram_bw = _VRAM_BW_FALLBACK_GB_S
+        _emit_bw_undetectable("vram")
     pcie_bw = 0.0
     try:
-        from gb_topology import get_topology, _PCIE_BW_PER_LANE_GBS
-        topo = get_topology()
         pcie_bw = (_PCIE_BW_PER_LANE_GBS.get(topo.pcie_gen, 0.0)
                    * topo.pcie_lanes * _PCIE_STREAM_EFF)
     except Exception:
         pass
     if pcie_bw <= 0:
-        print(f"  [gb-synapse] WARNING: PCIe gen/lanes undetectable — falling back "
-              f"to the reference-box {_PCIE_BW_FALLBACK_GB_S:.0f} GB/s", flush=True)
-        pcie_bw = _PCIE_BW_FALLBACK_GB_S
+        _emit_bw_undetectable("pcie")
     _link_bw_cache = (vram_bw, pcie_bw)
     return _link_bw_cache
 
@@ -1156,10 +1150,15 @@ def _estimate_tok_s(active_gb: float, budget_gb: float) -> float:
     depends on batch size, kernel efficiency, and cross-node RPC latency —
     treat this as an order-of-magnitude planning aid, not a benchmark. A
     `--measure` mode that runs a real llama-server warmup is future work.
+    Returns the 0.0 sentinel (never a fabricated floor) when bandwidth is
+    undetectable on this node — callers append a note rather than trusting
+    the number (see `recommend()`).
     """
     if active_gb <= 0:
         return 0.0
     vram_bw, pcie_bw = _link_bandwidths()   # node-derived, not literals (rule)
+    if vram_bw <= 0:
+        return 0.0   # undetectable — honest sentinel, not a guessed floor
     if active_gb <= budget_gb:
         eff_bw = vram_bw
     else:
@@ -1194,10 +1193,37 @@ def recommend(ctx: int = 65536, probe_feeders: bool = True) -> list[FitReport]:
         if fits and total_gb > host_budget_gb:
             _adv = "cluster holds it , prefer RPC split over lower quant"
             note = f"{note}; {_adv}" if note else _adv
+        # DI-2: when it doesn't fit even the aggregate cluster budget, report
+        # a partial-offload estimate (ollama capacity_fit port) instead of
+        # just "doesn't fit" — a real n_offload/n_layers number an operator
+        # can act on (--n-gpu-layers) rather than an all-or-nothing verdict.
+        if not fits and entry.n_layers > 0:
+            try:
+                import gb_placement
+                device_free_gb = [d["host_vram_free_mb"] / 1024.0]
+                device_free_gb += [f["vram_free_mb"] / 1024.0 for f in d["feeders"]
+                                   if f.get("online")]
+                layer_gb = weights_gb / entry.n_layers
+                cf = gb_placement.capacity_fit([layer_gb] * entry.n_layers, device_free_gb)
+                _adv = (f"partial offload: {cf.n_offload}/{entry.n_layers} layers fit "
+                       f"(--n-gpu-layers {cf.n_offload})")
+                note = f"{note}; {_adv}" if note else _adv
+                try:
+                    import gb_dataflux
+                    gb_dataflux.emit({"kind": "capacity_fit", "model": entry.name,
+                                      "n_layers": entry.n_layers, "n_offload": cf.n_offload,
+                                      "fraction": cf.fraction, "per_device_layers": cf.per_device_layers})
+                except Exception:
+                    pass
+            except Exception:
+                pass
         measured = _measured_tok_s(entry.name)
         est = measured if measured is not None else _estimate_tok_s(active_gb + kv_gb, budget_gb)
         if measured is not None:
             note = f"{note} (measured)".strip() if note else "measured"
+        elif est <= 0:
+            _adv = "tok/s estimate unavailable , bandwidth undetectable on this node"
+            note = f"{note}; {_adv}" if note else _adv
         reports.append(FitReport(entry.name, entry.quant, round(weights_gb, 2), round(kv_gb, 2),
                                   round(total_gb, 2), fits, round(overflow_gb, 2), est, ctx, note,
                                   measured=measured is not None))
@@ -1646,10 +1672,31 @@ def _compute_tensor_split(host_free_mb: int, online_feeders: list,
         shares[0] *= host_bias
         shares = [max(int(round(s)), 1) for s in shares]
 
+    # v3 (GB_SYNAPSE_SPLIT_V3=1, petals min-throughput port — see
+    # workflow/porting-reference.md §DI-3): scale each FEEDER's share down by
+    # its measured link quality relative to this host's own detected uplink
+    # (gb_topology.net_link_mbps — never a hardcoded reference bandwidth).
+    # A feeder with no measured link yet (link_mbps_ewma==0, e.g. first ever
+    # dispatch) or when the host's own link is undetectable gets factor=1.0
+    # (no penalty — falls back to v1/v2 behaviour rather than guessing).
+    # The host itself never gets a network penalty (it has no RPC hop).
+    v3 = os.environ.get("GB_SYNAPSE_SPLIT_V3", "") == "1"
+    if v3 and online_feeders:
+        try:
+            from gb_topology import get_topology
+            ref_mbps = get_topology().net_link_mbps or 0
+        except Exception:
+            ref_mbps = 0
+        factors = [1.0]
+        for f in online_feeders:
+            link = getattr(f, "link_mbps_ewma", 0.0) or 0.0
+            factors.append(min(1.0, link / ref_mbps) if (ref_mbps > 0 and link > 0) else 1.0)
+        shares = [max(int(round(s * fac)), 1) for s, fac in zip(shares, factors)]
+
     split = ",".join(str(s) for s in shares)
     try:
         import gb_dataflux
-        gb_dataflux.emit({"kind": "tensor_split", "split": split, "v2": v2,
+        gb_dataflux.emit({"kind": "tensor_split", "split": split, "v2": v2, "v3": v3,
                           "host_bias": host_bias, "kv_total_gb": round(kv_total_gb, 2),
                           "nodes": len(shares)})
     except Exception:

@@ -99,7 +99,7 @@ def test_parse_missing_file_returns_defaults(monkeypatch):
     # live detection → sentinel 0 (patched here so the test is machine-independent).
     import gb_topology as gt
     for det in ("_detect_vram_gb", "_detect_ram_total_gb", "_detect_pcie_gen",
-                "_detect_ram_speed_mt", "_detect_virtual_vram_gb"):
+                "_detect_pcie_lanes", "_detect_ram_speed_mt", "_detect_virtual_vram_gb"):
         monkeypatch.setattr(gt, det, lambda: 0)
     monkeypatch.setattr(gt, "_detect_compute_capability", lambda: "")
     monkeypatch.delenv("GREENBOOST_KV_RESERVE_MB", raising=False)
