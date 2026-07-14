@@ -34,7 +34,9 @@ tests/bench/results.jsonl
 .claude/
 .claude-sessions/
 .mcp-cache/
-.mcp.json
+# .mcp.json IS tracked (owner decision 2026-07-13): it's the project-scope MCP
+# registration for a fresh clone — 5 servers, relative python3 commands, no
+# machine paths or secrets. CLAUDE.md/workflow/ stay untracked below.
 CLAUDE.md
 MEMORY.md
 memory/
@@ -102,3 +104,9 @@ greenboost-ebpf-trace
 enhancements.md
 greenboost_next_check_polishroundup.md
 greenboost_jul12_1.md
+
+
+# Checks
+checks/
+docs/
+AGENTS.md

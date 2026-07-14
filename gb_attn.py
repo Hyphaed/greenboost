@@ -46,6 +46,7 @@ near-zero quality loss (+0.23% PPL).
 from __future__ import annotations
 
 import math
+import os
 import threading
 import time
 import numpy as np
@@ -312,8 +313,56 @@ def _adaptive_k_bits(base_bits: int, call_idx: int, total: int) -> int:
 
 # ── Sparse-V constants ────────────────────────────────────────────────────────
 
-SPARSE_V_THRESHOLD = 0.01   # skip V positions with attention weight < 1% of max
-SPARSE_V_MAX_SEQ   = 4096   # above this, fall back to standard _tq_attn
+SPARSE_V_THRESHOLD = float(os.environ.get("GB_SPARSE_V_TAU", "0.01"))
+# skip V positions with attention weight < this fraction of the per-(batch,head) max
+
+SPARSE_V_MAX_SEQ   = 4096   # LAST-RESORT fallback only (VRAM undetectable) — see
+                            # _sparse_v_max_seq() below for the real, %-derived limit.
+
+
+def _sparse_v_max_seq(batch: int = 1, n_heads: int = 32) -> int:
+    """DI-7: max sequence length the sparse-V path's materialized attention
+    matrix (B, H, S, S, float32) can afford without risking OOM — derived
+    from REAL available VRAM headroom (never the flat 4096 literal, rule).
+    Env override GB_SPARSE_V_MAX_SEQ takes precedence when set. Cached per
+    process, KEYED BY (batch, n_heads) — this runs in the attention hot path
+    (computed once per distinct shape, not once globally: a global-only cache
+    would silently keep serving the FIRST call's shape's answer for every
+    other model/batch size in the same process). Falls back to
+    SPARSE_V_MAX_SEQ, loudly, when VRAM is undetectable (matches
+    gb_topology's own 0-sentinel + fallback convention).
+    """
+    key = (batch, n_heads)
+    cached = _sparse_v_max_seq_cache.get(key)
+    if cached is not None:
+        return cached
+    override = os.environ.get("GB_SPARSE_V_MAX_SEQ")
+    if override:
+        try:
+            value = max(1, int(override))
+            _sparse_v_max_seq_cache[key] = value
+            return value
+        except ValueError:
+            pass
+    try:
+        free_b, _total_b = torch.cuda.mem_get_info()
+        # Keep only HALF of current free VRAM as the sparse-V matrix's margin
+        # — the rest is weights/KV/workspace headroom this path must not eat.
+        budget_bytes = free_b * 0.5
+        max_s = int((budget_bytes / max(1, batch * n_heads * 4)) ** 0.5)
+        # Sane floor (a limit so tiny it defeats the point) / ceiling (a
+        # limit so large it silently reintroduces the OOM risk this exists
+        # to prevent) — bounds on the DERIVED value, not new hardcoded sizes.
+        value = max(512, min(max_s, 131072))
+    except Exception:
+        print("  [gb_attn] WARNING: VRAM undetectable for sparse-V sizing — "
+              f"falling back to {SPARSE_V_MAX_SEQ}", flush=True)
+        value = SPARSE_V_MAX_SEQ
+    _sparse_v_max_seq_cache[key] = value
+    return value
+
+
+_sparse_v_max_seq_cache: "dict[tuple[int, int], int]" = {}
 
 
 # ── Attention core functions ──────────────────────────────────────────────────
@@ -373,7 +422,9 @@ def _tq_attn_sparse_v(query, key, value, k_bits: int, v_bits, device: str, origi
     Honours the caller's `scale` kwarg (e.g. RoPE / muP), falling back to
     1/sqrt(D) only if not provided.
     """
-    if key.shape[2] > SPARSE_V_MAX_SEQ:
+    # DI-7: %-derived limit (real VRAM headroom), not the flat 4096 literal.
+    max_seq = _sparse_v_max_seq(batch=query.shape[0], n_heads=query.shape[1])
+    if key.shape[2] > max_seq:
         return _tq_attn(query, key, value, k_bits, v_bits, device, original_sdpa, **sdpa_kwargs)
 
     K_idx, K_norms, K_signs = _quantize_k_turbo(key, k_bits, device)

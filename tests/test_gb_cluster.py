@@ -11,6 +11,7 @@ function accepts) or gb_cluster.feeders()/cluster_snapshot() is
 monkeypatched , mirrors the mocked-wire-struct, no-network conventions in
 tests/conftest.py.
 """
+import json
 import struct
 import subprocess
 import sys
@@ -99,6 +100,47 @@ def test_cluster_map_dispatches_to_feeder_and_preserves_order():
     assert [r[1] for r in result] == items
     assert remote_batches, "feeder never picked up any chunk"
     assert local_batches, "host never picked up any chunk"
+
+
+def test_cluster_map_small_batch_auto_chunk_splits_across_host_and_feeder():
+    """Real incident, 2026-07-14: a 4-item batch with chunk='auto' (the
+    default _DEFAULT_CHUNK=4) collapsed to exactly ONE queue chunk, so
+    whichever worker won the race for it took 100% of the batch — in
+    practice always the feeder (its thread starts before the host's own
+    pull loop), leaving the host at 0% utilization for a run the owner
+    explicitly expected to use both machines. chunk_size must scale down
+    when there are few items relative to participant count so a genuine
+    split becomes possible."""
+    f = _feeder()
+    key = f"{f.ip}:{f.port}"
+    # Cold-start _adaptive_pull_count (returns 1 for everyone) — module-level
+    # _throughput_ewma otherwise leaks history from earlier tests in this
+    # same process, which would skew pulls away from the clean 1-chunk-each
+    # split this test is actually verifying (matches the established
+    # cleanup pattern other tests in this file already use).
+    gc._throughput_ewma.pop(key, None)
+    gc._throughput_ewma.pop(gc._HOST_KEY, None)
+    local_batches, remote_batches = [], []
+
+    def run_local(batch):
+        local_batches.append(list(batch))
+        time.sleep(0.02)  # symmetric cost so both threads actually interleave
+        return [("local", x) for x in batch]
+
+    def run_remote(feeder, batch):
+        remote_batches.append(list(batch))
+        time.sleep(0.02)
+        return [("remote", x) for x in batch]
+
+    items = list(range(4))
+    try:
+        result = gc.cluster_map(items, run_local, run_remote, feeders=[f])  # chunk="auto"
+        assert sorted(r[1] for r in result) == items
+        assert local_batches, "host never picked up any chunk on a small auto-chunk batch"
+        assert remote_batches, "feeder never picked up any chunk on a small auto-chunk batch"
+    finally:
+        gc._throughput_ewma.pop(key, None)
+        gc._throughput_ewma.pop(gc._HOST_KEY, None)
 
 
 def test_cluster_map_multiple_feeders_only_known_ips_seen():
@@ -305,6 +347,90 @@ def test_cluster_map_updates_throughput_ewma_for_feeder_and_host():
     gc.cluster_map(list(range(10)), run_local, run_remote, feeders=[f], chunk=2)
     assert gc._throughput_ewma.get(key, 0.0) > 0.0
     assert gc._throughput_ewma.get(gc._HOST_KEY, 0.0) > 0.0
+
+
+# ── DI-5: throughput-weighted cluster_map chunk sizing ──────────────────────
+
+def test_adaptive_pull_count_cold_start_is_one_for_everyone():
+    keys = [gc._HOST_KEY, "10.0.0.5:9740"]
+    for k in keys:
+        gc._throughput_ewma.pop(k, None)
+    assert gc._adaptive_pull_count(gc._HOST_KEY, keys) == 1
+    assert gc._adaptive_pull_count(keys[1], keys) == 1
+
+
+def test_adaptive_pull_count_favors_faster_node(monkeypatch):
+    monkeypatch.delenv("GB_CLUSTER_CHUNK_WEIGHTED", raising=False)
+    keys = [gc._HOST_KEY, "10.0.0.5:9740"]
+    gc._throughput_ewma[gc._HOST_KEY] = 100.0
+    gc._throughput_ewma[keys[1]] = 10.0
+    fast = gc._adaptive_pull_count(gc._HOST_KEY, keys)
+    slow = gc._adaptive_pull_count(keys[1], keys)
+    assert fast > slow
+    assert slow >= 1   # never fully starved
+    gc._throughput_ewma.pop(gc._HOST_KEY, None)
+    gc._throughput_ewma.pop(keys[1], None)
+
+
+def test_adaptive_pull_count_escape_hatch_disables_weighting(monkeypatch):
+    monkeypatch.setenv("GB_CLUSTER_CHUNK_WEIGHTED", "0")
+    keys = [gc._HOST_KEY, "10.0.0.5:9740"]
+    gc._throughput_ewma[gc._HOST_KEY] = 100.0
+    gc._throughput_ewma[keys[1]] = 10.0
+    assert gc._adaptive_pull_count(gc._HOST_KEY, keys) == 1
+    assert gc._adaptive_pull_count(keys[1], keys) == 1
+    gc._throughput_ewma.pop(gc._HOST_KEY, None)
+    gc._throughput_ewma.pop(keys[1], None)
+
+
+def test_drain_pull_non_blocking_stops_at_empty():
+    import queue
+    q = queue.Queue()
+    q.put((0, [1, 2]))
+    q.put((2, [3]))
+    pulled = gc._drain_pull(q, n=5)   # only 2 chunks exist, ask for 5
+    assert pulled == [(0, [1, 2]), (2, [3])]
+    assert gc._drain_pull(q, n=1) == []   # now empty
+
+
+def test_cluster_map_cold_start_still_preserves_order_and_completeness():
+    """DI-5 must not change behavior when no throughput history exists yet
+    (the common case: fresh process, first-ever dispatch)."""
+    f = _feeder(ip="10.0.0.21")
+    key = f"{f.ip}:{f.port}"
+    gc._throughput_ewma.pop(key, None)
+    gc._throughput_ewma.pop(gc._HOST_KEY, None)
+
+    def run_local(batch):
+        return [x * 10 for x in batch]
+
+    def run_remote(feeder, batch):
+        return [x * 100 for x in batch]
+
+    items = list(range(20))
+    result = gc.cluster_map(items, run_local, run_remote, feeders=[f], chunk=2)
+    assert len(result) == len(items)
+    # every result came from EITHER path with the correct transform, in order
+    for i, r in zip(items, result):
+        assert r in (i * 10, i * 100)
+
+
+def test_cluster_map_chunk_remote_event_carries_chunk_policy_fields():
+    f = _feeder(ip="10.0.0.22")
+    key = f"{f.ip}:{f.port}"
+    gc._throughput_ewma.pop(key, None)
+    gc._throughput_ewma.pop(gc._HOST_KEY, None)
+
+    def run_local(batch):
+        return list(batch)
+
+    def run_remote(feeder, batch):
+        return list(batch)
+
+    gc.cluster_map(list(range(6)), run_local, run_remote, feeders=[f], chunk=2)
+    events = [e for e in gdf.read_events() if e.get("kind") == "chunk_remote"]
+    assert events, "expected at least one chunk_remote event"
+    assert "chunk_size" in events[0] and "pulled_chunks" in events[0]
 
 
 # ── stage_bundle: rsync/mkdir wiring + link EWMA update ─────────────────────
@@ -565,6 +691,147 @@ def test_cluster_job_queue_emits_dataflux_events():
     events = gdf.read_events()
     assert events
     assert all(ev["label"] == "queue-test" for ev in events)
+
+
+def test_ssh_gpu_telemetry_tolerates_na_field(monkeypatch):
+    """Real incident (2026-07-14): nvidia-smi reports "[N/A]" for
+    power.limit on some laptop GPUs (RTX 5070 Laptop, confirmed live) — a
+    single unparseable field must not discard the whole reply; util/temp/
+    power/clocks were all genuinely present in the same query."""
+    class _Result:
+        returncode = 0
+        stderr = ""
+        stdout = "NVIDIA GeForce RTX 5070 Laptop GPU, 0, 50, 12.16, 495, 810, [N/A]\n"
+
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: _Result())
+    f = _feeder(ip="10.0.0.50")
+    result = gc._ssh_gpu_telemetry(f)
+    assert result is not None
+    assert result["gpu_util_pct"] == 0
+    assert result["gpu_temp_c"] == 50
+    assert result["gpu_power_w"] == 12
+    assert result["sm_clock_mhz"] == 495
+    assert result["mem_clock_mhz"] == 810
+    assert "power_limit_w" not in result  # unparseable field omitted, not defaulted to 0/garbage
+
+
+def test_ssh_gpu_telemetry_all_na_returns_none(monkeypatch):
+    class _Result:
+        returncode = 0
+        stderr = ""
+        stdout = "GPU, [N/A], [N/A], [N/A]\n"
+
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: _Result())
+    f = _feeder(ip="10.0.0.51")
+    assert gc._ssh_gpu_telemetry(f) is None
+
+
+def test_feeders_merges_ssh_clocks_without_keyerror(monkeypatch):
+    """feeders()'s SSH-fallback merge must use .get(), not [...] , a field
+    _ssh_gpu_telemetry omits (see above) must not KeyError the merge."""
+    class _Result:
+        returncode = 0
+        stderr = ""
+        stdout = "GPU, 10, 45, 20, 500, 800, [N/A]\n"
+
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: _Result())
+    f = _feeder(ip="10.0.0.52", gpu_temp_c=0, gpu_util_pct=0, gpu_power_w=0)
+    ssh_tel = gc._ssh_gpu_telemetry(f)
+    f.gpu_util_pct = f.gpu_util_pct or ssh_tel.get("gpu_util_pct", 0)
+    f.power_limit_w = f.power_limit_w or ssh_tel.get("power_limit_w", 0)
+    assert f.gpu_util_pct == 10
+    assert f.power_limit_w == 0  # omitted field, safely defaulted
+
+
+def test_cluster_snapshot_feeder_dict_has_temp_c_alias(monkeypatch):
+    """Real gap found 2026-07-14 via the `greenboost cluster` CLI: the
+    compute-detail view reads a uniform key set (temp_c, gpu_power_w,
+    power_limit_w, sm_clock_mhz, mem_clock_mhz) across host AND feeder
+    rows. Host's dict already used `temp_c`; Feeder's own field is named
+    `gpu_temp_c`, so every feeder row showed temp blank. cluster_snapshot()
+    must alias it for symmetry."""
+    f = _feeder(ip="10.0.0.53", gpu_temp_c=42, online=True)
+    monkeypatch.setattr(gc, "feeders", lambda **kw: [f])
+    monkeypatch.setattr(gc, "_host_telemetry", lambda: {"temp_c": 30})
+    snap = gc.cluster_snapshot(force=True)
+    assert snap["feeders"][0]["temp_c"] == 42
+    assert snap["feeders"][0]["gpu_temp_c"] == 42
+
+
+def test_sync_feeder_dataflux_relabels_self_referential_node(monkeypatch, tmp_path):
+    """Real bug found live 2026-07-14, same session: a node's own
+    SnapshotRecorder self-identifies as "host" from ITS OWN local
+    perspective (it has no notion of being "a feeder" to someone else).
+    Re-emitting a feeder's pulled log verbatim would collide its telemetry
+    with the real host's own "host"-tagged events, corrupting per-node
+    aggregation. sync_feeder_dataflux must relabel any self-referential
+    node value to the feeder's real identity before re-emitting."""
+    remote_lines = "\n".join([
+        json.dumps({"node": "host", "kind": "snapshot", "label": "system_snapshot",
+                   "gpu_util_pct": 100, "ts": 100.0, "pid": 999}),
+        json.dumps({"node": "host", "kind": "node_topology", "label": "cluster",
+                   "ts": 101.0, "pid": 999}),
+    ])
+
+    class _Result:
+        returncode = 0
+        stderr = ""
+        stdout = remote_lines + "\n"
+
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: _Result())
+    monkeypatch.setattr(gc, "_DATAFLUX_SYNC_STATE_PATH", str(tmp_path / "state.json"))
+
+    f = _feeder(ip="10.0.0.60")
+    n = gc.sync_feeder_dataflux(f, max_lines=10)
+    assert n == 2
+
+    events = [e for e in gdf.read_events() if e.get("pid") == 999]
+    assert len(events) == 2
+    assert all(e["node"] == "feeder" for e in events)
+
+
+def test_sync_feeder_dataflux_dedups_across_calls(monkeypatch, tmp_path):
+    remote_lines = "\n".join([
+        json.dumps({"node": "host", "kind": "snapshot", "ts": 200.0, "pid": 888}),
+        json.dumps({"node": "host", "kind": "snapshot", "ts": 201.0, "pid": 888}),
+    ]) + "\n"
+
+    class _Result:
+        returncode = 0
+        stderr = ""
+        stdout = remote_lines
+
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: _Result())
+    monkeypatch.setattr(gc, "_DATAFLUX_SYNC_STATE_PATH", str(tmp_path / "state2.json"))
+
+    f = _feeder(ip="10.0.0.61")
+    first = gc.sync_feeder_dataflux(f, max_lines=10)
+    second = gc.sync_feeder_dataflux(f, max_lines=10)
+    assert first == 2
+    assert second == 0  # already-synced events must not be re-emitted
+
+
+def test_sync_feeder_dataflux_ssh_failure_returns_zero(monkeypatch, tmp_path):
+    class _Result:
+        returncode = 255
+        stderr = "Connection refused"
+        stdout = ""
+
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: _Result())
+    monkeypatch.setattr(gc, "_DATAFLUX_SYNC_STATE_PATH", str(tmp_path / "state3.json"))
+    f = _feeder(ip="10.0.0.62")
+    assert gc.sync_feeder_dataflux(f) == 0
+
+
+def test_sync_cluster_dataflux_skips_offline_feeders(monkeypatch):
+    calls = []
+    online = gc.Feeder(ip="10.0.0.70", port=9740, hostname="online1", online=True)
+    offline = gc.Feeder(ip="10.0.0.71", port=9740, hostname="offline1", online=False)
+    monkeypatch.setattr(gc, "feeders", lambda **kw: [online, offline])
+    monkeypatch.setattr(gc, "sync_feeder_dataflux",
+                        lambda f, max_lines=2000: calls.append(f.hostname) or 0)
+    gc.sync_cluster_dataflux()
+    assert calls == ["online1"]
 
 
 def test_dataflux_summarize_aggregates_by_node():

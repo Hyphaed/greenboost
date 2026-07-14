@@ -17,9 +17,10 @@ import gb_synapse as gs
 
 
 class _FakeFeeder:
-    def __init__(self, t1_free_mb):
+    def __init__(self, t1_free_mb, link_mbps_ewma=0.0):
         self.t1_free_mb = t1_free_mb
         self.online = True
+        self.link_mbps_ewma = link_mbps_ewma
 
 
 # ── estimate_kv_gb: real geometry vs bucket fallback ─────────────────────────
@@ -83,3 +84,56 @@ def test_split_bias_identity_is_v1(monkeypatch):
     monkeypatch.setenv("GB_SYNAPSE_HOST_BIAS", "1.0")
     split = gs._compute_tensor_split(11000, [_FakeFeeder(7000)], kv_total_gb=3.0)
     assert split == "11000,7000"
+
+
+# ── v3 (GB_SYNAPSE_SPLIT_V3): link-quality-scaled feeder shares ─────────────
+
+class _FakeTopo:
+    def __init__(self, net_link_mbps):
+        self.net_link_mbps = net_link_mbps
+
+
+def test_split_v3_off_by_default(monkeypatch):
+    monkeypatch.delenv("GB_SYNAPSE_SPLIT_V3", raising=False)
+    monkeypatch.delenv("GB_SYNAPSE_SPLIT_V2", raising=False)
+    monkeypatch.delenv("GB_SYNAPSE_HOST_BIAS", raising=False)
+    split = gs._compute_tensor_split(10000, [_FakeFeeder(10000, link_mbps_ewma=1.0)])
+    parts = [int(x) for x in split.split(",")]
+    assert parts[0] == parts[1]   # equal free VRAM, no v3 penalty applied -> stay equal
+
+
+def test_split_v3_penalizes_slow_feeder_link(monkeypatch):
+    monkeypatch.delenv("GB_SYNAPSE_SPLIT_V2", raising=False)
+    monkeypatch.delenv("GB_SYNAPSE_HOST_BIAS", raising=False)
+    monkeypatch.setattr("gb_topology.get_topology", lambda: _FakeTopo(net_link_mbps=100.0))
+    monkeypatch.delenv("GB_SYNAPSE_SPLIT_V3", raising=False)
+    off_parts = [int(x) for x in gs._compute_tensor_split(
+        10000, [_FakeFeeder(10000, link_mbps_ewma=10.0)]).split(",")]
+    monkeypatch.setenv("GB_SYNAPSE_SPLIT_V3", "1")
+    on_parts = [int(x) for x in gs._compute_tensor_split(
+        10000, [_FakeFeeder(10000, link_mbps_ewma=10.0)]).split(",")]
+    assert on_parts[1] < off_parts[1]                            # slow link (10/100) shrinks the feeder's share
+    assert on_parts[1] == pytest.approx(off_parts[1] * 0.1, rel=0.05)  # scaled by 10/100 = 0.1
+    assert on_parts[0] == off_parts[0]                           # host share untouched by v3
+
+
+def test_split_v3_no_penalty_when_link_unmeasured(monkeypatch):
+    monkeypatch.delenv("GB_SYNAPSE_SPLIT_V2", raising=False)
+    monkeypatch.delenv("GB_SYNAPSE_HOST_BIAS", raising=False)
+    monkeypatch.setattr("gb_topology.get_topology", lambda: _FakeTopo(net_link_mbps=100.0))
+    monkeypatch.delenv("GB_SYNAPSE_SPLIT_V3", raising=False)
+    off_split = gs._compute_tensor_split(10000, [_FakeFeeder(10000, link_mbps_ewma=0.0)])
+    monkeypatch.setenv("GB_SYNAPSE_SPLIT_V3", "1")
+    on_split = gs._compute_tensor_split(10000, [_FakeFeeder(10000, link_mbps_ewma=0.0)])
+    assert on_split == off_split   # link_mbps_ewma==0 (never measured) -> no penalty, byte-identical
+
+
+def test_split_v3_no_penalty_when_host_link_undetectable(monkeypatch):
+    monkeypatch.delenv("GB_SYNAPSE_SPLIT_V2", raising=False)
+    monkeypatch.delenv("GB_SYNAPSE_HOST_BIAS", raising=False)
+    monkeypatch.setattr("gb_topology.get_topology", lambda: _FakeTopo(net_link_mbps=0))
+    monkeypatch.delenv("GB_SYNAPSE_SPLIT_V3", raising=False)
+    off_split = gs._compute_tensor_split(10000, [_FakeFeeder(10000, link_mbps_ewma=5.0)])
+    monkeypatch.setenv("GB_SYNAPSE_SPLIT_V3", "1")
+    on_split = gs._compute_tensor_split(10000, [_FakeFeeder(10000, link_mbps_ewma=5.0)])
+    assert on_split == off_split   # no reference bandwidth -> never guess a penalty, byte-identical

@@ -20,9 +20,17 @@ and feeds decisions back into live tunables, closing feedback loops:
                                  Loop C KV grow (mem BW already saturated)
   Loop H , ECC SBE monitor:    ecc_sbe_volatile delta → advisory warning;
                                  sets sbe_elevated flag for operator awareness
-  Loop I , SM clock throttle:  sm_clock_mhz drops 12%+ from observed max →
-                                 clock_throttled=True; gates Loop C KV grow.
-                                 Mild zone (8–12%): halves KV step before hard gate.
+  Loop I , SM clock throttle:  NVML's own clock-throttle-reason bitmask
+                                 (is_real_throttle , SwPowerCap/HwSlowdown/
+                                 Sw|HwThermalSlowdown/HwPowerBrakeSlowdown only,
+                                 never GpuIdle) → clock_throttled=True; gates
+                                 Loop C KV grow. The sm_clock_mhz-vs-observed-max
+                                 ratio is a SECONDARY, advisory-only mild-zone
+                                 signal (8–12% drop, evaluated only above
+                                 _SM_CLOCK_UTIL_FLOOR_PCT utilization , the
+                                 ratio is meaningless noise on an idling GPU):
+                                 halves KV step as a pre-warning before the
+                                 hardware bitmask actually fires.
   Loop J , Phase KV reclaim:   shim_phase INFERENCE → IDLE/DEEP_IDLE transition
                                  → shrink KV reserve to floor immediately, freeing
                                  VRAM for the next model load or weight prefetch.
@@ -109,10 +117,13 @@ _MEM_BW_ENTER        = 85.0   # Loop G: mem_copy_util_pct enter threshold
 _MEM_BW_EXIT         = 65.0   # Loop G: mem_copy_util_pct exit threshold
 _MEM_BW_CONFIRM      = 2      # sustained polls before Loop G fires
 _SM_CLOCK_WARMUP     = 3      # warmup polls before Loop I ratio tracking starts
-_SM_CLOCK_DROP_ENTER = 12.0   # Loop I: enter when SM clock drops 12%+ from max
-_SM_CLOCK_DROP_EXIT  = 6.0    # Loop I: exit when drop recovers below 6%
+_SM_CLOCK_DROP_ENTER = 12.0   # Loop I mild-zone signal: enter when SM clock drops 12%+ from max
+_SM_CLOCK_DROP_EXIT  = 6.0    # Loop I mild-zone signal: exit when drop recovers below 6%
 _SM_CLOCK_DROP_MILD  = 8.0    # Loop I: mild zone , halve KV step (pre-throttle warning)
-_SM_CLOCK_CONFIRM    = 2      # polls before Loop I fires
+_SM_CLOCK_UTIL_FLOOR_PCT = 30.0  # Loop I: below this util%, GPU is idling , clock-vs-peak
+                                 # ratio is meaningless (nothing to be "throttled" from),
+                                 # skip feeding it rather than let idle P-states flap the signal
+_SM_CLOCK_CONFIRM    = 2      # polls before Loop I fires (both hw-bitmask gate and ratio signal)
 # ── Loop N , adaptive telemetry poll rate ─────────────────────────────────────
 _POLL_MS_INFERENCE   = 250    # faster during active token generation
 _POLL_MS_DEFAULT     = 500    # default / model-load / unknown phase
@@ -133,6 +144,50 @@ _GPU_POWER_STEP_W    = 15     # Loop P: power-limit step per thermal/throttle ev
 _GPU_POWER_FLOOR_FRAC = 0.5   # never step power limit below 50% of TDP
 
 _ORCH_STATE_FILE = Path("/run/greenboost/orch_state.json")
+
+
+class GpuHealth:
+    """5-state GPU health admission gate (MuxFlow SysMonitor port — DI-6, see
+    workflow/porting-reference.md §DI-6): INIT -> HEALTHY <-> UNHEALTHY ->
+    OVERLIMIT, DISABLED is the terminal state while the ECC ratchet is
+    engaged (never auto-clears — matches Loop A's own monotone discipline).
+
+    Deliberately a pure COMPOSITE of already-computed, already-tuned
+    orchestrator signals (Loop D thermal_stress, Loop I clock_throttled,
+    Loop G mem_bw_stress, the ECC ratchet) rather than new absolute
+    thresholds — every hysteresis band this depends on is tuned once, here
+    it just aggregates. OVERLIMIT = 2+ simultaneous stress signals
+    (compounding risk); UNHEALTHY = exactly 1; HEALTHY = none.
+
+    `admits_overcommit()` is the query placement/dispatch code should check
+    before committing to an overcommit-shaped decision (spilling KV/weights
+    speculatively, dispatching to a feeder under load) — HEALTHY only.
+    """
+    INIT, HEALTHY, UNHEALTHY, OVERLIMIT, DISABLED = (
+        "INIT", "HEALTHY", "UNHEALTHY", "OVERLIMIT", "DISABLED")
+
+    def __init__(self) -> None:
+        self.state = self.INIT
+
+    def feed(self, *, ecc_degraded: bool, thermal_stress: bool,
+            clock_throttled: bool, mem_bw_stress: bool) -> "str | None":
+        """One state-machine step. Returns the new state string if it
+        changed this call, else None (so callers only act/log on transitions,
+        matching the Signal on_enter/on_exit convention elsewhere here)."""
+        prev = self.state
+        stress_count = sum([thermal_stress, clock_throttled, mem_bw_stress])
+        if ecc_degraded:
+            self.state = self.DISABLED
+        elif stress_count >= 2:
+            self.state = self.OVERLIMIT
+        elif stress_count == 1:
+            self.state = self.UNHEALTHY
+        else:
+            self.state = self.HEALTHY
+        return self.state if self.state != prev else None
+
+    def admits_overcommit(self) -> bool:
+        return self.state == self.HEALTHY
 
 
 class ReactiveOrchestrator:
@@ -185,11 +240,19 @@ class ReactiveOrchestrator:
             self._weights_floor_mb = (max(512, int(_topo.physical_vram_mb * 0.18))
                                       if _topo.physical_vram_mb > 0
                                       else _WEIGHTS_FLOOR_MB)
+            # 2% of THIS card's VRAM per actuation tick, not a flat 256 MB
+            # (rule) — a 48 GB card would otherwise take 4x as many ticks to
+            # react as a 12 GB one. Bounded by the 25%-of-VRAM cap at the Loop
+            # B call sites, so a larger step here is still self-limiting.
+            self._ws_step_mb = (max(128, int(_topo.physical_vram_mb * 0.02))
+                                if _topo.physical_vram_mb > 0
+                                else _WS_STEP_MB)
         except Exception:
             self._kv_step_mb      = _KV_STEP_MB
             self._safety_max_gb   = _SAFETY_MAX_GB
             self._kv_floor_mb     = _KV_FLOOR_MB
             self._weights_floor_mb = _WEIGHTS_FLOOR_MB
+            self._ws_step_mb      = _WS_STEP_MB
 
         # Lazy import: gb_control may not be available in test environments
         if control is None:
@@ -206,7 +269,7 @@ class ReactiveOrchestrator:
         self.thermal_stress = False   # Loop D→C gate: suppresses KV grow when GPU is hot
         self.mem_bw_stress  = False   # Loop G→C gate: suppresses KV grow when HBM BW saturated
         self.sbe_elevated   = False   # Loop H: SBE rate above zero , advisory warning only
-        self.clock_throttled = False  # Loop I: SM clock dropped >12% from observed max
+        self.clock_throttled = False  # Loop I: NVML real-throttle-reason bitmask set
         self._ecc_seen      = 0       # monotone ratchet: never decreases
         self._sbe_seen      = 0       # SBE monotone counter (advisory; resets on driver restart)
         self._sm_clock_max  = 0       # ratcheting max observed SM clock (MHz)
@@ -214,6 +277,28 @@ class ReactiveOrchestrator:
         self._total_vram_mb = 0       # learned from first metrics snapshot
         self._ws_reserve_mb = 0       # current workstation_reserve target
         self._last_metrics: "Optional[GpuMetrics]" = None
+        self._health_fsm = GpuHealth()  # DI-6: composite admission-gate state
+
+        # DI-6: opt-in continuous PID scaling of Loop I's mild-throttle KV
+        # step (see _do_kv_grow). None (default) preserves the exact pre-DI-6
+        # discrete halve/full behavior. Setpoint = _SM_CLOCK_DROP_EXIT (the
+        # existing "recovered" threshold, not a new literal); gains default
+        # to conservative values and are env-tunable for live calibration —
+        # this control loop genuinely benefits from hardware-in-the-loop
+        # tuning, unlike CB-1a's pure scoring math.
+        self._sm_pid = None
+        self._sm_pid_last_ts = 0.0
+        if os.environ.get("GB_SM_PID", "0") == "1":
+            try:
+                kp = float(os.environ.get("GB_PID_KP", "0.05"))
+                ki = float(os.environ.get("GB_PID_KI", "0.01"))
+                kd = float(os.environ.get("GB_PID_KD", "0.0"))
+            except ValueError:
+                kp, ki, kd = 0.05, 0.01, 0.0
+            from gb_reactive import PidController
+            self._sm_pid = PidController(kp=kp, ki=ki, kd=kd,
+                                         setpoint=_SM_CLOCK_DROP_EXIT,
+                                         out_min=0.0, out_max=1.0)
 
         # ── Loop A , ECC ratchet (monotone, confirm=1) ────────────────────────
         self._ecc_sig = Signal(0, name="ecc_dbe", confirm=1)
@@ -303,11 +388,22 @@ class ReactiveOrchestrator:
         self._sbe_sig = Signal(0, name="ecc_sbe", confirm=2)
         self._sbe_sig.subscribe(self._on_sbe_change)
 
-        # ── Loop I , SM clock throttle direct detector ────────────────────────
-        # Tracks (1 - sm_clock/sm_clock_max)*100 = drop_pct. Signal fires on_enter
-        # when drop rises above _SM_CLOCK_DROP_ENTER (inverted ratio convention).
-        # After _SM_CLOCK_WARMUP polls, the ratcheting max is reliable enough.
-        # Mild zone (8–12%): halve KV step in _do_kv_grow before hard block fires.
+        # ── Loop I , SM clock throttle detector ───────────────────────────────
+        # Authoritative gate: NVML's own clock-throttle-reason bitmask
+        # (is_real_throttle , real thermal/power reasons only, never GpuIdle).
+        # This IS ground truth per NVIDIA , no ratio/guessing needed, and it
+        # can't false-positive on a GPU that's simply idling between bursts.
+        self._hw_throttle_sig = Signal(
+            False, name="clock_throttle_hw", confirm=_SM_CLOCK_CONFIRM,
+        )
+        self._hw_throttle_sig.subscribe(self._on_hw_throttle_change)
+
+        # Secondary, advisory-only: (1 - sm_clock/sm_clock_max)*100 = drop_pct,
+        # fed only above _SM_CLOCK_UTIL_FLOOR_PCT utilization (see on_metrics) ,
+        # a ratio against an idling GPU's clock is not evidence of throttling.
+        # Read continuously by _do_kv_grow for the mild-zone (8-12%) KV-step
+        # pre-warning; does NOT drive clock_throttled/GpuHealth (the hw gate
+        # above does that).
         self._clock_drop_sig = Signal(
             0.0,
             name="sm_clock_drop_pct",
@@ -315,8 +411,6 @@ class ReactiveOrchestrator:
             hysteresis=(_SM_CLOCK_DROP_ENTER, _SM_CLOCK_DROP_EXIT),
             confirm=_SM_CLOCK_CONFIRM,
         )
-        self._clock_drop_sig.on_enter(self._on_clock_throttled)
-        self._clock_drop_sig.on_exit(self._on_clock_ok)
 
         # ── Loop J , phase-transition detection via pairwise() (rxRust pattern) ─
         # _phase_sig holds the latest shim_phase string. pipe(pairwise()) turns
@@ -345,6 +439,9 @@ class ReactiveOrchestrator:
             hysteresis=(_PSI_IO_ENTER, _PSI_IO_EXIT), confirm=_PSI_IO_CONFIRM,
         )
         self._io_psi_sig.on_enter(self._on_io_psi_high)
+        self._io_psi_sig.on_exit(self._on_io_psi_ok)   # DI-12: geometric T3 cap restore
+        self._t3_cap_baseline_mb = 0   # DI-12: T3 total capacity, learned once from telemetry
+        self._t3_lever_active = False  # DI-12: whether the T3 cap is currently stepped down
 
         # ── Loop S , PCIe saturation → prefetch-throttle hint ─────────────────
         self._pcie_sat_sig = Signal(False, name="pcie_saturated", confirm=3)
@@ -365,15 +462,23 @@ class ReactiveOrchestrator:
         """
         self._last_metrics = m
 
-        # Loop I: SM clock throttle direct detector , ratchet _sm_clock_max
+        # Loop I: SM clock throttle , authoritative NVML bitmask gate first
+        # (ground truth, immune to idle-clock noise), ratchet _sm_clock_max
         # before the phase-transition feed below, since Loop O's handler
         # (fired synchronously from _phase_sig.set when the phase changes)
         # reads _sm_clock_max to size the clock lock on phase entry.
+        from gb_telemetry import is_real_throttle
+        self._hw_throttle_sig.set(is_real_throttle(m.throttle_reasons))
         if m.sm_clock_mhz > 0:
             if m.sm_clock_mhz > self._sm_clock_max:
                 self._sm_clock_max = m.sm_clock_mhz
             self._sm_clock_polls += 1
-            if self._sm_clock_polls >= _SM_CLOCK_WARMUP and self._sm_clock_max > 0:
+            # Advisory mild-zone ratio: only meaningful under real load , an
+            # idling GPU legitimately runs far below its peak clock with zero
+            # throttling involved, so skip feeding the signal below the floor
+            # rather than let normal idle P-state stepping flap it.
+            if (self._sm_clock_polls >= _SM_CLOCK_WARMUP and self._sm_clock_max > 0
+                    and m.gpu_util_pct >= _SM_CLOCK_UTIL_FLOOR_PCT):
                 drop_pct = (1.0 - m.sm_clock_mhz / self._sm_clock_max) * 100.0
                 self._clock_drop_sig.set(drop_pct)
 
@@ -468,18 +573,55 @@ class ReactiveOrchestrator:
         # Loop S: PCIe saturation (property is False when topology unavailable)
         self._pcie_sat_sig.set(m.pcie_saturated)
 
-        # Topology advisory , log once when PCIe slot runs below device max.
+        # Topology advisory , log once when PCIe slot runs below its real
+        # achievable ceiling (slot-clamped max; see GpuTopology.pcie_degraded ,
+        # this already excludes idle ASPM gen downclock and silicon-only width
+        # fantasies, e.g. a x16-capable chip wired into a x8 laptop slot).
         # Does not gate any loop; purely an operator warning surfaced in logs.
         if m.topology is not None and m.topology.pcie_degraded and not self._pcie_degraded_logged:
             self._pcie_degraded_logged = True
             log.warning(
                 "[gb_orchestrator] PCIe slot degraded: running gen%dx%d "
-                "(device max gen%dx%d) , effective T2↔T1 bandwidth %.0f MB/s "
+                "(slot max gen%dx%d) , effective T2↔T1 bandwidth %.0f MB/s "
                 "vs theoretical %.0f MB/s; B2 gate threshold adjusted automatically.",
                 m.topology.pcie_gen_current, m.topology.pcie_width_current,
                 m.topology.pcie_gen_max, m.topology.pcie_width_max,
                 m.topology.pcie_bw_mb_s, m.topology.pcie_bw_max_mb_s,
             )
+            try:
+                import gb_dataflux
+                gb_dataflux.emit({
+                    "node": "host", "label": "orchestrator", "kind": "pcie_degraded",
+                    "gen_current": m.topology.pcie_gen_current,
+                    "width_current": m.topology.pcie_width_current,
+                    "gen_max": m.topology.pcie_gen_max,
+                    "width_max": m.topology.pcie_width_max,
+                    "bw_mb_s": round(m.topology.pcie_bw_mb_s),
+                    "bw_max_mb_s": round(m.topology.pcie_bw_max_mb_s),
+                })
+            except Exception:
+                pass
+
+        # DI-6: composite health admission gate — last, so it sees this
+        # tick's up-to-date thermal_stress/clock_throttled/mem_bw_stress/
+        # ecc_degraded flags (all set by the Signal callbacks invoked above).
+        new_health = self._health_fsm.feed(
+            ecc_degraded=self.ecc_degraded, thermal_stress=self.thermal_stress,
+            clock_throttled=self.clock_throttled, mem_bw_stress=self.mem_bw_stress)
+        if new_health is not None:
+            log.info("[gb_orchestrator] GpuHealth: -> %s (ecc=%s thermal=%s "
+                     "clock=%s mem_bw=%s)", new_health, self.ecc_degraded,
+                     self.thermal_stress, self.clock_throttled, self.mem_bw_stress)
+            try:
+                import gb_dataflux
+                gb_dataflux.emit({"node": "host", "label": "orchestrator",
+                                  "kind": "health_transition", "state": new_health,
+                                  "ecc_degraded": self.ecc_degraded,
+                                  "thermal_stress": self.thermal_stress,
+                                  "clock_throttled": self.clock_throttled,
+                                  "mem_bw_stress": self.mem_bw_stress})
+            except Exception:
+                pass
 
     def feed_vram_state(self, non_gb_mb: float, total_mb: int) -> None:
         """
@@ -555,7 +697,7 @@ class ReactiveOrchestrator:
             self._ws_above      = True
             new_ws = min(
                 self._total_vram_mb // 4,   # max 25% of total VRAM
-                self._ws_reserve_mb + _WS_STEP_MB,
+                self._ws_reserve_mb + self._ws_step_mb,
             )
             log.info(
                 "[gb_orchestrator] Loop B: non-GB VRAM %.0f MiB > enter=%.0f , "
@@ -570,7 +712,7 @@ class ReactiveOrchestrator:
 
         elif exited:
             self._ws_above = False
-            new_ws = max(0, self._ws_reserve_mb - _WS_STEP_MB)
+            new_ws = max(0, self._ws_reserve_mb - self._ws_step_mb)
             log.info(
                 "[gb_orchestrator] Loop B: non-GB VRAM %.0f MiB < exit=%.0f , "
                 "restoring workstation_reserve to %d MiB",
@@ -771,12 +913,31 @@ class ReactiveOrchestrator:
             return
         old_kv = self._ctrl._last.get("kv_reserve_mb", (0, 0))[0] or 0
 
-        # Loop I: mild-throttle adaptive step , halve KV grow when SM clock is
-        # in the 8–12% drop zone (pre-throttle warning). Full step resumes when
-        # the clock recovers above _SM_CLOCK_DROP_MILD.
+        # Loop I: mild-throttle adaptive step. Default (GB_SM_PID unset/"0"):
+        # the original discrete halve when SM clock is in the 8-12% drop zone
+        # (pre-throttle warning), full step above _SM_CLOCK_DROP_MILD , exact
+        # pre-DI-6 behavior. DI-6 (GB_SM_PID=1, opt-in): continuous PID scaling
+        # instead of a binary halve/full jump — setpoint is _SM_CLOCK_DROP_EXIT
+        # (the existing, already-tuned "recovered" threshold in drop_pct terms,
+        # i.e. clock at >=94% of its observed max , not a new absolute number),
+        # so the step shrinks smoothly as drop_pct rises above that setpoint
+        # instead of a step function. Needs live hardware tuning before
+        # default-on; see workflow/tasks-jul13-sources-harness.md DI-6.
         step_mb = self._kv_step_mb
         drop_ema = float(self._clock_drop_sig.get() or 0.0)
-        if drop_ema >= _SM_CLOCK_DROP_MILD:
+        if self._sm_pid is not None:
+            now = time.monotonic()
+            dt = max(now - self._sm_pid_last_ts, 1e-3) if self._sm_pid_last_ts else 1.0
+            self._sm_pid_last_ts = now
+            scale = self._sm_pid.update(drop_ema, dt)
+            new_step = max(int(step_mb * scale), 0)
+            if new_step != step_mb:
+                log.debug(
+                    "[gb_orchestrator] Loop I: PID SM clock scaling (drop=%.1f%%, "
+                    "scale=%.2f) , KV step %d→%d MiB", drop_ema, scale, step_mb, new_step,
+                )
+            step_mb = new_step
+        elif drop_ema >= _SM_CLOCK_DROP_MILD:
             step_mb = max(step_mb // 2, 128)
             log.debug(
                 "[gb_orchestrator] Loop I: SM clock mild throttle (drop=%.1f%%) , "
@@ -901,8 +1062,19 @@ class ReactiveOrchestrator:
 
     # ── Loop I , SM clock throttle ───────────────────────────────────────────
 
+    def _on_hw_throttle_change(self, new: bool, old: bool) -> None:
+        """Bridges the authoritative NVML-bitmask Signal to the existing
+        throttled/ok handlers, passing the current (advisory) ratio EMA along
+        for logging/decision-record context only , it is not what triggered
+        this transition."""
+        drop_pct = float(self._clock_drop_sig.get() or 0.0)
+        if new:
+            self._on_clock_throttled(drop_pct)
+        else:
+            self._on_clock_ok(drop_pct)
+
     def _on_clock_throttled(self, drop_pct: float) -> None:
-        """Fires when SM clock drops > _SM_CLOCK_DROP_ENTER% from observed max."""
+        """Fires when NVML reports a real thermal/power throttle reason."""
         self.clock_throttled = True
         decision = {
             "loop":               "I_clock_throttle",
@@ -1160,21 +1332,91 @@ class ReactiveOrchestrator:
         })
 
     def _on_io_psi_high(self, value: float) -> None:
-        """PSI io "some" sustained high while T3 NVMe is under pressure ,
-        advisory only (no NVMe-device-path lever exists yet in GbControl)."""
+        """DI-12: PSI io "some" sustained high while T3 NVMe is under
+        pressure , step T3's cap down (max(256 MiB, 2% of current cap),
+        %-derived per the no-hardcode rule) so the shim's tier logic prefers
+        T2/compression over more NVMe traffic. Escape hatch GB_NVME_LEVER=0
+        keeps the previous advisory-only behavior."""
         if not self._os_tune_active():
             return
-        t3_pressured = bool(self._last_metrics and self._last_metrics.gb
-                             and self._last_metrics.gb.t3_pressure >= 2)
+        gb = self._last_metrics.gb if self._last_metrics else None
+        t3_pressured = bool(gb and gb.t3_pressure >= 2)
         if not t3_pressured:
             return
+        if self._ctrl is None or os.environ.get("GB_NVME_LEVER", "1") == "0":
+            log.warning(
+                "[gb_orchestrator] Loop R: PSI io-some=%.1f%% during T3 spill , "
+                "NVMe IO pressure detected (advisory; GB_NVME_LEVER=0 or no control)", value,
+            )
+            self._record_decision({
+                "loop": "R_nvme_lever", "ts": time.time(),
+                "psi_io_some_avg10": round(value, 1), "action": "advisory_only",
+            })
+            return
+
+        # Baseline = this node's real T3 capacity (used+free), learned once
+        # from telemetry , never a hardcoded NVMe size (rule).
+        if self._t3_cap_baseline_mb <= 0 and gb:
+            self._t3_cap_baseline_mb = max(1, gb.t3_used_mb + gb.t3_free_mb)
+        current_cap = self._ctrl._last.get("t3_cap_mb", (0, 0))[0] or self._t3_cap_baseline_mb
+        if current_cap <= 0:
+            current_cap = self._t3_cap_baseline_mb
+        step  = max(256, int(current_cap * 0.02))
+        floor = max(256, int(self._t3_cap_baseline_mb * 0.10))  # never cap below 10% of real capacity
+        new_cap = max(floor, current_cap - step)
+
+        if new_cap >= current_cap:
+            log.warning(
+                "[gb_orchestrator] Loop R: PSI io-some=%.1f%% during T3 spill , "
+                "T3 cap already at its floor (%d MiB) , advisory only", value, floor,
+            )
+            self._record_decision({
+                "loop": "R_nvme_lever", "ts": time.time(),
+                "psi_io_some_avg10": round(value, 1), "action": "advisory_floor_reached",
+                "t3_cap_mb": current_cap,
+            })
+            return
+
+        r = self._ctrl.set_t3_cap_mb(new_cap, reason="nvme_io_pressure")
+        self._t3_lever_active = True
         log.warning(
             "[gb_orchestrator] Loop R: PSI io-some=%.1f%% during T3 spill , "
-            "NVMe IO pressure detected (advisory; no reactive NVMe lever yet)", value,
+            "stepping T3 cap %d→%d MiB (baseline=%d MiB)",
+            value, current_cap, new_cap, self._t3_cap_baseline_mb,
         )
         self._record_decision({
-            "loop": "R_cpu_io_pressure", "ts": time.time(),
-            "psi_io_some_avg10": round(value, 1), "action": "advisory_only",
+            "loop": "R_nvme_lever", "ts": time.time(),
+            "psi_io_some_avg10": round(value, 1), "action": "t3_cap_step_down",
+            "t3_cap_mb": new_cap, "t3_cap_prev_mb": current_cap, "result": r.reason,
+        })
+
+    def _on_io_psi_ok(self, value: float) -> None:
+        """DI-12: PSI io pressure cleared , geometrically restore the T3 cap
+        (mirrors Loop C's own hysteresis-gated grow/shrink discipline). Fully
+        restores to 0 (disk-limited/no cap , GbControl's own convention) once
+        the cap has recovered to the learned baseline."""
+        if not self._t3_lever_active or self._ctrl is None:
+            return
+        current_cap = self._ctrl._last.get("t3_cap_mb", (0, 0))[0]
+        if current_cap <= 0 or self._t3_cap_baseline_mb <= 0:
+            self._t3_lever_active = False
+            return
+        step = max(256, int(current_cap * 0.02))
+        new_cap = current_cap + step
+        restored_fully = new_cap >= self._t3_cap_baseline_mb
+        if restored_fully:
+            new_cap = 0   # 0 = disk-limited / no cap (GbControl's own convention)
+            self._t3_lever_active = False
+        r = self._ctrl.set_t3_cap_mb(new_cap, reason="nvme_io_pressure_cleared")
+        log.info(
+            "[gb_orchestrator] Loop R: PSI io-some recovered (%.1f%%) , "
+            "restoring T3 cap %d→%d MiB%s",
+            value, current_cap, new_cap, " (fully restored)" if restored_fully else "",
+        )
+        self._record_decision({
+            "loop": "R_nvme_lever", "ts": time.time(),
+            "psi_io_some_avg10": round(value, 1), "action": "t3_cap_restore",
+            "t3_cap_mb": new_cap, "t3_cap_prev_mb": current_cap, "result": r.reason,
         })
 
     # ── Loop S , PCIe saturation → prefetch-throttle hint ─────────────────────
@@ -1242,6 +1484,10 @@ class ReactiveOrchestrator:
                 "lever": decision.get("loop", "?"),
                 "status": "ok", "n_items": 0, "items": [], "duration_s": 0.0,
                 "gated": bool(getattr(self, "_actuate", False)),
+                # pid stamped universally by gb_dataflux.emit() itself , see
+                # its docstring/comment for why (multi-process fan-out,
+                # observed live 2026-07-14 as near-simultaneous duplicate
+                # E_cluster_pressure/tier_auto_evict actuations).
                 **{k: v for k, v in decision.items()
                    if k not in ("loop",) and isinstance(v, (int, float, str, bool))},
             })
@@ -1325,6 +1571,8 @@ class ReactiveOrchestrator:
             "cluster_pressure":  self._cluster_pressure,      # B3
             "health_ok":         bool(self._health_sig.get()), # B4
             "health_evict_armed": self._health_evict_armed,   # B4
+            "health_state":      self._health_fsm.state,       # DI-6: composite admission gate
+            "admits_overcommit": self._health_fsm.admits_overcommit(),  # DI-6
             "poll_ms":           getattr(self._tel_manager, "poll_ms", _POLL_MS_DEFAULT),  # Loop N
             "topology":          self._topology_summary(),
             "total_vram_mb":     self._total_vram_mb,
@@ -1346,6 +1594,7 @@ class ReactiveOrchestrator:
             "pcie_width_current": t.pcie_width_current,
             "pcie_gen_max":      t.pcie_gen_max,
             "pcie_width_max":    t.pcie_width_max,
+            "pcie_active":       t.pcie_active,
             "pcie_bw_mb_s":      round(t.pcie_bw_mb_s),
             "pcie_saturated":    self._last_metrics.pcie_saturated,
             "pcie_degraded":     t.pcie_degraded,

@@ -112,7 +112,15 @@ class _Handler(BaseHTTPRequestHandler):
             if not self._authed():
                 return self._json(401, {"error": "missing/invalid Bearer token"})
             return self._json(200, gb_actuation.agent_card(bind=DEFAULT_BIND))
-        return self._json(404, {"error": "not found; try /.well-known/agent.json"})
+        if self.path.rstrip("/") == "/.well-known/agent-card.json":
+            # A2A protocol v0.3 path/shape (see gb_actuation.agent_card_v03) —
+            # interop with ai-forge's studio/server/a2a_gateway.py, which
+            # serves the same well-known path. docs/a2a-interop.md.
+            if not self._authed():
+                return self._json(401, {"error": "missing/invalid Bearer token"})
+            return self._json(200, gb_actuation.agent_card_v03(bind=DEFAULT_BIND))
+        return self._json(404, {"error": "not found; try /.well-known/agent.json "
+                                        "or /.well-known/agent-card.json (v0.3)"})
 
     def do_POST(self):  # noqa: N802
         client = self.client_address[0]

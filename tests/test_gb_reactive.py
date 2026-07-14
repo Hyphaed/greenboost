@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
-from gb_reactive import Signal, Computed
+from gb_reactive import Signal, Computed, PidController
 
 
 # ── EWMA ─────────────────────────────────────────────────────────────────────
@@ -697,3 +697,65 @@ def test_filter_subscribe_exception_isolated():
     def bad(n, o): raise RuntimeError("boom")
     s.pipe(rx_filter(lambda: True)).subscribe(bad)
     s.set(1)  # must not raise
+
+
+# ── PidController (DI-6, MuxFlow port) ──────────────────────────────────────
+
+def test_pid_zero_error_at_setpoint_yields_zero_output():
+    pid = PidController(kp=1.0, ki=0.5, kd=0.1, setpoint=100.0, out_min=0.0, out_max=1.0)
+    assert pid.update(100.0, dt=1.0) == 0.0
+
+
+def test_pid_output_clamped_to_max():
+    pid = PidController(kp=10.0, ki=0.0, kd=0.0, setpoint=100.0, out_min=0.0, out_max=1.0)
+    assert pid.update(0.0, dt=1.0) == 1.0   # huge positive error, kp alone would blow past 1.0
+
+
+def test_pid_output_clamped_to_min():
+    pid = PidController(kp=10.0, ki=0.0, kd=0.0, setpoint=100.0, out_min=0.0, out_max=1.0)
+    assert pid.update(1000.0, dt=1.0) == 0.0   # measured way above setpoint -> negative error, clamped to floor
+
+
+def test_pid_proportional_response_scales_with_error():
+    pid = PidController(kp=0.01, ki=0.0, kd=0.0, setpoint=100.0, out_min=0.0, out_max=1.0)
+    small_error_out = pid.update(95.0, dt=1.0)
+    pid.reset()
+    large_error_out = pid.update(50.0, dt=1.0)
+    assert large_error_out > small_error_out
+
+
+def test_pid_integral_accumulates_under_sustained_error():
+    pid = PidController(kp=0.0, ki=0.05, kd=0.0, setpoint=100.0, out_min=0.0, out_max=1.0)
+    out1 = pid.update(90.0, dt=1.0)
+    out2 = pid.update(90.0, dt=1.0)
+    assert out2 > out1   # same error, but integral has accumulated further
+
+
+def test_pid_reset_clears_integral_and_derivative_history():
+    pid = PidController(kp=0.0, ki=0.05, kd=0.0, setpoint=100.0, out_min=0.0, out_max=1.0)
+    pid.update(90.0, dt=1.0)
+    pid.update(90.0, dt=1.0)
+    pid.reset()
+    out_after_reset = pid.update(90.0, dt=1.0)
+    fresh = PidController(kp=0.0, ki=0.05, kd=0.0, setpoint=100.0, out_min=0.0, out_max=1.0)
+    out_fresh = fresh.update(90.0, dt=1.0)
+    assert out_after_reset == out_fresh
+
+
+def test_pid_never_windups_past_output_bound_after_long_saturation():
+    # Sustained large error for many steps must not leave the integral so
+    # large that output stays pinned long after the error suddenly reverses.
+    pid = PidController(kp=0.0, ki=0.1, kd=0.0, setpoint=100.0, out_min=0.0, out_max=1.0)
+    for _ in range(1000):
+        pid.update(0.0, dt=1.0)   # huge sustained error
+    assert pid.update(0.0, dt=1.0) == 1.0   # still pinned (expected while error persists)
+    # Error reverses hard (measured now far ABOVE setpoint) — with anti-windup
+    # the output must be able to leave the ceiling almost immediately.
+    out = pid.update(1000.0, dt=1.0)
+    assert out < 1.0
+
+
+def test_pid_zero_or_negative_dt_does_not_raise():
+    pid = PidController(kp=1.0, ki=1.0, kd=1.0, setpoint=100.0, out_min=0.0, out_max=1.0)
+    pid.update(50.0, dt=0.0)   # must not raise ZeroDivisionError
+    pid.update(50.0, dt=-1.0)

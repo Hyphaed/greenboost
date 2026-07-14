@@ -8,10 +8,13 @@ Lets an LLM (or any MCP client) query "how did data flow through the
 greenboost cluster" without shelling out or scraping the web UI: same JSONL
 log (gb_dataflux.py) that backs `greenboost dataflux-ui`, read-only.
 
-Tools:
+Tools (19 — keep this list in sync with the @mcp.tool defs below):
     dataflux_summary       , cheap aggregate overview (nodes/labels/runs/tok_s)
     dataflux_events         , raw events, filterable by node/label/kind/status
     dataflux_errors         , failed dispatches only
+    dataflux_decisions      , shim tier-placement/spill decisions (kind=shim_decision)
+    dataflux_actuations     , orchestrator lever moves (kind=actuation)
+    a2a_status              , A2A gateway liveness + recent a2a_request rollup
     dataflux_critic         , snapshot-correlated incident diagnosis + recommendations
     dataflux_topology       , per-node hardware topology events (deduped latest)
     dataflux_kinds          , event-kind breakdown (what actually happened)
@@ -20,9 +23,15 @@ Tools:
     dataflux_tok_s          , measured (not predicted) tokens/sec, per model
     dataflux_candidates     , best-of-N candidate_selected rollup, per slug
     dataflux_models         , per-model call/rotation rollup + tok_s merged
+    greenboost_pilot        , stage/tok_s trends + evidence-backed advice (gb_pilot)
     greenboost_capabilities , installed/running shim feature manifest (gb_monitor)
     greenboost_status       , live tier/phase/KV-prefetch snapshot (gb_monitor)
-    greenboost_pilot        , stage/tok_s trends + evidence-backed advice (gb_pilot)
+    synapse_status          , gb-synapse serving state
+    tiering_status          , GB-Tiering live state (T1/T2/T3 pool + phase)
+
+Note: greenboost_status/capabilities/pilot/synapse_status are also exposed on
+the greenboost-orchestrator server (gb_mcp.py) for "one server suffices"
+convenience — same underlying data, so either server answers identically.
 
 Run standalone (stdio transport, for `.mcp.json` registration):
     python3 gb_dataflux_mcp.py
@@ -46,9 +55,10 @@ def dataflux_summary(days: float = 5.0) -> dict:
     last `days` days: total events/items/compute-time, per-node throughput
     and error counts, per-script (label) item counts, and one row per
     script invocation (run). Use this first , it's the cheap overview
-    before pulling raw events."""
-    events = gdf.read_events(since_hours=days * 24)
-    return gdf.summarize(events)
+    before pulling raw events. Canonical owner (shared impl in
+    gb_mcp_common.py — also mirrored on greenboost-orchestrator)."""
+    import gb_mcp_common
+    return gb_mcp_common.dataflux_summary(days=days)
 
 
 @mcp.tool()
@@ -72,7 +82,14 @@ def dataflux_events(days: float = 5.0, node: str | None = None,
     """
     events = gdf.read_events(since_hours=days * 24)
     if node:
-        events = [e for e in events if e.get("node") == node]
+        # Match by canonical node, not the raw string , the SAME physical
+        # machine can appear under more than one raw label (e.g. "host" vs
+        # this host's real hostname, or a feeder's generic "feeder0"
+        # SnapshotRecorder tag vs its real hostname), so a caller filtering
+        # by "omen" would otherwise silently miss "feeder0"-tagged events
+        # for that exact same feeder (found live 2026-07-14).
+        _want = gdf.canonical_node(node)
+        events = [e for e in events if gdf.canonical_node(e.get("node")) == _want]
     if label:
         events = [e for e in events if e.get("label") == label]
     if kind:
@@ -165,10 +182,11 @@ def dataflux_topology(days: float = 30.0, node: str | None = None) -> list[dict]
     events = gdf.read_events(since_hours=days * 24)
     topo = [e for e in events if e.get("kind") == "node_topology"]
     if node:
-        topo = [e for e in topo if e.get("node") == node]
+        _want = gdf.canonical_node(node)
+        topo = [e for e in topo if gdf.canonical_node(e.get("node")) == _want]
     latest: dict[str, dict] = {}
     for e in topo:
-        n = e.get("node", "?")
+        n = gdf.canonical_node(e.get("node", "?"))
         if n not in latest or e.get("ts", 0.0) >= latest[n].get("ts", 0.0):
             latest[n] = e
     return sorted(latest.values(), key=lambda e: -e.get("ts", 0.0))
@@ -195,11 +213,33 @@ def dataflux_kinds(days: float = 5.0) -> dict:
 
 @mcp.tool()
 def dataflux_tier_moves(days: float = 5.0, limit: int = 100) -> list[dict]:
-    """Memory-tier movement events (T1/T2/T3 promote, demote, evict) emitted
-    by `gb_model_tier.py` over the last `days` days, most recent first."""
+    """Memory-tier movement events, most recent first, from BOTH real sources
+    of tier placement on this node (each event carries a `source` field so a
+    caller can tell them apart):
+
+    - `tier_move` , explicit Python-API moves via `gb_model_tier.py`'s
+      manual T1/T2/T3 promote/demote/evict calls. NOT currently invoked by
+      any ai-forge pipeline (verified 2026-07-14 via repo grep) , this half
+      is usually empty and that is expected, not a recording bug.
+    - `shim_decision` , the ACTIVE, automatic source: every time the CUDA
+      shim's smart allocator placed a buffer off the fastest tier (T2 DDR
+      spill, T3 NVMe spill, feeder T1, host-VMM fallback). This is where the
+      real, high-volume tier-placement telemetry actually lives today.
+
+    Previously this tool only queried `tier_move` and so returned `[]` on
+    every real box (that mechanism has zero callers) even though thousands of
+    real per-allocation tier decisions were being recorded every session
+    under `shim_decision` , a misleading "nothing to see" result masking a
+    real, rich data source. Fixed 2026-07-14 to surface both. Use
+    `fb_phys_used_pct` on `shim_decision` rows to spot Rule #1 violations
+    (a large `bytes_mb` spill to `t2_local` while `fb_phys_used_pct` is low
+    means physical VRAM was under-filled before overflowing — see
+    `GB_VRAM_FRONTLOAD` in `greenboost_cuda_shim.c`)."""
     events = gdf.read_events(since_hours=days * 24)
-    moves = [e for e in events if e.get("kind") == "tier_move"]
-    return list(reversed(moves))[:limit]
+    moves = [dict(e, source="tier_move") for e in events if e.get("kind") == "tier_move"]
+    decisions = [dict(e, source="shim_decision") for e in events if e.get("kind") == "shim_decision"]
+    merged = sorted(moves + decisions, key=lambda e: e.get("ts", 0.0))
+    return list(reversed(merged))[:limit]
 
 
 @mcp.tool()
@@ -332,12 +372,11 @@ def greenboost_pilot(days: float = 5.0) -> dict:
     trends per model, latest memory-pressure picture, and evidence-backed
     advice mapping findings to GbControl levers or config changes. Read-only —
     advice is never auto-applied. Use this to decide how to redirect
-    orchestration (re-quant, enable GB_TQ_ATTN, move a lever) from real data."""
-    import gb_pilot
-    events = gdf.read_events(since_hours=days * 24)
-    analysis = gb_pilot.analyze(events)
-    analysis["advice"] = gb_pilot.advise(analysis)
-    return analysis
+    orchestration (re-quant, enable GB_TQ_ATTN, move a lever) from real data.
+    Canonical owner (shared impl in gb_mcp_common.py — also mirrored on
+    greenboost-orchestrator)."""
+    import gb_mcp_common
+    return gb_mcp_common.greenboost_pilot(days=days)
 
 
 @mcp.tool()
@@ -347,12 +386,10 @@ def greenboost_capabilities() -> dict:
     the shim at init → install manifest → binary sniff). Keys: shim_version,
     abi, source, features{gb_quant_cudart_rebind, expert_pool, cluster_fabric,
     gds, kv_compress, report_physical_vram}. Use before assuming a shim feature
-    is present rather than sniffing the .so."""
-    try:
-        import gb_monitor
-        return gb_monitor.capabilities()
-    except Exception as e:
-        return {"error": f"gb_monitor unavailable: {e}", "features": {}}
+    is present rather than sniffing the .so. Canonical owner (shared impl in
+    gb_mcp_common.py — also mirrored on greenboost-orchestrator)."""
+    import gb_mcp_common
+    return gb_mcp_common.greenboost_capabilities()
 
 
 @mcp.tool()
@@ -361,17 +398,10 @@ def greenboost_status() -> dict:
     loaded, GPU, the T1/T2/T3 tier pool (MB) + combined GB, pressure labels,
     OOM/gaming flags, the shim phase + active allocation path, and the
     Phase-4 KV-prefetch counters (kv_prefetch_* in the raw shim map). This is
-    the same state `greenboost status --llm` reports."""
-    try:
-        import gb_monitor
-        snap = gb_monitor.snapshot()
-        d = snap.as_dict()
-        # surface the KV-prefetch metering (shim_stats) alongside the pool view
-        d["kv_prefetch"] = {k: v for k, v in snap.shim.items()
-                            if k.startswith("kv_prefetch")}
-        return d
-    except Exception as e:
-        return {"error": f"gb_monitor unavailable: {e}"}
+    the same state `greenboost status --llm` reports. Canonical owner (shared
+    impl in gb_mcp_common.py — also mirrored on greenboost-orchestrator)."""
+    import gb_mcp_common
+    return gb_mcp_common.greenboost_status()
 
 
 @mcp.tool()
@@ -382,12 +412,10 @@ def synapse_status() -> dict:
     running now. Check this before routing pipeline inference through
     gb-synapse (preferred over raw ollama per CLAUDE.md): if `engine_built` is
     false the fallback is raw ollama and the fix is `gb_synapse build` (host +
-    each feeder). Read-only."""
-    try:
-        import gb_synapse
-        return gb_synapse.status()   # single source of truth (gb_synapse.status)
-    except Exception as e:
-        return {"error": f"gb_synapse unavailable: {e}", "engine_built": False}
+    each feeder). Read-only. Canonical: greenboost-synapse. Mirrored here
+    (shared impl in gb_mcp_common.py)."""
+    import gb_mcp_common
+    return gb_mcp_common.synapse_status()
 
 
 @mcp.tool()

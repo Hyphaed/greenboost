@@ -110,6 +110,42 @@ def _detect_pcie_gen() -> int:
     return _cached("pcie_gen", _go)
 
 
+def _detect_pcie_lanes() -> int:
+    """Link width (lanes) via NVML — mirrors _detect_pcie_gen. A card riser'd
+    to x8/x4 must not be assumed x16: pcie_peak_bw_mb_s (feeds synapse tok/s
+    estimates and telemetry) is wrong by exactly that factor otherwise.
+
+    Clamped against the PHYSICAL SLOT's ceiling (parent PCI bridge), not just
+    the GPU silicon's own max , NVML's MaxPcieLinkWidth reports what the CHIP
+    supports regardless of how many lanes the slot actually wires (e.g. a
+    x16-capable laptop dGPU soldered into a x8 slot , the exact false
+    "gen4x16" reading fixed in gb_telemetry.py 2026-07-14). Reuses
+    gb_telemetry's _slot_pcie_ceiling/_sysfs_bdf , same sysfs read, ONE
+    implementation, not a second copy. (MaxPcieLinkGeneration needs no such
+    clamp: nvml.h documents it already accounts for the bus's link *speed*
+    ceiling, only *width* has this gap.)"""
+    def _go():
+        nv, h = _nvml()
+        if h is None:
+            return 0
+        try:
+            width = int(nv.nvmlDeviceGetMaxPcieLinkWidth(h))
+        except Exception:
+            return 0
+        try:
+            from gb_telemetry import _slot_pcie_ceiling, _sysfs_bdf
+            pci_fn = getattr(nv, "nvmlDeviceGetPciInfo_v3", None) or nv.nvmlDeviceGetPciInfo
+            raw = pci_fn(h).busId
+            bdf = raw.decode("ascii", errors="ignore").strip("\x00") if isinstance(raw, bytes) else str(raw)
+            ceiling = _slot_pcie_ceiling(_sysfs_bdf(bdf))
+            if ceiling is not None:
+                width = min(width, ceiling[1])
+        except Exception:
+            pass
+        return width
+    return _cached("pcie_lanes", _go)
+
+
 def _detect_ram_total_gb() -> int:
     def _go():
         try:
@@ -488,7 +524,10 @@ def _build_profile(raw: dict, *, live: bool, src: str) -> TopologyProfile:
         compute_capability=cc,
         vram_bw_gb_s=_hw_float("vram_bandwidth_gb_s", _detect_vram_bw_gb_s),
         pcie_gen=_hw_int("pcie_gen", _detect_pcie_gen),
-        pcie_lanes=_int("pcie_lanes", 16),
+        # 16 (not the usual 0 sentinel) is the final fallback here: pcie_lanes
+        # is a divisor-like factor in pcie_peak_bw_mb_s downstream , 0 lanes
+        # would zero out bandwidth estimates instead of just being imprecise.
+        pcie_lanes=_hw_int("pcie_lanes", _detect_pcie_lanes) or 16,
         ram_total_gb=ram_total_gb,
         ram_speed_mt=_hw_int("ram_speed_mt", _detect_ram_speed_mt),
         net_link_mbps=_hw_int("net_link_mbps", _detect_net_link_mbps),

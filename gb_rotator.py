@@ -197,7 +197,10 @@ def run_rotation(jobs: list[RotationJob],
 
 
 _EXAMPLE_QUEUE = {"jobs": [
-    {"model": "qwen36-coder:studio",
+    # Reference Workload Rule (CLAUDE.md, 2026-07-13): satgeze/qwen36-35b-
+    # uncensored-1m via GB-Synapse replaces qwen36-coder:studio / qwen35-
+    # claude-coder:9b for every agentic/coding roster slot.
+    {"model": "satgeze/qwen36-35b-uncensored-1m",
      "work": "echo 'coder batch here — pipeline consumes :11434'",
      "timeout_s": 7200, "ctx": 16384, "status": "pending"},
     {"model": "qwen3-vl:30b",

@@ -168,6 +168,14 @@ class Feeder:
     gpu_temp_c: int = 0
     gpu_power_w: int = 0
     mps_sm_pct: int = 0
+    # SSH nvidia-smi ONLY (real gap found 2026-07-14: GB_MSG_FEEDER_STATUS's
+    # wire protocol, v3.1, never carried these — fixing that needs a struct
+    # version bump in greenboost_netd.c PLUS a netd rebuild+restart on every
+    # feeder, not done here; this SSH-only path needs no feeder-side change
+    # at all). 0 when SSH telemetry hasn't run/failed.
+    sm_clock_mhz: int = 0
+    mem_clock_mhz: int = 0
+    power_limit_w: int = 0
     # GPU model string (SSH nvidia-smi `name`); "" when unavailable. Used by the
     # A2A gateway's per-node AgentCard so delegating agents can see the hardware.
     gpu_name: str = ""
@@ -271,9 +279,27 @@ def _ssh_opts(connect_timeout: int = 10, compress: bool = False) -> list[str]:
     (one owner , call sites must not hand-roll their own list).
 
     aes128-gcm: AES-NI wire-speed bulk transfers (~2× the chacha20 default).
+
+    ServerAliveInterval/CountMax: model_push (rsync of multi-GB checkpoints,
+    dataflux-observed duration 435s) and chunk_remote/cluster_map dispatch
+    (a feeder diffusion batch runs minutes with near-zero stdout on the SSH
+    channel while the remote GPU is busy) are long-lived sessions with long
+    silent stretches. Without a client-side liveness probe , OpenSSH sends
+    NONE by default , a dead peer or a stateful device on the path can drop
+    the TCP session and the client only discovers it on the next write/read,
+    surfacing as "Connection closed by ... port 22" or BrokenPipeError deep
+    into the job instead of a fast, clean failure (real dataflux errors ,
+    ensure_feeder_model and cluster_map's chunk_remote , 2026-06-30..07-13).
+    15s/6 tolerates up to 90s of no response , long enough to ride out a
+    transient blip on a busy LAN , without masking a truly dead peer for the
+    whole job duration. (greenboost-cli's cluster_adapter.py already uses
+    ServerAliveInterval for its worker tunnels, tuned the opposite way ,
+    5s/2 to fail FAST and avoid zombie workers , this module's sessions carry
+    the actual payload and must instead tolerate transient loss.)
     """
     return ["-o", "BatchMode=yes", "-o", f"ConnectTimeout={connect_timeout}",
             "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=6",
             "-o", "ControlMaster=auto",
             "-o", f"ControlPath={_cm_dir()}/gb-cm-%r@%h:%p",
             "-o", "ControlPersist=120s",
@@ -319,12 +345,22 @@ def _emit_link_transfer(feeder: "Feeder", op: str, nbytes: int, seconds: float,
 
 
 def _ssh_gpu_telemetry(feeder: Feeder, timeout_s: float = 3.0) -> dict | None:
-    """SSH `nvidia-smi` fallback for GPU util/temp/power.
+    """SSH `nvidia-smi` fallback for GPU util/temp/power/clocks/power-limit.
 
     Used when the fabric's GB_MSG_FEEDER_STATUS telemetry is unavailable
     (older netd without v3.1, or the query itself failed while T1/T2/T3
-    memory info still succeeded). Best-effort; None on any failure , never
-    raises, so callers can unconditionally attempt this after a fabric miss.
+    memory info still succeeded) — AND, as of 2026-07-14, for
+    sm_clock_mhz/mem_clock_mhz/power_limit_w regardless of fabric success,
+    since v3.1's wire struct never carries those three fields at all (a
+    real gap found live: the `greenboost cluster` CLI's per-node compute
+    detail showed them blank for every feeder, populated only for host,
+    which gets them from local NVML directly). Extending the wire protocol
+    to add them needs a struct version bump in greenboost_netd.c plus a
+    netd rebuild+restart on every feeder — a real fix, but not safe to do
+    unsupervised on a remote machine from here; this SSH-only path needs no
+    feeder-side change at all, so it's the immediate fix. Best-effort; None
+    on any failure , never raises, so callers can unconditionally attempt
+    this after a fabric miss (or just for the 3 always-missing fields).
     """
     import subprocess
     user = feeder.ssh_user or os.environ.get("USER", "root")
@@ -332,21 +368,177 @@ def _ssh_gpu_telemetry(feeder: Feeder, timeout_s: float = 3.0) -> dict | None:
     try:
         out = subprocess.run(
             ["ssh", *_ssh_opts(connect_timeout=int(timeout_s)), tgt,
-             "nvidia-smi --query-gpu=name,utilization.gpu,temperature.gpu,power.draw "
+             "nvidia-smi --query-gpu=name,utilization.gpu,temperature.gpu,"
+             "power.draw,clocks.sm,clocks.mem,power.limit "
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=timeout_s + 2)
         if out.returncode != 0 or not out.stdout.strip():
             return None
         # name is first and never contains a comma → safe to split on ",".
         parts = [p.strip() for p in out.stdout.strip().splitlines()[0].split(",")]
-        return {
-            "gpu_name": parts[0],
-            "gpu_util_pct": int(float(parts[1])),
-            "gpu_temp_c": int(float(parts[2])),
-            "gpu_power_w": int(float(parts[3])),
-        }
-    except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+
+        def _int_or_none(s: str) -> int | None:
+            # Real incident (2026-07-14): nvidia-smi reports "[N/A]" for
+            # power.limit on some laptop GPUs (RTX 5070 Laptop, confirmed
+            # live — the driver doesn't expose a power management limit
+            # query on this card). A single unparseable field must NOT
+            # poison the whole reply , util/temp/power/clocks were all
+            # genuinely available in the same query and must still be
+            # returned even when this one field isn't.
+            try:
+                return int(float(s))
+            except (ValueError, TypeError):
+                return None
+
+        result: dict = {"gpu_name": parts[0]}
+        if (v := _int_or_none(parts[1])) is not None:
+            result["gpu_util_pct"] = v
+        if (v := _int_or_none(parts[2])) is not None:
+            result["gpu_temp_c"] = v
+        if (v := _int_or_none(parts[3])) is not None:
+            result["gpu_power_w"] = v
+        # Clocks/power-limit are a newer addition to this query , tolerate a
+        # shorter reply (an even older nvidia-smi missing one of these
+        # fields) by only populating what's actually present AND parseable.
+        if len(parts) > 4 and (v := _int_or_none(parts[4])) is not None:
+            result["sm_clock_mhz"] = v
+        if len(parts) > 5 and (v := _int_or_none(parts[5])) is not None:
+            result["mem_clock_mhz"] = v
+        if len(parts) > 6 and (v := _int_or_none(parts[6])) is not None:
+            result["power_limit_w"] = v
+        return result if len(result) > 1 else None
+    except (OSError, IndexError, subprocess.TimeoutExpired):
         return None
+
+
+# ── Feeder dataflux sync (real gap found 2026-07-14) ─────────────────────────
+# Each node's SnapshotRecorder writes its OWN rich telemetry (temp/util/
+# clocks/T2/T3/etc, as observed LOCALLY, which the fabric's GB_MSG_FEEDER_
+# STATUS wire protocol only partially mirrors — see the Feeder dataclass
+# comment on sm_clock_mhz/mem_clock_mhz/power_limit_w) to
+# ~/.local/share/greenboost/dataflux.jsonl on THAT machine only. A feeder's
+# log never left that feeder , `dataflux_events`/`dataflux_summary`/
+# `dataflux_critic` (and every ai-forge pipeline consuming them) only ever
+# saw what the HOST observed secondhand about a feeder (link transfers,
+# stage dispatch results), never the feeder's own first-person telemetry
+# series. Confirmed live: omen's local log had 8770+ lines, actively
+# growing, completely disjoint from the host's log. This is the real
+# "whole cluster dataflux" gap , fixed by periodically pulling each
+# feeder's log tail and re-emitting any new events into the host's own log.
+_DATAFLUX_SYNC_STATE_PATH = "/run/greenboost/dataflux_sync_state.json"
+_dataflux_sync_lock = threading.Lock()
+
+
+def _dataflux_sync_state() -> dict:
+    try:
+        return json.loads(Path(_DATAFLUX_SYNC_STATE_PATH).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_dataflux_sync_state(state: dict) -> None:
+    try:
+        Path(_DATAFLUX_SYNC_STATE_PATH).parent.mkdir(parents=True, exist_ok=True)
+        Path(_DATAFLUX_SYNC_STATE_PATH).write_text(json.dumps(state))
+    except OSError:
+        pass
+
+
+def sync_feeder_dataflux(feeder: Feeder, max_lines: int = 2000) -> int:
+    """Pull the feeder's own local dataflux log tail over SSH and re-emit
+    any events newer than the last sync into the HOST's own dataflux log ,
+    so every consumer of `gb_dataflux.read_events()`
+    (dataflux_events/summary/critic MCP tools, ai-forge pipelines) sees the
+    feeder's real first-person telemetry, not just what the host inferred
+    about it secondhand.
+
+    Dedup: a per-feeder last-synced timestamp persists in a small state
+    file at `/run/greenboost/` (tmpfs, cleared on reboot , matches this
+    project's convention for ephemeral cluster state), so repeated calls
+    only pull genuinely new events. Bounded to a `tail -n max_lines` of the
+    remote file per call, not a full pull , cheap even against a large
+    log; a feeder that's been offline a while drains over several calls
+    rather than one huge pull, which is fine for a periodic sync loop.
+
+    Best-effort: returns 0 on ANY failure (SSH unreachable, empty/malformed
+    log, feeder offline) , never raises. Events are re-emitted AS-IS (the
+    feeder's own recorder already tags `node` correctly, e.g. "omen") , a
+    straight copy into the host's log, not a re-interpretation. A rare
+    state-loss (corrupted/missing state file) can cause some events to be
+    re-synced and appear twice , acceptable: real duplicated data is far
+    less harmful than the silent total gap this fixes.
+    """
+    import subprocess
+    user = feeder.ssh_user or os.environ.get("USER", "root")
+    tgt = f"{user}@{feeder.ip}"
+    try:
+        out = subprocess.run(
+            ["ssh", *_ssh_opts(connect_timeout=5), tgt,
+             f"tail -n {max_lines} ~/.local/share/greenboost/dataflux.jsonl 2>/dev/null"],
+            capture_output=True, text=True, timeout=10)
+        if out.returncode != 0 or not out.stdout.strip():
+            return 0
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+
+    key = f"{feeder.ip}:{feeder.port}"
+    with _dataflux_sync_lock:
+        last_ts = _dataflux_sync_state().get(key, 0.0)
+
+    try:
+        import gb_dataflux
+    except ImportError:
+        return 0
+
+    self_id = feeder.hostname or feeder.ip
+    synced = 0
+    max_ts = last_ts
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ts = ev.get("ts", 0)
+        if ts <= last_ts:
+            continue
+        # CRITICAL correction, not a verbatim copy: a node's own
+        # SnapshotRecorder self-identifies as "host" from ITS OWN local
+        # perspective (it has no notion of being "a feeder" to someone
+        # else — that's purely relational). Re-emitting verbatim would
+        # collide THIS feeder's telemetry with the real host's own "host"-
+        # tagged events in the host's log, making them indistinguishable
+        # and corrupting any per-node aggregation (dataflux_summary,
+        # cluster_snapshot consumers). Real bug caught live during this
+        # same fix's first test run , the very first sync call polluted
+        # the host's log with 200 mistagged events before this correction
+        # existed, since manually cleaned up.
+        if ev.get("node") in ("host", self_id, None, ""):
+            ev["node"] = self_id
+        gb_dataflux.emit(ev)
+        synced += 1
+        max_ts = max(max_ts, ts)
+
+    if synced:
+        with _dataflux_sync_lock:
+            state = _dataflux_sync_state()
+            state[key] = max_ts
+            _save_dataflux_sync_state(state)
+    return synced
+
+
+def sync_cluster_dataflux(max_lines: int = 2000) -> dict:
+    """sync_feeder_dataflux() for every configured, online feeder , the
+    convenience entry point a periodic caller (ai-forge's studio job queue,
+    a cron-style loop) actually calls. Returns {hostname_or_ip: n_synced}.
+    Never raises; an unreachable feeder just contributes 0."""
+    result: dict = {}
+    for f in feeders(probe=True, fetch_topology=False):
+        if f.online:
+            result[f.hostname or f.ip] = sync_feeder_dataflux(f, max_lines=max_lines)
+    return result
 
 
 # ── Cluster topology registry ────────────────────────────────────────────────
@@ -555,16 +747,29 @@ def feeders(probe: bool = True, timeout_s: float = 2.0,
             # condition). The old guard required ALL of util/temp/power to be 0,
             # so a working power reading suppressed the fallback and left temp+
             # util stuck at 0 forever. Trigger on any missing core signal.
+            # sm_clock_mhz/mem_clock_mhz/power_limit_w are SSH-only (the fabric
+            # wire protocol never carries them, see Feeder's field comment) ,
+            # so they trigger the fallback unconditionally, not just on a
+            # missing core signal.
             if f.online and ssh_fallback_telemetry and (
-                    f.gpu_temp_c == 0 or (f.gpu_util_pct == 0 and f.gpu_power_w == 0)):
+                    f.gpu_temp_c == 0 or (f.gpu_util_pct == 0 and f.gpu_power_w == 0)
+                    or f.sm_clock_mhz == 0):
                 ssh_tel = _ssh_gpu_telemetry(f)
                 if ssh_tel:
                     # Only overwrite a fabric value with the SSH value when the
                     # fabric value was missing , keep any good fabric reading.
-                    f.gpu_util_pct = f.gpu_util_pct or ssh_tel["gpu_util_pct"]
-                    f.gpu_temp_c   = f.gpu_temp_c   or ssh_tel["gpu_temp_c"]
-                    f.gpu_power_w  = f.gpu_power_w  or ssh_tel["gpu_power_w"]
+                    # .get(...) not [...] , _ssh_gpu_telemetry now omits any
+                    # single field nvidia-smi reported as unparseable (e.g.
+                    # "[N/A]" for power.limit on some laptop GPUs) rather than
+                    # failing the whole reply, so a field's absence here is
+                    # expected and must not KeyError.
+                    f.gpu_util_pct = f.gpu_util_pct or ssh_tel.get("gpu_util_pct", 0)
+                    f.gpu_temp_c   = f.gpu_temp_c   or ssh_tel.get("gpu_temp_c", 0)
+                    f.gpu_power_w  = f.gpu_power_w  or ssh_tel.get("gpu_power_w", 0)
                     f.gpu_name     = f.gpu_name     or ssh_tel.get("gpu_name", "")
+                    f.sm_clock_mhz   = f.sm_clock_mhz   or ssh_tel.get("sm_clock_mhz", 0)
+                    f.mem_clock_mhz  = f.mem_clock_mhz  or ssh_tel.get("mem_clock_mhz", 0)
+                    f.power_limit_w  = f.power_limit_w  or ssh_tel.get("power_limit_w", 0)
         # Adaptive placement history persists across feeders() calls (a fresh
         # Feeder is built above; the EWMA lives in module-level state keyed
         # by ip:port so repeated dispatches keep learning per node).
@@ -1040,8 +1245,34 @@ _SNAPSHOT_TTL_S = 1.0
 _BUSY_UTIL_PCT = 90
 
 
+def _host_metrics_dict(m) -> dict:
+    """Shape one GpuMetrics snapshot into the same T1/T2/T3 + GPU-compute
+    fields `Feeder` reports, so `cluster_snapshot()`'s host and feeder
+    sections are symmetric , the field GreenBoost's own cluster tooling
+    (the `greenboost cluster` CLI view, the greenboost-cluster MCP) needs to
+    show BOTH nodes' full tier + compute picture side by side, not just a
+    host stub with 3 fields next to a feeder with a dozen (gap found live
+    2026-07-14 while enhancing `greenboost cluster`'s cluster-level view)."""
+    gb = m.gb
+    out = {
+        "gpu_util_pct": m.gpu_util_pct, "free_vram_mb": m.fb_free_mb,
+        "temp_c": m.temp_c,
+        "t1_free_mb": m.fb_free_mb, "t1_total_mb": m.fb_total_mb,
+        "gpu_power_w": m.power_w, "power_limit_w": m.power_limit_w,
+        "sm_clock_mhz": m.sm_clock_mhz, "mem_clock_mhz": m.mem_clock_mhz,
+    }
+    if gb is not None:
+        out["t2_free_mb"] = gb.t2_available_mb
+        out["t2_total_mb"] = gb.t2_allocated_mb + gb.t2_available_mb
+        out["t3_free_mb"] = gb.t3_free_mb
+        out["t3_total_mb"] = gb.t3_used_mb + gb.t3_free_mb
+    return out
+
+
 def _host_telemetry() -> dict:
-    """Best-effort host GPU snapshot for placement decisions.
+    """Best-effort host GPU snapshot for placement decisions , and (as of
+    2026-07-14) the same T1/T2/T3 + compute shape `Feeder` reports, so
+    callers get a symmetric host/feeder picture instead of a 3-field stub.
 
     Prefers the CURRENT process's own gb_init telemetry singleton (zero
     extra cost , it's already polling in the background); falls back to a
@@ -1053,18 +1284,21 @@ def _host_telemetry() -> dict:
         import gb_init
         m = gb_init.snapshot()
         if m is not None:
-            return {"gpu_util_pct": m.gpu_util_pct, "free_vram_mb": m.fb_free_mb,
-                    "temp_c": m.temp_c}
+            return _host_metrics_dict(m)
     except Exception:
         pass
     try:
         import gb_telemetry
         m = gb_telemetry.sample_once(0)
-        return {"gpu_util_pct": m.gpu_util_pct, "free_vram_mb": m.fb_free_mb,
-                "temp_c": m.temp_c}
+        return _host_metrics_dict(m)
     except Exception:
         pass
-    return {"gpu_util_pct": None, "free_vram_mb": None, "temp_c": None}
+    return {"gpu_util_pct": None, "free_vram_mb": None, "temp_c": None,
+            "t1_free_mb": None, "t1_total_mb": None,
+            "t2_free_mb": None, "t2_total_mb": None,
+            "t3_free_mb": None, "t3_total_mb": None,
+            "gpu_power_w": None, "power_limit_w": None,
+            "sm_clock_mhz": None, "mem_clock_mhz": None}
 
 
 def cluster_snapshot(force: bool = False, ssh_fallback_telemetry: bool = True) -> dict:
@@ -1075,8 +1309,18 @@ def cluster_snapshot(force: bool = False, ssh_fallback_telemetry: bool = True) -
     Host metrics come from the running process's own telemetry
     (gb_init/gb_telemetry); feeder metrics come from the fabric
     (GB_MSG_FEEDER_STATUS), with an SSH nvidia-smi fallback for feeders
-    running an older netd. Cached ~1s so a hot per-chunk dispatch loop
-    doesn't re-probe the network on every iteration.
+    running an older netd (and, unconditionally, for sm_clock_mhz/
+    mem_clock_mhz/power_limit_w — the fabric protocol never carries those
+    three at all). Cached ~1s so a hot per-chunk dispatch loop doesn't
+    re-probe the network on every iteration.
+
+    Each feeder dict also carries a `temp_c` alias of its own `gpu_temp_c`
+    (real gap found 2026-07-14: the `greenboost cluster` CLI's compute-detail
+    view reads a uniform key set — `temp_c`, `gpu_power_w`, `power_limit_w`,
+    `sm_clock_mhz`, `mem_clock_mhz` — across both host and feeder rows;
+    `_host_metrics_dict` already used `temp_c`, but `Feeder`'s own field is
+    named `gpu_temp_c`, so every feeder row showed temp blank even when the
+    fabric or SSH fallback had it).
     """
     now = time.monotonic()
     with _snapshot_lock:
@@ -1084,10 +1328,14 @@ def cluster_snapshot(force: bool = False, ssh_fallback_telemetry: bool = True) -
         if not force and cached is not None and now - _snapshot_cache["ts"] < _SNAPSHOT_TTL_S:
             return cached
 
+    feeder_dicts = []
+    for f in feeders(probe=True, ssh_fallback_telemetry=ssh_fallback_telemetry):
+        d = asdict(f)
+        d["temp_c"] = d["gpu_temp_c"]
+        feeder_dicts.append(d)
     data = {
         "host": _host_telemetry(),
-        "feeders": [asdict(f) for f in
-                    feeders(probe=True, ssh_fallback_telemetry=ssh_fallback_telemetry)],
+        "feeders": feeder_dicts,
     }
     with _snapshot_lock:
         _snapshot_cache["ts"] = now
@@ -1268,6 +1516,48 @@ _DEFAULT_CHUNK = 4  # proven starting point (ai-forge express_gen); dynamic
                     # queue draining does the actual load-balancing, not this.
 
 
+def _drain_pull(q: "queue.Queue", n: int,
+                blocking_timeout: "float | None" = None) -> "list[tuple[int, list]]":
+    """Pull up to n pre-sized chunks from the shared queue in one round.
+    blocking_timeout=None: every pull is non-blocking (feeder workers — a
+    feeder that's briefly out of work just ends its loop, another thread or
+    the host picks up any remainder). blocking_timeout=X: the FIRST pull
+    blocks up to X seconds (propagates queue.Empty on timeout, same contract
+    the host loop already had); pulls 2..n are non-blocking so we never wait
+    for MORE work once we have at least one chunk."""
+    pulled: "list[tuple[int, list]]" = []
+    if blocking_timeout is not None:
+        pulled.append(q.get(timeout=blocking_timeout))  # may raise queue.Empty
+        n -= 1
+    for _ in range(max(0, n)):
+        try:
+            pulled.append(q.get_nowait())
+        except queue.Empty:
+            break
+    return pulled
+
+
+def _adaptive_pull_count(key: str, all_keys: "list[str]") -> int:
+    """DI-5: how many _DEFAULT_CHUNK-sized queue chunks THIS node's worker
+    should pull per round, weighted by its measured throughput_ewma relative
+    to its peers (largest-remainder apportionment — gb_placement.proportional_split,
+    exact-sum guarantee). Cold start (no throughput history for ANY node in
+    this dispatch yet) returns 1 for everyone — byte-identical to the
+    pre-DI-5 fixed-chunk behavior, so a first-ever run on a fresh process is
+    unaffected. Env escape hatch: GB_CLUSTER_CHUNK_WEIGHTED=0 (default on).
+    """
+    if os.environ.get("GB_CLUSTER_CHUNK_WEIGHTED", "1") == "0":
+        return 1
+    weights = [_throughput_ewma.get(k, 0.0) for k in all_keys]
+    if not any(weights):
+        return 1  # nobody has history yet — identical to fixed chunking
+    import gb_placement
+    total_pulls = max(1, len(all_keys) * 2)  # avg ~2 base chunks/node when weights are equal
+    counts = gb_placement.proportional_split(total_pulls, [w or 0.01 for w in weights],
+                                             mins=[1] * len(all_keys))
+    return max(1, counts[all_keys.index(key)])
+
+
 def _df_item_repr(item) -> str:
     """Best-effort short label for a work item, for the dataflux event log
     (slug/name/id attr or dict key when present, else a truncated repr)."""
@@ -1283,9 +1573,13 @@ def _df_item_repr(item) -> str:
 
 
 def _df_emit(run_id: str, node: str, label: str, kind: str, items: list,
-            duration_s: float, status: str = "ok", error: str | None = None) -> None:
+            duration_s: float, status: str = "ok", error: str | None = None,
+            **extra) -> None:
     """Record one dataflux event (gb_dataflux.py). Best-effort , never raises,
-    lazily imported so gb_cluster stays import-light when dataflux isn't used."""
+    lazily imported so gb_cluster stays import-light when dataflux isn't used.
+    **extra: additional scalar fields merged verbatim (e.g. DI-5's
+    chunk_size/pulled_chunks, so cluster_map's adaptive chunk policy is
+    visible per-event, not just inferred from n_items)."""
     try:
         import gb_dataflux
         ev = {
@@ -1296,6 +1590,7 @@ def _df_emit(run_id: str, node: str, label: str, kind: str, items: list,
         }
         if error:
             ev["error"] = error
+        ev.update(extra)
         gb_dataflux.emit(ev)
     except Exception:
         pass
@@ -1368,7 +1663,24 @@ def cluster_map(items, run_local, run_remote=None, *, chunk="auto",
                 on_progress(len(results), n)
         return results
 
-    chunk_size = _DEFAULT_CHUNK if chunk == "auto" else max(1, int(chunk))
+    if chunk == "auto":
+        # Ensure at least (host + every feeder) chunks exist when there's
+        # enough work to split — otherwise a small batch (n <= _DEFAULT_CHUNK)
+        # becomes exactly ONE queue entry, and whichever worker's thread wins
+        # the race for it (almost always a feeder: feeder threads are started
+        # before the host's own pull loop even begins, below) takes 100% of
+        # the batch, leaving every other participant idle for the whole run.
+        # Real incident, 2026-07-14: a genuine 4-item resume batch
+        # (chunk_size == _DEFAULT_CHUNK == 4 -> exactly one chunk) landed
+        # entirely on the feeder; host sat at 1% util, 10+ GB free, the whole
+        # time — "both machines should be used toward the same task" was not
+        # happening for any batch this small, not a one-off. Still capped at
+        # _DEFAULT_CHUNK as the max (never chunk LARGER than the proven
+        # amortization size just because there are few participants).
+        participants = 1 + len(feeders)
+        chunk_size = max(1, min(_DEFAULT_CHUNK, -(-n // participants)))  # ceil(n / participants)
+    else:
+        chunk_size = max(1, int(chunk))
 
     q: "queue.Queue" = queue.Queue()
     idx = 0
@@ -1389,33 +1701,43 @@ def cluster_map(items, run_local, run_remote=None, *, chunk="auto",
                 completed += count
                 on_progress(completed, n)
 
+    # DI-5: every worker's key (host + each feeder) so _adaptive_pull_count
+    # can weigh this round's pull against ALL participants' throughput_ewma,
+    # not just its own history.
+    all_keys = [_HOST_KEY] + [f"{f.ip}:{f.port}" for f in feeders]
+
     def _feeder_worker(feeder: "Feeder"):
         key = f"{feeder.ip}:{feeder.port}"
         node = feeder.hostname or feeder.ip
         while True:
-            try:
-                start, batch = q.get_nowait()
-            except queue.Empty:
+            pulled = _drain_pull(q, _adaptive_pull_count(key, all_keys))
+            if not pulled:
                 return
+            batch = [item for _, b in pulled for item in b]
             t0 = time.monotonic()
             try:
                 out = run_remote(feeder, batch)
                 elapsed = max(time.monotonic() - t0, 1e-6)
                 _ewma_update(_throughput_ewma, key, len(batch) / elapsed)
-                _df_emit(run_id, node, label, "chunk_remote", batch, elapsed)
+                _df_emit(run_id, node, label, "chunk_remote", batch, elapsed,
+                         chunk_size=len(batch), pulled_chunks=len(pulled))
                 with res_lock:
-                    for j, r in enumerate(out):
-                        results[start + j] = r
+                    offset = 0
+                    for start, b in pulled:
+                        for j, r in enumerate(out[offset:offset + len(b)]):
+                            results[start + j] = r
+                        offset += len(b)
                 _mark_done(len(batch))
             except Exception as e:
                 _df_emit(run_id, node, label, "chunk_remote", batch,
                          time.monotonic() - t0, status="error",
                          error=f"{e.__class__.__name__}: {e}")
                 print(f"  [cluster-map] feeder {feeder.hostname or feeder.ip} failed "
-                      f"on batch [{start}:{start + len(batch)}] "
+                      f"on a {len(pulled)}-chunk batch of {len(batch)} items "
                       f"({e.__class__.__name__}: {e}); re-queued for host",
                       flush=True)
-                q.put((start, batch))
+                for start, b in pulled:            # re-queue each ORIGINAL chunk
+                    q.put((start, b))               # separately, not the merged batch
                 return  # a failing feeder stops taking work
 
     threads = [threading.Thread(target=_feeder_worker, args=(f,), daemon=True)
@@ -1425,19 +1747,27 @@ def cluster_map(items, run_local, run_remote=None, *, chunk="auto",
 
     while True:
         try:
-            start, batch = q.get(timeout=0.5)
+            pulled = _drain_pull(q, _adaptive_pull_count(_HOST_KEY, all_keys),
+                                 blocking_timeout=0.5)
         except queue.Empty:
             if not any(t.is_alive() for t in threads):
                 break
             continue
+        if not pulled:
+            continue
+        batch = [item for _, b in pulled for item in b]
         t0 = time.monotonic()
         out = run_local(batch)
         elapsed = max(time.monotonic() - t0, 1e-6)
         _ewma_update(_throughput_ewma, _HOST_KEY, len(batch) / elapsed)
-        _df_emit(run_id, _HOST_KEY, label, "chunk_local", batch, elapsed)
+        _df_emit(run_id, _HOST_KEY, label, "chunk_local", batch, elapsed,
+                 chunk_size=len(batch), pulled_chunks=len(pulled))
         with res_lock:
-            for j, r in enumerate(out):
-                results[start + j] = r
+            offset = 0
+            for start, b in pulled:
+                for j, r in enumerate(out[offset:offset + len(b)]):
+                    results[start + j] = r
+                offset += len(b)
         _mark_done(len(batch))
 
     for t in threads:

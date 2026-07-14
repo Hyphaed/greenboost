@@ -30,8 +30,10 @@ def cluster_status(probe: bool = True) -> dict:
     installed, whether a cluster is configured, how many feeders are online,
     each node's T1/T2/T3 free/total MB, host GPU telemetry, and the
     workload/compute routing model. probe=False skips the network round-trip
-    and returns last-known feeder state."""
-    return gc.status(probe=probe)
+    and returns last-known feeder state. Canonical owner (shared impl in
+    gb_mcp_common.py — also mirrored on greenboost-orchestrator)."""
+    import gb_mcp_common
+    return gb_mcp_common.cluster_status(probe=probe)
 
 
 @mcp.tool()
@@ -41,6 +43,29 @@ def cluster_snapshot(force: bool = False) -> dict:
     link MB/s, and throughput items/s. Cached ~1s so a hot poll loop doesn't
     re-probe the fabric every call; pass force=True to re-probe now."""
     return gc.cluster_snapshot(force=force)
+
+
+@mcp.tool()
+def cluster_sync_dataflux(max_lines: int = 2000) -> dict:
+    """Pull every online feeder's OWN local dataflux log (its real
+    first-person GPU/system telemetry — this can be richer than what the
+    fabric's GB_MSG_FEEDER_STATUS wire protocol relays, e.g. sm_clock_mhz/
+    mem_clock_mhz/power_limit_w) and merge new events into the HOST's own
+    dataflux log, so dataflux_events/dataflux_summary/dataflux_critic (and
+    every pipeline consuming them) see the WHOLE cluster's activity, not
+    just what the host observed secondhand about a feeder.
+
+    Real gap found 2026-07-14: a feeder's local log (confirmed live:
+    thousands of lines, actively growing) was never read by anything on
+    the host side — the per-node dataflux stores were completely disjoint.
+    Dedup via a persisted per-feeder last-synced timestamp, so repeated
+    calls only pull genuinely new events; bounded to a `tail -n max_lines`
+    of the remote log per call, not a full pull. Returns
+    {hostname_or_ip: n_events_synced}. Call this periodically (ai-forge's
+    studio job queue already does, every ~30s) or on demand before a
+    dataflux_critic/summary read when you need the freshest cluster-wide
+    picture."""
+    return gc.sync_cluster_dataflux(max_lines=max_lines)
 
 
 @mcp.tool()

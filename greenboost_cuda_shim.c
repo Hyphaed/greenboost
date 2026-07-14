@@ -63,7 +63,17 @@
  *   GREENBOOST_DEEP_IDLE_TIMEOUT_MS  ms of additional inactivity in IDLE phase before
  *                                transitioning to DEEP_IDLE and signalling the reclaim
  *                                daemon to unload models (default: 900000 = 15 min; 0 = disabled).
- *   GREENBOOST_CUDART_PATH       explicit path to libcudart.so (override auto-search)
+ *   GREENBOOST_CUDART_PATH       explicit path to libcudart.so (override auto-search).
+ *                                Validated at runtime against whatever libcudart the
+ *                                app itself actually maps (via cudaRuntimeGetVersion):
+ *                                a major-version mismatch (e.g. a cu13 override under
+ *                                a cu128-linked PyTorch process) corrupts cudaDeviceProp
+ *                                reads - cudaDeviceProp's layout changed in CUDA 13.0 -
+ *                                which previously crashed PyTorch's CUDA RNG with SIGFPE
+ *                                (multiProcessorCount read as 0) or made SDPA's cutlassF
+ *                                backend reject the garbage properties ("no kernel found
+ *                                to launch"). On a provable mismatch the shim warns loudly
+ *                                and rebinds onto the app's own libcudart instead.
  *   GREENBOOST_T2_POOL_MB        MB to pre-register as T2 pool (0=disable; default 85% of T2)
  *   GREENBOOST_A0_DISABLE        1 = skip Path A zero-copy sub-method (cudaImportExternalMemory); use pinned sub-method directly
  *   GREENBOOST_KV_COMPRESS       1 = absmax int8 compress K/V before T1→T2 eviction
@@ -3686,6 +3696,8 @@ static void gb_write_stats(void)
                             " \"t3_speed_mbs\": %d,"
                             " \"pcie_link_gen\": %u,"
                             " \"pcie_link_width\": %u,"
+                            " \"pcie_link_gen_max\": %u,"
+                            " \"pcie_link_width_max\": %u,"
                             " \"pcie_effective_bw_mbs\": %u,"
                             " \"throttle_reasons\": %u,"
                             " \"ecc_dbe_count\": %u}%s\n",
@@ -3705,6 +3717,11 @@ static void gb_write_stats(void)
                             gb_netc_t3_speed_mbs(_fi),
                             gb_netc_feeder_pcie_link_gen(_fi),
                             gb_netc_feeder_pcie_link_width(_fi),
+                            /* D-PCIE-CEIL: real slot ceiling, 0 on feeders
+                             * older than 2026-07-14 - gb_telemetry.py falls
+                             * back to max=current when these read 0. */
+                            gb_netc_feeder_pcie_link_gen_max(_fi),
+                            gb_netc_feeder_pcie_link_width_max(_fi),
                             gb_netc_feeder_pcie_bw_mbs(_fi),
                             gb_netc_feeder_throttle_reasons(_fi),
                             gb_netc_feeder_ecc_dbe_count(_fi),
@@ -4119,11 +4136,30 @@ static void gb_kernel_sigs_load_file(const char *path);
 /*  fallback and every cudart hook calls GB_CUDART_ENSURE() — a         */
 /*  one-shot lazy rebind that scans /proc/self/maps for the libcudart   */
 /*  the app actually mapped and re-resolves all pointers from it.       */
-/*  GREENBOOST_CUDART_PATH (explicit override) disables the rebind.     */
+/*                                                                      */
+/*  GREENBOOST_CUDART_PATH (explicit override) is an escape hatch for   */
+/*  non-standard installs and normally skips the auto-rebind. Verified  */
+/*  incident (2026-07-14): a caller computed this path from the WRONG   */
+/*  venv (a cu13 libcudart) while the actual process had a cu128/cu12   */
+/*  PyTorch mapped. cudaDeviceProp's layout changed in CUDA 13.0 (every */
+/*  field after totalGlobalMem shifted), so cudaGetDeviceProperties     */
+/*  filled via the override's ABI handed back a struct whose            */
+/*  multiProcessorCount PyTorch read as 0/garbage through its own       */
+/*  (differently-laid-out) struct definition — SIGFPE in the CUDA RNG   */
+/*  grid-size division (reproduced under gdb), and in a fuller pipeline */
+/*  the same corruption surfaced as SDPA's cutlassF backend rejecting   */
+/*  the (garbage) reported properties ("no kernel found to launch").    */
+/*  The override is therefore now validated: if the app's own mapped    */
+/*  libcudart is discoverable and its CUDA major version differs from   */
+/*  the override's, the override is provably wrong for this process —  */
+/*  warn loudly and rebind onto the app's own library instead of        */
+/*  trusting the mismatched escape hatch (silently corrupting device    */
+/*  properties is strictly worse than ignoring a bad override).         */
 /* ------------------------------------------------------------------ */
 static char g_cudart_init_path[512];        /* path init dlopen()ed        */
 static char g_cudart_init_real[512];        /* ...canonicalized (realpath) */
 static int  g_cudart_override;              /* GREENBOOST_CUDART_PATH used */
+static int  g_cudart_override_major;         /* CUDA major of the override, 0=unknown */
 static _Atomic int g_cudart_rebound;        /* one-shot latch              */
 /* Set once we are bound to a libcudart the APP mapped (not our own fallback).
  * Until then the rebind stays re-armable: a backend that is dlopen()ed late
@@ -4222,6 +4258,22 @@ static void *gb_cudart_sym(void *h, const char *name)
     return p;
 }
 
+/* F-ABI1 hardening: CUDA major version (12, 13, ...) reported by the
+ * libcudart behind `h`, via cudaRuntimeGetVersion (e.g. 12080 -> 12,
+ * 13000 -> 13). Returns 0 on any resolution/call failure so callers treat
+ * "unknown" as "cannot rule out a mismatch, but also cannot prove one". */
+static int gb_cudart_major_from_handle(void *h)
+{
+    if (!h) return 0;
+    typedef cudaError_t (*pfn_cudaRuntimeGetVersion)(int *);
+    pfn_cudaRuntimeGetVersion fn =
+        (pfn_cudaRuntimeGetVersion)gb_cudart_sym(h, "cudaRuntimeGetVersion");
+    if (!fn) return 0;
+    int v = 0;
+    if (fn(&v) != 0 /* cudaSuccess */ || v <= 0) return 0;
+    return v / 1000;
+}
+
 static void gb_cudart_resolve_syms(void *libcudart)
 {
     real_cudaMalloc           = (pfn_cudaMalloc)           gb_cudart_sym(libcudart, "cudaMalloc");
@@ -4303,13 +4355,6 @@ static void gb_cudart_rebind(void)
         pthread_mutex_unlock(&rebind_mu);
         return;
     }
-    if (g_cudart_override) {
-        /* Explicit GREENBOOST_CUDART_PATH always wins - no auto-rebind. */
-        atomic_store_explicit(&g_cudart_rebound, 1, memory_order_release);
-        pthread_mutex_unlock(&rebind_mu);
-        return;
-    }
-
     /* A cudart hook is executing, so the caller's libcudart is mapped NOW.
      * Pick the first libcudart in maps that is not the one init loaded.
      *
@@ -4351,10 +4396,44 @@ static void gb_cudart_rebind(void)
          * the app resolves its own symbols; we only need function pointers. */
         void *h = dlopen(found, RTLD_NOW | RTLD_LOCAL);
         if (h) {
-            gb_cudart_resolve_syms(h);
-            atomic_store_explicit(&g_cudart_is_app, 1, memory_order_release);
-            gb_log("cudart rebind -> %s (init fallback was %s)",
-                   found, g_cudart_init_path[0] ? g_cudart_init_path : "none");
+            if (g_cudart_override) {
+                /* F-ABI1 hardening: an explicit GREENBOOST_CUDART_PATH is
+                 * normally left alone (it's the caller's escape hatch for a
+                 * non-standard install), but verify it actually matches what
+                 * the app mapped before trusting it — a mismatched major
+                 * (e.g. cu13 override vs a cu128-linked PyTorch process)
+                 * corrupts cudaDeviceProp reads (layout shifted in CUDA
+                 * 13.0) and previously produced a SIGFPE in PyTorch's CUDA
+                 * RNG grid-size division / cutlassF "no kernel found to
+                 * launch" (2026-07-14 incident). Only override the override
+                 * when the mismatch is provable (both versions resolved and
+                 * differ) — an unresolved version on either side is not
+                 * evidence of a problem, so the escape hatch still wins. */
+                int app_major = gb_cudart_major_from_handle(h);
+                if (app_major && g_cudart_override_major &&
+                        app_major != g_cudart_override_major) {
+                    fprintf(stderr,
+                        "[GreenBoost] WARNING: GREENBOOST_CUDART_PATH is CUDA %d "
+                        "but the app mapped a CUDA %d libcudart (%s) - the "
+                        "override's ABI does not match what this process "
+                        "actually links (cudaDeviceProp layout changed in "
+                        "CUDA 13.0). Rebinding onto the app's own libcudart "
+                        "instead of the mismatched override.\n",
+                        g_cudart_override_major, app_major, found);
+                    gb_cudart_resolve_syms(h);
+                    atomic_store_explicit(&g_cudart_is_app, 1, memory_order_release);
+                    gb_log("cudart rebind (override mismatch cu%d vs cu%d) -> %s",
+                           g_cudart_override_major, app_major, found);
+                }
+                /* else: versions agree (or are unresolvable) - keep the
+                 * override's already-resolved pointers, unchanged from the
+                 * pre-hardening behaviour. */
+            } else {
+                gb_cudart_resolve_syms(h);
+                atomic_store_explicit(&g_cudart_is_app, 1, memory_order_release);
+                gb_log("cudart rebind -> %s (init fallback was %s)",
+                       found, g_cudart_init_path[0] ? g_cudart_init_path : "none");
+            }
         }
     }
     /* Latch so the hot hooks (cudaLaunchKernel) never re-scan maps. When the
@@ -4719,8 +4798,10 @@ static void gb_shim_init(void)
             if (!libcudart)
                 fprintf(stderr, "[GreenBoost] WARNING: GREENBOOST_CUDART_PATH=%s failed: %s\n",
                         cudart_override, dlerror());
-            else
-                g_cudart_override = 1;  /* F-ABI1: explicit path - no auto-rebind */
+            else {
+                g_cudart_override = 1;  /* F-ABI1: explicit path - validated in gb_cudart_rebind */
+                g_cudart_override_major = gb_cudart_major_from_handle(libcudart);
+            }
         }
 
         if (!libcudart) {
@@ -5127,13 +5208,22 @@ static void gb_shim_init(void)
             if (gpu_count > 1) {
                 gb_nvlink_aggregated_bytes =
                     (gb_physical_vram_bytes / (size_t)gpu_count) * (size_t)(gpu_count - 1);
+                gb_log("NVLink pooling active: gpu_count=%d aggregated VRAM +%zu MB",
+                       gpu_count, gb_nvlink_aggregated_bytes >> 20);
             } else {
-                /* Fallback: assume 8-GPU node (original V100 cluster topology) */
-                gb_nvlink_aggregated_bytes = (gb_physical_vram_bytes >> 3) * 7;
+                /* DI-11 (owner rule 2026-07-13): gpu_count_per_node unknown
+                 * (older module build without the sysfs attribute, or a
+                 * genuinely single-GPU node) - do NOT guess an 8-GPU
+                 * topology (the historical V100-cluster assumption). Skip
+                 * aggregation entirely; a real per-node GPU count is the
+                 * only thing that can size this correctly, and reporting a
+                 * phantom aggregated VRAM pool on a 1-4 GPU node would
+                 * violate the same "never inherit a reference box's
+                 * numbers" rule as any other hardcoded hardware value. */
+                gb_nvlink_aggregated_bytes = 0;
+                gb_log("NVLink ready but gpu_count_per_node unknown/<=1 - "
+                       "skipping aggregation (no topology guess)");
             }
-            gb_log("NVLink pooling active: gpu_count=%d aggregated VRAM +%zu MB",
-                   gpu_count > 1 ? gpu_count : 8,
-                   gb_nvlink_aggregated_bytes >> 20);
         }
     }
 
@@ -6288,10 +6378,25 @@ static CUresult gb_overflow_alloc_ex(CUdeviceptr *dptr, size_t bytesize)
          * until free) but bounded by the actual T2 cap, which has its
          * own atomic reservation (PR-F/H3). */
         {
+            /* Owner rule 2026-07-13 (no host-shaped literal): default derived
+             * as a % of THIS node's RAM instead of a flat 6 GB literal — see
+             * gb_host_ram_floor_bytes() above for the same pattern. */
+#define GB_HOST_RAM_SAFETY_PCT_DEFAULT  10ULL
+#define GB_HOST_RAM_SAFETY_FLOOR_MB     1536L
             static long gb_host_ram_safety_mb = -1;
             if (__builtin_expect(gb_host_ram_safety_mb < 0, 0)) {
                 const char *s = getenv("GREENBOOST_HOST_RAM_SAFETY_MB");
-                gb_host_ram_safety_mb = s ? (long)gb_atoll(s) : 6144;
+                if (s) {
+                    gb_host_ram_safety_mb = (long)gb_atoll(s);
+                } else {
+                    size_t ram = gb_host_ram_bytes();
+                    gb_host_ram_safety_mb = ram
+                        ? (long)((unsigned long long)(ram >> 20)
+                                 * GB_HOST_RAM_SAFETY_PCT_DEFAULT / 100ULL)
+                        : GB_HOST_RAM_SAFETY_FLOOR_MB;
+                    if (gb_host_ram_safety_mb < GB_HOST_RAM_SAFETY_FLOOR_MB)
+                        gb_host_ram_safety_mb = GB_HOST_RAM_SAFETY_FLOOR_MB;
+                }
             }
             long avail_mb = 0;
             FILE *f = fopen("/proc/meminfo", "r");
@@ -6676,20 +6781,34 @@ path_b_hostreg:
 /*  gb_overflow_alloc wrapper                                           */
 /* ------------------------------------------------------------------ */
 /* Host RAM floor — local T2 must NEVER drive the machine into memory
- * pressure: with e.g. 64 GB total, GreenBoost may consume DDR only while
- * MemAvailable stays above the floor (default 9 GB ≈ "cap total use at
- * ~55 GB", counting every other process too since MemAvailable already
+ * pressure: GreenBoost may consume DDR only while MemAvailable stays above
+ * this floor (counting every other process too, since MemAvailable already
  * reflects them).  When an allocation would cross the floor, local T2 is
  * refused and smart_alloc cascades to feeder T2/T3 — protecting the host
- * AND putting the feeder's DDR to work.  Override: GREENBOOST_HOST_RAM_FLOOR_MB. */
+ * AND putting the feeder's DDR to work.
+ *
+ * Owner rule 2026-07-13 (no host-shaped literal): default derived as a % of
+ * THIS node's RAM (gb_host_ram_bytes()) rather than a flat 9 GB literal that
+ * a 16 GB box can't spare and a 256 GB box wastes — mirrors
+ * GB_POOL_PREREG_PCT/_FLOOR_BYTES above.  Override: GREENBOOST_HOST_RAM_FLOOR_MB
+ * (explicit absolute MB, unaffected by node RAM). */
+#define GB_HOST_RAM_FLOOR_PCT_DEFAULT   15ULL
+#define GB_HOST_RAM_FLOOR_FLOOR_BYTES   (2ULL * 1024ULL * 1024ULL * 1024ULL)
 static size_t gb_host_ram_floor_bytes(void)
 {
     static size_t floor_b = (size_t)-1;
     if (floor_b == (size_t)-1) {
-        long mb = 9216;
         const char *e = getenv("GREENBOOST_HOST_RAM_FLOOR_MB");
-        if (e && atol(e) >= 0) mb = atol(e);
-        floor_b = (size_t)mb << 20;
+        if (e && atol(e) >= 0) {
+            floor_b = (size_t)atol(e) << 20;
+        } else {
+            size_t ram = gb_host_ram_bytes();
+            floor_b = ram ? (size_t)((unsigned long long)ram
+                                     * GB_HOST_RAM_FLOOR_PCT_DEFAULT / 100ULL)
+                          : GB_HOST_RAM_FLOOR_FLOOR_BYTES;
+            if (floor_b < GB_HOST_RAM_FLOOR_FLOOR_BYTES)
+                floor_b = GB_HOST_RAM_FLOOR_FLOOR_BYTES;
+        }
     }
     return floor_b;
 }
@@ -8612,12 +8731,50 @@ CUresult cuMemGetInfo_v2(size_t *free_out, size_t *total_out)
         }
     }
 
+    /* GREENBOOST_REPORT_PHYSICAL_VRAM=1 (diffusion/PyTorch workloads, see
+     * cuDeviceTotalMem_v2 above): report REAL free/total, no pool inflation,
+     * and — real bug found + fixed 2026-07-14 — NO workstation reserve
+     * either. This flag is an explicit ground-truth request from a
+     * controlled, GreenBoost-integrated inference worker (gb_quant callers),
+     * not an uncontrolled desktop client the reserve exists to protect
+     * against; subtracting the reserve here directly contradicted the
+     * flag's own "report REAL free" contract and caused a real, reproduced
+     * CUDA OOM (Stable Audio Open's VAE decode, near_lossless AND fp8
+     * gb_quant modes both — the reserve, not the model's own footprint, was
+     * the actual constraint: nvidia-smi confirmed ~5-7 GB genuinely free on
+     * hardware at the exact failure moment while this function reported
+     * only ~3.6-4.8 GB). The reserve's own purpose (protect desktop
+     * responsiveness from a runaway shimless client) doesn't apply to a
+     * caller that explicitly asked for ground truth.
+     * Without the T2/T3-inflation-skip half of this branch, PyTorch's
+     * caching allocator (which sizes every allocation and formats OOM
+     * errors off cudaMemGetInfo/cuMemGetInfo, NOT cudaGetDeviceProperties/
+     * cuDeviceTotalMem_v2) still saw the inflated total_virtual = real_total
+     * + gb_virtual_vram_bytes + cluster_remote figure even when the caller
+     * had disabled inflation everywhere else — confirmed 2026-07-09: a
+     * feeder torch process reported "total capacity of 129.53 GiB" (an
+     * 8 GiB card + full cluster pool) from THIS function while
+     * cuDeviceTotalMem_v2 correctly reported the physical figure, so
+     * gb-quant/bf16 sizing decisions OOM'd against a capacity that was never
+     * really there. */
+    if (g_report_physical_vram) {
+        if (free_out)  *free_out  = real_free;
+        if (total_out) *total_out = real_total;
+        gb_log("cuMemGetInfo_v2: reporting physical free=%zuMB total=%zuMB "
+               "(inflation AND workstation reserve both disabled by "
+               "GREENBOOST_REPORT_PHYSICAL_VRAM=1)",
+               real_free >> 20, real_total >> 20);
+        return CUDA_SUCCESS;
+    }
+
     /* Workstation GPU headroom: subtract from physical VRAM free so --fit
      * leaves that much GPU memory for the desktop, compositor, and other
      * GPU-using processes.  When gaming_mode=1 (Proton wrapper active)
      * double the reserve so games can take VRAM back without inference
      * preempting them.  T2/T3 and remote memory are NOT reduced — they are
-     * DDR/NVMe and do not affect GPU rendering. */
+     * DDR/NVMe and do not affect GPU rendering.  Only applied on THIS path
+     * (T2/T3-inflated reporting, no explicit ground-truth request) — see the
+     * GREENBOOST_REPORT_PHYSICAL_VRAM branch above for why that path skips it. */
     size_t _ws_applied = gb_effective_workstation_reserve_bytes(real_free, real_total);
     {
         size_t ws = _ws_applied;
@@ -8634,27 +8791,6 @@ CUresult cuMemGetInfo_v2(size_t *free_out, size_t *total_out)
         _ws_applied = ws;
         if (real_free > ws) real_free -= ws;
         else                real_free  = 0;
-    }
-
-    /* GREENBOOST_REPORT_PHYSICAL_VRAM=1 (diffusion/PyTorch workloads, see
-     * cuDeviceTotalMem_v2 above): report REAL free/total, no pool inflation.
-     * Without this branch, PyTorch's caching allocator (which sizes every
-     * allocation and formats OOM errors off cudaMemGetInfo/cuMemGetInfo, NOT
-     * cudaGetDeviceProperties/cuDeviceTotalMem_v2) still saw the inflated
-     * total_virtual = real_total + gb_virtual_vram_bytes + cluster_remote
-     * figure even when the caller had disabled inflation everywhere else —
-     * confirmed 2026-07-09: a feeder torch process reported "total capacity
-     * of 129.53 GiB" (an 8 GiB card + full cluster pool) from THIS function
-     * while cuDeviceTotalMem_v2 correctly reported the physical figure, so
-     * gb-quant/bf16 sizing decisions OOM'd against a capacity that was never
-     * really there. */
-    if (g_report_physical_vram) {
-        if (free_out)  *free_out  = real_free;
-        if (total_out) *total_out = real_total;
-        gb_log("cuMemGetInfo_v2: reporting physical free=%zuMB total=%zuMB "
-               "(inflation disabled by GREENBOOST_REPORT_PHYSICAL_VRAM=1)",
-               real_free >> 20, real_total >> 20);
-        return CUDA_SUCCESS;
     }
 
     if (free_out)  *free_out  = real_free  + t2_free + remote_free;
