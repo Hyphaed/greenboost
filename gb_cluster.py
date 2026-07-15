@@ -1263,7 +1263,14 @@ def _host_metrics_dict(m) -> dict:
     }
     if gb is not None:
         out["t2_free_mb"] = gb.t2_available_mb
-        out["t2_total_mb"] = gb.t2_allocated_mb + gb.t2_available_mb
+        # t2_max_mb is the kernel's fixed pool ceiling (GB_IOCTL_GET_INFO's
+        # max_pool_mb, straight from greenboost.ko) — allocated+available
+        # drifts with live host memory pressure (available_mb tracks real
+        # free RAM against the safety reserve, not a static ceiling), which
+        # made this "total" bounce between calls (5000 MB vs the ioctl's
+        # 43008 MB moments apart, live bug found 2026-07-15 investigating
+        # a `greenboost cluster` host T2 readout the owner flagged as wrong).
+        out["t2_total_mb"] = gb.t2_max_mb
         out["t3_free_mb"] = gb.t3_free_mb
         out["t3_total_mb"] = gb.t3_used_mb + gb.t3_free_mb
     return out

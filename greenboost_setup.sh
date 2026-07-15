@@ -4653,13 +4653,18 @@ cmd_register_mcp() {
     return 0
 }
 
-# _gb_ensure_ollama , install ollama on the host during Full Install if missing,
-# or update it if a newer release exists. Feeders then match it via
-# `greenboost feeders sync-ollama` (kernel-name parity is what lets feeder-GPU
-# compute resolve host-dispatched kernels). Best-effort: logs progress, never
-# aborts the install. Set GB_SKIP_OLLAMA_UPDATE=1 to skip entirely.
+# _gb_ensure_ollama , OPT-IN ONLY (owner rule, 2026-07-15: gb-synapse is THE
+# Ollama replacement , GreenBoost must not install/depend on Ollama by
+# default anymore). Historically this ran unconditionally on every Full
+# Install to keep the host's Ollama current for feeder kernel-name parity;
+# that parity now comes from a matched gb-synapse engine build instead (see
+# cmd_feeders_sync_synapse + greenboost_netd.c's gb_kernel_lib(), repointed
+# off Ollama the same day). Ollama is no longer installed or auto-updated
+# unless GB_INSTALL_OLLAMA=1 is set , the one remaining reason to want it is
+# ai-forge's VLM critic fallback (forge/vlm_critic.py), which stays on Ollama
+# only until an HF-native vision GGUF+mmproj replaces it in gb-synapse.
 _gb_ensure_ollama() {
-    [[ "${GB_SKIP_OLLAMA_UPDATE:-0}" == "1" ]] && { gb_info "ollama update skipped (GB_SKIP_OLLAMA_UPDATE=1)"; return 0; }
+    [[ "${GB_INSTALL_OLLAMA:-0}" != "1" ]] && { gb_info "ollama install/update skipped (opt-in only , set GB_INSTALL_OLLAMA=1 if you specifically need it)"; return 0; }
     command -v curl &>/dev/null || { gb_warn "curl not found , skipping ollama update"; return 0; }
 
     local _before; _before=$(ollama --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
@@ -5146,6 +5151,16 @@ WRAPEOF
     # Repair existing cluster.key permissions on upgrade.
     [[ -f "$GB_CLUSTER_KEY" ]] && _gb_set_keyfile_perms "$GB_CLUSTER_KEY"
 
+    # gb-synapse's personal HF token store (gb_synapse.py's CONFIG_DIR /
+    # HF_TOKEN_FILE, written by `login()`) , owned by the invoking user, NOT
+    # root, since it's a personal secret (gb_synapse.py's own login()
+    # docstring: 0600, chown not chmod is the fix for a root-run leftover).
+    # Pre-create it here so a fresh Full Install never needs the manual
+    # `sudo mkdir + chown` dance gb_synapse.login() otherwise has to error out
+    # and ask for (real incident, 2026-07-15).
+    mkdir -p /etc/greenboost/synapse
+    chown -R "${SUDO_USER:-$(id -un)}" /etc/greenboost/synapse
+
     # Write build_info stamp (readable by 'greenboost build')
     mkdir -p /etc/greenboost
     local _git_hash
@@ -5168,10 +5183,10 @@ WRAPEOF
     # reinstall) never ran , module left unloaded, supervisor left dead.
     _gb_install_ebpf_tracer || gb_warn "eBPF tracer install failed , continuing"
 
-    # Ensure ollama is present + current so the host runs a known LLM backend
-    # version that feeders can match (kernel-name parity for feeder-GPU
-    # compute).  Best-effort; never fails the install.  Skip with
-    # GB_SKIP_OLLAMA_UPDATE=1.
+    # Opt-in only , gb-synapse is THE Ollama replacement (owner rule,
+    # 2026-07-15). Set GB_INSTALL_OLLAMA=1 if you specifically need Ollama
+    # (e.g. ai-forge's VLM critic fallback, until an HF vision GGUF replaces
+    # it in gb-synapse); Full Install no longer installs/updates it by default.
     _gb_ensure_ollama || gb_warn "ollama install/update check failed , continuing"
 
     # Register GreenBoost MCP servers with the Claude CLI (per-user) so an LLM
@@ -6714,14 +6729,25 @@ _gb_proc_is_protected() {
     # Protected categories (comments kept outside the pattern list because bash
     # forbids comments between '\'-continued case patterns):
     #   GNOME/desktop shell + session, display managers, X/Wayland, KDE,
-    #   init/session/bus/audio daemons, NVIDIA + GreenBoost daemons.
+    #   init/session/bus/audio daemons, NVIDIA + GreenBoost daemons,
+    #   virtualization/hypervisor GPU-acceleration processes (real incident,
+    #   2026-07-15: VMware's mksSandbox — the guest's 3D-acceleration/SVGA
+    #   process — legitimately holds >512MB in nvidia-smi's compute-apps list
+    #   despite doing zero AI inference, so the blunt ">=kill_min_mb CUDA
+    #   process" heuristic in cmd_clear_memory_pool killed it outright; same
+    #   risk applies to VirtualBox/QEMU GPU passthrough, so all three are
+    #   covered here rather than patching VMware alone).
     case "$1" in
         gnome-shell|gnome-shell-*|gnome-session*|gnome-control-*|gnome-software*|gnome-keyring*|mutter|gjs|tracker-*|\
         gdm|gdm-*|Xorg|Xorg.bin|Xwayland|Xwayland*|X|\
         kwin|kwin_*|plasmashell|kded*|ksmserver|sddm|sddm-*|lightdm|\
         systemd|systemd-*|init|dbus-daemon|dbus-broker|elogind|seatd|\
         pipewire|pipewire-*|wireplumber|pulseaudio|\
-        nvidia-persiste*|nvidia-*|greenboost*|greenboost-netd)
+        nvidia-persiste*|nvidia-*|greenboost*|greenboost-netd|\
+        mksSandbox|vmware-vmx|vmware-vmx-debug|vmware-vmx-stats|vmnet-natd|\
+        vmware-usbarbitrator*|vmtoolsd|vmware-hostd|\
+        VBoxSVC|VBoxHeadless|VBoxSDL|VirtualBoxVM|VBoxXPCOMIPCD|\
+        qemu-system-*|qemu-kvm)
             return 0 ;;
     esac
     return 1
@@ -9026,22 +9052,26 @@ _gb_connect_check_parity() {
         gb_ok "GreenBoost build parity OK (${_local_git:-$_local_id})."
     fi
 
-    # ollama version parity , the feeder's native libggml-cuda.so must expose
-    # the SAME CUDA kernels the host dispatches, which requires the SAME ollama
-    # build.  A skew (seen: host 0.30.8 vs feeder 0.21.1) is why remote kernel
-    # names don't resolve → LLM feeder-GPU compute can't run.
-    local _host_oll; _host_oll=$(_gb_host_ollama_version)
-    if [[ -n "$_host_oll" ]]; then
-        local _feeder_oll
-        _feeder_oll=$("${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 \
+    # gb-synapse engine parity , the feeder's native libggml-cuda.so must expose
+    # the SAME CUDA kernels the host dispatches, which requires the SAME engine
+    # build (owner rule, 2026-07-15: replaces the old ollama-version parity
+    # check , gb-synapse is THE Ollama replacement). A skew is why remote
+    # kernel names don't resolve → LLM feeder-GPU compute can't run.
+    local _host_syn; _host_syn=$(cat /usr/local/lib/greenboost/synapse/engine.version 2>/dev/null)
+    if [[ -n "$_host_syn" ]]; then
+        local _feeder_syn
+        _feeder_syn=$("${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 \
             -o StrictHostKeyChecking=no "${ssh_user}@${ip}" \
-            "ollama --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1" 2>/dev/null)
-        if [[ "$_feeder_oll" != "$_host_oll" ]]; then
-            gb_warn "ollama version mismatch , host ${_host_oll} vs feeder ${_feeder_oll:-none}."
-            gb_warn "  LLM feeder-GPU compute needs matching ollama (kernel-name parity)."
-            gb_info  "  Align now:  sudo greenboost feeders sync-ollama"
+            "cat /usr/local/lib/greenboost/synapse/engine.version 2>/dev/null" 2>/dev/null)
+        # git describe abbreviates to the shortest unique prefix at build time,
+        # so host/feeder builds of the SAME commit can differ in length , a
+        # prefix match (either direction) is parity, not just string equality.
+        if [[ -z "$_feeder_syn" || ( "$_host_syn" != "$_feeder_syn"* && "$_feeder_syn" != "$_host_syn"* ) ]]; then
+            gb_warn "gb-synapse engine mismatch , host ${_host_syn} vs feeder ${_feeder_syn:-none}."
+            gb_warn "  LLM feeder-GPU compute needs a matching engine build (kernel-name parity)."
+            gb_info  "  Align now:  sudo greenboost feeders sync-synapse"
         else
-            gb_ok "ollama parity OK (${_host_oll}) , LLM feeder-GPU compute eligible."
+            gb_ok "gb-synapse engine parity OK (${_host_syn}) , LLM feeder-GPU compute eligible."
         fi
     fi
 }
@@ -9243,14 +9273,17 @@ cmd_update_feeders() {
     fi
 
     # `greenboost update feeders` is THE canonical command to bring every
-    # feeder into parity with the host: (1) match ollama version so the
-    # feeder's native ggml has the host's kernels, then (2) rebuild + install
-    # GreenBoost (netd + interposer) ON each feeder from source (feeder CPU
-    # differs from host , Intel vs AMD , so binaries are never copied).
+    # feeder into parity with the host: (1) match the gb-synapse engine build
+    # so the feeder's native ggml has the host's kernels, then (2) rebuild +
+    # install GreenBoost (netd + interposer) ON each feeder from source
+    # (feeder CPU differs from host , Intel vs AMD , so binaries are never
+    # copied). Step 1 used to sync ollama instead (owner rule, 2026-07-15:
+    # gb-synapse is THE Ollama replacement , kernel dispatch parity now comes
+    # from a matched gb-synapse build, see cmd_feeders_sync_synapse).
     gb_section "Update feeders (match host)"
 
-    gb_info "Step 1/2 , matching ollama version…"
-    cmd_feeders_sync_ollama || gb_warn "ollama sync had failures (see above) , continuing to GreenBoost build"
+    gb_info "Step 1/2 , matching gb-synapse engine…"
+    cmd_feeders_sync_synapse || gb_warn "gb-synapse engine sync had failures (see above) , continuing to GreenBoost build"
 
     gb_info "Step 2/2 , building GreenBoost on each feeder from source…"
     _gb_feeders_upgrade_from_source
@@ -9523,9 +9556,75 @@ cmd_stability_monitor() {
 # Restarts greenboost-netd on each feeder after install.
 # Usage: sudo greenboost update feeders
 # _gb_host_ollama_version , the host's ollama version string (x.y.z) or "".
+# Kept only for `feeders sync-ollama`'s legacy/manual fallback , the update-feeders
+# flow itself no longer calls this (see cmd_feeders_sync_synapse below).
 _gb_host_ollama_version() {
     command -v ollama &>/dev/null || return 0
     ollama --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
+}
+
+# cmd_feeders_sync_synapse , bring every feeder's gb-synapse ENGINE (llama.cpp
+# build: llama-server/rpc-server/libggml-cuda.so) to parity with the host's.
+# Replaces cmd_feeders_sync_ollama as the update-feeders Step 1 (owner rule,
+# 2026-07-15: gb-synapse is THE Ollama replacement , kernel dispatch parity
+# between --rpc peers now depends on a matched gb-synapse build, not a matched
+# ollama version; see greenboost_netd.c's gb_kernel_lib()/ollama_libs preload,
+# repointed to /usr/local/lib/greenboost/synapse/libggml-cuda.so the same day).
+# Usage: sudo greenboost feeders sync-synapse
+cmd_feeders_sync_synapse() {
+    need_root "feeders sync-synapse"
+    [[ -f "$GB_CLUSTER_CONF" ]] || die "No feeders configured - run: sudo greenboost connect <IP>"
+    local _hostver
+    _hostver=$(cat /usr/local/lib/greenboost/synapse/engine.version 2>/dev/null)
+    [[ -z "$_hostver" ]] && die "Cannot determine host gb-synapse engine version , run: greenboost synapse build-engine"
+
+    gb_section "Sync gb-synapse engine to feeders  (host version: ${_hostver})"
+    local _ssh_as=()
+    [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]] && _ssh_as=(runuser -u "$SUDO_USER" --)
+
+    local _ok=0 _fail=0
+    while IFS= read -r _line; do
+        [[ -z "$_line" || "$_line" == \#* ]] && continue
+        local _ip _user
+        _ip=$(echo "$_line" | awk '{print $1}'); _ip="${_ip%%:*}"
+        _user=$(echo "$_line" | awk '{print $3}'); _user="${_user:-root}"
+        printf "\n  ${C_VIOLET}%-22s${C_RESET} %s@%s\n" "$(echo "$_line" | awk '{print $2}')" "$_user" "$_ip"
+
+        local _fver
+        _fver=$("${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+            "${_user}@${_ip}" "cat /usr/local/lib/greenboost/synapse/engine.version 2>/dev/null" 2>/dev/null)
+        # git describe abbreviates to the shortest unique prefix at build time,
+        # so host/feeder builds of the SAME commit can differ in length , a
+        # prefix match (either direction) is parity, not just string equality.
+        if [[ -n "$_fver" && ( "$_hostver" == "$_fver"* || "$_fver" == "$_hostver"* ) ]]; then
+            gb_ok "  Already at ${_fver} (matches host ${_hostver}) , no change."
+            _ok=$((_ok+1)); continue
+        fi
+        gb_info "  Feeder has ${_fver:-none} → rebuilding to ${_hostver} (streaming build output)…"
+        if ! "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+                "${_user}@${_ip}" "sudo -n bash -c true" 2>/dev/null; then
+            gb_warn "  No passwordless sudo , run: sudo greenboost feeders setup-sudo"
+            _fail=$((_fail+1)); continue
+        fi
+        local _rc=0
+        "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=1800 -o StrictHostKeyChecking=no \
+            "${_user}@${_ip}" \
+            "sudo -n python3 -c \"import sys; sys.path.insert(0, '/usr/local/lib/greenboost'); import gb_synapse; print(gb_synapse.update_engine())\"" \
+            2>&1 | sed 's/^/    /' || _rc=$?
+        local _newver
+        _newver=$("${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+            "${_user}@${_ip}" "cat /usr/local/lib/greenboost/synapse/engine.version 2>/dev/null" 2>/dev/null)
+        if [[ -n "$_newver" && ( "$_hostver" == "$_newver"* || "$_newver" == "$_hostver"* ) ]]; then
+            gb_ok "  Feeder now at ${_newver}."
+            _ok=$((_ok+1))
+        else
+            gb_warn "  Build did not reach ${_hostver} (feeder reports ${_newver:-none}, rc=${_rc})"
+            _fail=$((_fail+1))
+        fi
+    done < "$GB_CLUSTER_CONF"
+    echo ""
+    gb_info "gb-synapse engine sync: ${_ok} ok, ${_fail} failed"
+    (( _fail == 0 ))
 }
 
 # cmd_feeders_sync_ollama , install the HOST's exact ollama version on every
@@ -12570,15 +12669,16 @@ case "$COMMAND" in
     update-feeders)      cmd_update_feeders     ;;
     feeders)
         case "${2:-}" in
-            upgrade-greenboost) die "Use: sudo greenboost update feeders  (matches ollama + rebuilds GreenBoost on each feeder)" ;;
+            upgrade-greenboost) die "Use: sudo greenboost update feeders  (matches gb-synapse engine + rebuilds GreenBoost on each feeder)" ;;
             setup-sudo)         cmd_feeders_setup_sudo ;;
             diag)               cmd_feeders_diag "${3:-all}" ;;
             export-key)         cmd_feeders_export_key ;;
             import-key)         cmd_feeders_import_key "${3:-}" ;;
             genkey)             cmd_feeders_genkey ;;
             redeploy-netd)      cmd_feeders_redeploy_netd ;;
-            sync-ollama)        cmd_feeders_sync_ollama ;;
-            *) die "Usage: greenboost feeders [setup-sudo|diag|export-key|import-key|genkey|redeploy-netd|sync-ollama]  (to update feeders: sudo greenboost update feeders)" ;;
+            sync-synapse)       cmd_feeders_sync_synapse ;;
+            sync-ollama)        gb_warn_ui "'greenboost feeders sync-ollama' is deprecated , gb-synapse is THE Ollama replacement, use: sudo greenboost feeders sync-synapse"; cmd_feeders_sync_ollama ;;
+            *) die "Usage: greenboost feeders [setup-sudo|diag|export-key|import-key|genkey|redeploy-netd|sync-synapse]  (to update feeders: sudo greenboost update feeders)" ;;
         esac
         ;;
     built-stamp)         cmd_built_stamp "${@:2}" ;;

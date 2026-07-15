@@ -451,7 +451,20 @@ def _ollama_unload_models(ollama_url: str) -> bool:
         if not name:
             continue
         try:
-            payload = json.dumps({"name": name, "keep_alive": 0}).encode()
+            # Real bug, 2026-07-14: ollama's /api/generate model-selector
+            # field is "model", not "name" , the previous payload sent
+            # {"name": ..., "keep_alive": 0}, which ollama parses as an
+            # empty model ("" , the field it actually looks for is absent)
+            # and returns 404 "model '' not found" every single time. Since
+            # urlopen raises HTTPError on that 404, `unloaded` was correctly
+            # never incremented and this function correctly reported
+            # failure , but that means the graceful reclaim path has NEVER
+            # actually unloaded a model, on any machine, since this was
+            # written: every DEEP_IDLE-triggered reclaim silently fell
+            # through to whatever AGGRESSIVE_RECLAIM/no-op branch follows
+            # instead of the intended graceful unload. Confirmed via a
+            # direct manual repro of the exact request this function builds.
+            payload = json.dumps({"model": name, "keep_alive": 0}).encode()
             req = urllib.request.Request(
                 f"{ollama_url}/api/generate",
                 data=payload,
