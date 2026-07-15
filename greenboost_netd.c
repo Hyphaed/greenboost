@@ -650,9 +650,10 @@ static int probe_gpus(void)
 {
     void *libcudart = NULL;
     const char *cudart_paths[] = {
-        /* Ollama's bundled CUDA 13 first - supports Blackwell cc 12.0 (RTX 5070+) */
-        "/usr/local/lib/ollama/cuda_v13/libcudart.so",
-        /* System CUDA 12+ */
+        /* gb-synapse's engine links the system CUDA runtime directly (verified
+         * 2026-07-15 via ldd on libggml-cuda.so/rpc-server: libcudart.so.12 from
+         * /usr/lib/x86_64-linux-gnu, supports Blackwell cc 12.0 / RTX 5070 fine) ,
+         * no bundled-runtime dependency on Ollama needed anymore. */
         "/usr/local/cuda/lib64/libcudart.so",
         "libcudart.so",
         "libcudart.so.12",
@@ -3317,11 +3318,15 @@ static void *gb_kernel_lib(void)
         g_kernel_lib_tried = 1;
         const char *cands[] = {
             getenv("GB_NETD_KERNEL_LIB"),
+            /* gb-synapse's own engine build (2026-07-15 — replaces the Ollama
+             * bundled build; same libggml-cuda.so kernel container, built from
+             * the same llama.cpp source the host dispatches kernel names from). */
+            "/usr/local/lib/greenboost/synapse/libggml-cuda.so",
             "/usr/local/lib/ollama/cuda_v13/libggml-cuda.so",
             "/usr/local/lib/ollama/libggml-cuda.so",
             NULL
         };
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 4; i++) {
             if (!cands[i]) continue;
             /* libggml-cuda.so has no RUNPATH , Ollama supplies
              * LD_LIBRARY_PATH to its children.  Pre-load libggml-base.so.0
@@ -4742,21 +4747,27 @@ int main(int argc, char *argv[])
     signal(SIGTERM, sig_handler);
     signal(SIGPIPE, SIG_IGN);
 
-    /* Pre-load Ollama's bundled CUDA libraries into the global symbol namespace
-     * so that dlsym(RTLD_DEFAULT, kernel_name) can find Ollama kernels when
-     * the host sends GB_MSG_CUDA_REGISTER_FN + GB_MSG_CUDA_LAUNCH requests. */
+    /* Pre-load gb-synapse's CUDA libraries into the global symbol namespace so
+     * that dlsym(RTLD_DEFAULT, kernel_name) can find kernels when the host
+     * sends GB_MSG_CUDA_REGISTER_FN + GB_MSG_CUDA_LAUNCH requests. gb-synapse's
+     * engine (2026-07-15, replaces the Ollama bundled build) links the system
+     * CUDA 12 runtime directly (verified via ldd , no cuDNN dependency at all,
+     * llama.cpp doesn't use it) , only cublas/cublasLt + its own libggml-cuda.so
+     * need preloading; the Ollama paths stay as a fallback for boxes that
+     * haven't rebuilt the synapse engine yet. */
     {
-        static const char *ollama_libs[] = {
+        static const char *synapse_libs[] = {
+            "/usr/lib/x86_64-linux-gnu/libcublas.so.12",
+            "/usr/lib/x86_64-linux-gnu/libcublasLt.so.12",
+            "/usr/local/lib/greenboost/synapse/libggml-cuda.so",
             "/usr/local/lib/ollama/cuda_v13/libcublas.so",
             "/usr/local/lib/ollama/cuda_v13/libcublasLt.so",
-            "/usr/local/lib/ollama/cuda_v13/libcudnn.so",
-            "/usr/local/lib/ollama/cuda_v13/libcudnn_ops.so",
             "/usr/local/lib/ollama/libggml-cuda.so",
             NULL
         };
-        for (int _i = 0; ollama_libs[_i]; _i++) {
-            if (dlopen(ollama_libs[_i], RTLD_NOW | RTLD_GLOBAL) == NULL)
-                netd_log("INFO: optional lib not found: %s", ollama_libs[_i]);
+        for (int _i = 0; synapse_libs[_i]; _i++) {
+            if (dlopen(synapse_libs[_i], RTLD_NOW | RTLD_GLOBAL) == NULL)
+                netd_log("INFO: optional lib not found: %s", synapse_libs[_i]);
         }
     }
 

@@ -359,6 +359,14 @@ class ModelEntry:
     is_moe: bool = False
     n_experts: int = 0
     n_experts_used: int = 0
+    # dense (attention/shared/embedding) vs routed-expert byte split from
+    # gguf_summary() — real incident, 2026-07-15: gguf_summary() already
+    # returned these two keys but ModelEntry never had matching fields, so
+    # `pull()` crashed with TypeError on every GGUF (not just MoE ones,
+    # since gguf_summary always includes them) the moment it tried to
+    # construct the entry with **meta.
+    dense_bytes: int = 0
+    expert_bytes: int = 0
     ctx_length: int = 0
     # KV-cache geometry from GGUF metadata (0 => unknown, fall back to the
     # param-count bucket heuristic in estimate_kv_gb).
@@ -573,6 +581,29 @@ def _pull_and_convert(repo: str, quant: str, name: str | None) -> ModelEntry:
 # quant filename token too, e.g. "model-BF16.gguf") to avoid ambiguity —
 # FP8/INT8/INT4 are never real GGUF quant tokens (those use QX_K/QX_0 names).
 _GBQUANT_TOKENS = {"FP8", "INT8", "INT4"}
+
+
+def _vllm_venv_dir() -> Path | None:
+    """The managed vLLM venv directory, if the `vllm` binary resolved to one
+    (site-packages sits alongside bin/vllm; a system-PATH vllm has no such
+    venv to search)."""
+    vllm_bin = _find_vllm_bin()
+    if not vllm_bin:
+        return None
+    venv = Path(vllm_bin).resolve().parent.parent
+    return venv if (venv / "lib").is_dir() else None
+
+
+def _find_vllm_venv_lib(rel_glob: str) -> Path | None:
+    """A library bundled inside the vLLM venv's site-packages (e.g. torch's
+    own pinned nvidia-cuXX wheel's libcudart), for shim_env's cudart_path —
+    the shim needs a cudart new enough for whatever torch build vLLM pulled
+    in, not necessarily the system one."""
+    venv = _vllm_venv_dir()
+    if not venv:
+        return None
+    matches = list(venv.glob(f"lib/python*/site-packages/{rel_glob}"))
+    return matches[0] if matches else None
 
 
 def _find_vllm_bin() -> str | None:
@@ -839,10 +870,32 @@ def _field_str(reader, key: str) -> str:
         return ""
 
 
+_GGUF_SUMMARY_CACHE: dict[str, tuple[float, int, dict]] = {}
+
+
 def gguf_summary(path: str) -> dict:
     """Parse layer count, quant type, MoE expert config, context length, and
     total weight bytes from a GGUF file. Reuses the vendored llama.cpp
-    GGUFReader via gb_gguf_tensor_map."""
+    GGUFReader via gb_gguf_tensor_map.
+
+    Cached by (path, mtime, size) — real incident, 2026-07-15: list_models()
+    calls this for EVERY Ollama-sourced GGUF on EVERY call (it's a full
+    tensor-list scan, summing every tensor's n_bytes, not a cheap header
+    peek), and with several 20+ GB models indexed this made gb_synapse_api.py's
+    /api/tags handler block the single-threaded aiohttp event loop for 30+
+    seconds — every OTHER concurrent request (health, chat) queued behind it,
+    looking exactly like a hang. The file only needs re-summarizing when it
+    actually changes."""
+    try:
+        st = os.stat(path)
+        cache_key = (st.st_mtime, st.st_size)
+    except OSError:
+        cache_key = None
+    if cache_key is not None:
+        cached = _GGUF_SUMMARY_CACHE.get(path)
+        if cached is not None and cached[:2] == cache_key:
+            return dict(cached[2])
+
     GGUFReader = _load_gguf_reader()
     reader = GGUFReader(path, mode="r")
     n_bytes = sum(int(t.n_bytes) for t in reader.tensors)
@@ -872,13 +925,16 @@ def gguf_summary(path: str) -> dict:
     weight_types = Counter(t.tensor_type.name for t in reader.tensors if "weight" in t.name)
     if weight_types:
         quant = weight_types.most_common(1)[0][0]
-    return {
+    result = {
         "n_bytes": n_bytes, "n_layers": n_layers, "is_moe": is_moe,
         "n_experts": n_experts, "n_experts_used": n_experts_used,
         "dense_bytes": dense_bytes, "expert_bytes": expert_bytes,
         "ctx_length": ctx_length, "quant": quant, "arch": arch,
         "n_kv_heads": head_count_kv, "head_dim": head_dim,
     }
+    if cache_key is not None:
+        _GGUF_SUMMARY_CACHE[path] = (cache_key[0], cache_key[1], result)
+    return result
 
 
 _ARCH_CACHE: set[str] | None = None
@@ -1904,8 +1960,18 @@ def _serve_vllm(entry: ModelEntry, port: int) -> ServerState:
             f"set GB_SYNAPSE_VLLM_BIN."
         )
     internal_port = port + 1000
-    env = os.environ.copy()
-    env["GREENBOOST_ACTIVE"] = "1"  # gb_init's torch-layer hooks; vLLM never uses the CUDA shim
+    # vLLM is a PyTorch workload — same "torch" shim profile that already
+    # works for other GreenBoost-accelerated torch/diffusion GPU workers
+    # (ai-forge CLAUDE.md RULE #1), giving real T2 (DDR) VRAM extension
+    # WITHOUT CPU compute participation — never vLLM's own --cpu-offload-gb,
+    # which actually runs layers on CPU (real incident, 2026-07-15: the
+    # previous version of this function set GREENBOOST_ACTIVE=1 but never
+    # actually LD_PRELOADed the shim library, so it was a no-op — T2 was
+    # never really active for vLLM despite the flag being set).
+    vllm_cudart = str(_find_vllm_venv_lib("nvidia/cu13/lib/libcudart.so.13")
+                      or _find_vllm_venv_lib("nvidia/cu12/lib/libcudart.so.12") or "")
+    env = gb_cluster.shim_env(workload="torch", enabled=True,
+                              cudart_path=vllm_cudart or None)
     if hf_token():
         env["HF_TOKEN"] = hf_token()
     cuda_home = _cuda_home_for_vllm()
@@ -1917,10 +1983,31 @@ def _serve_vllm(entry: ModelEntry, port: int) -> ServerState:
     # process's VRAM use fluctuating ~1.5 GB tripped this at the library's
     # default 0.9 utilization) — size to LIVE free VRAM with a safety margin,
     # same "never trust a static default" approach as _compute_tensor_split.
+    #
+    # T2 headroom (real incident, 2026-07-15): with the shim active (above),
+    # weights genuinely landed partly in T2 DDR — confirmed via nvidia-smi
+    # showing real VRAM use well under what --gpu-memory-utilization implied
+    # — yet vLLM's OWN "how much room is left for the KV cache" check only
+    # sees bytes against its util*total budget, has no idea some of "its"
+    # allocated memory is T2-backed, and failed with "Available KV cache
+    # memory: -0.75 GiB" even though the load itself succeeded. Since T2
+    # genuinely extends usable capacity now (that's the whole point of the
+    # shim being on), size the effective budget against free VRAM + a safety
+    # fraction of free T2 DDR, not physical VRAM alone.
+    t2_free_mb = 0
+    try:
+        brief = Path("/sys/class/greenboost/greenboost/pool_brief").read_text()
+        m = re.search(r"T2:(\d+)/(\d+)GB", brief)
+        if m:
+            t2_free_mb = (int(m.group(2)) - int(m.group(1))) * 1024
+    except OSError:
+        pass
+
     from gb_nvml import get_nvml
     _, host_free_mb, host_total_mb, _ = get_nvml(0).mem()
     if host_total_mb > 0:
-        util = max(0.3, min(0.85, (host_free_mb * 0.85) / host_total_mb))
+        effective_free_mb = host_free_mb + t2_free_mb * 0.5
+        util = max(0.3, min(0.95, (effective_free_mb * 0.85) / host_total_mb))
     else:
         # pynvml not installed — this env's gb_nvml returns all zeros by
         # design (see its module docstring). Fall back to torch.cuda, same
@@ -1930,7 +2017,7 @@ def _serve_vllm(entry: ModelEntry, port: int) -> ServerState:
         try:
             import torch
             free_b, total_b = torch.cuda.mem_get_info()
-            util = max(0.3, min(0.85, (free_b * 0.85) / total_b))
+            util = max(0.3, min(0.95, ((free_b + t2_free_mb * 0.5 * 1024 ** 2) * 0.85) / total_b))
         except Exception:
             util = 0.85
 
@@ -2234,11 +2321,45 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
     llama_proc = subprocess.Popen(cmd, env=env, stdout=llama_log, stderr=subprocess.STDOUT,
                                    start_new_session=True)
 
-    return _launch_proxy_and_record(entry, llama_proc, port, internal_port,
-                                     tensor_split=tensor_split,
-                                     feeders=[f.ip for f in online_feeders],
-                                     ctx=ctx, kv_type=kv_type, placement=placement,
-                                     mtp=bool(_has_mtp(entry)), vision=bool(mmproj))
+    try:
+        return _launch_proxy_and_record(entry, llama_proc, port, internal_port,
+                                         tensor_split=tensor_split,
+                                         feeders=[f.ip for f in online_feeders],
+                                         ctx=ctx, kv_type=kv_type, placement=placement,
+                                         mtp=bool(_has_mtp(entry)), vision=bool(mmproj))
+    except RuntimeError as e:
+        # Real incident, 2026-07-15: a desktop with many long-running GPU
+        # contexts (browsers, IDEs, chat apps — 13 processes measured, one
+        # box) can fragment VRAM badly enough that a plain cudaMalloc for a
+        # buffer well UNDER the nominally-free byte count still fails —
+        # `budget_gb`/NVML only see aggregate free bytes, not whether a
+        # contiguous block of that size actually exists. The shim (which
+        # would otherwise absorb this via T2 spill) is unusable with
+        # llama.cpp on this build (see shim_note above) — so a raw -ngl 999
+        # fragmentation OOM has no other net. Retry ONCE at whatever layer
+        # count actually fits without a single giant weights allocation, the
+        # same partial-offload path used when the model genuinely doesn't
+        # fit in VRAM — slower, but it starts instead of dying outright.
+        if fits_vram and "out of memory" in str(e).lower():
+            fallback_ngl = _fit_gpu_layers(entry, budget_gb * 0.7, kv_total_gb,
+                                           1 + len(online_feeders))
+            print(f"  [gb-synapse] {entry.name}: all-GPU load hit a VRAM "
+                 f"fragmentation OOM (weights fit the nominal budget but no "
+                 f"contiguous block was actually free) — retrying at "
+                 f"-ngl {fallback_ngl}/{entry.n_layers} (partial GPU offload).",
+                 flush=True)
+            retry_cmd = list(cmd)
+            retry_cmd[retry_cmd.index("-ngl") + 1] = str(fallback_ngl)
+            llama_log = open(_run_log_path(entry.name), "ab")
+            llama_proc = subprocess.Popen(retry_cmd, env=env, stdout=llama_log,
+                                          stderr=subprocess.STDOUT, start_new_session=True)
+            return _launch_proxy_and_record(entry, llama_proc, port, internal_port,
+                                            tensor_split=tensor_split,
+                                            feeders=[f.ip for f in online_feeders],
+                                            ctx=ctx, kv_type=kv_type,
+                                            placement="PARTIAL CPU OFFLOAD (VRAM fragmentation fallback)",
+                                            mtp=bool(_has_mtp(entry)), vision=bool(mmproj))
+        raise
 
 
 def stop(model: str) -> bool:
