@@ -2,15 +2,15 @@
 """gb_synapse_mcp.py — GB-Synapse MCP (server `greenboost-synapse`).
 
 Serving control for GreenBoost's own model server (llama.cpp `--rpc`
-tensor-split across the cluster + the Ollama/OpenAI proxy on :11434) PLUS the
-greenboost-cli bridge, so scripts and LLMs use the whole greenboost-cli logic
-with ease:
+tensor-split across the cluster + the Ollama/OpenAI proxy on the gb-synapse
+port, default 11435, GB_SYNAPSE_PORT) PLUS the greenboost-cli bridge, so
+scripts and LLMs use the whole greenboost-cli logic with ease:
 
   * `cli_run(subcommand, args)`   — allowlisted READ-ONLY headless gb
     subcommands (JSON output via greenboost_cli.cli_headless).
   * `cli_prompt(prompt, model)`   — one-shot `gb -p` prompt; the CLI's
-    inference registry is gb-synapse-only (:11434/v1) and auto-starts it, so
-    this is inference-through-gb-synapse by construction.
+    inference registry is gb-synapse-only (default :11435/v1) and
+    auto-starts it, so this is inference-through-gb-synapse by construction.
 
 Programmatic use from scripts (no MCP needed):
   * `from greenboost_cli.cli_headless import dispatch` — same subcommands, in
@@ -18,8 +18,9 @@ Programmatic use from scripts (no MCP needed):
   * `gb -p "<prompt>"` / `gb <headless-subcommand> --llm` from any shell.
 
 Safety: `synapse_serve` / `synapse_stop` are DRY-RUN unless `confirm=True` —
-:11434 may be serving live consumers (ai-forge pipelines via FORGE_OLLAMA_URL);
-changing what serves there is an owner-visible action, never an implicit one.
+the gb-synapse port may be serving live consumers (ai-forge pipelines via
+FORGE_OLLAMA_URL); changing what serves there is an owner-visible action,
+never an implicit one.
 """
 from __future__ import annotations
 
@@ -50,9 +51,10 @@ def _gb_bin() -> str | None:
 @mcp.tool()
 def synapse_status() -> dict:
     """GB-Synapse status: engine built (llama-server + rpc-server) + version,
-    and whether the server and the :11434 Ollama/OpenAI proxy are running.
-    Canonical owner (shared impl in gb_mcp_common.py — also mirrored on
-    greenboost-orchestrator and greenboost-dataflux)."""
+    and whether the server and the gb-synapse Ollama/OpenAI proxy (default
+    port 11435, GB_SYNAPSE_PORT) are running. Canonical owner (shared impl
+    in gb_mcp_common.py — also mirrored on greenboost-orchestrator and
+    greenboost-dataflux)."""
     import gb_mcp_common
     return gb_mcp_common.synapse_status()
 
@@ -103,7 +105,9 @@ def synapse_recommend(ctx: int = 65536, probe_feeders: bool = True) -> list[dict
 @mcp.tool()
 def synapse_doctor(probe_feeders: bool = True) -> dict:
     """GB-Synapse environment diagnosis: engine, CUDA, cluster rpc reachability,
-    manifest health."""
+    manifest health, plus `torch_engine_ready`/`torch_engine_env` (the
+    synapse torch engine's venv, if installed) and `vllm_available`
+    (legacy backend, still live)."""
     try:
         import gb_synapse
         return gb_synapse.doctor(probe_feeders=probe_feeders)
@@ -114,17 +118,18 @@ def synapse_doctor(probe_feeders: bool = True) -> dict:
 @mcp.tool()
 def synapse_serve(model: str, ctx: int = 65536, use_cluster: bool = True,
                   engine: str = "", confirm: bool = False) -> dict:
-    """Serve a model through gb-synapse (engine backend + :11434 proxy;
-    tensor-split across the cluster when use_cluster and feeders are up for
-    the llama.cpp backend). `engine` ("llama.cpp"/"vllm"/"transformers"/
-    "diffusers") only affects the DRY-RUN preview's backend name — it does
-    NOT override the manifest's own engine for an actual (confirm=True)
-    serve; re-pull with --engine to change that durably.
+    """Serve a model through gb-synapse (engine backend + the gb-synapse
+    proxy, default port 11435, GB_SYNAPSE_PORT; tensor-split across the
+    cluster when use_cluster and feeders are up for the llama.cpp backend).
+    `engine` ("llama.cpp"/"vllm"/"transformers"/"diffusers") only affects the
+    DRY-RUN preview's backend name — it does NOT override the manifest's own
+    engine for an actual (confirm=True) serve; re-pull with --engine to
+    change that durably.
 
     DRY-RUN unless confirm=True: without it, returns the resolved model entry,
     which backend would serve it, and a warning about whatever is currently
-    bound to :11434 — the owner (or an explicitly-authorized flow) decides to
-    displace it."""
+    bound to the gb-synapse port — the owner (or an explicitly-authorized
+    flow) decides to displace it."""
     try:
         import gb_synapse
         from gb_synapse_backends import select_backend
@@ -142,9 +147,9 @@ def synapse_serve(model: str, ctx: int = 65536, use_cluster: bool = True,
             return {"dry_run": True, "would_serve": asdict(entry), "backend": backend_name,
                     "ctx": ctx, "use_cluster": use_cluster,
                     "currently_serving": current,
-                    "warning": ":11434 may have live consumers (ai-forge "
-                               "FORGE_OLLAMA_URL, ollama clients). Pass "
-                               "confirm=True to actually serve."}
+                    "warning": f"the gb-synapse port ({gb_synapse.DEFAULT_PORT}) may "
+                               "have live consumers (ai-forge FORGE_OLLAMA_URL, ollama "
+                               "clients). Pass confirm=True to actually serve."}
         st = gb_synapse.serve(entry.name, ctx=ctx, use_cluster=use_cluster)
         return {"serving": asdict(st)}
     except Exception as e:
@@ -154,7 +159,7 @@ def synapse_serve(model: str, ctx: int = 65536, use_cluster: bool = True,
 @mcp.tool()
 def synapse_stop(model: str, confirm: bool = False) -> dict:
     """Stop a served gb-synapse model. DRY-RUN unless confirm=True (same
-    :11434 protection as synapse_serve)."""
+    gb-synapse-port protection as synapse_serve)."""
     try:
         import gb_synapse
         if not confirm:
@@ -167,7 +172,7 @@ def synapse_stop(model: str, confirm: bool = False) -> dict:
 
 
 @mcp.tool()
-def serve_and_repoint(model: str, port: int = 11434,
+def serve_and_repoint(model: str, port: int = 0,
                       forge_url_target: str | None = None,
                       confirm: bool = False) -> dict:
     """ACTUATE (double-gated): the one-step "prefer gb-synapse" action , serve

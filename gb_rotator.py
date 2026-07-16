@@ -6,15 +6,17 @@ gb_rotator.py — sequential model-rotation runner for overnight autonomy.
 
 A 12+8 GB cluster serves ONE model at a time; multi-model overnight work is
 therefore a rotation, not a scheduler: serve model → run the pipeline that
-consumes it (via the :11434 Ollama-compatible endpoint) → unload → next.
-This module is that rotation, dataflux-recorded end to end so the whole
-night is followable through the dataflux MCP (`dataflux_models`).
+consumes it (via the gb-synapse Ollama-compatible endpoint, default :11435)
+→ unload → next. This module is that rotation, dataflux-recorded end to end
+so the whole night is followable through the dataflux MCP (`dataflux_models`).
 
 Dual serve mode (honest about what's installed):
     gb-synapse engine built  → gb_synapse.serve(model, ctx=..., use_cluster=True)
     engine NOT built         → ask the running ollama to load the model
                                (POST /api/generate {"keep_alive": "10m"})
-Either way the pipeline's `work` command talks to :11434 as usual.
+Either way the pipeline's `work` command talks to the resolved endpoint
+(FORGE_OLLAMA_URL → gb-synapse's own port → raw Ollama's legacy :11434) as
+usual.
 
 Resumable: the queue file records per-job status (pending/done/failed);
 re-running the same queue skips jobs already done. Aborts after 3
@@ -42,8 +44,43 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gb_dataflux  # noqa: E402
 
-OLLAMA_URL = os.environ.get("FORGE_OLLAMA_URL", "http://127.0.0.1:11434")
 MAX_CONSECUTIVE_FAILURES = 3
+
+
+def _candidate_urls() -> list[str]:
+    """Priority order for the Ollama-compatible endpoint this rotation talks
+    to: an explicit FORGE_OLLAMA_URL override, then gb-synapse's own proxy
+    port (GB_SYNAPSE_PORT, default 11435), then raw Ollama's legacy :11434
+    as a last-resort fallback for a box still mid-migration off it."""
+    urls = []
+    env = os.environ.get("FORGE_OLLAMA_URL")
+    if env:
+        urls.append(env.rstrip("/"))
+    try:
+        import gb_synapse
+        port = gb_synapse.DEFAULT_PORT
+    except Exception:
+        port = int(os.environ.get("GB_SYNAPSE_PORT", "11435"))
+    synapse_url = f"http://127.0.0.1:{port}"
+    if synapse_url not in urls:
+        urls.append(synapse_url)
+    if "http://127.0.0.1:11434" not in urls:
+        urls.append("http://127.0.0.1:11434")
+    return urls
+
+
+def _resolve_ollama_url() -> "str | None":
+    """Probe `_candidate_urls()` in priority order, return the first that
+    answers /api/ps. None if nothing is alive. Resolved fresh on every call
+    (never a frozen constant) so a box mid-migration between gb-synapse and
+    raw ollama always talks to whichever is actually up right now."""
+    for url in _candidate_urls():
+        try:
+            with urllib.request.urlopen(f"{url}/api/ps", timeout=5):
+                return url
+        except Exception:
+            continue
+    return None
 
 
 @dataclass
@@ -70,11 +107,7 @@ def _emit(model: str, phase: str, status: str, duration_s: float,
 
 
 def _endpoint_alive() -> bool:
-    try:
-        with urllib.request.urlopen(f"{OLLAMA_URL}/api/ps", timeout=5):
-            return True
-    except Exception:
-        return False
+    return _resolve_ollama_url() is not None
 
 
 def _engine_built() -> bool:
@@ -86,11 +119,13 @@ def _engine_built() -> bool:
 
 
 def _ollama_keep_alive(model: str, keep_alive: str) -> None:
-    """Ask the running ollama to (un)load `model` — empty prompt, no tokens.
-    keep_alive "10m" loads/refreshes; "0" unloads immediately."""
+    """Ask the resolved Ollama-compatible endpoint to (un)load `model` —
+    empty prompt, no tokens. keep_alive "10m" loads/refreshes; "0" unloads
+    immediately."""
+    url = _resolve_ollama_url() or _candidate_urls()[-1]
     body = json.dumps({"model": model, "keep_alive": keep_alive,
                        "stream": False}).encode()
-    req = urllib.request.Request(f"{OLLAMA_URL}/api/generate", data=body,
+    req = urllib.request.Request(f"{url}/api/generate", data=body,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=600) as r:
         r.read()
@@ -116,11 +151,13 @@ def _unload(job: RotationJob, mode: str) -> None:
 
 def _run_job(job: RotationJob) -> bool:
     """serve → work → unload for one job, dataflux event per phase."""
-    # Pre-gate (flux_health style): with :11434 down AND no gb-synapse
-    # engine there is nothing that can serve the model — skip honestly.
+    # Pre-gate (flux_health style): no candidate endpoint alive AND no
+    # gb-synapse engine means there is nothing that can serve the model —
+    # skip honestly.
     if not _dry() and not _endpoint_alive() and not _engine_built():
         _emit(job.model, "gate", "error", 0.0,
-              error=f"{OLLAMA_URL} unreachable and gb-synapse engine not built")
+              error=f"none of {_candidate_urls()} reachable and gb-synapse "
+                    "engine not built")
         return False
 
     mode = "dry"
@@ -201,10 +238,10 @@ _EXAMPLE_QUEUE = {"jobs": [
     # uncensored-1m via GB-Synapse replaces qwen36-coder:studio / qwen35-
     # claude-coder:9b for every agentic/coding roster slot.
     {"model": "satgeze/qwen36-35b-uncensored-1m",
-     "work": "echo 'coder batch here — pipeline consumes :11434'",
+     "work": "echo 'coder batch here — pipeline consumes the gb-synapse port'",
      "timeout_s": 7200, "ctx": 16384, "status": "pending"},
     {"model": "qwen3-vl:30b",
-     "work": "echo 'vision batch here — pipeline consumes :11434'",
+     "work": "echo 'vision batch here — pipeline consumes the gb-synapse port'",
      "timeout_s": 7200, "ctx": 16384, "status": "pending"},
 ]}
 

@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gb-synapse-torch-engine"
+version = "0.0.6.post1"
+description = "GreenBoost's torch-core inference engine (vendored gLLM, see NOTICE)"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "torch==2.9.1",
+    "torchvision==0.24.1",
+    "transformers==5.5.4",
+    "sgl-kernel==0.3.21",
+    "flashinfer-python==0.6.12",
+    "flashinfer-cubin==0.6.12",
+    "fastapi[standard]>=0.115.0",
+    "pydantic>=2.11.7",
+    "openai>=1.99.1",
+    "pyzmq",
+    "aiohttp",
+    "numpy",
+    "tqdm",
+    "einops",
+    "pillow",
+    "av",
+    "datasets",
+    "gptqmodel",
+    "autoawq",
+    "compressed-tensors",
+    # Pinned DOWN from pip's unconstrained latest — live bring-up (2026-07-16,
+    # RTX 5070 sm120) found both of these break `import gllm` at the versions
+    # pip resolves by default, before any model even loads. See
+    # synapse_engine/NOTICE for the full incident notes.
+    "kernels==0.14.1",              # transformers==5.5.4's hub_kernels calls
+                                    # LayerRepository(repo_id=, layer_name=)
+                                    # with no revision/version — kernels>=0.15
+                                    # made one of those two required, raising
+                                    # ValueError at transformers import time.
+    "nvidia-cutlass-dsl==4.5.0",     # sgl-kernel==0.3.21's bundled
+                                    # flash_attn_origin.cute module calls
+                                    # nvvm.RoundingModeKind, which doesn't
+                                    # exist in nvidia-cutlass-dsl 4.6.x's MLIR
+                                    # bindings (flashinfer-python's own floor
+                                    # is only ">=4.5.0", so pip picks 4.6.1
+                                    # unless pinned down explicitly).
+]
+
+[project.optional-dependencies]
+bnb = ["bitsandbytes"]
+
+[tool.setuptools]
+py-modules = ["logger"]
+
+[tool.setuptools.packages.find]
+include = ["gllm*"]
+
+[tool.setuptools.package-data]
+gllm = ["layers/moe/fused_moe_triton/configs/*.json"]

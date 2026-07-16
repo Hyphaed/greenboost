@@ -13,7 +13,7 @@ This is a walkthrough of one real configuration, end to end:
 | Context | 1,048,576 tokens (YaRN-baked), MTP layer grafted in, vision tower attached |
 | Host | RTX 5070, **12 GB** VRAM · 64 GB DDR4 |
 | Feeder | RTX 5070 Laptop, **8 GB** VRAM · 32 GB DDR5, over LAN |
-| Served by | GB-Synapse → `llama-server` + `--rpc`, on `:11434` |
+| Served by | GB-Synapse → `llama-server` + `--rpc`, on `:11435` |
 
 The whole problem in one line: **20.2 GiB of weights, ~17 GB of usable VRAM.**
 Everything below is about closing that 3 GB gap without paying for it in speed
@@ -238,7 +238,7 @@ caught. **The flux is the evidence; the log line is just a story.**
 
 ```
 gb  →  GB-CLI
-      │  (OpenAI/Ollama API on :11434)
+      │  (OpenAI/Ollama API on :11435)
       ▼
    GB-Synapse proxy ── translates Ollama `images` → OpenAI image_url
       │

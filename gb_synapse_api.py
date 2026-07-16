@@ -21,7 +21,7 @@ gb_synapse.py importable without aiohttp installed, and gives the proxy an
 independent lifetime tracked in ServerState.proxy_pid).
 
 Usage:
-    python3 gb_synapse_api.py --port 11434 --upstream-port 12434 --model-name qwen3-coder
+    python3 gb_synapse_api.py --port 11435 --upstream-port 12435 --model-name qwen3-coder
 """
 from __future__ import annotations
 
@@ -65,10 +65,10 @@ def _record_tok_s(model: str, t_first: "float | None", t_last: "float | None",
                   completion_tokens: int) -> None:
     """Compute client-observed decode tok/s from first→last token timing and
     the upstream's usage count, then hand it to gb_synapse.record_measured_tok_s
-    (dataflux emit + rolling store). Proxy-side so ANY client on :11434 (curl,
-    Zed, ai-forge's Ollama-compat steps) feeds recommend()'s fit estimator, not
-    only greenboost-cli. Best-effort: never raises, silently skips incomplete
-    samples (no usage, single token, zero interval)."""
+    (dataflux emit + rolling store). Proxy-side so ANY client on the gb-synapse
+    port (curl, Zed, ai-forge's Ollama-compat steps) feeds recommend()'s fit
+    estimator, not only greenboost-cli. Best-effort: never raises, silently
+    skips incomplete samples (no usage, single token, zero interval)."""
     try:
         if completion_tokens <= 1 or t_first is None or t_last is None:
             return

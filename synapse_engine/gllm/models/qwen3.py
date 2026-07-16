@@ -1,0 +1,164 @@
+import torch
+
+from gllm.input_data import InputData
+from gllm.layers.attention import FlashAttention
+from gllm.layers.layernorm import RMSNorm
+from gllm.layers.linear import QKVParallelLinear, RowParallelLinear
+from gllm.layers.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
+from gllm.modules.attention import Attention
+
+from .qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM
+from .qwen2 import Qwen2MLP as Qwen3MLP
+from .qwen2 import Qwen2Model
+from .utils import extract_rope_config
+
+try:
+    from sgl_kernel import fused_qk_norm_rope as _sgl_fused_qk_norm_rope
+except ImportError:
+    _sgl_fused_qk_norm_rope = None
+
+from gllm.layers.ops.qk_norm import fused_qk_norm_inplace
+
+
+class Qwen3Attention(Attention):
+    def __init__(self, layer_id, config):
+        head_dim = getattr(config, "head_dim", None)
+        super().__init__(
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.hidden_size,
+            head_dim,
+        )
+
+        self.rope_theta, _rope_scaling_normalized = extract_rope_config(
+            config, default_theta=1000000.0
+        )
+        self.qkv_bias = getattr(config, "attention_bias", False)
+
+        quant_config = getattr(config, "quantization_config", None)
+
+        self.qkv_proj = QKVParallelLinear(
+            self.hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=self.qkv_bias,
+            quant_config=quant_config,
+        )
+
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            self.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+        )
+        self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+        rope_scaling = _rope_scaling_normalized
+        if rope_scaling is None:
+            self.rotary_emb = RotaryEmbedding(
+                self.head_dim,
+                self.head_dim,
+                self.max_position_embeddings,
+                self.rope_theta,
+                True,
+            )
+        else:
+            assert "mrope_section" in rope_scaling
+            self.rotary_emb = MRotaryEmbedding(
+                self.head_dim,
+                self.head_dim,
+                self.max_position_embeddings,
+                self.rope_theta,
+                True,
+                rope_scaling["mrope_section"],
+            )
+        self.attn = FlashAttention(
+            layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim
+        )
+        self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
+
+        # `sgl_kernel.fused_qk_norm_rope` fuses 2 x RMSNorm + RoPE into one
+        # kernel pass, eliminating 2 RMSNorm launches + the standalone RoPE
+        # kernel per layer. Constraints (mirrored from sgl Qwen3 path):
+        #   - vanilla RoPE only (MRoPE / YaRN / Llama3 scaling fall back),
+        #   - head_dim in {64, 128, 256} (kernel template constraint),
+        #   - dtype == bfloat16 (kernel only ships a bf16 specialization).
+        # Decided once at __init__ to keep `forward` branch-free.
+        self._use_fused_qk_norm_rope = (
+            _sgl_fused_qk_norm_rope is not None
+            and isinstance(self.rotary_emb, RotaryEmbedding)
+            and not isinstance(self.rotary_emb, MRotaryEmbedding)
+            and self.head_dim in (64, 128, 256)
+            and rope_scaling is None
+        )
+
+    def forward(self, input_data: InputData, hidden_states: torch.Tensor):
+        qkv = self.qkv_proj(hidden_states)
+        if self._use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16:
+            # Operates in-place on qkv; layout is [q | k | v] along the last
+            # dim, which matches QKVParallelLinear's output. The kernel
+            # computes inv_freq on-the-fly from `base` (no cos_sin cache
+            # lookup), so we skip materializing self.rotary_emb.cos_sin_cache.
+            positions = (
+                input_data.get_position()
+                .view(-1)
+                .to(dtype=torch.int32, device=qkv.device)
+                .contiguous()
+            )
+            _sgl_fused_qk_norm_rope(
+                qkv,
+                self.num_heads,
+                self.num_kv_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.q_norm.variance_epsilon,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                float(self.rope_theta),
+                True,  # is_neox_style; Qwen3 RoPE is always NeoX-style.
+                positions,
+                1.0,
+                0.0,
+                0.0,
+                1.0,
+            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            # Fused q/k RMS-norm in a single Triton launch. Operates
+            # in-place on the qkv slice (the kernel loads/stores along
+            # the contiguous head_dim axis and tolerates the qkv-row
+            # stride on the token axis, so no ``.contiguous()`` copy is
+            # needed). Profile of Qwen3-VL-30B-A3B-Instruct TP=4 on
+            # H20-3e: 36.6 ms (19303 RMSNorm calls @ 1.9 us) -> ~14 ms
+            # via the fused path, with the same numerics as the per-
+            # head RMSNorm pair.
+            fused_qk_norm_inplace(
+                q,
+                k,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.q_norm.variance_epsilon,
+            )
+            q, k = self.rotary_emb(input_data.get_position(), q, k)
+        attn_output = self.attn.forward(q, k, v, input_data)
+        output = self.o_proj(attn_output)
+        return output
+
+
+class Qwen3DecoderLayer(Qwen2DecoderLayer):
+    def __init__(self, layer_id, config):
+        super().__init__(
+            layer_id, config, attention_type=Qwen3Attention, mlp_type=Qwen3MLP
+        )
+
+
+class Qwen3Model(Qwen2Model):
+    def __init__(self, config):
+        super().__init__(config, decoder_layer_type=Qwen3DecoderLayer)
+
+
+class Qwen3ForCausalLM(Qwen2ForCausalLM):
+    def __init__(self, config):
+        super().__init__(config, model_type=Qwen3Model)

@@ -205,13 +205,15 @@ def tier_actuate(lever: str, value: int, confirm: bool = False) -> dict:
     return plan
 
 
-def serve_and_repoint(model: str, port: int = 11434,
+def serve_and_repoint(model: str, port: int = 0,
                       forge_url_target: str | None = None,
                       confirm: bool = False) -> dict:
     """One step for the "prefer gb-synapse" rule: serve `model` via gb-synapse
     AND repoint FORGE_OLLAMA_URL (in inference.env) so ai-forge pipelines use
     the gb-synapse proxy instead of raw ollama. Closes the two-control-plane
     gap (serve on one server + out-of-band env edit) into a single actuation."""
+    import gb_synapse
+    port = port or gb_synapse.DEFAULT_PORT
     gate = actuation_gate(confirm)
     target = forge_url_target or f"127.0.0.1:{port}"
     plan = {"verb": "serve_and_repoint", "model": model, "port": port,
@@ -221,7 +223,6 @@ def serve_and_repoint(model: str, port: int = 11434,
                            f"FORGE_OLLAMA_URL={target}")
         return plan
     try:
-        import gb_synapse
         state = gb_synapse.serve(model, port=port)
         plan["served"] = getattr(state, "as_dict", lambda: str(state))()
         # Never point FORGE_OLLAMA_URL at a proxy that isn't actually

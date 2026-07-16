@@ -1,0 +1,318 @@
+import asyncio
+import hashlib
+import logging
+import math
+import os
+import socket
+import tempfile
+import uuid
+from functools import partial
+from pathlib import Path
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    ParamSpec,
+    Tuple,
+    TypeVar,
+    Union,
+)
+
+import filelock
+import torch
+import tqdm
+import zmq
+from logger import logger
+from torch.library import Library
+
+P = ParamSpec("P")
+K = TypeVar("K")
+T = TypeVar("T")
+
+
+def init_logger():
+    formatter = logging.Formatter(
+        f"[%(asctime)s %(filename)s:%(lineno)d] %(levelname)s - %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    for handler in logger.handlers:
+        handler.setFormatter(formatter)
+
+
+def make_async(func: Callable[P, T]) -> Callable[P, Awaitable[T]]:
+    """Take a blocking function, and run it on in an executor thread.
+
+    This function prevents the blocking function from blocking the
+    asyncio event loop.
+    The code in this function needs to be thread safe.
+    """
+
+    def _async_wrapper(*args: P.args, **kwargs: P.kwargs) -> asyncio.Future:
+        loop = asyncio.get_event_loop()
+        p_func = partial(func, *args, **kwargs)
+        return loop.run_in_executor(executor=None, func=p_func)
+
+    return _async_wrapper
+
+
+def random_uuid() -> str:
+    return str(uuid.uuid4().hex)
+
+
+def async_tensor_h2d(
+    data: list,
+    dtype: torch.dtype,
+    target_device: Union[str, torch.device],
+    pin_memory: bool,
+) -> torch.Tensor:
+    """Asynchronously create a tensor and copy it from host to device."""
+    t = torch.tensor(data, dtype=dtype, pin_memory=pin_memory, device="cpu")
+    return t.to(device=target_device, non_blocking=True)
+
+
+def make_socket(ctx, path: str, type):
+    if type == zmq.PUSH:
+        socket = ctx.socket(type)
+        socket.connect(path)
+        socket.setsockopt(zmq.SNDHWM, 0)
+        socket.setsockopt(zmq.SNDBUF, int(0.5 * 1024**3))
+        return socket
+    elif type == zmq.PULL:
+        socket = ctx.socket(type)
+        socket.bind(path)
+        socket.setsockopt(zmq.RCVHWM, 0)
+        socket.setsockopt(zmq.RCVBUF, int(0.5 * 1024**3))
+        return socket
+    else:
+        assert 0
+
+
+def find_free_port(host="0.0.0.0"):
+    """Ask the OS for a free TCP port on ``host`` (bind to :0)."""
+    bind_host = "" if host in ("0.0.0.0", "", None) else host
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((bind_host, 0))
+        return s.getsockname()[1]
+
+
+def find_free_ports(count, host="0.0.0.0"):
+    """Return ``count`` distinct free TCP ports (not necessarily contiguous).
+
+    Binds all sockets to ``:0`` simultaneously before reading their assigned
+    ports, so the OS hands back distinct numbers instead of reusing the same
+    just-released ephemeral port across a loop.
+    """
+    bind_host = "" if host in ("0.0.0.0", "", None) else host
+    socks = []
+    try:
+        for _ in range(count):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((bind_host, 0))
+            socks.append(s)
+        return [s.getsockname()[1] for s in socks]
+    finally:
+        for s in socks:
+            s.close()
+
+
+def make_pull_random(ctx, host):
+    """Bind a PULL socket to an OS-chosen free TCP port on ``host``.
+
+    Returns ``(socket, port)``. Instead of deriving a TCP port from a fixed
+    base (which can collide with whatever else is already listening), the
+    binder grabs whatever port is free and hands it to the connecting PUSH
+    peer out of band via ``send_obj_list``.
+    """
+    socket = ctx.socket(zmq.PULL)
+    port = socket.bind_to_random_port(f"tcp://{host}")
+    socket.setsockopt(zmq.RCVHWM, 0)
+    socket.setsockopt(zmq.RCVBUF, int(0.5 * 1024**3))
+    return socket, port
+
+
+temp_dir = tempfile.gettempdir()
+
+
+def get_lock(model_name_or_path: Union[str, Path], cache_dir: Optional[str] = None):
+    lock_dir = cache_dir or temp_dir
+    model_name_or_path = str(model_name_or_path)
+    os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
+    model_name = model_name_or_path.replace("/", "-")
+    hash_name = hashlib.sha256(model_name.encode()).hexdigest()
+    # add hash to avoid conflict with old users' lock files
+    lock_file_name = hash_name + model_name + ".lock"
+    # mode 0o666 is required for the filelock to be shared across users
+    lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
+    return lock
+
+
+def get_model_load_pbar(num_totals):
+    return tqdm.tqdm(
+        total=num_totals,
+        ncols=100,
+        bar_format="Loading model weights: {l_bar}{bar}{r_bar}",
+    )
+
+
+def set_weight_attrs(
+    weight: torch.Tensor,
+    weight_attrs: Optional[Dict[str, Any]],
+):
+    """Set attributes on a weight tensor.
+
+    This method is used to set attributes on a weight tensor. This method
+    will not overwrite existing attributes.
+
+    Args:
+        weight: The weight tensor.
+        weight_attrs: A dictionary of attributes to set on the weight tensor.
+    """
+    if weight_attrs is None:
+        return
+    for key, value in weight_attrs.items():
+        assert not hasattr(weight, key), f"Overwriting existing tensor attribute: {key}"
+        setattr(weight, key, value)
+
+
+gllm_lib = Library("gllm", "FRAGMENT")  # noqa
+
+
+def direct_register_custom_op(
+    op_name: str,
+    op_func: Callable,
+    mutates_args: List[str],
+    fake_impl: Optional[Callable] = None,
+    target_lib: Optional[Library] = None,
+    tags: Tuple[torch.Tag, ...] = (),
+):
+    """
+    `torch.library.custom_op` can have significant overhead because it
+    needs to consider complicated dispatching logic. This function
+    directly registers a custom op and dispatches it to the CUDA backend.
+    See https://gist.github.com/youkaichao/ecbea9ec9fc79a45d2adce1784d7a9a5
+    for more details.
+
+    By default, the custom op is registered to the vLLM library. If you
+    want to register it to a different library, you can pass the library
+    object to the `target_lib` argument.
+
+    IMPORTANT: the lifetime of the operator is tied to the lifetime of the
+    library object. If you want to bind the operator to a different library,
+    make sure the library object is alive when the operator is used.
+    """
+    import torch.library
+
+    if hasattr(torch.library, "infer_schema"):
+        schema_str = torch.library.infer_schema(op_func, mutates_args=mutates_args)
+    else:
+        # for pytorch 2.4
+        import torch._custom_op.impl
+
+        schema_str = torch._custom_op.impl.infer_schema(op_func, mutates_args)
+
+    my_lib = target_lib or gllm_lib
+    my_lib.define(op_name + schema_str, tags=tags)
+    my_lib.impl(op_name, op_func, "CUDA")
+    if fake_impl is not None:
+        my_lib._register_fake(op_name, fake_impl)
+
+
+def get_device_name(device_id: int = 0) -> str:
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        return torch.cuda.get_device_name(device_id)
+
+
+def round_up(x: int, y: int) -> int:
+    return ((x + y - 1) // y) * y
+
+
+def round_down(x: int, y: int) -> int:
+    return (x // y) * y
+
+
+def ceil_div(a, b):
+    return (a + b - 1) // b
+
+
+def cdiv(a: int, b: int) -> int:
+    """Ceiling division."""
+    return -(a // -b)
+
+
+def get_dtype_bytes(dtype):
+    if dtype.is_floating_point:
+        info = torch.finfo(dtype)
+    else:
+        info = torch.iinfo(dtype)
+    return info.bits // 8  # bits => bytes
+
+
+def get_device_capability():
+    device = torch.cuda.current_device()
+    capability_arr = torch.cuda.get_device_capability(device)
+    return capability_arr[0] * 10 + capability_arr[1]
+
+
+def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
+
+
+def cast_overflow_tensors(
+    tensors: torch.Tensor,
+    offset: float = 1000,
+) -> torch.Tensor:
+    if tensors.isinf().any() or tensors.isnan().any():
+        clamp_value = torch.finfo(tensors.dtype).max - offset
+        tensors = torch.clamp(tensors, min=-clamp_value, max=clamp_value)
+    return tensors
+
+
+def unify_decode(tokenizer, token_ids, skip_special_tokens: bool = True):
+    """Decode token ids back to text.
+
+    By default special tokens (e.g. ``<|im_end|>``, ``<|endoftext|>``) are
+    skipped so that the user-visible chat output stays clean across all
+    chat-tuned models, without needing per-model stop-string lists.
+    """
+    return tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
+
+
+def get_finish_reason(seq) -> Optional[str]:
+    """Best-effort OpenAI ``finish_reason`` for a completed sequence.
+
+    ``length`` when the output-length cap was hit, ``stop`` when generation
+    ended on an EOS/finish token, else ``stop`` as a generic fallback (e.g. an
+    aborted/disconnected request). Returns ``None`` if no tokens were produced.
+    """
+    if seq is None or not seq.token_ids:
+        return None
+    generated = len(seq.token_ids) - seq.raw_prompt_len
+    if not seq.ignore_eos and seq.token_ids[-1] in seq.finish_tokens:
+        return "stop"
+    if generated >= seq.output_len:
+        return "length"
+    return "stop"
+
+
+def build_usage(seq):
+    """OpenAI token-usage block computed from a (possibly finished) sequence."""
+    # Imported lazily: ``gllm.entrypoints.protocol`` imports from this module,
+    # so a top-level import here would be circular.
+    from gllm.entrypoints.protocol import UsageInfo
+
+    if seq is None:
+        return UsageInfo()
+    prompt_tokens = seq.raw_prompt_len
+    completion_tokens = max(0, len(seq.token_ids) - seq.raw_prompt_len)
+    return UsageInfo(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+    )
