@@ -2577,14 +2577,26 @@ Environment=GB_PY_ROOT=/usr/local/lib/greenboost
 #   Environment=GB_A2A_BIND=0.0.0.0:8790
 #   Environment=GB_A2A_TOKEN=<secret>   # refuses non-loopback bind without this
 Environment=GB_A2A_BIND=127.0.0.1:8790
-# Actuation OFF by default (observe/dry-run). Opt in to real lever moves via:
-#   Environment=GB_ORCH_ACTUATE=1
+# Actuation ON by default (real lever moves via A2A/MCP-gated verbs like
+# serve_and_repoint) — matches greenboost-supervisor.service's own default
+# (Environment=GB_ORCH_ACTUATE=1 above). Real incident, 2026-07-16: this was
+# OFF by default pre-fix, so a fresh install/reinstall silently double-gated
+# every actuation-verb MCP tool call (serve_and_repoint etc. always returned
+# "GB_ORCH_ACTUATE!=1 (double gate)") until a human found and manually wrote
+# this exact override.conf — the loopback bind (GB_A2A_BIND=127.0.0.1:8790,
+# above) is what actually keeps this safe, not the actuation gate; the gate
+# is a second belt-and-braces layer on top of that, not the network boundary.
+# Opt OUT to observe/dry-run instead via override.conf:
+#   systemctl edit greenboost-a2a.service
+#     [Service]
+#     Environment=GB_ORCH_ACTUATE=0
+Environment=GB_ORCH_ACTUATE=1
 [Install]
 WantedBy=multi-user.target
 A2AEOF
         systemctl daemon-reload
         systemctl enable --now greenboost-a2a.service 2>/dev/null \
-            && gb_ok "greenboost-a2a.service enabled (loopback :8790, actuation gated OFF)" \
+            && gb_ok "greenboost-a2a.service enabled (loopback :8790, actuation gate ON — see comments in the unit for opt-out)" \
             || gb_warn "a2a enable failed , run: sudo systemctl enable --now greenboost-a2a.service"
     else
         gb_warn "gb_a2a.py not installed , skipping A2A gateway unit"
@@ -4079,6 +4091,12 @@ do_purge() {
           /etc/systemd/system/greenboost-sentinel.service \
           /etc/systemd/system/greenboost-vram-watchdog.service \
           /etc/systemd/system/greenboost-idle-reclaim.service
+    # Wholesale removal — takes cli-venv AND vllm-env with it (both live
+    # under this dir; no separate rm needed for either). The user-home dev
+    # venv gb_synapse_backends._find_vllm_bin() also checks
+    # (~/.local/share/greenboost/synapse/vllm-env) is intentionally NOT
+    # touched here — it's a manual/dev install, not something Full Install
+    # created.
     rm -rf /usr/local/lib/greenboost
 
     # Legacy daemon scripts (all known names across all versions)
@@ -4292,6 +4310,8 @@ cmd_install_python_files() {
         gb_tiering.py
         gb_synapse.py
         gb_synapse_api.py
+        gb_synapse_backends.py
+        gb_diffusion_server.py
         gb_aviary.py
         gb_cluster.py
         gb_mcp.py
@@ -4488,6 +4508,121 @@ WRAPEOF
     gb_ok "greenboost-cli installed  (gb / greenboost-cli → $_venv)"
 }
 
+# cmd_install_vllm , provision a dedicated vLLM venv so gb-synapse's
+# VllmBackend (gb_synapse_backends.py) is available out of the box: token-less
+# safetensors pulls auto-route to vLLM+fp8 when this venv exists (owner
+# decision 2026-07-16), and ":fp8"/":int8"/":int4" pulls need it to avoid the
+# slower transformers fallback.
+#
+# Modeled on cmd_install_cli (same venv-under-$GB_PY_DEST pattern). Root-owned
+# system venv, NOT the user-home dev path gb_synapse_backends._find_vllm_bin()
+# also checks , this is what a fresh `git clone` + Full Install produces with
+# zero manual steps.
+#
+# Default-ON (owner decision): opt out with GB_INSTALL_VLLM=0. Best-effort ,
+# a missing venv module, offline mode, or a pip failure only warns; Full
+# Install must never abort on this step (vLLM is a multi-GB download).
+# Called from: cmd_install (full-install, after the synapse engine build) and
+# the install-vllm verb.
+cmd_install_vllm() {
+    if [[ "${GB_INSTALL_VLLM:-1}" == "0" ]]; then
+        gb_info "GB_INSTALL_VLLM=0 — skipping vLLM install (opt-out)"
+        return 0
+    fi
+    if [[ "${GB_OFFLINE:-0}" == "1" ]]; then
+        gb_warn "GB_OFFLINE=1 — skipping vLLM install (needs pip network access)"
+        return 0
+    fi
+    if ! python3 -m venv --help >/dev/null 2>&1; then
+        gb_warn "python3 venv module unavailable — skipping vLLM install (apt install python3-venv)"
+        return 0
+    fi
+
+    # Pick an interpreter vLLM's own dependency chain (cuda-tile/cuda-toolkit
+    # pins, torch, etc.) can actually resolve against — NOT whatever `python3`
+    # happens to be. Real incident, 2026-07-16: on Ubuntu 26.04 the system
+    # `python3` is 3.14 (this OS ships nothing older via apt — confirmed, no
+    # python3.12/3.13 package exists in its default repos), and vLLM 0.24.0's
+    # own transitive pins have no resolution against 3.14 yet (`pip install
+    # vllm` failed with "Cannot install cuda-tile==1.4.0, cuda-tile==1.5.0,
+    # cuda-toolkit==13.0.2 and vllm because these package versions have
+    # conflicting dependencies" — a too-new-interpreter symptom, not a real
+    # incompatibility to route around). Building the venv with 3.14 anyway
+    # made this fail SILENTLY as a "best-effort, continue" venv full of only
+    # `pip` — the vllm-env existed and looked installed, but had no vllm
+    # binary, so `synapse_doctor`'s vllm_available check reads its own set of
+    # signals (see gb_synapse_backends._find_vllm_bin) which can go stale
+    # against that half-built state and report available=true regardless.
+    # Prefer the newest of 3.13/3.12/3.11 found via PATH or common conda/
+    # miniforge install roots (a common pattern on ML dev boxes; NOT
+    # hardcoded to any one user's home — checks every $HOME under /home and
+    # this installer's own invoking $HOME). Falls back to system python3
+    # ONLY if nothing better exists, with a loud warning rather than a silent
+    # doomed build.
+    local _vllm_py="" _cand _root
+    for _cand in python3.13 python3.12 python3.11; do
+        if command -v "$_cand" >/dev/null 2>&1; then
+            _vllm_py=$(command -v "$_cand")
+            break
+        fi
+    done
+    if [[ -z "$_vllm_py" ]]; then
+        for _root in "$HOME" /home/*; do
+            for _cand in .miniforge3 miniconda3 anaconda3 miniforge3; do
+                for _v in python3.13 python3.12 python3.11; do
+                    if [[ -x "$_root/$_cand/bin/$_v" ]]; then
+                        _vllm_py="$_root/$_cand/bin/$_v"
+                        break 3
+                    fi
+                done
+            done
+        done
+    fi
+    if [[ -z "$_vllm_py" ]]; then
+        _vllm_py=$(command -v python3)
+        _pyver=$("$_vllm_py" --version 2>&1)
+        gb_warn "no 3.11-3.13 interpreter found (system python3 is $_pyver) — "
+        gb_warn "building vllm-env with it anyway; if pip's resolver fails with a "
+        gb_warn "'conflicting dependencies' error naming cuda-tile/cuda-toolkit, "
+        gb_warn "that IS this: install python3.11/3.12/3.13 (conda/miniforge is the "
+        gb_warn "easiest route when the OS repos don't package it, e.g. Ubuntu "
+        gb_warn "26.04) and re-run 'greenboost install-vllm'"
+    else
+        gb_info "vllm-env interpreter: $_vllm_py ($("$_vllm_py" --version 2>&1))"
+    fi
+
+    local _venv="$GB_PY_DEST/vllm-env"
+    if [[ ! -d "$_venv" ]]; then
+        if ! "$_vllm_py" -m venv "$_venv" &>/tmp/gb_vllm_venv.log; then
+            gb_warn "vllm-env creation failed (see /tmp/gb_vllm_venv.log) — skipping vLLM install"
+            return 0
+        fi
+    fi
+
+    gb_info "Installing vLLM ${GB_VLLM_VERSION:-0.24.0} into $_venv (multi-GB download) ..."
+    "$_venv/bin/pip" install --upgrade pip -q &>/tmp/gb_vllm_pip.log || true
+    if ! "$_venv/bin/pip" install -q "vllm==${GB_VLLM_VERSION:-0.24.0}" &>/tmp/gb_vllm_pip.log; then
+        gb_warn "vLLM pip install failed (see /tmp/gb_vllm_pip.log) — skipping vLLM install; gb-synapse falls back to the transformers engine for fp8/int8/int4 pulls"
+        return 0
+    fi
+
+    # Make the gb_*.py orchestration modules ($GB_PY_DEST) importable inside
+    # the venv , same .pth mechanism cmd_install_cli uses (gb_llm_server.py's
+    # transformers fallback also needs this, and vLLM subprocess env inherits
+    # PYTHONPATH from the shim_env() launcher — this .pth is belt-and-braces
+    # for any tool run directly against vllm-env's own interpreter).
+    local _sp
+    for _sp in "$_venv"/lib/python3.*/site-packages; do
+        [[ -d "$_sp" ]] && echo "$GB_PY_DEST" > "$_sp/greenboost.pth"
+    done
+
+    if ! "$_venv/bin/vllm" --version &>/tmp/gb_vllm_smoke.log; then
+        gb_warn "vllm --version smoke test failed (see /tmp/gb_vllm_smoke.log) — install may be incomplete"
+    fi
+
+    gb_ok "vLLM installed  ($_venv/bin/vllm , gb_synapse_backends._find_vllm_bin() picks it up automatically)"
+}
+
 # cmd_install_pipelines , provision the ai-forge pipeline dependencies that
 # GreenBoost's pipelines rely on (e.g. PaddleOCR for conduir art jobs).
 #
@@ -4614,7 +4749,7 @@ cmd_register_mcp() {
         "greenboost-orchestrator:$_py/gb_mcp.py"
         "greenboost-synapse:$_py/gb_synapse_mcp.py"
     )
-    local _entry _name _path _ok=0 _err
+    local _entry _name _path _ok=0 _err _envflag
     for _entry in "${_servers[@]}"; do
         _name="${_entry%%:*}"
         _path="${_entry#*:}"
@@ -4622,9 +4757,25 @@ cmd_register_mcp() {
             gb_warn "MCP module missing: $_path — skipping $_name"
             continue
         fi
+        # greenboost-orchestrator (tier_actuate/set_quant_policy) and
+        # greenboost-synapse (serve_and_repoint/synapse_serve) expose
+        # actuation-gated verbs (gb_actuation.py's double gate: confirm=True
+        # AND GB_ORCH_ACTUATE=1). `claude mcp add` registers stdio servers
+        # with an EMPTY env by default — the systemd services (greenboost-a2a/
+        # -supervisor, both default GB_ORCH_ACTUATE=1 above) are a separate
+        # process tree from these Claude-spawned MCP servers, so setting the
+        # var there does NOT propagate here. Real incident, 2026-07-16:
+        # without this, every actuation-verb MCP call silently no-ops
+        # ("GB_ORCH_ACTUATE!=1 (double gate)") on a fresh install even after
+        # fixing the systemd side, until traced to this second, independent
+        # env boundary. `-e KEY=value` is `claude mcp add`'s own env flag.
+        _envflag=()
+        if [[ "$_name" == "greenboost-orchestrator" || "$_name" == "greenboost-synapse" ]]; then
+            _envflag=(-e GB_ORCH_ACTUATE=1)
+        fi
         # Idempotent: drop any prior registration, then add fresh.
         "${_run[@]}" bash -c "$_prelude claude mcp remove '$_name'" &>/dev/null || true
-        if _err=$("${_run[@]}" bash -c "$_prelude claude mcp add --scope user '$_name' -- python3 '$_path'" 2>&1); then
+        if _err=$("${_run[@]}" bash -c "$_prelude claude mcp add --scope user '$_name' ${_envflag[*]} -- python3 '$_path'" 2>&1); then
             (( _ok++ )) || true
         else
             gb_warn "MCP registration failed: $_name — continuing (${_err//$'\n'/ })"
@@ -9621,6 +9772,16 @@ cmd_feeders_sync_synapse() {
             gb_warn "  Build did not reach ${_hostver} (feeder reports ${_newver:-none}, rc=${_rc})"
             _fail=$((_fail+1))
         fi
+
+        # vLLM is single-node only (no --rpc-equivalent cluster split for the
+        # VllmBackend yet) — report per-feeder presence for visibility, never
+        # gate sync success on it.
+        if "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+                "${_user}@${_ip}" "test -x /usr/local/lib/greenboost/vllm-env/bin/vllm" 2>/dev/null; then
+            gb_info "  vLLM present on this feeder (single-node backend — not cluster-split)"
+        else
+            gb_info "  vLLM not installed on this feeder (fine — vLLM is single-node only)"
+        fi
     done < "$GB_CLUSTER_CONF"
     echo ""
     gb_info "gb-synapse engine sync: ${_ok} ok, ${_fail} failed"
@@ -11785,6 +11946,7 @@ cmd_wizard() {
         gb_menu_item  8  "Tune GRUB"                 "Boot params: hugepages, rcu_nocbs, nohz_full (needs reboot)"  root
         gb_menu_item  9  "Generate inference config"  "Optimized Ollama/HF config for this hardware & environment"
         gb_menu_item 10  "Build gb-synapse engine"   "From-source llama.cpp build (llama-server, rpc-server, llama-quantize)"  root
+        gb_menu_item 20  "Install vLLM"              "gb-synapse VllmBackend venv (fp8-floor safetensors serving)"  root
 
         gb_section "Restore"
         gb_menu_item 11  "Restore sys configs"       "Remove Ollama drop-in, udev rules, LD_PRELOAD, governor service"  root
@@ -11834,6 +11996,7 @@ cmd_wizard() {
             17) cmd_clear_logs;                      gb_press_enter ;;
             18) cmd_uninstall;                       gb_press_enter ;;
             19) cmd_install_python_files;            gb_press_enter ;;
+            20) cmd_install_vllm;                    gb_press_enter ;;
             q|Q|"") exit 0 ;;
             *) gb_warn_ui "Unknown option."; sleep 1 ;;
         esac
@@ -12078,6 +12241,7 @@ cmd_help() {
         echo -e "  ${C_CYAN}${C_BOLD}ADVANCED:${C_RESET}"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-python"        "Copy gb_*.py orchestration stack to /usr/local/lib/greenboost/"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-cli"           "Install greenboost-cli (gb) into /usr/local/lib/greenboost/cli-venv"
+        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-vllm"          "Install vLLM (gb-synapse VllmBackend) into /usr/local/lib/greenboost/vllm-env [GB_INSTALL_VLLM=0 to skip]"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-pipelines"     "Provision ai-forge pipeline deps (PaddleOCR etc.) via setup_*.sh"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "register-mcp"          "Register GreenBoost MCP servers with the Claude CLI (per-user)"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-sys-configs"   "Ollama drop-in, udev, governor, LD_PRELOAD, THP (all-in-one)"
@@ -12510,6 +12674,12 @@ cmd_full_install() {
         gb_warn_ui "gb-synapse engine build failed — retry later: sudo greenboost synapse build-engine"
     fi
 
+    # 7 - vLLM engine (gb-synapse's VllmBackend). Default-on (opt-out
+    # GB_INSTALL_VLLM=0); best-effort under set -euo pipefail, same as the
+    # synapse engine build above — a failure here shouldn't take down an
+    # otherwise-successful Full Install.
+    cmd_install_vllm || gb_warn_ui "vLLM install failed — retry later: sudo greenboost install-vllm"
+
     # ── Final state guarantee (defects 2026-07-13) ───────────────────────
     # A Full Install must never end with the supervisor dead or the module
     # unloaded , verify both, loudly.  Step 4 normally reinstalls+starts the
@@ -12731,6 +12901,7 @@ case "$COMMAND" in
     recover)                cmd_recover               ;;
     install-python|install_python) cmd_install_python_files ;;
     install-cli|install_cli)       cmd_install_cli           ;;
+    install-vllm|install_vllm)     cmd_install_vllm          ;;
     install-pipelines|install_pipelines) cmd_install_pipelines ;;
     register-mcp|register_mcp)     cmd_register_mcp          ;;
     install-sys-configs)    cmd_install_sys_configs   ;;

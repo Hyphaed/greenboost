@@ -62,6 +62,7 @@ _REPO_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_REPO_DIR))
 
 import gb_cluster
+import gb_synapse_backends
 from gb_gguf_tensor_map import _load_gguf_reader
 
 # ---------------------------------------------------------------------------
@@ -329,7 +330,8 @@ def status() -> dict:
     out = {"engine_built": engine_installed(),
            "engine_version": engine_version() or None,
            "server_running": False, "proxy_running": False,
-           "engine_dir": str(ENGINE_DIR)}
+           "engine_dir": str(ENGINE_DIR),
+           "vllm_available": gb_synapse_backends._find_vllm_bin() is not None}
     for key, pat in (("server_running", f"{ENGINE_DIR}/llama-server"),
                      ("proxy_running", "gb_synapse_api")):
         try:
@@ -338,6 +340,7 @@ def status() -> dict:
             out[key] = bool(r.stdout.strip())
         except Exception:
             pass
+    out["engines_running"] = sorted({s.get("engine", "") for s in ps()} - {""})
     return out
 
 
@@ -353,7 +356,9 @@ class ModelEntry:
     repo: str = ""
     quant: str = ""
     arch: str = ""
-    engine: str = "llama.cpp"   # "llama.cpp" | "gbquant" (vLLM if available, else transformers)
+    engine: str = "llama.cpp"   # "llama.cpp" | "vllm" | "transformers" | "diffusers"
+                                # (legacy "gbquant" values are normalized to
+                                # "vllm" on manifest load — see _load_manifest)
     n_bytes: int = 0
     n_layers: int = 0
     is_moe: bool = False
@@ -378,7 +383,17 @@ class ModelEntry:
 def _load_manifest() -> dict[str, ModelEntry]:
     try:
         raw = json.loads(MANIFEST_FILE.read_text())
-        return {k: ModelEntry(**v) for k, v in raw.items()}
+        out = {}
+        for k, v in raw.items():
+            if v.get("engine") == "gbquant":
+                # Pre-taxonomy manifests: "gbquant" meant "vLLM if installed,
+                # else transformers" — normalize to "vllm" on read so every
+                # in-memory ModelEntry uses the current 4-value taxonomy.
+                # select_backend() still honours a raw "gbquant" value for
+                # any caller that constructs a ModelEntry directly.
+                v = {**v, "engine": "vllm"}
+            out[k] = ModelEntry(**v)
+        return out
     except (OSError, json.JSONDecodeError, TypeError):
         return {}
 
@@ -583,48 +598,14 @@ def _pull_and_convert(repo: str, quant: str, name: str | None) -> ModelEntry:
 _GBQUANT_TOKENS = {"FP8", "INT8", "INT4"}
 
 
-def _vllm_venv_dir() -> Path | None:
-    """The managed vLLM venv directory, if the `vllm` binary resolved to one
-    (site-packages sits alongside bin/vllm; a system-PATH vllm has no such
-    venv to search)."""
-    vllm_bin = _find_vllm_bin()
-    if not vllm_bin:
-        return None
-    venv = Path(vllm_bin).resolve().parent.parent
-    return venv if (venv / "lib").is_dir() else None
-
-
-def _find_vllm_venv_lib(rel_glob: str) -> Path | None:
-    """A library bundled inside the vLLM venv's site-packages (e.g. torch's
-    own pinned nvidia-cuXX wheel's libcudart), for shim_env's cudart_path —
-    the shim needs a cudart new enough for whatever torch build vLLM pulled
-    in, not necessarily the system one."""
-    venv = _vllm_venv_dir()
-    if not venv:
-        return None
-    matches = list(venv.glob(f"lib/python*/site-packages/{rel_glob}"))
-    return matches[0] if matches else None
-
-
-def _find_vllm_bin() -> str | None:
-    """vLLM search order: explicit override, gb-synapse-managed venv (mirrors
-    the built-engine layout under ENGINE_DIR's parent), then system PATH.
-    vLLM lives in its own venv (its own docs: `pip install -e
-    ~/Dev/turboquantsolutions/gemlite` "in the vLLM venv") — it's never
-    assumed to share gb_synapse.py's own interpreter."""
-    override = os.environ.get("GB_SYNAPSE_VLLM_BIN")
-    if override and Path(override).exists():
-        return override
-    managed = Path.home() / ".local/share/greenboost/synapse/vllm-env/bin/vllm"
-    if managed.exists():
-        return str(managed)
-    return shutil.which("vllm")
-
-
-def _pull_gbquant(repo: str, quant: str, name: str | None) -> ModelEntry:
+def _pull_gbquant(repo: str, quant: str, name: str | None, engine: str = "vllm") -> ModelEntry:
     """Fetch the safetensors snapshot for gb-quant serving (vLLM's on-the-fly
-    `--quantization gemlite` or the transformers fallback both quantize at
-    load time — no GGUF conversion needed here, unlike _pull_and_convert)."""
+    native quantization, or the transformers fallback, both quantize at load
+    time — no GGUF conversion needed here, unlike _pull_and_convert).
+
+    `engine` defaults to "vllm" (select_backend falls back to transformers
+    automatically when the vLLM venv isn't installed); pass "transformers"
+    explicitly to pin the fallback engine regardless of vLLM availability."""
     from huggingface_hub import snapshot_download
     cache_dir = str(MODEL_STORE_DIR / "_hf_cache")
     local_dir = snapshot_download(
@@ -632,31 +613,74 @@ def _pull_gbquant(repo: str, quant: str, name: str | None) -> ModelEntry:
         allow_patterns=["*.safetensors", "*.json", "*.model", "*.txt", "tokenizer*"],
     )
     entry_name = name or repo.split("/")[-1]
+    meta = safetensors_summary(local_dir)
     entry = ModelEntry(name=entry_name, path=local_dir, source="hf", repo=repo,
-                        engine="gbquant", quant=quant.upper(), added_ts=time.time())
+                        engine=engine, quant=quant.upper(), added_ts=time.time(), **meta)
     manifest = _load_manifest()
     manifest[entry_name] = entry
     _save_manifest(manifest)
     return entry
 
 
-def pull(repo_spec: str, name: str | None = None) -> ModelEntry:
-    """Download a GGUF from HuggingFace — or, if the repo has no native GGUF
-    release, convert it from safetensors on the fly (see _pull_and_convert).
+def _pull_diffusers(repo: str, name: str | None) -> ModelEntry:
+    """Fetch a full HF diffusers pipeline tree (model_index.json + every
+    component subfolder) for DiffusersBackend's image server. No GGUF
+    conversion — diffusers loads the safetensors/config layout directly.
+    Same cache-discipline as _pull_gbquant (MODEL_STORE_DIR/_hf_cache, so a
+    re-pull never re-downloads from scratch)."""
+    from huggingface_hub import snapshot_download
+    cache_dir = str(MODEL_STORE_DIR / "_hf_cache")
+    local_dir = snapshot_download(
+        repo_id=repo, token=hf_token(), cache_dir=cache_dir,
+        allow_patterns=["*.safetensors", "*.json", "*.txt", "*.model", "tokenizer*"],
+    )
+    entry_name = name or repo.split("/")[-1]
+    entry = ModelEntry(name=entry_name, path=local_dir, source="hf", repo=repo,
+                        engine="diffusers", quant="fp8", added_ts=time.time())
+    manifest = _load_manifest()
+    manifest[entry_name] = entry
+    _save_manifest(manifest)
+    return entry
 
-    repo_spec is "org/repo" or "org/repo:QUANT". With no quant given, picks
-    the largest quant whose weights fit the live cluster's aggregate VRAM
-    (falls back to the smallest available file if nothing fits — still
-    downloadable, just flagged by `recommend` as needing overflow tiers).
-    For a repo with no GGUF release, QUANT instead selects the target
-    llama-quantize format (default Q4_K_M).
-    Multi-shard GGUFs ("...-00001-of-00003.gguf") pull every shard; llama.cpp
-    loads the first and follows the split chain itself.
+
+def pull(repo_spec: str, name: str | None = None, engine: str = "") -> ModelEntry:
+    """Download a GGUF from HuggingFace — or, if the repo has no native GGUF
+    release, route it to whichever engine actually serves it (see
+    _pull_and_convert / _pull_gbquant / _pull_diffusers).
+
+    repo_spec is "org/repo" or "org/repo:QUANT". QUANT is either a GGUF quant
+    token (Q4_K_M, Q8_0, ...) served through llama.cpp, or FP8/INT8/INT4 to
+    route through gb-quant (vLLM if installed, else transformers).
+
+    With no quant and no explicit `engine`, the repo's own file listing
+    decides once it turns out to have no GGUF release: a diffusers
+    `model_index.json` routes to the image backend; a token-less safetensors
+    repo routes to vLLM at fp8 quality when the vLLM venv exists (falls back
+    to GGUF conversion otherwise, same as before this routing existed). A
+    repo WITH a GGUF release still picks the largest quant that fits the
+    live cluster's aggregate VRAM, same as always.
+
+    `engine` (also `--engine` on the CLI) overrides detection outright , one
+    of "vllm"/"transformers"/"diffusers"; use it when a repo's own layout is
+    ambiguous. Multi-shard GGUFs ("...-00001-of-00003.gguf") pull every
+    shard; llama.cpp loads the first and follows the split chain itself.
     """
     repo, _, quant = repo_spec.partition(":")
-    if quant.upper() in _GBQUANT_TOKENS:
-        return _pull_gbquant(repo, quant, name)
+    quant_u = quant.upper()
+
+    if engine == "diffusers":
+        return _pull_diffusers(repo, name)
+    if engine in ("vllm", "transformers") or quant_u in _GBQUANT_TOKENS:
+        return _pull_gbquant(repo, quant or "fp8", name,
+                             engine=engine or "vllm")
+
     files = list_repo_gguf(repo)
+    if not files and not quant and not engine:
+        fmt = gb_synapse_backends.detect_format(repo)
+        if fmt == "diffusers":
+            return _pull_diffusers(repo, name)
+        if fmt == "safetensors" and gb_synapse_backends._find_vllm_bin():
+            return _pull_gbquant(repo, "fp8", name)
     if not files:
         return _pull_and_convert(repo, quant, name)
 
@@ -937,6 +961,50 @@ def gguf_summary(path: str) -> dict:
     return result
 
 
+def safetensors_summary(local_dir: str) -> dict:
+    """gguf_summary()'s counterpart for a safetensors snapshot (vLLM/
+    transformers-routed pulls, `_pull_gbquant`). Real gap found live
+    2026-07-16: `_pull_gbquant` built every `ModelEntry` with n_bytes/
+    n_layers/arch/ctx_length/is_moe all zero/empty — VllmBackend.serve()
+    itself doesn't need these (it sizes `--gpu-memory-utilization` from live
+    free-VRAM telemetry, not the manifest), but `synapse_recommend`'s fit
+    reports and any other manifest-metadata consumer silently read a 0-byte
+    model as "trivially fits" regardless of its real size — misleading, not
+    a crash. Best-effort: returns an all-zero dict (same shape as a failed
+    gguf_summary, never raises) if config.json is missing/unparseable or no
+    *.safetensors files are found, so a metadata gap here degrades to
+    exactly today's silent-zero behavior rather than failing the pull."""
+    root = Path(local_dir)
+    result = {"n_bytes": 0, "n_layers": 0, "is_moe": False, "n_experts": 0,
+              "n_experts_used": 0, "dense_bytes": 0, "expert_bytes": 0,
+              "ctx_length": 0, "arch": "", "n_kv_heads": 0, "head_dim": 0}
+    try:
+        n_bytes = sum(f.stat().st_size for f in root.glob("*.safetensors"))
+        cfg = json.loads((root / "config.json").read_text())
+    except (OSError, ValueError):
+        return result
+    # Multimodal configs (Qwen3-VL family etc.) nest the LLM's own fields
+    # under text_config; text-only configs carry them at the top level.
+    tc = cfg.get("text_config", cfg)
+    n_experts = int(tc.get("num_experts") or tc.get("num_local_experts") or 0)
+    result.update({
+        "n_bytes": n_bytes,
+        "n_layers": int(tc.get("num_hidden_layers") or len(tc.get("layer_types", ())) or 0),
+        "ctx_length": int(tc.get("max_position_embeddings") or 0),
+        "arch": (cfg.get("architectures") or [cfg.get("model_type", "")])[0],
+        "n_kv_heads": int(tc.get("num_key_value_heads") or 0),
+        "head_dim": int(tc.get("head_dim") or 0),
+        "n_experts": n_experts,
+        "n_experts_used": int(tc.get("num_experts_per_tok") or 0),
+        "is_moe": n_experts > 0,
+        # No per-tensor expert/dense split available without opening the
+        # safetensors headers (unlike GGUF's per-tensor names) — a real,
+        # accepted granularity gap, not guessed: dense_bytes/expert_bytes
+        # stay 0 for MoE safetensors models rather than a wrong split.
+    })
+    return result
+
+
 _ARCH_CACHE: set[str] | None = None
 
 
@@ -1019,7 +1087,7 @@ def doctor(probe_feeders: bool = True) -> dict:
         "engine_version": engine_version(),
         "hf_token_set": hf_token() is not None,
         "cluster_configured": bool(fs),
-        "vllm_available": _find_vllm_bin() is not None,
+        "vllm_available": gb_synapse_backends._find_vllm_bin() is not None,
     }
 
 
@@ -1300,6 +1368,23 @@ class ServerState:
     tensor_split: str
     feeders: list = field(default_factory=list)
     started_ts: float = 0.0
+    engine: str = ""
+    # False = /health hadn't gone fully green within SERVE_READY_GRACE_S when
+    # serve() returned (large GGUFs can legitimately take minutes) — the
+    # server IS running and will finish loading, but a caller hitting it
+    # immediately can get a connection-refused/still-loading response rather
+    # than a real answer. True for every ServerState constructed before this
+    # field existed (default, so old persisted run-state JSON still parses).
+    ready: bool = True
+    # None = proxy bound :port and answered /health. Non-None = it did not
+    # (see _wait_proxy_ready) — most often another process already holds
+    # :port (raw ollama.service on a box mid-migration off it). The ENGINE
+    # can be genuinely healthy (`ready=True`) while this is set: they are
+    # different failure surfaces, both real, found live 2026-07-16.
+    proxy_error: str | None = None
+
+    def as_dict(self) -> dict:
+        return asdict(self)
 
 
 def _safe_name(name: str) -> str:
@@ -1812,6 +1897,59 @@ def _wait_upstream_ready(entry: ModelEntry, proc: subprocess.Popen, internal_por
     return False
 
 
+def _wait_proxy_ready(proxy_proc: subprocess.Popen, port: int, label: str,
+                      grace_s: float = 5.0) -> str | None:
+    """Watch a freshly spawned gb_synapse_api.py proxy until it serves, dies,
+    or `grace_s` runs out. Short grace vs the engine's own
+    (SERVE_READY_GRACE_S): proxy startup is near-instant when it succeeds: it
+    is a thin aiohttp app with no model to load, so the only real failure
+    mode observed is an immediate bind error.
+
+    Real incident, 2026-07-16: without this check, `_launch_proxy_and_record`
+    fired the proxy with `subprocess.Popen` and immediately reported success
+    — a caller (MCP tool, CLI) saw a clean ServerState even when the proxy
+    had already crashed (`OSError: [Errno 98] address already in use`,
+    raw ollama.service still bound to :11434, the recurring real case on a
+    box mid-migration off it). The engine WAS genuinely serving on
+    internal_port, so the failure was invisible until a client request came
+    back as a confusing "model not found" from whatever else answered :port
+    instead — three layers removed from the actual cause.
+
+    Returns None when healthy, else a short reason string (never raises —
+    the caller decides whether a dead proxy is fatal)."""
+    import urllib.error
+    import urllib.request
+
+    deadline = time.time() + grace_s
+    url = f"http://127.0.0.1:{port}/health"
+    while time.time() < deadline:
+        if proxy_proc.poll() is not None:
+            return (f"proxy exited during startup (rc={proxy_proc.returncode})\n"
+                    f"{_upstream_log_tail(label)}")
+        try:
+            with urllib.request.urlopen(url, timeout=2) as r:
+                # ONLY a genuine 200 counts. Real bug, found live 2026-07-16:
+                # an earlier version of this check treated ANY HTTP response
+                # (including urllib.error.HTTPError, i.e. any non-2xx status)
+                # as proof the proxy was up — but when raw ollama.service
+                # already holds `port`, ITS OWN generic "404 page not found"
+                # response satisfies that check too. The real proxy had
+                # already crashed (confirmed: its PID no longer existed) the
+                # whole time this returned a false "healthy". A 404 from
+                # something else on the same port is exactly what this check
+                # exists to catch, not a pass condition.
+                if r.status == 200 and proxy_proc.poll() is None:
+                    return None
+        except (urllib.error.HTTPError, OSError):
+            pass              # not our proxy answering, or not listening yet
+        time.sleep(0.3)
+    if proxy_proc.poll() is not None:
+        return (f"proxy exited during startup (rc={proxy_proc.returncode})\n"
+                f"{_upstream_log_tail(label)}")
+    return (f"proxy never answered /health with 200 within {grace_s}s — "
+            f"something else may already be listening on :{port}")
+
+
 def _health_says_loading(body: bytes) -> bool:
     """llama.cpp is not consistent about how /health reports a load in progress:
     newer builds answer 503, but the engine we ship answers 200 with
@@ -1865,15 +2003,23 @@ def _emit_serve(entry: ModelEntry, status: str, **fields) -> None:
 
 def _launch_proxy_and_record(entry: ModelEntry, upstream: subprocess.Popen, port: int,
                               internal_port: int, tensor_split: str = "",
-                              feeders: list | None = None, **serve_facts) -> ServerState:
-    """Shared tail for every engine (llama.cpp/vLLM/transformers): wait for the
-    engine to come up, start the gb_synapse_api.py proxy in front of it, and
-    record ServerState. The proxy only ever talks OpenAI /v1/* to the upstream,
-    so it's identical regardless of which engine is behind it — and all three
-    expose /health, so the readiness gate is too."""
+                              feeders: list | None = None, engine: str = "",
+                              **serve_facts) -> ServerState:
+    """Shared tail for every engine (llama.cpp/vLLM/transformers/diffusers):
+    wait for the engine to come up, start the gb_synapse_api.py proxy in
+    front of it, and record ServerState. The proxy only ever talks OpenAI
+    /v1/* to the upstream, so it's identical regardless of which engine is
+    behind it — and all four expose /health, so the readiness gate is too.
+
+    `engine` is the backend's own name (EngineBackend.name); every caller is
+    a backend's serve() method, which always passes it — falls back to
+    entry.engine only for callers that don't (there are none left, kept as a
+    defensive default rather than a required param so a future backend that
+    forgets it still gets a sane value instead of an empty string)."""
+    engine = engine or entry.engine
     t0 = time.time()
     common = {"port": port, "tensor_split": tensor_split, "feeders": feeders or [],
-              **serve_facts}
+              "engine": engine, **serve_facts}
     try:
         ready = _wait_upstream_ready(entry, upstream, internal_port)
     except RuntimeError as e:
@@ -1884,482 +2030,58 @@ def _launch_proxy_and_record(entry: ModelEntry, upstream: subprocess.Popen, port
                     load_s=round(time.time() - t0, 1), **common)
         raise
 
+    proxy_label = entry.name + "_proxy"
     proxy_cmd = [sys.executable, str(_REPO_DIR / "gb_synapse_api.py"),
                  "--port", str(port), "--upstream-port", str(internal_port),
                  "--model-name", entry.name]
-    proxy_log = open(_run_log_path(entry.name + "_proxy"), "ab")
+    proxy_log = open(_run_log_path(proxy_label), "ab")
     proxy_proc = subprocess.Popen(proxy_cmd, stdout=proxy_log, stderr=subprocess.STDOUT,
                                    start_new_session=True)
+    proxy_error = _wait_proxy_ready(proxy_proc, port, proxy_label)
 
     state = ServerState(model=entry.name, llama_pid=upstream.pid, proxy_pid=proxy_proc.pid,
                          port=port, internal_port=internal_port, tensor_split=tensor_split,
-                         feeders=feeders or [], started_ts=time.time())
+                         feeders=feeders or [], started_ts=time.time(), engine=engine,
+                         ready=ready, proxy_error=proxy_error)
     _write_run_state(state)
-    _emit_serve(entry, "ok" if ready else "loading",
-                load_s=round(time.time() - t0, 1), **common)
-    return state
-
-
-# vLLM CLI args per gb-quant token, using vLLM's OWN native quantization
-# (not the third-party gemlite/hqq vLLM plugins — live-tested against vLLM
-# 0.24.0 and both are broken: gemlite's backend.py and hqq's vllm.py both
-# subclass/import internal quantization classes — AWQConfig, AWQMarlinConfig,
-# HQQMarlinConfig — that vLLM has since renamed/removed. Both plugins also
-# load eagerly on ANY `vllm` invocation regardless of --quantization, so
-# merely having one installed breaks vLLM's own --version). fp8 and the
-# bitsandbytes default (4-bit) are confirmed working end-to-end; true 8-bit
-# needs a config-injection mechanism this session didn't nail down in vLLM
-# 0.24.0, so INT8 currently gets the same (4-bit) args as INT4 rather than
-# silently mislabeling it — see workflow/gb-synapse.md.
-_GBQUANT_VLLM_ARGS = {
-    "FP8": ["--quantization", "fp8"],
-    "INT8": ["--quantization", "bitsandbytes", "--load-format", "bitsandbytes"],
-    "INT4": ["--quantization", "bitsandbytes", "--load-format", "bitsandbytes"],
-}
-
-
-def _cuda_home_for_vllm() -> "str | None":
-    """vLLM's FlashInfer dependency JIT-compiles Blackwell (SM 12.x) kernels
-    and requires CUDA >= 12.9 to do it — it finds nvcc via CUDA_HOME, which
-    defaults to /usr (a stale distro-packaged nvcc, often < 12.9) when unset.
-    Same root cause as _find_nvcc(): the distro package and
-    /usr/local/cuda's update-alternatives-managed install can diverge.
-    FlashInfer swallows the resulting version-check exception internally and
-    misreports "GPU too old" instead of "CUDA too old" — confirmed live on
-    an RTX 5070 (cc 12.0) with CUDA 13.3 at /usr/local/cuda but 12.4 at
-    /usr/bin/nvcc."""
-    alt = Path("/usr/local/cuda")
-    return str(alt) if alt.exists() else None
-
-
-def _gbquant_model_source(entry: ModelEntry) -> str:
-    """Local snapshot dir if `_pull_gbquant()` already downloaded one (avoids
-    vLLM/transformers redundantly re-fetching the same repo into their own
-    default HF cache — ~/.cache/huggingface/hub — instead of reusing
-    gb-synapse's own MODEL_STORE_DIR/_hf_cache copy), else the bare repo id
-    so vLLM/transformers can fetch it themselves."""
-    return entry.path if entry.path and os.path.isdir(entry.path) else entry.repo
-
-
-def _serve_vllm(entry: ModelEntry, port: int) -> ServerState:
-    """vLLM's own OpenAI server speaks /v1/chat/completions + /v1/completions
-    natively (streaming included), so gb_synapse_api.py's existing passthrough
-    needs no changes — it just points at vLLM's port instead of llama-server's.
-    gb-quant applies via vLLM's own native quantization flags (see
-    _GBQUANT_VLLM_ARGS), quantizing on the fly at load time — no separate
-    convert/quantize step.
-
-    Single-node only for now: vLLM's own cluster mechanism (Ray tensor/pipeline
-    parallel) is a different distribution model than llama.cpp's --rpc split
-    and isn't wired to GreenBoost's feeder fabric here."""
-    vllm_bin = _find_vllm_bin()
-    if not vllm_bin:
-        raise RuntimeError(
-            f"'{entry.name}' needs vLLM (gb-quant {entry.quant} quantization) but no vllm "
-            f"binary was found — install it in its own venv and either put it on PATH or "
-            f"set GB_SYNAPSE_VLLM_BIN."
-        )
-    internal_port = port + 1000
-    # vLLM is a PyTorch workload — same "torch" shim profile that already
-    # works for other GreenBoost-accelerated torch/diffusion GPU workers
-    # (ai-forge CLAUDE.md RULE #1), giving real T2 (DDR) VRAM extension
-    # WITHOUT CPU compute participation — never vLLM's own --cpu-offload-gb,
-    # which actually runs layers on CPU (real incident, 2026-07-15: the
-    # previous version of this function set GREENBOOST_ACTIVE=1 but never
-    # actually LD_PRELOADed the shim library, so it was a no-op — T2 was
-    # never really active for vLLM despite the flag being set).
-    vllm_cudart = str(_find_vllm_venv_lib("nvidia/cu13/lib/libcudart.so.13")
-                      or _find_vllm_venv_lib("nvidia/cu12/lib/libcudart.so.12") or "")
-    env = gb_cluster.shim_env(workload="torch", enabled=True,
-                              cudart_path=vllm_cudart or None)
-    if hf_token():
-        env["HF_TOKEN"] = hf_token()
-    cuda_home = _cuda_home_for_vllm()
-    if cuda_home:
-        env["CUDA_HOME"] = cuda_home
-
-    # vLLM's own memory profiling asserts hard if free VRAM changes between
-    # its initial snapshot and the profiling pass (observed live: another
-    # process's VRAM use fluctuating ~1.5 GB tripped this at the library's
-    # default 0.9 utilization) — size to LIVE free VRAM with a safety margin,
-    # same "never trust a static default" approach as _compute_tensor_split.
-    #
-    # T2 headroom (real incident, 2026-07-15): with the shim active (above),
-    # weights genuinely landed partly in T2 DDR — confirmed via nvidia-smi
-    # showing real VRAM use well under what --gpu-memory-utilization implied
-    # — yet vLLM's OWN "how much room is left for the KV cache" check only
-    # sees bytes against its util*total budget, has no idea some of "its"
-    # allocated memory is T2-backed, and failed with "Available KV cache
-    # memory: -0.75 GiB" even though the load itself succeeded. Since T2
-    # genuinely extends usable capacity now (that's the whole point of the
-    # shim being on), size the effective budget against free VRAM + a safety
-    # fraction of free T2 DDR, not physical VRAM alone.
-    t2_free_mb = 0
-    try:
-        brief = Path("/sys/class/greenboost/greenboost/pool_brief").read_text()
-        m = re.search(r"T2:(\d+)/(\d+)GB", brief)
-        if m:
-            t2_free_mb = (int(m.group(2)) - int(m.group(1))) * 1024
-    except OSError:
-        pass
-
-    from gb_nvml import get_nvml
-    _, host_free_mb, host_total_mb, _ = get_nvml(0).mem()
-    if host_total_mb > 0:
-        effective_free_mb = host_free_mb + t2_free_mb * 0.5
-        util = max(0.3, min(0.95, (effective_free_mb * 0.85) / host_total_mb))
+    if proxy_error:
+        # The engine loaded a real model into memory (upstream.pid is alive);
+        # tearing it down here would waste a load that may have taken minutes
+        # just because the FRONT DOOR failed. Record the state (so ps()/
+        # failure_report() see a genuinely running engine behind a dead
+        # proxy) and surface the failure distinctly rather than either
+        # silently reporting full success or discarding real work.
+        _emit_serve(entry, "proxy_error", error=proxy_error.splitlines()[0],
+                    load_s=round(time.time() - t0, 1), **common)
     else:
-        # pynvml not installed — this env's gb_nvml returns all zeros by
-        # design (see its module docstring). Fall back to torch.cuda, same
-        # pattern as gb_llm._auto_budget_gb(); torch is already a hard
-        # requirement of both vLLM and the transformers fallback, so this
-        # import is free on any path that reaches _serve_vllm().
-        try:
-            import torch
-            free_b, total_b = torch.cuda.mem_get_info()
-            util = max(0.3, min(0.95, ((free_b + t2_free_mb * 0.5 * 1024 ** 2) * 0.85) / total_b))
-        except Exception:
-            util = 0.85
-
-    quant_args = _GBQUANT_VLLM_ARGS.get(entry.quant.upper(), ["--quantization", "fp8"])
-    cmd = [vllm_bin, "serve", _gbquant_model_source(entry),
-           *quant_args, "--served-model-name", entry.name,
-           "--host", "127.0.0.1", "--port", str(internal_port),
-           "--gpu-memory-utilization", f"{util:.2f}"]
-    log = open(_run_log_path(entry.name), "ab")
-    proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT,
-                             start_new_session=True)
-    return _launch_proxy_and_record(entry, proc, port, internal_port)
-
-
-def _serve_transformers(entry: ModelEntry, port: int) -> ServerState:
-    """Fallback when vLLM isn't installed: gb_llm_server.py wraps
-    gb_llm.load_causal_lm()/generate() (in-process transformers + gb-quant)
-    behind the same minimal OpenAI surface vLLM/llama-server provide. No
-    continuous batching — single-request-at-a-time — so prefer vLLM when
-    it's available; this exists so ':fp8'-style models are never a hard
-    dead end just because the vLLM venv isn't set up yet."""
-    internal_port = port + 1000
-    env = os.environ.copy()
-    env["GREENBOOST_ACTIVE"] = "1"
-    if hf_token():
-        env["HF_TOKEN"] = hf_token()
-    cmd = [sys.executable, str(_REPO_DIR / "gb_llm_server.py"),
-           "--model", _gbquant_model_source(entry), "--served-model-name", entry.name,
-           "--quant", entry.quant or "fp8",
-           "--host", "127.0.0.1", "--port", str(internal_port)]
-    log = open(_run_log_path(entry.name), "ab")
-    proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT,
-                             start_new_session=True)
-    return _launch_proxy_and_record(entry, proc, port, internal_port)
+        _emit_serve(entry, "ok" if ready else "loading",
+                    load_s=round(time.time() - t0, 1), **common)
+    return state
 
 
 def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
           use_cluster: bool = True, n_slots: int = 1, extra_args: str = "") -> ServerState:
     """Resolve `model` (manifest name, "org/repo[:quant]", or a bare Ollama
-    model name), bring up feeder rpc-server(s) if online, launch the host
-    llama-server with an explicit --rpc + --tensor-split, then start the API
-    proxy in front of it.
+    model name) and hand it to whichever engine backend its manifest entry
+    calls for (gb_synapse_backends.select_backend) — llama.cpp (default,
+    cluster --rpc split), vLLM (gb-quant fp8/int8/int4 safetensors), the
+    transformers fallback, or diffusers (image gen).
 
-    Also the single llama-server process manager for GreenBoost: carries the
-    flags formerly duplicated in greenboost-cli's own `/llamaserve` (disk-
-    persisted prompt-cache slots, P-core-pinned threading, KV quantization
-    matching Ollama's TurboQuant baseline, `--jinja` for correct native
-    tool-calling) so nothing outside this function spawns a competing
-    llama-server instance. `extra_args` (e.g. greenboost-cli's
-    `llamacpp_extra_args` setting) appends further raw CLI flags, shlex-split.
-
-    `entry.engine == "gbquant"` (repo pulled with a ":fp8"/":int8"/":int4"
-    quant token) routes to vLLM if installed, else the transformers fallback
-    — one interface, gb-synapse picks the runtime, per the project's "gb-serve
-    packs every option into one backend" design (see workflow/gb-synapse.md).
+    Also the single process manager for GreenBoost's own model servers:
+    reuses an already-running instance for this exact model instead of
+    racing a second launch (Ollama's scheduler solves this with a queue +
+    refcounted runners; gb-synapse only ever runs one model at a time, so
+    "return the existing one" is the equivalent guarantee).
     """
     entry = _resolve_model(model)
 
-    # Reuse an already-running instance for this exact model instead of
-    # racing a second launch — e.g. greenboost-cli's own auto-start-at-launch
-    # can overlap with a manual /llamaserve start. Ollama's scheduler solves
-    # this with a queue + refcounted runners (server/sched.go); gb-synapse
-    # only ever runs one model at a time, so "return the existing one" is
-    # the equivalent guarantee without needing that machinery.
     for st in _read_run_states():
         if st.model == entry.name and _pid_alive(st.llama_pid) and _pid_alive(st.proxy_pid):
             return st
 
-    if entry.engine == "gbquant":
-        return _serve_vllm(entry, port) if _find_vllm_bin() else _serve_transformers(entry, port)
-
-    if not engine_installed():
-        raise RuntimeError("engine not built — run: greenboost synapse build-engine")
-
-    supported = _engine_supported_archs()
-    if entry.arch and supported and entry.arch not in supported:
-        hint = (f"run it directly with Ollama instead: ollama run {entry.name}"
-                if entry.source == "ollama" else
-                "wait for upstream llama.cpp to add support, or pick a different quant/repo")
-        raise RuntimeError(
-            f"'{entry.name}' uses architecture '{entry.arch}', which this gb-synapse engine "
-            f"build (llama.cpp {engine_version()}) doesn't recognize — likely a custom/newer "
-            f"arch only another runtime supports; {hint}."
-        )
-
-    from gb_nvml import get_nvml
-    _, host_free_mb, _, _ = get_nvml(0).mem()
-
-    online_feeders, rpc_args = [], []
-    if use_cluster:
-        for i, f in enumerate(gb_cluster.feeders(probe=True)):
-            if not f.online:
-                continue
-            rpc_port = RPC_PORT_BASE + i
-            # Only a feeder we can actually REACH may influence the budget and
-            # the split. Degrading to a host-only serve is always better than
-            # handing llama.cpp a device it can't talk to, which fails the load
-            # outright instead of just being slower.
-            if not ensure_feeder_rpc(f, rpc_port):
-                continue
-            rpc_args.append(f"{f.ip}:{rpc_port}")
-            online_feeders.append(f)
-    budget_gb = host_free_mb / 1024 + sum(f.t1_free_mb for f in online_feeders) / 1024
-
-    internal_port = port + 1000
-    env = gb_cluster.shim_env(workload="llm", enabled=True)
-    env["GREENBOOST_CLUSTER"] = "0"  # RPC owns cross-node split; shim = local tiers only
-    # Pin the loader to the engine dir: the binary's RUNPATH points at the
-    # BUILD TREE, so without this a rebuilt tree silently swaps the ggml libs
-    # under an older binary (confirmed by crash backtraces referencing
-    # build-synapse/bin paths) — two engine versions in one process.
-    env["LD_LIBRARY_PATH"] = str(ENGINE_DIR) + (
-        ":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
-
-    # The shim currently aborts llama.cpp's CUDA backend on this host:
-    # LD_PRELOAD of libgreenboost_cuda.so makes cudaFuncGetAttributes return
-    # "invalid device function" inside ggml_cuda_kernel_can_use_pdl (reproduced
-    # with GREENBOOST_ACTIVE=0, so it is the interposition itself, not a
-    # GreenBoost code path; a plain cudart-12 test binary is unaffected, so the
-    # trigger is ggml's late-dlopen'ed backend). Serving through a shim that
-    # kills the engine is strictly worse than serving without it: RPC still
-    # splits across the cluster and gb-quant still holds quality, we only lose
-    # per-node T2/T3 spill. Probe once, then decide — never assume.
-    if os.environ.get("GB_SYNAPSE_SHIM", "0") != "1":
-        for k in ("LD_PRELOAD", "GREENBOOST_ACTIVE"):
-            env.pop(k, None)
-        shim_note = "off (known llama.cpp/CUDA incompatibility)"
-    else:
-        shim_note = "on (GB_SYNAPSE_SHIM=1)"
-
-    # -ngl 999 ("every layer on the GPU") is right only when the weights can
-    # actually LAND there. Without the shim inflating VRAM, forcing all layers
-    # onto a card that cannot hold them doesn't spill, it fails the load
-    # outright ("unable to allocate CUDA0 buffer of size 21398561280"). When the
-    # weights exceed the VRAM budget, let llama.cpp fit the layers itself: it
-    # puts as many on the GPU as fit and keeps the rest in host RAM. That is
-    # slower, and it is what the cluster (RPC) and the shim (T2) exist to avoid,
-    # so we say plainly which one we got.
-    weights_gb = entry.n_bytes / (1024 ** 3)
-    fits_vram = weights_gb <= budget_gb or "LD_PRELOAD" in env
-    cpu_quirk = (not fits_vram and entry.arch in ARCH_CPU_SPLIT_BROKEN
-                 and os.environ.get("GB_SYNAPSE_FORCE_SPLIT") != "1")
-
-    # ctx=0 means "whatever the model itself was certified for" — a 1M YaRN bake
-    # exists precisely so it can be USED, and a hardcoded 64K default silently
-    # discarded 94% of it. The budget clamp below still decides what actually
-    # fits, so asking for the model's full context is never dangerous, just
-    # honest about the ceiling.
-    #
-    # Which budget, though: when `cpu_quirk` is about to force this model onto
-    # the CPU-only arch-split-crash path, weights AND KV cache live in plain
-    # host+feeder RAM, not VRAM — clamping ctx/KV-type against the (already
-    # weights-insufficient) VRAM budget starved ctx down to a few thousand
-    # tokens even with 60+ GB of RAM sitting idle (observed: ctx clamped to
-    # 6144 on a model certified to 1M). Use the real RAM budget in that case.
-    ctx_kv_budget_gb = budget_gb
-    if cpu_quirk:
-        ram_free_mb = _read_ram_available_mb()
-        ctx_kv_budget_gb = max(
-            budget_gb,
-            ram_free_mb / 1024 + sum(f.t2_free_mb for f in online_feeders) / 1024)
-
-    if ctx <= 0:
-        ctx = entry.ctx_length or 65536
-    ctx = _clamp_ctx_to_budget(ctx, entry, ctx_kv_budget_gb)
-
-    # KV precision is a QUALITY tier, not a memory knob, so it is chosen against
-    # the budget rather than hardcoded: f16 is certification grade, q8_0 is a
-    # budget config that buys ~2x the cache for roughly one needle at long
-    # rungs. Serving q8_0 unconditionally (as this did) quietly demoted every
-    # model to the budget tier — including ones whose KV fits f16 with room to
-    # spare. Take f16 whenever it fits; drop to q8_0 only to make the context
-    # reachable at all, and say so.
-    kv_type = _pick_kv_type(ctx, entry, ctx_kv_budget_gb)
-
-    # Split reflects the (clamped) ctx's KV footprint at the KV tier we actually
-    # serve — an f16 cache is twice a q8_0 one, and a split sized for the wrong
-    # tier pushes weights onto a node that has no room left for them.
-    kv_total_gb = estimate_kv_gb(ctx, entry.n_bytes, entry.quant,
-                                 n_layers=entry.n_layers, n_kv_heads=entry.n_kv_heads,
-                                 head_dim=entry.head_dim,
-                                 kv_bytes_per_elem=2.0 if kv_type == "f16" else 1.0)
-    tensor_split = _compute_tensor_split(host_free_mb, online_feeders, kv_total_gb)
-
-    SLOT_DIR.mkdir(parents=True, exist_ok=True)
-    cmd = [str(ENGINE_DIR / "llama-server"), "-m", entry.path,
-           "--host", "127.0.0.1", "--port", str(internal_port),
-           "--ctx-size", str(ctx),
-           "--slot-save-path", str(SLOT_DIR), "--no-webui",
-           "--flash-attn", "auto",
-           # Reuse cached KV for repeated prefixes (system prompt, prior turns)
-           # instead of reprocessing them from scratch every request — the
-           # model card's own recommended invocation for agentic/Claude-Code
-           # use includes this exact flag. Without it, a multi-turn tool-call
-           # loop (call → tool result → final answer) reprocesses the whole
-           # growing context on EVERY turn; confirmed live (2026-07-13) this
-           # was the dominant cost, not raw decode speed, on a CPU-only serve.
-           "--cache-reuse", "256",
-           "--no-mmap",  # DMA-BUF pinning (Path A) is incompatible with mmap-backed pages
-           "-np", str(n_slots), "--threads", str(_pcore_threads()),
-           "--cache-type-k", kv_type, "--cache-type-v", kv_type,
-           # Renders the model's own Jinja chat template instead of llama-server's
-           # built-in simplified matcher — required for correct native tool-calling
-           # on models whose template defines a tool-call format (Qwen3 family and
-           # most modern instruct models). Without it, required tool arguments can
-           # go missing from emitted tool_calls (confirmed live: qwen36-coder:studio
-           # calling Glob/Read with no "pattern"/"file_path"). See known-issues.md.
-           "--jinja"]
-
-    n_cpu_moe = 0
-    if fits_vram:
-        cmd += ["-ngl", "999"]        # all layers on GPU — the fast path
-    elif cpu_quirk:
-        # Upstream llama.cpp CUDA regression (2026-07-12, engine 6b4dc2116):
-        # for this arch ANY CPU/GPU split aborts at the first batched prompt
-        # ("ggml_cuda_compute_forward: SOFT_MAX failed — invalid argument").
-        # Verified exhaustively: -ngl 10 plain, --n-cpu-moe, --cpu-moe, FA
-        # on/off, GGML_CUDA_DISABLE_GRAPHS, -ub 8, --no-op-offload — all crash;
-        # -ngl 0 works (11.2 tok/s measured, 3B-active MoE). Full-VRAM would
-        # also work but no quant of this model fits the cluster. Until the
-        # kernel is fixed upstream, CPU-only is the ONLY placement that serves
-        # at all — an explicit, temporary exception to the GPU-always rule,
-        # not a policy change. Re-test with GB_SYNAPSE_FORCE_SPLIT=1.
-        # See workflow/known-issues.md + ggml-org/llama.cpp#19816 (same family).
-        #
-        # -ngl 0 alone is NOT CPU-only: llama.cpp still creates a CUDA context
-        # and op-offloads batched matmuls to the GPU above ~32 tokens — a tiny
-        # curl probe passed while greenboost-cli's 4k-token agentic prompt
-        # crashed the same way. Hide the GPU entirely so no tensor can touch
-        # the broken kernel, whatever the batch size.
-        cmd += ["-ngl", "0", "--no-op-offload"]
-        env["CUDA_VISIBLE_DEVICES"] = ""
-    elif entry.is_moe:
-        # Every layer still runs on the GPU; only the experts of the first
-        # n_cpu_moe layers live in host DDR.
-        n_cpu_moe = _fit_cpu_moe_layers(entry, budget_gb, kv_total_gb,
-                                        1 + len(online_feeders))
-        cmd += ["-ngl", "999", "--n-cpu-moe", str(n_cpu_moe)]
-    else:
-        n_gpu = _fit_gpu_layers(entry, budget_gb, kv_total_gb, 1 + len(online_feeders))
-        cmd += ["-ngl", str(n_gpu)]
-
-    # No mmap: DMA-BUF pinning needs owned pages. Without the shim there is
-    # nothing to pin, and mmap lets the page cache serve a 20 GB GGUF instead of
-    # re-reading it from disk on every restart.
-    if "LD_PRELOAD" not in env:
-        cmd.remove("--no-mmap")
-
-    # Vision: a GGUF's projector is a SEPARATE file. Without --mmproj a VLM is
-    # served text-only and every image is silently dropped — the model answers
-    # confidently about an image it never saw, which is worse than an error.
-    mmproj = _find_mmproj(entry)
-    if mmproj:
-        cmd += ["--mmproj", str(mmproj)]
-
-    # MTP: models carrying a grafted multi-token-prediction layer (the aviary-1m
-    # fleet bakes one in) decode ~34% faster through llama.cpp's speculative
-    # path, with identical output — the draft head IS the model's own layer, so
-    # this costs no quality and no extra VRAM for a draft model.
-    if _has_mtp(entry):
-        cmd += ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(MTP_DRAFT_N)]
-
-    if rpc_args:
-        cmd += ["--rpc", ",".join(rpc_args), "--tensor-split", tensor_split]
-    if extra_args:
-        cmd += shlex.split(extra_args)
-
-    kv_grade = "certification-grade" if kv_type == "f16" else "budget"
-    if fits_vram:
-        placement = "all-GPU"
-    elif cpu_quirk:
-        placement = "CPU-ONLY (arch CUDA-split quirk — see known-issues.md)"
-    else:
-        placement = "PARTIAL CPU OFFLOAD (slow)"
-    print(f"  [gb-synapse] {entry.name}: ctx={ctx} kv={kv_type} ({kv_grade}) "
-          f"weights={weights_gb:.1f}GB/{budget_gb:.1f}GB budget → {placement}, "
-          f"shim={shim_note}"
-          f"{' +mtp' if _has_mtp(entry) else ''}{' +vision' if mmproj else ''}"
-          f"{' rpc=' + ','.join(rpc_args) if rpc_args else ''}", flush=True)
-    if cpu_quirk:
-        print(f"  [gb-synapse] {weights_gb:.1f} GB of weights vs {budget_gb:.1f} GB VRAM "
-              f"AND arch '{entry.arch}' cannot survive a CPU/GPU split on this llama.cpp "
-              f"build (upstream CUDA regression) — serving CPU-ONLY. Measured 11.2 tok/s "
-              f"decode (3B-active MoE). Re-test the split with GB_SYNAPSE_FORCE_SPLIT=1 "
-              f"after an engine upgrade.", flush=True)
-    elif not fits_vram and n_cpu_moe:
-        print(f"  [gb-synapse] {weights_gb:.1f} GB of weights vs {budget_gb:.1f} GB VRAM: "
-              f"ALL {entry.n_layers} layers stay on GPU (attention + KV); experts of "
-              f"{n_cpu_moe}/{entry.n_layers} layers held in DDR "
-              f"({_moe_expert_gb_per_layer(entry):.2f} GB/layer). Only 8 of "
-              f"{entry.n_experts} experts fire per token, so this is the cheapest "
-              f"weight in the model to keep out of VRAM.", flush=True)
-    elif not fits_vram:
-        _fit = _fit_gpu_layers(entry, budget_gb, kv_total_gb, 1 + len(online_feeders))
-        print(f"  [gb-synapse] {weights_gb:.1f} GB of weights do not fit "
-              f"{budget_gb:.1f} GB of VRAM: {_fit}/{entry.n_layers} layers on GPU, the "
-              f"rest on CPU. CPU layers cost far more than any memory transfer — add "
-              f"VRAM (another feeder) or a smaller quant to close the gap.", flush=True)
-
-    llama_log = open(_run_log_path(entry.name), "ab")
-    llama_proc = subprocess.Popen(cmd, env=env, stdout=llama_log, stderr=subprocess.STDOUT,
-                                   start_new_session=True)
-
-    try:
-        return _launch_proxy_and_record(entry, llama_proc, port, internal_port,
-                                         tensor_split=tensor_split,
-                                         feeders=[f.ip for f in online_feeders],
-                                         ctx=ctx, kv_type=kv_type, placement=placement,
-                                         mtp=bool(_has_mtp(entry)), vision=bool(mmproj))
-    except RuntimeError as e:
-        # Real incident, 2026-07-15: a desktop with many long-running GPU
-        # contexts (browsers, IDEs, chat apps — 13 processes measured, one
-        # box) can fragment VRAM badly enough that a plain cudaMalloc for a
-        # buffer well UNDER the nominally-free byte count still fails —
-        # `budget_gb`/NVML only see aggregate free bytes, not whether a
-        # contiguous block of that size actually exists. The shim (which
-        # would otherwise absorb this via T2 spill) is unusable with
-        # llama.cpp on this build (see shim_note above) — so a raw -ngl 999
-        # fragmentation OOM has no other net. Retry ONCE at whatever layer
-        # count actually fits without a single giant weights allocation, the
-        # same partial-offload path used when the model genuinely doesn't
-        # fit in VRAM — slower, but it starts instead of dying outright.
-        if fits_vram and "out of memory" in str(e).lower():
-            fallback_ngl = _fit_gpu_layers(entry, budget_gb * 0.7, kv_total_gb,
-                                           1 + len(online_feeders))
-            print(f"  [gb-synapse] {entry.name}: all-GPU load hit a VRAM "
-                 f"fragmentation OOM (weights fit the nominal budget but no "
-                 f"contiguous block was actually free) — retrying at "
-                 f"-ngl {fallback_ngl}/{entry.n_layers} (partial GPU offload).",
-                 flush=True)
-            retry_cmd = list(cmd)
-            retry_cmd[retry_cmd.index("-ngl") + 1] = str(fallback_ngl)
-            llama_log = open(_run_log_path(entry.name), "ab")
-            llama_proc = subprocess.Popen(retry_cmd, env=env, stdout=llama_log,
-                                          stderr=subprocess.STDOUT, start_new_session=True)
-            return _launch_proxy_and_record(entry, llama_proc, port, internal_port,
-                                            tensor_split=tensor_split,
-                                            feeders=[f.ip for f in online_feeders],
-                                            ctx=ctx, kv_type=kv_type,
-                                            placement="PARTIAL CPU OFFLOAD (VRAM fragmentation fallback)",
-                                            mtp=bool(_has_mtp(entry)), vision=bool(mmproj))
-        raise
+    backend = gb_synapse_backends.select_backend(entry)
+    return backend.serve(entry, port, ctx=ctx, use_cluster=use_cluster,
+                         n_slots=n_slots, extra_args=extra_args)
 
 
 def stop(model: str) -> bool:
@@ -2434,11 +2156,18 @@ def _cli_main(argv: list[str]) -> int:
         print("HuggingFace token saved.")
     elif verb == "pull":
         if not rest:
-            print("usage: gb_synapse.py pull <repo>[:quant] [name]", file=sys.stderr)
+            print("usage: gb_synapse.py pull <repo>[:quant] [name] "
+                  "[--engine llama.cpp|vllm|transformers|diffusers]", file=sys.stderr)
             return 2
-        entry = pull(rest[0], name=rest[1] if len(rest) > 1 else None)
+        engine = ""
+        if "--engine" in rest:
+            i = rest.index("--engine")
+            engine = rest[i + 1] if i + 1 < len(rest) else ""
+            rest = rest[:i] + rest[i + 2:]
+        entry = pull(rest[0], name=rest[1] if len(rest) > 1 else None, engine=engine)
         print(json.dumps(asdict(entry)) if llm
-              else f"pulled {entry.name}  ({entry.n_bytes / (1024 ** 3):.2f} GiB, {entry.quant})")
+              else f"pulled {entry.name}  ({entry.n_bytes / (1024 ** 3):.2f} GiB, {entry.quant}, "
+                   f"engine={entry.engine})")
     elif verb == "index-ollama":
         found = index_ollama_models()
         print(json.dumps([asdict(e) for e in found]) if llm

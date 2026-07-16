@@ -224,8 +224,19 @@ def serve_and_repoint(model: str, port: int = 11434,
         import gb_synapse
         state = gb_synapse.serve(model, port=port)
         plan["served"] = getattr(state, "as_dict", lambda: str(state))()
-        plan["repointed"] = _write_env_file({"FORGE_OLLAMA_URL": target})
-        _emit("serve_and_repoint", True, model=model, forge_url=target)
+        # Never point FORGE_OLLAMA_URL at a proxy that isn't actually
+        # answering — every ai-forge pipeline reading that URL would start
+        # hitting a dead endpoint. proxy_error (added 2026-07-16) is the
+        # real signal; a stale ServerState from before that field existed
+        # has no attribute at all, hence the getattr default of None (never
+        # block on an old field that can't exist yet).
+        proxy_error = getattr(state, "proxy_error", None)
+        if proxy_error:
+            plan["repointed"] = False
+            plan["error"] = f"engine served but proxy did not come up — NOT repointing: {proxy_error}"
+        else:
+            plan["repointed"] = _write_env_file({"FORGE_OLLAMA_URL": target})
+            _emit("serve_and_repoint", True, model=model, forge_url=target)
     except Exception as e:
         plan["error"] = str(e)
     return plan
