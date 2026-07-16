@@ -1,0 +1,152 @@
+GreenBoost synapse_engine — vendored third-party code
+=======================================================
+
+Upstream project: gLLM — An Efficient and Versatile Inference Engine for
+Distributed LLM Serving
+Repository:       https://github.com/gty111/GLLM
+Paper:            https://doi.org/10.1145/3712285.3759823 (SC'25)
+                  https://arxiv.org/abs/2504.14775
+Upstream version: 0.0.6.post1 (setup.py)
+Upstream commit:  b9e7680
+License:          Apache License 2.0 (see LICENSE, verbatim from upstream)
+Import date:      2026-07-16
+
+What was imported
+------------------
+The `gllm/` package tree (upstream's `gllm/` directory) and `LICENSE`,
+verbatim, from ~/Dev/greenboost_all/greenboost-backends/GLLM. Nothing else
+from upstream (benchmarks/, docs/, examples/, tests) was vendored — this
+repo's own tests cover the GreenBoost-side integration instead.
+
+Local modifications
+--------------------
+Every local patch to the vendored `gllm/` tree MUST be appended below,
+in order, so future contributors can tell upstream code from GreenBoost's
+own changes at a glance.
+
+- 2026-07-16: Initial import, no source modifications yet. Packaging is
+  GreenBoost's own (`synapse_engine/pyproject.toml`, not upstream's
+  setup.py) and `synapse_engine/logger.py` is a new stdlib shim (see below)
+  — neither counts as a modification to the vendored `gllm/` tree itself.
+
+- 2026-07-16: `gllm/layers/attention.py` — added a torch-SDPA fallback for
+  the GENERAL (non-MLA, dense-model — Qwen/Llama/Mistral/etc.) attention
+  path. Live bring-up on an RTX 5070 (Blackwell/sm120) found that
+  `sgl_kernel.flash_attn.flash_attn_with_kvcache` (used unconditionally by
+  `FlashAttention.forward()`/`_flash_attn_paged_varlen`) has NO hardware
+  capability guard in this sgl-kernel build — unlike its sibling
+  `flash_attn_varlen_func`, which correctly raises `NotImplementedError` via
+  `is_fa3_supported()` — so it crashed the CUDA context with `no kernel
+  image is available for execution on the device` instead of failing
+  cleanly. This affected every dense model, not an edge case: the file's
+  existing hardware-aware fallback (`MLAAttention._resolve_decode_backend`)
+  is MLA-decode-only and never covers the dense path at all, and no triton
+  (or any other non-FA3) kernel for dense paged-KV attention existed
+  anywhere in the vendored tree to fall back to (the only triton kernel
+  present, `triton_decode_attention.py`, is itself MLA-specific — its
+  tensor shapes assume a compressed KV latent, not per-head K/V, so it
+  cannot serve dense models regardless).
+  New: `_sdpa_paged_varlen_fallback()` — gathers each sequence's KV out of
+  the paged cache into a contiguous tensor and runs
+  `torch.nn.functional.scaled_dot_product_attention` per sequence (a Python
+  loop over the batch, not vectorized — correctness-first for otherwise-
+  unsupported hardware, not a performance path; sgl_kernel's flash_attn
+  stays the fast path wherever `_FA3_AVAILABLE` is True). Builds an explicit
+  bottom-right-aligned causal mask (SDPA's own `is_causal` is top-left-
+  aligned and only correct when q_len == kv_len, which isn't true for
+  prefill/decode mixed batches). `_flash_attn_paged_varlen` now checks
+  `_FA3_AVAILABLE` (same signal `flash_attn_varlen_func` already uses) and
+  routes to the fallback when false, with a one-time warning log.
+  Live-verified end-to-end: `Qwen/Qwen3-0.6B` bf16, both streaming and
+  non-streaming `/v1/chat/completions`, coherent output, HTTP 200 — with
+  `--disable-cuda-graph` (CUDA graph capture separately OOMs on a 12 GB card
+  with this model's 7.9 GB KV cache reservation plus graph-capture buffers;
+  that is a distinct, not-yet-investigated finding, not caused by this
+  patch, see workflow/gb-synapse.md).
+
+- 2026-07-16: `gllm/async_utils.py` — `FutureMap.token_ids_buf` changed from
+  `torch.empty` to `torch.zeros`. The buffer is a circular slot map of
+  sampled token ids consumed by the next batch under overlap scheduling;
+  `resolve_future()` can read a slot that `store_to_map()` hasn't written
+  yet this early in a server's life (before the buffer has fully "warmed
+  up" across enough requests to cycle every slot at least once). With
+  `torch.empty` that read returned whatever bit pattern was already in that
+  VRAM region, which as an int64 "token id" is essentially always outside
+  the tokenizer's real vocab range. Confirmed live: this crashed the FIRST
+  requests to a freshly started server (both a plain bf16 model and a GPTQ
+  one, proving it is not quant-method-specific) with `OverflowError: out of
+  range integral type conversion attempted` inside `tokenizer.decode`.
+  `torch.zeros` makes an unwritten slot resolve to token id 0 (harmless,
+  always valid) instead of undefined memory content. Live-verified as the
+  actual, sufficient fix after re-testing in a genuinely clean process
+  state (an earlier round had wrongly read this fix as "insufficient" —
+  that read was contaminated by an orphaned gLLM worker process left over
+  from a prior test iteration still holding GPU state; killed via
+  `os.killpg`, see the `gb_synapse.py` `_kill_process_group` fix below,
+  re-tested clean: sequential, 16-way concurrent, and long-generation runs
+  against both bf16 Qwen3-0.6B and GPTQ TinyLlama all pass with zero
+  crashes).
+
+- 2026-07-16: `gllm/models/llama.py` — `LlamaAttention.__init__` never read
+  `config.quantization_config` and never passed `quant_config=` to its
+  `QKVParallelLinear`/`RowParallelLinear` sublayers, so `LlamaForCausalLM`
+  (TinyLlama, Llama, Mistral-family) could never route through ANY
+  quantized linear method regardless of the checkpoint's actual format —
+  a pre-existing upstream gap, not something introduced by GreenBoost's own
+  GPTQ additions below, but the thing that was blocking them from ever
+  being reached for this architecture. Fixed by reading
+  `getattr(config, "quantization_config", None)` and threading it through
+  to both sublayers, matching the pattern already used elsewhere in the
+  tree for other architectures.
+
+- 2026-07-16: `gllm/layers/linear.py` — `create_weights()` and
+  `dispatch_quant_method()` gained a `quant_method == "gptq"` branch each,
+  dispatching to the new `gptq_create_weights`/`gptq_linear_method` in
+  `gllm/layers/quantization/gptq.py` (new file, GreenBoost addition, not
+  an upstream file). Implements GPTQ (2/4/8-bit, group-wise, `desc_act`
+  via `g_idx`) weight registration and forward dequant+matmul by calling
+  into the already-vendored `gptqmodel` package's tested Triton kernel
+  (`gptqmodel.nn_modules.triton_utils.dequant.quant_matmul`) rather than
+  reimplementing bit-unpacking math. Also handles the AutoGPTQ "v1" vs
+  "v2" checkpoint-format `qzeros` off-by-one (v1 stores zero-points minus
+  1; v2 doesn't) via a one-time additive correction keyed on
+  `quant_config["checkpoint_format"]`/`["format"]`.
+
+- 2026-07-16: `gllm/models/weight_utils.py` — added
+  `copy_qkv_proj_gptq_cols`/`copy_gate_up_proj_gptq_cols`: GPTQ's packed
+  tensors (`qweight`/`qzeros`/`scales`) are laid out
+  `[rows, out_features(_packed)]`, the opposite axis convention from the
+  plain (unquantized) weight tensors the existing QKV/gate-up column-merge
+  helpers assume, so a parallel pair of functions was needed rather than
+  reusing the existing ones; widths are read directly off each source
+  tensor's real shape (not recomputed from head_dim/pack_factor, to avoid
+  a second, divergent source of truth).
+
+- 2026-07-16: `gllm/models/weight_loader.py` — `h_qkv_proj`, `h_gate_up`,
+  `h_proj_dim1`, `h_proj_dim0` each gained a GPTQ-leaf check
+  (`.qweight`/`.qzeros`/`.scales`/`.g_idx`) ahead of their existing
+  substring-match logic: `.g_idx` (1-D, identical across the merged q/k/v
+  or gate/up sources) gets a verbatim `.copy_()` instead of being run
+  through the 2-D column-concat path (which indexed `dst.shape[1]` and
+  raised `IndexError: tuple index out of range` on a 1-D tensor); the other
+  three GPTQ leaves route to the new `copy_*_gptq_cols` functions above.
+  Non-GPTQ keys are unaffected, they fall through to the original logic.
+
+- 2026-07-16: `gllm/async_llm_engine.py` — per GreenBoost's dataflux
+  Observability rule (every subsystem must leave a debuggable trace, not
+  just a log line), the background schedule-loop task's exception handler
+  (`_log_task_completion`, invoked via `Task.add_done_callback`) now also
+  emits a `synapse_engine_error` dataflux event (model, phase, exception)
+  before falling through, best-effort (`gb_dataflux.emit` never raises, so
+  this cannot introduce a new failure mode). This is what made the
+  `OverflowError` investigation above actually debuggable through the
+  dataflux MCP instead of only through raw stderr.
+
+Why `synapse_engine/logger.py` exists
+--------------------------------------
+Upstream `gllm/` does `from logger import logger` in ~22 files, expecting
+a third-party PyPI package literally named `logger`. GreenBoost ships its
+own stdlib-only shim of that name instead (see synapse_engine/logger.py)
+so the vendored code needs zero source edits and pulls one fewer
+dependency. `logger` is dropped from this package's own requirements for
+that reason — see synapse_engine/pyproject.toml.

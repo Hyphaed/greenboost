@@ -4091,9 +4091,10 @@ do_purge() {
           /etc/systemd/system/greenboost-sentinel.service \
           /etc/systemd/system/greenboost-vram-watchdog.service \
           /etc/systemd/system/greenboost-idle-reclaim.service
-    # Wholesale removal — takes cli-venv AND vllm-env with it (both live
-    # under this dir; no separate rm needed for either). The user-home dev
-    # venv gb_synapse_backends._find_vllm_bin() also checks
+    # Wholesale removal — takes cli-venv, vllm-env, synapse-torch-env AND the
+    # vendored synapse_engine/ source copy with it (all live under this dir;
+    # no separate rm needed for any of them). The user-home dev venv
+    # gb_synapse_backends._find_vllm_bin() also checks
     # (~/.local/share/greenboost/synapse/vllm-env) is intentionally NOT
     # touched here — it's a manual/dev install, not something Full Install
     # created.
@@ -4340,6 +4341,7 @@ cmd_install_python_files() {
         gb_remote_blocks.py
         gb_moe.py
         gb_llm_server.py
+        gb_synapse_fallback.py
         gb_rotator.py
     )
     local _installed=0
@@ -4359,6 +4361,26 @@ cmd_install_python_files() {
     if [[ ! -f "$_dest/__init__.py" ]]; then
         printf '# GreenBoost Python orchestration package\n' \
             > "$_dest/__init__.py"
+    fi
+
+    # synapse_engine/ (vendored gLLM torch-core, see synapse_engine/NOTICE) is
+    # a whole package tree, not a single file — sync it as a directory rather
+    # than adding it to _py_files above. cmd_install_synapse_engine() then
+    # `pip install`s this copy into synapse-torch-env (never the source tree
+    # directly, so a `git pull` mid-session can't yank files out from under a
+    # running venv). rsync --delete keeps stale files from a previous version
+    # from lingering; best-effort , a missing source dir (old checkout,
+    # partial clone) only warns.
+    if [[ -d "$MODULE_DIR/synapse_engine" ]]; then
+        if command -v rsync >/dev/null 2>&1; then
+            rsync -a --delete "$MODULE_DIR/synapse_engine/" "$_dest/synapse_engine/" 2>/tmp/gb_synapse_engine_sync.log \
+                || gb_warn "synapse_engine/ sync failed (see /tmp/gb_synapse_engine_sync.log)"
+        else
+            rm -rf "$_dest/synapse_engine"
+            cp -r "$MODULE_DIR/synapse_engine" "$_dest/synapse_engine"
+        fi
+    else
+        gb_warn "synapse_engine/ not found in $MODULE_DIR — install-synapse-engine will have nothing to install"
     fi
 
     # Add to system-wide PYTHONPATH via profile.d (idempotent)
@@ -4508,6 +4530,58 @@ WRAPEOF
     gb_ok "greenboost-cli installed  (gb / greenboost-cli → $_venv)"
 }
 
+# _gb_resolve_ml_python , pick an interpreter a heavy ML dependency chain
+# (torch/cuda-tile/cuda-toolkit pins etc.) can actually resolve against — NOT
+# whatever `python3` happens to be. Real incident, 2026-07-16: on Ubuntu
+# 26.04 the system `python3` is 3.14 (this OS ships nothing older via apt —
+# confirmed, no python3.12/3.13 package exists in its default repos), and
+# vLLM 0.24.0's own transitive pins have no resolution against 3.14 yet
+# (`pip install vllm` failed with "Cannot install cuda-tile==1.4.0,
+# cuda-tile==1.5.0, cuda-toolkit==13.0.2 and vllm because these package
+# versions have conflicting dependencies" — a too-new-interpreter symptom,
+# not a real incompatibility to route around). Building the venv with 3.14
+# anyway made this fail SILENTLY as a "best-effort, continue" venv full of
+# only `pip` — the venv existed and looked installed, but had no real
+# binary, so a doctor-style availability check reading its own set of
+# signals can go stale against that half-built state and report
+# available=true regardless.
+#
+# Prefer the newest of 3.13/3.12/3.11 found via PATH or common conda/
+# miniforge install roots (a common pattern on ML dev boxes; NOT hardcoded
+# to any one user's home — checks every $HOME under /home and this
+# installer's own invoking $HOME). Falls back to system python3 ONLY if
+# nothing better exists. Echoes the resolved interpreter path (or the
+# system python3 fallback) on stdout; callers capture it with $().
+#
+# Shared by cmd_install_vllm and cmd_install_synapse_engine — lifted out of
+# cmd_install_vllm (2026-07-16) so both heavy-ML-venv installers use the
+# identical interpreter-selection logic instead of two copies drifting apart.
+_gb_resolve_ml_python() {
+    local _py="" _cand _root
+    for _cand in python3.13 python3.12 python3.11; do
+        if command -v "$_cand" >/dev/null 2>&1; then
+            _py=$(command -v "$_cand")
+            break
+        fi
+    done
+    if [[ -z "$_py" ]]; then
+        for _root in "$HOME" /home/*; do
+            for _cand in .miniforge3 miniconda3 anaconda3 miniforge3; do
+                for _v in python3.13 python3.12 python3.11; do
+                    if [[ -x "$_root/$_cand/bin/$_v" ]]; then
+                        _py="$_root/$_cand/bin/$_v"
+                        break 3
+                    fi
+                done
+            done
+        done
+    fi
+    if [[ -z "$_py" ]]; then
+        _py=$(command -v python3)
+    fi
+    echo "$_py"
+}
+
 # cmd_install_vllm , provision a dedicated vLLM venv so gb-synapse's
 # VllmBackend (gb_synapse_backends.py) is available out of the box: token-less
 # safetensors pulls auto-route to vLLM+fp8 when this venv exists (owner
@@ -4538,57 +4612,18 @@ cmd_install_vllm() {
         return 0
     fi
 
-    # Pick an interpreter vLLM's own dependency chain (cuda-tile/cuda-toolkit
-    # pins, torch, etc.) can actually resolve against — NOT whatever `python3`
-    # happens to be. Real incident, 2026-07-16: on Ubuntu 26.04 the system
-    # `python3` is 3.14 (this OS ships nothing older via apt — confirmed, no
-    # python3.12/3.13 package exists in its default repos), and vLLM 0.24.0's
-    # own transitive pins have no resolution against 3.14 yet (`pip install
-    # vllm` failed with "Cannot install cuda-tile==1.4.0, cuda-tile==1.5.0,
-    # cuda-toolkit==13.0.2 and vllm because these package versions have
-    # conflicting dependencies" — a too-new-interpreter symptom, not a real
-    # incompatibility to route around). Building the venv with 3.14 anyway
-    # made this fail SILENTLY as a "best-effort, continue" venv full of only
-    # `pip` — the vllm-env existed and looked installed, but had no vllm
-    # binary, so `synapse_doctor`'s vllm_available check reads its own set of
-    # signals (see gb_synapse_backends._find_vllm_bin) which can go stale
-    # against that half-built state and report available=true regardless.
-    # Prefer the newest of 3.13/3.12/3.11 found via PATH or common conda/
-    # miniforge install roots (a common pattern on ML dev boxes; NOT
-    # hardcoded to any one user's home — checks every $HOME under /home and
-    # this installer's own invoking $HOME). Falls back to system python3
-    # ONLY if nothing better exists, with a loud warning rather than a silent
-    # doomed build.
-    local _vllm_py="" _cand _root
-    for _cand in python3.13 python3.12 python3.11; do
-        if command -v "$_cand" >/dev/null 2>&1; then
-            _vllm_py=$(command -v "$_cand")
-            break
-        fi
-    done
-    if [[ -z "$_vllm_py" ]]; then
-        for _root in "$HOME" /home/*; do
-            for _cand in .miniforge3 miniconda3 anaconda3 miniforge3; do
-                for _v in python3.13 python3.12 python3.11; do
-                    if [[ -x "$_root/$_cand/bin/$_v" ]]; then
-                        _vllm_py="$_root/$_cand/bin/$_v"
-                        break 3
-                    fi
-                done
-            done
-        done
-    fi
-    if [[ -z "$_vllm_py" ]]; then
-        _vllm_py=$(command -v python3)
-        _pyver=$("$_vllm_py" --version 2>&1)
+    local _vllm_py _pyver
+    _vllm_py=$(_gb_resolve_ml_python)
+    _pyver=$("$_vllm_py" --version 2>&1)
+    if [[ "$_pyver" =~ 3\.1[123]\. ]]; then
+        gb_info "vllm-env interpreter: $_vllm_py ($_pyver)"
+    else
         gb_warn "no 3.11-3.13 interpreter found (system python3 is $_pyver) — "
         gb_warn "building vllm-env with it anyway; if pip's resolver fails with a "
         gb_warn "'conflicting dependencies' error naming cuda-tile/cuda-toolkit, "
         gb_warn "that IS this: install python3.11/3.12/3.13 (conda/miniforge is the "
         gb_warn "easiest route when the OS repos don't package it, e.g. Ubuntu "
         gb_warn "26.04) and re-run 'greenboost install-vllm'"
-    else
-        gb_info "vllm-env interpreter: $_vllm_py ($("$_vllm_py" --version 2>&1))"
     fi
 
     local _venv="$GB_PY_DEST/vllm-env"
@@ -4621,6 +4656,104 @@ cmd_install_vllm() {
     fi
 
     gb_ok "vLLM installed  ($_venv/bin/vllm , gb_synapse_backends._find_vllm_bin() picks it up automatically)"
+}
+
+# cmd_install_synapse_engine , provision the torch-core inference engine
+# (vendored gLLM, synapse_engine/) that will become gb-synapse's default
+# safetensors backend (SynapseTorchBackend, a later phase of the gb-synapse
+# unification — vLLM/transformers are the live backends until then).
+#
+# Modeled on cmd_install_vllm: same $GB_PY_DEST-rooted system venv, same
+# best-effort discipline (a missing venv module, offline mode, or a pip
+# failure only warns , Full Install must never abort here), same
+# _gb_resolve_ml_python() interpreter selection (this is exactly the class of
+# heavy torch/cuda dependency chain that helper exists for).
+#
+# Default-ON: opt out with GB_INSTALL_SYNAPSE_ENGINE=0. GB_INSTALL_BNB=1 adds
+# the bitsandbytes extra. GB_TORCH_INDEX_URL, when set, is passed as
+# --extra-index-url (mirrors GB_TORCH_INDEX_URL usage elsewhere for boxes
+# behind a package mirror or needing a specific CUDA wheel index).
+# Called from: cmd_install (full-install) and the install-synapse-engine verb.
+cmd_install_synapse_engine() {
+    if [[ "${GB_INSTALL_SYNAPSE_ENGINE:-1}" == "0" ]]; then
+        gb_info "GB_INSTALL_SYNAPSE_ENGINE=0 — skipping synapse torch engine install (opt-out)"
+        return 0
+    fi
+    if [[ "${GB_OFFLINE:-0}" == "1" ]]; then
+        gb_warn "GB_OFFLINE=1 — skipping synapse torch engine install (needs pip network access)"
+        return 0
+    fi
+    if ! python3 -m venv --help >/dev/null 2>&1; then
+        gb_warn "python3 venv module unavailable — skipping synapse torch engine install (apt install python3-venv)"
+        return 0
+    fi
+
+    # Defensive, idempotent: don't assume cmd_install_python_files already
+    # ran (the install-synapse-engine verb can be invoked standalone).
+    if [[ -d "$MODULE_DIR/synapse_engine" ]]; then
+        if command -v rsync >/dev/null 2>&1; then
+            rsync -a --delete "$MODULE_DIR/synapse_engine/" "$GB_PY_DEST/synapse_engine/" 2>/tmp/gb_synapse_engine_sync.log \
+                || gb_warn "synapse_engine/ sync failed (see /tmp/gb_synapse_engine_sync.log)"
+        else
+            rm -rf "$GB_PY_DEST/synapse_engine"
+            cp -r "$MODULE_DIR/synapse_engine" "$GB_PY_DEST/synapse_engine"
+        fi
+    fi
+    if [[ ! -d "$GB_PY_DEST/synapse_engine" ]]; then
+        gb_warn "$GB_PY_DEST/synapse_engine missing — skipping synapse torch engine install"
+        return 0
+    fi
+
+    local _py
+    _py=$(_gb_resolve_ml_python)
+    local _pyver
+    _pyver=$("$_py" --version 2>&1)
+    if [[ "$_pyver" =~ 3\.1[123]\. ]]; then
+        gb_info "synapse-torch-env interpreter: $_py ($_pyver)"
+    else
+        gb_warn "no 3.11-3.13 interpreter found (system python3 is $_pyver) — "
+        gb_warn "building synapse-torch-env with it anyway; if pip's resolver fails, "
+        gb_warn "install python3.11/3.12/3.13 (conda/miniforge is the easiest route "
+        gb_warn "when the OS repos don't package it) and re-run "
+        gb_warn "'greenboost install-synapse-engine'"
+    fi
+
+    local _venv="$GB_PY_DEST/synapse-torch-env"
+    if [[ ! -d "$_venv" ]]; then
+        if ! "$_py" -m venv "$_venv" &>/tmp/gb_synapse_engine_venv.log; then
+            gb_warn "synapse-torch-env creation failed (see /tmp/gb_synapse_engine_venv.log) — skipping install"
+            return 0
+        fi
+    fi
+
+    local _pip_extra=""
+    [[ "${GB_INSTALL_BNB:-0}" == "1" ]] && _pip_extra="[bnb]"
+    local -a _pip_args=(install -q "$GB_PY_DEST/synapse_engine$_pip_extra")
+    [[ -n "${GB_TORCH_INDEX_URL:-}" ]] && _pip_args+=(--extra-index-url "$GB_TORCH_INDEX_URL")
+
+    gb_info "Installing the synapse torch engine into $_venv (multi-GB download) ..."
+    "$_venv/bin/pip" install --upgrade pip -q &>/tmp/gb_synapse_engine_pip.log || true
+    if ! "$_venv/bin/pip" "${_pip_args[@]}" &>>/tmp/gb_synapse_engine_pip.log; then
+        gb_warn "synapse torch engine pip install failed (see /tmp/gb_synapse_engine_pip.log) — skipping; gb-synapse falls back to vLLM/transformers for safetensors serving"
+        return 0
+    fi
+
+    # Make the gb_*.py orchestration modules ($GB_PY_DEST) importable inside
+    # the venv , same .pth mechanism cmd_install_vllm/cmd_install_cli use.
+    local _sp
+    for _sp in "$_venv"/lib/python3.*/site-packages; do
+        [[ -d "$_sp" ]] && echo "$GB_PY_DEST" > "$_sp/greenboost.pth"
+    done
+
+    if ! "$_venv/bin/python" -c "
+import torch, gllm, sgl_kernel
+assert torch.cuda.is_available(), 'torch.cuda.is_available() is False'
+" &>/tmp/gb_synapse_engine_smoke.log; then
+        gb_warn "synapse torch engine smoke test failed (see /tmp/gb_synapse_engine_smoke.log) — install may be incomplete"
+        return 0
+    fi
+
+    gb_ok "synapse torch engine installed  ($_venv , gb_synapse_backends picks it up via GB_SYNAPSE_TORCH_ENV / the default search path)"
 }
 
 # cmd_install_pipelines , provision the ai-forge pipeline dependencies that
@@ -11947,6 +12080,7 @@ cmd_wizard() {
         gb_menu_item  9  "Generate inference config"  "Optimized Ollama/HF config for this hardware & environment"
         gb_menu_item 10  "Build gb-synapse engine"   "From-source llama.cpp build (llama-server, rpc-server, llama-quantize)"  root
         gb_menu_item 20  "Install vLLM"              "gb-synapse VllmBackend venv (fp8-floor safetensors serving)"  root
+        gb_menu_item 21  "Install synapse torch engine"  "gb-synapse torch-core engine (vendored gLLM) into synapse-torch-env"  root
 
         gb_section "Restore"
         gb_menu_item 11  "Restore sys configs"       "Remove Ollama drop-in, udev rules, LD_PRELOAD, governor service"  root
@@ -11997,6 +12131,7 @@ cmd_wizard() {
             18) cmd_uninstall;                       gb_press_enter ;;
             19) cmd_install_python_files;            gb_press_enter ;;
             20) cmd_install_vllm;                    gb_press_enter ;;
+            21) cmd_install_synapse_engine;          gb_press_enter ;;
             q|Q|"") exit 0 ;;
             *) gb_warn_ui "Unknown option."; sleep 1 ;;
         esac
@@ -12242,6 +12377,7 @@ cmd_help() {
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-python"        "Copy gb_*.py orchestration stack to /usr/local/lib/greenboost/"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-cli"           "Install greenboost-cli (gb) into /usr/local/lib/greenboost/cli-venv"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-vllm"          "Install vLLM (gb-synapse VllmBackend) into /usr/local/lib/greenboost/vllm-env [GB_INSTALL_VLLM=0 to skip]"
+        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-synapse-engine" "Install the synapse torch engine (vendored gLLM) into synapse-torch-env [GB_INSTALL_SYNAPSE_ENGINE=0 to skip]"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-pipelines"     "Provision ai-forge pipeline deps (PaddleOCR etc.) via setup_*.sh"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "register-mcp"          "Register GreenBoost MCP servers with the Claude CLI (per-user)"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-sys-configs"   "Ollama drop-in, udev, governor, LD_PRELOAD, THP (all-in-one)"
@@ -12661,6 +12797,9 @@ cmd_full_install() {
 
     # 6 - gb-synapse engine (llama-server, rpc-server, llama-quantize),
     # from-source build against the CUDA toolkit installed in step 4b.
+    # Owner rule (2026-07-16): `sudo greenboost synapse build-engine` stays
+    # part of Full Install — NOT reuse-only — so a fresh `git clone` + Full
+    # Install always produces a working engine with zero manual steps.
     # Last step deliberately: needs CUDA + Python orchestration stack from
     # earlier steps already in place. Best-effort under set -euo pipefail —
     # a build failure (network hiccup fetching llama.cpp, disk space, a
@@ -12679,6 +12818,14 @@ cmd_full_install() {
     # synapse engine build above — a failure here shouldn't take down an
     # otherwise-successful Full Install.
     cmd_install_vllm || gb_warn_ui "vLLM install failed — retry later: sudo greenboost install-vllm"
+
+    # 7b - synapse torch engine (vendored gLLM, synapse_engine/). Default-on
+    # (opt-out GB_INSTALL_SYNAPSE_ENGINE=0); same best-effort discipline as
+    # the vLLM step above. This is a NEW, separate engine alongside vLLM
+    # (not yet a replacement — that cutover is a later phase of the
+    # gb-synapse unification, once SynapseTorchBackend lands), so both
+    # install steps run.
+    cmd_install_synapse_engine || gb_warn_ui "synapse torch engine install failed — retry later: sudo greenboost install-synapse-engine"
 
     # ── Final state guarantee (defects 2026-07-13) ───────────────────────
     # A Full Install must never end with the supervisor dead or the module
@@ -12902,6 +13049,7 @@ case "$COMMAND" in
     install-python|install_python) cmd_install_python_files ;;
     install-cli|install_cli)       cmd_install_cli           ;;
     install-vllm|install_vllm)     cmd_install_vllm          ;;
+    install-synapse-engine|install_synapse_engine) cmd_install_synapse_engine ;;
     install-pipelines|install_pipelines) cmd_install_pipelines ;;
     register-mcp|register_mcp)     cmd_register_mcp          ;;
     install-sys-configs)    cmd_install_sys_configs   ;;

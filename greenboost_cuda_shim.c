@@ -2251,10 +2251,12 @@ static int    gb_use_dmabuf         = 1;
 static int    gb_no_hostreg         = 0;
 static int    initialized           = 0;
 
-/* VCM-01: Deferred init - set when GREENBOOST_VLLM_COMPAT=1.
+/* VCM-01: Deferred init - set when GREENBOOST_DEFER_INIT=1 (new canonical
+ * name, 2026-07-16) or GREENBOOST_VLLM_COMPAT=1 (legacy alias, kept forever).
  * Shim constructor skips force-loading libcuda.so to prevent CUDA context
- * conflicts in vLLM EngineCore subprocesses.  Init completes lazily on the
- * first intercepted CUDA call once libcuda.so becomes resident in the process. */
+ * conflicts in vLLM/synapse-torch-engine EngineCore subprocesses.  Init
+ * completes lazily on the first intercepted CUDA call once libcuda.so
+ * becomes resident in the process. */
 static volatile int         gb_init_deferred = 0;
 static pthread_once_t       gb_resume_once   = PTHREAD_ONCE_INIT;
 
@@ -3544,7 +3546,10 @@ static void gb_write_stats(void)
     fprintf(f, "path_a_count=%u\n",           a);
     fprintf(f, "path_b_count=%u\n",           b);
     fprintf(f, "initialized=%d\n",            initialized);
-    fprintf(f, "vllm_compat=%d\n",            getenv("GREENBOOST_VLLM_COMPAT") ? 1 : 0);
+    /* defer_init: new canonical name (2026-07-16, gb-synapse backend wiring) -
+     * GREENBOOST_VLLM_COMPAT is kept as a legacy alias, never removed. */
+    fprintf(f, "defer_init=%d\n",
+            (getenv("GREENBOOST_DEFER_INIT") || getenv("GREENBOOST_VLLM_COMPAT")) ? 1 : 0);
     fprintf(f, "virtual_vram_mb=%zu\n",           gb_virtual_vram_bytes >> 20);
     fprintf(f, "physical_vram_mb=%zu\n",          gb_physical_vram_bytes >> 20);
     fprintf(f, "cluster_remote_vram_mb=%zu\n",    g_cluster_remote_vram_bytes >> 20);
@@ -4756,10 +4761,10 @@ static void gb_shim_init(void)
          * force-loading libcuda.so here causes CUDA context conflicts in
          * vLLM's EngineCore subprocess.  Defer until the first CUDA API call,
          * by which time vLLM has already initialized its own CUDA context. */
-        if (getenv("GREENBOOST_VLLM_COMPAT")) {
+        if (getenv("GREENBOOST_DEFER_INIT") || getenv("GREENBOOST_VLLM_COMPAT")) {
             gb_init_deferred = 1;
             if (gb_debug)
-                fprintf(stderr, "[GreenBoost] vLLM compat: deferred init pending first CUDA call\n");
+                fprintf(stderr, "[GreenBoost] deferred init pending first CUDA call\n");
             return;
         }
         if (!forced) {
@@ -9206,7 +9211,8 @@ CUresult cuGetProcAddress(const char *symbol, void **pfn, int driverVersion,
     CUresult res;
     pfn_cuGetProcAddress fn = real_cuGetProcAddress;
     if (!fn) {
-        /* VCM-02: deferred init pending (GREENBOOST_VLLM_COMPAT=1) — resolve via
+        /* VCM-02: deferred init pending (GREENBOOST_DEFER_INIT=1 or the legacy
+         * GREENBOOST_VLLM_COMPAT=1) — resolve via
          * RTLD_NEXT so PyTorch cu130+ gets valid driver function pointers during
          * its own CUDA initialization (which happens before the first cuMemGetInfo
          * or cudaMalloc that triggers gb_try_resume_deferred).  Without this,

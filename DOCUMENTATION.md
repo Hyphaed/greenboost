@@ -116,7 +116,7 @@ this cycle builds on the v3.1 telemetry/orchestrator foundation:
 - Cross-node split rides llama.cpp's own `--rpc` backend (layer-granular,
   only activations cross the wire) while the GreenBoost shim keeps extending
   each node's own share into that node's local RAM/disk underneath it.
-- One port (`:11434`) speaks Ollama's API, OpenAI's API, and HuggingFace TGI
+- One port (`:11435`) speaks Ollama's API, OpenAI's API, and HuggingFace TGI
   at once, so existing tooling doesn't need to change. See § gb-synapse below
   and [GREENBOOST_COMMANDS.md](GREENBOOST_COMMANDS.md#-gb-synapse-huggingface-native-cluster-distributed-gguf-serving).
 
@@ -1719,7 +1719,7 @@ greenboost recommend                       # which pulled models fit the live cl
 sudo greenboost synapse login [TOKEN]      # store a HuggingFace token
 sudo greenboost pull <repo>[:quant] [name] # download a GGUF
 sudo greenboost synapse build-engine       # build llama-server/llama-cli/rpc-server (run on every node)
-greenboost synapse run <model> [port]      # serve it, cluster-aware, default :11434
+greenboost synapse run <model> [port]      # serve it, cluster-aware, default :11435
 greenboost synapse ps                      # what's running
 greenboost synapse stop <model>
 ```
@@ -1772,7 +1772,7 @@ cd greenboost_synapse_cli_new
 python synapse_cli.py --model "qwen3.6:latest"
 ```
 
-This routes through the Ollama backend (`localhost:11434`). GreenBoost provides the extended memory (T2+T3+cluster) so the 35B model fits even when local VRAM is smaller than the model size. Enable TurboQuant before loading for best throughput:
+This routes through the Ollama backend (`localhost:11435`). GreenBoost provides the extended memory (T2+T3+cluster) so the 35B model fits even when local VRAM is smaller than the model size. Enable TurboQuant before loading for best throughput:
 
 ```bash
 sudo greenboost turboquant on

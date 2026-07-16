@@ -103,7 +103,7 @@ MANIFEST_FILE = MODEL_STORE_DIR / "manifest.json"
 RUN_DIR = Path(os.environ.get("GB_SYNAPSE_RUN_DIR", "/run/greenboost/synapse"))
 SLOT_DIR = Path(os.environ.get("GB_SYNAPSE_SLOT_DIR", "/var/lib/greenboost/synapse/slots"))
 
-DEFAULT_PORT = 11434
+DEFAULT_PORT = int(os.environ.get("GB_SYNAPSE_PORT", "11435"))
 RPC_PORT_BASE = 50052
 _SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
              "-o", "StrictHostKeyChecking=accept-new"]
@@ -321,17 +321,21 @@ def engine_version() -> str:
 def status() -> dict:
     """Gb-Synapse status in one dict: engine built (llama-server + rpc-server
     present in ENGINE_DIR) + version, and whether a gb-synapse llama-server
-    and/or the :11434 Ollama/OpenAI proxy (gb_synapse_api) are running now.
+    and/or the gb-synapse Ollama/OpenAI proxy (gb_synapse_api, default port
+    11435, GB_SYNAPSE_PORT) are running now.
 
     Single source of truth for the `synapse_status` MCP tools (gb_dataflux_mcp,
     gb_synapse_mcp, gb_mcp) and the `status` CLI verb. Matches gb-synapse's OWN
     engine path — not ollama's internal llama-server."""
     import subprocess
+    torch_env = gb_synapse_backends._torch_env_dir()
     out = {"engine_built": engine_installed(),
            "engine_version": engine_version() or None,
            "server_running": False, "proxy_running": False,
            "engine_dir": str(ENGINE_DIR),
-           "vllm_available": gb_synapse_backends._find_vllm_bin() is not None}
+           "vllm_available": gb_synapse_backends._find_vllm_bin() is not None,
+           "torch_engine_ready": torch_env is not None,
+           "torch_engine_env": str(torch_env) if torch_env else ""}
     for key, pat in (("server_running", f"{ENGINE_DIR}/llama-server"),
                      ("proxy_running", "gb_synapse_api")):
         try:
@@ -355,10 +359,16 @@ class ModelEntry:
     source: str = "hf"          # "hf" | "ollama"
     repo: str = ""
     quant: str = ""
+    quant_method: str = ""      # "" | "gptq" | "awq" | "fp8" |
+                                # "compressed-tensors" | "bitsandbytes" —
+                                # checkpoint truth from read_quant_config(),
+                                # never a routing token guess.
+    quant_bits: int = 0
     arch: str = ""
-    engine: str = "llama.cpp"   # "llama.cpp" | "vllm" | "transformers" | "diffusers"
-                                # (legacy "gbquant" values are normalized to
-                                # "vllm" on manifest load — see _load_manifest)
+    engine: str = "llama.cpp"   # "llama.cpp" | "torch" | "diffusers"
+                                # (legacy on disk: "gbquant"/"vllm"/
+                                # "transformers" values are all normalized to
+                                # "torch" on manifest load — see _load_manifest)
     n_bytes: int = 0
     n_layers: int = 0
     is_moe: bool = False
@@ -385,13 +395,15 @@ def _load_manifest() -> dict[str, ModelEntry]:
         raw = json.loads(MANIFEST_FILE.read_text())
         out = {}
         for k, v in raw.items():
-            if v.get("engine") == "gbquant":
-                # Pre-taxonomy manifests: "gbquant" meant "vLLM if installed,
-                # else transformers" — normalize to "vllm" on read so every
-                # in-memory ModelEntry uses the current 4-value taxonomy.
-                # select_backend() still honours a raw "gbquant" value for
-                # any caller that constructs a ModelEntry directly.
-                v = {**v, "engine": "vllm"}
+            if v.get("engine") in ("gbquant", "vllm", "transformers"):
+                # Pre-torch-core manifests: "gbquant" (pre-taxonomy),
+                # "vllm", and "transformers" all meant "whatever backend
+                # handles safetensors" — normalize to "torch" on read so
+                # every in-memory ModelEntry uses the current 3-value
+                # taxonomy (llama.cpp | torch | diffusers). select_backend()
+                # still honours these legacy raw values for any caller that
+                # constructs a ModelEntry directly.
+                v = {**v, "engine": "torch"}
             out[k] = ModelEntry(**v)
         return out
     except (OSError, json.JSONDecodeError, TypeError):
@@ -598,35 +610,78 @@ def _pull_and_convert(repo: str, quant: str, name: str | None) -> ModelEntry:
 _GBQUANT_TOKENS = {"FP8", "INT8", "INT4"}
 
 
-def _pull_gbquant(repo: str, quant: str, name: str | None, engine: str = "vllm") -> ModelEntry:
-    """Fetch the safetensors snapshot for gb-quant serving (vLLM's on-the-fly
-    native quantization, or the transformers fallback, both quantize at load
-    time — no GGUF conversion needed here, unlike _pull_and_convert).
+_QUANT_METHOD_TOKEN = {
+    "fp8": "FP8",
+    "gptq": "GPTQ{bits}",
+    "awq": "AWQ{bits}",
+    "compressed-tensors": "CT-W{bits}",
+    "bitsandbytes": "BNB{bits}",
+}
 
-    `engine` defaults to "vllm" (select_backend falls back to transformers
-    automatically when the vLLM venv isn't installed); pass "transformers"
-    explicitly to pin the fallback engine regardless of vLLM availability."""
+
+def _quant_display_token(quant_method: str, quant_bits: int) -> str:
+    """The manifest's human-facing `quant` string for a checkpoint whose
+    quantization was detected from its own config.json (read_quant_config),
+    not chosen by the user — e.g. "GPTQ4", "FP8", "CT-W8". Empty for an
+    unrecognized/absent method."""
+    tmpl = _QUANT_METHOD_TOKEN.get(quant_method, "")
+    return tmpl.format(bits=quant_bits) if tmpl else ""
+
+
+def _pull_torch(repo: str, quant: str, name: str | None, engine: str = "torch") -> ModelEntry:
+    """Fetch the safetensors (or `.bin`) snapshot for torch-core serving
+    (vLLM's on-the-fly native quantization, or the transformers fallback,
+    both quantize at load time — no GGUF conversion needed here, unlike
+    _pull_and_convert).
+
+    Never re-quantizes an already-quantized checkpoint: `read_quant_config`
+    (folded into `safetensors_summary`'s returned meta) is the checkpoint's
+    OWN truth — when it reports a real quant_method, that overrides whatever
+    quant token the caller passed (with a loud warning if the two actually
+    disagree), because serving a GPTQ/AWQ/FP8/compressed-tensors/bnb
+    checkpoint AS IF it were a plain bf16 one to be re-quantized would
+    silently double-quantize it.
+
+    `engine` defaults to "torch" (select_backend currently routes that like
+    "vllm": prefer the vLLM backend, fall back to transformers automatically
+    when the vLLM venv isn't installed); pass "transformers" explicitly to
+    pin the fallback engine regardless of vLLM availability."""
     from huggingface_hub import snapshot_download
     cache_dir = str(MODEL_STORE_DIR / "_hf_cache")
     local_dir = snapshot_download(
         repo_id=repo, token=hf_token(), cache_dir=cache_dir,
-        allow_patterns=["*.safetensors", "*.json", "*.model", "*.txt", "tokenizer*"],
+        allow_patterns=["*.safetensors", "*.bin", "*.json", "*.model", "*.txt", "tokenizer*"],
+        ignore_patterns=["training_args.bin"],
     )
     entry_name = name or repo.split("/")[-1]
     meta = safetensors_summary(local_dir)
+    checkpoint_quant = meta.get("quant_method", "")
+    requested = (quant or "").upper()
+    if checkpoint_quant:
+        display = _quant_display_token(checkpoint_quant, meta.get("quant_bits", 0))
+        if requested and requested != display:
+            print(f"[gb-synapse] checkpoint is already {checkpoint_quant}-quantized — "
+                 f"serving it as-is (ignoring :{requested})")
+        quant_token = display or requested or "BF16"
+    else:
+        quant_token = requested or "BF16"
     entry = ModelEntry(name=entry_name, path=local_dir, source="hf", repo=repo,
-                        engine=engine, quant=quant.upper(), added_ts=time.time(), **meta)
+                        engine=engine, quant=quant_token, added_ts=time.time(), **meta)
     manifest = _load_manifest()
     manifest[entry_name] = entry
     _save_manifest(manifest)
     return entry
 
 
+# Kept for one release: pre-torch-core callers still spell this name.
+_pull_gbquant = _pull_torch
+
+
 def _pull_diffusers(repo: str, name: str | None) -> ModelEntry:
     """Fetch a full HF diffusers pipeline tree (model_index.json + every
     component subfolder) for DiffusersBackend's image server. No GGUF
     conversion — diffusers loads the safetensors/config layout directly.
-    Same cache-discipline as _pull_gbquant (MODEL_STORE_DIR/_hf_cache, so a
+    Same cache-discipline as _pull_torch (MODEL_STORE_DIR/_hf_cache, so a
     re-pull never re-downloads from scratch)."""
     from huggingface_hub import snapshot_download
     cache_dir = str(MODEL_STORE_DIR / "_hf_cache")
@@ -643,44 +698,57 @@ def _pull_diffusers(repo: str, name: str | None) -> ModelEntry:
     return entry
 
 
+# Deprecated `pull(engine=...)` spellings, mapped to the current taxonomy's
+# single safetensors-checkpoint backend name. Kept for one release.
+_DEPRECATED_ENGINE_ALIASES = {"vllm": "torch", "transformers": "torch"}
+
+
 def pull(repo_spec: str, name: str | None = None, engine: str = "") -> ModelEntry:
     """Download a GGUF from HuggingFace — or, if the repo has no native GGUF
     release, route it to whichever engine actually serves it (see
-    _pull_and_convert / _pull_gbquant / _pull_diffusers).
+    _pull_and_convert / _pull_torch / _pull_diffusers).
 
     repo_spec is "org/repo" or "org/repo:QUANT". QUANT is either a GGUF quant
     token (Q4_K_M, Q8_0, ...) served through llama.cpp, or FP8/INT8/INT4 to
-    route through gb-quant (vLLM if installed, else transformers).
+    route through torch-core (vLLM if installed, else transformers).
 
     With no quant and no explicit `engine`, the repo's own file listing
     decides once it turns out to have no GGUF release: a diffusers
     `model_index.json` routes to the image backend; a token-less safetensors
-    repo routes to vLLM at fp8 quality when the vLLM venv exists (falls back
-    to GGUF conversion otherwise, same as before this routing existed). A
-    repo WITH a GGUF release still picks the largest quant that fits the
-    live cluster's aggregate VRAM, same as always.
+    (or `.bin`) repo routes to torch-core at fp8 quality when the vLLM venv
+    exists (falls back to GGUF conversion otherwise, same as before this
+    routing existed). A repo WITH a GGUF release still picks the largest
+    quant that fits the live cluster's aggregate VRAM, same as always.
 
-    `engine` (also `--engine` on the CLI) overrides detection outright , one
-    of "vllm"/"transformers"/"diffusers"; use it when a repo's own layout is
-    ambiguous. Multi-shard GGUFs ("...-00001-of-00003.gguf") pull every
-    shard; llama.cpp loads the first and follows the split chain itself.
+    `engine` (also `--engine` on the CLI) overrides detection outright, one
+    of "torch"/"diffusers"; use it when a repo's own layout is ambiguous.
+    "vllm"/"transformers" are still accepted as deprecated aliases for
+    "torch" (printed note, no behavior loss for the common case — a
+    checkpoint's OWN quant_method, not this flag, decides how it's actually
+    quantized; see _pull_torch). Multi-shard GGUFs
+    ("...-00001-of-00003.gguf") pull every shard; llama.cpp loads the first
+    and follows the split chain itself.
     """
     repo, _, quant = repo_spec.partition(":")
     quant_u = quant.upper()
 
+    if engine in _DEPRECATED_ENGINE_ALIASES:
+        print(f"[gb-synapse] --engine {engine!r} is deprecated — mapped to "
+             f"\"torch\" (the current taxonomy's single safetensors backend name)")
+        engine = _DEPRECATED_ENGINE_ALIASES[engine]
+
     if engine == "diffusers":
         return _pull_diffusers(repo, name)
-    if engine in ("vllm", "transformers") or quant_u in _GBQUANT_TOKENS:
-        return _pull_gbquant(repo, quant or "fp8", name,
-                             engine=engine or "vllm")
+    if engine == "torch" or quant_u in _GBQUANT_TOKENS:
+        return _pull_torch(repo, quant or "fp8", name, engine="torch")
 
     files = list_repo_gguf(repo)
     if not files and not quant and not engine:
         fmt = gb_synapse_backends.detect_format(repo)
         if fmt == "diffusers":
             return _pull_diffusers(repo, name)
-        if fmt == "safetensors" and gb_synapse_backends._find_vllm_bin():
-            return _pull_gbquant(repo, "fp8", name)
+        if fmt == "safetensors" and gb_synapse_backends.SynapseTorchBackend().available():
+            return _pull_torch(repo, "fp8", name)
     if not files:
         return _pull_and_convert(repo, quant, name)
 
@@ -961,6 +1029,68 @@ def gguf_summary(path: str) -> dict:
     return result
 
 
+def read_quant_config(path_or_repo: str) -> dict:
+    """Checkpoint-truth quantization detection: parse `quantization_config`
+    (or `text_config.quantization_config` for nested multimodal configs) out
+    of a local checkpoint dir's `config.json`, or (for a bare "org/repo" that
+    doesn't exist locally) fetch just that one file from the HF Hub.
+
+    Returns `{"quant_method": "gptq"|"awq"|"fp8"|"compressed-tensors"|
+    "bitsandbytes"|"", "quant_bits": int}` — best-effort, `{}` on any
+    failure (missing config, malformed JSON, network error, unrecognized
+    shape). Never raises: this feeds routing decisions (P1.6's `pull()`),
+    where a metadata gap should degrade to "treat as an unquantized
+    checkpoint", not abort the pull."""
+    try:
+        if Path(path_or_repo).is_dir():
+            cfg = json.loads((Path(path_or_repo) / "config.json").read_text())
+        else:
+            from huggingface_hub import hf_hub_download
+            local = hf_hub_download(repo_id=path_or_repo, filename="config.json",
+                                    token=hf_token())
+            cfg = json.loads(Path(local).read_text())
+        tc = cfg.get("text_config", cfg)
+        qc = tc.get("quantization_config") or cfg.get("quantization_config")
+        if not qc:
+            return {}
+
+        method = (qc.get("quant_method") or "").lower()
+        if not method:
+            # bnb configs and some compressed-tensors exports carry no
+            # quant_method key at all — infer from the fields that are there.
+            if qc.get("load_in_4bit") or qc.get("load_in_8bit"):
+                method = "bitsandbytes"
+            elif "config_groups" in qc:
+                method = "compressed-tensors"
+            else:
+                return {}
+
+        if method == "fp8":
+            bits = 8
+        elif method in ("gptq", "awq"):
+            bits = int(qc.get("bits") or 0)
+        elif method == "bitsandbytes":
+            bits = 4 if qc.get("load_in_4bit") else 8
+        elif method == "compressed-tensors":
+            groups = [g for g in (qc.get("config_groups") or {}).values()
+                      if isinstance(g, dict)]
+            # A float-quantized (fp8) group carries no meaningful int "bits"
+            # the way int schemes do — normalize to fp8's own bucket rather
+            # than reporting a misleading bit count.
+            if any(g.get("weights", {}).get("type") == "float" for g in groups):
+                method, bits = "fp8", 8
+            else:
+                group_bits = [int(g["weights"]["num_bits"]) for g in groups
+                              if "weights" in g and "num_bits" in g["weights"]]
+                bits = min(group_bits) if group_bits else 0
+        else:
+            return {}
+
+        return {"quant_method": method, "quant_bits": bits}
+    except Exception:
+        return {}
+
+
 def safetensors_summary(local_dir: str) -> dict:
     """gguf_summary()'s counterpart for a safetensors snapshot (vLLM/
     transformers-routed pulls, `_pull_gbquant`). Real gap found live
@@ -977,9 +1107,12 @@ def safetensors_summary(local_dir: str) -> dict:
     root = Path(local_dir)
     result = {"n_bytes": 0, "n_layers": 0, "is_moe": False, "n_experts": 0,
               "n_experts_used": 0, "dense_bytes": 0, "expert_bytes": 0,
-              "ctx_length": 0, "arch": "", "n_kv_heads": 0, "head_dim": 0}
+              "ctx_length": 0, "arch": "", "n_kv_heads": 0, "head_dim": 0,
+              "quant_method": "", "quant_bits": 0}
     try:
         n_bytes = sum(f.stat().st_size for f in root.glob("*.safetensors"))
+        n_bytes += sum(f.stat().st_size for f in root.glob("*.bin")
+                       if f.name != "training_args.bin")
         cfg = json.loads((root / "config.json").read_text())
     except (OSError, ValueError):
         return result
@@ -1002,6 +1135,7 @@ def safetensors_summary(local_dir: str) -> dict:
         # accepted granularity gap, not guessed: dense_bytes/expert_bytes
         # stay 0 for MoE safetensors models rather than a wrong split.
     })
+    result.update(read_quant_config(local_dir))
     return result
 
 
@@ -1026,6 +1160,28 @@ def _engine_supported_archs() -> set[str]:
     except (OSError, IndexError):
         pass  # source not vendored/found — skip the check rather than false-block
     _ARCH_CACHE = archs
+    return archs
+
+
+_TORCH_ARCH_CACHE: set[str] | None = None
+
+
+def _torch_engine_supported_archs() -> set[str]:
+    """Architectures the vendored synapse torch engine (gLLM) actually
+    implements, parsed from its own model_loader.get_model_type() if/elif
+    chain (synapse_engine/gllm/model_loader.py) so this never drifts from
+    whatever engine version is actually vendored — same pattern as
+    _engine_supported_archs() for llama.cpp."""
+    global _TORCH_ARCH_CACHE
+    if _TORCH_ARCH_CACHE is not None:
+        return _TORCH_ARCH_CACHE
+    archs: set[str] = set()
+    try:
+        text = (_REPO_DIR / "synapse_engine" / "gllm" / "model_loader.py").read_text()
+        archs = set(re.findall(r'self\.architecture == "([A-Za-z0-9_]+)"', text))
+    except OSError:
+        pass  # fork not vendored/found — skip the check rather than false-block
+    _TORCH_ARCH_CACHE = archs
     return archs
 
 
@@ -1076,6 +1232,7 @@ def doctor(probe_feeders: bool = True) -> dict:
             feeder_reports.append({"hostname": f.hostname or f.ip, "online": False,
                                     "error": f.error})
 
+    torch_env = gb_synapse_backends._torch_env_dir()
     return {
         "host_gpu_name": nv.device_name() or "unknown GPU",
         "host_vram_total_mb": host_total_mb, "host_vram_free_mb": host_free_mb,
@@ -1088,6 +1245,8 @@ def doctor(probe_feeders: bool = True) -> dict:
         "hf_token_set": hf_token() is not None,
         "cluster_configured": bool(fs),
         "vllm_available": gb_synapse_backends._find_vllm_bin() is not None,
+        "torch_engine_ready": torch_env is not None,
+        "torch_engine_env": str(torch_env) if torch_env else "",
     }
 
 
@@ -1946,8 +2105,10 @@ def _wait_proxy_ready(proxy_proc: subprocess.Popen, port: int, label: str,
     if proxy_proc.poll() is not None:
         return (f"proxy exited during startup (rc={proxy_proc.returncode})\n"
                 f"{_upstream_log_tail(label)}")
-    return (f"proxy never answered /health with 200 within {grace_s}s — "
-            f"something else may already be listening on :{port}")
+    hint = ("raw ollama.service may own :11434 — gb-synapse now defaults to "
+             f":{DEFAULT_PORT}; set GB_SYNAPSE_PORT to change" if port == 11434 else
+             f"something else may already be listening on :{port}")
+    return f"proxy never answered /health with 200 within {grace_s}s — {hint}"
 
 
 def _health_says_loading(body: bytes) -> bool:
@@ -2023,9 +2184,9 @@ def _launch_proxy_and_record(entry: ModelEntry, upstream: subprocess.Popen, port
     try:
         ready = _wait_upstream_ready(entry, upstream, internal_port)
     except RuntimeError as e:
-        # No proxy is started for a dead engine: a proxy on :11434 in front of
-        # nothing is what turns "the model failed to load" into "connection
-        # closed mid-stream" three layers away.
+        # No proxy is started for a dead engine: a proxy in front of nothing
+        # is what turns "the model failed to load" into "connection closed
+        # mid-stream" three layers away.
         _emit_serve(entry, "error", error=str(e).splitlines()[0],
                     load_s=round(time.time() - t0, 1), **common)
         raise
@@ -2084,16 +2245,34 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
                          n_slots=n_slots, extra_args=extra_args)
 
 
+def _kill_process_group(pid: int) -> None:
+    """SIGTERM the whole process group `pid` leads, not just `pid` itself.
+
+    Every engine is launched with `start_new_session=True` (its own PID
+    becomes the process-group leader), so this reaches any detached child
+    the engine spawns. Real leak found live 2026-07-16: the synapse torch
+    engine (gLLM) spawns a `multiprocessing.spawn_main` worker that does
+    NOT receive a plain `os.kill(llama_pid, SIGTERM)` — killing only the
+    tracked PID left that worker running and holding ~10 GB of VRAM
+    (confirmed via nvidia-smi) after `stop()` reported success. Falls back
+    to a plain single-PID kill if the process group is already gone
+    (ESRCH) or `pid` was never a group leader (older run-state)."""
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except OSError:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+
 def stop(model: str) -> bool:
     for st in _read_run_states():
         if st.model != model:
             continue
         for pid in (st.llama_pid, st.proxy_pid):
             if _pid_alive(pid):
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except OSError:
-                    pass
+                _kill_process_group(pid)
         _run_state_path(model).unlink(missing_ok=True)
         return True
     return False
@@ -2128,6 +2307,8 @@ def _format_doctor(d: dict) -> str:
                  f"{d['aggregate_ram_mb'] / 1024:.1f} GB RAM")
     lines.append("Engine:     " + (f"built ({d['engine_version']})" if d['engine_installed']
                  else "NOT BUILT — run: greenboost synapse build-engine"))
+    lines.append("Torch core: " + (f"ready ({d['torch_engine_env']})" if d.get('torch_engine_ready')
+                 else "missing — run: sudo greenboost install-synapse-engine"))
     lines.append("HF token:   " + ("set" if d['hf_token_set']
                  else "NOT SET — run: greenboost synapse login"))
     return "\n".join(lines)
@@ -2157,7 +2338,7 @@ def _cli_main(argv: list[str]) -> int:
     elif verb == "pull":
         if not rest:
             print("usage: gb_synapse.py pull <repo>[:quant] [name] "
-                  "[--engine llama.cpp|vllm|transformers|diffusers]", file=sys.stderr)
+                  "[--engine llama.cpp|torch|diffusers]", file=sys.stderr)
             return 2
         engine = ""
         if "--engine" in rest:

@@ -1,0 +1,730 @@
+from typing import Optional
+
+import torch
+import torch.nn as nn
+from logger import logger
+
+from gllm.dist_utils import (
+    get_pp_layers,
+    get_tp_size,
+    is_dp_attn,
+    is_first_pp_rank,
+    is_last_pp_rank,
+    tensor_model_parallel_all_reduce,
+)
+from gllm.input_data import InputData
+from gllm.layers.activation import SiluAndMul
+from gllm.layers.attention import FlashAttention, MLAAttention
+from gllm.layers.layernorm import RMSNorm
+from gllm.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
+from gllm.layers.moe import FusedMoE
+from gllm.layers.rotary_embedding import YaRNScalingRotaryEmbedding
+from gllm.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from gllm.modules.attention import Attention
+from gllm.utils import yarn_get_mscale
+
+from .qwen2 import Qwen2ForCausalLM
+from .qwen2_moe import Qwen2MoeForCausalLM
+from .utils import dp_ep_moe_routed, extract_rope_config
+from .weight_loader import (
+    WeightRule,
+    contains,
+    h_proj_dim0,
+    h_qkv_a_proj,
+    make_w13_loader,
+    make_w2_loader,
+)
+
+
+class DeepseekV2MLP(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size,
+        intermediate_size,
+        reduce_results: bool = True,
+        quant_config=None,
+    ):
+        super().__init__()
+
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config
+        )
+
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            reduce_results=reduce_results,
+        )
+
+        self.act_fn = SiluAndMul()
+
+    def forward(self, x):
+        return self.down_proj(self.act_fn(self.gate_up_proj(x)))
+
+
+class DeepseekV2MOE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        dense_quant_config = getattr(config, "quantization_config", None)
+        moe_quant_config = getattr(config, "moe_quantization_config", dense_quant_config)
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.n_shared_experts: int = config.n_shared_experts
+        self.gate = ReplicatedLinear(
+            config.hidden_size,
+            config.n_routed_experts,
+            bias=False,
+        )
+        if config.topk_method == "noaux_tc":
+            self.gate.e_score_correction_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=torch.float32)
+            )
+        else:
+            self.gate.e_score_correction_bias = None
+
+        self.experts = FusedMoE(
+            num_experts=config.n_routed_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            reduce_results=False,
+            renormalize=config.norm_topk_prob,
+            use_grouped_topk=True,
+            num_expert_group=config.n_group,
+            topk_group=config.topk_group,
+            scoring_func=config.scoring_func,
+            e_score_correction_bias=self.gate.e_score_correction_bias,
+            quant_config=moe_quant_config,
+        )
+
+        if config.n_shared_experts is not None:
+            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+            self.shared_experts = DeepseekV2MLP(
+                config.hidden_size,
+                intermediate_size,
+                reduce_results=False,
+                quant_config=dense_quant_config,
+            )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        if is_dp_attn():
+            return self._forward_dp_ep(hidden_states, num_tokens, hidden_dim)
+        if self.n_shared_experts is not None:
+            shared_output = self.shared_experts(hidden_states)
+        # router_logits: (num_tokens, n_experts)
+        router_logits = self.gate(hidden_states)
+
+        if hidden_states.dtype != torch.float16:
+            final_hidden_states = (
+                self.experts(hidden_states=hidden_states, router_logits=router_logits)
+                * self.routed_scaling_factor
+            )
+        else:
+            # Fix FP16 overflow
+            # See DeepseekV2DecoderLayer for more details.
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
+        if shared_output is not None:
+            if hidden_states.dtype != torch.float16:
+                final_hidden_states = final_hidden_states + shared_output
+            else:
+                # Fix FP16 overflow
+                # See DeepseekV2DecoderLayer for more details.
+                final_hidden_states = final_hidden_states + shared_output * (
+                    1.0 / self.routed_scaling_factor
+                )
+
+        if get_tp_size() > 1:
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        return final_hidden_states.view(num_tokens, hidden_dim)
+
+    def _forward_dp_ep(
+        self, hidden_states: torch.Tensor, num_tokens: int, hidden_dim: int
+    ) -> torch.Tensor:
+        """DP-attention + Expert-Parallel MoE (``EP = DP x TP``, TP=1 here).
+
+        Each replica arrives with only *its own* tokens. The routed experts are
+        sharded across the whole DP group, so we:
+
+        1. run the (dense, replicated) shared experts on the local tokens;
+        2. all-gather every replica's tokens into the global batch;
+        3. run this replica's local expert shard over the global batch
+           (``reduce_results=False`` -> partial, non-local rows are zero);
+        4. all-reduce over the DP/EP group so every token accumulates the
+           contribution of *all* its top-k experts wherever they live;
+        5. slice this replica's own rows back out and fold in the shared output.
+
+        ``get_dp_forward_counts`` gives the per-replica row counts (published by
+        the worker each iteration). It is ``None`` only during the profile /
+        graph-warmup dummy forward, where every replica runs the same batch, so
+        a symmetric gather (``num_tokens`` per replica) is exact.
+        """
+        shared_output = None
+        if self.n_shared_experts is not None:
+            shared_output = self.shared_experts(hidden_states)
+            # The shared experts are dense and TP-sharded with
+            # ``reduce_results=False`` (the non-DP path relies on the single
+            # trailing TP all-reduce to sum them). Here the trailing reduce is
+            # replaced by the EP all-reduce on the *routed* output only, so the
+            # shared partials must be summed across the TP subgroup explicitly.
+            if get_tp_size() > 1:
+                shared_output = tensor_model_parallel_all_reduce(shared_output)
+
+        routed = dp_ep_moe_routed(self.experts, self.gate, hidden_states, num_tokens)
+
+        if hidden_states.dtype != torch.float16:
+            final_hidden_states = routed * self.routed_scaling_factor
+            if shared_output is not None:
+                final_hidden_states = final_hidden_states + shared_output
+        else:
+            # Fix FP16 overflow (see DeepseekV2DecoderLayer).
+            final_hidden_states = routed
+            if shared_output is not None:
+                final_hidden_states = final_hidden_states + shared_output * (
+                    1.0 / self.routed_scaling_factor
+                )
+
+        return final_hidden_states.view(num_tokens, hidden_dim)
+
+
+class DeepseekV2Attention(Attention):
+
+    def __init__(self, layer_id: int, config):
+        quant_config = getattr(config, "quantization_config", None)
+        self.hidden_size = config.hidden_size
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        super().__init__(
+            config.num_attention_heads,
+            config.num_attention_heads,
+            self.hidden_size,
+            self.qk_head_dim,
+        )
+        self.v_head_dim = config.v_head_dim
+        self.q_lora_rank = (
+            config.q_lora_rank if hasattr(config, "q_lora_rank") else None
+        )
+        self.kv_lora_rank = config.kv_lora_rank
+        self.rope_theta, rope_scaling = extract_rope_config(
+            config, default_theta=10000.0
+        )
+        self.max_poistion_embeddings = getattr(config, "max_position_embeddings", 8192)
+        if rope_scaling is None:
+            self.rope_scaling = {
+                "factor": 1.0,
+                "original_max_position_embeddings": self.max_poistion_embeddings,
+            }
+        else:
+            self.rope_scaling = dict(rope_scaling)
+            self.rope_scaling.setdefault("factor", 1.0)
+            self.rope_scaling.setdefault(
+                "original_max_position_embeddings", self.max_poistion_embeddings
+            )
+
+        if self.q_lora_rank is not None:
+            self.q_a_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.q_lora_rank,
+                bias=False,
+                quant_config=quant_config,
+            )
+            self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            self.q_b_proj = ColumnParallelLinear(
+                self.q_lora_rank,
+                self.total_num_heads * self.qk_head_dim,
+                bias=False,
+                quant_config=quant_config,
+            )
+        else:
+            self.q_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.total_num_heads * self.qk_head_dim,
+                bias=False,
+                quant_config=quant_config,
+            )
+
+        self.kv_a_proj_with_mqa = ReplicatedLinear(
+            self.hidden_size,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            bias=False,
+            quant_config=quant_config,
+        )
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
+        self.kv_b_proj = ColumnParallelLinear(
+            self.kv_lora_rank,
+            self.total_num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=False,
+            quant_config=quant_config,
+        )
+        # O projection
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.v_head_dim,
+            self.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+        )
+
+        if self.rope_scaling:
+            self.rope_scaling["rope_type"] = "deepseek_yarn"
+            mscale_all_dim = self.rope_scaling.get("mscale_all_dim", False)
+            scaling_factor = self.rope_scaling["factor"]
+            mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+            self.scaling = self.scaling * mscale * mscale
+
+        extra_kwargs = {
+            k: v
+            for k, v in self.rope_scaling.items()
+            if k in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow")
+        }
+        # DeepSeek/Kimi YaRN: the cos/sin amplitude is the ratio
+        # ``yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor,
+        # mscale_all_dim)`` (see YaRNScalingRotaryEmbedding). The softmax
+        # ``self.scaling`` above already carries ``mscale_all_dim``'s term, so
+        # the rope must use the ratio form -- not the generic single-term
+        # ``yarn_get_mscale(factor)`` -- otherwise the RoPE-part attention
+        # score is doubled.
+        if self.rope_scaling:
+            extra_kwargs["mscale"] = float(self.rope_scaling.get("mscale", 1))
+            extra_kwargs["mscale_all_dim"] = float(
+                self.rope_scaling.get("mscale_all_dim", 0)
+            )
+
+        self.rotary_emb = YaRNScalingRotaryEmbedding(
+            self.qk_rope_head_dim,
+            rotary_dim=self.qk_rope_head_dim,
+            max_position_embeddings=self.rope_scaling[
+                "original_max_position_embeddings"
+            ],
+            base=self.rope_theta,
+            is_neox_style=False,
+            scaling_factor=self.rope_scaling["factor"],
+            **extra_kwargs
+        )
+
+        self.attn = FlashAttention(
+            layer_id, self.scaling, self.num_heads, self.num_heads, self.qk_head_dim
+        )
+
+    def forward(self, input_data: InputData, hidden_states: torch.Tensor):
+        if self.q_lora_rank is not None:
+            q = self.q_a_proj(hidden_states)
+            q = self.q_a_layernorm(q)
+            q = self.q_b_proj(q).view(-1, self.num_heads, self.qk_head_dim)
+        else:
+            q = self.q_proj(hidden_states).view(-1, self.num_heads, self.qk_head_dim)
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        latent_cache = self.kv_a_proj_with_mqa(hidden_states)
+        kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        latent_cache = latent_cache.unsqueeze(1)
+        kv_a = self.kv_a_layernorm(kv_a)
+        kv = self.kv_b_proj(kv_a)
+        kv = kv.view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        k_pe = latent_cache[:, :, self.kv_lora_rank :]
+
+        q_pe, k_pe = self.rotary_emb(input_data.get_position(), q_pe, k_pe)
+
+        q[..., self.qk_nope_head_dim :] = q_pe
+        k = torch.empty_like(q)
+        k[..., : self.qk_nope_head_dim] = k_nope
+        k[..., self.qk_nope_head_dim :] = k_pe
+        # padding value to qk_head_dim for alignment
+        v = torch.nn.functional.pad(
+            v, [0, self.qk_head_dim - self.v_head_dim], value=0
+        ).view(-1, self.num_heads * self.qk_head_dim)
+        attn_output = self.attn.forward(q, k, v, input_data)
+        attn_output = attn_output.view(-1, self.num_heads, self.qk_head_dim)[
+            ..., : self.v_head_dim
+        ].reshape(-1, self.num_heads * self.v_head_dim)
+        output = self.o_proj(attn_output)
+        return output
+
+
+class DeepseekV2MLAAttention(Attention):
+    def __init__(self, layer_id: int, config):
+        quant_config = getattr(config, "quantization_config", None)
+        self.hidden_size = config.hidden_size
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        super().__init__(
+            config.num_attention_heads,
+            config.num_attention_heads,
+            self.hidden_size,
+            self.qk_head_dim,
+        )
+        self.v_head_dim = config.v_head_dim
+        self.q_lora_rank = (
+            config.q_lora_rank if hasattr(config, "q_lora_rank") else None
+        )
+        self.kv_lora_rank = config.kv_lora_rank
+        self.rope_theta, rope_scaling = extract_rope_config(
+            config, default_theta=10000.0
+        )
+        self.max_poistion_embeddings = getattr(config, "max_position_embeddings", 8192)
+        if rope_scaling is None:
+            self.rope_scaling = {
+                "factor": 1.0,
+                "original_max_position_embeddings": self.max_poistion_embeddings,
+            }
+        else:
+            self.rope_scaling = dict(rope_scaling)
+            self.rope_scaling.setdefault("factor", 1.0)
+            self.rope_scaling.setdefault(
+                "original_max_position_embeddings", self.max_poistion_embeddings
+            )
+        self.layer_id = layer_id
+
+        if self.q_lora_rank is not None:
+            self.fused_qkv_a_proj = MergedColumnParallelLinear(
+                self.hidden_size,
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                bias=False,
+                quant_config=quant_config,
+                disable_tp=True,
+            )
+        else:
+            self.kv_a_proj_with_mqa = ReplicatedLinear(
+                self.hidden_size,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                bias=False,
+                quant_config=quant_config,
+            )
+
+        if self.q_lora_rank is not None:
+            self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            self.q_b_proj = ColumnParallelLinear(
+                self.q_lora_rank,
+                self.total_num_heads * self.qk_head_dim,
+                bias=False,
+                quant_config=quant_config,
+            )
+        else:
+            self.q_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.total_num_heads * self.qk_head_dim,
+                bias=False,
+                quant_config=quant_config,
+            )
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
+        self.kv_b_proj = ColumnParallelLinear(
+            self.kv_lora_rank,
+            self.total_num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=False,
+            quant_config=quant_config,
+        )
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.v_head_dim,
+            self.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+        )
+
+        if self.rope_scaling:
+            self.rope_scaling["rope_type"] = "deepseek_yarn"
+            mscale_all_dim = self.rope_scaling.get("mscale_all_dim", False)
+            scaling_factor = self.rope_scaling["factor"]
+            mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+            self.scaling = self.scaling * mscale * mscale
+
+        extra_kwargs = {
+            k: v
+            for k, v in self.rope_scaling.items()
+            if k in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow")
+        }
+        # DeepSeek/Kimi YaRN: the cos/sin amplitude is the ratio
+        # ``yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor,
+        # mscale_all_dim)`` (see YaRNScalingRotaryEmbedding). The softmax
+        # ``self.scaling`` above already carries ``mscale_all_dim``'s term, so
+        # the rope must use the ratio form -- not the generic single-term
+        # ``yarn_get_mscale(factor)`` -- otherwise the RoPE-part attention
+        # score is doubled.
+        if self.rope_scaling:
+            extra_kwargs["mscale"] = float(self.rope_scaling.get("mscale", 1))
+            extra_kwargs["mscale_all_dim"] = float(
+                self.rope_scaling.get("mscale_all_dim", 0)
+            )
+
+        self.rotary_emb = YaRNScalingRotaryEmbedding(
+            self.qk_rope_head_dim,
+            rotary_dim=self.qk_rope_head_dim,
+            max_position_embeddings=self.rope_scaling[
+                "original_max_position_embeddings"
+            ],
+            base=self.rope_theta,
+            is_neox_style=False,
+            scaling_factor=self.rope_scaling["factor"],
+            **extra_kwargs
+        )
+
+        mla_decode_backend = getattr(config, "mla_decode_backend", None)
+        if mla_decode_backend is None:
+            logger.warning(
+                "mla_decode_backend not set on language config; defaulting MLA "
+                "decode to 'fa3'. For multimodal models ensure "
+                "propagate_serving_config() ran before load_model."
+            )
+            mla_decode_backend = "fa3"
+
+        self.mla_attn = MLAAttention(
+            layer_id=layer_id,
+            scale=self.scaling,
+            num_heads=self.num_heads,
+            head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
+            num_key_value_heads=1,
+            q_lora_rank=self.q_lora_rank,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            qk_head_dim=self.qk_head_dim,
+            v_head_dim=self.v_head_dim,
+            kv_b_proj=self.kv_b_proj,
+            decode_backend=mla_decode_backend,
+            page_size=getattr(config, "page_size", None),
+        )
+
+    def forward(
+        self,
+        input_data: InputData,
+        hidden_states: torch.Tensor,
+    ):
+        q_c = None
+        kv_lora = None
+
+        if self.q_lora_rank is not None:
+            qkv_lora = self.fused_qkv_a_proj(hidden_states)
+            q_c, kv_lora = qkv_lora.split(
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                dim=-1,
+            )
+            q_c = self.q_a_layernorm(q_c)
+            q = self.q_b_proj(q_c)
+        else:
+            kv_lora = self.kv_a_proj_with_mqa(hidden_states)
+            q = self.q_proj(hidden_states)
+
+        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_c_normed = self.kv_a_layernorm(kv_c)
+
+        q = q.view(-1, self.num_heads, self.qk_head_dim)
+        # Add head dim of 1 to k_pe
+        k_pe = k_pe.unsqueeze(1)
+
+        q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
+            input_data.get_position(), q[..., self.qk_nope_head_dim :], k_pe
+        )
+
+        output_shape = (hidden_states.shape[0], self.num_heads * self.v_head_dim)
+        output = torch.zeros(output_shape, dtype=q.dtype)
+
+        attn_out = self.mla_attn.forward(
+            q,
+            kv_c_normed,
+            k_pe,
+            input_data=input_data,
+            output=output,
+        )
+        return self.o_proj(attn_out)
+
+
+class DeepseekV2DecoderLayer(nn.Module):
+
+    def __init__(self, glb_layer_id: int, layer_id: int, config):
+        super().__init__()
+        quant_config = getattr(config, "quantization_config", None)
+        if not config.use_mla:
+            self.self_attn = DeepseekV2Attention(layer_id, config)
+        else:
+            self.self_attn = DeepseekV2MLAAttention(layer_id, config)
+
+        if (
+            config.n_routed_experts is not None
+            and glb_layer_id >= config.first_k_dense_replace
+            and glb_layer_id % config.moe_layer_freq == 0
+        ):
+            self.mlp = DeepseekV2MOE(config)
+        else:
+            self.mlp = DeepseekV2MLP(
+                config.hidden_size, config.intermediate_size, quant_config=quant_config
+            )
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.routed_scaling_factor = config.routed_scaling_factor
+
+        self.layer_id = layer_id
+
+    def forward(
+        self,
+        input_data: InputData,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        # Self Attention
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(input_data, hidden_states)
+
+        if hidden_states.dtype == torch.float16:
+            # Fix FP16 overflow
+            # We scale both hidden_states and residual before
+            # rmsnorm, and rmsnorm result would not affect by scale.
+            hidden_states *= 1.0 / self.routed_scaling_factor
+            if self.layer_idx == 0:
+                # The residual is shared by all layers, we only scale it on
+                # first layer.
+                residual *= 1.0 / self.routed_scaling_factor
+
+        # Fully Connected
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+
+        if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
+            # Fix FP16 overflow
+            # Scaling the DeepseekV2MLP output, it is the input of
+            # input_layernorm of next decoder layer.
+            # The scaling of DeepseekV2MOE output would be done in the forward
+            # of DeepseekV2MOE
+            hidden_states *= 1.0 / self.routed_scaling_factor
+
+        return hidden_states, residual
+
+
+class DeepseekV2Model(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        if is_first_pp_rank():
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size
+            )
+        self.start_layer, self.end_layer = get_pp_layers(config.num_hidden_layers)
+        self.layers = nn.ModuleList(
+            [
+                DeepseekV2DecoderLayer(i, i - self.start_layer, config)
+                for i in range(self.start_layer, self.end_layer)
+            ]
+        )
+
+        if is_last_pp_rank():
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(self, input_data: InputData, hidden_states=None, residual=None):
+        if is_first_pp_rank() and hidden_states is None:
+            hidden_states = self.embed_tokens(input_data.get_tokens())
+        for layer in self.layers:
+            hidden_states, residual = layer(input_data, hidden_states, residual)
+        if is_last_pp_rank():
+            hidden_states, _ = self.norm(hidden_states, residual)
+            return hidden_states
+        else:
+            return hidden_states, residual
+
+
+class DeepseekV2ForCausalLM(Qwen2MoeForCausalLM):
+    def __init__(self, config):
+        super().__init__(config, model_type=DeepseekV2Model)
+        attn = self.model.layers[0].self_attn
+        if not config.use_mla:
+            self.head_dim = attn.qk_head_dim
+        else:
+            self.head_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
+
+    def attn_weight_rules(self):
+        """MLA attention rules (DeepSeek-V2/V3, Kimi).
+
+        Replaces the dense ``self_attn.qkv_proj`` rule:
+
+        * ``fused_qkv_a_proj`` — MLA fuses ``q_a_proj`` ++ ``kv_a_proj_with_mqa``
+          (only present when ``q_lora_rank`` is set / ``use_mla``).
+        * ``q_proj`` / ``q_b_proj`` / ``kv_b_proj`` are column-parallel
+          (output-dim sliced) -> ``h_proj_dim0``.
+        * ``o_proj`` stays row-parallel (``h_proj_dim1``) via the base rules.
+        """
+        return [
+            WeightRule(
+                contains("self_attn.fused_qkv_a_proj"), h_qkv_a_proj, "mla_qkv_a"
+            ),
+            WeightRule(
+                contains("q_proj", "kv_b_proj", "q_b_proj"), h_proj_dim0, "mla_q_kv_b"
+            ),
+        ]
+
+    def _is_int4_moe(self):
+        """True when routed experts are compressed-tensors int4 (e.g. Kimi).
+
+        The model loader normalizes such checkpoints to
+        ``moe_quantization_config = {"quant_method": "int4_moe", ...}`` on the
+        (text) config the language model is built from.
+        """
+        qc = getattr(self.config, "moe_quantization_config", None)
+        return isinstance(qc, dict) and qc.get("quant_method") == "int4_moe"
+
+    def expert_weight_rules(self):
+        """Routed-expert rules. For int4 checkpoints the packed/scale tensors
+        (``w13_weight_packed`` / ``w13_weight_scale`` / ``w2_weight_packed`` /
+        ``w2_weight_scale``) must be matched *before* the generic
+        ``w13_weight`` / ``w2_weight`` rules, since ``"w13_weight" in
+        "w13_weight_packed"`` is True.
+        """
+        if not self._is_int4_moe():
+            return super().expert_weight_rules()
+
+        return [
+            WeightRule(
+                contains("w13_weight_packed"),
+                make_w13_loader(
+                    "w13_weight_packed",
+                    "gate_proj.weight_packed",
+                    "up_proj.weight_packed",
+                ),
+                "int4_w13_packed",
+            ),
+            WeightRule(
+                contains("w13_weight_scale"),
+                make_w13_loader(
+                    "w13_weight_scale",
+                    "gate_proj.weight_scale",
+                    "up_proj.weight_scale",
+                ),
+                "int4_w13_scale",
+            ),
+            WeightRule(
+                contains("w2_weight_packed"),
+                make_w2_loader("w2_weight_packed", "down_proj.weight_packed"),
+                "int4_w2_packed",
+            ),
+            WeightRule(
+                contains("w2_weight_scale"),
+                make_w2_loader("w2_weight_scale", "down_proj.weight_scale"),
+                "int4_w2_scale",
+            ),
+        ] + super().expert_weight_rules()
+
+    def weight_rules(self):
+        # MLA attn rules + expert rules + dense base rules. The MLA rules are
+        # placed before the base ``self_attn.qkv_proj`` rule (which DeepSeek
+        # never has) so the column-parallel q/kv_b projections dispatch
+        # correctly instead of falling through to a generic copy.
+        return (
+            self.attn_weight_rules()
+            + self.expert_weight_rules()
+            + Qwen2ForCausalLM.weight_rules(self)
+        )

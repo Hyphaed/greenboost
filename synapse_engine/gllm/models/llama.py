@@ -1,0 +1,158 @@
+from typing import Optional
+
+import torch
+from torch import nn
+
+from gllm.input_data import InputData
+from gllm.layers.attention import FlashAttention
+from gllm.layers.layernorm import RMSNorm
+from gllm.layers.linear import QKVParallelLinear, RowParallelLinear
+from gllm.layers.rotary_embedding import (
+    LinearScalingRotaryEmbedding,
+    Llama3RotaryEmbedding,
+    RotaryEmbedding,
+)
+from gllm.modules.attention import Attention
+
+from .qwen2 import Qwen2ForCausalLM, Qwen2MLP, Qwen2Model
+from .utils import extract_rope_config
+
+
+class LlamaMLP(Qwen2MLP):
+
+    def __init__(self, config):
+        super().__init__(config, False)
+
+
+class LlamaAttention(Attention):
+
+    def __init__(self, layer_id: int, config):
+        super().__init__(
+            config.num_attention_heads, config.num_key_value_heads, config.hidden_size
+        )
+
+        # GreenBoost local patch (see synapse_engine/NOTICE): quant_config was
+        # never threaded through here, unlike Qwen2Attention's identical
+        # pattern (qwen2.py) — every Llama-family checkpoint's qkv_proj/o_proj
+        # silently got quant_config=None regardless of the model's actual
+        # quantization, registering plain bf16 weight Parameters that the
+        # weight loader then failed to fill from a quantized checkpoint
+        # (KeyError: no ".weight" key — only .qweight/.qzeros/.scales/.g_idx
+        # exist on disk). Found live serving a real GPTQ Llama checkpoint.
+        quant_config = getattr(config, "quantization_config", None)
+
+        self.qkv_proj = QKVParallelLinear(
+            self.hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=False,
+            quant_config=quant_config,
+        )
+
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim, self.hidden_size, bias=False,
+            quant_config=quant_config,
+        )
+
+        self.rope_theta, rope_scaling = extract_rope_config(
+            config, default_theta=10000.0
+        )
+        if rope_scaling is not None:
+            scaling_type = (
+                rope_scaling["type"]
+                if "type" in rope_scaling
+                else rope_scaling["rope_type"]
+            )
+            if scaling_type == "llama3":
+                low_freq_factor = rope_scaling["low_freq_factor"]
+                high_freq_factor = rope_scaling["high_freq_factor"]
+                original_max_position = rope_scaling["original_max_position_embeddings"]
+                self.rotary_emb = Llama3RotaryEmbedding(
+                    self.head_dim,
+                    self.head_dim,
+                    original_max_position,
+                    self.rope_theta,
+                    True,
+                    rope_scaling["factor"],
+                    low_freq_factor,
+                    high_freq_factor,
+                    original_max_position,
+                )
+            elif rope_scaling["type"] == "linear":
+                self.rotary_emb = LinearScalingRotaryEmbedding(
+                    self.head_dim,
+                    self.head_dim,
+                    config.max_position_embeddings,
+                    self.rope_theta,
+                    True,
+                    rope_scaling["factor"],
+                )
+            else:
+                assert 0
+        else:
+            self.rotary_emb = RotaryEmbedding(
+                self.head_dim,
+                self.head_dim,
+                config.max_position_embeddings,
+                self.rope_theta,
+                True,
+            )
+
+        self.attn = FlashAttention(
+            layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim
+        )
+
+    def forward(self, input_data: InputData, hidden_states: torch.Tensor):
+        qkv = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=1)
+        q, k = self.rotary_emb(input_data.get_position(), q, k)
+        attn_output = self.attn.forward(q, k, v, input_data)
+        output = self.o_proj(attn_output)
+        return output
+
+
+class LlamaDecoderLayer(nn.Module):
+
+    def __init__(self, layer_id: int, config):
+        super().__init__()
+        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.self_attn = LlamaAttention(layer_id, config)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.mlp = LlamaMLP(config)
+
+    def forward(
+        self,
+        input_data: InputData,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+    ):
+        # residual connection and input layernorm
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        # self attention
+        hidden_states = self.self_attn(input_data, hidden_states)
+
+        # post attention layernorm
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+        # mlp
+        hidden_states = self.mlp(hidden_states)
+
+        return hidden_states, residual
+
+
+class LlamaModel(Qwen2Model):
+
+    def __init__(self, config):
+        super().__init__(config, LlamaDecoderLayer)
+
+
+class LlamaForCausalLM(Qwen2ForCausalLM):
+
+    def __init__(self, config):
+        super().__init__(config, LlamaModel)

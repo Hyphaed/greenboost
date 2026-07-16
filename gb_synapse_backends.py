@@ -38,10 +38,27 @@ sys.path.insert(0, str(_REPO_DIR))
 # Format detection
 # ---------------------------------------------------------------------------
 
+def _has_weight_files(names) -> bool:
+    """True if `names` (an iterable of filenames) contains at least one real
+    weight file: `*.safetensors`, or `*.bin` other than `training_args.bin`
+    (a training-loop artifact, never a weight checkpoint, that HF repos and
+    local `transformers.Trainer` output dirs commonly ship alongside the
+    real `pytorch_model.bin`/`pytorch_model-NNNNN-of-NNNNN.bin` shards)."""
+    for n in names:
+        if n.endswith(".safetensors"):
+            return True
+        if n.endswith(".bin") and Path(n).name != "training_args.bin":
+            return True
+    return False
+
+
 def detect_format(path_or_repo: str) -> str:
     """"gguf" | "safetensors" | "diffusers" | "unknown" for a local
     directory/file OR a bare "org/repo" HF repo id (queried via the HF API
-    when `path_or_repo` isn't a path that exists locally)."""
+    when `path_or_repo` isn't a path that exists locally). "safetensors" also
+    covers `.bin`-only checkpoints (older HF exports, pre-safetensors) — the
+    return value name stays "safetensors" since both route to the same
+    torch-core engine backend."""
     p = Path(path_or_repo)
     if p.exists():
         if p.is_dir():
@@ -49,7 +66,8 @@ def detect_format(path_or_repo: str) -> str:
                 return "diffusers"
             if any(p.glob("*.gguf")):
                 return "gguf"
-            if (p / "config.json").is_file() and any(p.glob("*.safetensors")):
+            names = [f.name for f in p.iterdir() if f.is_file()]
+            if (p / "config.json").is_file() and _has_weight_files(names):
                 return "safetensors"
             return "unknown"
         return "gguf" if p.suffix == ".gguf" else "unknown"
@@ -66,7 +84,7 @@ def detect_format(path_or_repo: str) -> str:
         return "diffusers"
     if any(n.endswith(".gguf") for n in names):
         return "gguf"
-    if "config.json" in names and any(n.endswith(".safetensors") for n in names):
+    if "config.json" in names and _has_weight_files(names):
         return "safetensors"
     return "unknown"
 
@@ -95,8 +113,32 @@ _GBQUANT_VLLM_ARGS = {
 # Below the fp8 quality floor — served, but flagged in serve_facts so the
 # fp8-floor policy (gb_mcp.py quant_advisor, gb_actuation.set_quant_policy)
 # has a truthful signal for THIS backend too, not just gb_quant's own budget
-# planner.
+# planner. Legacy token set for GGUF/llama.cpp-routed entries (llama.cpp
+# quant is a filename token, not parsed checkpoint metadata — no
+# quant_method/quant_bits to check).
 _BELOW_FP8_QUANTS = {"INT8", "INT4"}
+
+# Checkpoint-truth below-fp8-floor bit widths per quant_method (Phase 2's
+# read_quant_config/_pull_torch) — a method/bits check, not a fixed token
+# set, since e.g. GPTQ2/GPTQ3/GPTQ4 all count regardless of the exact bit
+# width, and new bit widths shouldn't need a new set entry.
+_BELOW_FP8_METHOD_BITS = {
+    "gptq": (2, 3, 4),
+    "awq": (4,),
+    "compressed-tensors": (4,),
+    "bitsandbytes": (4, 8),
+}
+
+
+def _quant_below_fp8_floor(entry) -> bool:
+    """True if `entry`'s quantization is below the fp8 quality floor.
+    Prefers checkpoint truth (`entry.quant_method`/`entry.quant_bits`,
+    Phase 2) when set; falls back to the legacy `_BELOW_FP8_QUANTS` token
+    check for GGUF/llama.cpp-routed entries, which carry no quant_method at
+    all (GGUF quant is a filename token, not parsed checkpoint metadata)."""
+    if entry.quant_method:
+        return entry.quant_bits in _BELOW_FP8_METHOD_BITS.get(entry.quant_method, ())
+    return entry.quant.upper() in _BELOW_FP8_QUANTS
 
 
 def _vllm_venv_dir() -> "Path | None":
@@ -142,18 +184,122 @@ def _find_vllm_bin() -> "str | None":
     return shutil.which("vllm")
 
 
-def _cuda_home_for_vllm() -> "str | None":
-    """vLLM's FlashInfer dependency JIT-compiles Blackwell (SM 12.x) kernels
-    and requires CUDA >= 12.9 to do it — it finds nvcc via CUDA_HOME, which
-    defaults to /usr (a stale distro-packaged nvcc, often < 12.9) when unset.
-    Same root cause as gb_synapse._find_nvcc(): the distro package and
-    /usr/local/cuda's update-alternatives-managed install can diverge.
-    FlashInfer swallows the resulting version-check exception internally and
-    misreports "GPU too old" instead of "CUDA too old" — confirmed live on
-    an RTX 5070 (cc 12.0) with CUDA 13.3 at /usr/local/cuda but 12.4 at
-    /usr/bin/nvcc."""
+def _cuda_home_for_torch() -> "str | None":
+    """FlashInfer (used by both vLLM and the synapse torch engine) JIT-
+    compiles Blackwell (SM 12.x) kernels and requires CUDA >= 12.9 to do
+    it — it finds nvcc via CUDA_HOME, which defaults to /usr (a stale
+    distro-packaged nvcc, often < 12.9) when unset. Same root cause as
+    gb_synapse._find_nvcc(): the distro package and /usr/local/cuda's
+    update-alternatives-managed install can diverge. FlashInfer swallows
+    the resulting version-check exception internally and misreports "GPU
+    too old" instead of "CUDA too old" — confirmed live on an RTX 5070
+    (cc 12.0) with CUDA 13.3 at /usr/local/cuda but 12.4 at /usr/bin/nvcc.
+
+    Generic (no vLLM- or torch-engine-specific logic) — genuinely shared
+    by both backends, unlike the venv-lib lookups below, which do differ
+    per backend."""
     alt = Path("/usr/local/cuda")
     return str(alt) if alt.exists() else None
+
+
+# Kept for the still-live VllmBackend call site (renamed to the generic name
+# above since the logic was never actually vLLM-specific).
+_cuda_home_for_vllm = _cuda_home_for_torch
+
+
+def _torch_env_dir() -> "Path | None":
+    """The synapse torch engine's venv directory: explicit override, the
+    user-home dev venv (`gb-synapse install-synapse-engine`-equivalent run
+    by hand), then the root-owned Full-Install venv
+    ($GB_PY_DEST/synapse-torch-env — see cmd_install_synapse_engine in
+    greenboost_setup.sh). Returns the first candidate that actually has a
+    `bin/python` (a bare empty dir from a half-finished install doesn't
+    count as "available")."""
+    override = os.environ.get("GB_SYNAPSE_TORCH_ENV")
+    candidates = ([Path(override)] if override else []) + [
+        Path.home() / ".local/share/greenboost/synapse/torch-env",
+        Path("/usr/local/lib/greenboost/synapse-torch-env"),
+    ]
+    for c in candidates:
+        if (c / "bin/python").exists():
+            return c
+    return None
+
+
+def _find_torch_venv_lib(rel_glob: str) -> "Path | None":
+    """A library bundled inside the synapse torch engine's venv
+    site-packages (e.g. torch's own pinned nvidia-cuXX wheel's libcudart),
+    for shim_env's cudart_path — same need as _find_vllm_venv_lib, against
+    the torch venv instead of the vLLM one."""
+    venv = _torch_env_dir()
+    if not venv:
+        return None
+    matches = list(venv.glob(f"lib/python*/site-packages/{rel_glob}"))
+    return matches[0] if matches else None
+
+
+# Cached per-venv-path: is `import gllm, sgl_kernel` actually importable in
+# this venv? A real subprocess probe (imports have real side effects — CUDA
+# context, etc. — not safe to do in-process from gb_synapse's own
+# interpreter), so cache the result rather than re-probing on every serve.
+_TORCH_ENGINE_IMPORTABLE_CACHE: dict = {}
+
+
+def _torch_engine_importable(venv_py: str) -> bool:
+    if venv_py in _TORCH_ENGINE_IMPORTABLE_CACHE:
+        return _TORCH_ENGINE_IMPORTABLE_CACHE[venv_py]
+    try:
+        r = subprocess.run([venv_py, "-c", "import gllm, sgl_kernel"],
+                           capture_output=True, timeout=30)
+        ok = r.returncode == 0
+    except Exception:
+        ok = False
+    _TORCH_ENGINE_IMPORTABLE_CACHE[venv_py] = ok
+    return ok
+
+
+def _torch_serve_mode(entry) -> "tuple[str, str]":
+    """("gllm"|"fallback", reason) — pure function (the one subprocess probe
+    it makes, _torch_engine_importable, is itself cached, so repeated calls
+    have no side effects). Decides whether SynapseTorchBackend hands `entry`
+    to the real synapse torch engine (gLLM) or to the single-request
+    transformers+gb-quant fallback server (gb_synapse_fallback.py), in
+    order:
+
+    (a) the venv doesn't actually have a working gllm/sgl_kernel import
+        (missing/broken install) — fallback.
+    (b) `entry.arch` isn't one gLLM's own model_loader recognizes
+        (`gb_synapse._torch_engine_supported_archs()`) — fallback.
+    (c) the checkpoint is NOT already quantized (`quant_method == ""`) AND
+        either its bf16 byte size exceeds the live VRAM+T2 budget, or the
+        caller explicitly requested a below-fp8 requantization token
+        (`:INT8`/`:INT4` — gLLM has no on-the-fly quantize-to-fit the way
+        the fallback's gb_quant does) — fallback.
+    Reason is a short human-readable string for the "prints WHY" caller
+    contract; empty when mode is "gllm"."""
+    venv = _torch_env_dir()
+    if not venv or not _torch_engine_importable(str(venv / "bin" / "python")):
+        return "fallback", "synapse torch engine venv missing or import-broken"
+
+    import gb_synapse as gs
+    supported = gs._torch_engine_supported_archs()
+    if entry.arch and supported and entry.arch not in supported:
+        return "fallback", (f"architecture '{entry.arch}' not recognized by "
+                            f"the vendored synapse torch engine")
+
+    if not entry.quant_method:
+        _, effective_free_mb, _ = effective_vram_budget_mb()
+        bf16_mb = entry.n_bytes / (1024 ** 2)
+        if bf16_mb > effective_free_mb:
+            return "fallback", (f"{bf16_mb / 1024:.1f} GB bf16 exceeds the "
+                                f"{effective_free_mb / 1024:.1f} GB VRAM+T2 budget "
+                                f"(gLLM has no quantize-to-fit)")
+        if entry.quant.upper() in _BELOW_FP8_QUANTS:
+            return "fallback", (f"requested {entry.quant} requantization — gLLM has "
+                                f"no on-the-fly quantize-to-fit, only the fallback's "
+                                f"gb_quant does")
+
+    return "gllm", ""
 
 
 def _gbquant_model_source(entry) -> str:
@@ -238,14 +384,19 @@ def _read_shim_stats() -> dict:
     return stats
 
 
-def _validate_genuine_t2(entry, util: float, budget_facts: dict) -> None:
-    """After a vLLM serve, confirm the weights genuinely landed partly in T2
-    rather than the whole overflow silently sitting in T2 while T1 stayed
-    under-filled (Rule #1). Reads /run/greenboost/shim_stats (t2 bytes,
-    vllm_compat) + live NVML fb_used_pct; emits a `synapse_vllm_placement`
-    dataflux event with `rule1_warning=true` when t2_bytes>0 while
-    vram_used_pct is below GB_SYNAPSE_RULE1_PCT (default 85). Best-effort ,
-    never raises."""
+def _validate_placement(entry, util: float, budget_facts: dict, engine: str) -> None:
+    """After a vLLM or synapse-torch-engine serve, confirm the weights
+    genuinely landed partly in T2 rather than the whole overflow silently
+    sitting in T2 while T1 stayed under-filled (Rule #1). Reads
+    /run/greenboost/shim_stats (t2 bytes, defer_init) + live NVML
+    fb_used_pct; emits a `synapse_engine_placement` dataflux event with
+    `rule1_warning=true` when t2_bytes>0 while vram_used_pct is below
+    GB_SYNAPSE_RULE1_PCT (default 85). Best-effort, never raises.
+
+    Renamed from `_validate_genuine_t2` / event kind renamed from
+    `synapse_vllm_placement` (2026-07-16, Phase 4 backend wiring) — this
+    validation is engine-agnostic and now covers SynapseTorchBackend too,
+    not just VllmBackend; `engine` says which one actually served."""
     try:
         stats = _read_shim_stats()
         t2_bytes = (int(stats.get("tier_t2_local_cur_mb", "0") or 0)
@@ -261,13 +412,18 @@ def _validate_genuine_t2(entry, util: float, budget_facts: dict) -> None:
             rule1_pct = 85.0
         rule1_warning = t2_bytes > 0 and vram_used_pct < rule1_pct
 
+        # defer_init is the new shim_stats key; vllm_compat is read as a
+        # fallback for a shim built before the C-side rename (P4.6).
+        defer_init = stats.get("defer_init", stats.get("vllm_compat", "0")) == "1"
+
         import gb_dataflux
         gb_dataflux.emit({
-            "kind": "synapse_vllm_placement", "status": "warn" if rule1_warning else "ok",
-            "model": entry.name, "vram_used_pct": vram_used_pct, "t2_bytes": t2_bytes,
+            "kind": "synapse_engine_placement", "status": "warn" if rule1_warning else "ok",
+            "model": entry.name, "engine": engine,
+            "vram_used_pct": vram_used_pct, "t2_bytes": t2_bytes,
             "t2_fraction": budget_facts.get("t2_fraction"),
             "gpu_mem_util_flag": round(util, 2), "quant": entry.quant,
-            "vllm_compat": stats.get("vllm_compat", "0") == "1",
+            "defer_init": defer_init,
             "rule1_warning": rule1_warning,
         })
     except Exception:
@@ -564,7 +720,7 @@ class VllmBackend(EngineBackend):
 
     def serve_facts(self, entry) -> dict:
         _, _, facts = effective_vram_budget_mb()
-        facts["quant_below_floor"] = entry.quant.upper() in _BELOW_FP8_QUANTS
+        facts["quant_below_floor"] = _quant_below_fp8_floor(entry)
         return facts
 
     def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=1, extra_args=""):
@@ -643,7 +799,115 @@ class VllmBackend(EngineBackend):
                                  start_new_session=True)
         state = gs._launch_proxy_and_record(entry, proc, port, internal_port,
                                             engine=self.name, **self.serve_facts(entry))
-        _validate_genuine_t2(entry, util, budget_facts)
+        _validate_placement(entry, util, budget_facts, self.name)
+        return state
+
+
+class SynapseTorchBackend(EngineBackend):
+    """GreenBoost's own torch-core inference engine (vendored gLLM, see
+    synapse_engine/NOTICE) — the safetensors-checkpoint backend the
+    gb-synapse unification is converging on. Currently routes every
+    checkpoint through gLLM's own `api_server` (OpenAI-compatible,
+    streaming included, same passthrough gb_synapse_api.py already uses
+    for llama.cpp/vLLM); a fallback single-request server for models the
+    engine can't yet load is added in a later phase.
+
+    Single-node only for now, same as vLLM: gLLM's own `--pp`/`--tp` are a
+    different parallelism model than llama.cpp's --rpc cluster split, not
+    wired to GreenBoost's feeder fabric here."""
+    name = "torch"
+
+    def available(self) -> bool:
+        return _torch_env_dir() is not None
+
+    def can_serve(self, entry) -> bool:
+        return entry.engine in ("torch", "vllm", "transformers", "gbquant")
+
+    def serve_facts(self, entry) -> dict:
+        _, _, facts = effective_vram_budget_mb()
+        facts["quant_method"] = entry.quant_method
+        facts["quant_below_floor"] = _quant_below_fp8_floor(entry)
+        return facts
+
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=1, extra_args=""):
+        import gb_synapse as gs
+        import gb_cluster
+
+        venv = _torch_env_dir()
+        if not venv:
+            raise RuntimeError(
+                f"'{entry.name}' needs the synapse torch engine but no venv was found — "
+                f"install it (Full Install default-on, or: sudo greenboost "
+                f"install-synapse-engine) or set GB_SYNAPSE_TORCH_ENV."
+            )
+        venv_py = str(venv / "bin" / "python")
+        internal_port = port + 1000
+
+        # Same "torch" shim profile already validated for VllmBackend/FLUX
+        # (ai-forge CLAUDE.md RULE #1): real T2 (DDR) VRAM extension without
+        # CPU compute participation.
+        torch_cudart = str(_find_torch_venv_lib("nvidia/cu13/lib/libcudart.so.13")
+                           or _find_torch_venv_lib("nvidia/cu12/lib/libcudart.so.12") or "")
+        shim_on = os.environ.get("GB_SYNAPSE_TORCH_SHIM", "1") != "0"
+        env = gb_cluster.shim_env(workload="torch", enabled=shim_on,
+                                  cudart_path=torch_cudart or None)
+        if shim_on:
+            # Deferred-shim-init env var (greenboost_cuda_shim.c) — new
+            # canonical name for the mechanism VllmBackend calls
+            # GREENBOOST_VLLM_COMPAT; the shim accepts either (see the C
+            # shim's env check).
+            env.setdefault("GREENBOOST_DEFER_INIT", "1")
+        if gs.hf_token():
+            env["HF_TOKEN"] = gs.hf_token()
+        cuda_home = _cuda_home_for_torch()
+        if cuda_home:
+            env["CUDA_HOME"] = cuda_home
+
+        facts = self.serve_facts(entry)
+        mode, reason = _torch_serve_mode(entry)
+
+        if mode == "fallback":
+            print(f"  [gb-synapse] {entry.name}: using the single-request fallback "
+                 f"server instead of the synapse torch engine — {reason}.", flush=True)
+            cmd = [venv_py, str(_REPO_DIR / "gb_synapse_fallback.py"),
+                   "--model", _gbquant_model_source(entry),
+                   "--served-model-name", entry.name,
+                   "--quant", entry.quant or "fp8",
+                   "--host", "127.0.0.1", "--port", str(internal_port)]
+            facts["degraded"] = "fallback-single-request"
+        else:
+            try:
+                util = float(os.environ.get("GB_SYNAPSE_TORCH_KV_UTIL", "0.90"))
+            except ValueError:
+                util = 0.90
+            util = max(0.3, min(0.95, util))
+
+            cmd = [venv_py, "-m", "gllm.entrypoints.api_server",
+                   "--model-path", _gbquant_model_source(entry),
+                   "--host", "127.0.0.1", "--port", str(internal_port),
+                   "--gpu-memory-util", f"{util:.2f}"]
+            if ctx and ctx > 0:
+                cmd += ["--model-max-length", str(ctx)]
+
+            # CUDA graph capture reserves its own warmup buffers on top of
+            # the KV cache — confirmed live 2026-07-16 (P3.9 bring-up) to
+            # OOM on a 12 GB card with this engine's default KV-cache
+            # sizing. Off by default until that sizing is revisited
+            # (workflow/gb-synapse.md); GB_SYNAPSE_TORCH_CUDA_GRAPH=1
+            # re-enables it for boxes with headroom to spare.
+            if os.environ.get("GB_SYNAPSE_TORCH_CUDA_GRAPH", "0") != "1":
+                cmd += ["--disable-cuda-graph"]
+
+        if extra_args:
+            cmd += shlex.split(extra_args)
+
+        log = open(gs._run_log_path(entry.name), "ab")
+        proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                 start_new_session=True)
+        state = gs._launch_proxy_and_record(entry, proc, port, internal_port,
+                                            engine=self.name, **facts)
+        _, _, budget_facts = effective_vram_budget_mb()
+        _validate_placement(entry, util if mode == "gllm" else 0.0, budget_facts, self.name)
         return state
 
 
@@ -722,17 +986,29 @@ class DiffusersBackend(EngineBackend):
 # ---------------------------------------------------------------------------
 
 def select_backend(entry) -> EngineBackend:
-    """Legacy `entry.engine == "gbquant"` (pre-taxonomy manifests, normalized
-    to "vllm" on load by gb_synapse._load_manifest — this branch is the
-    behavioral half of that compat: prefer vLLM, fall back to transformers)
-    and the current "vllm" value both route the same way. "transformers" and
-    "diffusers" are explicit — no silent fallback. Anything else (including
-    the "llama.cpp" default) gets the llama.cpp engine."""
-    if entry.engine in ("vllm", "gbquant"):
+    """Legacy `entry.engine` values "gbquant"/"vllm"/"transformers" (all
+    normalized to "torch" on load by gb_synapse._load_manifest — see that
+    function's docstring) plus the current "torch" value itself all route
+    to SynapseTorchBackend by default — live-verified end-to-end (Phase 3/
+    P3.9 bring-up, 2026-07-16: the vendored gLLM engine, with its local
+    SDPA-fallback patch, serves bf16 safetensors checkpoints correctly on
+    this hardware). Falls back to VllmBackend/TransformersBackend only if
+    the torch engine isn't installed, or if GB_SYNAPSE_FORCE_VLLM=1 and a
+    vllm binary is actually present (a soak-window escape hatch for anyone
+    who needs to keep using vLLM while the torch engine is new — dies in
+    Phase 6 alongside VllmBackend itself). "diffusers" is explicit — no
+    silent fallback. Anything else (including the "llama.cpp" default) gets
+    the llama.cpp engine."""
+    if entry.engine in ("torch", "vllm", "gbquant", "transformers"):
+        if os.environ.get("GB_SYNAPSE_FORCE_VLLM") == "1":
+            v = VllmBackend()
+            if v.available():
+                return v
+        t = SynapseTorchBackend()
+        if t.available():
+            return t
         v = VllmBackend()
         return v if v.available() else TransformersBackend()
-    if entry.engine == "transformers":
-        return TransformersBackend()
     if entry.engine == "diffusers":
         return DiffusersBackend()
     return LlamaCppBackend()

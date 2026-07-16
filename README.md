@@ -27,7 +27,7 @@
 | 📡 **GB-Dataflux** | Live telemetry exposed through the GreenBoost Dataflux MCP server and a web dashboard. Launch the UI with `greenboost dataflux-ui`. |
 | 🌐 **GB-Cluster** | Borrow idle GPU and RAM resources from other machines on your local network. |
 | 🔗 **GB-Synapse** | Translation proxy exposing Ollama-compatible endpoints (`/api/generate`, `/api/chat`, `/api/tags`, `/api/ps`) and the OpenAI-compatible `/v1/*` API on port `11434`. It sits in front of `gb-synapse` (`llama-server --rpc`), enabling cross-GPU RPC execution, GB-Quant, and proxy-side Dataflux telemetry (including tokens/sec). A genuine drop-in replacement for Ollama. |
-| 🖥️ **GB-CLI** | Agentic terminal client, installed by Full Install — no separate setup. Open it with `gb` (or `greenboost-cli`); one-shot prompts with `gb -p "…"`; headless JSON subcommands for scripts (`gb rag-search …`). Always talks to GB-Synapse on `:11434` (Ollama **and** HuggingFace models via `greenboost synapse pull` / `index-ollama`). |
+| 🖥️ **GB-CLI** | Agentic terminal client, installed by Full Install — no separate setup. Open it with `gb` (or `greenboost-cli`); one-shot prompts with `gb -p "…"`; headless JSON subcommands for scripts (`gb rag-search …`). Always talks to GB-Synapse on `:11435` (Ollama **and** HuggingFace models via `greenboost synapse pull` / `index-ollama`). |
 </div>
 
 <div align="center">
@@ -175,7 +175,7 @@ LLM assistant one query surface over all of it:
 ┌──────────────────────────────────────────────────────────────────┐
 │  Your app , gb CLI, or any Ollama / OpenAI / HF-TGI client        │
 └───────────────────────────────┬──────────────────────────────────┘
-                                 │  :11434
+                                 │  :11435
                     ┌────────────┴─────────────┐
                     │  GB-Synapse  +  GB-CLI     │── tok/s, requests ──┐
                     │  (Ollama/OpenAI/TGI proxy)  │                     │
@@ -475,7 +475,7 @@ Full security model: [DOCUMENTATION.md § Cluster security](DOCUMENTATION.md).
 
 ## 🔗 GB-Synapse
 
-**GreenBoost's own model server and Ollama-compatible proxy on `:11434`,
+**GreenBoost's own model server and Ollama-compatible proxy on `:11435`,
 spread across the cluster.**
 
 New in v3.2. Ollama only serves models from its own registry. GB-Synapse
@@ -489,7 +489,7 @@ that node's local RAM/disk underneath it.
 ```bash
 sudo greenboost synapse login              # store a HuggingFace token
 sudo greenboost pull <repo>[:quant]        # download a GGUF
-greenboost synapse run <model>             # serve it, cluster-aware, on :11434
+greenboost synapse run <model>             # serve it, cluster-aware, on :11435
 ```
 
 The proxy in front of `llama-server` speaks Ollama's API (`/api/generate`,
@@ -502,7 +502,7 @@ between an orchestration decision and its real, client-observed throughput.
 Serving control is also exposed over the `greenboost-synapse` MCP server
 (`synapse_status`, `synapse_models`, `synapse_ps`, `synapse_recommend`,
 `synapse_doctor`; `synapse_serve`/`synapse_stop` are confirmation-gated so an
-assistant can't yank a live `:11434` out from under you).
+assistant can't yank a live `:11435` out from under you).
 
 Full reference: [GREENBOOST_COMMANDS.md § gb-synapse](GREENBOOST_COMMANDS.md#-gb-synapse-huggingface-native-cluster-distributed-gguf-serving).
 
@@ -522,7 +522,7 @@ gb -p "summarize this repo"   # one-shot prompt
 gb rag-search "kv cache"      # headless JSON subcommand, for scripts
 ```
 
-GB-CLI always talks to **GB-Synapse on `:11434`**, so whatever you served
+GB-CLI always talks to **GB-Synapse on `:11435`**, so whatever you served
 (Ollama-indexed or HuggingFace-pulled GGUF, single-GPU or RPC-split across the
 cluster) is what the agent runs on, with GB-Quant and GB-Tiering underneath and
 every turn's measured tokens/sec landing in GB-Dataflux.

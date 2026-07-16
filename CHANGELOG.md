@@ -1,5 +1,11 @@
 # GreenBoost Changelog
 
+## Unreleased
+
+- **gb-synapse default port 11434 → 11435** (`GB_SYNAPSE_PORT`). Ollama keeps
+  :11434 — the two no longer collide by default. Migration: re-run
+  `serve_and_repoint` (MCP `greenboost-synapse` / `gb_actuation.py`) or update
+  `FORGE_OLLAMA_URL` in `inference.env` to point at the new port.
 
 <details>
 <summary><strong>Jump to a version</strong></summary>
@@ -39,8 +45,8 @@ telemetry and the MCP servers all use the same names:
 | 🗜️ **GB-Quant** | Compresses **weights** (quantize-to-fit planner, bf16 > int8 > int4, GemLite kernels) **and the KV cache** (TurboQuant, the KV branch , it is *not* a separate product). |
 | 📡 **GB-Dataflux** | The flight recorder. Every placement, quantization, tier move, serve and measured tok/s lands in one event log, queryable live over MCP and in a web UI (`greenboost dataflux-ui`). |
 | 🌐 **GB-Cluster** | Borrows idle GPUs and RAM from LAN machines ("feeders"), and now peers their *compute*, not just their memory. |
-| 🔗 **GB-Synapse** | GreenBoost's own model server + Ollama/OpenAI proxy on `:11434`, in front of `llama-server --rpc`. A drop-in replacement for Ollama that can split one model across two machines' GPUs. |
-| 🖥️ **GB-CLI** | The agentic terminal client, **installed by Full Install , no separate setup**. `gb` for the REPL, `gb -p "…"` for one-shot prompts, `gb rag-search …` for headless JSON. It always talks to GB-Synapse on `:11434`, so whatever the cluster is serving is what the agent thinks with. |
+| 🔗 **GB-Synapse** | GreenBoost's own model server + Ollama/OpenAI proxy on `:11435`, in front of `llama-server --rpc`. A drop-in replacement for Ollama that can split one model across two machines' GPUs. |
+| 🖥️ **GB-CLI** | The agentic terminal client, **installed by Full Install , no separate setup**. `gb` for the REPL, `gb -p "…"` for one-shot prompts, `gb rag-search …` for headless JSON. It always talks to GB-Synapse on `:11435`, so whatever the cluster is serving is what the agent thinks with. |
 
 ### 🖥️ GB-CLI , the agent that ships with GreenBoost
 
@@ -238,7 +244,7 @@ own RAM if it doesn't fit VRAM. In short: llama.cpp's RPC handles the split
 ```bash
 sudo greenboost synapse login              # store a HuggingFace token
 sudo greenboost pull <repo>[:quant]        # download a GGUF
-greenboost synapse run <model>             # serve it, cluster-aware, on :11434
+greenboost synapse run <model>             # serve it, cluster-aware, on :11435
 ```
 
 Once running, it speaks Ollama's API, OpenAI's API, and HuggingFace's TGI API
