@@ -60,10 +60,19 @@ def synapse_status() -> dict:
 @mcp.tool()
 def synapse_models() -> list[dict]:
     """Models in the gb-synapse manifest (pulled from HF via `pull`, or
-    imported from ollama via `index-ollama`) with name/quant/size/source."""
+    imported from ollama via `index-ollama`) with name/engine/quant/format/
+    size/source. `format` is detected from the model's own files (gguf/
+    safetensors/diffusers/unknown) — independent of `engine`, which is the
+    manifest's routing decision (may differ if the manifest is stale)."""
     try:
         import gb_synapse
-        return [asdict(m) for m in gb_synapse.list_models()]
+        from gb_synapse_backends import detect_format
+        out = []
+        for m in gb_synapse.list_models():
+            d = asdict(m)
+            d["format"] = detect_format(m.path) if m.path else "unknown"
+            out.append(d)
+        return out
     except Exception as e:
         return [{"error": str(e)}]
 
@@ -104,15 +113,21 @@ def synapse_doctor(probe_feeders: bool = True) -> dict:
 
 @mcp.tool()
 def synapse_serve(model: str, ctx: int = 65536, use_cluster: bool = True,
-                  confirm: bool = False) -> dict:
-    """Serve a model through gb-synapse (llama-server + :11434 proxy;
-    tensor-split across the cluster when use_cluster and feeders are up).
+                  engine: str = "", confirm: bool = False) -> dict:
+    """Serve a model through gb-synapse (engine backend + :11434 proxy;
+    tensor-split across the cluster when use_cluster and feeders are up for
+    the llama.cpp backend). `engine` ("llama.cpp"/"vllm"/"transformers"/
+    "diffusers") only affects the DRY-RUN preview's backend name — it does
+    NOT override the manifest's own engine for an actual (confirm=True)
+    serve; re-pull with --engine to change that durably.
 
-    DRY-RUN unless confirm=True: without it, returns the resolved model entry
-    and a warning about whatever is currently bound to :11434 — the owner (or
-    an explicitly-authorized flow) decides to displace it."""
+    DRY-RUN unless confirm=True: without it, returns the resolved model entry,
+    which backend would serve it, and a warning about whatever is currently
+    bound to :11434 — the owner (or an explicitly-authorized flow) decides to
+    displace it."""
     try:
         import gb_synapse
+        from gb_synapse_backends import select_backend
         entry = next((m for m in gb_synapse.list_models()
                       if m.name == model or model.lower() in m.name.lower()), None)
         if entry is None:
@@ -120,8 +135,11 @@ def synapse_serve(model: str, ctx: int = 65536, use_cluster: bool = True,
                              f"(gb_synapse pull) or index-ollama first",
                     "available": [m.name for m in gb_synapse.list_models()]}
         current = gb_synapse.ps()
+        preview_engine = engine or entry.engine
+        backend_name = select_backend(
+            type(entry)(**{**asdict(entry), "engine": preview_engine})).name
         if not confirm:
-            return {"dry_run": True, "would_serve": asdict(entry),
+            return {"dry_run": True, "would_serve": asdict(entry), "backend": backend_name,
                     "ctx": ctx, "use_cluster": use_cluster,
                     "currently_serving": current,
                     "warning": ":11434 may have live consumers (ai-forge "
