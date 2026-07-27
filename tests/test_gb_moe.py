@@ -536,6 +536,68 @@ def test_b1plus_hot_threshold_stable_when_ok_vram_and_low_misses():
     )
 
 
+# ── hysteresis (anti-thrash), ported from colibri's tier_pick_lfru margin ────
+
+def test_is_hot_hysteresis_dead_zone():
+    """An expert sitting inside the dead zone keeps its current resident
+    state regardless of which side of the raw threshold it's on."""
+    from gb_moe import GbMoEManager
+
+    mgr = GbMoEManager(nn.Module(), hot_threshold=0.10, hysteresis_margin=0.25,
+                       tier_manager=MagicMock())
+    # Raw threshold is 0.10; dead zone is [0.075, 0.125).
+    assert mgr._is_hot(0.11, was_hot=True) is True,  "above raw threshold, was hot -> stays hot"
+    assert mgr._is_hot(0.11, was_hot=False) is False, "above raw but inside dead zone, was cold -> stays cold"
+    assert mgr._is_hot(0.08, was_hot=True) is True,  "below raw but inside dead zone, was hot -> stays hot"
+    assert mgr._is_hot(0.08, was_hot=False) is False, "below raw threshold, was cold -> stays cold"
+    assert mgr._is_hot(0.13, was_hot=False) is True,  "clearly above threshold -> promotes"
+    assert mgr._is_hot(0.07, was_hot=True) is False,  "clearly below threshold -> demotes"
+
+
+def test_rebalance_batched_no_flap_at_threshold_boundary():
+    """An expert whose frequency sits exactly at hot_threshold across
+    repeated rebalance windows must not promote/demote every pass , the
+    real-world trigger: hot_threshold itself drifts each _rebalance_batched
+    call (B1+ adaptation), which walks other experts' norm[i] through this
+    exact boundary over time. Without hysteresis this test fails by
+    recording >1 flip; colibri's own tier.h documents this identical
+    ping-pong failure mode as the reason for its margin."""
+    from gb_moe import GbMoEManager, _REBALANCE_EVERY
+
+    model = _make_batched_model(n_experts=4)
+    mgr = GbMoEManager(model, hot_threshold=0.25, prefetch_topn=1, cold_bits=8,
+                       tier_manager=MagicMock())
+    n_blocks = mgr.attach()
+    if n_blocks == 0:
+        pytest.skip("No batched MoE blocks")
+    bst = mgr._batched_blocks[0]
+
+    flips = 0
+    real_restore, real_demote = mgr._restore_expert_slice, mgr._demote_expert_slice
+    def _count_restore(b, i):
+        nonlocal flips
+        if i == 0:
+            flips += 1
+    def _count_demote(b, i):
+        nonlocal flips
+        if i == 0:
+            flips += 1
+
+    # Expert 0's frequency jitters just above/below hot_threshold=0.25 each
+    # window (realistic routing noise) , VRAM OK, no misses, isolating the
+    # boundary-jitter case from B1+'s own threshold drift.
+    with patch("gb_moe._vram_budget_ok", return_value=True), \
+         patch.object(mgr, "_restore_expert_slice", side_effect=_count_restore), \
+         patch.object(mgr, "_demote_expert_slice", side_effect=_count_demote):
+        for k in range(6):
+            e0 = 0.26 if k % 2 == 0 else 0.24
+            bst.freq = torch.tensor([e0, 0.30, 0.25, 0.20])
+            bst.misses = 0
+            mgr._rebalance_batched(bst)
+
+    assert flips <= 1, f"expert 0 flapped {flips} times across 6 windows at the exact boundary"
+
+
 # ── dequant restore path (cold_bits <= 4) ────────────────────────────────────
 
 def test_restore_expert_slice_dequant_path():

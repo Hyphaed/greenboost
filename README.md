@@ -325,9 +325,10 @@ report = gb_quant.quantize_to_fit(pipe_or_model, budget_gb=11.0)
   `third_party/`) and quantizer ship inside GreenBoost - your venv installs
   nothing extra.
 - **Works with**: diffusers pipelines (two-phase text-encoder recipe
-  included), HF causal LLMs (`gb_llm.py`), and pipelines you don't own via
-  the `GB_QUANT_BUDGET_GB` environment hook. vLLM is served by the bundled
-  plugin (`--quantization gemlite`).
+  included), HF causal LLMs (`gb_synapse_fallback.py`'s `load_causal_lm`/
+  `generate`, or natively through gb-synapse's own torch-core engine —
+  bf16/GPTQ/AWQ/FP8), and pipelines you don't own via the
+  `GB_QUANT_BUDGET_GB` environment hook.
 - Measured on an RTX 5070 12 GB: a 9 B image model that needed ~7 min/image
   through DDR overflow runs at ~5 s/image quantized into VRAM, with no
   visible quality loss; a 12 B LLM (22.7 GiB bf16) fits in 6.2 GiB.
@@ -506,9 +507,10 @@ assistant can't yank a live `:11435` out from under you).
 
 Full reference: [GREENBOOST_COMMANDS.md § gb-synapse](GREENBOOST_COMMANDS.md#-gb-synapse-huggingface-native-cluster-distributed-gguf-serving).
 
-When vLLM isn't installed, GB-Synapse falls back to `gb_llm_server.py`, a
-minimal OpenAI-compatible server built directly on `gb_llm.py` - same API
-surface, no extra dependency.
+When gb-synapse's own torch-core engine can't take a checkpoint (or its venv
+isn't installed), GB-Synapse falls back to `gb_synapse_fallback.py`, a
+minimal single-request OpenAI-compatible server (transformers + gb-quant) -
+same API surface, no extra dependency.
 
 ---
 

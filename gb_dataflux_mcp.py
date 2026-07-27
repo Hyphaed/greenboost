@@ -8,9 +8,9 @@ Lets an LLM (or any MCP client) query "how did data flow through the
 greenboost cluster" without shelling out or scraping the web UI: same JSONL
 log (gb_dataflux.py) that backs `greenboost dataflux-ui`, read-only.
 
-Tools (19 — keep this list in sync with the @mcp.tool defs below):
-    dataflux_summary       , cheap aggregate overview (nodes/labels/runs/tok_s)
-    dataflux_events         , raw events, filterable by node/label/kind/status
+Tools (21 — keep this list in sync with the @mcp.tool defs below):
+    dataflux_summary       , cheap aggregate overview (nodes/labels/runs/tok_s/by_kind)
+    dataflux_events         , raw events, filterable by node/label/kind/status/from_ts/to_ts/cursor
     dataflux_errors         , failed dispatches only
     dataflux_decisions      , shim tier-placement/spill decisions (kind=shim_decision)
     dataflux_actuations     , orchestrator lever moves (kind=actuation)
@@ -18,6 +18,8 @@ Tools (19 — keep this list in sync with the @mcp.tool defs below):
     dataflux_critic         , snapshot-correlated incident diagnosis + recommendations
     dataflux_topology       , per-node hardware topology events (deduped latest)
     dataflux_kinds          , event-kind breakdown (what actually happened)
+    dataflux_schema         , the event-kind REGISTRY , what every kind means (group/fields/incident rules)
+    dataflux_group          , every event across a whole registry group (e.g. "shim", "quant") in one call
     dataflux_tier_moves     , T1/T2/T3 promote/demote/evict events
     dataflux_quantization   , quantize / quantize_to_fit decisions
     dataflux_tok_s          , measured (not predicted) tokens/sec, per model
@@ -65,20 +67,26 @@ def dataflux_summary(days: float = 5.0) -> dict:
 def dataflux_events(days: float = 5.0, node: str | None = None,
                     label: str | None = None, kind: str | None = None,
                     status: str | None = None, stage: str | None = None,
-                    limit: int = 200) -> list[dict]:
+                    limit: int = 200, from_ts: float | None = None,
+                    to_ts: float | None = None, cursor: float | None = None) -> list[dict]:
     """Raw dataflux events over the last `days` days, most recent first.
 
     Filter by node (e.g. "host" or a feeder's hostname/ip), label (the
     script/workload name a caller passed to cluster_map/ClusterJobQueue,
-    e.g. "gen_image_batch.py"), kind (the event category, e.g. "tier_move",
-    "quantize", "quantize_to_fit", "turboquant_activate", "tok_s_measured",
-    "chunk_local", "chunk_remote", "job_local", "job_remote", "model_push",
-    "stage_bundle", "snapshot" , see `dataflux_kinds` for what's actually
-    present), status ("ok" or "error"), and/or stage — the stage_profile
-    stage name, substring match (e.g. "forge:image", "conduir:batch",
-    "artloop"), the fast path to one pipeline stage's timing series.
-    `limit` caps the number of events returned (default 200, most recent
-    first).
+    e.g. "gen_image_batch.py"), kind (the event category , see
+    `dataflux_schema()` for what every known kind means, or `dataflux_kinds`
+    for what's actually present in this window), status ("ok" or "error"),
+    and/or stage — the stage_profile stage name, substring match (e.g.
+    "forge:image", "conduir:batch", "artloop"), the fast path to one
+    pipeline stage's timing series. `limit` caps the number of events
+    returned (default 200, most recent first).
+
+    `from_ts`/`to_ts` (unix seconds) narrow the window with exact bounds
+    instead of the coarse `days`-back window , use when correlating against
+    a known incident timestamp. `cursor` (a `ts` value from a previous
+    call's last returned event) pages further back: pass the oldest event's
+    `ts` from one call as `cursor` on the next to continue past `limit`
+    without re-scanning from `days` again.
     """
     events = gdf.read_events(since_hours=days * 24)
     if node:
@@ -98,7 +106,53 @@ def dataflux_events(days: float = 5.0, node: str | None = None,
         events = [e for e in events if e.get("status") == status]
     if stage:
         events = [e for e in events if stage in str(e.get("stage", ""))]
+    if from_ts is not None:
+        events = [e for e in events if e.get("ts", 0) >= from_ts]
+    if to_ts is not None:
+        events = [e for e in events if e.get("ts", 0) <= to_ts]
+    if cursor is not None:
+        events = [e for e in events if e.get("ts", 0) < cursor]
     return list(reversed(events))[:limit]
+
+
+@mcp.tool()
+def dataflux_schema(kind: str | None = None) -> dict:
+    """The dataflux event-kind registry (gb_dataflux_kinds.py) , what every
+    known kind MEANS: its group, expected fields, which numeric fields are
+    worth trending, which statuses make it an incident, and whether it's
+    emitted by GreenBoost itself or by a consumer repo (ai-forge). Without
+    this, "queryable via dataflux_events(kind=...)" is technically true but
+    practically useless , an LLM has to read source to know that e.g.
+    "placement" carries `tensor_split`/`floor_bits`. Pass `kind` for one
+    entry, omit for the full registry (~40 kinds across 9 groups)."""
+    import gb_dataflux_kinds
+    return gb_dataflux_kinds.schema(kind)
+
+
+@mcp.tool()
+def dataflux_group(group: str, days: float = 5.0, limit: int = 200,
+                   from_ts: float | None = None, to_ts: float | None = None) -> dict:
+    """Every event across ALL kinds in one registry group (see
+    `dataflux_schema()` for the group each kind belongs to: placement, quant,
+    synapse, cluster, shim, pipeline, health, agent, eval), plus a per-kind
+    rollup (count/errors/last_ts) , the single tool that makes the ~22
+    previously-orphaned kinds (shim_transition, turboquant_activate,
+    tensor_split, capacity_fit, synapse_stall, pcie_degraded, health_transition,
+    image_gen, and more) queryable without one dedicated tool per kind."""
+    import gb_dataflux_kinds
+    kinds_in_group = gb_dataflux_kinds.kinds_in_group(group)
+    events = gdf.read_events(since_hours=days * 24)
+    if from_ts is not None:
+        events = [e for e in events if e.get("ts", 0) >= from_ts]
+    if to_ts is not None:
+        events = [e for e in events if e.get("ts", 0) <= to_ts]
+    group_events = [e for e in events if e.get("kind") in kinds_in_group]
+    by_kind = gdf.summarize(group_events)["by_kind"]
+    return {
+        "group": group, "kinds": list(kinds_in_group),
+        "event_count": len(group_events), "by_kind": by_kind,
+        "events": list(reversed(group_events))[:limit],
+    }
 
 
 @mcp.tool()

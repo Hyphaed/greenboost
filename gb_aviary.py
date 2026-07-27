@@ -34,6 +34,18 @@ import time
 import urllib.request
 from pathlib import Path
 
+def _default_synapse_url() -> str:
+    """gb-synapse's own port (GB_SYNAPSE_PORT, default 11435) , not raw
+    Ollama's legacy :11434. gb-synapse is THE Ollama replacement (owner
+    rule, 2026-07-15); certifying against the wrong port would measure a
+    different serving path than the one that actually runs the model."""
+    try:
+        import gb_synapse
+        return f"http://127.0.0.1:{gb_synapse.DEFAULT_PORT}"
+    except Exception:
+        return "http://127.0.0.1:11435"
+
+
 # 1M is the default target because it is the certified frontier, not because it
 # is the maximum: the upstream "Beyond 1M" ladder study found clean retrieval to
 # 1.31M, one dropped needle at 1.57M, and a visible bend at 2M (6/10).
@@ -160,7 +172,7 @@ def _build_haystack(target_tokens: int, needles, chars_per_token: float, seed: i
 
 
 def niah_certify(model: str, tokens: int, needles: int = 10,
-                 url: str = "http://127.0.0.1:11434", seed: int = 1337,
+                 url: "str | None" = None, seed: int = 1337,
                  kv_type: str = "unknown") -> dict:
     """Plant `needles` secret codes at evenly spread depths in a `tokens`-long
     haystack and score how many the model can retrieve in one pass.
@@ -171,6 +183,8 @@ def niah_certify(model: str, tokens: int, needles: int = 10,
     upstream certifies on f16 KV only and labels quantized-KV runs as budget
     configs. An unlabelled score is a claim, not a certificate.
     """
+    if url is None:
+        url = _default_synapse_url()
     rng = random.Random(seed)
     cities = rng.sample(_CITIES, needles)
     codes = {c: str(rng.randint(1000000, 9999999)) for c in cities}
@@ -218,7 +232,7 @@ def niah_certify(model: str, tokens: int, needles: int = 10,
 
 # ── Coherence gate ────────────────────────────────────────────────────────────
 
-def smoke_gate(model: str, url: str = "http://127.0.0.1:11434") -> dict:
+def smoke_gate(model: str, url: "str | None" = None) -> dict:
     """Refuse a model that has collapsed into repetition.
 
     A quant that is too low doesn't error — it loops. Six-gram repetition and
@@ -226,6 +240,8 @@ def smoke_gate(model: str, url: str = "http://127.0.0.1:11434") -> dict:
     gb-quant's "never below fp8" rule be enforced against evidence instead of
     against a table of assumptions.
     """
+    if url is None:
+        url = _default_synapse_url()
     body = json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": "Say hello and name three colors."}],

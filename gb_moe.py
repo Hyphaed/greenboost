@@ -274,17 +274,35 @@ class GbMoEManager:
     prefetch_topn : int
         Number of next-block historically-hottest experts to prefetch async
         while the current block computes. Default 2.
+    hysteresis_margin : float
+        Relative dead-zone around hot_threshold an expert's normalized
+        frequency must clear before its resident state flips (promote needs
+        norm >= hot_threshold*(1+margin); demote needs norm <
+        hot_threshold*(1-margin); anything in between keeps its current
+        state). Without this, an expert whose frequency sits near the
+        threshold flaps promote/demote every _REBALANCE_EVERY window , each
+        flip does real work (quantize/dequantize + a tier move), and
+        hot_threshold itself is adapted every batched-rebalance pass
+        (_rebalance_batched), which pushes MORE experts toward that boundary
+        over time. Same anti-thrashing principle as colibri's
+        tier_pick_lfru margin (25%+fixed-floor hysteresis on its heat
+        score) , adapted here to a per-expert relative-frequency threshold
+        rather than colibri's bounded-slot swap-gain comparison, since this
+        manager tracks an unbounded hot SET rather than a fixed number of
+        pinned slots. Default 0.25 (colibri's own default margin, `fc>>2`).
     tier_manager : ModelTierManager | None
         Reuse an existing one (e.g. the diffusion/LLM orchestrator's), or a
         dedicated instance is created.
     """
 
     def __init__(self, model: torch.nn.Module, hot_threshold: float = 0.05,
-                 cold_bits: "int | str" = 4, prefetch_topn: int = 2, tier_manager=None):
+                 cold_bits: "int | str" = 4, prefetch_topn: int = 2,
+                 hysteresis_margin: float = 0.25, tier_manager=None):
         self.model = model
         self.hot_threshold = hot_threshold
         self.cold_bits = cold_bits
         self.prefetch_topn = prefetch_topn
+        self.hysteresis_margin = hysteresis_margin
 
         from gb_model_tier import ModelTierManager
         self.tm = tier_manager or ModelTierManager()
@@ -487,22 +505,51 @@ class GbMoEManager:
 
     # ── compression / tier rebalance ─────────────────────────────────────────
 
+    def _is_hot(self, freq_norm: float, was_hot: bool) -> bool:
+        """Hysteresis-gated hot/cold decision , see hysteresis_margin
+        docstring on __init__. Not-yet-classified experts (was_hot=False on
+        an expert never seen resident) use the plain threshold, same as a
+        demoted expert would on the cold side."""
+        if was_hot:
+            return freq_norm >= self.hot_threshold * (1.0 - self.hysteresis_margin)
+        return freq_norm >= self.hot_threshold * (1.0 + self.hysteresis_margin)
+
+    def _emit_expert_placement(self, block_name: str, key: str, action: str,
+                               freq_norm: float) -> None:
+        """Best-effort dataflux event for a real hot/cold expert-tier
+        transition , Rule #1's MoE clause is that the VRAM occupied by
+        experts must be the subset ACTUALLY used by inference (real routing
+        frequency), not an arbitrary or load-order-determined one; without
+        this, that placement decision was invisible to dataflux entirely."""
+        try:
+            import gb_dataflux
+            gb_dataflux.emit({
+                "node": "host", "label": "gb_moe", "kind": "placement",
+                "runtime": "moe_expert", "block": block_name, "expert": key,
+                "action": action, "freq_norm": round(freq_norm, 4),
+                "cold_bits": self.cold_bits,
+            })
+        except Exception:
+            pass
+
     def _rebalance(self, st: _BlockState):
         import gb_quant
 
         total = st.freq.sum().clamp_min(1e-8)
         norm = st.freq / total
         for i, (key, mod) in enumerate(st.experts):
-            is_hot = float(norm[i]) >= self.hot_threshold
             was_hot = key in st.hot
+            is_hot = self._is_hot(float(norm[i]), was_hot)
             entry_name = f"moe::{st.block_name}::{key}"
             if is_hot and not was_hot:
                 self.tm.promote(entry_name)
                 st.hot.add(key)
+                self._emit_expert_placement(st.block_name, key, "promote", float(norm[i]))
             elif not is_hot and was_hot:
                 gb_quant.quantize_module(mod, bits=self.cold_bits)
                 self.tm.demote(entry_name)
                 st.hot.discard(key)
+                self._emit_expert_placement(st.block_name, key, "demote", float(norm[i]))
 
     # ── batched rebalance + prefetch ─────────────────────────────────────────
 
@@ -532,12 +579,14 @@ class GbMoEManager:
         total = bst.freq.sum().clamp_min(1e-8)
         norm = bst.freq / total
         for i in range(bst.num_experts):
-            is_hot = float(norm[i]) >= self.hot_threshold
             was_hot = str(i) in bst.hot
+            is_hot = self._is_hot(float(norm[i]), was_hot)
             if is_hot and not was_hot:
                 self._restore_expert_slice(bst, i)
+                self._emit_expert_placement(bst.block_name, str(i), "promote", float(norm[i]))
             elif not is_hot and was_hot:
                 self._demote_expert_slice(bst, i)
+                self._emit_expert_placement(bst.block_name, str(i), "demote", float(norm[i]))
 
     def _prefetch_next_batched(self, bst: _BatchedBlockState) -> None:
         """Copy the historically-hottest cold expert slices of the NEXT batched

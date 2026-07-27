@@ -12,13 +12,17 @@ pytest.importorskip("aiohttp")
 import gb_synapse_api as api
 
 
-def test_usage_completion_tokens_extracts_and_keeps_last():
-    assert api._usage_completion_tokens({}, 0) == 0
-    assert api._usage_completion_tokens({"usage": {"completion_tokens": 50}}, 0) == 50
-    # a chunk without usage keeps the previous value
-    assert api._usage_completion_tokens({"choices": [{}]}, 50) == 50
+def test_usage_counts_extracts_and_keeps_last():
+    assert api._usage_counts({}, (0, 0)) == (0, 0)
+    assert api._usage_counts({"usage": {"completion_tokens": 50, "prompt_tokens": 12}},
+                              (0, 0)) == (50, 12)
+    # a chunk without usage keeps the previous values
+    assert api._usage_counts({"choices": [{}]}, (50, 12)) == (50, 12)
     # null usage keeps previous
-    assert api._usage_completion_tokens({"usage": {"completion_tokens": None}}, 50) == 50
+    assert api._usage_counts({"usage": {"completion_tokens": None, "prompt_tokens": None}},
+                              (50, 12)) == (50, 12)
+    # partial usage (only one field present) updates just that field
+    assert api._usage_counts({"usage": {"completion_tokens": 60}}, (50, 12)) == (60, 12)
 
 
 def test_record_tok_s_computes_decode_rate(monkeypatch):
@@ -66,7 +70,7 @@ def test_stream_loop_simulation(monkeypatch):
     monkeypatch.setattr(api.time, "monotonic", lambda: next(times))
 
     t_first = t_last = None
-    ctok = 0
+    ctok = ptok = 0
     for chunk in chunks:
         piece = (chunk.get("choices") or [{}])[0].get("delta", {}).get("content", "")
         if piece:
@@ -74,7 +78,7 @@ def test_stream_loop_simulation(monkeypatch):
             if t_first is None:
                 t_first = now
             t_last = now
-        ctok = api._usage_completion_tokens(chunk, ctok)
+        ctok, ptok = api._usage_counts(chunk, (ctok, ptok))
     api._record_tok_s("qwen3", t_first, t_last, ctok)
 
     # (3-1) tokens / (101.0 - 100.0)s = 2 tok/s

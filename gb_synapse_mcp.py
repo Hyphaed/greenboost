@@ -106,8 +106,7 @@ def synapse_recommend(ctx: int = 65536, probe_feeders: bool = True) -> list[dict
 def synapse_doctor(probe_feeders: bool = True) -> dict:
     """GB-Synapse environment diagnosis: engine, CUDA, cluster rpc reachability,
     manifest health, plus `torch_engine_ready`/`torch_engine_env` (the
-    synapse torch engine's venv, if installed) and `vllm_available`
-    (legacy backend, still live)."""
+    synapse torch engine's venv, if installed)."""
     try:
         import gb_synapse
         return gb_synapse.doctor(probe_feeders=probe_feeders)
@@ -121,10 +120,11 @@ def synapse_serve(model: str, ctx: int = 65536, use_cluster: bool = True,
     """Serve a model through gb-synapse (engine backend + the gb-synapse
     proxy, default port 11435, GB_SYNAPSE_PORT; tensor-split across the
     cluster when use_cluster and feeders are up for the llama.cpp backend).
-    `engine` ("llama.cpp"/"vllm"/"transformers"/"diffusers") only affects the
-    DRY-RUN preview's backend name — it does NOT override the manifest's own
-    engine for an actual (confirm=True) serve; re-pull with --engine to
-    change that durably.
+    `engine` ("llama.cpp"/"torch"/"diffusers" — "vllm"/"transformers" still
+    accepted as deprecated aliases for "torch") only affects the DRY-RUN
+    preview's backend name — it does NOT override the manifest's own engine
+    for an actual (confirm=True) serve; re-pull with --engine to change
+    that durably.
 
     DRY-RUN unless confirm=True: without it, returns the resolved model entry,
     which backend would serve it, and a warning about whatever is currently

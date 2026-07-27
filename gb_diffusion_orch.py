@@ -187,6 +187,22 @@ class DiffusionOrchestrator:
 
     # ── phase context managers ────────────────────────────────────────────────
 
+    def _emit_phase(self, phase: str, promoted: tuple, demoted: tuple) -> None:
+        """Best-effort dataflux event for a real T1/T2 phase transition , this
+        choreographer is the phase-promotion decision-maker for every
+        ai-forge image-gen pipeline that runs through gb_quant's batch mode
+        (encode -> denoise -> decode), and previously left zero dataflux
+        trace of which components moved where and when."""
+        try:
+            import gb_dataflux
+            gb_dataflux.emit({
+                "node": "host", "label": "gb_diffusion_orch", "kind": "placement",
+                "runtime": "diffusion_phase", "phase": phase,
+                "promoted": list(promoted), "demoted": list(demoted),
+            })
+        except Exception:
+            pass
+
     @contextlib.contextmanager
     def encode_phase(self):
         """
@@ -196,6 +212,7 @@ class DiffusionOrchestrator:
         Yields into the encoding context; on exit frees encoder memory.
         """
         print("[gb_orch] encode_phase: promoting encoders → T1", flush=True)
+        self._emit_phase("encode", self.encoder_attrs, self.denoiser_attrs + self.vae_attrs)
         self.tm.session_active()
 
         # Demote denoiser + VAE first to make room
@@ -241,6 +258,7 @@ class DiffusionOrchestrator:
             (e.g. 0.1); None (default) leaves the denoiser unpatched.
         """
         print("[gb_orch] denoise_phase: promoting denoiser → T1", flush=True)
+        self._emit_phase("denoise", self.denoiser_attrs, self.vae_attrs)
 
         for attr in self.denoiser_attrs:
             if attr in self.tm._entries:
@@ -310,6 +328,7 @@ class DiffusionOrchestrator:
           - VAE on GPU (T1), denoiser demoted to T2
         """
         print("[gb_orch] decode_phase: promoting VAE → T1", flush=True)
+        self._emit_phase("decode", self.vae_attrs, self.denoiser_attrs)
 
         for attr in self.denoiser_attrs:
             if attr in self.tm._entries:

@@ -71,12 +71,30 @@ def _candidate_urls() -> list[str]:
 
 def _resolve_ollama_url() -> "str | None":
     """Probe `_candidate_urls()` in priority order, return the first that
-    answers /api/ps. None if nothing is alive. Resolved fresh on every call
-    (never a frozen constant) so a box mid-migration between gb-synapse and
-    raw ollama always talks to whichever is actually up right now."""
+    answers. None if nothing is alive. Resolved fresh on every call (never a
+    frozen constant) so a box mid-migration between gb-synapse and raw
+    ollama always talks to whichever is actually up right now.
+
+    gb-synapse's own candidate is probed via /health (tied to the real
+    upstream engine's liveness — gb_synapse_api.health() actually checks the
+    engine, not just that the proxy process exists) rather than /api/ps:
+    /api/ps used to be a hardcoded stub that always answered 200 with one
+    fake entry regardless of whether anything was really serving, so this
+    probe passed against a dead engine. It's since been fixed to be honest
+    (backed by gb_synapse.ps()), but /health remains the more direct signal
+    and doesn't depend on a model name being resolvable. Raw Ollama has no
+    /health endpoint, so the legacy :11434 fallback still uses /api/ps."""
+    try:
+        import gb_synapse
+        synapse_port = gb_synapse.DEFAULT_PORT
+    except Exception:
+        synapse_port = int(os.environ.get("GB_SYNAPSE_PORT", "11435"))
+    synapse_url = f"http://127.0.0.1:{synapse_port}"
+
     for url in _candidate_urls():
+        probe = "/health" if url == synapse_url else "/api/ps"
         try:
-            with urllib.request.urlopen(f"{url}/api/ps", timeout=5):
+            with urllib.request.urlopen(f"{url}{probe}", timeout=5):
                 return url
         except Exception:
             continue
@@ -111,9 +129,19 @@ def _endpoint_alive() -> bool:
 
 
 def _engine_built() -> bool:
+    """True when SOME gb-synapse backend can actually serve the job — the
+    llama.cpp engine built, OR the torch engine's venv is present. Gating
+    only on the llama.cpp build meant a torch-only host silently fell
+    through to _ollama_keep_alive() every night, which the proxy has no
+    handling for at all (no keep_alive support) — a torch-served rotation
+    would appear to run to completion but never actually serve/unload
+    anything against the model it thought it was rotating."""
     try:
         import gb_synapse
-        return gb_synapse.engine_installed()
+        if gb_synapse.engine_installed():
+            return True
+        import gb_synapse_backends
+        return gb_synapse_backends._torch_env_dir() is not None
     except Exception:
         return False
 

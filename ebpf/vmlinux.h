@@ -51954,6 +51954,7 @@ struct bpf_prog_ops {
 struct bpf_prog_pack {
 	struct list_head list;
 	void *ptr;
+	bool arch_flush_needed;
 	long unsigned int bitmap[0];
 };
 
@@ -96313,7 +96314,7 @@ struct iommufd_vevent {
 	struct iommufd_vevent_header header;
 	struct list_head node;
 	ssize_t data_len;
-	u64 event_data[0];
+	u8 event_data[0];
 };
 
 struct iommufd_veventq {
@@ -121372,7 +121373,7 @@ struct pid {
 };
 
 union proc_op {
-	int (*proc_get_link)(struct dentry *, struct path *);
+	int (*proc_get_link)(struct dentry *, struct path *, struct task_struct *);
 	int (*proc_show)(struct seq_file *, struct pid_namespace *, struct pid *, struct task_struct *);
 	int lsmid;
 };
@@ -130083,10 +130084,6 @@ struct rx_queue_attribute {
 	struct attribute attr;
 	ssize_t (*show)(struct netdev_rx_queue *, char *);
 	ssize_t (*store)(struct netdev_rx_queue *, const char *, size_t);
-};
-
-struct s {
-	__be32 conv;
 };
 
 struct s3_save {
@@ -140871,6 +140868,7 @@ struct tcp_ao_info {
 	u32 snd_sne;
 	u32 rcv_sne;
 	refcount_t refcnt;
+	struct callback_head rcu;
 };
 
 struct tcp_ao_info_opt {
@@ -153987,6 +153985,7 @@ struct udmabuf {
 	long unsigned int nr_pinned;
 	struct folio **pinned_folios;
 	struct sg_table *sg;
+	enum dma_data_direction sg_dir;
 	struct miscdevice *device;
 	long unsigned int *offsets;
 };

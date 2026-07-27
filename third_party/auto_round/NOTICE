@@ -1,0 +1,74 @@
+GreenBoost third_party/auto_round — vendored third-party code
+===============================================================
+
+Upstream project: auto-round (Intel® AutoRound)
+Repository:       https://github.com/intel/auto-round
+Upstream commit:  3cae4b68addc738a2be20fd827c9d7775342fe12 (2026-07-24)
+Upstream version: 0.15.0
+License:          Apache-2.0 (see LICENSE, verbatim from upstream)
+Import date:      2026-07-26
+
+What was imported
+------------------
+This is NOT a hand-picked subset. GreenBoost only needs
+`auto_round.auto_scheme.gen_auto_scheme`/`delta_loss`/`register` +
+`auto_round.schemes` (the AutoScheme quality-tier search + calibration
+engine), but `auto_round/__init__.py` eagerly imports the package's full
+feature surface (AutoRound's main compressor class, every algorithm
+config: RTN/SignRound/SignRoundV2/AWQ/Hadamard/SpinQuant) — and Python
+always executes a package's `__init__.py` before any of its submodules,
+so there is no way to import just the 4 target files without triggering
+that eager chain. A full dependency trace (AST-walking every
+`auto_round.*` import transitively, from the 4 files above as roots)
+found 139 files are actually reachable — verified by import, not just
+counted: `import auto_round` (this vendored copy) succeeds end-to-end.
+That is what's vendored here: every file the real import graph touches,
+preserving the exact `auto_round`/`auto_round_extension` package layout so
+internal relative/absolute imports resolve unchanged.
+
+NOT vendored: `test/`, `docs/`, `examples/`, `scripts/` (upstream's own
+test/doc/example trees) — this repo's own tests
+(tests/test_gb_quant_calib_delta_loss.py) cover the GreenBoost-side
+integration, same exclusion policy as llama.cpp/NOTICE and
+synapse_engine/NOTICE.
+
+New runtime dependencies this pulls in (declared in
+synapse_engine/pyproject.toml): `accelerate`, `py-cpuinfo` (both new;
+`datasets`, `pydantic`, `tqdm`, `numpy`, `torch`, `transformers` were
+already direct or transitive dependencies of the torch engine). This is
+the exact "drags in accelerate/datasets" outcome a narrower 4-file vendor
+was meant to avoid — confirmed unavoidable for THIS upstream package
+layout (its `__init__.py` is not lazy), not a scope creep on GreenBoost's
+side. `calibrate_with_prompts()` (gb_quant_calib.py) imports this tree
+lazily, inside its own function body only, gated behind
+`sensitivity_source="delta_loss"` / `GB_QUANT_CALIB=delta_loss` — never at
+gb_quant.py's own module level, and never touched by the zero-data
+default calibration path.
+
+Local modifications
+--------------------
+Every local patch to the vendored tree MUST be appended below, in order,
+so future contributors can tell upstream code from GreenBoost's own
+changes at a glance (same convention as third_party/gemlite/NOTICE).
+
+- `auto_round/__init__.py`: removed the unconditional `monkey_patch()`
+  call at import time. Upstream's `monkey_patch()`
+  (`auto_round/utils/common.py:monkey_patch_transformers`) globally
+  patches the PROCESS-WIDE `transformers` module (rebinds
+  `transformers.modeling_utils.no_init_weights`, wraps
+  `AutoModelForCausalLM.from_pretrained`'s kwargs, patches RoPE init) as a
+  side effect of merely `import auto_round`. GreenBoost imports this tree
+  lazily inside gb_quant_calib's opt-in delta-loss path, in the SAME
+  process as gb_synapse_fallback/synapse_engine's own transformers usage
+  — a calibration helper must never silently alter global transformers
+  behavior for every other consumer sharing that process. Verified: with
+  the patch, `transformers.AutoModelForCausalLM.from_pretrained.__func__`
+  is identical before and after `import auto_round` (bound-classmethod
+  objects themselves always differ across separate attribute accesses —
+  `__func__` is the correct identity check, not the bound method).
+  `auto_round.monkey_patch()` itself is untouched and still callable by
+  any future caller that specifically wants AutoRound's own patches; none
+  do today.
+
+No other files were modified — everything else is a verbatim copy at the
+pinned commit.

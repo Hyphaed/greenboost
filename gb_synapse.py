@@ -33,8 +33,9 @@ CLI:
     python3 gb_synapse.py pull <repo>[:quant] [name]
         quant is either a GGUF token (Q4_K_M, Q8_0, ...) served through
         llama.cpp, or FP8/INT8/INT4 to route through gb-quant instead
-        (vLLM if installed, else a transformers fallback — one interface,
-        gb-synapse picks the runtime; see workflow/gb-synapse.md).
+        (the synapse torch engine if installed, else a transformers
+        fallback — one interface, gb-synapse picks the runtime; see
+        workflow/gb-synapse.md).
     python3 gb_synapse.py index-ollama
     python3 gb_synapse.py list|rm <name>
     python3 gb_synapse.py doctor [--llm]
@@ -91,7 +92,9 @@ def _resolve_engine_dir() -> Path:
 
 
 ENGINE_DIR = _resolve_engine_dir()
-ENGINE_SRC_DIR = _REPO_DIR.parent / "greenboost-sources" / "llama.cpp"
+ENGINE_SRC_DIR = _REPO_DIR / "third_party" / "llama.cpp"
+# Documentation-only now (used by the maintainer "bump the pin" workflow,
+# not by any runtime path) — see ENGINE_SRC_DIR/NOTICE and PINNED_COMMIT.
 LLAMA_CPP_REMOTE = "https://github.com/ggml-org/llama.cpp"
 
 CONFIG_DIR = Path("/etc/greenboost/synapse")
@@ -119,6 +122,24 @@ _SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
 # its whole second GPU.
 RPC_READY_TIMEOUT_S = float(os.environ.get("GB_SYNAPSE_RPC_READY_S", "30"))
 SERVE_READY_GRACE_S = float(os.environ.get("GB_SYNAPSE_READY_GRACE_S", "20"))
+
+# gLLM cluster PP (SynapseTorchBackend) rendezvous port — a full band clear of
+# RPC_PORT_BASE (50052 + up to a plausible feeder count) so the two mechanisms
+# can never collide. One port suffices: only the host ever acts as PP master,
+# so there's no per-feeder offset the way RPC_PORT_BASE + i needs one.
+GLLM_MASTER_PORT_BASE = 51052
+
+# How long the LOCAL master's /health gets to respond after launching a
+# cluster PP serve, before giving up and retrying host-only. Deliberately
+# much larger than SERVE_READY_GRACE_S: gLLM's dist.init_process_group()
+# rendezvous (dist_utils.py) passes no timeout=, so a feeder that's slow to
+# join (cold GPU CUDA init) or never joins at all (bad network/firewall) just
+# hangs rather than failing fast — this is the GreenBoost-side bound that
+# stands in for the one gLLM doesn't provide. NOT yet validated against a
+# real hung rendezvous (see workflow/gb-synapse.md) — the actual hang
+# behavior of a from-source torch.distributed build wasn't measured this
+# session; treat this default as a starting point, not a proven value.
+GLLM_CLUSTER_READY_TIMEOUT_S = float(os.environ.get("GB_SYNAPSE_GLLM_CLUSTER_READY_S", "90"))
 
 
 def _run(cmd: list[str], capture: bool = False, check: bool = True, **kw) -> subprocess.CompletedProcess:
@@ -155,32 +176,40 @@ def _find_nvcc() -> str:
     return "nvcc"  # let cmake resolve it from PATH, and fail loudly if that's wrong too
 
 
-def fetch_engine_source(remote: str = LLAMA_CPP_REMOTE, src_dir: Path = ENGINE_SRC_DIR) -> str:
-    """Clone src_dir from `remote` if absent, else fast-forward it to
-    origin's default branch. Returns `git describe` for the checked-out tree.
+def engine_source_pin(src_dir: Path = ENGINE_SRC_DIR) -> str:
+    """The pinned upstream llama.cpp commit for the vendored tree at
+    `src_dir` (full SHA, from third_party/llama.cpp/PINNED_COMMIT) — the
+    source of truth for `engine.version` now that src_dir is a plain
+    committed subtree of the greenboost repo, not its own git checkout
+    (so `git describe` run there would describe greenboost's own tags/
+    history, not llama.cpp's — confirmed live 2026-07-24: it silently
+    returned greenboost's own short hash instead of erroring)."""
+    pin_file = Path(src_dir) / "PINNED_COMMIT"
+    try:
+        return pin_file.read_text().strip()
+    except OSError:
+        raise RuntimeError(f"no PINNED_COMMIT at {pin_file} — vendored llama.cpp "
+                            f"tree is missing or incomplete")
 
-    This is the "fetch latest llama.cpp" mechanism: the vendored tree at
-    greenboost-sources/llama.cpp starts as a point-in-time snapshot; this
-    function is how `greenboost synapse update-engine` tracks upstream
-    github.com/ggml-org/llama.cpp going forward.
-    """
-    if not shutil.which("git"):
-        raise RuntimeError("gb-synapse engine fetch needs git: "
-                           + _install_hint("git") + "   (or: sudo greenboost install-deps)")
+
+def verify_engine_source(src_dir: Path = ENGINE_SRC_DIR) -> str:
+    """Assert the vendored llama.cpp tree at `src_dir` is present (does NOT
+    fetch — see third_party/llama.cpp/NOTICE for the maintainer "bump the
+    pin" workflow). Returns the pinned commit (short form, matching the
+    style `cmd_feeders_sync_synapse`'s prefix-match parity check expects).
+
+    Replaces the old fetch_engine_source(), which did a live `git clone`/
+    `fetch --depth 1 && reset --hard` against LLAMA_CPP_REMOTE on every
+    `sync-synapse` run — the engine source is now vendored+pinned in-repo,
+    exactly like synapse_engine/gllm/, so there is nothing to fetch here."""
     src_dir = Path(src_dir)
-    if not (src_dir / ".git").exists():
-        src_dir.parent.mkdir(parents=True, exist_ok=True)
-        _run(["git", "clone", "--depth", "1", remote, str(src_dir)])
-    else:
-        _run(["git", "-C", str(src_dir), "fetch", "--depth", "1", "origin"])
-        show = _run(["git", "-C", str(src_dir), "remote", "show", "origin"], capture=True).stdout
-        branch = "master"
-        for line in show.splitlines():
-            if "HEAD branch" in line:
-                branch = line.rsplit(":", 1)[-1].strip()
-        _run(["git", "-C", str(src_dir), "reset", "--hard", f"origin/{branch}"])
-    return _run(["git", "-C", str(src_dir), "describe", "--always", "--dirty"],
-                capture=True).stdout.strip()
+    if not (src_dir / "CMakeLists.txt").exists():
+        raise RuntimeError(
+            f"vendored llama.cpp source not found at {src_dir} — your "
+            f"greenboost repo checkout is missing third_party/llama.cpp/; "
+            f"git pull the repo (this directory travels with it, same as "
+            f"synapse_engine/)")
+    return engine_source_pin(src_dir)[:9]
 
 
 def _install_hint(pkgs: str) -> str:
@@ -260,9 +289,7 @@ def build_engine(src_dir: Path = ENGINE_SRC_DIR, install_dir: Path = ENGINE_DIR,
     """
     _preflight_build_tools(need_nvcc=True)
     src_dir = Path(src_dir)
-    if not src_dir.exists():
-        raise RuntimeError(f"llama.cpp source not found at {src_dir}; "
-                            f"run fetch_engine_source() first")
+    version = verify_engine_source(src_dir)
     build_dir = src_dir / "build-synapse"
     jobs = jobs or os.cpu_count() or 4
 
@@ -272,7 +299,15 @@ def build_engine(src_dir: Path = ENGINE_SRC_DIR, install_dir: Path = ENGINE_DIR,
           "-DGGML_RPC=ON",
           f"-DCMAKE_CUDA_ARCHITECTURES={_cuda_arch()}",
           f"-DCMAKE_CUDA_COMPILER={_find_nvcc()}",
-          "-DLLAMA_CURL=OFF"])  # gb-synapse owns HF downloads; no need for llama.cpp's own fetcher
+          "-DLLAMA_CURL=OFF",  # gb-synapse owns HF downloads; no need for llama.cpp's own fetcher
+          # tests/examples/pocs/app aren't vendored (see NOTICE) — these
+          # options default ON in a standalone build (LLAMA_STANDALONE) and
+          # gate exactly those add_subdirectory() calls, so they're
+          # load-bearing, not cosmetic: confirmed live 2026-07-24, cmake
+          # fails outright without them.
+          "-DLLAMA_BUILD_TESTS=OFF",
+          "-DLLAMA_BUILD_EXAMPLES=OFF",
+          "-DLLAMA_BUILD_APP=OFF"])
     # Upstream's CMake target for the RPC server is "ggml-rpc-server" (the
     # binary was renamed at some point; the source file is still
     # tools/rpc/rpc-server.cpp). gb-synapse keeps installing it AS
@@ -295,15 +330,14 @@ def build_engine(src_dir: Path = ENGINE_SRC_DIR, install_dir: Path = ENGINE_DIR,
     for so in build_dir.glob("bin/*.so*"):  # ggml/llama shared libs, layout varies by cmake version
         shutil.copy2(so, install_dir / so.name)
 
-    version = _run(["git", "-C", str(src_dir), "describe", "--always", "--dirty"],
-                    capture=True).stdout.strip()
     (install_dir / "engine.version").write_text(version + "\n")
     return {"version": version, "install_dir": str(install_dir)}
 
 
 def update_engine() -> dict:
-    """Pull the latest github.com/ggml-org/llama.cpp and rebuild in place."""
-    fetch_engine_source()
+    """Rebuild the vendored, pinned llama.cpp for this node — no fetch (the
+    source is vendored+pinned in-repo; bump third_party/llama.cpp/ deliberately
+    via the maintainer workflow in its NOTICE to track a newer upstream)."""
     return build_engine()
 
 
@@ -329,22 +363,28 @@ def status() -> dict:
     engine path — not ollama's internal llama-server."""
     import subprocess
     torch_env = gb_synapse_backends._torch_env_dir()
+    running = ps()
     out = {"engine_built": engine_installed(),
            "engine_version": engine_version() or None,
-           "server_running": False, "proxy_running": False,
+           # Derived from ps() (== _read_run_states(), pid-checked) instead
+           # of a pgrep pattern that only ever matched llama-server — that
+           # made server_running lie False for the 3 of 4 backends (gLLM,
+           # transformers fallback, diffusers) that aren't llama-server.
+           "server_running": any(_pid_alive(s["llama_pid"]) for s in running),
+           "proxy_running": any(_pid_alive(s["proxy_pid"]) for s in running),
            "engine_dir": str(ENGINE_DIR),
-           "vllm_available": gb_synapse_backends._find_vllm_bin() is not None,
            "torch_engine_ready": torch_env is not None,
            "torch_engine_env": str(torch_env) if torch_env else ""}
-    for key, pat in (("server_running", f"{ENGINE_DIR}/llama-server"),
-                     ("proxy_running", "gb_synapse_api")):
-        try:
-            r = subprocess.run(["pgrep", "-f", pat],
-                               capture_output=True, text=True, timeout=5)
-            out[key] = bool(r.stdout.strip())
-        except Exception:
-            pass
-    out["engines_running"] = sorted({s.get("engine", "") for s in ps()} - {""})
+    # Supplementary signal, kept from the old check: a llama-server process
+    # pgrep can find that ps()/run-state doesn't know about at all (manually
+    # launched outside gb_synapse.serve(), or its run-state file was lost).
+    try:
+        r = subprocess.run(["pgrep", "-f", f"{ENGINE_DIR}/llama-server"],
+                           capture_output=True, text=True, timeout=5)
+        out["orphan_engine_detected"] = bool(r.stdout.strip()) and not out["server_running"]
+    except Exception:
+        out["orphan_engine_detected"] = False
+    out["engines_running"] = sorted({s.get("engine", "") for s in running} - {""})
     return out
 
 
@@ -603,10 +643,11 @@ def _pull_and_convert(repo: str, quant: str, name: str | None) -> ModelEntry:
     return entry
 
 
-# Tokens that mean "quantize via gb-quant, serve through vLLM/transformers"
-# instead of a GGUF/llama.cpp quant. Deliberately excludes BF16 (a real GGUF
-# quant filename token too, e.g. "model-BF16.gguf") to avoid ambiguity —
-# FP8/INT8/INT4 are never real GGUF quant tokens (those use QX_K/QX_0 names).
+# Tokens that mean "quantize via gb-quant, serve through the torch engine/
+# transformers" instead of a GGUF/llama.cpp quant. Deliberately excludes
+# BF16 (a real GGUF quant filename token too, e.g. "model-BF16.gguf") to
+# avoid ambiguity — FP8/INT8/INT4 are never real GGUF quant tokens (those
+# use QX_K/QX_0 names).
 _GBQUANT_TOKENS = {"FP8", "INT8", "INT4"}
 
 
@@ -630,9 +671,9 @@ def _quant_display_token(quant_method: str, quant_bits: int) -> str:
 
 def _pull_torch(repo: str, quant: str, name: str | None, engine: str = "torch") -> ModelEntry:
     """Fetch the safetensors (or `.bin`) snapshot for torch-core serving
-    (vLLM's on-the-fly native quantization, or the transformers fallback,
-    both quantize at load time — no GGUF conversion needed here, unlike
-    _pull_and_convert).
+    (the synapse torch engine's on-the-fly native quantization, or the
+    transformers fallback, both quantize at load time — no GGUF conversion
+    needed here, unlike _pull_and_convert).
 
     Never re-quantizes an already-quantized checkpoint: `read_quant_config`
     (folded into `safetensors_summary`'s returned meta) is the checkpoint's
@@ -642,10 +683,10 @@ def _pull_torch(repo: str, quant: str, name: str | None, engine: str = "torch") 
     checkpoint AS IF it were a plain bf16 one to be re-quantized would
     silently double-quantize it.
 
-    `engine` defaults to "torch" (select_backend currently routes that like
-    "vllm": prefer the vLLM backend, fall back to transformers automatically
-    when the vLLM venv isn't installed); pass "transformers" explicitly to
-    pin the fallback engine regardless of vLLM availability."""
+    `engine` defaults to "torch" (select_backend prefers the synapse torch
+    engine, falling back to transformers automatically when the torch venv
+    isn't installed); pass "transformers" explicitly to pin the fallback
+    engine regardless of torch-engine availability."""
     from huggingface_hub import snapshot_download
     cache_dir = str(MODEL_STORE_DIR / "_hf_cache")
     local_dir = snapshot_download(
@@ -682,13 +723,27 @@ def _pull_diffusers(repo: str, name: str | None) -> ModelEntry:
     component subfolder) for DiffusersBackend's image server. No GGUF
     conversion — diffusers loads the safetensors/config layout directly.
     Same cache-discipline as _pull_torch (MODEL_STORE_DIR/_hf_cache, so a
-    re-pull never re-downloads from scratch)."""
-    from huggingface_hub import snapshot_download
-    cache_dir = str(MODEL_STORE_DIR / "_hf_cache")
-    local_dir = snapshot_download(
-        repo_id=repo, token=hf_token(), cache_dir=cache_dir,
-        allow_patterns=["*.safetensors", "*.json", "*.txt", "*.model", "tokenizer*"],
-    )
+    re-pull never re-downloads from scratch) — EXCEPT it checks the
+    interactive user's own default HF cache first (`local_files_only=True`
+    against `huggingface_hub`'s own `HF_HUB_CACHE`): image models are
+    routinely pulled by hand into `~/.cache/huggingface` before gb-synapse
+    is asked to serve them (e.g. via a Studio/comfy workflow), and
+    `snapshot_download` dedupes by content hash PER cache_dir, so pointing
+    straight at MODEL_STORE_DIR/_hf_cache would silently re-download every
+    blob into a second location instead of reusing what's already on disk."""
+    from huggingface_hub import constants as _hf_constants, snapshot_download
+    patterns = ["*.safetensors", "*.json", "*.txt", "*.model", "tokenizer*"]
+    try:
+        local_dir = snapshot_download(
+            repo_id=repo, cache_dir=_hf_constants.HF_HUB_CACHE,
+            allow_patterns=patterns, local_files_only=True,
+        )
+    except Exception:
+        cache_dir = str(MODEL_STORE_DIR / "_hf_cache")
+        local_dir = snapshot_download(
+            repo_id=repo, token=hf_token(), cache_dir=cache_dir,
+            allow_patterns=patterns,
+        )
     entry_name = name or repo.split("/")[-1]
     entry = ModelEntry(name=entry_name, path=local_dir, source="hf", repo=repo,
                         engine="diffusers", quant="fp8", added_ts=time.time())
@@ -710,15 +765,17 @@ def pull(repo_spec: str, name: str | None = None, engine: str = "") -> ModelEntr
 
     repo_spec is "org/repo" or "org/repo:QUANT". QUANT is either a GGUF quant
     token (Q4_K_M, Q8_0, ...) served through llama.cpp, or FP8/INT8/INT4 to
-    route through torch-core (vLLM if installed, else transformers).
+    route through torch-core (the synapse torch engine if installed, else
+    transformers).
 
     With no quant and no explicit `engine`, the repo's own file listing
     decides once it turns out to have no GGUF release: a diffusers
     `model_index.json` routes to the image backend; a token-less safetensors
-    (or `.bin`) repo routes to torch-core at fp8 quality when the vLLM venv
-    exists (falls back to GGUF conversion otherwise, same as before this
-    routing existed). A repo WITH a GGUF release still picks the largest
-    quant that fits the live cluster's aggregate VRAM, same as always.
+    (or `.bin`) repo routes to torch-core at fp8 quality when the torch
+    engine's venv exists (falls back to GGUF conversion otherwise, same as
+    before this routing existed). A repo WITH a GGUF release still picks
+    the largest quant that fits the live cluster's aggregate VRAM, same as
+    always.
 
     `engine` (also `--engine` on the CLI) overrides detection outright, one
     of "torch"/"diffusers"; use it when a repo's own layout is ambiguous.
@@ -790,6 +847,102 @@ def pull(repo_spec: str, name: str | None = None, engine: str = "") -> ModelEntr
     manifest[entry_name] = entry
     _save_manifest(manifest)
     return entry
+
+
+def pull_model(name: str, progress: "callable | None" = None) -> ModelEntry:
+    """Thin wrapper around pull() for gb_api.py's public facade , the
+    call ai-forge's forge/gb_models.py hand-rolls itself (streaming
+    /api/pull, an 8-attempt/60s backoff sized around "a greenboost
+    reinstall can SIGKILL ollama mid-request and the reload takes ~30s").
+
+    `progress`, if given, is called once with ("start", name) before the
+    pull and once with ("done", name) after. pull() itself has no
+    byte-level download progress hook today (that would need
+    instrumenting the huggingface_hub download call inside it) , this is
+    a coarse two-event signal, not a percentage callback, documented here
+    so a caller doesn't expect more than it gets."""
+    if progress:
+        progress("start", name)
+    entry = pull(name)
+    if progress:
+        progress("done", name)
+    return entry
+
+
+def wait_ready(url: str, *, path: str = "/health", timeout_s: float = 120.0,
+              attempts: "int | None" = None) -> bool:
+    """Poll `url + path` until it answers HTTP 200, or timeout_s elapses.
+    A GENERIC readiness gate for any OpenAI/Ollama-compatible endpoint ,
+    not tied to gb-synapse's own engine lifecycle the way
+    _wait_upstream_ready/_wait_proxy_ready are (those need a live Popen to
+    poll for early death; this is for a caller with no process handle at
+    all, e.g. ai-forge waiting on its own OCR-VL server, or a gb-synapse
+    endpoint from a separate process).
+
+    `attempts`, if given, caps the number of poll attempts regardless of
+    timeout_s (still time-bounded by it); backoff between attempts grows
+    linearly up to 10s so a slow-loading multi-GB model isn't hammered
+    with requests while it loads."""
+    import urllib.error
+    import urllib.request
+
+    deadline = time.time() + timeout_s
+    n = 0
+    while time.time() < deadline:
+        n += 1
+        if attempts is not None and n > attempts:
+            return False
+        try:
+            with urllib.request.urlopen(f"{url}{path}", timeout=5) as r:
+                if r.status == 200:
+                    return True
+        except (urllib.error.URLError, OSError, TimeoutError):
+            pass
+        time.sleep(min(2.0 * n, 10.0))
+    return False
+
+
+def serve_gguf(model_path: str, port: int, mmproj: "str | None" = None,
+               ctx: int = 0) -> dict:
+    """Serve an arbitrary GGUF file directly via llama-server on `port` ,
+    no gb-synapse Ollama-compatible proxy, no manifest resolution, no
+    cluster split. The gap behind ai-forge's forge/ocr_vl.py: it
+    REIMPLEMENTS _resolve_engine_dir (its own docstring says so) then
+    hand-launches and health-polls llama-server itself for its OCR-VL
+    model on :8081, because gb-synapse had no "just serve this GGUF on
+    this port" call , serve_and_repoint only covers the :11435-compatible
+    proxy.
+
+    Returns {"pid", "port"} , the raw process handle, not a full
+    ServerState (no proxy, no run-state persistence): this is a
+    standalone serve and the caller owns its own lifecycle (stop it by
+    killing "pid")."""
+    if not engine_installed():
+        raise RuntimeError("engine not built — run: greenboost synapse build-engine")
+    cmd = [str(ENGINE_DIR / "llama-server"), "-m", model_path,
+           "--host", "127.0.0.1", "--port", str(port),
+           "-ngl", "999", "--no-webui"]
+    if ctx > 0:
+        cmd += ["--ctx-size", str(ctx)]
+    if mmproj:
+        cmd += ["--mmproj", mmproj]
+    log = open(_run_log_path(f"servegguf_{port}"), "ab")
+    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    return {"pid": proc.pid, "port": port}
+
+
+def endpoints() -> dict:
+    """The known inference endpoints this box exposes, read from
+    /etc/greenboost/inference.env (the file gb_actuation.serve_and_repoint()
+    writes) , the registry ai-forge's forge/config.py currently parses
+    itself, tracking 4 independent endpoints (gb-synapse :11435, OCR-VL
+    :8081, OCR-GPU :8082, AI-tools :8083) with no shared source of truth.
+    Reuses gb_actuation._read_env_file rather than a second parser."""
+    try:
+        import gb_actuation
+        return gb_actuation._read_env_file()
+    except Exception:
+        return {}
 
 
 # ---- Ollama blob indexing (mirrors _gb_ollama_model_blob, greenboost_setup.sh:10281) ----
@@ -1092,11 +1245,11 @@ def read_quant_config(path_or_repo: str) -> dict:
 
 
 def safetensors_summary(local_dir: str) -> dict:
-    """gguf_summary()'s counterpart for a safetensors snapshot (vLLM/
+    """gguf_summary()'s counterpart for a safetensors snapshot (torch-engine/
     transformers-routed pulls, `_pull_gbquant`). Real gap found live
     2026-07-16: `_pull_gbquant` built every `ModelEntry` with n_bytes/
-    n_layers/arch/ctx_length/is_moe all zero/empty — VllmBackend.serve()
-    itself doesn't need these (it sizes `--gpu-memory-utilization` from live
+    n_layers/arch/ctx_length/is_moe all zero/empty — the serving backend
+    itself doesn't need these (it sizes its memory-utilization flag from live
     free-VRAM telemetry, not the manifest), but `synapse_recommend`'s fit
     reports and any other manifest-metadata consumer silently read a 0-byte
     model as "trivially fits" regardless of its real size — misleading, not
@@ -1244,7 +1397,6 @@ def doctor(probe_feeders: bool = True) -> dict:
         "engine_version": engine_version(),
         "hf_token_set": hf_token() is not None,
         "cluster_configured": bool(fs),
-        "vllm_available": gb_synapse_backends._find_vllm_bin() is not None,
         "torch_engine_ready": torch_env is not None,
         "torch_engine_env": str(torch_env) if torch_env else "",
     }
@@ -1541,6 +1693,13 @@ class ServerState:
     # can be genuinely healthy (`ready=True`) while this is set: they are
     # different failure surfaces, both real, found live 2026-07-16.
     proxy_error: str | None = None
+    # Second, minimal llama-server (--embeddings --pooling mean) alongside
+    # the primary engine, started when GB_SYNAPSE_EMBED_MODEL is set at
+    # serve() time (see _maybe_serve_embedding). 0 = no embeddings engine
+    # configured for this serve — default so old persisted run-state JSON
+    # still parses.
+    embed_pid: int = 0
+    embed_internal_port: int = 0
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -1723,6 +1882,94 @@ def ensure_feeder_rpc(feeder, rpc_port: int = RPC_PORT_BASE, device: int = 0) ->
           f"{RPC_READY_TIMEOUT_S:.0f}s (firewall? see /tmp/gb_synapse_rpc.log on the feeder)",
           flush=True)
     return False
+
+
+# Distinguishing marker on every gLLM slave-rank launch so
+# kill_feeder_gllm_slave() can pkill precisely, and so a leftover process
+# from a previous aborted attempt doesn't get mistaken for a fresh one — see
+# both functions below.
+_GLLM_SLAVE_MARKER = "GB_SYNAPSE_GLLM_SLAVE=1"
+
+
+def ensure_feeder_gllm_slave(feeder, master_ip: str, master_port: int,
+                              pp_rank: int, pp_size: int, model_path: str) -> bool:
+    """Launch a gLLM `--launch-mode slave` worker on a feeder over SSH,
+    contributing PP rank `pp_rank` (TP fixed at 1 — see SynapseTorchBackend.
+    serve()'s cluster branch for why: gLLM's TP fast-path all-reduce uses
+    same-host-only CUDA IPC, and TP's every-layer all-reduce would dominate
+    wall-clock over the feeder's 1GbE link anyway; PP only exchanges
+    activations at stage boundaries).
+
+    Unlike ensure_feeder_rpc(), this does NOT poll for readiness — a slave
+    rank doesn't open a listening port the way rpc-server does, it dials
+    OUT to master_ip:master_port and blocks inside dist.init_process_group()
+    until the whole PP group has joined. That join is confirmed by the
+    LOCAL master's own /health endpoint instead (see the caller) — this
+    function only confirms the remote process launched and is still alive a
+    moment later, catching immediate failures (missing venv, bad
+    model_path, wrong CUDA arch) rather than a full rendezvous timeout.
+
+    UNVALIDATED (2026-07-24): whether `model_path` needs to already be
+    present locally on the feeder, or whether gLLM's own loader can pull an
+    HF repo id itself at slave-rank load time, was not tested this session
+    — gLLM's PP split loads each rank's own layer-slice of weights locally
+    (structurally different from llama.cpp's --rpc split, where only the
+    host needs the weights). If the feeder has no local copy and gLLM can't
+    self-pull, this launches successfully but the slave rank fails to load
+    — surfaces as the master's /health never coming up, same as any other
+    join failure, and the caller degrades to host-only exactly the same
+    way. Flagging so a real failure here isn't mistaken for something
+    else."""
+    remote_cmd = (
+        'for p in "$HOME/.local/share/greenboost/synapse/torch-env" '
+        '/usr/local/lib/greenboost/synapse-torch-env; do '
+        '[ -x "$p/bin/python" ] && VENV="$p" && break; done; '
+        '[ -n "${VENV:-}" ] || { echo "synapse torch engine venv not found — run: sudo greenboost install-synapse-engine" >&2; exit 1; }; '
+        f'nohup env {_GLLM_SLAVE_MARKER} GREENBOOST_CLUSTER=0 '
+        '"$VENV/bin/python" -m gllm.entrypoints.api_server '
+        '--launch-mode slave '
+        f'--ranks {pp_rank} --pp {pp_size} --tp 1 '
+        f'--master-addr {master_ip} --master-port {master_port} '
+        f'--model-path {shlex.quote(model_path)} '
+        '>/tmp/gb_synapse_gllm_slave.log 2>&1 & disown'
+    )
+    launch = subprocess.run(["ssh", *_SSH_OPTS, _feeder_ssh_target(feeder), remote_cmd],
+                            capture_output=True, text=True)
+    if launch.returncode != 0:
+        print(f"  [gb-synapse] feeder {feeder.ip}: gLLM slave launch failed: "
+              f"{launch.stderr.strip()[:200]}", flush=True)
+        return False
+
+    # Short liveness check only — catches a launch that dies immediately
+    # (missing venv/model), not a join failure (that's the caller's job via
+    # the master's /health, per this function's docstring).
+    time.sleep(2.0)
+    check = subprocess.run(
+        ["ssh", *_SSH_OPTS, _feeder_ssh_target(feeder),
+         f"pgrep -f 'gllm.entrypoints.api_server.*--launch-mode slave' >/dev/null"],
+        capture_output=True)
+    if check.returncode != 0:
+        print(f"  [gb-synapse] feeder {feeder.ip}: gLLM slave process not found 2s after "
+              f"launch (crashed at startup? see /tmp/gb_synapse_gllm_slave.log on the feeder)",
+              flush=True)
+        return False
+    return True
+
+
+def kill_feeder_gllm_slave(feeder) -> None:
+    """Tear down a feeder's gLLM slave rank — used when the master's
+    rendezvous readiness check (SynapseTorchBackend.serve()'s cluster
+    branch) times out, so a half-joined NCCL world doesn't linger holding
+    the GPU. Best-effort: a feeder that's unreachable for the kill is
+    already unreachable for everything else too, log and move on rather
+    than raising out of a cleanup path."""
+    result = subprocess.run(
+        ["ssh", *_SSH_OPTS, _feeder_ssh_target(feeder),
+         f"pkill -f 'gllm.entrypoints.api_server.*--launch-mode slave' || true"],
+        capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"  [gb-synapse] feeder {feeder.ip}: gLLM slave kill failed (best-effort): "
+              f"{result.stderr.strip()[:200]}", flush=True)
 
 
 MTP_DRAFT_N = int(os.environ.get("GB_SYNAPSE_MTP_DRAFT_N", "3"))
@@ -2017,6 +2264,28 @@ def _upstream_log_tail(model: str, n: int = 8) -> str:
     return "\n".join("      " + ln.strip() for ln in (errs or lines)[-n:])
 
 
+def emit_stall(model: str, engine: str, elapsed_s: float) -> None:
+    """A request has been streaming for `elapsed_s` with zero tokens
+    produced — the gap documented in workflow/gb-synapse.md's torch-core
+    bring-up notes: `/health` returns 200 (the engine process is alive and
+    answering), but the FIRST real request hung forever hitting a CUDA
+    error during prefill, so the client just sees a silent hang, not an
+    error. Called from gb_synapse_api.py's proxy subprocess (same shape as
+    record_measured_tok_s: a proxy-side signal handed back into gb_synapse's
+    own dataflux emit) by a per-request watchdog task, not by the streaming
+    loop itself — the loop is exactly what's stuck, so nothing there can
+    notice the stall on its own. Best-effort, never raises."""
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({
+            "kind": "synapse_stall", "status": "warn",
+            "model": model, "engine": engine, "elapsed_s": round(elapsed_s, 1),
+            "log_tail": _upstream_log_tail(model),
+        })
+    except Exception:
+        pass
+
+
 def _wait_upstream_ready(entry: ModelEntry, proc: subprocess.Popen, internal_port: int,
                           grace_s: float = SERVE_READY_GRACE_S) -> bool:
     """Watch a freshly spawned engine until it serves, dies, or `grace_s` runs out.
@@ -2116,8 +2385,8 @@ def _health_says_loading(body: bytes) -> bool:
     newer builds answer 503, but the engine we ship answers 200 with
     {"status": "loading model"}. Trusting the status code alone marks a model
     "served" seconds before it has parsed its own hyperparameters — the exact
-    window in which a bad GGUF exits. vLLM/gb_llm_server answer 200 with no
-    status field, which is genuinely ready."""
+    window in which a bad GGUF exits. The torch engine/gb_synapse_fallback
+    answer 200 with no status field, which is genuinely ready."""
     try:
         status = json.loads(body or b"{}").get("status", "ok")
     except (ValueError, AttributeError):
@@ -2162,11 +2431,29 @@ def _emit_serve(entry: ModelEntry, status: str, **fields) -> None:
         pass
 
 
+def _start_proxy(entry: ModelEntry, port: int, internal_port: int,
+                  engine: str) -> "tuple[subprocess.Popen, str | None]":
+    """Launch gb_synapse_api.py in front of an already-running upstream
+    engine and wait for it to bind. Factored out of _launch_proxy_and_record
+    so serve()'s proxy-only restart path (engine alive, proxy dead) can
+    reuse the exact same launch+readiness logic without re-running engine
+    startup — see serve()'s docstring for why that distinction matters."""
+    proxy_label = entry.name + "_proxy"
+    proxy_cmd = [sys.executable, str(_REPO_DIR / "gb_synapse_api.py"),
+                 "--port", str(port), "--upstream-port", str(internal_port),
+                 "--model-name", entry.name, "--engine", engine]
+    proxy_log = open(_run_log_path(proxy_label), "ab")
+    proxy_proc = subprocess.Popen(proxy_cmd, stdout=proxy_log, stderr=subprocess.STDOUT,
+                                   start_new_session=True)
+    proxy_error = _wait_proxy_ready(proxy_proc, port, proxy_label)
+    return proxy_proc, proxy_error
+
+
 def _launch_proxy_and_record(entry: ModelEntry, upstream: subprocess.Popen, port: int,
                               internal_port: int, tensor_split: str = "",
                               feeders: list | None = None, engine: str = "",
                               **serve_facts) -> ServerState:
-    """Shared tail for every engine (llama.cpp/vLLM/transformers/diffusers):
+    """Shared tail for every engine (llama.cpp/torch/transformers/diffusers):
     wait for the engine to come up, start the gb_synapse_api.py proxy in
     front of it, and record ServerState. The proxy only ever talks OpenAI
     /v1/* to the upstream, so it's identical regardless of which engine is
@@ -2191,14 +2478,7 @@ def _launch_proxy_and_record(entry: ModelEntry, upstream: subprocess.Popen, port
                     load_s=round(time.time() - t0, 1), **common)
         raise
 
-    proxy_label = entry.name + "_proxy"
-    proxy_cmd = [sys.executable, str(_REPO_DIR / "gb_synapse_api.py"),
-                 "--port", str(port), "--upstream-port", str(internal_port),
-                 "--model-name", entry.name]
-    proxy_log = open(_run_log_path(proxy_label), "ab")
-    proxy_proc = subprocess.Popen(proxy_cmd, stdout=proxy_log, stderr=subprocess.STDOUT,
-                                   start_new_session=True)
-    proxy_error = _wait_proxy_ready(proxy_proc, port, proxy_label)
+    proxy_proc, proxy_error = _start_proxy(entry, port, internal_port, engine)
 
     state = ServerState(model=entry.name, llama_pid=upstream.pid, proxy_pid=proxy_proc.pid,
                          port=port, internal_port=internal_port, tensor_split=tensor_split,
@@ -2221,28 +2501,89 @@ def _launch_proxy_and_record(entry: ModelEntry, upstream: subprocess.Popen, port
 
 
 def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
-          use_cluster: bool = True, n_slots: int = 1, extra_args: str = "") -> ServerState:
+          use_cluster: bool = True, n_slots: int = -1, extra_args: str = "") -> ServerState:
     """Resolve `model` (manifest name, "org/repo[:quant]", or a bare Ollama
     model name) and hand it to whichever engine backend its manifest entry
     calls for (gb_synapse_backends.select_backend) — llama.cpp (default,
-    cluster --rpc split), vLLM (gb-quant fp8/int8/int4 safetensors), the
-    transformers fallback, or diffusers (image gen).
+    cluster --rpc split), the synapse torch engine (gb-quant fp8/int8/int4
+    safetensors), the transformers fallback, or diffusers (image gen).
 
     Also the single process manager for GreenBoost's own model servers:
     reuses an already-running instance for this exact model instead of
     racing a second launch (Ollama's scheduler solves this with a queue +
     refcounted runners; gb-synapse only ever runs one model at a time, so
     "return the existing one" is the equivalent guarantee).
+
+    A THIRD case, not just alive/dead: the engine can be alive while only
+    its proxy died (another process squatted the port, an OOM-killer got the
+    proxy but not the much larger engine, ...). The old reuse-check required
+    BOTH pids alive, so this case fell through to backend.serve() — which
+    spawns a brand-new engine while the first one, already holding VRAM for
+    a loaded model, keeps running unreferenced. Restarting just the proxy
+    (same ports the engine already committed to) is the fix.
     """
     entry = _resolve_model(model)
 
     for st in _read_run_states():
-        if st.model == entry.name and _pid_alive(st.llama_pid) and _pid_alive(st.proxy_pid):
-            return st
+        if st.model != entry.name:
+            continue
+        engine_alive = _pid_alive(st.llama_pid)
+        proxy_alive = _pid_alive(st.proxy_pid)
+        if engine_alive and proxy_alive:
+            return _maybe_serve_embedding(st)
+        if engine_alive and not proxy_alive:
+            proxy_proc, proxy_error = _start_proxy(entry, st.port, st.internal_port, st.engine)
+            st.proxy_pid = proxy_proc.pid
+            st.proxy_error = proxy_error
+            _write_run_state(st)
+            _emit_serve(entry, "proxy_error" if proxy_error else "ok",
+                        port=st.port, tensor_split=st.tensor_split, feeders=st.feeders,
+                        engine=st.engine, load_s=0.0, restart="proxy_only")
+            return _maybe_serve_embedding(st)
+        # Neither pid alive — stale run-state; fall through to a fresh serve().
 
     backend = gb_synapse_backends.select_backend(entry)
-    return backend.serve(entry, port, ctx=ctx, use_cluster=use_cluster,
-                         n_slots=n_slots, extra_args=extra_args)
+    state = backend.serve(entry, port, ctx=ctx, use_cluster=use_cluster,
+                          n_slots=n_slots, extra_args=extra_args)
+    return _maybe_serve_embedding(state)
+
+
+def _maybe_serve_embedding(state: ServerState) -> ServerState:
+    """Eagerly bring up a second, minimal embeddings engine alongside the
+    primary serve when GB_SYNAPSE_EMBED_MODEL is set — the RAG-client-usable
+    half of the embeddings design (P6): a client can't call :11435/v1/
+    embeddings at all without SOME engine behind it. An on-demand,
+    first-request lazy launch triggered from the proxy itself is a real,
+    larger feature intentionally left for later — the proxy is a separate
+    process from this call, so triggering a launch from inside a request
+    handler needs its own coordination (a callback into gb_synapse.py, or a
+    control endpoint), not attempted here.
+
+    Idempotent and best-effort: a no-op when unset or already running;
+    logs and returns the state unchanged on any failure — an optional
+    embeddings side-engine must never break the primary serve it rides
+    alongside."""
+    embed_model = os.environ.get("GB_SYNAPSE_EMBED_MODEL", "").strip()
+    if not embed_model:
+        return state
+    if state.embed_internal_port and _pid_alive(state.embed_pid):
+        return state  # already up
+    try:
+        embed_entry = _resolve_model(embed_model)
+        backend = gb_synapse_backends.select_backend(embed_entry)
+        if not hasattr(backend, "serve_embedding"):
+            print(f"[gb-synapse] GB_SYNAPSE_EMBED_MODEL={embed_model!r}: "
+                  f"{type(backend).__name__} has no embeddings support — skipping",
+                  file=sys.stderr)
+            return state
+        proc, internal_port = backend.serve_embedding(embed_entry, state.port)
+        state.embed_pid = proc.pid
+        state.embed_internal_port = internal_port
+        _write_run_state(state)
+    except Exception as e:
+        print(f"[gb-synapse] embeddings engine for {embed_model!r} failed to start: {e}",
+              file=sys.stderr)
+    return state
 
 
 def _kill_process_group(pid: int) -> None:
@@ -2266,27 +2607,85 @@ def _kill_process_group(pid: int) -> None:
             pass
 
 
+def _teardown_feeders(model: str, st: "ServerState") -> None:
+    """Best-effort cluster-side teardown for stop().
+
+    A cluster-PP (torch engine) stop must kill each feeder's gLLM slave
+    rank — it dials into a NCCL world that no longer has a master the
+    moment the local process dies, and unlike ensure_feeder_rpc()'s
+    rpc-server, a slave rank is bound 1:1 to THIS serve's master_ip/port/
+    pp_rank (see ensure_feeder_gllm_slave's docstring) — it can never be
+    reused by a later serve, so leaving it running only holds feeder VRAM
+    in a world nothing will ever join again.
+
+    For --rpc (llama.cpp), a feeder's rpc-server IS deliberately reused
+    across serves (ensure_feeder_rpc() no-ops when already reachable) — so
+    it is only stopped here when no OTHER currently-running gb-synapse
+    serve still lists that feeder, to avoid breaking that reuse for a
+    co-resident model.
+    """
+    if not st.feeders:
+        return
+    try:
+        by_ip = {f.ip: f for f in gb_cluster.feeders(probe=False)}
+    except Exception:
+        return
+
+    if st.engine == "torch":
+        for ip in st.feeders:
+            feeder = by_ip.get(ip)
+            if feeder is not None:
+                kill_feeder_gllm_slave(feeder)
+        return
+
+    if st.engine == "llama.cpp":
+        others_using = {ip for other in _read_run_states()
+                         if other.model != model and other.engine == "llama.cpp"
+                         for ip in other.feeders}
+        for idx, ip in enumerate(st.feeders):
+            if ip in others_using:
+                continue
+            feeder = by_ip.get(ip)
+            if feeder is None:
+                continue
+            rpc_port = RPC_PORT_BASE + idx
+            try:
+                subprocess.run(
+                    ["ssh", *_SSH_OPTS, _feeder_ssh_target(feeder),
+                     f"pkill -f 'rpc-server.*--port {rpc_port}' || true"],
+                    capture_output=True, text=True, timeout=10)
+            except Exception:
+                pass
+
+
 def stop(model: str) -> bool:
     for st in _read_run_states():
         if st.model != model:
             continue
-        for pid in (st.llama_pid, st.proxy_pid):
-            if _pid_alive(pid):
+        for pid in (st.llama_pid, st.proxy_pid, st.embed_pid):
+            if pid and _pid_alive(pid):
                 _kill_process_group(pid)
+        _teardown_feeders(model, st)
         _run_state_path(model).unlink(missing_ok=True)
         return True
     return False
 
 
 def ps() -> list[dict]:
-    """Running gb-synapse servers. Entries whose llama-server PID has died
-    are treated as stale and dropped."""
+    """Running gb-synapse servers. An entry is pruned only once BOTH the
+    engine and the proxy have died — a live engine behind a dead proxy
+    (see serve()'s proxy-only restart) is still a real, VRAM-holding
+    server, and dropping it here would hide that from status()/stop()."""
     live = []
     for st in _read_run_states():
-        if _pid_alive(st.llama_pid):
-            live.append(asdict(st))
-        else:
+        engine_alive = _pid_alive(st.llama_pid)
+        proxy_alive = _pid_alive(st.proxy_pid)
+        if not engine_alive and not proxy_alive:
             _run_state_path(st.model).unlink(missing_ok=True)
+            continue
+        if engine_alive and not proxy_alive and not st.proxy_error:
+            st.proxy_error = "proxy process is gone"
+        live.append(asdict(st))
     return live
 
 
@@ -2322,7 +2721,6 @@ def _cli_main(argv: list[str]) -> int:
     llm = "--llm" in argv[1:]
 
     if verb == "build-engine":
-        fetch_engine_source()
         info = build_engine()
         print(json.dumps(info) if llm else f"engine built: {info['version']}")
     elif verb == "update-engine":
@@ -2395,9 +2793,34 @@ def _cli_main(argv: list[str]) -> int:
                       (f"  ({r.note})" if r.note else ""))
     elif verb == "serve":
         if not rest:
-            print("usage: gb_synapse.py serve <model> [port]", file=sys.stderr)
+            print("usage: gb_synapse.py serve <model> [port] [--ctx N] [--n-slots N] "
+                  "[--extra-args '...'] [--no-cluster]", file=sys.stderr)
             return 2
-        st = serve(rest[0], port=int(rest[1]) if len(rest) > 1 else DEFAULT_PORT)
+        # serve()'s own signature already takes ctx/n_slots/extra_args/
+        # use_cluster — this CLI verb only ever exposed model+port. Parse
+        # the extra flags the same "pop from rest" style pull() uses above.
+        ctx = 0
+        n_slots = -1
+        extra_args = ""
+        use_cluster = True
+        for flag, attr in (("--ctx", "ctx"), ("--n-slots", "n_slots"),
+                           ("--extra-args", "extra_args")):
+            if flag in rest:
+                i = rest.index(flag)
+                val = rest[i + 1] if i + 1 < len(rest) else ""
+                rest = rest[:i] + rest[i + 2:]
+                if attr == "ctx":
+                    ctx = int(val)
+                elif attr == "n_slots":
+                    n_slots = int(val)
+                else:
+                    extra_args = val
+        if "--no-cluster" in rest:
+            rest = [a for a in rest if a != "--no-cluster"]
+            use_cluster = False
+        port = int(rest[1]) if len(rest) > 1 else DEFAULT_PORT
+        st = serve(rest[0], port=port, ctx=ctx, use_cluster=use_cluster,
+                  n_slots=n_slots, extra_args=extra_args)
         print(json.dumps(asdict(st)) if llm
               else f"serving {st.model} on :{st.port}  (tensor-split {st.tensor_split})")
     elif verb == "stop":
@@ -2412,6 +2835,23 @@ def _cli_main(argv: list[str]) -> int:
         else:
             print("\n".join(f"  {r['model']}  :{r['port']}  tensor-split={r['tensor_split']}"
                              for r in running) or "  (none running)")
+    elif verb == "logs":
+        if not rest:
+            print("usage: gb_synapse.py logs <model> [--proxy] [-n LINES]", file=sys.stderr)
+            return 2
+        label = rest[0] + ("_proxy" if "--proxy" in rest else "")
+        n = 100
+        if "-n" in rest:
+            i = rest.index("-n")
+            if i + 1 < len(rest):
+                n = int(rest[i + 1])
+        path = log_path(label)
+        if not path.is_file():
+            print(f"(no log yet: {path})", file=sys.stderr)
+            return 1
+        lines = path.read_text(errors="replace").splitlines()[-n:]
+        print(json.dumps({"path": str(path), "lines": lines}) if llm
+              else "\n".join(lines))
     else:
         print(f"unknown verb: {verb}", file=sys.stderr)
         return 2

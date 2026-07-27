@@ -1,0 +1,184 @@
+GreenBoost third_party/gemlite — vendored third-party code
+===============================================================
+
+Upstream project: gemlite
+Repository:       https://github.com/mobiusml/gemlite
+Upstream commit:  fd3f9338a96b0c792b7f06fc1b26702aadb7e2d1 (2026-06-30)
+License:          Apache-2.0 (see LICENSE, verbatim from upstream)
+Upstream baseline as of this NOTICE: no upstream commits after 2026-06-30
+(confirmed live, 2026-07-26, against a fresh clone at the commit above ,
+previously recorded only as a date, now pinned to the exact SHA so this
+tree is mechanically rebasable against upstream).
+
+What was imported
+------------------
+gemlite/ (core.py, helper.py, quant_utils.py, dtypes.py, bitpack.py,
+triton_kernels/, vllm/, configs/), LICENSE — verbatim from upstream, minus
+this repo's own local patches below. `tests/` is NOT vendored (kept only in
+the reference checkout at greenboost-quants-techs-github/gemlite for
+diffing against upstream) — this repo's own tests
+(tests/test_gb_kernel_backends*.py) cover the GreenBoost-side integration,
+same exclusion policy as llama.cpp/NOTICE and synapse_engine/NOTICE.
+
+Local modifications
+--------------------
+Every local patch to the vendored tree MUST be appended below, in order,
+so future contributors can tell upstream code from GreenBoost's own
+changes at a glance. Verified against gemlite's own test suite
+(test_int.py / test_mxfp.py / test_serialization.py, run from the
+reference checkout with PYTHONPATH pointed at this tree) — see individual
+entries for pass/fail state.
+
+- Lazy CUDA initialization (multiple files: triton_kernels/utils.py,
+  triton_kernels/gemv_kernels.py, quant_utils.py). Upstream allocates
+  several per-GPU constant/scratch tensors AND reads
+  `torch.cuda.get_device_capability()` / `torch.cuda.get_device_properties()`
+  eagerly at IMPORT TIME (module-level `for g_id in range(torch.cuda.device_count())`
+  loops, and bare `torch.cuda.get_device_properties(...)` calls at module
+  scope). Under GreenBoost's LD_PRELOAD CUDA shim, any CUDA call that runs
+  before the shim has finished its own init (which can happen simply by
+  `import gemlite` running before the shim is ready, or in a CPU-only
+  import) crashes or corrupts shim state. Fixed by:
+    - `triton_kernels/utils.py`: `GPU_COMPUTE_CAPABILITY` (module-level)
+      replaced by `gpu_compute_capability()` (lazy, cached); `NUM_SMS`
+      (module-level) replaced by `get_num_SMs()` (lazy, cached); new
+      `LazyDeviceTensors` class — a `[device_index]`-indexable, first-use
+      allocator with CUDA-graph-capture guard (refuses to allocate while
+      `torch.cuda.is_current_stream_capturing()`, since capture-time
+      allocation would produce an address that isn't stable across replays).
+    - `triton_kernels/gemv_kernels.py`: `fp4_mapping` (was an eager
+      per-device list built at import) now a `LazyDeviceTensors`.
+    - `quant_utils.py`: `fp4_values`/`fp4_p_vals`/`fp4_thresholds`/`thr_pos`
+      (MXFP4 quantizer workspace) and `_nvfp4_meta_scale_bufs`/
+      `_nvfp4_amax_bufs`/`_nvfp4_counter_bufs` (NVFP4 dynamic meta-scale
+      scratch) — same treatment, all now `LazyDeviceTensors`. `NUM_SMS`
+      module-level constant removed; all `grid = lambda META: (min(NUM_SMS, ...` call sites updated to `get_num_SMs()`.
+  Call sites keep indexing with `[device_index]` — API-compatible with
+  upstream's eager lists, so no downstream call site changed.
+
+- `core.py`: `enable_activation_scaling(batch_size)` restored to
+  upstream's own documented-but-disabled batch-gated logic
+  (`return batch_size >= 2`) instead of upstream's unconditional
+  `return True`. Fixed 2026-07-10: `return True` unconditionally hit the
+  small-M / non-EVEN_M masked branch of `channel_scale_mode==5`'s Triton
+  codegen (gemm_kernels.py / gemm_splitK_kernels.py), which fails to
+  *compile* on this GPU/Triton version regardless of dtype (fp8 or int4) —
+  confirmed via mispeech/Dasheng-AudioGen-Multilingual (mt5 encoder
+  attention AND the model's own DiT backbone attention both hit the
+  identical CompilationError at batch_size=1). Upstream's own TODO already
+  names the real fix (https://github.com/triton-lang/triton/pull/9577);
+  this restores the workaround upstream left commented out.
+  KNOWN CONSEQUENCE (found 2026-07-26, NOT yet fixed — see below).
+
+- `quant_utils.py`: `quantize_mxfp4`'s `@torch.compile(fullgraph=True)`
+  changed to `fullgraph=False` (2026-07-26, this session). Same root cause
+  as the pre-existing `quantize_nvfp4` fix directly below it in the same
+  file (already `fullgraph=False` before this session): both call into
+  `LazyDeviceTensors`-backed lookups (`round_to_closest_fp4` indexes
+  `fp4_p_vals`/`fp4_thresholds`), whose `__getitem__` calls
+  `torch.cuda.is_current_stream_capturing()` — a `torch.*` op returning a
+  plain `bool`, which Dynamo cannot trace under `fullgraph=True`
+  ("torch.* op returned non-Tensor"). `quantize_nvfp4` already had this
+  fix; `quantize_mxfp4` did not — an incomplete application of the same
+  fix, not a new problem. Quantization is a one-time load step, so a graph
+  break costs nothing at runtime. Found via gemlite's own
+  test_serialization.py (TestMXScales2Dto5D, TestNnSequentialRoundTripMX)
+  — both now pass.
+
+- `core.py`: adopted upstream's checkpoint-serialization rework wholesale
+  (2026-07-26, this session) — GreenBoost's previous local version
+  (independently written, predates this session) was a SIMPLER, buggier
+  implementation: plain attribute assignment in `load_state_dict()`, no
+  upfront `register_buffer()` of the checkpoint schema in `__init__`, and
+  no `_load_from_state_dict()` override. Upstream's version (their own
+  "issue #68" fix, already present in the 2026-06-30 upstream snapshot)
+  fixes two real, test-confirmed gaps GreenBoost's version had:
+    1. A freshly-constructed (unpacked) `GemLiteLinearTriton` did not
+       advertise `W_q`/`scales`/`zeros`/`metadata`/`orig_shape`/
+       `meta_scale`/`bias` in its own `state_dict()` at all.
+    2. Loading via a PARENT module's `load_state_dict()` (e.g.
+       `nn.Sequential(gemlite_layer).load_state_dict(sd)`) went through
+       PyTorch's default `_load_from_state_dict`, not GreenBoost's custom
+       `load_state_dict` override — which only fires when called directly
+       on the GemLite layer — so a parent-driven load either silently used
+       the wrong (empty-placeholder) tensors or raised "unexpected keys"
+       depending on strict mode.
+  Confirmed via gemlite's own test_serialization.py: GreenBoost's prior
+  core.py failed 9/17 tests (`TestFreshStateDictSchema`,
+  `TestNnSequentialRoundTrip*`, `TestAssignTrueLoad`, `TestBiasRoundTrip`,
+  `TestMXScales2Dto5D`) with exactly these two failure modes; upstream's
+  version (verified standalone against the same test file) passes 17/17.
+  Merged: took upstream's `__init__`/`_save_to_state_dict`/
+  `_apply_state_dict`/`load_state_dict`/`_load_from_state_dict`/parameter-
+  promotion tail of `pack()` verbatim, re-applied GreenBoost's own
+  `enable_activation_scaling` batch-gate on top (the only other local
+  core.py change — an unrelated region, no merge conflict). Full local
+  suite after merge (this repo's tree, via
+  greenboost-quants-techs-github/gemlite's tests/ against
+  PYTHONPATH=third_party): test_serialization.py 17/17 pass.
+
+- `helper.py`: `except ImportException:` -> `except ImportError:` (both
+  occurrences). Upstream bug, not a GreenBoost feature change:
+  `ImportException` is not a real Python exception class, so upstream's
+  own `try/except ImportException` around the optional `hqq` import would
+  itself raise `NameError` on any box without `hqq` installed instead of
+  printing the intended "install hqq" message. Worth reporting upstream.
+
+- `helper.py`: `_patch_linearlayers` deduplicates by `id(layer)` via a
+  module-level `_replacement_by_id` dict before replacing a
+  `torch.nn.Linear`/`HQQLinear` with its quantized form. Fixes a real
+  correctness bug for models where the same Linear module object is
+  registered under multiple parents (e.g. LTX-2's `patchify_proj`, which
+  lives on both the transformer and its args preprocessor) — quantizing
+  strips the original's weights in place, so a second parent that still
+  held a reference to the pre-quantization original would call
+  `F.linear(weight=None)` at runtime. Upstream replaces unconditionally on
+  every occurrence, re-quantizing (and re-stripping) the same underlying
+  layer more than once.
+
+- `triton_kernels/gemm_kernels.py`, `triton_kernels/gemm_splitK_kernels.py`:
+  removed the `warp_specialize=warp_specialize` kwarg from three
+  `tl.range(...)` calls. Triton 3.3.0 (this repo's pinned version) rejects
+  `warp_specialize` as a `tl.range` kwarg even when the value is `False` —
+  a version-compat fix, not a behavior change: `WARP_SPECIALIZE` defaults
+  to `False` in `triton_kernels/config.py`, so removing the kwarg here is a
+  no-op on any Triton version that DOES accept it.
+
+KNOWN, UNFIXED gemlite bug (found 2026-07-26, NOT reachable from
+GreenBoost's own code today)
+-------------------------------------------------------------------------
+`enable_activation_scaling`'s batch-gate (see above) decides, PER FORWARD
+CALL, whether to actually compute dynamic activation scales
+(`forward_functional`'s local `scaled_activations` var, core.py:229) — but
+`channel_scale_mode` (which Triton kernel variant gets selected/compiled)
+is baked in at `pack()` time from the STATIC, per-layer `self.scaled_activations`
+flag (core.py:664), not from the runtime batch size. So for a layer
+constructed with `scaled_activations=True`, batch_size=1 forward calls
+select a kernel that expects a real `scales_a_ptr` (because the layer's
+static flag says scaled activations are on), while `enable_activation_scaling(1)`
+returns `False` and `forward_functional` leaves `scales_x = None` — the
+kernel then dereferences a null pointer (`AttributeError: 'NoneType' object
+has no attribute 'type'` inside the Triton-generated wrapper). Reproduced
+via gemlite's own test suite: every `*_dynamic` test in
+test_mxfp.py/test_int.py that uses `scaled_activations=True`
+(`A4W4_MXFP_dynamic`, `A4W4_NVFP_dynamic`, `A8W4_MXFP_dynamic`,
+`A8W8_MXFP_dynamic`, `A8W8_MXFP_post_scale_dynamic`,
+`test_int8xWn_scaled_activations`, `test_int8Wn_scaled_weights_scaled_activations`,
+`test_fp8xWn_scaled_activations`, `test_fp8xfp8_scaled_weights_scaled_activations`,
+`test_int8_block_quant`, `test_fp8_block_quant`) fails at `batch_sizes[0]==1`
+in the exact same way — 11 tests across the two files. Also present in the
+PRISTINE upstream 2026-06-30 snapshot before any local patch — this is an
+upstream bug, not something GreenBoost introduced; GreenBoost's batch-gate
+fix (above) just makes it reachable at batch_size=1 for a code path
+upstream's own unconditional `return True` never took.
+NOT currently a live GreenBoost risk: `gb_quant.py` only ever constructs
+GemLite layers through the WEIGHT-ONLY `A16W4_HQQ_INT`/`A16W4_NVFP`/
+`A16W8_INT8`/`A16W8_FP8`/`A16Wn` processors (`gb_quant.py:153-159`) — every
+one of those is `scaled_activations=False` by construction (activations
+stay full-precision). The `A8W4_MXFP_dynamic`/`A4W4_NVFP_dynamic`/etc.
+processors that hit this bug are never imported anywhere in this repo
+outside third_party/gemlite itself. Fix it before adopting ANY dynamic
+activation-quantization processor (A8W*/A4W4_*_dynamic) in gb_quant.py —
+the real fix is making kernel/`channel_scale_mode` selection consult the
+same per-call `enable_activation_scaling(batch_size)` decision that
+`forward_functional` already makes, not just the static per-layer flag.

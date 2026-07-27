@@ -1,0 +1,54 @@
+GreenBoost third_party/turboquant — vendored third-party code
+===============================================================
+
+Upstream project: turboquant
+Repository:       https://github.com/OmarHory/turboquant
+Upstream commit:  ecf3f21031d63d2624b57bc91f382ce5acc2c011 (2026-03-29)
+License:          MIT License (see LICENSE, verbatim from upstream)
+Import date:      2026-07-26
+
+Paper: Zandieh et al., "TurboQuant: Online Vector Quantization with
+Near-optimal Distortion Rate", arXiv:2504.19874 (ICLR 2026).
+
+This is a SEPARATE implementation from `gb_quant_tq.py`'s existing
+TurboQuant weight-quantization codebooks (own workbench, no upstream repo
+tracked) — this vendored tree specifically covers the KV-CACHE / attention
+side (`QuantizedAttention`, `TurboQuantCache`), which `gb_attn.py` did not
+previously have: `gb_attn.py`'s own TurboQuant support quantizes K/V then
+DEQUANTIZES before calling SDPA (bandwidth saving only, no packed storage,
+no real memory saving). This vendored tree adds `QuantizedAttention` (runs
+Q·Kᵀ directly on compressed indices, no dequantization) and true 2/3/4-bit
+byte packing (`packing.py`) , real KV memory compression, not just
+bandwidth reduction.
+
+What was imported
+------------------
+`turboquant/` (`__init__.py`, `core.py`, `cache.py`, `packing.py`,
+`attention.py`, `cuda_kernels.py` , the whole package, only 6 files/1698
+lines total, genuinely small and self-contained unlike auto_round's
+139-file closure), `LICENSE` — verbatim from upstream.
+
+NOT vendored: `benchmarks/`, `scripts/`, `results/`, `assets/`,
+`.env.example` (upstream's own benchmark/paper-reproduction tooling) ,
+this repo's own tests (tests/test_gb_attn_packed.py) cover the
+GreenBoost-side integration, same exclusion policy as every other
+third_party/*/NOTICE in this repo.
+
+New runtime dependency (declared in synapse_engine/pyproject.toml):
+`scipy` (`cache.py`/`core.py`/`cuda_kernels.py` use `scipy.stats.norm` for
+the Lloyd-Max Gaussian quantizer construction). `transformers.cache_utils.
+DynamicCache`/`DynamicLayer` (used by `cache.py`) were already a direct
+dependency.
+
+Consumer: `gb_attn.py`'s `patch_sdpa(backend="packed")` (opt-in,
+`GB_ATTN_BACKEND=packed`; default `"dequant"` unchanged) — torch-engine/
+fallback/diffusion attention only, NOT gb-synapse's llama.cpp path
+(llama.cpp owns its own KV cache and never calls
+`F.scaled_dot_product_attention`; its equivalent lever is
+`--cache-type-k/v` via `_pick_kv_type`, a separate mechanism — see
+gb_attn.py's own module docstring).
+
+This tree is a verbatim copy at the pinned commit , no local patches. If one
+is ever needed, add a "Local modifications" section here (bulleted, in
+order) per the convention established in third_party/gemlite/NOTICE and
+third_party/auto_round/NOTICE.

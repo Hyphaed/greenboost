@@ -5,7 +5,7 @@ already-quantized checkpoint" rule in _pull_torch (P1.6 of the gb-synapse
 unification).
 
 CPU-only. No real HF network calls — snapshot_download/list_repo_gguf/
-_find_vllm_bin are all monkeypatched."""
+_torch_env_dir are all monkeypatched."""
 import json
 import sys
 from pathlib import Path

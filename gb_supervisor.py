@@ -98,6 +98,7 @@ WARN_PCT      = int(os.environ.get("GB_SUPERVISOR_VRAM_WARN_PCT",         "10"))
 CRIT_FREE_PCT = int(os.environ.get("GB_SUPERVISOR_VRAM_CRIT_FREE_PCT",    "8"))
 AGGRESSIVE    = os.environ.get("GB_SUPERVISOR_AGGRESSIVE_RECLAIM", "0") == "1"
 OLLAMA_URL    = os.environ.get("GB_SUPERVISOR_OLLAMA_URL", "http://127.0.0.1:11434")
+_DATAFLUX_COMPACT_INTERVAL_S = int(os.environ.get("GB_DATAFLUX_COMPACT_INTERVAL_S", str(6 * 3600)))
 CONFIRM_POLLS = int(os.environ.get("GB_SUPERVISOR_IDLE_CONFIRM_POLLS", "3"))
 
 # System-RAM pressure thresholds , %-of-node's-own-total, never absolute MB
@@ -730,6 +731,16 @@ class GreenBoostSupervisor:
             except Exception as exc:
                 log.debug("dataflux recorder unavailable: %s", exc)
 
+        # Periodic dataflux archive compaction , emit()'s rotation only ever
+        # moves bytes out of the hot write path (a size-capped ".jsonl.1"),
+        # it never deletes anything; something has to apply the
+        # GB_DATAFLUX_RETAIN_DAYS trim, and it belongs on this already-
+        # installed daemon's tick, not a new systemd unit (no new install/
+        # purge parity debt for a periodic housekeeping task). Gated to run
+        # at most once per _DATAFLUX_COMPACT_INTERVAL_S , rewriting a large
+        # archive on every 10s tick would be its own performance problem.
+        self._last_dataflux_compaction_ts = 0.0
+
     def run(self) -> None:
         # Phase 0: ensure state directories exist
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -843,6 +854,19 @@ class GreenBoostSupervisor:
             # Non-idle or GPU still active , reset counter
             if self._idle_count > 0:
                 self._idle_count = 0
+
+        # 3e. Periodic dataflux archive compaction (see __init__'s comment).
+        now = time.time()
+        if now - self._last_dataflux_compaction_ts >= _DATAFLUX_COMPACT_INTERVAL_S:
+            self._last_dataflux_compaction_ts = now
+            try:
+                import gb_dataflux
+                dropped = gb_dataflux.compact_archive()
+                if dropped:
+                    log.info("dataflux archive compacted: %d event(s) past retention dropped",
+                             dropped)
+            except Exception as exc:
+                log.debug("dataflux compaction error: %s", exc)
 
     def _on_stop(self, signum: int, frame) -> None:
         log.info("Received signal %d , shutting down", signum)

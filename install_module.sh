@@ -457,9 +457,19 @@ gb_ok "CUDA shim + native libs installed"
 gb_step "Installing GreenBoost Python orchestration stack..."
 GB_PY_DEST="/usr/local/lib/greenboost"
 mkdir -p "$GB_PY_DEST"
+# Deliberately a LIBRARY-ONLY subset, not gb-synapse's HTTP-serving stack —
+# this is the standalone kernel-module installer, so it ships just enough for
+# a consumer script to `import gb_quant`/`gb_attn`/etc. directly. Each of
+# these files is self-contained against exactly this list (verified:
+# gb_synapse_fallback.py imports only gb_quant + stdlib/torch/aiohttp, so it
+# works standalone here as a library AND as its own runnable single-request
+# server — it is NOT missing gb_synapse.py/_api/_backends/_mcp/gb_rotator.py/
+# gb_diffusion_server.py by omission, those simply aren't this script's job).
+# `greenboost synapse serve` / the :11435 proxy / cluster RPC split need the
+# full stack — that's `greenboost_setup.sh`'s Full Install, not this script.
 GB_PY_FILES=(
     gb_init.py
-    gb_quant.py gb_quant_tq.py gb_attn.py gb_llm.py
+    gb_quant.py gb_quant_tq.py gb_attn.py gb_synapse_fallback.py
     gb_telemetry.py gb_stream_sched.py gb_model_tier.py
     gb_mem_pool.py gb_diffusion_orch.py
     gb_stability_monitor.py gb_feeder_diag.py

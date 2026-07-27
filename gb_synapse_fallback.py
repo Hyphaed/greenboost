@@ -161,11 +161,30 @@ def generate(model, tok, prompt: str, max_new_tokens: int = 128,
     return tok.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
 
 
+def _flatten_content(content) -> str:
+    """`content` is normally a plain string, but the proxy's vision
+    translation (gb_synapse_api._ollama_messages_to_openai) always produces
+    OpenAI's multimodal list-of-parts shape ([{"type":"text",...},
+    {"type":"image_url",...}]) for any request carrying images. This
+    fallback is a plain-text HF generate() path with no vision
+    preprocessing at all, so an image part is dropped here (degrading to
+    text-only) rather than crashing — the previous behavior TypeErrored
+    inside apply_chat_template's own except branch ("\n".join() on a
+    list), turning a vision-via-fallback request into an HTTP 500 instead
+    of a degraded text-only answer."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(p.get("text", "") for p in content
+                         if isinstance(p, dict) and p.get("type") == "text")
+    return str(content) if content else ""
+
+
 def _apply_chat_template(messages: list[dict]):
     try:
         ids = TOK.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt")
     except Exception:
-        text = "\n".join(m.get("content", "") for m in messages)
+        text = "\n".join(_flatten_content(m.get("content", "")) for m in messages)
         ids = TOK(text, return_tensors="pt")
     if not torch.is_tensor(ids):
         ids = ids["input_ids"]
@@ -355,9 +374,18 @@ async def health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok" if MODEL is not None else "loading", "model": MODEL_NAME})
 
 
+async def models(request: web.Request) -> web.Response:
+    """GET /v1/models — this backend was the one of the 4 gb-synapse
+    backends missing it entirely (gb_diffusion_server.py has the same
+    route), so `:11435/v1/models` 404s exactly when the transformers
+    fallback is the last-resort backend actually serving."""
+    return web.json_response({"object": "list", "data": [{"id": MODEL_NAME, "object": "model"}]})
+
+
 def build_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/health", health)
+    app.router.add_get("/v1/models", models)
     app.router.add_post("/v1/chat/completions", chat_completions)
     app.router.add_post("/v1/completions", completions)
     return app

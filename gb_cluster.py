@@ -682,6 +682,29 @@ def _resolve_feeder_topology(feeder: Feeder, sock, feature_flags: int, fd) -> No
         _write_topology_cache()
 
 
+def _local_ip_toward(dest_ip: str) -> "str | None":
+    """This host's own IP address as seen FROM `dest_ip`'s side of the
+    route — i.e. the address a feeder should dial to reach us back, not
+    necessarily the same as the address we use to reach it (multi-homed
+    boxes, NAT). Needed for gLLM's cluster PP mode: unlike llama.cpp's
+    --rpc (host connects out to the feeder's rpc-server), gLLM's slave
+    ranks dial IN to the master's --master-addr, so the master has to hand
+    out an address that's actually routable from the feeder's side —
+    "0.0.0.0" (gLLM's own default) only works for same-host processes.
+
+    Standard no-packets-sent trick: connect() a UDP socket to dest_ip (UDP
+    connect() only does a routing-table lookup, no handshake, so this
+    works even if nothing is listening on the far end) and read back the
+    local address the kernel picked for that route."""
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((dest_ip, 1))
+            return s.getsockname()[0]
+    except OSError:
+        return None
+
+
 def feeders(probe: bool = True, timeout_s: float = 2.0,
             ssh_fallback_telemetry: bool = False,
             fetch_topology: bool = True) -> list[Feeder]:
@@ -795,6 +818,57 @@ def cluster_available(timeout_s: float = 2.0) -> bool:
 
 def shim_supported() -> bool:
     return Path(GREENBOOST_SHIM).exists()
+
+
+def cudart_for(python_exe: str) -> "str | None":
+    """Resolve the CUDA runtime shared library (libcudart.so) a given
+    Python interpreter's own environment would load.
+
+    shim_env()'s own docstring names this exact gap: "the consumer
+    discovers it [cudart_path] — it knows its own venv layout". ai-forge's
+    answer to that gap is a 70-line resolver (forge/gpu.py
+    _find_cudart_path) rebuilt per-repo, with 2 documented production
+    incidents in its history (a wrong-capability cudart loaded from the
+    wrong venv, and a `uv venv` symlink escape). This is the shared
+    implementation so a new consumer doesn't have to rediscover either.
+
+    Search order: the interpreter's own site-packages nvidia-cuda-runtime
+    wheel (pip cu12/cu13 wheels ship libcudart.so.{12,13} under
+    nvidia/cuda_runtime/lib/) — both via `sysconfig` (works even through a
+    symlinked venv) and a direct site-packages glob relative to the
+    interpreter path (works even if invoking `sysconfig` via subprocess
+    fails) — then the system CUDA toolkit install locations, newest
+    version first. Returns None if nothing is found; the caller decides
+    the fallback (e.g. let the dynamic linker's own default search apply).
+    """
+    import subprocess
+
+    candidates: list[Path] = []
+    try:
+        out = subprocess.run(
+            [python_exe, "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+            capture_output=True, text=True, timeout=10)
+        if out.returncode == 0 and out.stdout.strip():
+            candidates.append(Path(out.stdout.strip()) / "nvidia" / "cuda_runtime" / "lib")
+    except Exception:
+        pass
+
+    try:
+        py_root = Path(python_exe).resolve().parent.parent
+        for pat in ("lib/python3.*/site-packages", "lib64/python3.*/site-packages"):
+            candidates.extend(py_root.glob(f"{pat}/nvidia/cuda_runtime/lib"))
+    except OSError:
+        pass
+
+    candidates.extend(sorted(Path("/usr/local").glob("cuda-1[0-9].*/lib64"), reverse=True))
+    candidates.append(Path("/usr/local/cuda/lib64"))
+
+    for cand in candidates:
+        for so_name in ("libcudart.so.13", "libcudart.so.12", "libcudart.so"):
+            hit = cand / so_name
+            if hit.is_file():
+                return str(hit)
+    return None
 
 
 def shim_env(workload: str = "diffusion", enabled: bool = True,

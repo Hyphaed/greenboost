@@ -1,0 +1,1261 @@
+# Copyright (c) 2025 Intel Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from __future__ import annotations
+
+import importlib
+import os
+import re
+import sys
+from dataclasses import dataclass
+from functools import lru_cache, wraps
+from typing import Any
+
+import torch
+import transformers
+from packaging import version
+
+from auto_round.export.export_to_gguf.config import GGUF_CONFIG
+from auto_round.logger import logger
+
+
+def download_audiocaps_csv():
+    """Download AudioCaps train.csv and return the local cache path.
+
+    Downloads from GitHub on first use and caches in a temporary directory.
+
+    Returns:
+        str: Path to the cached CSV file.
+    """
+    import tempfile
+
+    import requests
+
+    url = "https://raw.githubusercontent.com/cdjkim/audiocaps/master/dataset2.0/train.csv"
+    cache_dir = os.path.join(tempfile.gettempdir(), "audiocaps_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_file = os.path.join(cache_dir, "train.csv")
+
+    if os.path.exists(cache_file) and os.path.getsize(cache_file) > 0:
+        logger.debug(f"Using cached AudioCaps dataset: {cache_file}")
+        return cache_file
+
+    logger.info("Downloading AudioCaps dataset from GitHub...")
+    try:
+        resp = requests.get(url, timeout=60)
+        resp.raise_for_status()
+        if not resp.text or len(resp.text.strip()) == 0:
+            raise RuntimeError("Downloaded AudioCaps dataset is empty")
+        with open(cache_file, "w", encoding="utf-8") as f:
+            f.write(resp.text)
+        logger.info(f"AudioCaps dataset cached at: {cache_file}")
+    except requests.RequestException as e:
+        raise RuntimeError(f"Failed to download AudioCaps from {url}: {e}") from e
+    except IOError as e:
+        raise RuntimeError(f"Failed to write AudioCaps cache to {cache_file}: {e}") from e
+
+    return cache_file
+
+
+def compare_versions(v1, v2):
+    return version.parse(v1) >= version.parse(v2)
+
+
+def torch_version_at_least(version_string):
+    return compare_versions(torch.__version__, version_string)
+
+
+TORCH_VERSION_AT_LEAST_2_6_PRE_RELEASE = torch_version_at_least("2.5.99")
+TORCH_VERSION_AT_LEAST_2_6 = torch_version_at_least("2.6.0")
+TORCH_VERSION_AT_LEAST_2_5 = torch_version_at_least("2.5.0")
+TORCH_VERSION_AT_LEAST_2_4 = torch_version_at_least("2.4.0")
+
+
+class LazyImport(object):
+    """Lazy import python module till use."""
+
+    def __init__(self, module_name):
+        """Init LazyImport object.
+
+        Args:
+            module_name (string): The name of module imported later
+        """
+        self.module_name = module_name
+        self.module = None
+
+    def __getattr__(self, name):
+        """Get the attributes of the module by name."""
+        try:
+            self.module = importlib.import_module(self.module_name)
+            mod = getattr(self.module, name)
+        except:
+            spec = importlib.util.find_spec(str(self.module_name + "." + name))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        return mod
+
+    def __call__(self, *args, **kwargs):
+        """Call the function in that module."""
+        function_name = self.module_name.split(".")[-1]
+        module_name = self.module_name.split(f".{function_name}")[0]
+        self.module = importlib.import_module(module_name)
+        function = getattr(self.module, function_name)
+        return function(*args, **kwargs)
+
+
+def _patch_classmethod_kwargs(cls, method_name, **name_map):
+    """Wrap a classmethod to rename keyword arguments, preserving the descriptor protocol.
+
+    This patches the method by extracting the underlying function via ``__func__``,
+    wrapping it, and re-assigning it as a proper ``classmethod``.  This ensures that
+    ``__func__`` remains accessible to downstream code that relies on the standard
+    classmethod protocol (e.g. ``compressed_tensors.offload.load.patch_from_pretrained``).
+
+    Args:
+        cls: The class whose classmethod should be patched.
+        method_name: Name of the classmethod to patch.
+        **name_map: ``old_kwarg_name=new_kwarg_name`` pairs.  When the patched method
+            is called with *old_kwarg_name*, it is transparently renamed to
+            *new_kwarg_name* before forwarding to the original implementation.
+    """
+    underlying_func = getattr(cls, method_name).__func__
+
+    @wraps(underlying_func)
+    def patched(klass, *args, **kwargs):
+        for old_name, new_name in name_map.items():
+            if old_name in kwargs:
+                if new_name in kwargs:
+                    raise TypeError(f"Cannot specify both '{old_name}' and '{new_name}'")
+                kwargs[new_name] = kwargs.pop(old_name)
+        return underlying_func(klass, *args, **kwargs)
+
+    setattr(cls, method_name, classmethod(patched))
+
+
+def normalize_no_split_modules(no_split_modules):
+    if not no_split_modules:
+        return []
+
+    def flatten_items(value):
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                yield from flatten_items(item)
+        else:
+            yield value
+
+    flattened = []
+    for item in flatten_items(no_split_modules):
+        if item is None:
+            continue
+        flattened.append(item)
+    return flattened
+
+
+def _patch_transpose_for_buffers():
+    """Patch Transpose.convert() to skip transposition for buffer tensors.
+
+    transformers 5.2.0 calls model.get_parameter() inside Transpose.convert(),
+    but auto_round registers weight_packed/weight_scale as buffers, not Parameters,
+    causing AttributeError. This patch returns buffer tensors unchanged.
+    """
+    try:
+        from transformers.core_model_loading import Transpose
+    except ImportError:
+        return  # Not present in this transformers version
+
+    _original_convert = Transpose.convert
+
+    @wraps(_original_convert)
+    def _patched_convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        if not self.check_dims:
+            return _original_convert(self, input_dict, source_patterns, target_patterns, **kwargs)
+
+        model = kwargs.get("model")
+        full_layer_name = kwargs.get("full_layer_name")
+
+        if model is not None and full_layer_name is not None:
+            module_path, _, param_name = full_layer_name.rpartition(".")
+            try:
+                module_obj = model.get_submodule(module_path) if module_path else model
+                buffer_tensor = module_obj.get_buffer(param_name) if hasattr(module_obj, "get_buffer") else None
+                if buffer_tensor is not None:
+                    # Buffer tensors must not be transposed – return as-is.
+                    target_pattern = self.get_target_pattern(input_dict, source_patterns, target_patterns)
+                    tensors = next(iter(input_dict.values()))
+                    tensor = tensors[0] if isinstance(tensors, list) else tensors
+                    return {target_pattern: tensor}
+            except Exception as exc:
+                logger.debug(
+                    "Failed to apply buffer transpose patch for model=%r, full_layer_name=%r, module_path=%r; "
+                    "falling back to original Transpose.convert behavior. Error: %s",
+                    model,
+                    full_layer_name,
+                    module_path,
+                    exc,
+                    exc_info=True,
+                )
+
+        return _original_convert(self, input_dict, source_patterns, target_patterns, **kwargs)
+
+    Transpose.convert = _patched_convert
+
+
+def _patch_tensor_get_dtype_for_prequantized_loading():
+    """Add a minimal ``torch.Tensor.get_dtype()`` shim for transformers 5.3.0.
+
+    transformers 5.3.0 added a pre-quantized loading branch in
+    ``core_model_loading.convert_and_load_state_dict_in_model()`` that calls
+    ``tensor.get_dtype()`` on checkpoint values. During actual weight loading,
+    those values are plain ``torch.Tensor`` instances returned by
+    ``modeling_utils.load_state_dict()``, which do not implement that method.
+
+    Older transformers versions only disabled dtype casting when a key was
+    renamed. The new version additionally inspects non-floating tensors, but it
+    does so through a safetensors-slice API that is not available on regular
+    tensors. Providing the method here preserves the new intent while restoring
+    compatibility for plain tensors.
+    """
+    if hasattr(torch.Tensor, "get_dtype"):
+        return
+
+    from safetensors.torch import _TYPES
+
+    torch_to_safetensors_dtype = {v: k for k, v in _TYPES.items()}
+
+    def _tensor_get_dtype(self):
+        return torch_to_safetensors_dtype.get(self.dtype, str(self.dtype).removeprefix("torch.").upper())
+
+    torch.Tensor.get_dtype = _tensor_get_dtype
+
+
+def _patch_default_rope_init():
+    """Restore legacy ``rope_type='default'`` support for older remote-code models.
+
+    Some third-party model implementations still look up ``ROPE_INIT_FUNCTIONS["default"]``
+    directly when no explicit rope scaling is configured. Newer transformers releases no
+    longer register that key, even though the standard RoPE parameterization is still valid.
+    Register a small compatibility shim that computes the original default inverse frequencies.
+    """
+    try:
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+    except ImportError:
+        return
+
+    if "default" in ROPE_INIT_FUNCTIONS:
+        return
+
+    def _compute_default_rope_parameters(config=None, device=None, seq_len=None, layer_type=None):
+        del seq_len  # Unused for the default RoPE type.
+
+        if config is None:
+            raise ValueError("config must be provided to compute default RoPE parameters")
+
+        rope_parameters = {}
+        if hasattr(config, "standardize_rope_params") and hasattr(config, "rope_parameters"):
+            config.standardize_rope_params()
+            rope_parameters = config.rope_parameters[layer_type] if layer_type is not None else config.rope_parameters
+        elif hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
+            rope_parameters = config.rope_scaling
+
+        base = rope_parameters.get("rope_theta", getattr(config, "rope_theta", 10000.0))
+        partial_rotary_factor = rope_parameters.get(
+            "partial_rotary_factor", getattr(config, "partial_rotary_factor", 1.0)
+        )
+        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        dim = int(head_dim * partial_rotary_factor)
+        if dim <= 0:
+            raise ValueError(f"Invalid RoPE dimension {dim} for config {config.__class__.__name__}")
+
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
+        )
+        return inv_freq, 1.0
+
+    ROPE_INIT_FUNCTIONS["default"] = _compute_default_rope_parameters
+
+
+def _patch_rotary_embedding_init_for_legacy_remote_code():
+    """Patch transformers weight init to support legacy remote-code RotaryEmbedding modules.
+
+    transformers 5.5+ expects RotaryEmbedding modules using ``rope_type='default'``
+    to expose ``compute_default_rope_parameters``. Older remote-code models often do
+    not define that helper and instead looked up the default entry in
+    ``ROPE_INIT_FUNCTIONS`` directly.
+    """
+    pre_trained_model = transformers.modeling_utils.PreTrainedModel
+    original_init_weights = pre_trained_model._init_weights
+
+    if getattr(original_init_weights, "_auto_round_rotary_default_patch", False):
+        return
+
+    @wraps(original_init_weights)
+    def _patched_init_weights(self, module):
+        try:
+            return original_init_weights(self, module)
+        except AttributeError as exc:
+            if (
+                "compute_default_rope_parameters" not in str(exc)
+                or "RotaryEmbedding" not in module.__class__.__name__
+                or not hasattr(module, "original_inv_freq")
+                or not hasattr(module, "inv_freq")
+                or getattr(module, "rope_type", None) != "default"
+            ):
+                raise
+
+            from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+            buffer_value, _ = ROPE_INIT_FUNCTIONS["default"](module.config)
+            with torch.no_grad():
+                module.inv_freq.copy_(buffer_value)
+                module.original_inv_freq.copy_(buffer_value)
+
+    _patched_init_weights._auto_round_rotary_default_patch = True
+    pre_trained_model._init_weights = _patched_init_weights
+
+
+# TODO: only AutoModelForCausalLM is patched; other Auto* classes are not covered yet
+def monkey_patch_transformers():
+    transformers_version = getattr(transformers, "__version__", None)
+    if transformers_version is None:
+        logger.warning("transformers.__version__ is not available; skipping transformers monkey patching.")
+        return
+    try:
+        parsed_version = version.parse(transformers_version)
+    except Exception as exc:
+        logger.warning(
+            "Failed to parse transformers version '%s'; skipping transformers monkey patching. Error: %s",
+            transformers_version,
+            exc,
+        )
+        return
+
+    if parsed_version >= version.parse("5.0.0"):
+        from transformers.initialization import no_init_weights
+
+        setattr(transformers.modeling_utils, "no_init_weights", no_init_weights)
+    if parsed_version >= version.parse("5.2.0"):
+        # transformers 5.2.0 added Transpose.convert() which calls get_parameter() on
+        # quantized buffer tensors (weight_packed, weight_scale), causing AttributeError.
+        _patch_transpose_for_buffers()
+    if parsed_version >= version.parse("5.3.0"):
+        # transformers 5.3.0 calls tensor.get_dtype() on plain torch.Tensor objects
+        # while loading pre-quantized checkpoints.
+        _patch_tensor_get_dtype_for_prequantized_loading()
+    _patch_default_rope_init()
+    _patch_rotary_embedding_init_for_legacy_remote_code()
+    if parsed_version >= version.parse("4.56.0"):
+        _patch_classmethod_kwargs(transformers.AutoModelForCausalLM, "from_pretrained", torch_dtype="dtype")
+    else:
+        _patch_classmethod_kwargs(transformers.AutoModelForCausalLM, "from_pretrained", dtype="torch_dtype")
+
+
+@lru_cache(None)
+def monkey_patch():
+    monkey_patch_transformers()
+
+
+def monkey_patch_model(model) -> None:
+    """Apply model-instance-level monkey patches after a model is loaded.
+
+    This is the central place for all instance-level patches (as opposed to the
+    class-level patches in ``monkey_patch_transformers``).
+    """
+    _patch_prepare_inputs_for_generation(model)
+    _patch_mimo_attention_forward(model)
+
+
+def _patch_prepare_inputs_for_generation(model) -> None:
+    """Fix positional-arg mismatch in models whose prepare_inputs_for_generation
+    passes arguments positionally to GenerationMixin.prepare_inputs_for_generation.
+
+    transformers >= 5.1 inserted ``next_sequence_length`` as the 2nd positional
+    parameter in the base ``GenerationMixin.prepare_inputs_for_generation``.
+    Some model implementations (e.g. Qwen2.5-Omni / Qwen3-Omni MoE talker)
+    still pass ``past_key_values`` etc. positionally, causing a
+    "got multiple values for argument 'next_sequence_length'" TypeError.
+
+    This function monkey-patches the affected sub-model to use keyword arguments
+    instead, which works with both old and new transformers.
+    """
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
+
+    if model_type == "qwen2_5_omni":
+        _patch_qwen25_omni_talker(model)
+    elif model_type == "qwen3_omni_moe":
+        _patch_qwen3_omni_moe_talker(model)
+
+
+def _patch_mimo_attention_forward(model) -> None:
+    """Patch MiMo remote-code attention helpers for newer transformers call sites."""
+    # Check if this is a MiMo model by class name (remote code models may not have model_type)
+    model_class_name = model.__class__.__name__
+    logger.debug(f"_patch_mimo_attention_forward called for {model_class_name}")
+
+    if "MiMo" not in model_class_name and "mimo" not in model_class_name.lower():
+        logger.debug(f"Skipping patch: not a MiMo model (class name: {model_class_name})")
+        return
+
+    try:
+        module = importlib.import_module(model.__class__.__module__)
+        logger.debug(f"Imported module: {model.__class__.__module__}")
+    except ImportError as e:
+        logger.warning(f"Could not import module {model.__class__.__module__}: {e}")
+        return
+
+    eager_attention_forward = getattr(module, "eager_attention_forward", None)
+    logger.debug(f"eager_attention_forward found: {eager_attention_forward is not None}")
+
+    if eager_attention_forward is None:
+        logger.debug("Skipping patch: eager_attention_forward not found in module")
+        return
+
+    if getattr(eager_attention_forward, "_auto_round_mimo_patch", False):
+        logger.debug("Skipping patch: already patched")
+        return
+
+    @wraps(eager_attention_forward)
+    def _patched_eager_attention_forward(
+        module_obj,
+        query,
+        key,
+        value,
+        attention_mask,
+        scaling,
+        dropout=0.0,
+        sinks=None,
+        **kwargs,
+    ):
+        del kwargs
+        return eager_attention_forward(module_obj, query, key, value, attention_mask, scaling, dropout, sinks)
+
+    _patched_eager_attention_forward._auto_round_mimo_patch = True
+    module.eager_attention_forward = _patched_eager_attention_forward
+    logger.debug(f"Successfully patched eager_attention_forward in {model.__class__.__module__}")
+
+
+def _patch_qwen25_omni_talker(model) -> None:
+    """Patch Qwen2.5-Omni talker prepare_inputs_for_generation."""
+    talker = getattr(model, "talker", None)
+    if talker is None:
+        return
+
+    import types
+
+    def _fixed_prepare_inputs_for_generation(
+        self,
+        input_ids,
+        input_text_ids=None,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        thinker_reply_part=None,
+        cache_position=None,
+        position_ids=None,
+        use_cache=True,
+        pixel_values=None,
+        pixel_values_videos=None,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        input_audio_features=None,
+        audio_feature_attention_mask=None,
+        audio_feature_lengths=None,
+        use_audio_in_video=None,
+        video_second_per_grid=None,
+        **kwargs,
+    ):
+        from transformers.generation.utils import GenerationMixin
+
+        model_inputs = GenerationMixin.prepare_inputs_for_generation(
+            self,
+            input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            cache_position=cache_position,
+            use_cache=use_cache,
+            thinker_reply_part=thinker_reply_part,
+            input_text_ids=input_text_ids,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            input_audio_features=input_audio_features,
+            audio_feature_attention_mask=audio_feature_attention_mask,
+            audio_feature_lengths=audio_feature_lengths,
+            use_audio_in_video=use_audio_in_video,
+            video_second_per_grid=video_second_per_grid,
+            **kwargs,
+        )
+        model_inputs["position_ids"] = None
+        return model_inputs
+
+    talker.prepare_inputs_for_generation = types.MethodType(_fixed_prepare_inputs_for_generation, talker)
+    from auto_round.logger import logger
+
+    logger.info("Patched Qwen2.5-Omni talker prepare_inputs_for_generation for transformers compat.")
+
+
+def _patch_qwen3_omni_moe_talker(model) -> None:
+    """Patch Qwen3-Omni MoE talker prepare_inputs_for_generation.
+
+    The talker passes past_key_values, attention_mask, inputs_embeds positionally
+    to super().prepare_inputs_for_generation(), colliding with the new
+    next_sequence_length parameter in transformers >= 5.1.
+    """
+    talker = getattr(model, "talker", None)
+    if talker is None:
+        return
+
+    import types
+
+    _orig_prepare = (
+        talker.prepare_inputs_for_generation.__func__
+        if hasattr(talker.prepare_inputs_for_generation, "__func__")
+        else talker.prepare_inputs_for_generation
+    )
+
+    def _fixed_prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        is_first_iteration=False,
+        **kwargs,
+    ):
+        from transformers.generation.utils import GenerationMixin
+
+        hidden_states = kwargs.pop("hidden_states", None)
+        inputs = GenerationMixin.prepare_inputs_for_generation(
+            self,
+            input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            is_first_iteration=is_first_iteration,
+            **kwargs,
+        )
+
+        # Qwen3-Omni will prepare position ids in forward with deltas
+        inputs["position_ids"] = None
+
+        # Reproduce the talker's codec logic for non-first iterations
+        if not is_first_iteration and kwargs.get("use_cache", True):
+            import torch
+
+            input_ids_last = input_ids[:, -1:]
+            generation_step = kwargs.get("generation_step")
+            trailing_text_hidden = kwargs.get("trailing_text_hidden")
+            tts_pad_embed = kwargs.get("tts_pad_embed")
+            last_id_hidden = self.get_input_embeddings()(input_ids_last)
+
+            past_hidden = hidden_states[0][-1][:, -1:].to(last_id_hidden.device)
+            predictor_result = self.code_predictor.generate(
+                inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),
+                max_new_tokens=self.config.num_code_groups - 1,
+                do_sample=True,
+                top_k=50,
+                top_p=0.8,
+                output_hidden_states=True,
+                return_dict_in_generate=True,
+            )
+            residual_codes = torch.cat((input_ids_last, predictor_result.sequences.to(input_ids_last.device)), dim=-1)
+
+            mid_residual_hiddens = [hid[0].to(last_id_hidden.device) for hid in predictor_result.hidden_states[1:]]
+            last_residual_hidden = self.code_predictor.get_input_embeddings()[-1](
+                predictor_result.sequences[..., -1:]
+            ).to(last_id_hidden.device)
+            codec_hiddens = torch.cat(
+                [last_id_hidden] + mid_residual_hiddens + [last_residual_hidden],
+                dim=1,
+            )
+            inputs_embeds_new = codec_hiddens.sum(1, keepdim=True)
+
+            if generation_step < trailing_text_hidden.shape[1]:
+                inputs_embeds_new = inputs_embeds_new + trailing_text_hidden[:, generation_step].unsqueeze(1).to(
+                    inputs_embeds_new.device
+                )
+            else:
+                inputs_embeds_new = inputs_embeds_new + tts_pad_embed.to(inputs_embeds_new.device)
+            inputs["inputs_embeds"] = inputs_embeds_new
+            inputs["residual_codes"] = residual_codes
+
+        return inputs
+
+    talker.prepare_inputs_for_generation = types.MethodType(_fixed_prepare_inputs_for_generation, talker)
+    from auto_round.logger import logger
+
+    logger.info("Patched Qwen3-Omni MoE talker prepare_inputs_for_generation for transformers compat.")
+
+
+auto_gptq = LazyImport("auto_gptq")
+htcore = LazyImport("habana_frameworks.torch.core")
+
+
+class SupportedFormats:
+
+    def __init__(self):
+        self._support_format = (
+            "auto_round",
+            "auto_gptq",
+            "auto_awq",
+            "auto_round:auto_gptq",
+            "auto_round:gptqmodel",
+            "auto_round:auto_awq",
+            "auto_round:llm_compressor",
+            "fake",
+            "llm_compressor",
+            "fp8",
+            "auto_round:fp8",
+            "mlx",
+            "auto_round:mlx",
+        )
+        self._gguf_format = tuple(sorted(GGUF_CONFIG.keys()))
+        self._support_list = self._support_format + self._gguf_format
+
+    def __contains__(self, key):
+        return True if key in self._support_list else False
+
+    def __str__(self):
+        # Return "(%s)" % ', '.join(self._support_format + ("gguf:q*_0", "gguf:q*_1", "gguf:q*_k_s"))
+        return "(%s)" % ", ".join(self._support_list)
+
+    def __getitem__(self, key):
+        return self._support_list[key]
+
+
+SHARED_CACHE_KEYS = ("position_ids", "cache_position", "position_embeddings", "cu_seqlens")
+
+deepspeed_exists = False
+if importlib.util.find_spec("deepspeed"):  # check if deepspeed is installed
+    deepspeed_exists = True
+
+SUPPORTED_DTYPES = ("int", "mx_fp", "fp", "nv_fp", "mx_int")
+SUPPORTED_FORMATS = SupportedFormats()
+SUPPORTED_LAYER_TYPES = (torch.nn.Linear, transformers.pytorch_utils.Conv1D)
+# Changed to str as it relies on triton or others lib to load this
+INNER_SUPPORTED_LAYER_TYPES = ("FP8Linear", "CompressedLinear")
+# transformers.integrations.finegrained_fp8.FP8Linear
+if deepspeed_exists:
+    from deepspeed.module_inject import LinearAllreduce, LinearLayer
+
+    SUPPORTED_LAYER_TYPES = SUPPORTED_LAYER_TYPES + (LinearLayer, LinearAllreduce)
+
+VISION_MM_KEYS = (
+    "vision",
+    "visual",
+    "image",
+    "img",
+)
+AUDIO_MM_KEYS = (
+    "audio",
+    "speech",
+    "wav",
+    "waveform",
+)
+MM_MODULE_KEYS = [
+    "multi_modal_projector",
+    "vision_tower",
+    "multimodal_projector",
+    "thinker",
+    "talker",
+    "token2wav",
+    "code2wav",
+    "code_predictor",
+    "vqmodel",
+    "vision_model",
+    "audio_tower",
+    "audio_model",
+    "vision_encoder",
+    "vision_language_adapter",
+    "patch_merger",
+    "pre_mm_projector_norm",
+    "image_newline",
+    "model.connector",
+    "audio",
+    *VISION_MM_KEYS,
+]
+MM_KEYS = [*MM_MODULE_KEYS, "speech", "wav", "waveform"]
+
+
+def contain_any_mm_keys(name: str) -> bool:
+    for key in MM_MODULE_KEYS:
+        if key in name:
+            return True
+    return False
+
+
+def is_debug_mode():
+    """Checks if the Python interpreter is running in debug mode.
+
+    Returns:
+        bool: True if debugging is enabled, False otherwise.
+    """
+    return sys.gettrace() is not None or sys.flags.debug == 1
+
+
+def is_local_path(path):
+    """Checks if a given path exists locally.
+
+    Args:
+        path (str): The path to check.
+
+    Returns:
+        bool: True if the path exists locally, False otherwise.
+    """
+    format_list = (
+        "json",
+        "txt",
+    )
+    flag = None
+    for x in format_list:
+        flag = True if x in path else flag
+    return flag and os.path.exists(path)
+
+
+def get_library_version(library_name):
+    from packaging.version import Version
+
+    python_version = Version(sys.version.split()[0])
+    if python_version < Version("3.8"):
+        import warnings
+
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        import pkg_resources  # pylint: disable=E0401
+
+        try:
+            version = pkg_resources.get_distribution(library_name).version
+            return version
+        except pkg_resources.DistributionNotFound:
+            return f"{library_name} is not installed"
+    else:
+        import importlib.metadata  # pylint: disable=E0401
+
+        try:
+            version = importlib.metadata.version(library_name)
+            return version
+        except importlib.metadata.PackageNotFoundError:
+            return f"{library_name} is not installed"
+
+
+def str2bool(v):
+    import argparse
+
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    elif v.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    else:
+        raise argparse.ArgumentTypeError("Boolean value expected.")
+
+
+def flatten_list(nested_list):
+    flattened = []
+    for item in nested_list:
+        if isinstance(item, (list, tuple)):
+            flattened.extend(flatten_list(item))
+        else:
+            flattened.append(item)
+    return flattened
+
+
+def to_standard_regex(pattern: str) -> str:
+    """
+    Convert a user-specified string into a standardized regex for layer matching.
+
+    Rules:
+    - If the pattern already contains regex tokens ('.*', '^', '$', etc.),
+      keep them as-is.
+    - Otherwise, wrap the pattern with `.*` on both sides to allow substring matching.
+    - Always ensure the returned regex is valid (compilable by re).
+
+    Examples:
+    >>> to_standard_regex("model.embed_tokens")
+    '.*model\\.embed_tokens.*'
+    >>> to_standard_regex("mlp.gate")
+    '.*mlp\\.gate.*'
+    >>> to_standard_regex("mlp.gate$")
+    '.*mlp\\.gate$'
+    >>> to_standard_regex("mlp.*gate")
+    '.*mlp.*gate.*'
+    """
+    # Heuristic: if pattern contains regex meta characters, assume partial regex
+    meta_chars = {".*", "^", "$", "|", "(", ")", "[", "]", "?", "+"}
+    has_regex = any(tok in pattern for tok in meta_chars)
+    if not has_regex:
+        # Escape literal dots, etc., and wrap with .* for substring matching
+        pattern = re.escape(pattern)
+        regex = f".*{pattern}.*"
+    else:
+        # Only escape bare dots that are not already part of regex constructs
+        # Avoid double escaping .* sequences
+        tmp = []
+        i = 0
+        while i < len(pattern):
+            if pattern[i] == ".":
+                if i + 1 < len(pattern) and pattern[i + 1] == "*":
+                    tmp.append(".*")  # keep regex token
+                    i += 2
+                    continue
+                else:
+                    tmp.append("\\.")  # escape bare dot
+            else:
+                tmp.append(pattern[i])
+            i += 1
+        regex = "".join(tmp)
+        # If no anchors are provided, allow substring matching
+        if not regex.startswith("^") and not regex.startswith(".*"):
+            regex = ".*" + regex
+        if not regex.endswith("$") and not regex.endswith(".*"):
+            regex = regex + ".*"
+    # Validate regex
+    try:
+        re.compile(regex)
+    except re.error as e:
+        raise ValueError(f"Invalid regex generated from pattern '{pattern}': {e}")
+    return regex
+
+
+def matches_any_regex(layer_name: str, regex_config: dict[str, dict]) -> bool:
+    """
+    Check whether `layer_name` matches any regex pattern key in `regex_config`.
+    Args:
+        layer_name (str): The layer name to test.
+        regex_config (dict[str, dict]): A mapping of regex patterns to configs.
+    Returns:
+        bool: True if any pattern matches `layer_name`, otherwise False.
+    """
+    if not regex_config:
+        return False
+
+    for pattern in regex_config:
+        # Strip dynamic prefixes (e.g., "+:" or "-:")
+        raw_pattern = pattern[2:] if pattern.startswith(("+:", "-:")) else pattern
+
+        try:
+            if re.search(raw_pattern, layer_name):
+                return True
+        except re.error as e:
+            logger.warning("Skipping invalid regex pattern %r: %s", pattern, e)
+            continue
+
+    return False
+
+
+def json_serialize(obj: Any):
+    """Convert non-JSON-serializable objects into JSON-friendly formats."""
+    if isinstance(obj, torch.dtype):
+        return str(obj).split(".")[-1]  # e.g., torch.float16 -> "float16"
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def get_reciprocal(tensor):
+    """
+    Memory-frugal reciprocal:
+    - Uses torch.where to avoid boolean indexing (aten.nonzero),
+      which is not supported by torch.compile inductor backend.
+    """
+    eps = 1e-5 if tensor.dtype == torch.float16 else 1e-30
+
+    # Create mask for very small elements
+    safe = tensor.abs() >= eps
+
+    # Use torch.where to avoid graph breaks under torch.compile
+    # Replace near-zero values with 1.0 before dividing to avoid inf,
+    # then mask the result. Both branches are evaluated by torch.where,
+    # so the dummy 1.0 prevents division-by-zero in the unsafe branch.
+    safe_tensor = torch.where(safe, tensor, torch.ones_like(tensor))
+    recip = torch.where(safe, 1.0 / safe_tensor, torch.zeros_like(tensor))
+
+    return recip
+
+
+@dataclass
+class GlobalState:
+    replaced_module_count = 0
+
+
+global_state = GlobalState()
+
+
+@lru_cache(None)
+def is_transformers_version_greater_or_equal_5_4_0():
+    import transformers
+    from packaging import version
+
+    return version.parse(transformers.__version__) >= version.parse("5.4.0")
+
+
+@lru_cache(None)
+def is_transformers_version_greater_or_equal_5():
+    import transformers
+    from packaging import version
+
+    return version.parse(transformers.__version__) >= version.parse("5.0.0")
+
+
+# TODO: (yiliu30) refine version check logic
+@lru_cache(None)
+def is_transformers_version_greater_or_equal_4():
+    import transformers
+    from packaging import version
+
+    return version.parse(transformers.__version__) >= version.parse("4.0.0")
+
+
+import json
+
+
+def parse_layer_config_arg(s: str) -> dict:
+    def strip_matching_quotes(token: str) -> str:
+        token = token.strip().replace("“", '"').replace("”", '"')
+        if len(token) >= 2 and token[0] == token[-1] and token[0] in ("'", '"'):
+            return token[1:-1]
+        return token
+
+    def normalize_scalar(value):
+        if not isinstance(value, str):
+            return value
+
+        value = strip_matching_quotes(value)
+        if value.lstrip("-").isdigit():
+            return int(value)
+        try:
+            return float(value)
+        except ValueError:
+            pass
+
+        lower_value = value.lower()
+        if lower_value == "true":
+            return True
+        if lower_value == "false":
+            return False
+        if lower_value in ("null", "none"):
+            return None
+        return value
+
+    def normalize_tree(value):
+        if isinstance(value, dict):
+            return {normalize_scalar(k): normalize_tree(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [normalize_tree(item) for item in value]
+        return normalize_scalar(value)
+
+    def escape_invalid_json_backslashes(text: str) -> str:
+        escaped = []
+        in_string = False
+        index = 0
+
+        while index < len(text):
+            ch = text[index]
+            if not in_string:
+                if ch == '"':
+                    in_string = True
+                escaped.append(ch)
+                index += 1
+                continue
+
+            if ch == "\\":
+                next_ch = text[index + 1] if index + 1 < len(text) else ""
+                if next_ch not in {'"', "\\", "/", "b", "f", "n", "r", "t", "u"}:
+                    escaped.append("\\\\")
+                    index += 1
+                    continue
+
+            if ch == '"':
+                in_string = False
+            escaped.append(ch)
+            index += 1
+
+    s = strip_matching_quotes(s)
+
+    # 1. Prefer strict JSON.
+    try:
+        return normalize_tree(json.loads(s))
+    except Exception:
+        pass
+
+    # 2. Repair shell-friendly regex strings like "\d" into valid JSON escapes.
+    try:
+        return normalize_tree(json.loads(escape_invalid_json_backslashes(s)))
+    except Exception:
+        pass
+
+    # 3. Fallback parser for CLI-friendly dict syntax.
+    tokens = re.findall(r"[{}:,]|[^\s{}:,]+", s)
+    pos = 0
+
+    def peek():
+        return tokens[pos] if pos < len(tokens) else None
+
+    def consume(expected=None):
+        nonlocal pos
+        tok = peek()
+        if tok is None:
+            raise ValueError("Unexpected end of input")
+        if expected and tok != expected:
+            raise ValueError(f"Expected '{expected}', got '{tok}'")
+        pos += 1
+        return tok
+
+    def parse_value():
+        tok = peek()
+        if tok == "{":
+            return parse_dict()
+
+        consume()
+        return normalize_scalar(tok)
+
+    def parse_dict():
+        consume("{")
+        result = {}
+
+        while True:
+            tok = peek()
+            if tok == "}":
+                consume("}")
+                break
+
+            key = normalize_scalar(consume())
+            consume(":")
+            value = parse_value()
+            result[key] = value
+
+            if peek() == ",":
+                consume(",")
+
+        return result
+
+    result = parse_dict()
+    if not isinstance(result, dict):
+        raise ValueError("--layer_config must parse to a dictionary")
+    return result
+
+
+def compress_layer_names(names: list) -> str:
+    """Compress numbered layer names, e.g. layer.0, layer.1, layer.2 → layer.[0-2].
+
+    Runs the compression pass repeatedly until stable so that multi-level
+    numbering is fully reduced.  For example::
+
+        layers.0.experts.[0-255].down_proj
+        layers.10.experts.[0-255].down_proj
+        →  layers.[0,10].experts.[0-255].down_proj
+    """
+    import re as _re
+    from collections import defaultdict
+
+    def _compress_once(name_list: list) -> list:
+        groups: dict = defaultdict(list)
+        singles: list = []
+        for name in name_list:
+            m = _re.match(r"^(.*\.)?(\d+)(\..+)?$", name)
+            if m:
+                prefix = m.group(1) or ""
+                num = int(m.group(2))
+                suffix = m.group(3) or ""
+                groups[(prefix, suffix)].append(num)
+            else:
+                singles.append(name)
+        parts: list = []
+        for (prefix, suffix), nums in groups.items():
+            nums_sorted = sorted(set(nums))
+            if len(nums_sorted) == 1:
+                parts.append(f"{prefix}{nums_sorted[0]}{suffix}")
+            else:
+                # Build comma-separated contiguous ranges, e.g. [0,2-3,5]
+                ranges = []
+                start = prev = nums_sorted[0]
+                for n in nums_sorted[1:]:
+                    if n == prev + 1:
+                        prev = n
+                        continue
+                    # Close the current range
+                    if start == prev:
+                        ranges.append(str(start))
+                    else:
+                        ranges.append(f"{start}-{prev}")
+                    start = prev = n
+                # Close the final range
+                if start == prev:
+                    ranges.append(str(start))
+                else:
+                    ranges.append(f"{start}-{prev}")
+                range_str = ",".join(ranges)
+                parts.append(f"{prefix}[{range_str}]{suffix}")
+        parts.extend(singles)
+        return parts
+
+    current = list(names)
+    while True:
+        compressed = _compress_once(current)
+        # Stop when no further merging occurred
+        if len(compressed) >= len(current):
+            break
+        current = compressed
+
+    current.sort()
+    return ", ".join(current)
+
+
+def infer_bits_by_data_type(data_type: str):
+    """Infer bits by data_type
+
+    Args:
+        data_type (str): data_type
+
+    Returns:
+        int: bits inferred by data_type, None means cannot infer correct bits by data_type
+    """
+    from auto_round.utils import SUPPORTED_DTYPES
+
+    if data_type is None:
+        return 16
+    for supported_dtype in SUPPORTED_DTYPES:
+        if data_type.startswith(supported_dtype) and len(data_type) > len(supported_dtype):
+            ##first check the following two bits
+            suc_2str = data_type[len(supported_dtype) : len(supported_dtype) + 2]
+            if str.isdigit(suc_2str):
+                return int(suc_2str)
+            if str.isdigit(data_type[len(supported_dtype)]):
+                return int(data_type[len(supported_dtype)])
+    return None
+
+
+def get_checkpoint_conversion_mapping(model):
+    """Get the checkpoint conversion mapping for a given model, if it exists."""
+    checkpoint_conversion_mapping = {}
+
+    # transformers <= 5.3.0 use _checkpoint_conversion_mapping
+    checkpoint_conversion_mapping.update(getattr(model, "_checkpoint_conversion_mapping", {}))
+
+    # transformers > 5.3.0 use get_checkpoint_conversion_mapping
+    if hasattr(transformers, "conversion_mapping") and (
+        hasattr(model, "config") and hasattr(model.config, "model_type")
+    ):
+        from transformers.conversion_mapping import (
+            get_checkpoint_conversion_mapping as transformers_get_checkpoint_conversion_mapping,
+        )
+
+        conversion_mappings = transformers_get_checkpoint_conversion_mapping(model.config.model_type)
+
+        # For composite models (e.g. VLMs) loaded as text sub-models via AutoModelForCausalLM,
+        # the composite model_type may not have a mapping, but the text sub-model type does.
+        if conversion_mappings is None:
+            text_config = getattr(getattr(model, "config", None), "text_config", None)
+            text_model_type = getattr(text_config, "model_type", None)
+            if text_model_type:
+                conversion_mappings = transformers_get_checkpoint_conversion_mapping(text_model_type)
+
+        if conversion_mappings is not None:
+            for conversion_mapping in conversion_mappings:
+                for source_pattern in conversion_mapping.source_patterns:
+                    checkpoint_conversion_mapping[source_pattern] = conversion_mapping.target_patterns
+    return checkpoint_conversion_mapping
+
+
+def get_reverse_checkpoint_conversion_mapping(model):
+    """Get the reverse checkpoint conversion mapping for a given model, if it exists."""
+    reverse_checkpoint_conversion_mapping = {
+        v: k for k, v in getattr(model, "_checkpoint_conversion_mapping", {}).items()
+    }
+
+    if hasattr(model, "_weight_conversions"):
+        weight_conversions = model._weight_conversions
+        for weight_conversion in weight_conversions:
+            reverse_conversion_mapping = weight_conversion.reverse_transform()
+            for source_pattern in reverse_conversion_mapping.source_patterns:
+                reverse_checkpoint_conversion_mapping[source_pattern] = reverse_conversion_mapping.target_patterns
+
+    return reverse_checkpoint_conversion_mapping
+
+
+def revert_checkpoint_conversion_mapping(name: str, key_mapping: dict[str, str]) -> str:
+    if "," in name:
+        return ",".join(revert_checkpoint_conversion_mapping(part, key_mapping) for part in name.split(","))
+
+    for source_pattern, target_patterns in key_mapping.items():
+        if isinstance(target_patterns, str):
+            target_patterns = [target_patterns]
+        for target_pattern in target_patterns:
+            source_pattern = source_pattern.lstrip("^")  # strip off un-needed chars and patterns
+            # Skip stripping the capture group if the target backreferences it,
+            # otherwise re.subn raises "invalid group reference".
+            if not re.search(r"\\g?<?\d+>?", target_pattern):
+                source_pattern = re.sub(r"\(.*\)", "", source_pattern)
+
+            # Weight-conversion reverse mappings may expose bare tensor names
+            # such as "weight" -> ".weight_packed". Treat those as terminal
+            # tensor suffixes so they do not rewrite already-quantized names
+            # like ".weight_packed" into malformed keys such as
+            # "..weight_packed_packed".
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", source_pattern) and target_pattern.startswith("."):
+                match_pattern = rf"\.{re.escape(source_pattern)}$"
+            else:
+                match_pattern = source_pattern
+
+            name, n_replace = re.subn(match_pattern, target_pattern, name)
+            # Early exit of the loop
+            if n_replace > 0:
+                return name
+    return name
+
+
+def preserve_original_visual_block_name(original_name: str | None, reverted_name: str) -> str:
+    """Keep composite multimodal block prefixes stable in serialized quant configs.
+
+    Some multimodal models expose block names under the composite model path
+    (for example ``model.visual.*`` or ``model.language_model.*``) during
+    quantization, but checkpoint conversion rules can rewrite those config-only
+    block prefixes to text-submodel paths such as ``visual.*`` or
+    ``model.layers``. The direct multimodal loaders expect the composite path to
+    remain intact in ``block_name_to_quantize``.
+    """
+    if not (isinstance(original_name, str) and isinstance(reverted_name, str)):
+        return reverted_name
+
+    original_parts = [part.strip() for part in original_name.split(",")]
+    reverted_parts = [part.strip() for part in reverted_name.split(",")]
+    if len(original_parts) != len(reverted_parts):
+        return reverted_name
+
+    preserved_parts = []
+    for original_part, reverted_part in zip(original_parts, reverted_parts):
+        if original_part.startswith("model.visual.") and reverted_part == original_part[len("model.") :]:
+            preserved_parts.append(original_part)
+        elif original_part.startswith("model.language_model.") and reverted_part.startswith("model.layers"):
+            preserved_parts.append(original_part)
+            preserved_parts.append(reverted_part)
+        else:
+            preserved_parts.append(reverted_part)
+
+    deduped_parts = []
+    for preserved_part in preserved_parts:
+        if preserved_part not in deduped_parts:
+            deduped_parts.append(preserved_part)
+
+    return ",".join(deduped_parts)
+
+
+def apply_checkpoint_conversion_mapping(name: str, key_mapping: dict[str, str]) -> str:
+    for source_pattern, target_patterns in key_mapping.items():
+        if isinstance(target_patterns, str):
+            target_patterns = [target_patterns]
+        for target_pattern in target_patterns:
+            name, n_replace = re.subn(source_pattern, target_pattern, name)
+            # Early exit of the loop
+            if n_replace > 0:
+                return name
+    return name

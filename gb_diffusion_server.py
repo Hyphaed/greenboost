@@ -33,8 +33,8 @@ PIPE = None
 ORCH = None
 MODEL_NAME = ""
 
-# gb_quant precision-ladder tokens, same mapping gb_llm_server.py uses for
-# the transformers text backend.
+# gb_quant precision-ladder tokens, same mapping gb_synapse_fallback.py uses
+# for the transformers text backend.
 _QUANT_TO_BITS = {"FP8": "fp8", "INT8": 8, "INT4": 4}
 
 
@@ -50,8 +50,12 @@ def _load(model: str, quant: str) -> None:
     pipe = AutoPipelineForText2Image.from_pretrained(model, torch_dtype=torch.bfloat16)
     orch = DiffusionOrchestrator(pipe)
     bits = _QUANT_TO_BITS.get(quant.upper(), "fp8")
-    gb_quant.quantize_encoders(pipe, bits=bits)
-    gb_quant.quantize_denoiser(pipe, bits=bits)
+    # quality=None is required , both quantize_encoders/denoiser default to
+    # quality="near_lossless", which takes priority over `bits` and silently
+    # ignores this server's own --quant flag (previously: --quant int4 still
+    # quantized at whatever near_lossless's calibrated per-layer plan chose).
+    gb_quant.quantize_encoders(pipe, bits=bits, quality=None)
+    gb_quant.quantize_denoiser(pipe, bits=bits, quality=None)
     PIPE, ORCH = pipe, orch
     print(f"[gb_diffusion_server] ready, serving '{model}'", flush=True)
 

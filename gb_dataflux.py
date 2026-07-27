@@ -23,6 +23,7 @@ CLI:
 """
 from __future__ import annotations
 
+import contextlib
 import http.server
 import json
 import os
@@ -116,6 +117,32 @@ def _log_path() -> Path:
     with monkeypatch.setenv, and so a long-lived process (the web server,
     a supervisor) picks up an env change without a restart."""
     return Path(os.environ.get("GREENBOOST_DATAFLUX_LOG", _DEFAULT_LOG_PATH))
+
+
+def _archive_path(log_path: Path) -> Path:
+    return log_path.parent / (log_path.name + ".1")
+
+
+_DEFAULT_MAX_LOG_BYTES = 512 * 1024 * 1024  # 512 MiB hard ceiling
+
+
+def _max_log_bytes(log_path: Path) -> int:
+    """Rotation trigger size. Never a bare hardcoded literal (project rule):
+    min(512 MiB, 1% of the log filesystem's free space). GB_DATAFLUX_MAX_BYTES
+    overrides with an explicit absolute value when set."""
+    override = os.environ.get("GB_DATAFLUX_MAX_BYTES")
+    if override:
+        try:
+            return max(1, int(override))
+        except ValueError:
+            pass
+    try:
+        probe = log_path.parent if log_path.parent.is_dir() else Path("/")
+        st = os.statvfs(probe)
+        free = st.f_bavail * st.f_frsize
+        return min(_DEFAULT_MAX_LOG_BYTES, max(1, int(free * 0.01)))
+    except OSError:
+        return _DEFAULT_MAX_LOG_BYTES
 
 
 class SnapshotRecorder:
@@ -251,23 +278,23 @@ class SnapshotRecorder:
     def _detect_shim_decisions(self, m, gb, node: str) -> None:
         """Emit one `shim_decision` event per tier placement by diffing the
         shim's monotonic per-tier alloc counters (shim_stats). Best-effort;
-        never raises. Closes observability gap B1 with real bytes/counts."""
+        never raises. Closes observability gap B1 with real bytes/counts.
+
+        Reads via gb_monitor.read_shim_stats() (the canonical parser) rather
+        than hand-opening /run/greenboost/shim_stats directly — the hand-
+        rolled version had NO /tmp/greenboost_shim_stats fallback, unlike
+        every other shim_stats reader in the repo, so on a box where the
+        shim fell back to /tmp (the documented raw-Ollama case, LD_PRELOAD
+        into a non-writable /run), this method silently found nothing and
+        zero shim_decision events were ever produced."""
         try:
-            stats_path = "/run/greenboost/shim_stats"
-            kv: dict[str, str] = {}
-            with open(stats_path) as _f:
-                for _line in _f:
-                    if "=" in _line:
-                        _k, _, _v = _line.strip().partition("=")
-                        kv[_k.strip()] = _v.strip()
+            import gb_monitor
+            kv = gb_monitor.read_shim_stats()
             if not kv:
                 return
             # Freshness-gate identically to gb_telemetry (30s) so a dead
             # process's stale file never emits phantom decisions.
-            try:
-                if (time.time() - float(kv.get("timestamp", "0"))) > 30.0:
-                    return
-            except ValueError:
+            if kv.get("_stale", True):
                 return
 
             def _i(key: str) -> int:
@@ -432,6 +459,16 @@ def emit(event: dict) -> None:
     Best-effort , logging failures (disk full, permissions, or a
     non-JSON-serializable value in the event dict) are swallowed so a
     dispatch never fails because history couldn't be recorded.
+
+    Size-capped rotation: the log grows unbounded otherwise (no MCP tool or
+    web UI request ever asked for anything but the recent past, yet every
+    read scanned the whole file). Once the file exceeds _max_log_bytes(),
+    this call atomically os.replace()s it to a single ".jsonl.1" archive —
+    a concurrent writer that already has this call in flight just lands its
+    line in whichever file existed at the moment IT opened the path (same
+    tradeoff gb_cluster.py's feeder-sync dedup already accepts explicitly).
+    Exactly one archive generation is kept; older history is dropped by the
+    supervisor's periodic compact_archive() call, not here.
     """
     try:
         log_path = _log_path()
@@ -449,30 +486,241 @@ def emit(event: dict) -> None:
         event.setdefault("pid", os.getpid())
         with open(log_path, "a") as f:
             f.write(json.dumps(event) + "\n")
+            size = f.tell()
+        if size > _max_log_bytes(log_path):
+            _rotate_log(log_path)
     except (OSError, TypeError, ValueError):
         pass
 
 
-def read_events(since_hours: float | None = None) -> list[dict]:
-    """All logged events, optionally filtered to the last `since_hours`."""
-    log_path = _log_path()
-    if not log_path.exists():
-        return []
-    cutoff = time.time() - since_hours * 3600 if since_hours else None
+def _rotate_log(log_path: Path) -> None:
+    """Move the just-capped log out of the hot write path.
+
+    If no archive exists yet, a plain os.replace() is enough (atomic;
+    a concurrent writer's next open() lands in the fresh empty file). If an
+    archive ALREADY exists , meaning a previous rotation fired before
+    compact_archive() ever got to trim it (a burst of emits blowing through
+    the cap many times faster than the supervisor's periodic compaction
+    runs) , os.replace() would silently CLOBBER everything already in it.
+    So this appends the current log's bytes onto the existing archive
+    instead: history is never lost, only compact_archive()'s retention-day
+    trim is allowed to bound the archive's eventual size."""
+    archive = _archive_path(log_path)
+    try:
+        if archive.exists():
+            with open(log_path, "rb") as src, open(archive, "ab") as dst:
+                while True:
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+            log_path.unlink()
+        else:
+            os.replace(log_path, archive)
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def stage(name: str, **fields):
+    """Context manager: emit a `stage_profile` event for the wrapped block
+    , status="ok" + duration_s on a clean exit, status="error" + a
+    truncated error string + duration_s BEFORE re-raising on any exception
+    (never swallowed). This is the canonical pattern the Observability
+    Must-Rule already asks every ai-forge pipeline stage to hand-build
+    (build_jobs_exams.py's df_emit/_vlm, run_all_exams.py's build_dir) ,
+    one shared implementation instead of four independent, hand-rolled
+    ones, each one attempt at the same "emit before re-raise" shape.
+
+    Usage:
+        with gb_dataflux.stage("forge:image", label="gen_art", model=m):
+            do_the_actual_work()
+    """
+    t0 = time.time()
+    try:
+        yield
+    except Exception as e:
+        emit({"kind": "stage_profile", "stage": name, "status": "error",
+              "error": str(e)[:500], "duration_s": round(time.time() - t0, 3), **fields})
+        raise
+    else:
+        emit({"kind": "stage_profile", "stage": name, "status": "ok",
+              "duration_s": round(time.time() - t0, 3), **fields})
+
+
+_TAIL_SEEK_BLOCK = 1024 * 1024  # 1 MiB backward scan step
+
+
+def _tail_seek_start(path: Path, cutoff: float) -> int:
+    """Return a byte offset into `path` safe to start a forward scan from
+    for events with ts >= cutoff , guaranteed to be AT OR BEFORE the first
+    qualifying line, so reading forward from it and filtering by cutoff
+    (as read_events() already does) can never skip a real event.
+
+    Not a strict binary search over a sorted key (concurrent writers and
+    feeder-sync appends can locally violate strict timestamp order ,
+    read_events()'s final sort already absorbs that local disorder): walk
+    backward in fixed 1 MiB blocks, and as soon as a block's first
+    successfully-parsed line has ts < cutoff, that block's start is a safe
+    answer , everything before it is provably older. Falls back to 0 (read
+    the whole file) if the scan exhausts the file without ever finding one,
+    which is the correct answer when the query genuinely wants everything.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return 0
+    pos = size
+    with open(path, "rb") as f:
+        while pos > 0:
+            start = max(0, pos - _TAIL_SEEK_BLOCK)
+            f.seek(start)
+            block = f.read(pos - start)
+            pos = start
+            lines = block.split(b"\n")
+            if start > 0:
+                lines = lines[1:]  # drop a possibly-partial leading fragment
+            found_ts = None
+            for raw in lines:
+                if not raw.strip():
+                    continue
+                try:
+                    found_ts = json.loads(raw).get("ts", 0)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                break
+            if found_ts is not None and found_ts < cutoff:
+                return start
+    return 0
+
+
+def _read_jsonl_file(path: Path, cutoff: "float | None") -> list[dict]:
+    """Parse one JSONL file into events, honoring `cutoff` via
+    _tail_seek_start() instead of a full linear scan when it's set."""
+    start = 0
+    if cutoff is not None:
+        start = _tail_seek_start(path, cutoff)
     out: list[dict] = []
-    with open(log_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                ev = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if cutoff is None or ev.get("ts", 0) >= cutoff:
-                out.append(ev)
-    out.sort(key=lambda e: e.get("ts", 0))
+    try:
+        with open(path) as f:
+            if start:
+                f.seek(start)
+                f.readline()  # discard the partial line landed on at `start`
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if cutoff is None or ev.get("ts", 0) >= cutoff:
+                    out.append(ev)
+    except OSError:
+        return []
     return out
+
+
+# Process-local memo , NOT persisted, no invalidation risk: one MCP-serving
+# process makes many read_events() calls per request (dataflux_critic ->
+# critic_report -> read_events, etc.), and the same (path, mtime, size)
+# pair means the file hasn't changed since the last read.
+_READ_EVENTS_MEMO: "dict[tuple, list[dict]]" = {}
+
+
+def _stat_key(p: Path) -> "tuple | None":
+    try:
+        st = p.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def read_events(since_hours: float | None = None) -> list[dict]:
+    """All logged events, optionally filtered to the last `since_hours`.
+
+    Reads the rotated archive (.jsonl.1) THEN the current log, so rotation
+    never punches a history hole in an existing query; the archive is
+    skipped entirely once its mtime (the time of its LAST write, so
+    necessarily >= every event's ts inside it) predates the query window ,
+    one stat() call removes the whole archive from every hot, recent-window
+    query once retention-days compaction is running (see compact_archive())."""
+    log_path = _log_path()
+    archive = _archive_path(log_path)
+    cutoff = time.time() - since_hours * 3600 if since_hours else None
+
+    archive_key = _stat_key(archive)
+    main_key = _stat_key(log_path)
+    memo_key = (str(log_path), archive_key, main_key, since_hours)
+    cached = _READ_EVENTS_MEMO.get(memo_key)
+    if cached is not None:
+        return list(cached)
+
+    out: list[dict] = []
+    if archive_key is not None:
+        skip_archive = cutoff is not None and (archive_key[0] / 1e9) < cutoff
+        if not skip_archive:
+            out.extend(_read_jsonl_file(archive, cutoff))
+    if main_key is not None:
+        out.extend(_read_jsonl_file(log_path, cutoff))
+
+    out.sort(key=lambda e: e.get("ts", 0))
+    _READ_EVENTS_MEMO[memo_key] = out
+    return list(out)
+
+
+_DEFAULT_RETAIN_DAYS = 30.0
+
+
+def compact_archive(retain_days: "float | None" = None) -> "int | None":
+    """Drop events older than `retain_days` (default 30,
+    GB_DATAFLUX_RETAIN_DAYS) from the rotated ".jsonl.1" archive and rewrite
+    it , this is what actually bounds the archive's size; emit()'s rotation
+    only ever moves bytes out of the hot write path, it never deletes
+    anything. Meant to be called periodically by a long-lived process (the
+    supervisor's tick, not emit() itself , this can be an O(archive size)
+    rewrite and must never sit on the hot path a real dispatch is waiting
+    on). Best-effort: never raises. Returns the number of events dropped,
+    or None if there was no archive to compact."""
+    try:
+        if retain_days is None:
+            retain_days = float(os.environ.get("GB_DATAFLUX_RETAIN_DAYS", _DEFAULT_RETAIN_DAYS))
+        archive = _archive_path(_log_path())
+        if not archive.exists():
+            return None
+        cutoff = time.time() - retain_days * 86400
+        kept: list[str] = []
+        total = 0
+        with open(archive) as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                total += 1
+                try:
+                    ev = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue  # corrupt line , dropped by omission below
+                if ev.get("ts", 0) >= cutoff:
+                    kept.append(stripped)
+        # Dropped = anything that didn't survive into `kept`, whether it was
+        # past retention OR simply unparseable , both need the rewrite below,
+        # so this can't be tracked only via the retention branch (a corrupt
+        # line that never increments a separate counter would otherwise make
+        # `dropped == 0` skip rewriting a file that still needs the corrupt
+        # line stripped out).
+        dropped = total - len(kept)
+        if dropped == 0:
+            return 0
+        tmp = archive.with_suffix(archive.suffix + ".compact_tmp")
+        with open(tmp, "w") as f:
+            for line in kept:
+                f.write(line + "\n")
+        os.replace(tmp, archive)
+        _READ_EVENTS_MEMO.clear()
+        return dropped
+    except (OSError, ValueError):
+        return None
 
 
 def summarize(events: list[dict]) -> dict:
@@ -483,11 +731,21 @@ def summarize(events: list[dict]) -> dict:
     runs: dict[str, dict] = {}
     tok_s: dict[str, dict] = {}
     stages: dict[str, dict] = {}
+    by_kind: dict[str, dict] = {}
     errors = 0
     total_items = 0
     total_duration = 0.0
 
     for ev in events:
+        # Registry-driven per-kind rollup , covers EVERY kind automatically
+        # (including the 22 that had no dedicated rollup before this
+        # registry existed), not just the two special-cased below.
+        k = ev.get("kind", "?")
+        bk = by_kind.setdefault(k, {"count": 0, "errors": 0, "last_ts": 0.0})
+        bk["count"] += 1
+        if ev.get("status") == "error":
+            bk["errors"] += 1
+        bk["last_ts"] = max(bk["last_ts"], ev.get("ts", 0))
         # P1-D per-node attribution: feeder events key tok_s/stages as
         # "<node>:<model>" / "<node>:<stage>" so host and feeder rates never
         # blend.  Host events ("", "host", None node) keep their unprefixed
@@ -561,6 +819,7 @@ def summarize(events: list[dict]) -> dict:
         "runs": runs,
         "tok_s": tok_s,
         "stages": stages,
+        "by_kind": by_kind,
     }
 
 
@@ -600,9 +859,19 @@ def _bits_below_fp8(bits) -> bool:
 
 
 def _is_incident(ev: dict) -> bool:
+    """status=="error" is always an incident, for any kind. Beyond that, a
+    kind can register additional statuses (e.g. "warn") as incident-worthy
+    via gb_dataflux_kinds.KINDS[kind].incident_when , so a newly registered
+    kind's warn-level events (T3-spill shim_decision, quant_budget_fallback,
+    synapse_stall, bw_undetectable, pcie_degraded, health_transition, ...)
+    are incident-eligible the moment they're registered, with no change
+    needed here. Previously this hardcoded exactly one kind (shim_transition)
+    , every other kind's warn events were invisible to the critic."""
     if ev.get("status") == "error":
         return True
-    return ev.get("kind") == "shim_transition" and ev.get("status") == "warn"
+    import gb_dataflux_kinds
+    spec = gb_dataflux_kinds.KINDS.get(ev.get("kind"))
+    return bool(spec and ev.get("status") in spec.incident_when)
 
 
 def _diagnosis_hints(ev: dict, before: dict | None, after: dict | None,
@@ -700,16 +969,22 @@ def _diagnosis_hints(ev: dict, before: dict | None, after: dict | None,
     return hints
 
 
-def critic_report(days: float = 1.0) -> dict:
+def critic_report(days: float = 1.0, limit: int = 50) -> dict:
     """Snapshot-correlated critic report over the dataflux log.
 
-    For every incident (status=error anywhere; shim_transition warns) in the
+    For every incident (status=error anywhere; plus any kind's registered
+    warn-worthy statuses , see _is_incident/gb_dataflux_kinds.KINDS) in the
     last `days` days, attach the nearest snapshot within ±60s before and
     after (VRAM/util/phase/T2/T3/KV = what was happening at that moment), the
     cluster activity in that window (was the feeder working?), and rule-based
     diagnosis_hints. Ends with merged recommendations (incident hints +
     gb_pilot.advise when importable) toward best cluster inference at ≥fp8
-    quality. Pure stdlib; every section is best-effort."""
+    quality. Pure stdlib; every section is best-effort.
+
+    `limit` caps how many of the most recent incidents are returned (the
+    return dict's `total_incidents`/`truncated` fields make a silent cap
+    visible instead of quietly dropping older ones with no signal , the same
+    class of bug as a proxy returning an empty success on an error)."""
     events = read_events(since_hours=days * 24)
     snaps = [e for e in events if e.get("kind") == "snapshot"]
     snap_ts = [s.get("ts", 0) for s in snaps]   # events are ts-sorted
@@ -775,7 +1050,9 @@ def critic_report(days: float = 1.0) -> dict:
             "diagnosis_hints": _diagnosis_hints(ev, before, after, ctx, window),
         })
 
-    incidents = incidents[-50:]
+    total_incidents = len(incidents)
+    incidents = incidents[-limit:]
+    truncated = total_incidents > len(incidents)
     recommendations: list[str] = []
     seen: set[str] = set()
     for inc in incidents:
@@ -809,6 +1086,8 @@ def critic_report(days: float = 1.0) -> dict:
         "events_scanned": len(events),
         "snapshots": len(snaps),
         "incident_count": len(incidents),
+        "total_incidents": total_incidents,
+        "truncated": truncated,
         "incidents": incidents,
         "recommendations": recommendations,
     }

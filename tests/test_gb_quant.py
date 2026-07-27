@@ -43,6 +43,69 @@ def test_gpu_profile_cached():
     assert p1 is p2
 
 
+# ── nvfp4 crash-gate (P0) ─────────────────────────────────────────────────
+# Blackwell's nvfp4 precision routes into a documented Triton sm_120 compiler
+# crash (workflow/known-issues.md). gpu_profile()'s own quality_default/
+# tiered-mode floor steered straight into it by default before this gate
+# existed — must be filtered in the planner, not left as a CLI-only opt-out.
+
+def test_gate_nvfp4_drops_it_from_precisions_by_default(monkeypatch):
+    import gb_quant
+    monkeypatch.delenv("GB_ALLOW_NVFP4", raising=False)
+    blackwell = gb_quant.GpuProfile(
+        family="blackwell", cc=(12, 0),
+        precisions=(16, "fp8", "nvfp4", 8, 4, "tq3", "tq2"),
+        floor_default="nvfp4", quality_default="nvfp4", t2_tolerance_gb=1.0,
+    )
+    gated = gb_quant._gate_nvfp4(blackwell)
+    assert "nvfp4" not in gated.precisions
+    assert gated.precisions == (16, "fp8", 8, 4, "tq3", "tq2")
+    assert gated.quality_default == "fp8"
+    assert gated.floor_default == 4
+    # Everything else (cc, t2_tolerance_gb) passes through unchanged.
+    assert gated.cc == (12, 0)
+    assert gated.t2_tolerance_gb == 1.0
+
+
+def test_gate_nvfp4_opt_out_env_var_keeps_it(monkeypatch):
+    import gb_quant
+    monkeypatch.setenv("GB_ALLOW_NVFP4", "1")
+    blackwell = gb_quant.GpuProfile(
+        family="blackwell", cc=(12, 0),
+        precisions=(16, "fp8", "nvfp4", 8, 4, "tq3", "tq2"),
+        floor_default="nvfp4", quality_default="nvfp4", t2_tolerance_gb=1.0,
+    )
+    gated = gb_quant._gate_nvfp4(blackwell)
+    assert gated is blackwell  # untouched, same object
+
+
+def test_gate_nvfp4_is_a_noop_for_non_blackwell_profiles(monkeypatch):
+    import gb_quant
+    monkeypatch.delenv("GB_ALLOW_NVFP4", raising=False)
+    hopper = gb_quant.GpuProfile(
+        family="hopper", cc=(9, 0), precisions=(16, "fp8", 8, 4, "tq3", "tq2"),
+        floor_default=4, quality_default="fp8", t2_tolerance_gb=1.0,
+    )
+    assert gb_quant._gate_nvfp4(hopper) is hopper
+
+
+def test_gpu_profile_end_to_end_never_returns_nvfp4_on_blackwell(monkeypatch):
+    """Full gpu_profile() path, not just the gate helper in isolation —
+    confirms the gate is actually wired into the family-match branch."""
+    import gb_quant
+    monkeypatch.delenv("GB_ALLOW_NVFP4", raising=False)
+    gb_quant._GPU_PROFILE_CACHE = None
+    with patch("torch.cuda.is_available", return_value=True), \
+         patch("torch.cuda.get_device_capability", return_value=(12, 0)), \
+         patch.object(gb_quant, "_t2_pool_total_gb", return_value=100.0):
+        p = gb_quant.gpu_profile()
+    gb_quant._GPU_PROFILE_CACHE = None
+    assert p.family == "blackwell"
+    assert "nvfp4" not in p.precisions
+    assert p.quality_default == "fp8"
+    assert p.floor_default == 4
+
+
 # ── _bits_tag() ──────────────────────────────────────────────────────────────
 
 def test_bits_tag_16():
@@ -483,3 +546,61 @@ def test_plan_fit_default_unchanged_allows_bf16(monkeypatch):
     with c1, c2:
         rep = gb_quant.plan_fit(object(), budget_gb=1.0)   # roomy → bf16
     assert rep.components[0].bits == 16
+
+
+# ── is_prequantized_linear() — the crash-risk guard ──────────────────────────
+# Real incident (2026-07-26): LongLive's FourOverSixLinear subclasses
+# nn.Linear and registers quantized_weight_values/_scale_factors buffers with
+# `weight` nulled. _delegate_patch's isinstance(l, nn.Linear) scan matched it
+# with no guard, reading layer.weight.dtype unconditionally.
+
+def test_is_prequantized_linear_detects_nulled_weight():
+    """A Linear whose weight Parameter was deleted (common post-quantization
+    pattern) is flagged prequantized."""
+    import gb_quant
+    lin = nn.Linear(64, 64)
+    lin._parameters["weight"] = None
+    assert gb_quant.is_prequantized_linear(lin) is True
+
+
+def test_is_prequantized_linear_detects_named_quant_buffer():
+    """A Linear subclass carrying a telltale quantization buffer (mimicking
+    LongLive's FourOverSixLinear) is flagged prequantized even though its
+    `weight` Parameter object still exists on the class."""
+    import gb_quant
+
+    class _FakeQuantLinear(nn.Linear):
+        def __init__(self, i, o):
+            super().__init__(i, o)
+            self.register_buffer("quantized_weight_values",
+                                 torch.zeros(o, i // 2, dtype=torch.uint8))
+
+    lin = _FakeQuantLinear(64, 64)
+    assert gb_quant.is_prequantized_linear(lin) is True
+
+
+def test_is_prequantized_linear_detects_nonfloat_weight_dtype():
+    """A plain nn.Linear whose weight storage is already int8/fp8 (no
+    distinguishing subclass) is still flagged prequantized via dtype."""
+    import gb_quant
+    lin = nn.Linear(64, 64)
+    with torch.no_grad():
+        lin.weight = nn.Parameter(lin.weight.to(torch.int8), requires_grad=False)
+    assert gb_quant.is_prequantized_linear(lin) is True
+
+
+def test_is_prequantized_linear_false_positive_guard_multihead_attention():
+    """nn.MultiheadAttention.out_proj is an nn.Linear SUBCLASS
+    (NonDynamicallyQuantizableLinear) with a genuine live float weight and
+    MUST still be treated as quantizable — the guard must not reject it just
+    for not being exactly `type(x) is nn.Linear`."""
+    import gb_quant
+    mha = nn.MultiheadAttention(embed_dim=64, num_heads=4)
+    assert gb_quant.is_prequantized_linear(mha.out_proj) is False
+
+
+def test_is_prequantized_linear_false_positive_guard_plain_linear():
+    """An ordinary, never-quantized nn.Linear is never flagged."""
+    import gb_quant
+    lin = nn.Linear(64, 64)
+    assert gb_quant.is_prequantized_linear(lin) is False

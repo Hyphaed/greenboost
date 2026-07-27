@@ -7,9 +7,10 @@ gb_synapse_backends.py — engine backend abstraction for gb-synapse.
 gb_synapse.py owns model sourcing (pull/manifest), GGUF metadata, and the
 shared serve-tail (proxy launch, run-state, dataflux `synapse_serve` events).
 This module owns HOW each engine actually gets launched: llama.cpp (the
-default, cluster --rpc split), vLLM (gb-quant safetensors, single-node
-fp8-floor), transformers (vLLM's fallback when the venv isn't installed), and
-diffusers (HF image-gen pipelines).
+default, cluster --rpc split), the synapse torch engine (gb-quant
+safetensors, cluster PP split — see SynapseTorchBackend), transformers (its
+fallback when the torch venv isn't installed), and diffusers (HF image-gen
+pipelines).
 
 `gb_synapse.serve()` calls `select_backend(entry).serve(...)` — one call
 site, format/engine detection decides which backend runs. Every backend
@@ -89,27 +90,6 @@ def detect_format(path_or_repo: str) -> str:
     return "unknown"
 
 
-# ---------------------------------------------------------------------------
-# vLLM discovery + gb-quant arg mapping (moved from gb_synapse.py)
-# ---------------------------------------------------------------------------
-
-# vLLM CLI args per gb-quant token, using vLLM's OWN native quantization
-# (not the third-party gemlite/hqq vLLM plugins — live-tested against vLLM
-# 0.24.0 and both are broken: gemlite's backend.py and hqq's vllm.py both
-# subclass/import internal quantization classes — AWQConfig, AWQMarlinConfig,
-# HQQMarlinConfig — that vLLM has since renamed/removed. Both plugins also
-# load eagerly on ANY `vllm` invocation regardless of --quantization, so
-# merely having one installed breaks vLLM's own --version). fp8 and the
-# bitsandbytes default (4-bit) are confirmed working end-to-end; true 8-bit
-# needs a config-injection mechanism this session didn't nail down in vLLM
-# 0.24.0, so INT8 currently gets the same (4-bit) args as INT4 rather than
-# silently mislabeling it — see workflow/gb-synapse.md.
-_GBQUANT_VLLM_ARGS = {
-    "FP8": ["--quantization", "fp8"],
-    "INT8": ["--quantization", "bitsandbytes", "--load-format", "bitsandbytes"],
-    "INT4": ["--quantization", "bitsandbytes", "--load-format", "bitsandbytes"],
-}
-
 # Below the fp8 quality floor — served, but flagged in serve_facts so the
 # fp8-floor policy (gb_mcp.py quant_advisor, gb_actuation.set_quant_policy)
 # has a truthful signal for THIS backend too, not just gb_quant's own budget
@@ -141,70 +121,18 @@ def _quant_below_fp8_floor(entry) -> bool:
     return entry.quant.upper() in _BELOW_FP8_QUANTS
 
 
-def _vllm_venv_dir() -> "Path | None":
-    """The managed vLLM venv directory, if the `vllm` binary resolved to one
-    (site-packages sits alongside bin/vllm; a system-PATH vllm has no such
-    venv to search)."""
-    vllm_bin = _find_vllm_bin()
-    if not vllm_bin:
-        return None
-    venv = Path(vllm_bin).resolve().parent.parent
-    return venv if (venv / "lib").is_dir() else None
-
-
-def _find_vllm_venv_lib(rel_glob: str) -> "Path | None":
-    """A library bundled inside the vLLM venv's site-packages (e.g. torch's
-    own pinned nvidia-cuXX wheel's libcudart), for shim_env's cudart_path —
-    the shim needs a cudart new enough for whatever torch build vLLM pulled
-    in, not necessarily the system one."""
-    venv = _vllm_venv_dir()
-    if not venv:
-        return None
-    matches = list(venv.glob(f"lib/python*/site-packages/{rel_glob}"))
-    return matches[0] if matches else None
-
-
-def _find_vllm_bin() -> "str | None":
-    """vLLM search order: explicit override, gb-synapse-managed USER venv
-    (a dev/manual `pip install vllm` under the user's home), the root-owned
-    Full-Install venv ($GB_PY_DEST/vllm-env — see cmd_install_vllm in
-    greenboost_setup.sh, default-on since 2026-07-16), then system PATH.
-    vLLM lives in its own venv (its own docs: `pip install -e
-    ~/Dev/turboquantsolutions/gemlite` "in the vLLM venv") — it's never
-    assumed to share gb_synapse.py's own interpreter."""
-    override = os.environ.get("GB_SYNAPSE_VLLM_BIN")
-    if override and Path(override).exists():
-        return override
-    managed = Path.home() / ".local/share/greenboost/synapse/vllm-env/bin/vllm"
-    if managed.exists():
-        return str(managed)
-    system = Path("/usr/local/lib/greenboost/vllm-env/bin/vllm")
-    if system.exists():
-        return str(system)
-    return shutil.which("vllm")
-
-
 def _cuda_home_for_torch() -> "str | None":
-    """FlashInfer (used by both vLLM and the synapse torch engine) JIT-
-    compiles Blackwell (SM 12.x) kernels and requires CUDA >= 12.9 to do
-    it — it finds nvcc via CUDA_HOME, which defaults to /usr (a stale
-    distro-packaged nvcc, often < 12.9) when unset. Same root cause as
-    gb_synapse._find_nvcc(): the distro package and /usr/local/cuda's
-    update-alternatives-managed install can diverge. FlashInfer swallows
-    the resulting version-check exception internally and misreports "GPU
-    too old" instead of "CUDA too old" — confirmed live on an RTX 5070
-    (cc 12.0) with CUDA 13.3 at /usr/local/cuda but 12.4 at /usr/bin/nvcc.
-
-    Generic (no vLLM- or torch-engine-specific logic) — genuinely shared
-    by both backends, unlike the venv-lib lookups below, which do differ
-    per backend."""
+    """FlashInfer (used by the synapse torch engine) JIT-compiles Blackwell
+    (SM 12.x) kernels and requires CUDA >= 12.9 to do it — it finds nvcc via
+    CUDA_HOME, which defaults to /usr (a stale distro-packaged nvcc, often
+    < 12.9) when unset. Same root cause as gb_synapse._find_nvcc(): the
+    distro package and /usr/local/cuda's update-alternatives-managed install
+    can diverge. FlashInfer swallows the resulting version-check exception
+    internally and misreports "GPU too old" instead of "CUDA too old" —
+    confirmed live on an RTX 5070 (cc 12.0) with CUDA 13.3 at
+    /usr/local/cuda but 12.4 at /usr/bin/nvcc."""
     alt = Path("/usr/local/cuda")
     return str(alt) if alt.exists() else None
-
-
-# Kept for the still-live VllmBackend call site (renamed to the generic name
-# above since the logic was never actually vLLM-specific).
-_cuda_home_for_vllm = _cuda_home_for_torch
 
 
 def _torch_env_dir() -> "Path | None":
@@ -229,8 +157,7 @@ def _torch_env_dir() -> "Path | None":
 def _find_torch_venv_lib(rel_glob: str) -> "Path | None":
     """A library bundled inside the synapse torch engine's venv
     site-packages (e.g. torch's own pinned nvidia-cuXX wheel's libcudart),
-    for shim_env's cudart_path — same need as _find_vllm_venv_lib, against
-    the torch venv instead of the vLLM one."""
+    for shim_env's cudart_path."""
     venv = _torch_env_dir()
     if not venv:
         return None
@@ -304,10 +231,10 @@ def _torch_serve_mode(entry) -> "tuple[str, str]":
 
 def _gbquant_model_source(entry) -> str:
     """Local snapshot dir if `_pull_gbquant()`/`_pull_diffusers()` already
-    downloaded one (avoids vLLM/transformers/diffusers redundantly
-    re-fetching the same repo into their own default HF cache instead of
-    reusing gb-synapse's own MODEL_STORE_DIR/_hf_cache copy), else the bare
-    repo id so the runtime can fetch it itself."""
+    downloaded one (avoids the torch engine/transformers/diffusers
+    redundantly re-fetching the same repo into their own default HF cache
+    instead of reusing gb-synapse's own MODEL_STORE_DIR/_hf_cache copy), else
+    the bare repo id so the runtime can fetch it itself."""
     return entry.path if entry.path and os.path.isdir(entry.path) else entry.repo
 
 
@@ -321,8 +248,8 @@ def effective_vram_budget_mb() -> "tuple[float, float, dict]":
 
     effective_free_mb = host_free_mb + t2_free_mb * GB_SYNAPSE_T2_FRACTION
     (default 0.5, env-overridable) — T2 genuinely extends usable capacity
-    when the shim is active (see VllmBackend.serve()'s T2-headroom comment),
-    so sizing against physical VRAM alone under-fills T1. Setting
+    when the shim is active, so sizing against physical VRAM alone
+    under-fills T1. Setting
     GB_SYNAPSE_T2_FRACTION=0 reproduces pre-shim (shimless) sizing exactly —
     used as the negative control in the T2 validation matrix.
 
@@ -350,8 +277,9 @@ def effective_vram_budget_mb() -> "tuple[float, float, dict]":
         pass
     if host_total_mb <= 0:
         # pynvml not installed — gb_nvml returns all zeros by design in that
-        # case. torch is already a hard requirement of vLLM/transformers, so
-        # this import is free on any path that reaches this function.
+        # case. torch is already a hard requirement of the torch engine/
+        # transformers, so this import is free on any path that reaches
+        # this function.
         try:
             import torch
             free_b, total_b = torch.cuda.mem_get_info()
@@ -385,9 +313,9 @@ def _read_shim_stats() -> dict:
 
 
 def _validate_placement(entry, util: float, budget_facts: dict, engine: str) -> None:
-    """After a vLLM or synapse-torch-engine serve, confirm the weights
-    genuinely landed partly in T2 rather than the whole overflow silently
-    sitting in T2 while T1 stayed under-filled (Rule #1). Reads
+    """After a synapse-torch-engine serve, confirm the weights genuinely
+    landed partly in T2 rather than the whole overflow silently sitting in
+    T2 while T1 stayed under-filled (Rule #1). Reads
     /run/greenboost/shim_stats (t2 bytes, defer_init) + live NVML
     fb_used_pct; emits a `synapse_engine_placement` dataflux event with
     `rule1_warning=true` when t2_bytes>0 while vram_used_pct is below
@@ -395,8 +323,9 @@ def _validate_placement(entry, util: float, budget_facts: dict, engine: str) -> 
 
     Renamed from `_validate_genuine_t2` / event kind renamed from
     `synapse_vllm_placement` (2026-07-16, Phase 4 backend wiring) — this
-    validation is engine-agnostic and now covers SynapseTorchBackend too,
-    not just VllmBackend; `engine` says which one actually served."""
+    validation is engine-agnostic; `engine` says which backend actually
+    served (the vLLM backend this originally validated was retired in
+    Phase 6)."""
     try:
         stats = _read_shim_stats()
         t2_bytes = (int(stats.get("tier_t2_local_cur_mb", "0") or 0)
@@ -443,7 +372,17 @@ class EngineBackend:
     def can_serve(self, entry) -> bool:
         raise NotImplementedError
 
-    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=1, extra_args=""):
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args=""):
+        """n_slots=-1 (default) means "let the engine decide" — for
+        LlamaCppBackend this passes straight through to llama.cpp's own
+        `-np -1` auto mode (n_parallel=4, kv_unified=true, a single shared
+        KV pool split across slots, not 4x the memory), rather than
+        GreenBoost overriding it with a hardcoded 1 and silently disabling
+        upstream's own continuous-batching default (Speed Program audit
+        Finding 10, 2026-07-26: n_slots defaulted to 1 everywhere, disabling
+        batching entirely with no one ever passing a real value). Backends
+        that don't support concurrent slots (Transformers/Diffusers) ignore
+        this parameter regardless of its value."""
         raise NotImplementedError
 
     def serve_facts(self, entry) -> dict:
@@ -465,7 +404,7 @@ class LlamaCppBackend(EngineBackend):
     def can_serve(self, entry) -> bool:
         return entry.engine == "llama.cpp"
 
-    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=1, extra_args=""):
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args=""):
         import gb_synapse as gs
         import gb_cluster
         from gb_nvml import get_nvml
@@ -583,6 +522,10 @@ class LlamaCppBackend(EngineBackend):
                "--flash-attn", "auto",
                "--cache-reuse", "256",
                "--no-mmap",  # DMA-BUF pinning (Path A) is incompatible with mmap-backed pages
+               # n_slots defaults to -1 (EngineBackend.serve's docstring):
+               # passed straight through, llama.cpp's own arg parser treats
+               # -1 as "auto" (n_parallel=4, kv_unified=true) — no GreenBoost
+               # override needed here.
                "-np", str(n_slots), "--threads", str(gs._pcore_threads()),
                "--cache-type-k", kv_type, "--cache-type-v", kv_type,
                "--jinja"]
@@ -700,121 +643,87 @@ class LlamaCppBackend(EngineBackend):
                     mtp=bool(gs._has_mtp(entry)), vision=bool(mmproj))
             raise
 
+    def serve_embedding(self, entry, primary_port: int) -> "tuple[subprocess.Popen, int]":
+        """Launch a SECOND, minimal llama-server in --embeddings mode for
+        `entry`, on an internal port distinct from the primary engine's own
+        (primary uses `port + 1000`; this uses `port + 2000`). Host-only,
+        deliberately simpler than serve() above: an embedding model is
+        typically small, and a RAG client's latency budget doesn't benefit
+        from a cluster RPC split the way a large generation model does, so
+        this skips the feeder/tensor-split/MTP/vision logic entirely.
 
-class VllmBackend(EngineBackend):
-    """vLLM's own OpenAI server speaks /v1/chat/completions + /v1/completions
-    natively (streaming included), so gb_synapse_api.py's existing passthrough
-    needs no changes. gb-quant applies via vLLM's own native quantization
-    flags (_GBQUANT_VLLM_ARGS), quantizing on the fly at load time.
-
-    Single-node only for now: vLLM's own cluster mechanism (Ray tensor/pipeline
-    parallel) is a different distribution model than llama.cpp's --rpc split
-    and isn't wired to GreenBoost's feeder fabric here."""
-    name = "vllm"
-
-    def available(self) -> bool:
-        return _find_vllm_bin() is not None
-
-    def can_serve(self, entry) -> bool:
-        return entry.engine in ("vllm", "gbquant")
-
-    def serve_facts(self, entry) -> dict:
-        _, _, facts = effective_vram_budget_mb()
-        facts["quant_below_floor"] = _quant_below_fp8_floor(entry)
-        return facts
-
-    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=1, extra_args=""):
+        No VRAM-budget check against the primary model here — Rule #1 says
+        VRAM belongs to the primary model until proven otherwise, but
+        enforcing that split precisely needs the primary's own live
+        footprint, which serve()'s caller has already computed and this
+        method doesn't receive. Left as -ngl 999 (fits the common case: a
+        small embedding model website alongside a quantized generation
+        model); GB_SYNAPSE_EMBED_NGL overrides for a tighter box.
+        """
         import gb_synapse as gs
         import gb_cluster
 
-        vllm_bin = _find_vllm_bin()
-        if not vllm_bin:
-            raise RuntimeError(
-                f"'{entry.name}' needs vLLM (gb-quant {entry.quant} quantization) but no vllm "
-                f"binary was found — install it (Full Install default-on, or: sudo "
-                f"greenboost install-vllm) and either put it on PATH or set "
-                f"GB_SYNAPSE_VLLM_BIN."
-            )
-        internal_port = port + 1000
+        if not gs.engine_installed():
+            raise RuntimeError("engine not built — run: greenboost synapse build-engine")
 
-        # vLLM is a PyTorch workload — the same "torch" shim profile already
-        # validated for FLUX/Klein diffusion (ai-forge CLAUDE.md RULE #1) gives
-        # real T2 (DDR) VRAM extension WITHOUT CPU compute participation.
-        # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False, GREENBOOST_CLUSTER=0,
-        # and GREENBOOST_KV_RESERVE_MB=0 (vLLM pre-allocates its own KV inside
-        # --gpu-memory-utilization; the shim's adaptive KV reserve would double-
-        # reserve and under-fill T1) all come from that "torch" profile already
-        # (gb_cluster.py _WORKLOAD_PROFILES) — don't re-set them here.
-        vllm_cudart = str(_find_vllm_venv_lib("nvidia/cu13/lib/libcudart.so.13")
-                          or _find_vllm_venv_lib("nvidia/cu12/lib/libcudart.so.12") or "")
-        shim_on = os.environ.get("GB_SYNAPSE_VLLM_SHIM", "1") != "0"
-        env = gb_cluster.shim_env(workload="torch", enabled=shim_on,
-                                  cudart_path=vllm_cudart or None)
-        if shim_on:
-            # VCM-01/02 (greenboost_cuda_shim.c): defers shim init until after
-            # vLLM's own EngineCore subprocess has set up its CUDA context,
-            # instead of racing it. Never set by the launcher before this.
-            env.setdefault("GREENBOOST_VLLM_COMPAT", "1")
-        if gs.hf_token():
-            env["HF_TOKEN"] = gs.hf_token()
-        cuda_home = _cuda_home_for_vllm()
-        if cuda_home:
-            env["CUDA_HOME"] = cuda_home
+        internal_port = primary_port + 2000
+        env = gb_cluster.shim_env(workload="llm", enabled=True)
+        env["GREENBOOST_CLUSTER"] = "0"
+        env["LD_LIBRARY_PATH"] = str(gs.ENGINE_DIR) + (
+            ":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+        if os.environ.get("GB_SYNAPSE_SHIM", "0") != "1":
+            for k in ("LD_PRELOAD", "GREENBOOST_ACTIVE"):
+                env.pop(k, None)
 
-        # gpu_memory_utilization MUST be sized against REAL physical free VRAM
-        # (host_free_mb), never the T2-DDR-inclusive effective_free_mb. Real
-        # bug, found live 2026-07-16: vLLM's own worker_base.init_device() ->
-        # request_memory() hard-rejects at startup ("Free memory on device
-        # cuda:0 (9.93/11.48 GiB) is less than desired GPU memory utilization
-        # (0.95, 10.9 GiB)") the moment util*total exceeds what
-        # torch.cuda.mem_get_info() reports RIGHT THEN — and at that exact
-        # moment the shim has NOT engaged yet: GREENBOOST_VLLM_COMPAT=1 (set
-        # a few lines up whenever shim_on) deliberately DEFERS shim init
-        # until after EngineCore's own CUDA context is up, specifically to
-        # avoid racing vLLM's context setup. So this one gate always sees
-        # real, uninflated free memory regardless of shim_on — sizing util
-        # from the T2-inclusive figure passed a value the gate could never
-        # satisfy, on every T2-dependent (i.e. VRAM-short) serve, which is
-        # exactly the case this sizing exists for. The T2 credit still has
-        # real value for capacity PLANNING (synapse_recommend's fit reports,
-        # "does this model belong on this box at all") — just not for the
-        # literal --gpu-memory-utilization value vLLM's pre-shim gate checks
-        # against real hardware.
-        host_free_mb, effective_free_mb, budget_facts = effective_vram_budget_mb()
-        try:
-            safety_pct = float(os.environ.get("GB_SYNAPSE_VRAM_SAFETY_PCT", "0.85"))
-        except ValueError:
-            safety_pct = 0.85
-        host_total_mb = budget_facts["host_total_mb"]
-        util = (max(0.3, min(0.95, (host_free_mb * safety_pct) / host_total_mb))
-                if host_total_mb > 0 else 0.85)
-
-        quant_args = _GBQUANT_VLLM_ARGS.get(entry.quant.upper(), ["--quantization", "fp8"])
-        cmd = [vllm_bin, "serve", _gbquant_model_source(entry),
-               *quant_args, "--served-model-name", entry.name,
+        ctx = min(entry.ctx_length or 8192, 8192)  # embeddings never need a huge window
+        ngl = os.environ.get("GB_SYNAPSE_EMBED_NGL", "999")
+        gs.SLOT_DIR.mkdir(parents=True, exist_ok=True)
+        cmd = [str(gs.ENGINE_DIR / "llama-server"), "-m", entry.path,
                "--host", "127.0.0.1", "--port", str(internal_port),
-               "--gpu-memory-utilization", f"{util:.2f}"]
-        log = open(gs._run_log_path(entry.name), "ab")
-        proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT,
-                                 start_new_session=True)
-        state = gs._launch_proxy_and_record(entry, proc, port, internal_port,
-                                            engine=self.name, **self.serve_facts(entry))
-        _validate_placement(entry, util, budget_facts, self.name)
-        return state
+               "--ctx-size", str(ctx), "--embeddings", "--pooling", "mean",
+               "-np", "1", "--threads", str(gs._pcore_threads()),
+               "-ngl", ngl, "--no-webui", "--no-mmap"]
+
+        log = open(gs._run_log_path(entry.name + "_embed"), "ab")
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env,
+                                start_new_session=True)
+        try:
+            gs._wait_upstream_ready(entry, proc, internal_port, grace_s=60.0)
+        except RuntimeError as e:
+            raise RuntimeError(f"embeddings engine for '{entry.name}' failed to start: {e}") from e
+        return proc, internal_port
 
 
 class SynapseTorchBackend(EngineBackend):
     """GreenBoost's own torch-core inference engine (vendored gLLM, see
     synapse_engine/NOTICE) — the safetensors-checkpoint backend the
-    gb-synapse unification is converging on. Currently routes every
-    checkpoint through gLLM's own `api_server` (OpenAI-compatible,
-    streaming included, same passthrough gb_synapse_api.py already uses
-    for llama.cpp/vLLM); a fallback single-request server for models the
-    engine can't yet load is added in a later phase.
+    gb-synapse unification is converging on. Routes every checkpoint gLLM
+    can load through its own `api_server` (OpenAI-compatible, streaming
+    included, same passthrough gb_synapse_api.py already uses for
+    llama.cpp); `_torch_serve_mode()` decides per-checkpoint whether that's
+    possible, and `serve()` falls back to `gb_synapse_fallback.py` (the
+    same single-request server `TransformersBackend` uses when there's no
+    torch venv at all) under this venv's own python when it isn't.
 
-    Single-node only for now, same as vLLM: gLLM's own `--pp`/`--tp` are a
-    different parallelism model than llama.cpp's --rpc cluster split, not
-    wired to GreenBoost's feeder fabric here."""
+    Cluster PP (2026-07-24): unlike llama.cpp's --rpc (a from-scratch
+    protocol GreenBoost wired itself), gLLM already ships its own
+    multi-host launch mode (`--launch-mode master|slave` + `--ranks`) and
+    real TCP rendezvous (`dist.init_process_group` with a routable
+    --master-addr) — this backend just orchestrates it, the same shape
+    ensure_feeder_rpc() already established for llama.cpp: SSH-launch the
+    remote side, degrade to host-only on any failure.
+
+    Deliberately PP-only, TP fixed at 1 — two reasons, both from reading
+    the vendored source, not assumption: gLLM's frontend↔rank-0 scheduling
+    sockets are hardcoded `ipc://` (Unix domain, can't cross machines) so
+    rank 0 + the HTTP server must stay on the host regardless; and gLLM's
+    TP fast-path all-reduce (CustomAllreduce) uses same-host-only CUDA IPC
+    handles, unconditionally attempted whenever tp_size>1 — never
+    constructed when tp_size==1, so this sidesteps it entirely rather than
+    working around it. PP also just suits the hardware better: the feeder
+    link is 1GbE (~0.11-0.12 GB/s, measured separately) and PP only
+    exchanges activations at pipeline-stage boundaries, where TP would need
+    a full all-reduce every layer."""
     name = "torch"
 
     def available(self) -> bool:
@@ -829,7 +738,7 @@ class SynapseTorchBackend(EngineBackend):
         facts["quant_below_floor"] = _quant_below_fp8_floor(entry)
         return facts
 
-    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=1, extra_args=""):
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args=""):
         import gb_synapse as gs
         import gb_cluster
 
@@ -843,19 +752,19 @@ class SynapseTorchBackend(EngineBackend):
         venv_py = str(venv / "bin" / "python")
         internal_port = port + 1000
 
-        # Same "torch" shim profile already validated for VllmBackend/FLUX
-        # (ai-forge CLAUDE.md RULE #1): real T2 (DDR) VRAM extension without
-        # CPU compute participation.
+        # Same "torch" shim profile already validated for FLUX (ai-forge
+        # CLAUDE.md RULE #1): real T2 (DDR) VRAM extension without CPU
+        # compute participation.
         torch_cudart = str(_find_torch_venv_lib("nvidia/cu13/lib/libcudart.so.13")
                            or _find_torch_venv_lib("nvidia/cu12/lib/libcudart.so.12") or "")
         shim_on = os.environ.get("GB_SYNAPSE_TORCH_SHIM", "1") != "0"
         env = gb_cluster.shim_env(workload="torch", enabled=shim_on,
                                   cudart_path=torch_cudart or None)
         if shim_on:
-            # Deferred-shim-init env var (greenboost_cuda_shim.c) — new
-            # canonical name for the mechanism VllmBackend calls
-            # GREENBOOST_VLLM_COMPAT; the shim accepts either (see the C
-            # shim's env check).
+            # Deferred-shim-init env var (greenboost_cuda_shim.c) — the
+            # canonical name for the mechanism the retired VllmBackend set
+            # as GREENBOOST_VLLM_COMPAT; the shim still accepts either name
+            # (see the C shim's env check).
             env.setdefault("GREENBOOST_DEFER_INIT", "1")
         if gs.hf_token():
             env["HF_TOKEN"] = gs.hf_token()
@@ -865,16 +774,32 @@ class SynapseTorchBackend(EngineBackend):
 
         facts = self.serve_facts(entry)
         mode, reason = _torch_serve_mode(entry)
+        # Queryable via dataflux (dataflux_events kind=synapse_serve), not
+        # just stdout — "why did this land on the fallback instead of the
+        # real engine" was previously only answerable by reading the print()
+        # below or grepping the log file directly.
+        facts["torch_serve_mode"] = mode
+        facts["torch_serve_reason"] = reason
 
         if mode == "fallback":
             print(f"  [gb-synapse] {entry.name}: using the single-request fallback "
                  f"server instead of the synapse torch engine — {reason}.", flush=True)
-            cmd = [venv_py, str(_REPO_DIR / "gb_synapse_fallback.py"),
+            # gb_synapse_fallback.py needs torch/aiohttp/transformers, which
+            # _torch_serve_mode()'s "fallback" reasons don't call into
+            # question (its only import probe is `import gllm, sgl_kernel` —
+            # see _torch_engine_importable — so a venv that fails THAT can
+            # still have a perfectly good torch/transformers install). Prefer
+            # this venv's own python for that reason; only fall back to
+            # sys.executable in the genuinely broken case where venv_py
+            # itself isn't even a real executable (corrupted/partial venv).
+            fallback_py = venv_py if Path(venv_py).is_file() else sys.executable
+            cmd = [fallback_py, str(_REPO_DIR / "gb_synapse_fallback.py"),
                    "--model", _gbquant_model_source(entry),
                    "--served-model-name", entry.name,
                    "--quant", entry.quant or "fp8",
                    "--host", "127.0.0.1", "--port", str(internal_port)]
             facts["degraded"] = "fallback-single-request"
+            online_feeders = []
         else:
             try:
                 util = float(os.environ.get("GB_SYNAPSE_TORCH_KV_UTIL", "0.90"))
@@ -882,12 +807,32 @@ class SynapseTorchBackend(EngineBackend):
                 util = 0.90
             util = max(0.3, min(0.95, util))
 
+            model_path = _gbquant_model_source(entry)
             cmd = [venv_py, "-m", "gllm.entrypoints.api_server",
-                   "--model-path", _gbquant_model_source(entry),
+                   "--model-path", model_path,
                    "--host", "127.0.0.1", "--port", str(internal_port),
                    "--gpu-memory-util", f"{util:.2f}"]
             if ctx and ctx > 0:
                 cmd += ["--model-max-length", str(ctx)]
+
+            # gLLM's own --maxp (max prefill tokens per batch, used to size
+            # profile_run()'s dummy warmup sequence) defaults to 8192
+            # regardless of --model-max-length/the checkpoint's real
+            # max_position_embeddings — confirmed live, 2026-07-26:
+            # TheBloke/TinyLlama-1.1B-Chat-v1.0-AWQ (max_position_embeddings
+            # =2048) crashed profile_run() with "size of tensor a (2048)
+            # must match tensor b (8192)" before ever reaching a forward
+            # pass, on every quant method (reproduces identically for bf16/
+            # GPTQ/AWQ — the crash is in generic input-buffer sizing, not
+            # anything quant-specific). Clamp --maxp to whatever's actually
+            # known to be smaller than gLLM's default: the requested ctx, or
+            # failing that the checkpoint's own ctx_length from its
+            # config.json (safetensors_summary/gguf_summary already parse
+            # this). Leave gLLM's default alone for large-context models —
+            # this only ever shrinks the dummy prefill, never grows it.
+            effective_max_len = ctx if (ctx and ctx > 0) else entry.ctx_length
+            if effective_max_len and effective_max_len < 8192:
+                cmd += ["--maxp", str(effective_max_len)]
 
             # CUDA graph capture reserves its own warmup buffers on top of
             # the KV cache — confirmed live 2026-07-16 (P3.9 bring-up) to
@@ -898,13 +843,83 @@ class SynapseTorchBackend(EngineBackend):
             if os.environ.get("GB_SYNAPSE_TORCH_CUDA_GRAPH", "0") != "1":
                 cmd += ["--disable-cuda-graph"]
 
+            # Cluster PP — see class docstring for why PP-only/TP=1. Host is
+            # always pp_rank 0 (gLLM's frontend↔rank-0 sockets are
+            # hardcoded ipc://, can't move); each online feeder becomes the
+            # next PP stage, same enumeration pattern as LlamaCppBackend's
+            # RPC_PORT_BASE + i.
+            #
+            # All-or-nothing launch, deliberately: every rank's --pp commits
+            # it to a specific world_size before dist.init_process_group()
+            # runs, so a world_size that shrinks mid-launch (because feeder
+            # 2 of 3 failed to start) would leave the survivors waiting for
+            # a peer that's never coming — there's no such thing as a
+            # partial rendezvous to fall back to. If any candidate fails,
+            # kill whichever slaves already launched and drop to host-only
+            # entirely rather than serve with a wrong world_size.
+            online_feeders = []
+            if use_cluster:
+                candidates = [f for f in gb_cluster.feeders(probe=True) if f.online]
+                if candidates:
+                    master_ip = gb_cluster._local_ip_toward(candidates[0].ip)
+                    master_port = gs.GLLM_MASTER_PORT_BASE
+                    pp_size = 1 + len(candidates)
+                    if not master_ip:
+                        print(f"  [gb-synapse] couldn't resolve this host's own routable "
+                              f"IP toward {candidates[0].ip} — skipping cluster PP", flush=True)
+                    else:
+                        launched = []
+                        all_ok = True
+                        for i, f in enumerate(candidates):
+                            if gs.ensure_feeder_gllm_slave(f, master_ip, master_port,
+                                                            pp_rank=i + 1, pp_size=pp_size,
+                                                            model_path=model_path):
+                                launched.append(f)
+                            else:
+                                all_ok = False
+                                break
+                        if all_ok:
+                            online_feeders = launched
+                            cmd += ["--launch-mode", "master",
+                                    "--ranks", "0", "--pp", str(pp_size), "--tp", "1",
+                                    "--master-addr", master_ip, "--master-port", str(master_port)]
+                        else:
+                            for f in launched:
+                                gs.kill_feeder_gllm_slave(f)
+
         if extra_args:
             cmd += shlex.split(extra_args)
 
         log = open(gs._run_log_path(entry.name), "ab")
         proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT,
                                  start_new_session=True)
+
+        if online_feeders:
+            # Cluster rendezvous needs a much larger readiness budget than a
+            # single-node load (cold GPU CUDA init on the feeder + the NCCL
+            # handshake itself) — gLLM's own dist.init_process_group() call
+            # passes no timeout=, so a feeder that never joins just hangs
+            # rather than failing fast; this is the GreenBoost-side bound
+            # standing in for the one gLLM doesn't provide. On expiry, tear
+            # down both sides and retry host-only rather than leaving a
+            # half-joined NCCL world holding the GPU.
+            try:
+                ready = gs._wait_upstream_ready(entry, proc, internal_port,
+                                                 grace_s=gs.GLLM_CLUSTER_READY_TIMEOUT_S)
+            except RuntimeError:
+                ready = False
+            if not ready:
+                print(f"  [gb-synapse] {entry.name}: cluster PP rendezvous did not "
+                      f"complete within {gs.GLLM_CLUSTER_READY_TIMEOUT_S:.0f}s — "
+                      f"tearing down and retrying host-only.", flush=True)
+                proc.kill()
+                for f in online_feeders:
+                    gs.kill_feeder_gllm_slave(f)
+                return self.serve(entry, port, ctx=ctx, use_cluster=False,
+                                   n_slots=n_slots, extra_args=extra_args)
+
         state = gs._launch_proxy_and_record(entry, proc, port, internal_port,
+                                            feeders=[f.ip for f in online_feeders],
                                             engine=self.name, **facts)
         _, _, budget_facts = effective_vram_budget_mb()
         _validate_placement(entry, util if mode == "gllm" else 0.0, budget_facts, self.name)
@@ -912,12 +927,20 @@ class SynapseTorchBackend(EngineBackend):
 
 
 class TransformersBackend(EngineBackend):
-    """Fallback when vLLM isn't installed: gb_llm_server.py wraps
-    gb_llm.load_causal_lm()/generate() (in-process transformers + gb-quant)
-    behind the same minimal OpenAI surface vLLM/llama-server provide. No
-    continuous batching — single-request-at-a-time — so prefer vLLM when
-    it's available; this exists so ':fp8'-style models are never a hard
-    dead end just because the vLLM venv isn't set up yet."""
+    """Fallback when the synapse torch engine isn't installed at all (no
+    torch venv found — see `_torch_env_dir()`): runs `gb_synapse_fallback.py`
+    (in-process transformers + gb-quant quantize-to-fit) under `sys.executable`
+    — the same interpreter running gb_synapse.py itself, since there's no
+    dedicated venv to defer to here. gb_synapse_fallback.py's own imports
+    (torch/aiohttp/transformers/gb_quant) resolve the same way whichever
+    interpreter runs it, script-directory auto-insertion covers gb_quant/
+    gb_init and the rest are ordinary pip deps expected on any host that runs
+    gb_synapse.py at all. No continuous batching — single-request-at-a-time
+    — so prefer the torch engine when it's available; this exists so
+    ':fp8'-style models are never a hard dead end just because that venv
+    isn't set up yet. SynapseTorchBackend's own fallback branch (torch venv
+    present but gLLM/sgl_kernel import broken) uses this same script under
+    the torch venv's python instead — see its serve()."""
     name = "transformers"
 
     def available(self) -> bool:
@@ -926,7 +949,7 @@ class TransformersBackend(EngineBackend):
     def can_serve(self, entry) -> bool:
         return entry.engine in ("transformers", "gbquant")
 
-    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=1, extra_args=""):
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args=""):
         import gb_synapse as gs
 
         internal_port = port + 1000
@@ -934,7 +957,7 @@ class TransformersBackend(EngineBackend):
         env["GREENBOOST_ACTIVE"] = "1"
         if gs.hf_token():
             env["HF_TOKEN"] = gs.hf_token()
-        cmd = [sys.executable, str(_REPO_DIR / "gb_llm_server.py"),
+        cmd = [sys.executable, str(_REPO_DIR / "gb_synapse_fallback.py"),
                "--model", _gbquant_model_source(entry), "--served-model-name", entry.name,
                "--quant", entry.quant or "fp8",
                "--host", "127.0.0.1", "--port", str(internal_port)]
@@ -962,12 +985,13 @@ class DiffusersBackend(EngineBackend):
     def can_serve(self, entry) -> bool:
         return entry.engine == "diffusers"
 
-    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=1, extra_args=""):
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args=""):
         import gb_synapse as gs
         import gb_cluster
 
         internal_port = port + 1000
-        # Same shim posture as vLLM: torch workload, no cluster fabric, real T2.
+        # Same "torch" shim posture as SynapseTorchBackend/TransformersBackend:
+        # torch workload, no cluster fabric, real T2.
         env = gb_cluster.shim_env(workload="torch", enabled=True)
         if gs.hf_token():
             env["HF_TOKEN"] = gs.hf_token()
@@ -992,23 +1016,13 @@ def select_backend(entry) -> EngineBackend:
     to SynapseTorchBackend by default — live-verified end-to-end (Phase 3/
     P3.9 bring-up, 2026-07-16: the vendored gLLM engine, with its local
     SDPA-fallback patch, serves bf16 safetensors checkpoints correctly on
-    this hardware). Falls back to VllmBackend/TransformersBackend only if
-    the torch engine isn't installed, or if GB_SYNAPSE_FORCE_VLLM=1 and a
-    vllm binary is actually present (a soak-window escape hatch for anyone
-    who needs to keep using vLLM while the torch engine is new — dies in
-    Phase 6 alongside VllmBackend itself). "diffusers" is explicit — no
-    silent fallback. Anything else (including the "llama.cpp" default) gets
-    the llama.cpp engine."""
+    this hardware). Falls back to TransformersBackend only if the torch
+    engine isn't installed (VllmBackend retired — Phase 6). "diffusers" is
+    explicit — no silent fallback. Anything else (including the "llama.cpp"
+    default) gets the llama.cpp engine."""
     if entry.engine in ("torch", "vllm", "gbquant", "transformers"):
-        if os.environ.get("GB_SYNAPSE_FORCE_VLLM") == "1":
-            v = VllmBackend()
-            if v.available():
-                return v
         t = SynapseTorchBackend()
-        if t.available():
-            return t
-        v = VllmBackend()
-        return v if v.available() else TransformersBackend()
+        return t if t.available() else TransformersBackend()
     if entry.engine == "diffusers":
         return DiffusersBackend()
     return LlamaCppBackend()

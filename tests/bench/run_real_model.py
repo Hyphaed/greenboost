@@ -41,6 +41,8 @@ from pathlib import Path
 # gb_moe.py are untracked-but-not-yet-deployed as of this writing).
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+import gb_bench  # noqa: E402 — the real "bench_result" dataflux emit site; see gb_bench.py
+
 RESULTS_PATH = Path(__file__).parent / "results.jsonl"
 
 
@@ -106,8 +108,9 @@ def main() -> int:
     ap.add_argument("--model", required=True, help="HF model id, e.g. Qwen/Qwen2.5-7B-Instruct")
     ap.add_argument("--budget-gb", type=float, default=None,
                      help="force gb_quant's fit-to-VRAM budget low enough that the model "
-                          "overflows into T2 (default: gb_llm's auto budget, ~92%% free VRAM, "
-                          "which may let small models fit entirely in T1 and never overflow)")
+                          "overflows into T2 (default: gb_synapse_fallback's auto budget, "
+                          "~92%% free VRAM, which may let small models fit entirely in T1 "
+                          "and never overflow)")
     ap.add_argument("--moe", action="store_true", help="attach gb_moe.GbMoEManager")
     ap.add_argument("--prefetch", action="store_true", help="attach gb_prefetch.LayerPrefetcher (dense)")
     ap.add_argument("--keep-resident", type=int, default=2)
@@ -119,7 +122,7 @@ def main() -> int:
     ap.add_argument("--tag", default="run", help="label stamped into results.jsonl for A/B grouping")
     args = ap.parse_args()
 
-    import gb_llm
+    import gb_synapse_fallback as gb_llm
 
     record = {
         "tag": args.tag,
@@ -189,6 +192,20 @@ def main() -> int:
 def _append(record: dict) -> None:
     with RESULTS_PATH.open("a") as f:
         f.write(json.dumps(record) + "\n")
+    # Speed Program Phase 0: this harness only measures decode tok/s;
+    # prefill bandwidth is gb_pathbench's job. See gb_bench.py for why the
+    # emit call itself lives outside tests/.
+    config_keys = ("model", "budget_gb", "moe", "prefetch", "keep_resident",
+                   "lookahead", "hot_threshold", "prefetch_topn", "max_new_tokens", "prompt")
+    gb_bench.emit_bench_result(
+        path="run_real_model",
+        config={k: record.get(k) for k in config_keys},
+        model=record.get("model"),
+        tag=record.get("tag"),
+        decode_tok_s=record.get("tok_per_s"),
+        load_s=record.get("load_s"),
+        error=record.get("error"),
+    )
 
 
 if __name__ == "__main__":
