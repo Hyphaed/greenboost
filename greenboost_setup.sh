@@ -2987,30 +2987,16 @@ HPEOF
             fi
         fi
 
-        # snap-confine inside snapd snap - the snap ships its own confined binary
-        # (/snap/snapd/NNNN/usr/lib/snapd/snap-confine) whose AppArmor profile is
-        # stored in /var/lib/snapd/apparmor/profiles/ and loaded by snapd directly
-        # (not by apparmor_parser from /etc/apparmor.d/).  The local/ override
-        # above only affects the system binary.  Patch the snapd snap profile too.
-        local _snapd_profile
-        _snapd_profile=$(find /var/lib/snapd/apparmor/profiles/ \
-            -name "snap-confine.snapd.*" -o -name "snap-confine.*" 2>/dev/null \
-            | head -1)
-        if [[ -n "$_snapd_profile" ]]; then
-            if ! grep -q "libgreenboost_audit" "$_snapd_profile" 2>/dev/null; then
-                {
-                    echo ""
-                    echo "# GreenBoost: allow snap-confine (snapd snap) to mmap audit stub"
-                    echo "/usr/local/lib/libgreenboost_audit.so mr,"
-                    echo "/usr/local/lib/x86_64-linux-gnu/libgreenboost_audit.so mr,"
-                } >> "$_snapd_profile"
-                apparmor_parser -r "$_snapd_profile" 2>/dev/null && \
-                    gb_ok "snapd snap-confine profile patched and reloaded: $(basename "$_snapd_profile")" || \
-                    gb_warn "snapd snap-confine profile patched but reload failed (will apply on next snapd start)"
-            else
-                gb_info "snapd snap-confine profile already patched (skip)"
-            fi
-        fi
+        # NOTE: do NOT patch /var/lib/snapd/apparmor/profiles/ - that directory is
+        # snapd-generated and regenerated on every snapd start, so a patch never
+        # persists, and an append (`>>`) lands outside the profile's closing brace,
+        # which breaks the whole apparmor_parser batch and stops every snap from
+        # launching (confirmed live incident, 2026-07-27: two contaminated
+        # snap-confine.snapd.* profiles took down Firefox, Chromium, snap-store,
+        # cups system-wide via "snap-confine has elevated permissions and is not
+        # confined but should be").  The supported override is the local/ file
+        # written above; legacy cleanup for machines already carrying the bad
+        # lines lives in `_do_purge_apparmor` / `greenboost apparmor-uninstall`.
 
         # Layer B - dynamic scan: patch profiles that don't inherit from base.
         # Skip: sub-directories, abstractions, tunables, disable, force-complain,
@@ -3796,7 +3782,10 @@ _gb_backup_restore() {
 #   2) abstractions/base                            - Layer A: `#include` injection
 #   3) /etc/apparmor.d/*                            - Layer B: per-profile includes
 #   4) local/usr.lib.snapd.snap-confine.real        - snap-confine override
-#   5) /var/lib/snapd/apparmor/profiles/snap-confine*  - snapd-snap profile patch
+#   5) /var/lib/snapd/apparmor/profiles/snap-confine*  - legacy cleanup only;
+#      install no longer writes this (2026-07-27, see install-side note above -
+#      it broke snap-confine's own profile), kept here for machines that still
+#      carry the bad lines from before that fix
 #   6) apparmor_parser -r /etc/apparmor.d/          - make the kernel forget
 #   7) snapd-shipped snap-confine profile reload    - restore self-integrity check
 # ---------------------------------------------------------------------------
@@ -3900,6 +3889,61 @@ cmd_apparmor_uninstall() {
     info "Test with: snap run firefox  (or just click the icon)"
 }
 
+# ---- _gb_stop_synapse - stop any running gb-synapse engine+proxy ---------
+# gb-synapse's engine and proxy are Popen-spawned with start_new_session=True
+# (gb_synapse.py's _launch_proxy_and_record/_start_proxy) — NOT systemd
+# services like ollama/llama-server just above, so nothing else in do_purge
+# ever stopped them. Without this, `rm -rf /usr/local/lib/greenboost` deleted
+# the llama-server binary out from under a LIVE process, which kept running,
+# holding VRAM and :11435, after "GreenBoost uninstalled cleanly."
+_gb_stop_synapse() {
+    local run_dir="/run/greenboost/synapse"
+    [[ -d "$run_dir" ]] || return 0
+    compgen -G "$run_dir"/'*.json' >/dev/null 2>&1 || return 0
+
+    # Preferred: the real stop() logic — kills the engine+proxy process
+    # groups AND tears down feeder-side state (gLLM slave ranks / the
+    # rpc-server reuse tracking), same code path `greenboost synapse stop`
+    # uses. Best-effort: a broken/half-installed tree just falls through to
+    # the raw pid-kill fallback below instead of failing the whole purge.
+    if [[ -f "$MODULE_DIR/gb_synapse.py" ]] && command -v python3 &>/dev/null; then
+        if (cd "$MODULE_DIR" && python3 -c "
+import glob, json, sys
+sys.path.insert(0, '.')
+import gb_synapse
+stopped = 0
+for f in glob.glob('$run_dir/*.json'):
+    try:
+        model = json.load(open(f)).get('model')
+        if model and gb_synapse.stop(model):
+            stopped += 1
+    except Exception:
+        pass
+sys.exit(0 if stopped >= 0 else 1)
+" 2>/dev/null); then
+            gb_ok "Stopped any running gb-synapse server(s) (engine+proxy+feeders)"
+            return 0
+        fi
+    fi
+
+    # Fallback: no Python/module available — best-effort raw pid kill for the
+    # local processes only (no feeder teardown), same as every other
+    # best-effort step in this function.
+    local state_file pid pgid killed=0
+    for state_file in "$run_dir"/*.json; do
+        [[ -f "$state_file" ]] || continue
+        for pid in $(grep -oE '"(llama|proxy)_pid": *[0-9]+' "$state_file" | grep -oE '[0-9]+$'); do
+            [[ "$pid" -gt 0 ]] || continue
+            kill -0 "$pid" 2>/dev/null || continue
+            pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+            if [[ -n "$pgid" ]]; then kill -TERM -- "-$pgid" 2>/dev/null || true
+            else kill -TERM "$pid" 2>/dev/null || true; fi
+            (( killed++ )) || true
+        done
+    done
+    [[ $killed -gt 0 ]] && gb_ok "Stopped $killed gb-synapse process(es) (fallback, no feeder teardown)"
+}
+
 # ---- do_purge - remove ALL previously installed GreenBoost artifacts -----
 # Internal helper (no root check - callers must ensure root).
 # Called by cmd_uninstall and cmd_full_install.
@@ -3912,6 +3956,20 @@ do_purge() {
     local restart_after="${1:-0}"
     local preserve_cluster="${2:-0}"
 
+    # -2. Capture the .pth fan-out manifest BEFORE anything below deletes it
+    #     (/usr/local/lib/greenboost is wiped wholesale a few steps down) , the
+    #     paths it names are cleaned up much later, at the `.pth` removal step,
+    #     so they must be read into memory now or that cleanup has nothing left
+    #     to read and falls back to only the 4 hardcoded dist-packages paths
+    #     (the original parity hole: a conda-env .pth this install created
+    #     survived every uninstall).
+    local -a _pth_manifest_paths=()
+    if [[ -f /usr/local/lib/greenboost/pth_manifest.txt ]]; then
+        while IFS= read -r _pmp_line; do
+            [[ -n "$_pmp_line" ]] && _pth_manifest_paths+=("$_pmp_line")
+        done < /usr/local/lib/greenboost/pth_manifest.txt
+    fi
+
     # -1. Stop everything BEFORE touching any file: force-release T1/T2/T3 and
     #     kill lingering GPU inference processes (same as `greenboost clear
     #     memory-pool`), and stop feeding if this machine is currently a
@@ -3921,6 +3979,7 @@ do_purge() {
     #     nothing is loaded/running, so this always runs, on every purge.
     cmd_clear_memory_pool || true
     cmd_feed stop || true
+    _gb_stop_synapse || true
 
     # 0. Remove any legacy boot-cleanup artifacts from previous failed install attempts.
     #    These services caused more problems than they solved (kernel oops during boot).
@@ -4091,13 +4150,11 @@ do_purge() {
           /etc/systemd/system/greenboost-sentinel.service \
           /etc/systemd/system/greenboost-vram-watchdog.service \
           /etc/systemd/system/greenboost-idle-reclaim.service
-    # Wholesale removal — takes cli-venv, vllm-env, synapse-torch-env AND the
+    # Wholesale removal — takes cli-venv, synapse-torch-env AND the
     # vendored synapse_engine/ source copy with it (all live under this dir;
-    # no separate rm needed for any of them). The user-home dev venv
-    # gb_synapse_backends._find_vllm_bin() also checks
-    # (~/.local/share/greenboost/synapse/vllm-env) is intentionally NOT
-    # touched here — it's a manual/dev install, not something Full Install
-    # created.
+    # no separate rm needed for any of them). Also covers gb_llm.py/
+    # gb_llm_server.py orphans left by a pre-2026-07-26 install (absorbed
+    # into gb_synapse_fallback.py, no longer shipped — see cmd_install_python_files).
     rm -rf /usr/local/lib/greenboost
 
     # Legacy daemon scripts (all known names across all versions)
@@ -4111,12 +4168,22 @@ do_purge() {
           /usr/local/bin/greenboost-run-vllm
     # greenboost-cli wrappers (the venv itself lives under /usr/local/lib/greenboost/)
     rm -f /usr/local/bin/gb /usr/local/bin/greenboost-cli
+    rm -f /usr/local/bin/greenboost-py-root
     # Documentation directory and stray Python hooks
     rm -rf /usr/local/share/greenboost/
     rm -f /usr/local/lib/greenboost_*.py
     rm -rf /usr/local/lib/greenboost/
     rm -f /etc/profile.d/greenboost_pythonpath.sh
     rm -f /usr/local/lib/python3*/dist-packages/greenboost.pth 2>/dev/null || true
+    # Remove every .pth/sitecustomize.py pair install-python actually wrote
+    # (conda/mamba envs discovered at install time, captured into
+    # _pth_manifest_paths above before /usr/local/lib/greenboost was wiped).
+    if [[ ${#_pth_manifest_paths[@]} -gt 0 ]]; then
+        local _pmp_path
+        for _pmp_path in "${_pth_manifest_paths[@]}"; do
+            rm -f "$_pmp_path" 2>/dev/null || true
+        done
+    fi
     # Claude CLI MCP registrations (per-user) , symmetric with cmd_register_mcp.
     # The gb_*_mcp.py targets live under /usr/local/lib/greenboost (removed just
     # above), so their registrations are now dangling. Remove only on a TRUE
@@ -4147,6 +4214,18 @@ do_purge() {
     rmdir /var/lib/greenboost 2>/dev/null || true
     # Cluster topology registry cache (tmpfs; Full Install's gb_cluster writes it)
     rm -f /run/greenboost/cluster_topology.json
+    # gb-synapse run-state (tmpfs; _gb_stop_synapse above already killed any
+    # live process these describe) — left un-purged before, so a phantom
+    # ServerState could survive an uninstall→reinstall within one boot and
+    # make the next serve()'s reuse-check see a server that no longer exists.
+    rm -rf /run/greenboost/synapse
+    # gb-synapse's own GreenBoost-generated artifacts under /var/lib —
+    # llama.cpp's multi-GB prompt-cache slots and the measured-tok/s rolling
+    # store. NOT /var/lib/greenboost/synapse/models/ — that holds pulled
+    # model weights, which is user data this uninstaller explicitly promises
+    # not to touch.
+    rm -rf /var/lib/greenboost/synapse/slots
+    rm -f /var/lib/greenboost/synapse/models/measured_tok_s.json
     systemctl daemon-reload 2>/dev/null || true
 
     # 7. Strip GreenBoost env lines from service unit files
@@ -4288,7 +4367,7 @@ cmd_install_python_files() {
         gb_init.py
         gb_quant.py gb_quant_tq.py gb_quant_calib.py
         gb_kernel_backends.py gb_placement.py
-        gb_attn.py  gb_llm.py
+        gb_attn.py
         gb_telemetry.py
         gb_stream_sched.py
         gb_model_tier.py
@@ -4304,6 +4383,7 @@ cmd_install_python_files() {
         gb_control.py
         gb_orchestrator.py
         gb_dataflux.py
+        gb_dataflux_kinds.py
         # Monitoring / serving / cluster stack (the installed greenboost-cli
         # resolves these from /usr/local/lib/greenboost via GB_PY_ROOT)
         gb_monitor.py
@@ -4334,15 +4414,32 @@ cmd_install_python_files() {
         # import them at runtime (audit 2026-07-13): gb_prefetch (gb_init),
         # gb_topology (gb_orchestrator/gb_telemetry), gb_diffcache
         # (gb_diffusion_orch), gb_remote_blocks (gb_cluster), plus standalone
-        # entry points gb_moe / gb_llm_server / gb_rotator.
+        # entry points gb_moe / gb_rotator. gb_llm.py/gb_llm_server.py were
+        # absorbed into gb_synapse_fallback.py (gb-synapse Phase 6 vLLM
+        # removal, 2026-07-26) and no longer exist in the source tree.
         gb_prefetch.py
         gb_topology.py
         gb_diffcache.py
         gb_remote_blocks.py
         gb_moe.py
-        gb_llm_server.py
         gb_synapse_fallback.py
         gb_rotator.py
+        # P7 public facade for external consumers (ai-forge etc.): gb_paths.py
+        # resolves GB_PY_ROOT the same way greenboost-cli's own copy does,
+        # greenboost_bootstrap.py is the zero-dependency sys.path shim a bare
+        # venv imports first, gb_api.py is the facade itself.
+        gb_paths.py
+        greenboost_bootstrap.py
+        gb_api.py
+        # Speed Program Phase 0 (2026-07-26): the single "bench_result"
+        # dataflux emit site (see gb_bench.py's own docstring for why it's
+        # NOT in tests/bench/ — check_dataflux_coverage.py excludes tests/).
+        # Not required for any production serve path, but installer parity
+        # applies to every root module regardless (Installer/Uninstaller
+        # Parity MUST-RULE): a fresh install must let tests/bench/*.py run
+        # unmodified against $GB_PY_DEST the same way it does against a dev
+        # checkout.
+        gb_bench.py
     )
     local _installed=0
     for _f in "${_py_files[@]}"; do
@@ -4383,6 +4480,106 @@ cmd_install_python_files() {
         gb_warn "synapse_engine/ not found in $MODULE_DIR — install-synapse-engine will have nothing to install"
     fi
 
+    # third_party/llama.cpp/ (vendored+pinned, see NOTICE) — same rationale as
+    # synapse_engine/ above: gb_synapse.py's ENGINE_SRC_DIR is
+    # _REPO_DIR/third_party/llama.cpp, and _REPO_DIR resolves relative to
+    # gb_synapse.py's OWN installed location ($_dest), not $MODULE_DIR — so
+    # the vendored source must be synced here too, or build-engine/
+    # update-engine find nothing once gb_synapse.py itself is running from
+    # $_dest instead of the git checkout. rsync --delete keeps a stale prior
+    # pin from lingering after a version bump.
+    if [[ -d "$MODULE_DIR/third_party/llama.cpp" ]]; then
+        if command -v rsync >/dev/null 2>&1; then
+            rsync -a --delete --exclude=build-synapse \
+                "$MODULE_DIR/third_party/llama.cpp/" "$_dest/third_party/llama.cpp/" 2>/tmp/gb_llamacpp_sync.log \
+                || gb_warn "third_party/llama.cpp/ sync failed (see /tmp/gb_llamacpp_sync.log)"
+        else
+            rm -rf "$_dest/third_party/llama.cpp"
+            mkdir -p "$_dest/third_party"
+            cp -r "$MODULE_DIR/third_party/llama.cpp" "$_dest/third_party/llama.cpp"
+        fi
+    else
+        gb_warn "third_party/llama.cpp/ not found in $MODULE_DIR — build-engine/update-engine will have nothing to build"
+    fi
+
+    # third_party/auto_round/ (vendored AutoRound AutoScheme, see NOTICE) ,
+    # same rationale as third_party/llama.cpp/ above: gb_quant_calib.py's
+    # _ensure_auto_round_path() resolves it relative to $_dest (this
+    # install's own location), not $MODULE_DIR, so the vendored tree must
+    # be synced here too or calibrate_with_prompts() finds nothing once
+    # gb_quant_calib.py itself runs from $_dest instead of the git checkout.
+    if [[ -d "$MODULE_DIR/third_party/auto_round" ]]; then
+        if command -v rsync >/dev/null 2>&1; then
+            rsync -a --delete \
+                "$MODULE_DIR/third_party/auto_round/" "$_dest/third_party/auto_round/" 2>/tmp/gb_autoround_sync.log \
+                || gb_warn "third_party/auto_round/ sync failed (see /tmp/gb_autoround_sync.log)"
+        else
+            rm -rf "$_dest/third_party/auto_round"
+            mkdir -p "$_dest/third_party"
+            cp -r "$MODULE_DIR/third_party/auto_round" "$_dest/third_party/auto_round"
+        fi
+    else
+        gb_warn "third_party/auto_round/ not found in $MODULE_DIR — calibrate_with_prompts() will have nothing to import"
+    fi
+
+    # third_party/turboquant/ (vendored TurboQuant packed-KV attention, see
+    # NOTICE) , same rationale as third_party/auto_round/ above: gb_attn.py's
+    # _ensure_turboquant_path() resolves it relative to $_dest, not
+    # $MODULE_DIR, so the vendored tree must be synced here too or
+    # patch_sdpa(backend="packed") finds nothing once gb_attn.py itself runs
+    # from $_dest instead of the git checkout.
+    if [[ -d "$MODULE_DIR/third_party/turboquant" ]]; then
+        if command -v rsync >/dev/null 2>&1; then
+            rsync -a --delete \
+                "$MODULE_DIR/third_party/turboquant/" "$_dest/third_party/turboquant/" 2>/tmp/gb_turboquant_sync.log \
+                || gb_warn "third_party/turboquant/ sync failed (see /tmp/gb_turboquant_sync.log)"
+        else
+            rm -rf "$_dest/third_party/turboquant"
+            mkdir -p "$_dest/third_party"
+            cp -r "$MODULE_DIR/third_party/turboquant" "$_dest/third_party/turboquant"
+        fi
+    else
+        gb_warn "third_party/turboquant/ not found in $MODULE_DIR — patch_sdpa(backend=\"packed\") will have nothing to import"
+    fi
+
+    # third_party/gemlite/ + third_party/hqq/ (vendored low-bit GEMM backend
+    # + quantizer, see workflow/known-issues.md's "gemlite/hqq never synced
+    # by the installer" entry, found 2026-07-26) , same rationale as
+    # third_party/auto_round/ above: gb_quant.py's _ensure_vendored_paths()
+    # resolves BOTH relative to $_dest (this install's own location), not
+    # $MODULE_DIR. Before this fix a Full Install running from $_dest (not a
+    # dev checkout) had NO quantization backend at all , gb_quant silently
+    # degraded to whatever fallback path exists, or errored, with no signal
+    # pointing at "third_party wasn't shipped". rsync --delete keeps a stale
+    # prior version from lingering after an update.
+    if [[ -d "$MODULE_DIR/third_party/gemlite" ]]; then
+        if command -v rsync >/dev/null 2>&1; then
+            rsync -a --delete \
+                "$MODULE_DIR/third_party/gemlite/" "$_dest/third_party/gemlite/" 2>/tmp/gb_gemlite_sync.log \
+                || gb_warn "third_party/gemlite/ sync failed (see /tmp/gb_gemlite_sync.log)"
+        else
+            rm -rf "$_dest/third_party/gemlite"
+            mkdir -p "$_dest/third_party"
+            cp -r "$MODULE_DIR/third_party/gemlite" "$_dest/third_party/gemlite"
+        fi
+    else
+        gb_warn "third_party/gemlite/ not found in $MODULE_DIR — gb_quant's quantize-to-fit will have no GEMM backend"
+    fi
+
+    if [[ -d "$MODULE_DIR/third_party/hqq" ]]; then
+        if command -v rsync >/dev/null 2>&1; then
+            rsync -a --delete \
+                "$MODULE_DIR/third_party/hqq/" "$_dest/third_party/hqq/" 2>/tmp/gb_hqq_sync.log \
+                || gb_warn "third_party/hqq/ sync failed (see /tmp/gb_hqq_sync.log)"
+        else
+            rm -rf "$_dest/third_party/hqq"
+            mkdir -p "$_dest/third_party"
+            cp -r "$MODULE_DIR/third_party/hqq" "$_dest/third_party/hqq"
+        fi
+    else
+        gb_warn "third_party/hqq/ not found in $MODULE_DIR — gb_quant's quantize-to-fit will have no HQQ quantizer"
+    fi
+
     # Add to system-wide PYTHONPATH via profile.d (idempotent)
     local _profile_pth="/etc/profile.d/greenboost_pythonpath.sh"
     cat > "$_profile_pth" << 'PYPATHEOF'
@@ -4391,31 +4588,28 @@ export PYTHONPATH="/usr/local/lib/greenboost${PYTHONPATH:+:$PYTHONPATH}"
 PYPATHEOF
     chmod 644 "$_profile_pth"
 
-    # Also write a .pth file so conda/pip envs pick it up without sourcing profile.d
-    # (this covers artpipeline_cu13 and any venv that respects site.py)
-    local _pth_dir
-    for _pth_dir in \
-        /usr/local/lib/python3/dist-packages \
-        /usr/local/lib/python3.12/dist-packages \
-        /usr/local/lib/python3.11/dist-packages \
-        /usr/local/lib/python3.10/dist-packages
-    do
-        if [[ -d "$_pth_dir" ]]; then
-            echo "$_dest" > "$_pth_dir/greenboost.pth"
-        fi
-    done
-    # Also drop a .pth in the active conda/mamba env if detectable
-    if [[ -n "${CONDA_PREFIX:-}" && -d "$CONDA_PREFIX/lib" ]]; then
-        local _conda_pth
-        _conda_pth=$(find "$CONDA_PREFIX/lib" -maxdepth 2 -name "dist-packages" -o -name "site-packages" 2>/dev/null | head -1)
-        [[ -n "$_conda_pth" ]] && echo "$_dest" > "$_conda_pth/greenboost.pth"
-    fi
-
-    # Write a sitecustomize.py into every detected site-packages so that
-    # processes launched with GREENBOOST_ACTIVE=1 (system services, _gen_gb.sh,
-    # greenboost run) get gb_init auto-imported even without sourcing profile.d.
-    # We use a unique filename (greenboost_sitecustomize.py) to avoid clobbering
-    # an existing sitecustomize.py written by other tools.
+    # Write a .pth + sitecustomize.py into every detected site-packages so
+    # conda/pip envs pick up $_dest on sys.path (site.py processes .pth files)
+    # AND get gb_init auto-imported under GREENBOOST_ACTIVE=1 without sourcing
+    # profile.d. Unique filename (greenboost_sitecustomize.py) avoids
+    # clobbering a sitecustomize.py some other tool already owns.
+    #
+    # Discovery used to be 4 hardcoded dist-packages dirs + the ACTIVE
+    # $CONDA_PREFIX only , so any conda/mamba env not active at install time
+    # (e.g. ai-forge's own env, installed separately from GreenBoost's) never
+    # saw $_dest on its path and had to hand-roll sys.path.insert instead.
+    # Broadened to every env under the common conda/mamba roots of the
+    # invoking (non-root) user , install runs via sudo, so $HOME is /root,
+    # same idiom cmd_install_pipelines uses for _sudo_home. GB_PTH_ROOTS
+    # (space-separated site-packages dirs) replaces the conda-env globs
+    # entirely when set, for a fully explicit/opt-out list.
+    #
+    # Every path actually written is recorded in pth_manifest.txt so do_purge
+    # can remove exactly what was created here (previously only the 4
+    # hardcoded dist-packages paths were ever cleaned up , a conda-env .pth
+    # survived every uninstall).
+    local _pth_manifest="$_dest/pth_manifest.txt"
+    : > "$_pth_manifest"
     local _sc_content='# GreenBoost auto-bootstrap , generated by install-python
 import os as _os
 if _os.environ.get("GREENBOOST_ACTIVE") == "1":
@@ -4424,31 +4618,61 @@ if _os.environ.get("GREENBOOST_ACTIVE") == "1":
     except Exception:
         pass
 '
-    local _sc_target
-    for _pth_dir in \
-        /usr/local/lib/python3/dist-packages \
-        /usr/local/lib/python3.12/dist-packages \
-        /usr/local/lib/python3.11/dist-packages \
-        /usr/local/lib/python3.10/dist-packages
-    do
-        if [[ -d "$_pth_dir" ]]; then
-            _sc_target="$_pth_dir/greenboost_sitecustomize.py"
-            printf '%s' "$_sc_content" > "$_sc_target"
-            # Hook it via a .pth import line so site.py executes it
-            printf '%s\nimport greenboost_sitecustomize\n' "$_dest" \
-                > "$_pth_dir/greenboost.pth"
+    local -a _pth_targets=()
+    if [[ -n "${GB_PTH_ROOTS:-}" ]]; then
+        read -ra _pth_targets <<< "$GB_PTH_ROOTS"
+    else
+        _pth_targets=(
+            /usr/local/lib/python3/dist-packages
+            /usr/local/lib/python3.12/dist-packages
+            /usr/local/lib/python3.11/dist-packages
+            /usr/local/lib/python3.10/dist-packages
+        )
+        if [[ -n "${CONDA_PREFIX:-}" && -d "$CONDA_PREFIX/lib" ]]; then
+            local _conda_sp
+            _conda_sp=$(find "$CONDA_PREFIX/lib" -maxdepth 2 \
+                \( -name "dist-packages" -o -name "site-packages" \) 2>/dev/null | head -1)
+            [[ -n "$_conda_sp" ]] && _pth_targets+=("$_conda_sp")
         fi
-    done
-    if [[ -n "${CONDA_PREFIX:-}" && -d "$CONDA_PREFIX/lib" ]]; then
-        local _conda_sp
-        _conda_sp=$(find "$CONDA_PREFIX/lib" -maxdepth 2 \
-            \( -name "dist-packages" -o -name "site-packages" \) 2>/dev/null | head -1)
-        if [[ -n "$_conda_sp" ]]; then
-            printf '%s' "$_sc_content" > "$_conda_sp/greenboost_sitecustomize.py"
-            printf '%s\nimport greenboost_sitecustomize\n' "$_dest" \
-                > "$_conda_sp/greenboost.pth"
-        fi
+        local _sudo_home=""
+        [[ -n "${SUDO_USER:-}" ]] && _sudo_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+        local _pth_home="${_sudo_home:-$HOME}"
+        local _envs_root _env_dir _env_sp
+        for _envs_root in \
+            "$_pth_home/.conda/envs" \
+            "$_pth_home/miniconda3/envs" \
+            "$_pth_home/anaconda3/envs" \
+            "$_pth_home/miniforge3/envs" \
+            "$_pth_home/mambaforge/envs" \
+            "$_pth_home/.miniforge3/envs"
+        do
+            [[ -d "$_envs_root" ]] || continue
+            for _env_dir in "$_envs_root"/*; do
+                [[ -d "$_env_dir" ]] || continue
+                for _env_sp in "$_env_dir"/lib/python3.*/site-packages; do
+                    [[ -d "$_env_sp" ]] && _pth_targets+=("$_env_sp")
+                done
+            done
+        done
     fi
+    local _pth_dir
+    for _pth_dir in "${_pth_targets[@]}"; do
+        [[ -d "$_pth_dir" ]] || continue
+        printf '%s' "$_sc_content" > "$_pth_dir/greenboost_sitecustomize.py"
+        printf '%s\nimport greenboost_sitecustomize\n' "$_dest" \
+            > "$_pth_dir/greenboost.pth"
+        printf '%s\n' "$_pth_dir/greenboost.pth" >> "$_pth_manifest"
+        printf '%s\n' "$_pth_dir/greenboost_sitecustomize.py" >> "$_pth_manifest"
+    done
+
+    # greenboost-py-root , a shell/Makefile-friendly way to resolve the
+    # installed python root without going through the cli-venv (P7: same
+    # resolver gb_paths.py/gb_api.py use, exposed for non-Python consumers).
+    cat > /usr/local/bin/greenboost-py-root << WRAPEOF
+#!/usr/bin/env bash
+exec python3 -c "import sys; sys.path.insert(0, '$_dest'); import gb_paths; print(gb_paths.gb_py_root())"
+WRAPEOF
+    chmod 755 /usr/local/bin/greenboost-py-root
 
     gb_ok "Python orchestration files installed to $_dest/ ($_installed files)"
     gb_info "  import: from gb_telemetry import TelemetryManager"
@@ -4553,9 +4777,8 @@ WRAPEOF
 # nothing better exists. Echoes the resolved interpreter path (or the
 # system python3 fallback) on stdout; callers capture it with $().
 #
-# Shared by cmd_install_vllm and cmd_install_synapse_engine — lifted out of
-# cmd_install_vllm (2026-07-16) so both heavy-ML-venv installers use the
-# identical interpreter-selection logic instead of two copies drifting apart.
+# Shared interpreter-selection logic for heavy-ML-venv installers
+# (cmd_install_synapse_engine).
 _gb_resolve_ml_python() {
     local _py="" _cand _root
     for _cand in python3.13 python3.12 python3.11; do
@@ -4582,91 +4805,14 @@ _gb_resolve_ml_python() {
     echo "$_py"
 }
 
-# cmd_install_vllm , provision a dedicated vLLM venv so gb-synapse's
-# VllmBackend (gb_synapse_backends.py) is available out of the box: token-less
-# safetensors pulls auto-route to vLLM+fp8 when this venv exists (owner
-# decision 2026-07-16), and ":fp8"/":int8"/":int4" pulls need it to avoid the
-# slower transformers fallback.
-#
-# Modeled on cmd_install_cli (same venv-under-$GB_PY_DEST pattern). Root-owned
-# system venv, NOT the user-home dev path gb_synapse_backends._find_vllm_bin()
-# also checks , this is what a fresh `git clone` + Full Install produces with
-# zero manual steps.
-#
-# Default-ON (owner decision): opt out with GB_INSTALL_VLLM=0. Best-effort ,
-# a missing venv module, offline mode, or a pip failure only warns; Full
-# Install must never abort on this step (vLLM is a multi-GB download).
-# Called from: cmd_install (full-install, after the synapse engine build) and
-# the install-vllm verb.
-cmd_install_vllm() {
-    if [[ "${GB_INSTALL_VLLM:-1}" == "0" ]]; then
-        gb_info "GB_INSTALL_VLLM=0 — skipping vLLM install (opt-out)"
-        return 0
-    fi
-    if [[ "${GB_OFFLINE:-0}" == "1" ]]; then
-        gb_warn "GB_OFFLINE=1 — skipping vLLM install (needs pip network access)"
-        return 0
-    fi
-    if ! python3 -m venv --help >/dev/null 2>&1; then
-        gb_warn "python3 venv module unavailable — skipping vLLM install (apt install python3-venv)"
-        return 0
-    fi
-
-    local _vllm_py _pyver
-    _vllm_py=$(_gb_resolve_ml_python)
-    _pyver=$("$_vllm_py" --version 2>&1)
-    if [[ "$_pyver" =~ 3\.1[123]\. ]]; then
-        gb_info "vllm-env interpreter: $_vllm_py ($_pyver)"
-    else
-        gb_warn "no 3.11-3.13 interpreter found (system python3 is $_pyver) — "
-        gb_warn "building vllm-env with it anyway; if pip's resolver fails with a "
-        gb_warn "'conflicting dependencies' error naming cuda-tile/cuda-toolkit, "
-        gb_warn "that IS this: install python3.11/3.12/3.13 (conda/miniforge is the "
-        gb_warn "easiest route when the OS repos don't package it, e.g. Ubuntu "
-        gb_warn "26.04) and re-run 'greenboost install-vllm'"
-    fi
-
-    local _venv="$GB_PY_DEST/vllm-env"
-    if [[ ! -d "$_venv" ]]; then
-        if ! "$_vllm_py" -m venv "$_venv" &>/tmp/gb_vllm_venv.log; then
-            gb_warn "vllm-env creation failed (see /tmp/gb_vllm_venv.log) — skipping vLLM install"
-            return 0
-        fi
-    fi
-
-    gb_info "Installing vLLM ${GB_VLLM_VERSION:-0.24.0} into $_venv (multi-GB download) ..."
-    "$_venv/bin/pip" install --upgrade pip -q &>/tmp/gb_vllm_pip.log || true
-    if ! "$_venv/bin/pip" install -q "vllm==${GB_VLLM_VERSION:-0.24.0}" &>/tmp/gb_vllm_pip.log; then
-        gb_warn "vLLM pip install failed (see /tmp/gb_vllm_pip.log) — skipping vLLM install; gb-synapse falls back to the transformers engine for fp8/int8/int4 pulls"
-        return 0
-    fi
-
-    # Make the gb_*.py orchestration modules ($GB_PY_DEST) importable inside
-    # the venv , same .pth mechanism cmd_install_cli uses (gb_llm_server.py's
-    # transformers fallback also needs this, and vLLM subprocess env inherits
-    # PYTHONPATH from the shim_env() launcher — this .pth is belt-and-braces
-    # for any tool run directly against vllm-env's own interpreter).
-    local _sp
-    for _sp in "$_venv"/lib/python3.*/site-packages; do
-        [[ -d "$_sp" ]] && echo "$GB_PY_DEST" > "$_sp/greenboost.pth"
-    done
-
-    if ! "$_venv/bin/vllm" --version &>/tmp/gb_vllm_smoke.log; then
-        gb_warn "vllm --version smoke test failed (see /tmp/gb_vllm_smoke.log) — install may be incomplete"
-    fi
-
-    gb_ok "vLLM installed  ($_venv/bin/vllm , gb_synapse_backends._find_vllm_bin() picks it up automatically)"
-}
-
 # cmd_install_synapse_engine , provision the torch-core inference engine
-# (vendored gLLM, synapse_engine/) that will become gb-synapse's default
-# safetensors backend (SynapseTorchBackend, a later phase of the gb-synapse
-# unification — vLLM/transformers are the live backends until then).
+# (vendored gLLM, synapse_engine/) — gb-synapse's default safetensors
+# backend (SynapseTorchBackend), with transformers as its fallback.
 #
-# Modeled on cmd_install_vllm: same $GB_PY_DEST-rooted system venv, same
-# best-effort discipline (a missing venv module, offline mode, or a pip
-# failure only warns , Full Install must never abort here), same
-# _gb_resolve_ml_python() interpreter selection (this is exactly the class of
+# Same $GB_PY_DEST-rooted system venv, same best-effort discipline (a
+# missing venv module, offline mode, or a pip failure only warns , Full
+# Install must never abort here), same _gb_resolve_ml_python() interpreter
+# selection (this is exactly the class of
 # heavy torch/cuda dependency chain that helper exists for).
 #
 # Default-ON: opt out with GB_INSTALL_SYNAPSE_ENGINE=0. GB_INSTALL_BNB=1 adds
@@ -4734,12 +4880,12 @@ cmd_install_synapse_engine() {
     gb_info "Installing the synapse torch engine into $_venv (multi-GB download) ..."
     "$_venv/bin/pip" install --upgrade pip -q &>/tmp/gb_synapse_engine_pip.log || true
     if ! "$_venv/bin/pip" "${_pip_args[@]}" &>>/tmp/gb_synapse_engine_pip.log; then
-        gb_warn "synapse torch engine pip install failed (see /tmp/gb_synapse_engine_pip.log) — skipping; gb-synapse falls back to vLLM/transformers for safetensors serving"
+        gb_warn "synapse torch engine pip install failed (see /tmp/gb_synapse_engine_pip.log) — skipping; gb-synapse falls back to transformers for safetensors serving"
         return 0
     fi
 
     # Make the gb_*.py orchestration modules ($GB_PY_DEST) importable inside
-    # the venv , same .pth mechanism cmd_install_vllm/cmd_install_cli use.
+    # the venv , same .pth mechanism cmd_install_cli uses.
     local _sp
     for _sp in "$_venv"/lib/python3.*/site-packages; do
         [[ -d "$_sp" ]] && echo "$GB_PY_DEST" > "$_sp/greenboost.pth"
@@ -5368,6 +5514,9 @@ case "\$1" in
     pull)            exec "\$GB_SETUP" pull "\${@:2}" ;;
     synapse)         exec "\$GB_SETUP" synapse "\${@:2}" ;;
     setup|install|full-install) exec "\$GB_SETUP" "\$@" ;;
+    install-python)          exec "\$GB_SETUP" install-python ;;
+    install-cli)             exec "\$GB_SETUP" install-cli ;;
+    install-synapse-engine)  exec "\$GB_SETUP" install-synapse-engine ;;
     install-pipelines)  exec "\$GB_SETUP" install-pipelines ;;
     register-mcp)       exec "\$GB_SETUP" register-mcp ;;
     uninstall)          exec "\$GB_SETUP" uninstall ;;
@@ -9568,6 +9717,7 @@ cmd_update_feeders() {
 
     gb_info "Step 1/2 , matching gb-synapse engine…"
     cmd_feeders_sync_synapse || gb_warn "gb-synapse engine sync had failures (see above) , continuing to GreenBoost build"
+    cmd_feeders_sync_synapse_torch || gb_warn "gb-synapse torch engine sync had failures (see above) , continuing to GreenBoost build"
 
     gb_info "Step 2/2 , building GreenBoost on each feeder from source…"
     _gb_feeders_upgrade_from_source
@@ -9621,11 +9771,17 @@ cmd_feeders_setup_sudo() {
         done
         printf '\n' > /dev/tty
 
-        # sudo -S reads the password from stdin - no TTY or PTY needed
+        # sudo -S reads the password from stdin - no TTY or PTY needed.
+        # Both /bin/bash (generic remote commands) and /usr/bin/python3 (the
+        # gb_synapse.update_engine() invocation cmd_feeders_sync_synapse runs
+        # via `sudo -n python3 -c ...`) need NOPASSWD - a bash-only rule left
+        # sync-synapse's actual build step hitting "sudo: interactive
+        # authentication is required" even though the pre-flight
+        # `sudo -n bash -c true` check passed clean.
         local _setup_rc=0
         "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=30 \
             -o StrictHostKeyChecking=no "${_ssh_user}@${_ip}" \
-            "sudo -S sh -c 'echo \"${_ssh_user} ALL=(root) NOPASSWD: /bin/bash\" > /etc/sudoers.d/greenboost && chmod 440 /etc/sudoers.d/greenboost && echo SUDOERS_OK' 2>/dev/null" \
+            "sudo -S sh -c 'printf \"%s\\n%s\\n\" \"${_ssh_user} ALL=(root) NOPASSWD: /bin/bash\" \"${_ssh_user} ALL=(root) NOPASSWD: /usr/bin/python3\" > /etc/sudoers.d/greenboost && chmod 440 /etc/sudoers.d/greenboost && echo SUDOERS_OK' 2>/dev/null" \
             <<< "$_sudo_pass" | grep -q "SUDOERS_OK" || _setup_rc=$?
         if (( _setup_rc == 0 )); then
             printf "    %b\n" "${C_LIME}✓  sudo configured - upgrade-greenboost will now work${C_RESET}"
@@ -9861,6 +10017,8 @@ cmd_feeders_sync_synapse() {
     local _hostver
     _hostver=$(cat /usr/local/lib/greenboost/synapse/engine.version 2>/dev/null)
     [[ -z "$_hostver" ]] && die "Cannot determine host gb-synapse engine version , run: greenboost synapse build-engine"
+    local _hostpin
+    _hostpin=$(cat /usr/local/lib/greenboost/third_party/llama.cpp/PINNED_COMMIT 2>/dev/null)
 
     gb_section "Sync gb-synapse engine to feeders  (host version: ${_hostver})"
     local _ssh_as=()
@@ -9884,6 +10042,23 @@ cmd_feeders_sync_synapse() {
             gb_ok "  Already at ${_fver} (matches host ${_hostver}) , no change."
             _ok=$((_ok+1)); continue
         fi
+        # Pin-parity check BEFORE attempting a rebuild: the vendored source
+        # now travels with the feeder's own `git pull` of this repo (see
+        # cmd_install_python_files), not a live fetch — if the feeder's
+        # checkout hasn't been updated, rebuilding just reproduces the same
+        # stale version and reports a confusing "still doesn't match"
+        # instead of the real problem (a repo-sync gap, not a build gap).
+        if [[ -n "$_hostpin" ]]; then
+            local _fpin
+            _fpin=$("${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+                "${_user}@${_ip}" "cat /usr/local/lib/greenboost/third_party/llama.cpp/PINNED_COMMIT 2>/dev/null" 2>/dev/null)
+            if [[ -n "$_fpin" && "$_fpin" != "$_hostpin" ]]; then
+                gb_warn "  Feeder's vendored llama.cpp pin (${_fpin:0:9}) differs from host's (${_hostpin:0:9}) — "
+                gb_warn "  this feeder's greenboost repo checkout is behind, not just its build. On the "
+                gb_warn "  feeder: git pull && sudo greenboost install-python, then re-run this sync."
+                _fail=$((_fail+1)); continue
+            fi
+        fi
         gb_info "  Feeder has ${_fver:-none} → rebuilding to ${_hostver} (streaming build output)…"
         if ! "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
                 "${_user}@${_ip}" "sudo -n bash -c true" 2>/dev/null; then
@@ -9905,19 +10080,65 @@ cmd_feeders_sync_synapse() {
             gb_warn "  Build did not reach ${_hostver} (feeder reports ${_newver:-none}, rc=${_rc})"
             _fail=$((_fail+1))
         fi
-
-        # vLLM is single-node only (no --rpc-equivalent cluster split for the
-        # VllmBackend yet) — report per-feeder presence for visibility, never
-        # gate sync success on it.
-        if "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
-                "${_user}@${_ip}" "test -x /usr/local/lib/greenboost/vllm-env/bin/vllm" 2>/dev/null; then
-            gb_info "  vLLM present on this feeder (single-node backend — not cluster-split)"
-        else
-            gb_info "  vLLM not installed on this feeder (fine — vLLM is single-node only)"
-        fi
     done < "$GB_CLUSTER_CONF"
     echo ""
     gb_info "gb-synapse engine sync: ${_ok} ok, ${_fail} failed"
+    (( _fail == 0 ))
+}
+
+# cmd_feeders_sync_synapse_torch , bring every feeder's gb-synapse TORCH
+# engine (synapse-torch-env venv) up if missing — needed for cluster-PP
+# (gLLM slave ranks, gb_synapse.ensure_feeder_gllm_slave) which requires the
+# torch venv on EVERY feeder, not just the host. cmd_feeders_sync_synapse
+# above only ever synced the llama.cpp --rpc engine; a feeder that never had
+# `sudo greenboost install-synapse-engine` run on it silently failed every
+# cluster-PP join attempt with nothing telling the operator to run that.
+# Usage: sudo greenboost feeders sync-synapse-torch
+cmd_feeders_sync_synapse_torch() {
+    need_root "feeders sync-synapse-torch"
+    [[ -f "$GB_CLUSTER_CONF" ]] || die "No feeders configured - run: sudo greenboost connect <IP>"
+
+    gb_section "Sync gb-synapse torch engine to feeders"
+    local _ssh_as=()
+    [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]] && _ssh_as=(runuser -u "$SUDO_USER" --)
+
+    local _ok=0 _fail=0
+    while IFS= read -r _line; do
+        [[ -z "$_line" || "$_line" == \#* ]] && continue
+        local _ip _user
+        _ip=$(echo "$_line" | awk '{print $1}'); _ip="${_ip%%:*}"
+        _user=$(echo "$_line" | awk '{print $3}'); _user="${_user:-root}"
+        printf "\n  ${C_VIOLET}%-22s${C_RESET} %s@%s\n" "$(echo "$_line" | awk '{print $2}')" "$_user" "$_ip"
+
+        # Already present? — same venv search order
+        # gb_synapse.ensure_feeder_gllm_slave() itself uses.
+        if "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+                "${_user}@${_ip}" \
+                'for p in "$HOME/.local/share/greenboost/synapse/torch-env" /usr/local/lib/greenboost/synapse-torch-env; do [ -x "$p/bin/python" ] && exit 0; done; exit 1' \
+                2>/dev/null; then
+            gb_ok "  Torch engine venv already present, no change."
+            _ok=$((_ok+1)); continue
+        fi
+
+        if ! "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+                "${_user}@${_ip}" "sudo -n bash -c true" 2>/dev/null; then
+            gb_warn "  No passwordless sudo , run: sudo greenboost feeders setup-sudo"
+            _fail=$((_fail+1)); continue
+        fi
+
+        gb_info "  Installing torch engine (multi-GB download, streaming output)…"
+        if "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=1800 -o StrictHostKeyChecking=no \
+                "${_user}@${_ip}" "sudo -n greenboost install-synapse-engine" \
+                2>&1 | sed 's/^/    /'; then
+            gb_ok "  Torch engine installed."
+            _ok=$((_ok+1))
+        else
+            gb_warn "  Torch engine install failed on this feeder (see output above)"
+            _fail=$((_fail+1))
+        fi
+    done < "$GB_CLUSTER_CONF"
+    echo ""
+    gb_info "gb-synapse torch engine sync: ${_ok} ok, ${_fail} failed"
     (( _fail == 0 ))
 }
 
@@ -12079,7 +12300,6 @@ cmd_wizard() {
         gb_menu_item  8  "Tune GRUB"                 "Boot params: hugepages, rcu_nocbs, nohz_full (needs reboot)"  root
         gb_menu_item  9  "Generate inference config"  "Optimized Ollama/HF config for this hardware & environment"
         gb_menu_item 10  "Build gb-synapse engine"   "From-source llama.cpp build (llama-server, rpc-server, llama-quantize)"  root
-        gb_menu_item 20  "Install vLLM"              "gb-synapse VllmBackend venv (fp8-floor safetensors serving)"  root
         gb_menu_item 21  "Install synapse torch engine"  "gb-synapse torch-core engine (vendored gLLM) into synapse-torch-env"  root
 
         gb_section "Restore"
@@ -12130,7 +12350,6 @@ cmd_wizard() {
             17) cmd_clear_logs;                      gb_press_enter ;;
             18) cmd_uninstall;                       gb_press_enter ;;
             19) cmd_install_python_files;            gb_press_enter ;;
-            20) cmd_install_vllm;                    gb_press_enter ;;
             21) cmd_install_synapse_engine;          gb_press_enter ;;
             q|Q|"") exit 0 ;;
             *) gb_warn_ui "Unknown option."; sleep 1 ;;
@@ -12376,7 +12595,6 @@ cmd_help() {
         echo -e "  ${C_CYAN}${C_BOLD}ADVANCED:${C_RESET}"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-python"        "Copy gb_*.py orchestration stack to /usr/local/lib/greenboost/"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-cli"           "Install greenboost-cli (gb) into /usr/local/lib/greenboost/cli-venv"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-vllm"          "Install vLLM (gb-synapse VllmBackend) into /usr/local/lib/greenboost/vllm-env [GB_INSTALL_VLLM=0 to skip]"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-synapse-engine" "Install the synapse torch engine (vendored gLLM) into synapse-torch-env [GB_INSTALL_SYNAPSE_ENGINE=0 to skip]"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-pipelines"     "Provision ai-forge pipeline deps (PaddleOCR etc.) via setup_*.sh"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "register-mcp"          "Register GreenBoost MCP servers with the Claude CLI (per-user)"
@@ -12813,18 +13031,10 @@ cmd_full_install() {
         gb_warn_ui "gb-synapse engine build failed — retry later: sudo greenboost synapse build-engine"
     fi
 
-    # 7 - vLLM engine (gb-synapse's VllmBackend). Default-on (opt-out
-    # GB_INSTALL_VLLM=0); best-effort under set -euo pipefail, same as the
-    # synapse engine build above — a failure here shouldn't take down an
-    # otherwise-successful Full Install.
-    cmd_install_vllm || gb_warn_ui "vLLM install failed — retry later: sudo greenboost install-vllm"
-
-    # 7b - synapse torch engine (vendored gLLM, synapse_engine/). Default-on
-    # (opt-out GB_INSTALL_SYNAPSE_ENGINE=0); same best-effort discipline as
-    # the vLLM step above. This is a NEW, separate engine alongside vLLM
-    # (not yet a replacement — that cutover is a later phase of the
-    # gb-synapse unification, once SynapseTorchBackend lands), so both
-    # install steps run.
+    # 7 - synapse torch engine (vendored gLLM, synapse_engine/) —
+    # gb-synapse's default safetensors backend. Default-on (opt-out
+    # GB_INSTALL_SYNAPSE_ENGINE=0); best-effort under set -euo pipefail — a
+    # failure here shouldn't take down an otherwise-successful Full Install.
     cmd_install_synapse_engine || gb_warn_ui "synapse torch engine install failed — retry later: sudo greenboost install-synapse-engine"
 
     # ── Final state guarantee (defects 2026-07-13) ───────────────────────
@@ -12994,8 +13204,9 @@ case "$COMMAND" in
             genkey)             cmd_feeders_genkey ;;
             redeploy-netd)      cmd_feeders_redeploy_netd ;;
             sync-synapse)       cmd_feeders_sync_synapse ;;
+            sync-synapse-torch) cmd_feeders_sync_synapse_torch ;;
             sync-ollama)        gb_warn_ui "'greenboost feeders sync-ollama' is deprecated , gb-synapse is THE Ollama replacement, use: sudo greenboost feeders sync-synapse"; cmd_feeders_sync_ollama ;;
-            *) die "Usage: greenboost feeders [setup-sudo|diag|export-key|import-key|genkey|redeploy-netd|sync-synapse]  (to update feeders: sudo greenboost update feeders)" ;;
+            *) die "Usage: greenboost feeders [setup-sudo|diag|export-key|import-key|genkey|redeploy-netd|sync-synapse|sync-synapse-torch]  (to update feeders: sudo greenboost update feeders)" ;;
         esac
         ;;
     built-stamp)         cmd_built_stamp "${@:2}" ;;
@@ -13048,7 +13259,6 @@ case "$COMMAND" in
     recover)                cmd_recover               ;;
     install-python|install_python) cmd_install_python_files ;;
     install-cli|install_cli)       cmd_install_cli           ;;
-    install-vllm|install_vllm)     cmd_install_vllm          ;;
     install-synapse-engine|install_synapse_engine) cmd_install_synapse_engine ;;
     install-pipelines|install_pipelines) cmd_install_pipelines ;;
     register-mcp|register_mcp)     cmd_register_mcp          ;;

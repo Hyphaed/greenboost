@@ -1347,10 +1347,37 @@ cmd_full_install() {
     gb_ok "GRUB updated"
 
     # Generate hardware profile
+    local main_script="$MODULE_DIR/greenboost_setup.sh"
     if [[ ! -f "${GB_ACTIVE_PROFILE_LINK}" ]]; then
-        local main_script="$MODULE_DIR/greenboost_setup.sh"
         [[ -x "$main_script" ]] && "$main_script" profile create 2>/dev/null || true
         gb_ok "Hardware profile generated"
+    fi
+
+    # 5c - Python orchestration stack + MCP + gb-synapse (delegated to the
+    # main, distro-agnostic setup script — this Arch installer only ever
+    # covered the kernel module + CUDA shim + system tuning above; the whole
+    # Python/MCP/CLI/gb-quant/gb-dataflux/gb-synapse layer was silently
+    # absent on Arch until now. Each step mirrors greenboost_setup.sh's own
+    # Full Install: best-effort, never aborts the install on failure — a
+    # missing/incompatible piece here should warn and let the user retry it
+    # standalone, not fail the whole Arch install.
+    if [[ -x "$main_script" ]]; then
+        gb_info "Applying: Python orchestration stack (gb-quant/gb-dataflux/gb-synapse/CLI)"
+        "$main_script" install-python \
+            || gb_warn "Python file install had failures — retry: sudo ./greenboost_setup.sh install-python"
+        "$main_script" install-cli \
+            || gb_warn "greenboost-cli install had failures — retry: sudo ./greenboost_setup.sh install-cli"
+        "$main_script" register-mcp \
+            || gb_warn "MCP registration had failures — retry: greenboost register-mcp"
+        if [[ "${GB_INSTALL_SYNAPSE_ENGINE:-1}" != "0" ]]; then
+            "$main_script" install-synapse-engine \
+                || gb_warn "gb-synapse torch engine install had failures — retry: sudo greenboost install-synapse-engine"
+            "$main_script" synapse build-engine \
+                || gb_warn "gb-synapse llama.cpp engine build had failures — retry: sudo greenboost synapse build-engine"
+        fi
+        gb_ok "Python orchestration stack + gb-synapse installed"
+    else
+        gb_warn "greenboost_setup.sh not found next to this script — skipping Python/MCP/gb-synapse install"
     fi
 
     echo ""

@@ -185,8 +185,10 @@ to 8**
   and `greenboost_pilot` tools alongside the existing dataflux-log tools.
 - `gb_synapse_tools.py` - text-based tool-call injection for GGUFs that
   don't emit native OpenAI `tool_calls`, shared by gb-synapse serving.
-- `gb_llm_server.py` - minimal OpenAI-compatible server on `gb_llm.py`;
-  the "gbquant" engine fallback gb-synapse uses when vLLM isn't installed.
+- `gb_synapse_fallback.py` - minimal single-request OpenAI-compatible server
+  (transformers + gb-quant quantize-to-fit); gb-synapse's fallback engine
+  when its torch-core engine (vendored gLLM) can't take a checkpoint or
+  isn't installed.
 - `gb_placement.py` - fp8-floor cluster-fit planner (`GB_PLACEMENT=1`);
   prefers a connected feeder over dropping below fp8, and arbitrates
   between GGUF RPC tensor-split and PyTorch `offload_tail_blocks`.
@@ -409,8 +411,8 @@ can adopt them one at a time:
 │  Layer 5 · gb_diffusion_orch.py , diffusion pipeline orchestrator │
 │  (multi-component management: VAE, CLIP, UNet/DiT)               │
 ├─────────────────────────────────────────────────────────────────┤
-│  Layer 4 · gb_llm.py , LLM inference quantization               │
-│  (HuggingFace Transformers + vLLM, apply gb-quant at load time)  │
+│  Layer 4 · gb_synapse_fallback.py , LLM inference quantization  │
+│  (HuggingFace Transformers, apply gb-quant at load time)          │
 ├─────────────────────────────────────────────────────────────────┤
 │  Layer 3 · gb_quant.py , weight quantize-to-fit                  │
 │  (shrink weights to fit VRAM: bf16 → int8 → int4 → tq3 → tq2)   │
@@ -518,16 +520,20 @@ model = quantize_module(model)   # planner picks the right precision for each la
 `GB_QUANT_BUDGET_GB` overrides the VRAM budget. A warm-kernel autotune cache
 (`~/.cache/greenboost/`) means Triton compilation only happens once.
 
-### Layer 4 , `gb_llm.py` (LLM inference)
+### Layer 4 , `gb_synapse_fallback.py` (LLM inference)
 
-**What it solves:** Wiring gb-quant into HuggingFace Transformers or vLLM with
-the right hooks and profiler annotations.
+**What it solves:** Wiring gb-quant into HuggingFace Transformers with the
+right hooks and profiler annotations. gb-synapse's own torch-core engine
+(vendored gLLM) is the primary LLM serving path for continuous-batching
+throughput; this layer is what it falls back to for a checkpoint the torch
+core can't yet take, and what any script can import directly for a quick
+single-request load.
 
 ```python
-from gb_llm import load_model_gb
+from gb_synapse_fallback import load_causal_lm
 
 # Loads a HF model, auto-selects quantization, pins KV cache to the right tier
-model, tokenizer = load_model_gb("mistralai/Mistral-7B-v0.3")
+model, tokenizer = load_causal_lm("mistralai/Mistral-7B-v0.3")
 ```
 
 NVTX range `gb:llm_load:<model>` is emitted around the load phase so Nsight
@@ -1557,10 +1563,11 @@ embeds = gb_quant.encode_then_quantize(pipe, prompts)
 gb_quant.maybe_quantize_from_env(model)
 ```
 
-LLMs go through `gb_llm.py` (`load_causal_lm` for transformers; vLLM via
-the bundled plugin: `vllm serve <model> --quantization gemlite`). Ollama
-runs pre-quantized GGUF - there the lever is the shim plus the quant level
-you pull.
+LLMs go through `gb_synapse_fallback.py` (`load_causal_lm` for transformers)
+or, for continuous-batching throughput, gb-synapse's own torch-core engine
+(vendored gLLM — native bf16/GPTQ/AWQ/FP8 quantization at load time, see
+`workflow/gb-synapse.md`). Ollama runs pre-quantized GGUF - there the lever
+is the shim plus the quant level you pull.
 
 gb-quant and the tiers are complementary: quantize to fit FIRST, then let
 T2 absorb only what genuinely exceeds the quantized footprint. Measured on

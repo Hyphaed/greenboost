@@ -2266,6 +2266,33 @@ cmd_full_install() {
         cmd_profile_create
     fi
 
+    # 5c - Python orchestration stack + MCP + gb-synapse (delegated to the
+    # main, distro-agnostic setup script — this Rocky/RHEL installer only
+    # ever covered the kernel module + CUDA shim + system tuning above; the
+    # whole Python/MCP/CLI/gb-quant/gb-dataflux/gb-synapse layer was
+    # silently absent on Rocky until now. Each step mirrors
+    # greenboost_setup.sh's own Full Install: best-effort, never aborts the
+    # install on failure.
+    local main_script="$MODULE_DIR/greenboost_setup.sh"
+    if [[ -x "$main_script" ]]; then
+        info "Applying: Python orchestration stack (gb-quant/gb-dataflux/gb-synapse/CLI)"
+        "$main_script" install-python \
+            || warn "Python file install had failures — retry: sudo ./greenboost_setup.sh install-python"
+        "$main_script" install-cli \
+            || warn "greenboost-cli install had failures — retry: sudo ./greenboost_setup.sh install-cli"
+        "$main_script" register-mcp \
+            || warn "MCP registration had failures — retry: greenboost register-mcp"
+        if [[ "${GB_INSTALL_SYNAPSE_ENGINE:-1}" != "0" ]]; then
+            "$main_script" install-synapse-engine \
+                || warn "gb-synapse torch engine install had failures — retry: sudo greenboost install-synapse-engine"
+            "$main_script" synapse build-engine \
+                || warn "gb-synapse llama.cpp engine build had failures — retry: sudo greenboost synapse build-engine"
+        fi
+        gb_ok "Python orchestration stack + gb-synapse installed"
+    else
+        warn "greenboost_setup.sh not found next to this script — skipping Python/MCP/gb-synapse install"
+    fi
+
     info "╔══════════════════════════════════════════════════════════════╗"
     info "║  Full install complete!                                      ║"
     info "╚══════════════════════════════════════════════════════════════╝"

@@ -323,11 +323,25 @@ gb_cutlass:
 	    python3 third_party/gb_cutlass/setup.py build_ext --inplace
 	@echo "[GreenBoost] Built gb_cutlass extension (enable at runtime with GB_CUTLASS_ENABLE=1 after bench)"
 
+# Speed Program Phase 0 opt-in: path-bandwidth microbenchmark (bulk H2D/D2H,
+# VRAM d2d, zero-copy SM read, staged-DMA-then-read). NOT part of `all` or
+# `install` — a dev measurement tool, same status as gb_cutlass above.
+# GB_BENCH_ARCH overrides the target SM arch (default sm_120a — Blackwell,
+# this box's RTX 5070); NVCC overrides the compiler path.
+NVCC          ?= nvcc
+GB_BENCH_ARCH ?= sm_120a
+pathbench: tests/bench/gb_pathbench.cu
+	$(NVCC) -O3 -arch=$(GB_BENCH_ARCH) -std=c++17 \
+	    -o tests/bench/gb_pathbench tests/bench/gb_pathbench.cu -lcuda
+	@echo "[GreenBoost] Built tests/bench/gb_pathbench (arch=$(GB_BENCH_ARCH))"
+	@echo "[GreenBoost]   Run: python3 tests/bench/gb_pathbench.py"
+
 clean: ebpf-clean
 	$(MAKE) -C $(KDIR) M=$(PWD) $(KERNEL_LLVM) clean
 	rm -f $(SHIM) $(AUDIT) $(AUDIT32) $(VMM_OVERRIDE) $(NETD) greenboost_cuda_v12.o
 	rm -f third_party/gb_cutlass/*.so third_party/gb_cutlass/_gb_cutlass_C*.so
 	rm -rf third_party/gb_cutlass/build
+	rm -f tests/bench/gb_pathbench
 
 install: all dkms-install install-libs
 	@echo "[GreenBoost] Install complete. Load with: sudo modprobe greenboost"

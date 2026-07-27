@@ -1,0 +1,40 @@
+GreenBoost third_party/llama.cpp — vendored third-party code
+===============================================================
+
+Upstream project: llama.cpp
+Repository:       https://github.com/ggml-org/llama.cpp
+Upstream commit:  e8f19cc0ad70a243c8012bf17b4be601abfc8ea2 (2026-07-16)
+License:          MIT License (see LICENSE, verbatim from upstream)
+Import date:      2026-07-24
+
+What was imported
+------------------
+CMakeLists.txt, CMakePresets.json, cmake/, src/, include/, ggml/, common/,
+tools/, vendor/, gguf-py/, conversion/, grammars/, requirements/, scripts/,
+convert_hf_to_gguf.py, LICENSE, licenses/ — verbatim, from
+https://github.com/ggml-org/llama.cpp at the pinned commit.
+
+NOT vendored: models/ (test-fixture GGUFs), docs/, tests/, benches/,
+examples/, pocs/, app/, media/ — this repo's own tests cover the
+GreenBoost-side integration instead (same exclusion policy as
+synapse_engine/NOTICE). `LLAMA_BUILD_TESTS`/`LLAMA_BUILD_EXAMPLES`/
+`LLAMA_BUILD_APP` are passed =OFF at configure time by
+gb_synapse.build_engine() since these excluded directories are exactly
+what those CMake options gate — they default ON in a standalone build
+(LLAMA_STANDALONE), so the OFF flags are load-bearing, not cosmetic:
+without them cmake fails looking for the missing add_subdirectory() paths.
+
+`scripts/` was NOT in the original prune list and had to be added after a
+real `cmake --build` against the pruned tree failed — `tools/ui` (part of
+`llama-server`) needs `scripts/ui-assets.cmake` to build its embedded web
+UI. Verified 2026-07-24: a full `cmake --build` of all four targets
+(llama-server, llama-cli, ggml-rpc-server, llama-quantize) against this
+exact pruned tree succeeds and all four binaries run.
+
+Local modifications
+--------------------
+Every local patch to the vendored tree MUST be appended below, in order,
+so future contributors can tell upstream code from GreenBoost's own
+changes at a glance.
+
+- 2026-07-24: Initial import, no source modifications yet.

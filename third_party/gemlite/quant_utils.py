@@ -106,7 +106,15 @@ class WeightQuantizerMXFP:
 
         return W_q, scales
     
-    @torch.compile(fullgraph=True)
+    # fullgraph=False: same reason as quantize_nvfp4 below - round_to_closest_fp4
+    # indexes LazyDeviceTensors (fp4_p_vals/fp4_thresholds), whose __getitem__
+    # calls torch.cuda.is_current_stream_capturing() (a non-Tensor-returning
+    # torch.* op), which Dynamo cannot trace under fullgraph=True. Quantization
+    # is a one-time load step - graph breaks are fine here. Found via gemlite's
+    # own test_serialization.py (TestMXScales2Dto5D/TestNnSequentialRoundTripMX),
+    # which quantize_nvfp4's existing fix didn't cover since it's a different
+    # function.
+    @torch.compile(fullgraph=False)
     def quantize_mxfp4(
         self, W: torch.Tensor, window_size: int = 0, index: bool = False
     ) -> (torch.Tensor, torch.Tensor):

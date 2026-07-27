@@ -198,6 +198,21 @@ class GpuProfile:
     t2_tolerance_gb: float            # GB of T2 DDR the quality tier may reserve
                                       # (DERIVED at runtime = family fraction ×
                                       # this node's real T2 pool; see gpu_profile)
+    # Subset of `precisions` plan_quality()'s per-layer ladder walk is allowed
+    # to pick implicitly. Excludes "tq3"/"tq2" (and "nvfp4" unless explicitly
+    # passed) , gb_quant_calib's dequant emulators for those are plain per-row
+    # absmax approximations, not the real kernels (workflow/gb-quant.md:
+    # measured tq3 relative error ~6x the near_lossless ceiling), so letting
+    # the automatic quality-fit walk reach them would silently trust a wrong
+    # number. tq*/nvfp4 stay reachable via an explicit scalar `bits=` call.
+    # Auto-derived from `precisions` when left unset (empty tuple sentinel);
+    # pass explicitly only to override.
+    calibrated_precisions: Tuple = ()
+
+    def __post_init__(self) -> None:
+        if not self.calibrated_precisions:
+            self.calibrated_precisions = tuple(
+                p for p in self.precisions if p not in ("tq3", "tq2", "nvfp4"))
 
 
 # Family table: (cc_min, cc_max) → (family, precisions, floor, quality_default, t2_tol_frac).
@@ -247,6 +262,30 @@ def _t2_pool_total_gb() -> float:
     return 0.0
 
 
+def _nvfp4_allowed() -> bool:
+    return os.environ.get("GB_ALLOW_NVFP4", "0") == "1"
+
+
+def _gate_nvfp4(profile: "GpuProfile") -> "GpuProfile":
+    """Blackwell's nvfp4 precision routes straight into a documented Triton
+    sm_120 compiler crash (workflow/known-issues.md). gpu_profile()'s own
+    `quality_default`/tiered-mode floor steer new quantize calls into it by
+    default, so this must be filtered in the planner itself, not left as a
+    CLI-only workaround — a fresh Blackwell install must not crash on its
+    first quantize call. Opt back in with GB_ALLOW_NVFP4=1 once a fixed
+    Triton ships."""
+    if "nvfp4" not in profile.precisions or _nvfp4_allowed():
+        return profile
+    precisions = tuple(p for p in profile.precisions if p != "nvfp4")
+    floor_default = 4 if profile.floor_default == "nvfp4" else profile.floor_default
+    quality_default = "fp8" if profile.quality_default == "nvfp4" else profile.quality_default
+    return GpuProfile(
+        family=profile.family, cc=profile.cc, precisions=precisions,
+        floor_default=floor_default, quality_default=quality_default,
+        t2_tolerance_gb=profile.t2_tolerance_gb,
+    )
+
+
 def gpu_profile(device: int = 0) -> GpuProfile:
     """Return the GpuProfile for `device` (cached after the first call).
 
@@ -273,11 +312,11 @@ def gpu_profile(device: int = 0) -> GpuProfile:
     cc = torch.cuda.get_device_capability(device)
     for (cc_min, cc_max, family, precisions, floor, q_def, t2_frac) in _GPU_FAMILIES:
         if cc_min <= cc <= cc_max:
-            _GPU_PROFILE_CACHE = GpuProfile(
+            _GPU_PROFILE_CACHE = _gate_nvfp4(GpuProfile(
                 family=family, cc=cc, precisions=precisions,
                 floor_default=floor, quality_default=q_def,
                 t2_tolerance_gb=round(t2_frac * pool_gb, 1),
-            )
+            ))
             return _GPU_PROFILE_CACHE
 
     # Unknown/future architecture: conservative safe fallback (0.15 fraction)
@@ -319,10 +358,107 @@ def _bits_tag(bits) -> str:
         return "fp8"
     return f"int{bits}" if isinstance(bits, int) else str(bits)
 
+
+# Precision tokens below the fp8 quality floor , the owner precision rule
+# (fp8 is the default; anything below it is a deliberate quality/footprint
+# tradeoff, never silently applied). Keyed on the NORMALIZED value
+# normalize_bits_token() returns, not the raw user string.
+_BELOW_FP8_BITS = (8, 4, "nvfp4", "tq3", "tq2")
+
+
+def normalize_bits_token(token: str) -> "int | str":
+    """Canonical user-facing precision-token -> gb_quant-accepted `bits`
+    value. Single source of truth for every caller that parses a bits
+    string from a human or another process (greenboost-cli's
+    quant_cmds._normalize_bits, gb_actuation.set_quant_policy) , previously
+    each had its own ad hoc mapping, and quant_cmds' own version mapped
+    "bf16" to the STRING "bf16", which none of quantize_module/_bits_tag/
+    _BYTES_PER_PARAM recognize as gb_quant's actual bf16-passthrough
+    sentinel (the int 16) , it fell through into the real per-layer
+    quantize path and ValueError'd deep inside _delegate_patch/
+    _build_processor instead of no-op'ing as bf16 is supposed to.
+
+    "auto" is returned as a passthrough literal ("auto"), NOT resolved to a
+    concrete precision here , what "auto" means differs per caller
+    (quant_cmds._run_inprocess treats it as "use quantize_to_fit with a
+    VRAM-derived budget", a whole different code path from a scalar bits
+    value; a caller with no such auto-fit mode of its own, e.g.
+    maybe_quantize_from_env, resolves it via gpu_profile().quality_default
+    itself). Previously quant_cmds' own _normalize_bits resolved "auto" to
+    a hardcoded "fp8" immediately, which made _run_inprocess's own
+    `if bits == "auto":` branch unreachable dead code , this restores it.
+    Genuinely unrecognized tokens fall back to "fp8" (mirrors the previous
+    quant_cmds default, a safe floor on any family)."""
+    t = token.strip().lower()
+    if t in ("int4", "4"):
+        return 4
+    if t in ("int8", "8"):
+        return 8
+    if t in ("fp8", "e4m3"):
+        return "fp8"
+    if t == "nvfp4":
+        return "nvfp4"
+    if t in ("tq3", "3"):
+        return "tq3"
+    if t in ("tq2", "2"):
+        return "tq2"
+    if t == "bf16":
+        return 16
+    if t == "auto":
+        return "auto"
+    return "fp8"
+
+
 # Components we never quantize (small, precision-sensitive, or non-Linear-heavy).
 _DEFAULT_SKIP_COMPONENTS = ("vae", "scheduler", "image_processor", "feature_extractor")
 # Linear sub-modules to leave at full precision inside a quantized component.
 _DEFAULT_SKIP_MODULES = ("lm_head", "vision", "visual", "embed", "norm", "proj_out")
+
+# Buffer/param/submodule name fragments that mean "this nn.Linear's weights are
+# ALREADY quantized by someone else" — re-quantizing them corrupts state or
+# crashes outright. Real incident (2026-07-26): LongLive's FourOverSixLinear
+# subclasses nn.Linear and registers `quantized_weight_values`/`_scale_factors`
+# buffers with `weight` nulled; _delegate_patch's isinstance(l, nn.Linear) scan
+# matched it and would have read `layer.weight.dtype` on a None weight.
+#   quantized_weight*  LongLive/FourOverSix NVFP4 (fouroversix/.../linear.py)
+#   weight_scale/scale_inv  compressed-tensors, DeepSeek-style fp8 checkpoints
+#   scale_factors/_amax/weight_quantizer  TransformerEngine, NVIDIA ModelOpt
+#   qweight  GPTQ / AWQ / Marlin
+#   _gb_impl  a previous gb_quant pass over the same layer (idempotency)
+_PREQUANT_NAME_HINTS = ("quantized_weight", "weight_scale", "scale_factors",
+                        "weight_quantizer", "_amax", "qweight", "scale_inv",
+                        "_gb_impl")
+_FLOAT_WEIGHT_DTYPES = (torch.float64, torch.float32, torch.float16, torch.bfloat16)
+
+
+def is_prequantized_linear(layer: "torch.nn.Module") -> bool:
+    """True when `layer` is an nn.Linear (or subclass) whose weight is not a
+    plain, live float tensor — i.e. already quantized/compressed by something
+    other than gb_quant, or already gb_quant'd once.
+
+    Reads `layer._parameters` directly, never `layer.weight`: some quantizers
+    delete the attribute entirely (nulled weight), and a `__getattr__`
+    override on the owning module (e.g. LongLive's DynamicSwapInstaller,
+    utils/memory.py) can turn a plain `.weight` read into a device copy.
+
+    Deliberately NOT a `type(layer) is not nn.Linear` check: that would
+    false-positive on legitimate float-weight Linear subclasses (e.g.
+    `torch.nn.modules.linear.NonDynamicallyQuantizableLinear`, used as
+    `nn.MultiheadAttention.out_proj`) and would also miss a plain `nn.Linear`
+    loaded from an fp8/int checkpoint with no distinguishing subclass at all.
+    """
+    params = getattr(layer, "_parameters", None)
+    if params is None:
+        return False
+    w = params.get("weight")
+    if w is None:
+        return True                                   # weight stripped/deleted
+    if getattr(w, "dtype", None) not in _FLOAT_WEIGHT_DTYPES:
+        return True                                   # fp8/int storage already
+    names = (tuple(getattr(layer, "_buffers", ()) or ())
+             + tuple(params)
+             + tuple(getattr(layer, "_modules", ()) or ()))
+    return any(hint in n for n in names for hint in _PREQUANT_NAME_HINTS)
 
 
 @dataclass
@@ -590,12 +726,18 @@ def _delegate_patch(module, processor, skip_modules, group_size, device,
     _backend_counts: Dict[str, int] = {}
 
     seen = set()
+    n_prequant_skipped = 0
+    n_bf16_kept = 0
+    n_scalar_fallback = 0
     linears = [(n, l) for n, l in module.named_modules()
                if isinstance(l, torch.nn.Linear)]
     for name, layer in linears:
         if id(layer) in seen:
             continue
         seen.add(id(layer))
+        if is_prequantized_linear(layer):
+            n_prequant_skipped += 1
+            continue
         layer.name = name                      # parity with backend patch_model
         layer.to(device=device, non_blocking=True)
         if any(s in name for s in skip_modules):
@@ -611,8 +753,22 @@ def _delegate_patch(module, processor, skip_modules, group_size, device,
         # Determine this layer's bits.
         if per_layer_bits is not None:
             bits = per_layer_bits.get(name)
-            if bits is None or bits == 16:
-                # Not in plan or kept BF16 , skip quantization.
+            if bits is None:
+                # Layer missing from the plan (structural drift between
+                # plan_quality() and this module, or a caller that combines
+                # a per-layer plan with a scalar default) , this docstring's
+                # own contract is "use scalar_bits", but that fallback never
+                # actually ran: it silently kept the layer BF16, identical
+                # to bits==16, with no accounting anywhere that a layer
+                # fell outside the plan. A large layer silently staying
+                # BF16 this way is exactly how a plan that "fits" OOMs.
+                if scalar_bits is None:
+                    n_bf16_kept += 1
+                    continue
+                bits = scalar_bits
+                n_scalar_fallback += 1
+            if bits == 16:
+                n_bf16_kept += 1
                 continue
             gs = group_size if bits == 4 else None
             if gs is not None and in_f % gs != 0:
@@ -658,12 +814,15 @@ def _delegate_patch(module, processor, skip_modules, group_size, device,
         layer.forward = impl.forward
     module.to(device=device)
 
-    if _backend_counts:
+    if _backend_counts or n_prequant_skipped or n_bf16_kept or n_scalar_fallback:
         try:
             import gb_dataflux
             gb_dataflux.emit({"kind": "kernel_backend",
                               "env": _env_backend,
-                              "backends": _backend_counts})
+                              "backends": _backend_counts,
+                              "skipped_prequantized": n_prequant_skipped,
+                              "bf16_kept": n_bf16_kept,
+                              "scalar_fallback": n_scalar_fallback})
         except Exception:
             pass
 
@@ -694,9 +853,14 @@ def quantize_module(module, bits, device: str = "cuda",
 
     if per_layer_bits is not None:
         # Per-layer quality path: build processors lazily in _delegate_patch.
+        # scalar_bits=bits , this docstring's own contract ("bits is used
+        # only as the default for layers not in the dict") was never wired
+        # through: a layer plan_quality() didn't cover (structural drift
+        # between planning and this call) silently stayed BF16 unaccounted
+        # instead of falling back to `bits` as documented.
         with _gb_nvtx("gb:quantize:per_layer", color="cyan"):
             _delegate_patch(module, None, list(skip_modules), group_size, device,
-                            per_layer_bits=per_layer_bits)
+                            per_layer_bits=per_layer_bits, scalar_bits=bits)
         gc.collect()
         _gb_cache_release()
         return module
@@ -1001,7 +1165,7 @@ def plan_quality(module: "torch.nn.Module",
         in_f = layer.in_features
         if in_f < 32 or in_f % 32 != 0:
             continue
-        if layer.weight is None:
+        if is_prequantized_linear(layer):
             continue
 
         n_params = layer.weight.numel()
@@ -1014,25 +1178,27 @@ def plan_quality(module: "torch.nn.Module",
             bits = profile.quality_default
         else:
             layer_s = sensitivity[name]
-            q_default = profile.quality_default  # fp8 on Blackwell
-            bits = q_default  # quality default is the floor for non-compact tiers
-            # Walk the profile ladder: pick the LOWEST precision that still
-            # meets the error ceiling (highest quality that isn't BF16).
-            # Profile ladder is (16, "fp8", "nvfp4", 8, 4, ...) , skip 16.
-            for candidate in profile.precisions:
-                if candidate == 16:
-                    continue
+            # Walk the CALIBRATED ladder from the most-compressed precision
+            # upward toward fp8 (i.e. reversed from precisions' own
+            # highest-quality-first order), and take the FIRST one that
+            # meets the ceiling , that is what "select the LOWEST precision
+            # where rel_err <= error_ceiling" (this function's own
+            # docstring) means: don't spend more bits than the tier's
+            # quality floor requires. The previous walk went highest-
+            # quality-first and broke on the first (i.e. best, not lowest)
+            # match, so fp8 — always first in the Blackwell ladder and
+            # almost always under both the 3% and 8% ceilings — won
+            # unconditionally; "balanced" (8% ceiling) was byte-identical
+            # to "near_lossless" (3%), making the whole tier dead code.
+            ladder = [p for p in profile.calibrated_precisions if p != 16]
+            bits = 16
+            for candidate in reversed(ladder):
                 err = layer_s.get(candidate, 1.0)
                 if err <= error_ceil:
                     bits = candidate
                     break
-            else:
-                # No quantized precision meets the ceiling , this layer is
-                # genuinely sensitive. Keep BF16 (goes to T2 reservoir).
-                bits = 16
-            # Record the calibrated error for the chosen bits.
-            chosen_err = layer_s.get(bits, 0.0) if bits != 16 else 0.0
-            layer_errs_used.append(chosen_err)
+            # else: no calibrated precision meets the ceiling , this layer
+            # is genuinely sensitive. Keep BF16 (goes to T2 reservoir).
 
         # For INT4: check group_size divisibility.
         if bits == 4 and in_f % group_size != 0:
@@ -1042,6 +1208,14 @@ def plan_quality(module: "torch.nn.Module",
             bits = ladder[idx - 1] if idx > 0 else 16
 
         per_layer_bits[name] = bits
+        # Record the real calibrated error for whatever bits were actually
+        # assigned , covers compact/no-sensitivity/group-size-fallback
+        # layers too, not just the ladder-walk branch above (previously
+        # those were silently excluded from accounting, so
+        # QualityFitReport.__str__ reported mean_err=0.00000 for an
+        # all-compact plan as if it were lossless).
+        if bits != 16 and name in sensitivity and bits in sensitivity[name]:
+            layer_errs_used.append(sensitivity[name][bits])
 
     # T1 / T2 split estimate.
     # Priority: smallest quantized layers first → fill T1; BF16 + overflow → T2.
@@ -1082,6 +1256,19 @@ def plan_quality(module: "torch.nn.Module",
     )
     if verbose:
         print(str(report), flush=True)
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({
+            "node": "host", "label": "gb_quant", "kind": "quant_plan",
+            "n_items": len(per_layer_bits), "items": [model_id],
+            "duration_s": 0.0, "status": "ok",
+            "target": target, "error_ceiling": error_ceil,
+            "precision_histogram": hist,
+            "bf16_kept": hist.get("bf16", 0),
+            "mean_rel_err": round(mean_err, 5), "max_rel_err": round(max_err, 5),
+        })
+    except Exception:
+        pass
     return report
 
 
@@ -1457,13 +1644,17 @@ def maybe_quantize_from_env(obj, default_budget_gb: "float | None" = None,
     prefer_bits: "int | str" = 4
     raw_bits = os.environ.get("GB_QUANT_BITS", "").strip().lower()
     if raw_bits:
-        if raw_bits in ("tq3", "tq2", "3", "2"):
-            prefer_bits = "tq" + raw_bits.lstrip("tq")
-        elif raw_bits in ("4", "8"):
-            prefer_bits = int(raw_bits)
-        elif verbose:
-            print(f"[gb_quant] ignoring invalid GB_QUANT_BITS={raw_bits!r}",
-                  flush=True)
+        # Shared normalizer (also used by set_quant_policy/quant_cmds) , now
+        # accepts the full precision vocabulary (fp8/nvfp4/tq3/tq2/int8/int4/
+        # bf16/auto), not just the legacy tq*/3/2/4/8 subset this used to
+        # hand-parse. Unrecognized tokens fall back to "fp8" (a safe, real
+        # precision) rather than the old silent "ignore, keep default 4".
+        prefer_bits = normalize_bits_token(raw_bits)
+        if prefer_bits == "auto":
+            # This path has no quantize_to_fit-style auto-budget mode of its
+            # own (unlike quant_cmds._run_inprocess) , resolve to a concrete,
+            # family-aware precision instead.
+            prefer_bits = gpu_profile().quality_default
     if raw == "fit":
         budget = default_budget_gb
         if budget is None:

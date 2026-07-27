@@ -26,9 +26,25 @@ dependencies = [
     "pillow",
     "av",
     "datasets",
-    "gptqmodel",
+    "gptqmodel==7.2.0",     # pinned DOWN from unconstrained-latest (7.3.2) , that
+                            # version's models/definitions/solar_open2.py imports
+                            # transformers.masking_utils.create_recurrent_attention_mask,
+                            # absent from the pinned transformers==5.5.4 (confirmed:
+                            # neither solar_open2.py nor any reference to it exists in
+                            # 7.2.0's source). GPTQ and AWQ's linear methods share this
+                            # one lazy top-level import in gptqmodel/models/auto.py, so
+                            # ANY packed-int quantize call crashed at import time before
+                            # this pin, not just SolarOpen2 usage.
     "autoawq",
     "compressed-tensors",
+    "accelerate",           # third_party/auto_round's real, direct dep (was only
+                            # transitively present via transformers/gptqmodel/autoawq
+                            # before , declared explicitly so a future upstream
+                            # version bump there can't silently drop it)
+    "py-cpuinfo",           # third_party/auto_round/auto_round/utils/device.py does
+                            # a hard top-level `import cpuinfo` , not optional/lazy
+    "scipy",                # third_party/turboquant's core.py/cache.py/cuda_kernels.py
+                            # use scipy.stats.norm (Lloyd-Max Gaussian quantizer)
     # Pinned DOWN from pip's unconstrained latest — live bring-up (2026-07-16,
     # RTX 5070 sm120) found both of these break `import gllm` at the versions
     # pip resolves by default, before any model even loads. See

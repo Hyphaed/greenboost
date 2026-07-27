@@ -16,6 +16,10 @@ modules.order
 # Compiled shared library
 libgreenboost_cuda.so
 
+# Per-node build output — vendored llama.cpp is built locally on every
+# cluster node (host Intel / feeder AMD), never committed.
+third_party/llama.cpp/build-synapse/
+
 # Editor temp files
 nano.*.save
 *.swp

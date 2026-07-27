@@ -163,6 +163,7 @@ class GbSnapshot:
     # GPU live (nvidia-smi, best-effort)
     gpu_mem_used_mb: int = 0
     gpu_mem_total_mb: int = 0
+    gpu_util_pct: float = 0.0
     # shim flow (shim_stats)
     shim_stale: bool = True
     shim_phase: str = ""
@@ -197,7 +198,7 @@ class GbSnapshot:
             "t2_allocated_mb", "t2_available_mb", "t3_total_mb", "t3_used_mb",
             "total_combined_mb", "active_buffers", "oom_active", "swap_pressure",
             "t2_pressure", "kv_reserve_mb", "kv_used_mb", "kv_t2_mb",
-            "gaming_mode", "gpu_mem_used_mb", "gpu_mem_total_mb", "shim_stale",
+            "gaming_mode", "gpu_mem_used_mb", "gpu_mem_total_mb", "gpu_util_pct", "shim_stale",
             "shim_phase", "shim_active_path", "shim_pid", "error")}
         d["total_combined_gb"] = self.total_combined_gb
         d["indicator"] = self.indicator
@@ -256,7 +257,7 @@ def _probe_gpu(s: GbSnapshot) -> None:
     try:
         r = subprocess.run(
             ["nvidia-smi",
-             "--query-gpu=name,memory.used,memory.total",
+             "--query-gpu=name,memory.used,memory.total,utilization.gpu",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5)
         if r.returncode != 0:
@@ -269,6 +270,11 @@ def _probe_gpu(s: GbSnapshot) -> None:
             s.gpu_mem_total_mb = _to_int(parts[2])
             if not s.vram_physical_mb:
                 s.vram_physical_mb = s.gpu_mem_total_mb
+        if len(parts) >= 4:
+            try:
+                s.gpu_util_pct = float(parts[3])
+            except ValueError:
+                pass
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
@@ -317,6 +323,39 @@ def tier_stats() -> "dict | None":
         "swap_pressure": s.swap_pressure,
         "oom_active": s.oom_active,
     }
+
+
+def gpu_state() -> dict:
+    """{used_mb, total_mb, free_mb, util_pct} for the local GPU — the
+    typed accessor ai-forge's forge/gpu.py hand-rolled 3 nvidia-smi
+    subprocess calls for (vram_free_mb/gpu_utilization_pct/gpu_processes),
+    duplicating what snapshot()'s NVML probe already collects. util_pct is
+    only populated when the shim's GPU probe reports it (best-effort,
+    0.0 otherwise — a caller checking contention should treat 0.0 as
+    "unknown", not "idle")."""
+    s = snapshot(probe_gpu=True)
+    used = s.gpu_mem_used_mb
+    total = s.gpu_mem_total_mb
+    return {
+        "used_mb": used, "total_mb": total,
+        "free_mb": max(0, total - used) if total else 0,
+        "util_pct": s.gpu_util_pct,
+    }
+
+
+def wait_for_vram(free_mb: float, timeout_s: float = 60.0, poll_s: float = 1.0) -> bool:
+    """Block until at least `free_mb` of GPU VRAM is free, or `timeout_s`
+    elapses. Returns True if the budget was reached, False on timeout —
+    the polling guard ai-forge's forge/gpu.py built as `guard()` (added
+    after free-VRAM-alone missed a real contention case where another
+    process held the GPU at ~99% util with memory nominally free)."""
+    deadline = time.time() + timeout_s
+    while True:
+        if gpu_state()["free_mb"] >= free_mb:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(poll_s)
 
 
 def context_summary(stats: "dict | None" = None) -> str:

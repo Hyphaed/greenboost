@@ -198,12 +198,18 @@ _GPTQ_LEAF_NAMES = (".qweight", ".qzeros", ".scales", ".g_idx")
 
 
 def _gptq_leaf(k: str) -> "str | None":
-    """The GPTQ parameter leaf name at the end of `k` (qweight/qzeros/
-    scales/g_idx), or None for a plain weight/weight_scale key. GreenBoost
-    local patch (see synapse_engine/NOTICE) — GPTQ tensors are laid out
-    [rows, out_features(_packed)], the opposite axis convention from the
-    plain weight tensor, so fusing them needs a column-slice concat instead
-    of copy_qkv_proj/copy_gate_up_proj's row-slice."""
+    """The packed-quant parameter leaf name at the end of `k` (qweight/
+    qzeros/scales/g_idx), or None for a plain weight/weight_scale key.
+    GreenBoost local patch (see synapse_engine/NOTICE) — these tensors are
+    laid out [rows, out_features(_packed)], the opposite axis convention
+    from the plain weight tensor, so fusing them needs a column-slice
+    concat instead of copy_qkv_proj/copy_gate_up_proj's row-slice. Despite
+    the name, this also serves AWQ: AWQ's qweight/qzeros/scales checkpoint
+    tensors use the exact same leaf names and the same
+    [rows, out_features(_packed)] axis convention (AWQ has no g_idx
+    checkpoint key at all — its g_idx is a synthesized, unregistered
+    attribute, see gllm/layers/quantization/awq.py, so it never reaches
+    this function)."""
     for leaf in _GPTQ_LEAF_NAMES:
         if k.endswith(leaf):
             return leaf

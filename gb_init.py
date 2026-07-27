@@ -5,8 +5,9 @@
 gb_init.py , GreenBoost Python layer bootstrap.
 
 Single-import wiring module: idempotent, safe to import multiple times.
-All downstream GreenBoost modules (gb_quant, gb_diffusion_orch, gb_llm,
-gb_attn) import this at their top level when GREENBOOST_ACTIVE=1.
+All downstream GreenBoost modules (gb_quant, gb_diffusion_orch,
+gb_synapse_fallback, gb_attn) import this at their top level when
+GREENBOOST_ACTIVE=1.
 
 What this does on first import when GREENBOOST_ACTIVE=1:
   1. Enforces PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False (mandatory).
@@ -24,7 +25,7 @@ When GREENBOOST_ACTIVE != "1": import is a no-op (zero overhead for non-GB
 venvs, unit tests, CI environments).
 
 Usage in downstream modules:
-    # At the top of gb_quant.py, gb_llm.py, etc.:
+    # At the top of gb_quant.py, gb_synapse_fallback.py, etc.:
     import gb_init  # activates all layers when GREENBOOST_ACTIVE=1
 
     # Read the telemetry snapshot (always fast, no I/O):
@@ -309,8 +310,9 @@ def auto_budget_gb(headroom: float = 0.92) -> float:
     so it correctly accounts for the expanded address space.
     Torch fallback: raw cuMemGetInfo , real VRAM only, misses T2/T3 overflow.
 
-    Downstream callers (gb_quant, gb_llm) should call this instead of querying
-    torch.cuda.mem_get_info() directly so all budget decisions use the same view.
+    Downstream callers (gb_quant, gb_synapse_fallback) should call this
+    instead of querying torch.cuda.mem_get_info() directly so all budget
+    decisions use the same view.
     """
     m = snapshot()
     if m is not None and m.fb_free_mb > 0:

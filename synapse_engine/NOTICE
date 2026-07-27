@@ -142,6 +142,49 @@ own changes at a glance.
   `OverflowError` investigation above actually debuggable through the
   dataflux MCP instead of only through raw stderr.
 
+- 2026-07-26: `gllm/layers/quantization/awq.py` (new file, GreenBoost
+  addition) — AWQ (4-bit only, `zero_point: true` only) weight registration
+  and forward dequant+matmul, reusing GPTQ's already-vendored
+  `gptqmodel.nn_modules.triton_utils.dequant.quant_matmul` Triton kernel
+  rather than adding a second one: AWQ and GPTQ checkpoints store the
+  identical logical `[in_features, out_features]` matrix, group-quantized
+  the same way, so once AWQ's two real format differences are corrected the
+  GPTQ kernel dequants an AWQ checkpoint correctly. The two differences
+  (checked against AutoAWQ's own layout and vLLM's `auto_awq.py` reference
+  conversion), both fixed once, lazily, on first forward pass in
+  `_maybe_convert_awq_layout()` (the real packed values only exist after
+  the weight loader has filled them):
+    1. Packing axis — AWQ packs `qweight` along the OUTPUT dim
+       (`[in_features, out_features // pack_factor]`); GPTQ's kernel expects
+       it packed along the INPUT dim
+       (`[in_features // pack_factor, out_features]`). `qzeros` already
+       matches GPTQ's axis convention on disk, no change needed there.
+    2. Bit order within a packed word — AWQ interleaves sub-values as
+       `[0,4,1,5,2,6,3,7]` (4-bit); GPTQ uses plain sequential order.
+       `_AWQ_PACK_ORDER`/the unpack-reorder-repack math is copied from
+       vLLM's `auto_awq.py` (`_REVERSE_AWQ_PACK_ORDER`), a previously
+       solved/tested constant, not re-derived.
+  No g_idx checkpoint key (AWQ has no `desc_act` equivalent): a trivial
+  `arange(in_features) // group_size` is computed once and kept as a plain
+  unregistered tensor attribute (never a checkpoint-loaded Parameter), so
+  the weight loader never looks for a `.g_idx` key no AWQ checkpoint has on
+  disk. No v1/v2 zero-point offset quirk either (GPTQ-specific) — AWQ's raw
+  `qzeros` already encode the true zero point directly.
+
+- 2026-07-26: `gllm/layers/linear.py` — `create_weights()` and
+  `dispatch_quant_method()` gained a `quant_method == "awq"` branch each,
+  mirroring the `"gptq"` branches added 2026-07-16, dispatching to the new
+  `awq_create_weights`/`awq_linear_method` above.
+
+- 2026-07-26: `gllm/models/weight_loader.py` — `_gptq_leaf()`'s docstring
+  updated to note it also serves AWQ despite the name: AWQ's
+  qweight/qzeros/scales checkpoint tensors use the exact same leaf names and
+  `[rows, out_features(_packed)]` axis convention GPTQ's leaf-detection and
+  column-concat helpers already handle, so no new AWQ-specific code path was
+  needed there (AWQ's g_idx never reaches this function at all — it's a
+  synthesized, unregistered attribute per the awq.py note above, not a
+  checkpoint key). No behavior change, comment-only.
+
 Why `synapse_engine/logger.py` exists
 --------------------------------------
 Upstream `gllm/` does `from logger import logger` in ~22 files, expecting

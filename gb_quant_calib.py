@@ -238,6 +238,7 @@ def _iter_quantizable_linears(
     skip_modules: Tuple[str, ...],
 ) -> Iterable[Tuple[str, nn.Linear]]:
     """Yield (name, layer) for every quantizable nn.Linear in `module`."""
+    from gb_quant import is_prequantized_linear  # lazy: gb_quant imports this module too
     for name, layer in module.named_modules():
         if not isinstance(layer, nn.Linear):
             continue
@@ -245,7 +246,7 @@ def _iter_quantizable_linears(
             continue
         if layer.in_features < _MIN_IN_FEATURES:
             continue
-        if layer.weight is None:
+        if is_prequantized_linear(layer):
             continue
         yield name, layer
 
@@ -357,4 +358,233 @@ def calibrate_pipeline_components(
             mod, precisions=precisions, model_id=comp_id,
             group_size=group_size, verbose=verbose,
         )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Real-activation calibration via the vendored AutoRound AutoScheme search
+# (third_party/auto_round , see NOTICE). Additive: calibrate_sensitivity's
+# zero-data Frobenius proxy above stays the default everywhere , this is
+# opt-in (sensitivity_source="delta_loss" / GB_QUANT_CALIB=delta_loss) for
+# callers that have a real tokenizer and want the sub-0.1% regime refined
+# with actual forward-pass activations instead of random-Gaussian ones.
+# ---------------------------------------------------------------------------
+
+# GreenBoost's own tiny, stdlib-only default calibration corpus , no
+# `datasets` dependency for GreenBoost's OWN prompt set (third_party/
+# auto_round's internal calibration dataloader is a separate matter and
+# already depends on `datasets`, see its own NOTICE). Deliberately short and
+# diverse (code, prose, dialogue, numbers) rather than large , this is a
+# sensitivity PROBE, not a training corpus.
+_DEFAULT_CALIB_PROMPTS: Tuple[str, ...] = (
+    "The quick brown fox jumps over the lazy dog while the sun sets slowly "
+    "behind the distant mountains, painting the sky in shades of orange.",
+    "def fibonacci(n):\n    if n <= 1:\n        return n\n    return "
+    "fibonacci(n - 1) + fibonacci(n - 2)\n",
+    "In a shocking turn of events, scientists have discovered that the "
+    "average temperature of the ocean has risen by 0.5 degrees over the "
+    "past decade, raising concerns about marine ecosystems.",
+    "Q: What is the capital of France?\nA: The capital of France is Paris, "
+    "a city known for its art, culture, and the Eiffel Tower.",
+    "SELECT customer_id, SUM(order_total) FROM orders WHERE order_date > "
+    "'2026-01-01' GROUP BY customer_id ORDER BY SUM(order_total) DESC;",
+    "Dear team, following our meeting yesterday, I wanted to summarize the "
+    "action items: 1) finalize the budget, 2) schedule the review, "
+    "3) notify stakeholders by Friday.",
+    "The mitochondria is the powerhouse of the cell, converting nutrients "
+    "into adenosine triphosphate (ATP) through a process called cellular "
+    "respiration.",
+    "12 + 37 = 49. If a train travels at 80 km/h for 3.5 hours, it covers "
+    "280 kilometers, assuming a constant speed and no stops along the way.",
+)
+
+
+def _calib_prompts(prompts: "Iterable[str] | None" = None) -> "list[str]":
+    """Resolve the real-activation calibration prompt set: explicit
+    `prompts` arg > GB_QUANT_CALIB_PROMPTS (one prompt per line in a plain
+    text file) > GreenBoost's own small stdlib-only default corpus."""
+    if prompts is not None:
+        return list(prompts)
+    path = os.environ.get("GB_QUANT_CALIB_PROMPTS", "").strip()
+    if path:
+        try:
+            with open(os.path.expanduser(path), encoding="utf-8") as f:
+                lines = [ln.strip() for ln in f if ln.strip()]
+            if lines:
+                return lines
+        except OSError:
+            pass
+    return list(_DEFAULT_CALIB_PROMPTS)
+
+
+def _ensure_auto_round_path() -> None:
+    """Make the vendored AutoRound tree (third_party/auto_round/auto_round)
+    importable , same env-override > greenboost/third_party search order
+    gb_quant._ensure_vendored_paths() uses for gemlite/hqq."""
+    import importlib.util
+    import sys as _sys
+    override = os.environ.get("GB_AUTO_ROUND_PATH")
+    candidates = [override, os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "third_party", "auto_round")]
+    try:
+        present = importlib.util.find_spec("auto_round") is not None
+    except (ImportError, ValueError):
+        present = False
+    if present:
+        return
+    for path in candidates:
+        if path and os.path.isdir(os.path.join(path, "auto_round")) and path not in _sys.path:
+            _sys.path.insert(0, path)
+            return
+
+
+def _require_auto_round():
+    """Import the vendored AutoRound AutoScheme entry points, raising a
+    clear, actionable error if the tree or its (real, heavier-than-gb_quant's
+    own) runtime deps are missing , mirrors gb_quant._require_gemlite()'s
+    pattern. Never imported at this module's own top level: opt-in only.
+    Returns (AutoScheme, GenScheme, preset_name_to_scheme) , all 3 AutoRound
+    symbols calibrate_with_prompts needs, from one choke point (a single
+    entry point is also what makes this trivially mockable in tests)."""
+    _ensure_auto_round_path()
+    try:
+        from auto_round.auto_scheme.gen_auto_scheme import AutoScheme, GenScheme
+        from auto_round.schemes import preset_name_to_scheme
+        return AutoScheme, GenScheme, preset_name_to_scheme
+    except Exception as e:
+        raise RuntimeError(
+            "calibrate_with_prompts needs third_party/auto_round (vendored "
+            "AutoRound AutoScheme) plus its runtime deps (accelerate, "
+            "datasets, py-cpuinfo , declared in synapse_engine/pyproject.toml, "
+            "installed via `sudo greenboost install-synapse-engine`). "
+            f"Original error: {e!r}"
+        ) from e
+
+
+# AutoRound QuantizationScheme preset names for gb_quant's own precision
+# vocabulary , only the ones gb_quant.GpuProfile.calibrated_precisions ever
+# picks automatically (fp8/int8/int4); tq3/tq2/nvfp4 have no AutoRound
+# preset equivalent and are never part of this search.
+_GB_BITS_TO_AUTOROUND_PRESET = {"fp8": "FP8", 8: "INT8", 4: "INT4"}
+_AUTOROUND_PRESET_TO_GB_BITS = {v: k for k, v in _GB_BITS_TO_AUTOROUND_PRESET.items()}
+
+
+def calibrate_with_prompts(
+    module: nn.Module,
+    tokenizer,
+    prompts: "Iterable[str] | None" = None,
+    options: "Tuple[str, ...] | list" = ("fp8", 8, 4),
+    avg_bits: "float | None" = None,
+    model_id: str = "model",
+    skip_modules: Tuple[str, ...] = _DEFAULT_SKIP_MODULES,
+    nsamples: int = 8,
+    seqlen: int = 512,
+    device_map: "str | None" = None,
+    verbose: bool = True,
+    force_recompute: bool = False,
+) -> Dict[str, object]:
+    """Real-activation per-layer bit ASSIGNMENT via the vendored AutoRound
+    AutoScheme search (delta-loss method) , the sub-0.1% regime this
+    module's own docstring names as calibrate_sensitivity's future
+    extension point.
+
+    Unlike calibrate_sensitivity() (a per-layer, per-precision ERROR TABLE
+    that plan_quality()'s own ladder walk picks from), this returns a
+    per-layer bits ASSIGNMENT directly , AutoRound's search algorithm picks
+    the final scheme itself, it does not score a ladder of independent
+    options the way the zero-data Frobenius proxy does. Feed the result
+    straight into quantize_module(module, bits=<floor>,
+    per_layer_bits=result) , this bypasses plan_quality()'s ladder walk
+    entirely for this path, it does not slot into `sensitivity=`.
+
+    `avg_bits`: target average bits/param across `options`. Defaults to the
+    midpoint of the achievable range (computed once options are resolved)
+    when unset , a caller with no strong opinion gets a sane default rather
+    than an error.
+
+    Cached to disk like calibrate_sensitivity(), but in a SEPARATE
+    namespace (model_id suffixed with the source) so the two calibration
+    sources never collide or overwrite each other's cache entries for the
+    same model_id.
+
+    Known live-verification gap: this has been verified to import and wire
+    correctly against the real vendored AutoRound package (third_party/
+    auto_round/NOTICE), but end-to-end correctness of the actual per-layer
+    scores needs a real tokenizer + model + forward pass to confirm , not
+    yet re-run against a live model in this session. Treat a first real run
+    as a verification step, not an assumed-correct dependency.
+    """
+    # Validate options / build the preset-name list first , pure lookups
+    # against a local dict, no need to touch AutoRound (or fail loudly if
+    # it's missing) for a call that's about to be a cache hit anyway.
+    options = tuple(options)
+    preset_names = []
+    for opt in options:
+        name = _GB_BITS_TO_AUTOROUND_PRESET.get(opt)
+        if name is None:
+            raise ValueError(
+                f"calibrate_with_prompts: option {opt!r} has no AutoRound preset "
+                f"equivalent (supported: {sorted(_GB_BITS_TO_AUTOROUND_PRESET, key=str)})")
+        preset_names.append(name)
+
+    quant_layer_names = [name for name, _ in _iter_quantizable_linears(module, skip_modules)]
+    if not quant_layer_names:
+        return {}
+
+    resolved_prompts = _calib_prompts(prompts)
+    cache_hash = _model_hash(module, tuple(preset_names), nsamples) + "_" + \
+        hashlib.sha256("\n".join(resolved_prompts).encode()).hexdigest()[:8]
+    cpath = _cache_path(f"{model_id}.delta_loss", cache_hash)
+
+    if not force_recompute:
+        cached = _load_cache(cpath)
+        if cached is not None:
+            if verbose:
+                print(f"[gb_quant_calib] delta_loss cache loaded: {cpath}", flush=True)
+            # Unlike calibrate_sensitivity's cache (int PRECISION keys need
+            # restoring after JSON stringifies dict keys), this cache's keys
+            # are layer names (always strings) and values are bits (int or
+            # str) , JSON round-trips those correctly with no ambiguity, no
+            # restoration needed.
+            return cached
+
+    # Only reached on a cache MISS , a warm cache hit above must never touch
+    # AutoRound at all (its real deps are heavier than gb_quant's own).
+    AutoScheme, GenScheme, preset_name_to_scheme = _require_auto_round()
+    schemes = [preset_name_to_scheme(n) for n in preset_names]
+    bit_options = [float(s.bits) for s in schemes]
+    target = avg_bits if avg_bits is not None else (min(bit_options) + max(bit_options)) / 2.0
+
+    if verbose:
+        print(f"[gb_quant_calib] delta_loss: {len(quant_layer_names)} layers, "
+              f"options={preset_names}, target avg_bits={target:.2f}, "
+              f"{len(resolved_prompts)} calibration prompts …", flush=True)
+
+    auto_scheme = AutoScheme(
+        avg_bits=target, options=list(preset_names),
+        nsamples=nsamples, seqlen=seqlen, device_map=device_map,
+        low_gpu_mem_usage=True, low_cpu_mem_usage=True,
+    )
+    gen = GenScheme(
+        auto_scheme, module, quant_layer_names, fixed_layer_scheme={},
+        tokenizer=tokenizer,
+    )
+    layer_config = gen.get_layer_config()
+
+    result: Dict[str, object] = {}
+    for name, cfg in layer_config.items():
+        bits = cfg.get("bits")
+        data_type = str(cfg.get("data_type", "int"))
+        if data_type in ("fp8", "float8_e4m3fn"):
+            result[name] = "fp8"
+        else:
+            result[name] = _AUTOROUND_PRESET_TO_GB_BITS.get(
+                f"INT{bits}" if bits is not None else None, bits)
+
+    gc.collect()
+    _save_cache(cpath, result)
+    if verbose:
+        print(f"[gb_quant_calib] delta_loss done , {len(result)} layers assigned. "
+              f"Cache saved: {cpath}", flush=True)
+    return result
     return out

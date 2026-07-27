@@ -35,6 +35,27 @@ def tiering_status(probe_gpu: bool = True) -> dict:
         return {"error": f"gb_tiering: shim/kmod state unavailable: {e}"}
 
 
+def t2_pool() -> dict:
+    """Narrow, typed T2 DDR pool accessor: {total_mb, allocated_mb,
+    available_mb, pressure}. The data already lives inside tiering_status()
+    (via gb_monitor.snapshot()); this exists because ai-forge had to
+    regex-scrape /sys/class/greenboost/greenboost/pool_brief directly in
+    two places (forge/gpu.py, forge/runners/longlive.py) for exactly this
+    number, duplicating what this module already computes. Returns all-
+    zero fields (not an error) when the shim/kmod state is unavailable —
+    a T2 pool of size 0 is itself a valid, actionable answer for a caller
+    sizing a cgroup MemoryMax against it."""
+    status = tiering_status(probe_gpu=False)
+    if "error" in status:
+        return {"total_mb": 0, "allocated_mb": 0, "available_mb": 0, "pressure": 0}
+    return {
+        "total_mb": status.get("t2_pool_mb", 0),
+        "allocated_mb": status.get("t2_allocated_mb", 0),
+        "available_mb": status.get("t2_available_mb", 0),
+        "pressure": status.get("t2_pressure", 0),
+    }
+
+
 def manager():
     """The process-wide ModelTierManager singleton if gb_init started one
     (GREENBOOST_ACTIVE=1), else None. Prefer this over constructing your own so

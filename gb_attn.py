@@ -71,6 +71,104 @@ else:
 _layer_state_lock = threading.Lock()
 
 
+# ── Packed backend (third_party/turboquant, see NOTICE) ──────────────────────
+# P9: an alternative K-side quantizer/dequantizer sourced from the vendored
+# TurboQuant implementation (Zandieh et al., ICLR 2026), opt-in via
+# patch_sdpa(backend="packed") / GB_ATTN_BACKEND=packed. Default ("dequant")
+# is the module's own original K/V compression above , unchanged.
+#
+# Scope of THIS integration, stated plainly: it still dequantizes K before
+# calling the real `original_sdpa` (same safe structure as _tq_attn above ,
+# PyTorch's own SDPA kernel does the actual softmax/causal-mask/dropout math,
+# never a hand-rolled reimplementation of it), so it is a BANDWIDTH
+# optimization (a different, real Lloyd-Max + random-rotation codebook),
+# not yet the vendored package's more aggressive "skip K dequantization
+# entirely" fast path (`QuantizedAttention.quantized_attention_scores`) or
+# real PERSISTENT packed storage (`TurboQuantCache`, a `transformers`
+# `Cache` subclass , needs generation-loop wiring in SynapseTorchBackend/
+# gb_synapse_fallback, not just an SDPA patch, plus live VRAM measurement
+# to confirm the actual memory delta). Both are real, scoped follow-ons ,
+# not done here because neither can be verified without a live model
+# session in this environment. See third_party/turboquant/NOTICE.
+_turboquant_pkg_err = None
+
+
+def _ensure_turboquant_path() -> None:
+    import importlib.util
+    import sys as _sys
+    override = os.environ.get("GB_TURBOQUANT_PATH")
+    candidates = [override, os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "third_party", "turboquant")]
+    try:
+        present = importlib.util.find_spec("turboquant") is not None
+    except (ImportError, ValueError):
+        present = False
+    if present:
+        return
+    for path in candidates:
+        if path and os.path.isdir(os.path.join(path, "turboquant")) and path not in _sys.path:
+            _sys.path.insert(0, path)
+            return
+
+
+def _require_turboquant():
+    """Import the vendored TurboQuant K-side quantizer, raising a clear,
+    actionable error if the tree or its runtime deps (scipy , declared in
+    synapse_engine/pyproject.toml) are missing. Never imported at this
+    module's own top level: opt-in only."""
+    _ensure_turboquant_path()
+    try:
+        from turboquant.attention import QuantizedAttention
+        return QuantizedAttention
+    except Exception as e:
+        raise RuntimeError(
+            "backend=\"packed\" needs third_party/turboquant (vendored "
+            "TurboQuant) plus its one new runtime dep (scipy , declared in "
+            "synapse_engine/pyproject.toml, installed via `sudo greenboost "
+            f"install-synapse-engine`). Original error: {e!r}"
+        ) from e
+
+
+_packed_quantizer_cache: dict = {}
+
+
+def _get_packed_quantizer(bit_width: int, head_dim: int, device: str):
+    key = (bit_width, head_dim, str(device))
+    qa = _packed_quantizer_cache.get(key)
+    if qa is None:
+        QuantizedAttention = _require_turboquant()
+        qa = QuantizedAttention(bit_width, head_dim, torch.device(device))
+        _packed_quantizer_cache[key] = qa
+    return qa
+
+
+@torch.no_grad()
+def _packed_tq_attn(query, key, value, k_bits: int, v_bits, device: str,
+                    original_sdpa, **sdpa_kwargs):
+    """K-side quantize/dequantize via the vendored TurboQuant codebook
+    (Lloyd-Max + random rotation), V-side unchanged (this module's own
+    PolarQuant dequant) , then delegate the actual attention math to the
+    real `original_sdpa`, exactly like `_tq_attn` above. See the module-
+    level "Packed backend" note for what this does and does not cover yet.
+    """
+    qa = _get_packed_quantizer(int(k_bits), key.shape[-1], str(key.device))
+    K_idx, K_norms = qa.quantize_keys(key)
+    K_hat = qa.dequantize(K_idx, K_norms)
+
+    orig_dtype = query.dtype
+
+    if isinstance(v_bits, float) and v_bits != int(v_bits):
+        h_idx, h_norms, l_idx, l_norms, order, low_bits = _quantize_v_split(value, v_bits, device)
+        V_hat = _dequantize_v_split(h_idx, h_norms, l_idx, l_norms, order, low_bits, device)
+    else:
+        vb = int(v_bits)
+        Pi, Pi_T, centroids, boundaries, _ = _get_quantizer(vb, value.shape[-1], device)
+        V_idx, V_norms = _quantize(value, Pi_T, boundaries)
+        V_hat = _dequantize(V_idx, V_norms, Pi, centroids)
+
+    return original_sdpa(query, K_hat.to(orig_dtype), V_hat.to(orig_dtype), **sdpa_kwargs)
+
+
 # ── Lloyd-Max codebook ────────────────────────────────────────────────────────
 
 def _lloyd_max_gaussian(num_levels: int, sigma: float, max_iter: int = 500):
@@ -466,9 +564,19 @@ def _tq_attn_sparse_v(query, key, value, k_bits: int, v_bits, device: str, origi
 _original_sdpa = None
 
 
-def _make_tq_sdpa(k_bits: int, v_bits, device: str, sparse_v: bool, layer_adaptive: bool):
+def _make_tq_sdpa(k_bits: int, v_bits, device: str, sparse_v: bool, layer_adaptive: bool,
+                  backend: str = "dequant"):
     original = _F.scaled_dot_product_attention
-    attn_fn  = _tq_attn_sparse_v if sparse_v else _tq_attn
+    if backend == "packed":
+        if sparse_v:
+            raise ValueError('gb_attn: backend="packed" does not compose with '
+                             "sparse_v=True yet , use backend=\"dequant\" (the default) "
+                             "for sparse-V, or sparse_v=False for the packed K codebook.")
+        attn_fn = _packed_tq_attn
+    elif backend == "dequant":
+        attn_fn = _tq_attn_sparse_v if sparse_v else _tq_attn
+    else:
+        raise ValueError(f'gb_attn: unknown backend={backend!r}. Valid: "dequant" (default), "packed".')
 
     # @torch.compiler.disable: prevent dynamo from tracing into numpy/.item() code
     # inside _get_quantizer.  Without this, compile creates catastrophic graph breaks
@@ -822,12 +930,13 @@ _active_device:         Optional[str]   = None
 _active_sparse_v:       bool            = False
 _active_layer_adaptive: bool            = True
 _active_mode:           str             = "turboquant"
+_active_backend:        str             = "dequant"
 
 
 def patch_sdpa(bit_width: Union[int, float] = 3, device: str = "cuda",
                k_bits: int = None, v_bits: Union[int, float] = None,
                sparse_v: bool = False, layer_adaptive: bool = True,
-               mode: str = "turboquant", **mode_kwargs):
+               mode: str = "turboquant", backend: "str | None" = None, **mode_kwargs):
     """
     Globally replace F.scaled_dot_product_attention with TurboQuant+ or a KVPress mode.
 
@@ -838,6 +947,11 @@ def patch_sdpa(bit_width: Union[int, float] = 3, device: str = "cuda",
     v_bits:    explicit V bit width (PolarQuant). Defaults to max(floor(bit_width)−1, 2).
     sparse_v:  skip V positions with attention weight < 1% of max (sequences ≤4096 only).
     layer_adaptive: boundary layers get +1 bit for K automatically (default True).
+    backend:   "dequant" (default, this module's own K/V compression) or "packed"
+               (P9: K-side quantize/dequantize via the vendored TurboQuant codebook,
+               third_party/turboquant/NOTICE , mode="turboquant" only, not composable
+               with sparse_v=True yet). Defaults to GB_ATTN_BACKEND env var, else
+               "dequant" , unchanged behavior for every existing caller.
 
     KVPress mode_kwargs:
       snapkv:    keep_ratio=0.25    - fraction of K/V positions to retain
@@ -849,7 +963,7 @@ def patch_sdpa(bit_width: Union[int, float] = 3, device: str = "cuda",
                 → 6–12× KV compression (sparsify first, then quantise survivors).
     """
     global _original_sdpa, _active_k_bits, _active_v_bits, _active_device
-    global _active_sparse_v, _active_layer_adaptive, _active_mode
+    global _active_sparse_v, _active_layer_adaptive, _active_mode, _active_backend
     # PR-E: previously this silently no-op'd if a patch was already installed,
     # which made re-calling patch_sdpa() with different settings invisible to
     # the caller - a debugging nightmare.  Auto-unpatch first so the new
@@ -864,11 +978,19 @@ def patch_sdpa(bit_width: Union[int, float] = 3, device: str = "cuda",
         unpatch_sdpa()
     kb = k_bits if k_bits is not None else int(math.ceil(bit_width))
     vb = v_bits if v_bits is not None else max(bit_width - 1, 2)
+    if backend is None:
+        backend = os.environ.get("GB_ATTN_BACKEND", "dequant")
+    if backend == "packed" and mode != "turboquant":
+        raise ValueError(
+            f'gb_attn: backend="packed" is only wired for mode="turboquant" so far '
+            f"(got mode={mode!r}) , the KVPress-combined modes still silently use "
+            '"dequant" internally, so this raises rather than silently ignoring '
+            "the requested backend.")
 
     original = _F.scaled_dot_product_attention
 
     if mode == "turboquant":
-        patched, _ = _make_tq_sdpa(kb, vb, device, sparse_v, layer_adaptive)
+        patched, _ = _make_tq_sdpa(kb, vb, device, sparse_v, layer_adaptive, backend=backend)
     elif mode == "snapkv":
         patched, _ = _make_snapkv_sdpa(mode_kwargs.get("keep_ratio", 0.25), original)
     elif mode == "streaming":
@@ -946,6 +1068,7 @@ def patch_sdpa(bit_width: Union[int, float] = 3, device: str = "cuda",
     _active_sparse_v       = sparse_v
     _active_layer_adaptive = layer_adaptive
     _active_mode           = mode
+    _active_backend        = backend
     _F.scaled_dot_product_attention = patched
     import torch.nn.functional as F2
     F2.scaled_dot_product_attention = patched
@@ -973,7 +1096,7 @@ def unpatch_sdpa():
     impossible.  Now every unpatch returns the module to a fully-initial
     state."""
     global _original_sdpa, _active_k_bits, _active_v_bits, _active_device
-    global _active_sparse_v, _active_layer_adaptive, _active_mode
+    global _active_sparse_v, _active_layer_adaptive, _active_mode, _active_backend
     global _call_in_seq, _est_total_layers, _last_call_time
     if _original_sdpa is None:
         return
@@ -995,6 +1118,7 @@ def unpatch_sdpa():
         _est_total_layers = 0
         _last_call_time   = 0.0
     _active_mode           = "turboquant"
+    _active_backend        = "dequant"
 
 
 @contextmanager
@@ -1095,6 +1219,7 @@ def status() -> dict:
     return {
         "patched":        _original_sdpa is not None,
         "mode":           _active_mode,
+        "backend":        _active_backend,
         "k_bits":         _active_k_bits,
         "v_bits":         _active_v_bits,
         "layer_adaptive": _active_layer_adaptive,

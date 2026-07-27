@@ -21,7 +21,7 @@ from greenboost_cli.terminal.theme import (
 from greenboost_cli.environment.settings import GB_HOME
 from greenboost_cli.terminal.commands import register_command
 
-# Path to the GreenBoost source tree (gb_quant.py / gb_llm.py live here)
+# Path to the GreenBoost source tree (gb_quant.py / gb_synapse_fallback.py live here)
 from greenboost_cli.gb_paths import gb_py_root, gb_root_hint
 
 _GB_SRC = gb_py_root()
@@ -60,17 +60,20 @@ def _resolve_hf_id(name: str) -> str:
 
 
 def _normalize_bits(bits: str):
-    """Normalise user bit-width string to a gb_quant-accepted value (int or str)."""
-    b = bits.strip().lower()
-    if b in ("int4", "4"):
-        return 4
-    if b in ("int8", "8"):
-        return 8
-    if b in ("fp8", "e4m3"):
-        return "fp8"
-    if b in ("tq3", "tq2", "bf16"):
-        return b
-    return "fp8"   # safe default for unknown/auto on Blackwell
+    """Normalise user bit-width string to a gb_quant-accepted value (int or
+    str) , delegates to gb_quant.normalize_bits_token, the single shared
+    normalizer also used by gb_actuation.set_quant_policy. Previously this
+    had its own ad hoc copy that mapped "bf16" to the STRING "bf16" (which
+    gb_quant's quantize_module/_delegate_patch don't recognize as the real
+    bf16-passthrough sentinel, the int 16 , and later ValueError'd deep
+    inside _build_processor) and resolved "auto" straight to a hardcoded
+    "fp8", making _run_inprocess's own `if bits == "auto":` special-cased
+    quantize_to_fit path unreachable dead code. gb_quant.normalize_bits_token
+    fixes both: "bf16" -> 16, "auto" passes through unresolved so the
+    special case below stays reachable."""
+    _ensure_gb_path()
+    import gb_quant
+    return gb_quant.normalize_bits_token(bits)
 
 
 def _ensure_gb_path() -> None:
@@ -172,8 +175,8 @@ def _run_inprocess(hf_id: str, bits, _session, _settings: dict) -> None:
         pass
     _ensure_gb_path()
     try:
-        import gb_llm
-        reply = gb_llm.generate(model, tok, "Hello! What can you do?", max_new_tokens=64)
+        import gb_synapse_fallback
+        reply = gb_synapse_fallback.generate(model, tok, "Hello! What can you do?", max_new_tokens=64)
         console.print(f"\n[{GRAY}]Test generation:[/]")
         console.print(f"[{LIME}]{reply.strip()}[/]\n")
     except Exception as e:

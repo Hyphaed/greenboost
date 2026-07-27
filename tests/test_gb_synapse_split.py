@@ -17,10 +17,11 @@ import gb_synapse as gs
 
 
 class _FakeFeeder:
-    def __init__(self, t1_free_mb, link_mbps_ewma=0.0):
+    def __init__(self, t1_free_mb, link_mbps_ewma=0.0, t1_total_mb=0):
         self.t1_free_mb = t1_free_mb
         self.online = True
         self.link_mbps_ewma = link_mbps_ewma
+        self.t1_total_mb = t1_total_mb
 
 
 # ── estimate_kv_gb: real geometry vs bucket fallback ─────────────────────────
@@ -51,23 +52,40 @@ def test_kv_falls_back_to_bucket_without_geometry():
 
 
 # ── _compute_tensor_split: v1 default identity, v2 KV-aware + host bias ───────
+#
+# Every share below is free VRAM minus a %-derived per-device compute/graph
+# workspace reserve (gb_synapse._compute_reserve_gb == gb_topology's shared
+# max(0.75 GiB, 8% of that device's own VRAM) formula — see its docstring:
+# a flat "raw free VRAM" share used to hand a small feeder more than it could
+# actually hold). host_free=11000 -> reserve 880 MB -> free 10120;
+# feeder t1_free=7000 (no t1_total_mb, falls back to its own free as "total")
+# -> reserve 768 MB -> free 6232. Expectations are computed via the shared
+# helper below instead of hardcoded so a future reserve-formula tweak doesn't
+# silently desync the tests from the code.
+
+def _reserved_free_mb(mb: int) -> int:
+    return int(mb - gs._compute_reserve_gb(mb) * 1024.0)
+
 
 def test_split_v1_default_is_free_vram(monkeypatch):
     monkeypatch.delenv("GB_SYNAPSE_SPLIT_V2", raising=False)
     monkeypatch.delenv("GB_SYNAPSE_HOST_BIAS", raising=False)
     split = gs._compute_tensor_split(11000, [_FakeFeeder(7000)], kv_total_gb=4.0)
-    assert split == "11000,7000"             # exact v1 string, KV ignored
+    host = _reserved_free_mb(11000)
+    feeder = _reserved_free_mb(7000)
+    assert split == f"{host},{feeder}"       # KV ignored in v1; reserve still applied
+    assert split == "10120,6232"             # pinned so a reserve-formula change is visible
 
 
 def test_split_v2_subtracts_kv(monkeypatch):
     monkeypatch.setenv("GB_SYNAPSE_SPLIT_V2", "1")
     monkeypatch.delenv("GB_SYNAPSE_HOST_BIAS", raising=False)
-    # 2 GiB KV = 2048 MB spread proportionally over 11000+7000 free.
+    # Reserve applies first (10120/6232 free, as above), THEN 2 GiB KV spreads
+    # proportionally over that reserved-free total (16352 MB).
     split = gs._compute_tensor_split(11000, [_FakeFeeder(7000)], kv_total_gb=2.0)
     parts = [int(x) for x in split.split(",")]
-    # host loses 2048*11/18 ≈ 1252 -> ~9748 ; feeder loses ~796 -> ~6204
-    assert parts[0] == pytest.approx(9748, abs=5)
-    assert parts[1] == pytest.approx(6204, abs=5)
+    assert parts[0] == pytest.approx(8853, abs=5)
+    assert parts[1] == pytest.approx(5451, abs=5)
 
 
 def test_split_host_bias(monkeypatch):
@@ -75,15 +93,34 @@ def test_split_host_bias(monkeypatch):
     monkeypatch.setenv("GB_SYNAPSE_HOST_BIAS", "1.5")
     split = gs._compute_tensor_split(10000, [_FakeFeeder(10000)], kv_total_gb=0.0)
     parts = [int(x) for x in split.split(",")]
-    assert parts[0] == pytest.approx(15000, abs=5)   # host boosted 1.5x
-    assert parts[1] == pytest.approx(10000, abs=5)
+    reserved = _reserved_free_mb(10000)      # 9200 — same reserve on both sides
+    assert parts[0] == pytest.approx(reserved * 1.5, abs=5)   # host boosted 1.5x
+    assert parts[1] == pytest.approx(reserved, abs=5)         # feeder untouched by bias
 
 
 def test_split_bias_identity_is_v1(monkeypatch):
     monkeypatch.delenv("GB_SYNAPSE_SPLIT_V2", raising=False)
     monkeypatch.setenv("GB_SYNAPSE_HOST_BIAS", "1.0")
     split = gs._compute_tensor_split(11000, [_FakeFeeder(7000)], kv_total_gb=3.0)
-    assert split == "11000,7000"
+    assert split == f"{_reserved_free_mb(11000)},{_reserved_free_mb(7000)}"
+
+
+def test_split_reserve_scales_with_each_devices_own_total(monkeypatch):
+    """The reserve is per-device, derived from THAT device's own total VRAM
+    (t1_total_mb when known) — not a shared/host-derived figure. Two feeders
+    with identical free VRAM but different total capacity must get different
+    absolute reserves, and thus different final shares. This is the exact
+    failure mode _compute_reserve_gb's docstring cites: a small feeder handed
+    more share than it can actually hold when reserve wasn't per-device."""
+    monkeypatch.delenv("GB_SYNAPSE_SPLIT_V2", raising=False)
+    monkeypatch.delenv("GB_SYNAPSE_HOST_BIAS", raising=False)
+    small = _FakeFeeder(4000, t1_total_mb=4000)     # small card: reserve floors at 0.75 GiB
+    large = _FakeFeeder(4000, t1_total_mb=40000)    # same free, much bigger card: reserve scales up
+    split = gs._compute_tensor_split(30000, [small, large], kv_total_gb=0.0)
+    parts = [int(x) for x in split.split(",")]
+    assert parts[1] == 4000 - int(gs._compute_reserve_gb(4000) * 1024.0)
+    assert parts[2] == 4000 - int(gs._compute_reserve_gb(40000) * 1024.0)
+    assert parts[1] > parts[2]               # identical free VRAM, but the bigger card lost more to its reserve
 
 
 # ── v3 (GB_SYNAPSE_SPLIT_V3): link-quality-scaled feeder shares ─────────────

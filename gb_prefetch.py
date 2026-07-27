@@ -58,8 +58,8 @@ baseline, so there is no winning default to bake in) - this module's intended
 use case is a model NOT already placed by gb_quant (e.g. a raw bf16/fp8 stack
 overflowing via the shim's transparent cudaMalloc path), matching the
 DeepSpeed ZeRO-Infinity overlap pattern this module is modeled on. Stacking
-LayerPrefetcher on top of gb_llm.load_causal_lm (which always routes through
-gb_quant) is currently a net loss - don't do both.
+LayerPrefetcher on top of gb_synapse_fallback.load_causal_lm (which always
+routes through gb_quant) is currently a net loss - don't do both.
 
 Usage:
     import gb_prefetch
@@ -233,7 +233,7 @@ class LayerPrefetcher:
                 # on="gemm"): the named "gemm" stream is only current
                 # inside an explicit `with gs.on("gemm")` block (e.g.
                 # gb_diffusion_orch.py's denoise loop). Callers like
-                # gb_llm.generate() never enter that block, so forward
+                # gb_synapse_fallback.generate() never enter that block, so forward
                 # compute actually runs on torch's ambient current
                 # stream - waiting on "gemm" there is a no-op and the
                 # async H2D copy can still be in flight when the GEMM

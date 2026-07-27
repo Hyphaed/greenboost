@@ -122,16 +122,8 @@ def test_select_backend_routes_to_torch_when_engine_available(monkeypatch, engin
     assert isinstance(backend, gsb.SynapseTorchBackend)
 
 
-def test_select_backend_falls_back_to_vllm_when_torch_engine_unavailable(monkeypatch):
+def test_select_backend_falls_back_to_transformers_when_torch_engine_unavailable(monkeypatch):
     monkeypatch.setattr(gsb, "_torch_env_dir", lambda: None)
-    monkeypatch.setattr(gsb, "_find_vllm_bin", lambda: "/fake/vllm")
-    backend = gsb.select_backend(_FakeEntry("torch"))
-    assert isinstance(backend, gsb.VllmBackend)
-
-
-def test_select_backend_falls_back_to_transformers_when_neither_available(monkeypatch):
-    monkeypatch.setattr(gsb, "_torch_env_dir", lambda: None)
-    monkeypatch.setattr(gsb, "_find_vllm_bin", lambda: None)
     backend = gsb.select_backend(_FakeEntry("vllm"))
     assert isinstance(backend, gsb.TransformersBackend)
 
@@ -143,27 +135,6 @@ def test_select_backend_gbquant_legacy_routes_to_torch(monkeypatch):
     ModelEntry directly without going through the manifest)."""
     monkeypatch.setattr(gsb, "_torch_env_dir", lambda: Path("/fake/torch-env"))
     backend = gsb.select_backend(_FakeEntry("gbquant"))
-    assert isinstance(backend, gsb.SynapseTorchBackend)
-
-
-def test_select_backend_force_vllm_escape_hatch(monkeypatch):
-    """GB_SYNAPSE_FORCE_VLLM=1 + a real vllm binary present bypasses the
-    torch-engine default entirely — a soak-window escape hatch, dies in
-    Phase 6."""
-    monkeypatch.setenv("GB_SYNAPSE_FORCE_VLLM", "1")
-    monkeypatch.setattr(gsb, "_torch_env_dir", lambda: Path("/fake/torch-env"))
-    monkeypatch.setattr(gsb, "_find_vllm_bin", lambda: "/fake/vllm")
-    backend = gsb.select_backend(_FakeEntry("torch"))
-    assert isinstance(backend, gsb.VllmBackend)
-
-
-def test_select_backend_force_vllm_ignored_without_vllm_binary(monkeypatch):
-    """GB_SYNAPSE_FORCE_VLLM=1 with no real vllm binary must not crash or
-    silently serve nothing — falls through to the torch engine."""
-    monkeypatch.setenv("GB_SYNAPSE_FORCE_VLLM", "1")
-    monkeypatch.setattr(gsb, "_torch_env_dir", lambda: Path("/fake/torch-env"))
-    monkeypatch.setattr(gsb, "_find_vllm_bin", lambda: None)
-    backend = gsb.select_backend(_FakeEntry("torch"))
     assert isinstance(backend, gsb.SynapseTorchBackend)
 
 
@@ -264,10 +235,6 @@ def test_find_torch_venv_lib_none_when_env_override_empty(tmp_path, monkeypatch)
         assert gsb._find_torch_venv_lib("nvidia/cu12/lib/libcudart.so.12") is None
 
 
-def test_cuda_home_for_vllm_is_alias_of_torch():
-    assert gsb._cuda_home_for_vllm is gsb._cuda_home_for_torch
-
-
 # ── quant_below_fp8_floor ─────────────────────────────────────────────────
 
 class _FakeQuantEntry:
@@ -308,6 +275,7 @@ class _FakeSynapseEntry:
         self.engine = engine
         self.arch = ""
         self.source = "hf"
+        self.ctx_length = 0
 
 
 def _patch_torch_serve_common(monkeypatch, tmp_path, mode="gllm", reason=""):
@@ -338,11 +306,19 @@ def _patch_torch_serve_common(monkeypatch, tmp_path, mode="gllm", reason=""):
     monkeypatch.setattr(gb_cluster, "shim_env",
                         lambda workload, enabled, base_env=None, cudart_path=None:
                         {"GREENBOOST_ACTIVE": "1"} if enabled else {})
+    # No cluster configured — these tests exercise the single-node path.
+    # Without this, gb_cluster.feeders() hits the REAL /etc/greenboost/
+    # cluster.conf on whatever machine runs the suite, which is a real
+    # test-isolation bug in its own right (a dev box with an actual feeder
+    # configured makes these tests behave differently than CI) — the
+    # cluster branch itself is covered by its own dedicated tests below.
+    monkeypatch.setattr(gb_cluster, "feeders", lambda probe=True: [])
 
     popen_calls = []
 
     class _FakeProc:
-        pass
+        def kill(self):
+            pass
 
     def _fake_popen(cmd, env=None, stdout=None, stderr=None, start_new_session=None):
         popen_calls.append({"cmd": cmd, "env": env})
@@ -370,6 +346,54 @@ def test_synapse_torch_backend_serve_full_cmd(tmp_path, monkeypatch):
     assert cmd[cmd.index("--model-max-length") + 1] == "8192"
     assert "--disable-cuda-graph" in cmd
     assert captured["engine"] == "torch"
+    assert captured["facts"]["torch_serve_mode"] == "gllm"
+    assert captured["facts"]["torch_serve_reason"] == ""
+
+
+# ── --maxp clamp for small-context checkpoints ────────────────────────────
+# Real bug found live 2026-07-16: gLLM's --maxp (max prefill tokens per
+# batch, sizes profile_run()'s dummy warmup sequence) defaults to 8192
+# regardless of --model-max-length or the checkpoint's own
+# max_position_embeddings — TheBloke/TinyLlama-1.1B-Chat-v1.0-AWQ
+# (ctx_length=2048) crashed profile_run() with "size of tensor a (2048)
+# must match tensor b (8192)" before any forward pass ran, reproducing
+# identically regardless of quant method (generic input-buffer sizing, not
+# AWQ-specific).
+
+def test_synapse_torch_backend_serve_clamps_maxp_to_checkpoint_ctx_length(tmp_path, monkeypatch):
+    popen_calls, captured, venv = _patch_torch_serve_common(monkeypatch, tmp_path)
+    entry = _FakeSynapseEntry()
+    entry.ctx_length = 2048   # smaller than gLLM's 8192 default
+
+    gsb.SynapseTorchBackend().serve(entry, port=11435)   # no explicit ctx=
+
+    cmd = popen_calls[0]["cmd"]
+    assert cmd[cmd.index("--maxp") + 1] == "2048"
+
+
+def test_synapse_torch_backend_serve_explicit_ctx_wins_over_checkpoint_ctx_length(tmp_path, monkeypatch):
+    popen_calls, captured, venv = _patch_torch_serve_common(monkeypatch, tmp_path)
+    entry = _FakeSynapseEntry()
+    entry.ctx_length = 2048
+
+    gsb.SynapseTorchBackend().serve(entry, port=11435, ctx=1024)   # explicit, smaller than ctx_length
+
+    cmd = popen_calls[0]["cmd"]
+    assert cmd[cmd.index("--maxp") + 1] == "1024"
+
+
+def test_synapse_torch_backend_serve_no_maxp_clamp_for_large_context_model(tmp_path, monkeypatch):
+    """A model whose real context is >= gLLM's 8192 default (or unknown,
+    ctx_length=0) must not get a --maxp flag at all — the whole point is to
+    only ever SHRINK the dummy prefill, never touch/grow it."""
+    popen_calls, captured, venv = _patch_torch_serve_common(monkeypatch, tmp_path)
+    entry = _FakeSynapseEntry()
+    entry.ctx_length = 0   # unknown, e.g. an old manifest entry
+
+    gsb.SynapseTorchBackend().serve(entry, port=11435)
+
+    cmd = popen_calls[0]["cmd"]
+    assert "--maxp" not in cmd
 
 
 def test_synapse_torch_backend_serve_util_clamped(tmp_path, monkeypatch):
@@ -455,6 +479,54 @@ def test_synapse_torch_backend_serve_fallback_mode_cmd(tmp_path, monkeypatch):
     assert "--gpu-memory-util" not in cmd
     assert "--disable-cuda-graph" not in cmd
     assert captured["facts"]["degraded"] == "fallback-single-request"
+    # Queryable via dataflux_events(kind="synapse_serve") — "why this model
+    # landed on the fallback" no longer requires reading the log/stdout.
+    assert captured["facts"]["torch_serve_mode"] == "fallback"
+    assert captured["facts"]["torch_serve_reason"] == "test reason"
+
+
+# ── TransformersBackend: the no-torch-venv-at-all fallback ───────────────
+
+def test_transformers_backend_serve_builds_fallback_cmd(tmp_path, monkeypatch):
+    """Reached only when _torch_env_dir() found no torch venv whatsoever
+    (see select_backend), so this always runs gb_synapse_fallback.py under
+    sys.executable — never a venv path, since there isn't one."""
+    import gb_synapse as gs
+
+    monkeypatch.setattr(gs, "hf_token", lambda: None)
+    monkeypatch.setattr(gs, "_run_log_path", lambda name: tmp_path / f"{name}.log")
+
+    popen_calls = []
+
+    class _FakeProc:
+        def kill(self):
+            pass
+
+    def _fake_popen(cmd, env=None, stdout=None, stderr=None, start_new_session=None):
+        popen_calls.append({"cmd": cmd, "env": env})
+        return _FakeProc()
+
+    monkeypatch.setattr(gsb.subprocess, "Popen", _fake_popen)
+
+    captured = {}
+
+    def _fake_launch(entry, proc, port, internal_port, engine="", **facts):
+        captured.update(engine=engine)
+        return "sentinel-state"
+
+    monkeypatch.setattr(gs, "_launch_proxy_and_record", _fake_launch)
+
+    entry = _FakeSynapseEntry(engine="transformers", quant="FP8")
+    result = gsb.TransformersBackend().serve(entry, port=11435)
+
+    assert result == "sentinel-state"
+    cmd = popen_calls[0]["cmd"]
+    assert cmd[0] == gsb.sys.executable
+    assert cmd[1] == str(gsb._REPO_DIR / "gb_synapse_fallback.py")
+    assert cmd[cmd.index("--served-model-name") + 1] == "fake-model"
+    assert cmd[cmd.index("--quant") + 1] == "FP8"
+    assert cmd[cmd.index("--port") + 1] == "12435"
+    assert captured["engine"] == "transformers"
 
 
 # ── _torch_serve_mode: fallback trigger logic (pure-function cases) ──────
@@ -471,6 +543,7 @@ def test_torch_serve_mode_fallback_when_no_venv(monkeypatch):
     monkeypatch.setattr(gsb, "_torch_env_dir", lambda: None)
     mode, reason = gsb._torch_serve_mode(_FakeSynapseEntry())
     assert mode == "fallback"
+    assert reason  # non-empty — SynapseTorchBackend.serve() prints it verbatim
 
 
 def test_torch_serve_mode_fallback_when_arch_unsupported(monkeypatch):
@@ -566,3 +639,103 @@ def test_torch_engine_importable_false_on_exception(monkeypatch, tmp_path):
 
     monkeypatch.setattr(gsb.subprocess, "run", _fake_run)
     assert gsb._torch_engine_importable(str(tmp_path / "nonexistent-python")) is False
+
+
+# ── SynapseTorchBackend.serve(): cluster PP branch ────────────────────────
+
+class _FakeGllmFeeder:
+    def __init__(self, ip="10.0.0.5"):
+        self.ip = ip
+        self.online = True
+
+
+def test_synapse_torch_backend_serve_cluster_pp_success(tmp_path, monkeypatch):
+    popen_calls, captured, venv = _patch_torch_serve_common(monkeypatch, tmp_path)
+    import gb_synapse as gs
+    import gb_cluster
+
+    feeder = _FakeGllmFeeder()
+    monkeypatch.setattr(gb_cluster, "feeders", lambda probe=True: [feeder])
+    monkeypatch.setattr(gb_cluster, "_local_ip_toward", lambda dest_ip: "10.0.0.1")
+    slave_calls = []
+    monkeypatch.setattr(gs, "ensure_feeder_gllm_slave",
+                        lambda f, master_ip, master_port, pp_rank, pp_size, model_path:
+                        slave_calls.append((f.ip, master_ip, master_port, pp_rank, pp_size,
+                                            model_path)) or True)
+    monkeypatch.setattr(gs, "_wait_upstream_ready", lambda entry, proc, port, grace_s=0: True)
+    kill_calls = []
+    monkeypatch.setattr(gs, "kill_feeder_gllm_slave", lambda f: kill_calls.append(f.ip))
+
+    entry = _FakeSynapseEntry()
+    result = gsb.SynapseTorchBackend().serve(entry, port=11435)
+
+    assert result == "sentinel-state"
+    assert len(popen_calls) == 1   # no retry — the cluster attempt succeeded
+    assert slave_calls == [("10.0.0.5", "10.0.0.1", gs.GLLM_MASTER_PORT_BASE, 1, 2,
+                            "org/fake-model")]
+    assert kill_calls == []   # nothing to tear down on the success path
+    cmd = popen_calls[0]["cmd"]
+    assert cmd[cmd.index("--launch-mode") + 1] == "master"
+    assert cmd[cmd.index("--ranks") + 1] == "0"
+    assert cmd[cmd.index("--pp") + 1] == "2"
+    assert cmd[cmd.index("--tp") + 1] == "1"
+    assert cmd[cmd.index("--master-addr") + 1] == "10.0.0.1"
+    assert cmd[cmd.index("--master-port") + 1] == str(gs.GLLM_MASTER_PORT_BASE)
+    assert captured["facts"]["feeders"] == ["10.0.0.5"]
+
+
+def test_synapse_torch_backend_serve_cluster_pp_degrades_on_slave_launch_failure(tmp_path, monkeypatch):
+    popen_calls, captured, venv = _patch_torch_serve_common(monkeypatch, tmp_path)
+    import gb_synapse as gs
+    import gb_cluster
+
+    feeder = _FakeGllmFeeder()
+    monkeypatch.setattr(gb_cluster, "feeders", lambda probe=True: [feeder])
+    monkeypatch.setattr(gb_cluster, "_local_ip_toward", lambda dest_ip: "10.0.0.1")
+    monkeypatch.setattr(gs, "ensure_feeder_gllm_slave",
+                        lambda f, master_ip, master_port, pp_rank, pp_size, model_path: False)
+    kill_calls = []
+    monkeypatch.setattr(gs, "kill_feeder_gllm_slave", lambda f: kill_calls.append(f.ip))
+    ready_calls = []
+    monkeypatch.setattr(gs, "_wait_upstream_ready",
+                        lambda entry, proc, port, grace_s=0: ready_calls.append(grace_s) or True)
+
+    entry = _FakeSynapseEntry()
+    result = gsb.SynapseTorchBackend().serve(entry, port=11435)
+
+    assert result == "sentinel-state"
+    assert kill_calls == []   # nothing launched yet when the only candidate failed
+    assert ready_calls == []  # never attempted cluster mode — no cluster-grace wait
+    cmd = popen_calls[0]["cmd"]
+    assert "--launch-mode" not in cmd   # fell back to plain single-node args
+    assert captured["facts"]["feeders"] == []
+
+
+def test_synapse_torch_backend_serve_cluster_pp_retries_host_only_on_rendezvous_timeout(tmp_path, monkeypatch):
+    popen_calls, captured, venv = _patch_torch_serve_common(monkeypatch, tmp_path)
+    import gb_synapse as gs
+    import gb_cluster
+
+    feeder = _FakeGllmFeeder()
+    monkeypatch.setattr(gb_cluster, "feeders", lambda probe=True: [feeder])
+    monkeypatch.setattr(gb_cluster, "_local_ip_toward", lambda dest_ip: "10.0.0.1")
+    monkeypatch.setattr(gs, "ensure_feeder_gllm_slave",
+                        lambda f, master_ip, master_port, pp_rank, pp_size, model_path: True)
+    kill_calls = []
+    monkeypatch.setattr(gs, "kill_feeder_gllm_slave", lambda f: kill_calls.append(f.ip))
+    # First call (cluster attempt) times out; the recursive host-only retry
+    # never reaches _wait_upstream_ready at all (only LlamaCppBackend-style
+    # cluster branches call it directly — the plain path uses
+    # _launch_proxy_and_record, which is fully mocked by _fake_launch).
+    monkeypatch.setattr(gs, "_wait_upstream_ready", lambda entry, proc, port, grace_s=0: False)
+
+    entry = _FakeSynapseEntry()
+    result = gsb.SynapseTorchBackend().serve(entry, port=11435)
+
+    assert result == "sentinel-state"
+    assert kill_calls == ["10.0.0.5"]      # the launched slave was torn down
+    assert len(popen_calls) == 2           # cluster attempt, then the host-only retry
+    cluster_cmd, retry_cmd = popen_calls[0]["cmd"], popen_calls[1]["cmd"]
+    assert "--launch-mode" in cluster_cmd
+    assert "--launch-mode" not in retry_cmd
+    assert captured["facts"]["feeders"] == []   # final recorded state is the retry's

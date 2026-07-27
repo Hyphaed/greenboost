@@ -65,7 +65,6 @@ def test_doctor_reports_torch_engine_absent(monkeypatch):
 def test_status_reports_torch_engine_present(monkeypatch, tmp_path):
     venv = tmp_path / "synapse-torch-env"
     monkeypatch.setattr(gsb, "_torch_env_dir", lambda: venv)
-    monkeypatch.setattr(gsb, "_find_vllm_bin", lambda: None)
     s = gs.status()
     assert s["torch_engine_ready"] is True
     assert s["torch_engine_env"] == str(venv)

@@ -42,11 +42,16 @@ def actuation_gate(confirm: bool) -> dict:
     return {"allowed": True, "reason": "confirm=True and GB_ORCH_ACTUATE=1"}
 
 
-def _emit(verb: str, gated: bool, **fields) -> None:
+def _emit(verb: str, gated: bool, *, kind: str = "actuation", **fields) -> None:
+    """`kind` defaults to "actuation" (every verb but one). run_under_greenboost
+    passes kind="agent_run" , this was documented at its own docstring above
+    (and in gb_mcp.py's) but never actually implemented: this function
+    hardcoded "actuation" unconditionally, so an "agent_run" event could
+    never exist no matter what the caller intended."""
     try:
         import gb_dataflux
         gb_dataflux.emit({
-            "node": "host", "label": "actuation", "kind": "actuation",
+            "node": "host", "label": "actuation", "kind": kind,
             "stage": verb, "lever": verb, "gated": gated, "status": "ok",
             "n_items": 0, "items": [], "duration_s": 0.0,
             **{k: v for k, v in fields.items()
@@ -143,21 +148,33 @@ def cluster_dispatch_plan(confirm: bool = False) -> dict:
 
 def set_quant_policy(budget_gb: float | None = None, quality: str | None = None,
                      confirm: bool = False) -> dict:
-    """Set the quant policy the NEXT pipeline run reads: GB_QUANT_BUDGET_GB and
-    GB_QUALITY in the shared inference.env. Enforces the fp8 quality floor ,
-    quality below fp8 (nvfp4/int8/int4/tq*) requires an explicit non-default
-    value AND is surfaced as a tradeoff, never silently applied."""
+    """Set the quant policy the NEXT pipeline run reads: GB_QUANT_BUDGET_GB,
+    and either GB_QUALITY (a tier name) or GB_QUANT_BITS (a precision token)
+    in the shared inference.env , whichever `quality` actually is.
+    gb_quant.maybe_quantize_from_env only recognizes GB_QUALITY as one of
+    its tier names (near_lossless/balanced/compact); it previously accepted
+    ANY string here, including a precision token like "nvfp4"/"int8"/"tq3",
+    which silently had ZERO effect (maybe_quantize_from_env's tier check
+    failed, and with no GB_QUANT_BUDGET_GB set either, the whole call was a
+    no-op). Enforces the fp8 quality floor , a below-fp8 precision requires
+    an explicit non-default value AND is surfaced as a tradeoff, never
+    silently applied."""
+    import gb_quant
     gate = actuation_gate(confirm)
     updates: dict[str, str] = {}
     if budget_gb is not None:
         updates["GB_QUANT_BUDGET_GB"] = f"{float(budget_gb):.1f}"
     tradeoff = None
     if quality is not None:
-        below_fp8 = {"nvfp4", "8", "int8", "4", "int4", "tq3", "tq2"}
-        if str(quality).lower() in below_fp8:
-            tradeoff = (f"quality={quality} is below the fp8 floor , accept only "
-                        f"with a measured quality gate (niah_certify/smoke_gate)")
-        updates["GB_QUALITY"] = str(quality)
+        q = str(quality).strip().lower()
+        if q in gb_quant.QUALITY_TIERS:
+            updates["GB_QUALITY"] = q
+        else:
+            normalized = gb_quant.normalize_bits_token(q)
+            updates["GB_QUANT_BITS"] = str(normalized)
+            if normalized in gb_quant._BELOW_FP8_BITS:
+                tradeoff = (f"quality={quality} is below the fp8 floor , accept only "
+                            f"with a measured quality gate (niah_certify/smoke_gate)")
     plan = {"verb": "set_quant_policy", "gate": gate, "updates": updates,
             "env_file": str(INFERENCE_ENV)}
     if tradeoff:
@@ -293,7 +310,7 @@ def run_under_greenboost(command: "list[str] | str", workload: str = "llm",
         return plan
 
     run_env = {**os.environ, **env_overlay}
-    _emit("run_under_greenboost", True, run_id=run_id, status="started",
+    _emit("run_under_greenboost", True, kind="agent_run", run_id=run_id, status="started",
           command=" ".join(argv), workload=workload)
     t0 = time.monotonic()
     try:
@@ -304,19 +321,97 @@ def run_under_greenboost(command: "list[str] | str", workload: str = "llm",
         plan["duration_s"]  = round(duration, 2)
         plan["stdout_tail"] = proc.stdout[-4000:]
         plan["stderr_tail"] = proc.stderr[-4000:]
-        _emit("run_under_greenboost", True, run_id=run_id,
+        _emit("run_under_greenboost", True, kind="agent_run", run_id=run_id,
               status="ok" if proc.returncode == 0 else "error",
               exit_code=proc.returncode, duration_s=round(duration, 2))
     except subprocess.TimeoutExpired:
         duration = time.monotonic() - t0
         plan["error"] = f"timed out after {timeout_s}s"
         plan["duration_s"] = round(duration, 2)
-        _emit("run_under_greenboost", True, run_id=run_id, status="error",
+        _emit("run_under_greenboost", True, kind="agent_run", run_id=run_id, status="error",
               error="timeout", duration_s=round(duration, 2))
     except Exception as e:
         plan["error"] = str(e)
-        _emit("run_under_greenboost", True, run_id=run_id, status="error", error=str(e))
+        _emit("run_under_greenboost", True, kind="agent_run", run_id=run_id,
+              status="error", error=str(e))
     return plan
+
+
+def run_capped(argv: list[str], *, mem_max_mb: "float | None" = None,
+              env: "dict[str, str] | None" = None, cwd: "str | None" = None,
+              secrets_file: bool = True, timeout_s: int = 3600) -> dict:
+    """Run `argv` under `systemd-run --user`, memory-capped, with the
+    subprocess env delivered CORRECTLY , encoding 4 hard-won facts ai-forge
+    had to discover the hard way building its own version of this wrapper
+    (forge/runners/longlive.py), the last of which caused a real production
+    incident (a run of torch.OutOfMemoryErrors originally misdiagnosed as a
+    shim allocator bug before the actual cause , the env silently vanishing
+    , was found):
+
+    1. `subprocess.run(cmd, env=...)` only sets the systemd-run CLI
+       process's OWN environment; the transient unit it starts over D-Bus
+       inherits the systemd --user MANAGER's ambient environment (fixed at
+       session/login start), not the caller's. Every var needed inside the
+       unit must be delivered THROUGH systemd-run itself.
+    2. Secrets (HF_TOKEN, etc.) must never go via `--setenv KEY=value` ,
+       those land in the unit's argv, which /proc/pid/cmdline exposes to
+       every local user. A 0600 EnvironmentFile= (a temp file, deleted
+       after the run) is used instead whenever `secrets_file=True`
+       (the default) — the one case where NOT doing this is a real
+       leak, not just a style preference.
+    3. `MemoryMax` must sit ABOVE the pinned T2 DMA-BUF pool
+       (gb_tiering.t2_pool()'s total_mb) , that memory is already reserved
+       by greenboost.ko and doesn't show up as "used" to the cgroup
+       accounting until the shim actually touches it, so capping AT or
+       below the T2 total OOM-kills the unit for memory that was never
+       really free to take away. mem_max_mb=None auto-derives a 20%
+       headroom above the live T2 pool (0 => uncapped when T2 isn't
+       active at all); the % headroom is a rule-sanctioned
+       max(measured, pct) shape, never a bare literal.
+    4. `systemd-run --user` defaults cwd to $HOME, not the caller's , an
+       explicit --working-directory is required.
+
+    Returns {"returncode", "stdout", "stderr"} , blocks until the unit
+    finishes (--wait) or timeout_s elapses."""
+    import tempfile
+
+    if mem_max_mb is None:
+        try:
+            import gb_tiering
+            t2_total = gb_tiering.t2_pool()["total_mb"]
+        except Exception:
+            t2_total = 0
+        mem_max_mb = t2_total * 1.20 if t2_total else 0
+
+    run_env = dict(os.environ)
+    if env:
+        run_env.update(env)
+
+    cmd = ["systemd-run", "--user", "--wait", "--collect", "--pipe",
+           f"--working-directory={cwd or os.getcwd()}"]
+    if mem_max_mb:
+        cmd.append(f"--property=MemoryMax={int(mem_max_mb)}M")
+
+    tmp_env_path = None
+    try:
+        if secrets_file:
+            fd, tmp_env_path = tempfile.mkstemp(prefix="gb_run_capped_", suffix=".env")
+            os.chmod(tmp_env_path, 0o600)
+            with os.fdopen(fd, "w") as f:
+                for k, v in run_env.items():
+                    f.write(f"{k}={v}\n")
+            cmd.append(f"--property=EnvironmentFile={tmp_env_path}")
+        else:
+            cmd += [f"--setenv={k}={v}" for k, v in run_env.items()]
+        cmd += ["--", *argv]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        return {"returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
+    finally:
+        if tmp_env_path is not None:
+            try:
+                os.unlink(tmp_env_path)
+            except OSError:
+                pass
 
 
 # ── AgentCard (for A2A) ───────────────────────────────────────────────────────

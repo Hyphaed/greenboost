@@ -124,6 +124,10 @@ class LinearBase(torch.nn.Module):
             from gllm.layers.quantization.gptq import gptq_create_weights
             gptq_create_weights(
                 self, input_size_per_partition, output_partition_sizes, params_dtype)
+        elif self.quant_config["quant_method"] == "awq":
+            from gllm.layers.quantization.awq import awq_create_weights
+            awq_create_weights(
+                self, input_size_per_partition, output_partition_sizes, params_dtype)
         else:
             raise Exception(
                 f"gLLM do not support quant_method {self.quant_config['quant_method']}"
@@ -143,6 +147,9 @@ class LinearBase(torch.nn.Module):
         elif self.quant_config["quant_method"] == "gptq":
             from gllm.layers.quantization.gptq import gptq_linear_method
             return partial(gptq_linear_method, layer=self)
+        elif self.quant_config["quant_method"] == "awq":
+            from gllm.layers.quantization.awq import awq_linear_method
+            return partial(awq_linear_method, layer=self)
         else:
             raise Exception(
                 f"gLLM do not support quant_method {self.quant_config['quant_method']}"

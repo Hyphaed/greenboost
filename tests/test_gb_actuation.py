@@ -45,6 +45,25 @@ def test_executes_when_double_gated(monkeypatch):
     assert "duration_s" in result
 
 
+def test_run_under_greenboost_emits_agent_run_kind_not_actuation(monkeypatch, tmp_path):
+    """Documented at run_under_greenboost's own docstring and gb_mcp.py's,
+    but the emitter used to hardcode kind="actuation" unconditionally, so an
+    "agent_run" event could never actually exist in the log."""
+    monkeypatch.setenv("GB_ORCH_ACTUATE", "1")
+    monkeypatch.setenv("GREENBOOST_DATAFLUX_LOG", str(tmp_path / "dataflux.jsonl"))
+    import gb_dataflux
+    gb_dataflux._READ_EVENTS_MEMO.clear()
+
+    ga.run_under_greenboost(["true"], confirm=True)
+
+    events = gb_dataflux.read_events()
+    agent_run_events = [e for e in events if e.get("kind") == "agent_run"]
+    actuation_events = [e for e in events if e.get("kind") == "actuation"]
+    assert len(agent_run_events) == 2  # started + completed
+    assert actuation_events == []      # none of THIS verb's events are misfiled
+    assert {e["status"] for e in agent_run_events} == {"started", "ok"}
+
+
 def test_string_command_is_tokenized_not_shell_interpreted(monkeypatch):
     """A string command must be split with shlex and run with shell=False —
     shell metacharacters must NOT be interpreted (the 'no shell passthrough'

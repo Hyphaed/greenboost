@@ -137,14 +137,38 @@ class MemPoolManager:
         with self._pools[name].use():
             yield
 
+    def _emit_trim(self, name: str, before_mb: float, after_mb: float) -> None:
+        """Best-effort dataflux event for a real pool-reclaim decision , this
+        was the one decision-making module in the codebase with zero
+        gb_dataflux reference at all; without this, "how much did trim()
+        actually reclaim" was invisible even though it's the exact number a
+        pipeline calling trim() between major stages needs to know whether
+        the call did anything."""
+        try:
+            import gb_dataflux
+            gb_dataflux.emit({
+                "node": "host", "label": "gb_mem_pool", "kind": "mem_pool_trim",
+                "pool": name, "allocated_before_mb": round(before_mb, 1),
+                "allocated_after_mb": round(after_mb, 1),
+                "reclaimed_mb": round(max(0.0, before_mb - after_mb), 1),
+            })
+        except Exception:
+            pass
+
     def trim(self, name: str, target_mb: Optional[float] = None):
         """Release cached pages in the named pool."""
+        before = self._pools[name].stats().allocated_mb
         self._pools[name].trim(target_mb)
+        after = self._pools[name].stats().allocated_mb
+        self._emit_trim(name, before, after)
 
     def trim_all(self):
         """Trim all pools. Call between major pipeline stages."""
-        for p in self._pools.values():
+        for name, p in self._pools.items():
+            before = p.stats().allocated_mb
             p.trim()
+            after = p.stats().allocated_mb
+            self._emit_trim(name, before, after)
 
     def stats(self) -> Dict[str, PoolStats]:
         return {n: p.stats() for n, p in self._pools.items()}

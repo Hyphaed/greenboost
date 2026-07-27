@@ -76,10 +76,19 @@
  *                                and rebinds onto the app's own libcudart instead.
  *   GREENBOOST_T2_POOL_MB        MB to pre-register as T2 pool (0=disable; default 85% of T2)
  *   GREENBOOST_A0_DISABLE        1 = skip Path A zero-copy sub-method (cudaImportExternalMemory); use pinned sub-method directly
- *   GREENBOOST_KV_COMPRESS       1 = absmax int8 compress K/V before T1→T2 eviction
- *                                (halves DMA bandwidth; default 0 - opt-in until validated)
- *   GREENBOOST_GDS               1 = use cuFile GPUDirect Storage for T3 NVMe path
- *                                (~7 GB/s vs ~1.8 GB/s CPU-bounce; requires libcufile.so.0)
+ *   GREENBOOST_KV_COMPRESS       NO-OP (Speed Program audit, 2026-07-26): the absmax int8
+ *                                K/V codec this used to enable was dead code, zero callers,
+ *                                eviction never compressed anything. Real KV compression is
+ *                                gb_attn.py's TurboQuant+. Kept parsed (warns instead of
+ *                                silently ignored) so a caller relying on the old behavior
+ *                                finds out rather than getting a silent no-op.
+ *   GREENBOOST_GDS               1 = use cuFile GPUDirect Storage for T3 NVMe path.
+ *                                STUB as of the Speed Program audit (2026-07-26): gb_gds_read/
+ *                                gb_gds_write have zero callers and g_cufile_handle is never
+ *                                assigned, so this flag currently changes nothing at runtime
+ *                                beyond the capability-blob report. Also currently unachievable
+ *                                on a dm_crypt+LVM-backed T3 store regardless (see
+ *                                workflow/known-issues.md).
  *   GREENBOOST_DOUBLE_BUFFER     1 = U18 double-buffer T3→T2 async staging: while GPU
  *                                consumes the current prefetched tile, speculatively
  *                                madvise the next contiguous tile (default 0 - opt-in
@@ -1342,18 +1351,6 @@ static pfn_cuMemAddressReserve             real_cuMemAddressReserve;
 static pfn_cuMemAddressFree                real_cuMemAddressFree;
 static pfn_cuMemGetAllocationGranularity   real_cuMemGetAllocationGranularity;
 
-/* E1: PTX module management - cuModuleLoadData / cuModuleGetFunction */
-typedef CUresult (*pfn_cuModuleLoadData)(CUmodule *, const void *);
-typedef CUresult (*pfn_cuModuleGetFunction)(CUfunction *, CUmodule, const char *);
-static pfn_cuModuleLoadData   real_cuModuleLoadData;
-static pfn_cuModuleGetFunction real_cuModuleGetFunction;
-
-static CUmodule   g_gb_ptx_module       = NULL;
-static CUfunction g_gb_absmax_quant_fn  = NULL;
-static CUfunction g_gb_absmax_dequant_fn = NULL;
-
-/* Forward declaration - definition is after the PTX string (avoids reordering the large string) */
-static void gb_kv_ptx_init(void *libcuda);
 
 /* ------------------------------------------------------------------ */
 /*  T2 Pre-Registered Pool - function implementations                  */
@@ -2105,7 +2102,7 @@ static int gb_pool_contains(CUdeviceptr dptr)
 
 /* ------------------------------------------------------------------ */
 
-static size_t vram_headroom_bytes    = 512ULL * 1024 * 1024;  /* 512 MB default - scaled to 5% of VRAM after NVML probe; override with GREENBOOST_VRAM_HEADROOM_MB */
+static size_t vram_headroom_bytes    = 512ULL * 1024 * 1024;  /* 512 MB default - rescaled to max(128MB, 2% of VRAM) after NVML probe; override with GREENBOOST_VRAM_HEADROOM_MB */
 /* Workstation GPU headroom: subtracted from reported free VRAM so --fit leaves
  * this many MB of physical GPU VRAM for the desktop/display/other apps.
  * Dynamic by default (see gb_effective_workstation_reserve_bytes): sized to
@@ -2607,10 +2604,16 @@ static _Atomic uint64_t g_idle_entered_ms;
  * INFERENCE phase (handles models that overlap weight + KV loading). */
 #define GB_PHASE_LOAD_COUNT_MAX 128
 
-/* ── Phase 2: K/V int8 compression (opt-in via GREENBOOST_KV_COMPRESS=1) ─── */
-static int            g_kv_compress_enabled = 0;
-static pthread_once_t g_ptx_init_once       = PTHREAD_ONCE_INIT;
-static void          *g_saved_libcuda       = NULL;
+/* K/V int8 compression: REMOVED (Speed Program audit, 2026-07-26). The
+ * embedded-PTX absmax codec (gb_kv_compress_d2t2/gb_kv_decompress_t2tod)
+ * had zero callers, eviction never compressed anything, it only discarded
+ * buffers (gb_htable_flush/gb_htable_evict_kv_arc). g_kv_compress_enabled
+ * stays as a permanently-false flag so the capability blob and metrics.json
+ * keep reporting an honest "off" instead of removing the field shape
+ * consumers may already parse. GREENBOOST_KV_COMPRESS is now a no-op, real
+ * KV compression is gb_attn.py's TurboQuant+ (kv_compression_bits/
+ * kv_compressed_mb in the ioctl status, unrelated to this removed codec). */
+static const int      g_kv_compress_enabled = 0;
 
 /* ── Phase 3: GPUDirect Storage (opt-in via GREENBOOST_GDS=1) ─────────────── */
 static int    g_gds_ok      = 0;
@@ -2706,10 +2709,20 @@ static void gb_write_phase_file(int phase, uint64_t idle_ms)
  * the .so binary for a log literal (the fragile pre-manifest scheme in
  * ai-forge forge/gpu.py). Read back by gb_monitor.capabilities().
  *
- * Static features (gb_quant_cudart_rebind, expert_pool, cluster_fabric) are
- * true for every build of this shim; runtime features (gds, kv_compress,
+ * Static features (gb_quant_cudart_rebind, cluster_fabric) are true for
+ * every build of this shim; runtime features (gds, kv_compress,
  * report_physical_vram) reflect the env this process was launched with.
  * tmp+rename so a concurrent reader never sees a half-written file.
+ *
+ * expert_pool is hardcoded false (Speed Program audit, 2026-07-26): the
+ * hot-expert VRAM cache this flag once described was built, instrumented,
+ * and removed after failing across ~4 sessions (see
+ * workflow/known-issues.md's expert-cache history) — Ollama's
+ * cudaLaunchKernelExC entry point never fired the substitution hooks, CUDA
+ * graphs bypass launch hooks entirely, and flat buffer-base kernel args made
+ * pointer-equality substitution structurally impossible. There is no
+ * expert-pool code left in this file; advertising it as a live feature was
+ * false advertising to any consumer that checked this flag.
  */
 static void gb_write_capabilities_file(void)
 {
@@ -2727,7 +2740,7 @@ static void gb_write_capabilities_file(void)
         "  \"ts\": %lld,\n"
         "  \"features\": {\n"
         "    \"gb_quant_cudart_rebind\": true,\n"
-        "    \"expert_pool\": true,\n"
+        "    \"expert_pool\": false,\n"
         "    \"cluster_fabric\": true,\n"
         "    \"gds\": %s,\n"
         "    \"kv_compress\": %s,\n"
@@ -4643,11 +4656,16 @@ static void gb_shim_init(void)
     env = getenv("GREENBOOST_KV_SIZE_THRESHOLD_MB");
     if (env) g_kv_size_threshold_bytes = (size_t)gb_atoll(env) * 1024ULL * 1024ULL;
 
-    /* Phase 2: K/V int8 compression before T1→T2 eviction (halves DMA bandwidth) */
+    /* GREENBOOST_KV_COMPRESS: no-op (Speed Program audit, 2026-07-26). The
+     * mechanism it used to enable was dead code with zero callers, see the
+     * g_kv_compress_enabled declaration's comment. Warn instead of silently
+     * ignoring, so a caller who sets this expecting a real effect finds out. */
     env = getenv("GREENBOOST_KV_COMPRESS");
     if (env && env[0] == '1') {
-        g_kv_compress_enabled = 1;
-        GB_INIT_LOG_ONCE("[GreenBoost] GREENBOOST_KV_COMPRESS=1: K/V int8 compression enabled\n");
+        GB_INIT_LOG_ONCE("[GreenBoost] GREENBOOST_KV_COMPRESS=1 has no effect: "
+                          "the K/V int8 compression codec was removed as dead "
+                          "code (zero callers). Real KV compression is "
+                          "gb_attn.py's TurboQuant+.\n");
     }
 
     /* Phase-aware KV prefetch (Stage 3). Default off. "stats" measures
@@ -5284,13 +5302,6 @@ static void gb_shim_init(void)
                     gb_virtual_vram_bytes >> 30);
     }
 
-    /* E1: Save libcuda handle for lazy PTX init.  cuModuleLoadData cannot be
-     * called here because no CUDA context exists yet (cuInit() has not been
-     * called by the application).  Actual module loading is deferred to the
-     * first gb_kv_compress_d2t2 / gb_kv_decompress_t2tod call via
-     * pthread_once(&g_ptx_init_once, gb_kv_ptx_init_lazy). */
-    if (g_kv_compress_enabled)
-        g_saved_libcuda = libcuda;
 
     /* Connect to cluster feeders from /etc/greenboost/cluster.conf.
      * Single-virtual-GPU model: feeder memory is aggregated into device 0's
@@ -6010,276 +6021,6 @@ static int gb_gds_read(CUdeviceptr dst, size_t size, off_t file_offset)
                   "T3_GDS", size >> 20, dst, ok ? "cuFileRead_ok" : "cuFileRead_err");
     GB_NVTX_POP();
     return ok ? 0 : -1;
-}
-
-/* ── Phase 2: K/V int8 absmax quantisation (E1) ──────────────────────────────
- *
- * Embedded PTX kernels targeting sm_89 (Ada Lovelace, RTX 5070 Laptop).
- * Loaded lazily on first use via cuModuleLoadData (no separate nvcc step).
- *
- * Algorithm (per row of GB_KV_COMPRESS_ROW = 128 fp16 elements):
- *   Quant:    scale = max(|x|) / 127  (parallel reduction in shared memory)
- *             int8[i] = clamp(round(fp16[i] / scale), -127, 127)
- *   Dequant:  fp32 = int8[i] * scale  →  convert to fp16
- *
- * Grid  : (n_rows, 1, 1) blocks
- * Block : (128, 1, 1) threads  - one thread per element, one block per row
- */
-static const char gb_kv_ptx_src[] =
-    ".version 8.0\n"
-    ".target sm_89\n"
-    ".address_size 64\n"
-    "\n"
-    /* ── Absmax quantise: fp16 → int8 ────────────────────────────── */
-    ".visible .entry gb_absmax_quant(\n"
-    "    .param .u64 src_fp16,\n"
-    "    .param .u64 dst_int8,\n"
-    "    .param .u64 scales,\n"
-    "    .param .u64 n_rows\n"
-    ")\n"
-    "{\n"
-    "    .reg .u64   %rd<10>;\n"
-    "    .reg .u32   %r<8>;\n"
-    "    .reg .f32   %f<8>;\n"
-    "    .reg .pred  %p<6>;\n"
-    "    .shared .align 4 .f32 sh[128];\n"
-    /* row/col from built-ins */
-    "    mov.u32     %r0, %ctaid.x;\n"    /* row */
-    "    mov.u32     %r1, %tid.x;\n"     /* col 0..127 */
-    /* bounds check */
-    "    ld.param.u64 %rd0, [n_rows];\n"
-    "    cvt.u64.u32 %rd1, %r0;\n"
-    "    setp.ge.u64 %p0, %rd1, %rd0;\n"
-    "    @%p0 bra QEND;\n"
-    /* elem_idx = row*128 + col */
-    "    mad.lo.u32  %r2, %r0, 128, %r1;\n"
-    /* load fp16 element → fp32 */
-    "    ld.param.u64 %rd2, [src_fp16];\n"
-    "    cvt.u64.u32 %rd3, %r2;\n"
-    "    shl.b64     %rd4, %rd3, 1;\n"   /* *2 bytes per fp16 */
-    "    add.u64     %rd5, %rd2, %rd4;\n"
-    "    ld.global.u16 %r3, [%rd5];\n"
-    "    cvt.f32.f16 %f0, %r3;\n"        /* fp16 → fp32 */
-    /* abs(f0) → shared[tid] */
-    "    abs.f32     %f1, %f0;\n"
-    "    mov.u64     %rd6, sh;\n"
-    "    cvta.shared.u64 %rd7, %rd6;\n"  /* generic addr of sh[0] */
-    "    cvt.u64.u32 %rd8, %r1;\n"
-    "    shl.b64     %rd8, %rd8, 2;\n"   /* *4 bytes per f32 */
-    "    add.u64     %rd9, %rd7, %rd8;\n"/* rd9 = &sh[tid] */
-    "    st.f32      [%rd9], %f1;\n"
-    "    bar.sync    0;\n"
-    /* parallel reduction - 7 steps for 128 threads */
-    "    setp.lt.u32 %p1, %r1, 64;\n"
-    "    @%p1 ld.f32 %f2, [%rd9 + 256];\n"  /* sh[tid+64] */
-    "    @%p1 max.f32 %f1, %f1, %f2;\n"
-    "    @%p1 st.f32 [%rd9], %f1;\n"
-    "    bar.sync    0;\n"
-    "    setp.lt.u32 %p1, %r1, 32;\n"
-    "    @%p1 ld.f32 %f2, [%rd9 + 128];\n"
-    "    @%p1 max.f32 %f1, %f1, %f2;\n"
-    "    @%p1 st.f32 [%rd9], %f1;\n"
-    "    bar.sync    0;\n"
-    "    setp.lt.u32 %p1, %r1, 16;\n"
-    "    @%p1 ld.f32 %f2, [%rd9 + 64];\n"
-    "    @%p1 max.f32 %f1, %f1, %f2;\n"
-    "    @%p1 st.f32 [%rd9], %f1;\n"
-    "    bar.sync    0;\n"
-    "    setp.lt.u32 %p1, %r1, 8;\n"
-    "    @%p1 ld.f32 %f2, [%rd9 + 32];\n"
-    "    @%p1 max.f32 %f1, %f1, %f2;\n"
-    "    @%p1 st.f32 [%rd9], %f1;\n"
-    "    bar.sync    0;\n"
-    "    setp.lt.u32 %p1, %r1, 4;\n"
-    "    @%p1 ld.f32 %f2, [%rd9 + 16];\n"
-    "    @%p1 max.f32 %f1, %f1, %f2;\n"
-    "    @%p1 st.f32 [%rd9], %f1;\n"
-    "    bar.sync    0;\n"
-    "    setp.lt.u32 %p1, %r1, 2;\n"
-    "    @%p1 ld.f32 %f2, [%rd9 + 8];\n"
-    "    @%p1 max.f32 %f1, %f1, %f2;\n"
-    "    @%p1 st.f32 [%rd9], %f1;\n"
-    "    bar.sync    0;\n"
-    "    setp.eq.u32 %p1, %r1, 0;\n"     /* p1 = (tid == 0) from here on */
-    "    @%p1 ld.f32 %f2, [%rd9 + 4];\n"
-    "    @%p1 max.f32 %f1, %f1, %f2;\n"
-    "    @%p1 st.f32 [%rd9], %f1;\n"
-    "    bar.sync    0;\n"
-    /* sh[0] = max absval for this row */
-    "    ld.f32      %f3, [%rd7];\n"     /* f3 = max_absval */
-    /* scale = max_absval / 127.0 */
-    "    div.approx.f32 %f5, %f3, 127.0;\n"
-    /* thread 0: write scale */
-    "    @!%p1 bra SKIP_SCALE;\n"
-    "    ld.param.u64 %rd2, [scales];\n"
-    "    cvt.u64.u32 %rd3, %r0;\n"
-    "    shl.b64     %rd3, %rd3, 2;\n"
-    "    add.u64     %rd3, %rd2, %rd3;\n"
-    "    st.global.f32 [%rd3], %f5;\n"
-    "SKIP_SCALE:\n"
-    /* quantize: q = round(f0 / scale), clamped to [-127, 127] */
-    "    setp.eq.f32 %p2, %f5, 0.0;\n"
-    "    mov.u32     %r4, 0;\n"
-    "    @%p2 bra QWRITE;\n"
-    "    div.approx.f32 %f6, %f0, %f5;\n"
-    "    cvt.rni.s32.f32 %r4, %f6;\n"   /* round to nearest int */
-    "    setp.gt.s32 %p3, %r4, 127;\n"
-    "    @%p3 mov.u32 %r4, 127;\n"
-    "    setp.lt.s32 %p4, %r4, -127;\n"
-    "    @%p4 mov.s32 %r4, -127;\n"
-    "QWRITE:\n"
-    "    ld.param.u64 %rd2, [dst_int8];\n"
-    "    cvt.u64.u32 %rd3, %r2;\n"
-    "    add.u64     %rd3, %rd2, %rd3;\n"
-    "    st.global.s8 [%rd3], %r4;\n"
-    "QEND:\n"
-    "    ret;\n"
-    "}\n"
-    "\n"
-    /* ── Absmax dequantise: int8 → fp16 ──────────────────────────── */
-    ".visible .entry gb_absmax_dequant(\n"
-    "    .param .u64 src_int8,\n"
-    "    .param .u64 scales,\n"
-    "    .param .u64 dst_fp16,\n"
-    "    .param .u64 n_rows\n"
-    ")\n"
-    "{\n"
-    "    .reg .u64   %rd<10>;\n"
-    "    .reg .u32   %r<6>;\n"
-    "    .reg .f32   %f<4>;\n"
-    "    .reg .pred  %p<2>;\n"
-    "    mov.u32     %r0, %ctaid.x;\n"
-    "    mov.u32     %r1, %tid.x;\n"
-    "    ld.param.u64 %rd0, [n_rows];\n"
-    "    cvt.u64.u32 %rd1, %r0;\n"
-    "    setp.ge.u64 %p0, %rd1, %rd0;\n"
-    "    @%p0 bra DEND;\n"
-    /* elem_idx = row*128 + col */
-    "    mad.lo.u32  %r2, %r0, 128, %r1;\n"
-    /* load per-row scale */
-    "    ld.param.u64 %rd2, [scales];\n"
-    "    cvt.u64.u32 %rd3, %rd1;\n"
-    "    shl.b64     %rd3, %rd3, 2;\n"
-    "    add.u64     %rd3, %rd2, %rd3;\n"
-    "    ld.global.f32 %f0, [%rd3];\n"   /* f0 = scale */
-    /* load int8 element */
-    "    ld.param.u64 %rd4, [src_int8];\n"
-    "    cvt.u64.u32 %rd5, %r2;\n"
-    "    add.u64     %rd5, %rd4, %rd5;\n"
-    "    ld.global.s8 %r3, [%rd5];\n"
-    /* dequantize: fp32 = int8 * scale → fp16 */
-    "    cvt.f32.s32 %f1, %r3;\n"
-    "    mul.f32     %f2, %f1, %f0;\n"
-    "    cvt.rn.f16.f32 %r4, %f2;\n"    /* fp32 → fp16 */
-    /* store fp16 */
-    "    ld.param.u64 %rd6, [dst_fp16];\n"
-    "    cvt.u64.u32 %rd7, %r2;\n"
-    "    shl.b64     %rd7, %rd7, 1;\n"
-    "    add.u64     %rd7, %rd6, %rd7;\n"
-    "    st.global.u16 [%rd7], %r4;\n"
-    "DEND:\n"
-    "    ret;\n"
-    "}\n";
-
-/* Trampoline for pthread_once - called the first time a compress/decompress
- * function runs, by which point cuInit() has been called and a CUDA context
- * exists.  Uses g_saved_libcuda stored during gb_shim_init(). */
-static void gb_kv_ptx_init_lazy(void)
-{
-    if (g_saved_libcuda)
-        gb_kv_ptx_init(g_saved_libcuda);
-}
-
-/* Load the embedded PTX module.  Must be called after a CUDA context exists
- * (i.e. after cuInit()).  Use gb_kv_ptx_init_lazy / pthread_once instead of
- * calling directly. */
-static void gb_kv_ptx_init(void *libcuda)
-{
-    if (!real_cuModuleLoadData)
-        real_cuModuleLoadData = (pfn_cuModuleLoadData)dlsym(libcuda, "cuModuleLoadData");
-    if (!real_cuModuleGetFunction)
-        real_cuModuleGetFunction = (pfn_cuModuleGetFunction)dlsym(libcuda, "cuModuleGetFunction");
-
-    if (!real_cuModuleLoadData || !real_cuModuleGetFunction) {
-        fprintf(stderr, "[GreenBoost] E1: cuModuleLoadData unavailable - "
-                "K/V PTX compression disabled\n");
-        g_kv_compress_enabled = 0;
-        return;
-    }
-
-    CUresult rc = real_cuModuleLoadData(&g_gb_ptx_module, gb_kv_ptx_src);
-    if (rc != CUDA_SUCCESS) {
-        fprintf(stderr, "[GreenBoost] E1: cuModuleLoadData failed (%d) - "
-                "K/V PTX compression disabled\n", rc);
-        g_kv_compress_enabled = 0;
-        return;
-    }
-
-    rc  = real_cuModuleGetFunction(&g_gb_absmax_quant_fn,  g_gb_ptx_module, "gb_absmax_quant");
-    rc |= real_cuModuleGetFunction(&g_gb_absmax_dequant_fn, g_gb_ptx_module, "gb_absmax_dequant");
-    if (rc != CUDA_SUCCESS) {
-        fprintf(stderr, "[GreenBoost] E1: cuModuleGetFunction failed (%d) - "
-                "K/V PTX compression disabled\n", rc);
-        g_kv_compress_enabled = 0;
-        return;
-    }
-
-    fprintf(stderr, "[GreenBoost] E1: K/V absmax PTX kernels loaded "
-            "(gb_absmax_quant + gb_absmax_dequant)\n");
-}
-
-/* ── Phase 2: compress fp16 K/V tensor (T1 VRAM) → int8 (T2 host buffer) ─── */
-static int gb_kv_compress_d2t2(CUdeviceptr src_fp16, uint8_t *dst_int8,
-                                 float *scales, uint64_t n_elems)
-{
-    /* Lazy PTX init: runs once after cuInit() has been called by the app. */
-    if (g_kv_compress_enabled && g_saved_libcuda)
-        pthread_once(&g_ptx_init_once, gb_kv_ptx_init_lazy);
-
-    if (!g_gb_absmax_quant_fn || !real_cuLaunchKernel)
-        return -1;
-
-    /* n_rows = n_elems / GB_KV_COMPRESS_ROW (must be exact multiple) */
-    if (n_elems % GB_KV_COMPRESS_ROW != 0) return -1;
-    uint64_t n_rows = n_elems / GB_KV_COMPRESS_ROW;
-    if (n_rows == 0 || n_rows > UINT32_MAX) return -1;
-
-    /* dst_int8 and scales must be device-accessible (cuMemHostRegister'd) */
-    CUdeviceptr d_dst   = (CUdeviceptr)(uintptr_t)dst_int8;
-    CUdeviceptr d_scale = (CUdeviceptr)(uintptr_t)scales;
-
-    void *args[] = { &src_fp16, &d_dst, &d_scale, &n_rows };
-    CUresult rc = real_cuLaunchKernel(g_gb_absmax_quant_fn,
-                                      (unsigned int)n_rows, 1, 1,
-                                      GB_KV_COMPRESS_ROW, 1, 1,
-                                      0, NULL, args, NULL);
-    return (rc == CUDA_SUCCESS) ? 0 : -1;
-}
-
-/* ── Phase 2: decompress int8 (T2 host buffer) → fp16 (T1 VRAM) ─────────── */
-static int gb_kv_decompress_t2tod(uint8_t *src_int8, const float *scales,
-                                   CUdeviceptr dst_fp16, uint64_t n_elems)
-{
-    /* Lazy PTX init: runs once after cuInit() has been called by the app. */
-    if (g_kv_compress_enabled && g_saved_libcuda)
-        pthread_once(&g_ptx_init_once, gb_kv_ptx_init_lazy);
-
-    if (!g_gb_absmax_dequant_fn || !real_cuLaunchKernel)
-        return -1;
-
-    if (n_elems % GB_KV_COMPRESS_ROW != 0) return -1;
-    uint64_t n_rows = n_elems / GB_KV_COMPRESS_ROW;
-    if (n_rows == 0 || n_rows > UINT32_MAX) return -1;
-
-    CUdeviceptr d_src   = (CUdeviceptr)(uintptr_t)src_int8;
-    CUdeviceptr d_scale = (CUdeviceptr)(uintptr_t)scales;
-
-    void *args[] = { &d_src, &d_scale, &dst_fp16, &n_rows };
-    CUresult rc = real_cuLaunchKernel(g_gb_absmax_dequant_fn,
-                                      (unsigned int)n_rows, 1, 1,
-                                      GB_KV_COMPRESS_ROW, 1, 1,
-                                      0, NULL, args, NULL);
-    return (rc == CUDA_SUCCESS) ? 0 : -1;
 }
 
 /* Overflow allocation - routes T1 misses to T2 (DDR) via pinned DDR paths.

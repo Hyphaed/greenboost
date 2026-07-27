@@ -2,6 +2,64 @@
 
 ## Unreleased
 
+- **Speed Program audit: measurement harness + dead-code cleanup.** New
+  `tests/bench/gb_pathbench.cu`/`.py` (bulk H2D/D2H, VRAM d2d, zero-copy SM
+  read, 8-of-256 MoE-gather-pattern read, all logged via the new
+  `bench_result` dataflux kind) and `tests/bench/run_gguf_decode.py` (drives
+  the real `LlamaCppBackend.serve()` production path, streaming TTFT/decode
+  tok/s, unlike `run_real_model.py` which only covers the `transformers`
+  fallback). New `gb_bench.py` is the single `bench_result` emit site (kept
+  out of `tests/` deliberately, see its own docstring). Key finding: T2
+  zero-copy PCIe reads measure at ~24 GB/s, tracking bulk DMA within noise
+  even for the scattered MoE-gather access pattern, overturning an earlier
+  assumption that this path was latency-bound at ~5-12 GB/s. Removed
+  `gb_kv_compress_d2t2`/`gb_kv_decompress_t2tod` and the embedded-PTX absmax
+  K/V codec supporting them (~270 lines) from `greenboost_cuda_shim.c`,
+  confirmed zero callers; `GREENBOOST_KV_COMPRESS=1` now warns it's a no-op
+  instead of silently doing nothing. Shim capability blob's `expert_pool`
+  flag corrected `true`→`false` (the hot-expert VRAM cache it described was
+  removed after failing across ~4 sessions, see `workflow/known-issues.md`).
+  `third_party/gemlite`/`hqq` now rsync'd by `cmd_install_python_files`
+  (a Full Install previously shipped with no quantization backend at all).
+  `architecture.md` corrected: GDS's "~7 GB/s" and KV-compression's "2× at
+  eviction" were both aspirational, not measured, the code paths are dead
+  stubs with zero callers. **gb-synapse: continuous batching re-enabled by
+  default.** `n_slots` defaulted to `1` on every `serve()` call across all
+  backends, silently overriding llama.cpp's own `-np -1` "auto" mode
+  (`n_parallel=4, kv_unified=true`) with no code ever computing a real
+  value. Default changed to `-1` throughout (`gb_synapse.py`,
+  `gb_synapse_backends.py`, the CLI `--n-slots` default), letting
+  llama-server's own tested default take over. **Live-verified:** started a
+  real server and confirmed via `/slots`, 4 slots, each with the full
+  requested `n_ctx`, `kv_unified=true` genuinely active. Also added an M4
+  go/no-go mode to `gb_pathbench` (`cuMemCreate(HOST_NUMA_CURRENT)` SM
+  accessibility, the exact construct `GB_VRAM_FRONTLOAD`'s host-portion
+  backing depends on): **confirmed still fails**
+  (`CUDA_ERROR_INVALID_VALUE`) on CUDA 13.3 / cc 12.0, matching an earlier
+  finding on an older CUDA version. `GB_VRAM_FRONTLOAD` stays off for the
+  `llm` profile, permanently, not provisionally.
+- **gb-synapse: vLLM backend retired, GreenBoost's own torch-core engine
+  (vendored gLLM) is now the single safetensors serving path.**
+  `gb_llm.py`/`gb_llm_server.py` deleted, absorbed into
+  `gb_synapse_fallback.py` (the single-request transformers+gb-quant
+  fallback both `TransformersBackend` and `SynapseTorchBackend`'s own
+  per-checkpoint fallback branch now share). `entry.engine` values
+  `"vllm"`/`"gbquant"`/`"transformers"` are still accepted as deprecated
+  aliases, normalized to `"torch"` on manifest load — existing pulls keep
+  working unchanged. AWQ (4-bit) joins the already-shipped GPTQ loader,
+  reusing the same vendored Triton kernel. No installer/env changes needed
+  for existing users; `cmd_install_vllm`/`GB_INSTALL_VLLM` are gone (Full
+  Install's `install-synapse-engine` step already covers the torch core).
+- **gb-synapse: `--maxp` fix for small-context checkpoints.** The torch-core
+  engine's dummy profiling prefill defaulted to 8192 tokens regardless of a
+  checkpoint's real context window, crashing startup for any small-context
+  model (found via TinyLlama, ctx=2048). Now clamped to the checkpoint's own
+  `ctx_length` (or the requested `ctx`) whenever that's smaller.
+- **gb-synapse: post-ready stall detection.** A streaming request that sits
+  with zero output for `GB_SYNAPSE_STALL_THRESHOLD_S` (default 120s) after
+  `/health` already reported ready now emits a `synapse_stall` dataflux
+  event (model, engine, elapsed, upstream log tail) — closes the "client
+  sees a silent hang, not an error" gap from a hung first forward pass.
 - **gb-synapse default port 11434 → 11435** (`GB_SYNAPSE_PORT`). Ollama keeps
   :11434 — the two no longer collide by default. Migration: re-run
   `serve_and_repoint` (MCP `greenboost-synapse` / `gb_actuation.py`) or update
