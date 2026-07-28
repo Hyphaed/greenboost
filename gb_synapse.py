@@ -427,6 +427,19 @@ class ModelEntry:
     # param-count bucket heuristic in estimate_kv_gb).
     n_kv_heads: int = 0
     head_dim: int = 0
+    # Layers that actually hold a real, per-token-growing KV cache — 0 means
+    # "unknown, assume every layer does" (correct for a plain transformer,
+    # and the safe/conservative default for an old manifest entry pulled
+    # before this field existed). For a hybrid recurrent/attention
+    # architecture (e.g. qwen35's Gated DeltaNet + Gated Attention mix,
+    # `{arch}.full_attention_interval`), only 1 layer in N is real attention
+    # — the rest hold a fixed-size recurrent state that does NOT grow with
+    # context length. Confirmed live 2026-07-27: this reference model's own
+    # GGUF encodes `full_attention_interval=4` over 65 layers (16 real
+    # attention layers), but `estimate_kv_gb()` was using all 65 uniformly —
+    # a ~4x KV-size overestimate that was clamping ctx far below what the
+    # hardware can actually hold. See gguf_summary()'s computation.
+    n_kv_layers: int = 0
     added_ts: float = 0.0
 
 
@@ -1166,6 +1179,15 @@ def gguf_summary(path: str) -> dict:
     emb_len = int(_field_scalar(reader, f"{arch}.embedding_length") or 0)
     key_len = int(_field_scalar(reader, f"{arch}.attention.key_length") or 0)
     head_dim = key_len or (emb_len // head_count if head_count else 0)
+    # Hybrid recurrent/attention architectures (qwen35's Gated DeltaNet +
+    # Gated Attention mix) only give a real, context-length-scaling KV cache
+    # to 1 layer in `full_attention_interval` — the rest hold a fixed-size
+    # recurrent state. Absent this key (the common case), every layer is a
+    # real attention layer, matching llama.cpp's own default in
+    # src/models/qwen35.cpp (`full_attn_interval = 4` there is qwen35-
+    # specific; the GENERIC GGUF key read here is 1 for a plain transformer).
+    full_attn_interval = int(_field_scalar(reader, f"{arch}.full_attention_interval") or 1)
+    n_kv_layers = math.ceil(n_layers / full_attn_interval) if full_attn_interval > 1 else n_layers
     quant = ""
     weight_types = Counter(t.tensor_type.name for t in reader.tensors if "weight" in t.name)
     if weight_types:
@@ -1176,6 +1198,7 @@ def gguf_summary(path: str) -> dict:
         "dense_bytes": dense_bytes, "expert_bytes": expert_bytes,
         "ctx_length": ctx_length, "quant": quant, "arch": arch,
         "n_kv_heads": head_count_kv, "head_dim": head_dim,
+        "n_kv_layers": n_kv_layers,
     }
     if cache_key is not None:
         _GGUF_SUMMARY_CACHE[path] = (cache_key[0], cache_key[1], result)
@@ -1612,7 +1635,8 @@ def recommend(ctx: int = 65536, probe_feeders: bool = True) -> list[FitReport]:
     for entry in list_models():
         weights_gb = entry.n_bytes / (1024 ** 3)
         kv_gb = estimate_kv_gb(ctx, entry.n_bytes, entry.quant,
-                               n_layers=entry.n_layers, n_kv_heads=entry.n_kv_heads,
+                               n_layers=(entry.n_kv_layers or entry.n_layers),
+                               n_kv_heads=entry.n_kv_heads,
                                head_dim=entry.head_dim)
         total_gb = weights_gb + kv_gb
         active_gb = weights_gb
@@ -1796,7 +1820,24 @@ def _pid_alive(pid: int) -> bool:
         return True     # no procfs (non-Linux): fall back to the signal-0 answer
 
 
+# Legacy / de-facto model names that consumers (ai-forge, greenboost-cli
+# scripts, older docs) still reference by their OLD name, resolved to
+# whichever model is the CURRENT standing reference workload (see this
+# repo's own CLAUDE.md, Reference Workload Rule). One source of truth here
+# means a future reference-model swap updates every caller at once instead
+# of requiring a sweep across every repo that names a model directly —
+# confirmed real need 2026-07-27: ai-forge alone had 20+ files hardcoding
+# "qwen36-coder:studio" (the previous reference's Ollama-Modelfile tag) as
+# its de facto "the local coder model" constant.
+MODEL_ALIASES = {
+    "qwen36-coder:studio": "Qwen3.6-27B-Fable-Fusion-711-Uncensored-Heretic-NM-DAU-NEO-MAX-MTP-GGUF",
+    "rafw007/qwen36-a3b-claude-coder:latest": "Qwen3.6-27B-Fable-Fusion-711-Uncensored-Heretic-NM-DAU-NEO-MAX-MTP-GGUF",
+    "satgeze/qwen36-35b-uncensored-1m": "Qwen3.6-27B-Fable-Fusion-711-Uncensored-Heretic-NM-DAU-NEO-MAX-MTP-GGUF",
+}
+
+
 def _resolve_model(spec: str) -> ModelEntry:
+    spec = MODEL_ALIASES.get(spec, spec)
     manifest = _load_manifest()
     if spec in manifest:
         return manifest[spec]
@@ -2097,7 +2138,8 @@ def _pick_kv_type(ctx: int, entry: ModelEntry, budget_gb: float) -> str:
         return pin
     weights_gb = entry.n_bytes / (1024 ** 3)
     kv_f16_gb = estimate_kv_gb(ctx, entry.n_bytes, entry.quant,
-                               n_layers=entry.n_layers, n_kv_heads=entry.n_kv_heads,
+                               n_layers=(entry.n_kv_layers or entry.n_layers),
+                               n_kv_heads=entry.n_kv_heads,
                                head_dim=entry.head_dim,
                                kv_bytes_per_elem=2.0)     # f16: 2 bytes/elem
     return "f16" if weights_gb + kv_f16_gb <= budget_gb else "q8_0"
@@ -2154,7 +2196,8 @@ def _clamp_ctx_to_budget(requested_ctx: int, entry: ModelEntry, budget_gb: float
     weights_gb = entry.n_bytes / (1024 ** 3)
     kv_budget_gb = max(budget_gb - weights_gb, 0.25)
     kv_gb = estimate_kv_gb(requested_ctx, entry.n_bytes, entry.quant,
-                           n_layers=entry.n_layers, n_kv_heads=entry.n_kv_heads,
+                           n_layers=(entry.n_kv_layers or entry.n_layers),
+                           n_kv_heads=entry.n_kv_heads,
                            head_dim=entry.head_dim)
     if kv_gb <= kv_budget_gb:
         return requested_ctx
@@ -2299,9 +2342,42 @@ def _wait_upstream_ready(entry: ModelEntry, proc: subprocess.Popen, internal_por
     returned a ServerState for a corpse, callers printed "✓ started (pid N)",
     and the truth only surfaced later as an unreadable mid-stream
     RemoteProtocolError in whatever client had believed them.
+
+    One more corpse this also has to catch: llama.cpp's own pre-flight
+    admission check (`common_fit_params`) can log "failed to fit params to
+    free device memory ... abort" and then NOT actually exit the process —
+    confirmed live 2026-07-27 against an RPC feeder split, the process sat
+    alive (proc.poll() stayed None) for the full grace period and beyond,
+    never opening the HTTP port, until an external teardown finally killed
+    it. Without this, that failure is a silent multi-minute hang, not a
+    caught error the retry-and-back-off logic in gb_synapse_backends.py can
+    act on. Kill it and raise the same way a real exit would, so callers see
+    one failure shape either way.
+
+    This scan reads only the bytes appended to the log SINCE this call
+    started, not `_upstream_log_tail`'s file-tail — the log path is the same
+    file across every retry attempt (opened "ab" each time), so a plain tail
+    scan finds a STALE match from a PREVIOUS attempt's failure and kills a
+    CURRENT attempt that's actually loading fine. Confirmed live 2026-07-27:
+    a retry's tail scan matched a `common_fit_params` line from an attempt
+    two retries back, well before the current process had written anything.
     """
     import urllib.error
     import urllib.request
+
+    log_path = _run_log_path(entry.name)
+    try:
+        start_offset = log_path.stat().st_size
+    except OSError:
+        start_offset = 0
+
+    def _new_log_output() -> str:
+        try:
+            with open(log_path, "rb") as f:
+                f.seek(start_offset)
+                return f.read().decode("utf-8", errors="replace")
+        except OSError:
+            return ""
 
     deadline = time.time() + grace_s
     url = f"http://127.0.0.1:{internal_port}/health"
@@ -2312,7 +2388,18 @@ def _wait_upstream_ready(entry: ModelEntry, proc: subprocess.Popen, internal_por
             raise RuntimeError(
                 f"'{entry.name}' failed to load: the engine exited during startup "
                 f"(rc={proc.returncode}).\n"
-                f"    log: {_run_log_path(entry.name)}\n{_upstream_log_tail(entry.name)}")
+                f"    log: {log_path}\n{_upstream_log_tail(entry.name)}")
+        if "failed to fit params to free device memory" in _new_log_output().lower():
+            proc.kill()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass  # kill() was sent either way; not worth blocking the failure report on it
+            raise RuntimeError(
+                f"'{entry.name}' failed to load: llama.cpp's pre-flight fit-check "
+                f"rejected the requested layer split and hung instead of exiting "
+                f"(killed after detection).\n"
+                f"    log: {log_path}\n{_upstream_log_tail(entry.name)}")
         try:
             with urllib.request.urlopen(url, timeout=2) as r:
                 if r.status == 200 and not _health_says_loading(r.read(256)):
@@ -2543,8 +2630,30 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
         # Neither pid alive — stale run-state; fall through to a fresh serve().
 
     backend = gb_synapse_backends.select_backend(entry)
-    state = backend.serve(entry, port, ctx=ctx, use_cluster=use_cluster,
-                          n_slots=n_slots, extra_args=extra_args)
+    try:
+        state = backend.serve(entry, port, ctx=ctx, use_cluster=use_cluster,
+                              n_slots=n_slots, extra_args=extra_args)
+    except RuntimeError:
+        # A cluster/RPC load can fail for reasons that have nothing to do with
+        # whether the model can run at all — a feeder's engine build gap, a
+        # network-latency-bound split, a compute-reserve estimate that's wrong
+        # specifically for a multi-device config. Falling all the way through
+        # to the caller here is what pushed greenboost-cli into querying a
+        # DIFFERENT backend's port on failure instead of getting a working
+        # gb-synapse serve (confirmed live 2026-07-27: `gb -m <model> -p ...`
+        # hit an RPC-split failure, then fell back to raw Ollama's port and
+        # reported "model not found" there — gb-synapse is supposed to be the
+        # only backend, so failing outward like that is itself the bug).
+        # Retrying host-only here is never worse than the cluster attempt
+        # (strictly fewer devices, same or smaller footprint), so it's safe to
+        # do automatically rather than surfacing a cluster-specific error for
+        # a model that may well run fine node-local.
+        if not use_cluster:
+            raise
+        print(f"  [gb-synapse] {entry.name}: cluster/RPC serve failed — "
+              f"retrying host-only before giving up.", flush=True)
+        state = backend.serve(entry, port, ctx=ctx, use_cluster=False,
+                              n_slots=n_slots, extra_args=extra_args)
     return _maybe_serve_embedding(state)
 
 

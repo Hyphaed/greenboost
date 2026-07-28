@@ -349,6 +349,8 @@ def factory_submit(
     prompt: str,
     agent: str = "",
     priority: int = 10,
+    cwd: str = "",
+    gate_cmd: list[list[str]] | None = None,
 ) -> str:
     """Submit a task to the GreenBoost AI factory.
 
@@ -359,6 +361,16 @@ def factory_submit(
         prompt:   Natural language task description.
         agent:    Agent name to assign (empty = auto-select best agent).
         priority: Task priority 1–20 (1=highest, default 10).
+        cwd:      Absolute path to the project directory this task should work
+                   in (empty = the factory process's own cwd). The agent is
+                   told to use absolute paths under this directory for every
+                   file/shell operation; thread-scoped, safe under concurrent
+                   workers.
+        gate_cmd: Optional list of argv lists (e.g. [["npm","run","build"]])
+                   run in `cwd` after the agent turn completes — the real
+                   "Evaluate" stage. On failure the task auto-retries (up to
+                   the factory's max_retries) with the gate's own output
+                   appended to the prompt instead of blindly repeating it.
 
     Returns:
         Task ID confirmation.
@@ -367,10 +379,18 @@ def factory_submit(
     prompt   = _cap(prompt, _MAX_TEXT_LEN)
     agent    = _cap(agent, _MAX_PROJECT_LEN)
     priority = max(1, min(priority, 20))
+    cwd      = _cap(cwd, _MAX_PROJECT_LEN)
+    if cwd and not os.path.isdir(cwd):
+        return f"error: cwd does not exist or is not a directory: {cwd}"
+    metadata: dict = {}
+    if cwd:
+        metadata["cwd"] = cwd
+    if gate_cmd:
+        metadata["gate_cmd"] = gate_cmd
     from greenboost_cli.workflow.factory import get_factory
     factory = get_factory()
-    task_id = factory.submit(prompt=prompt, agent_name=agent, priority=priority)
-    return f"Task submitted — ID: {task_id}  priority: {priority}"
+    task_id = factory.submit(prompt=prompt, agent_name=agent, priority=priority, metadata=metadata)
+    return f"Task submitted — ID: {task_id}  priority: {priority}" + (f"  cwd: {cwd}" if cwd else "")
 
 
 @mcp.tool()

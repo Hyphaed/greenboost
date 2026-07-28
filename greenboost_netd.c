@@ -611,6 +611,10 @@ static pthread_mutex_t     g_ancestry_lock = PTHREAD_MUTEX_INITIALIZER;
 static void *gb_kernel_resolve(const char *kname);
 static void *gb_fatbin_resolve(const char *name);
 static int   gb_kernel_name_allowed(const char *kname);
+/* Rotation for the long-lived daemon log , open_log() itself is defined
+ * much later in this TU (alongside write_pid_file/remove_pid_file), this
+ * forward decl lets netd_log() below trigger a mid-run rotation. */
+static int open_log(void);
 
 static uint64_t mono_ms(void)
 {
@@ -624,6 +628,19 @@ static void netd_log(const char *fmt, ...)
 
 static void netd_log(const char *fmt, ...)
 {
+    /* This daemon is meant to run for months uninterrupted (confirmed live
+     * 2026-07-27: a feeder's netd.log had grown past 1 GB since first boot,
+     * no rotation ever existed). open_log()'s startup rotation alone can't
+     * catch that — check on every write instead. ftell() is a cheap,
+     * syscall-free read of the FILE*'s tracked position (kept in sync by
+     * the fflush() at the end of every prior call), so this doesn't add a
+     * stat()-per-log-line cost. */
+    if (g_logfp && ftell(g_logfp) >= (long)GB_NETD_LOG_MAX_BYTES) {
+        fclose(g_logfp);
+        g_logfp = NULL;
+        open_log();  /* rotates GB_NETD_LOG_FILE -> .1, reopens fresh */
+    }
+
     FILE *out = g_logfp ? g_logfp : stderr;
     time_t t = time(NULL);
     struct tm tm;
@@ -4113,9 +4130,27 @@ static void remove_pid_file(void)
     unlink(GB_NETD_PID_FILE);
 }
 
+/* Rotate GB_NETD_LOG_FILE -> GB_NETD_LOG_FILE ".1" (overwriting any previous
+ * ".1") if it's already at/over GB_NETD_LOG_MAX_BYTES. One generation is
+ * enough for "what was this daemon doing before it filled up" without
+ * building a full logrotate-style ladder into a small C daemon. Best-effort:
+ * a failed rename just means the current file keeps growing, not a crash. */
+static void rotate_log_if_oversized(void)
+{
+    struct stat st;
+    if (stat(GB_NETD_LOG_FILE, &st) != 0)
+        return;
+    if ((unsigned long)st.st_size < GB_NETD_LOG_MAX_BYTES)
+        return;
+    char rotated[sizeof(GB_NETD_LOG_FILE) + 4];
+    snprintf(rotated, sizeof(rotated), "%s.1", GB_NETD_LOG_FILE);
+    rename(GB_NETD_LOG_FILE, rotated);
+}
+
 static int open_log(void)
 {
     mkdir("/var/log/greenboost", 0755);
+    rotate_log_if_oversized();
     g_logfp = fopen(GB_NETD_LOG_FILE, "a");
     if (!g_logfp) {
         fprintf(stderr, "WARNING: cannot open %s - logging to stderr\n", GB_NETD_LOG_FILE);

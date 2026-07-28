@@ -22,11 +22,12 @@ _OLLAMA_BASE = "http://localhost:11434"
 
 # ── Ollama service coexistence ──────────────────────────────────────────────
 #
-# gb-synapse's llama-server binds the same default port Ollama uses (11434 —
-# see registry.py's "gb-synapse" entry), and both compete for the same GPU
-# VRAM. These manage the actual Ollama SYSTEMD SERVICE so it steps aside
-# before gb-synapse (or any other GPU-heavy task, e.g. /gb-quant --serve)
-# starts — unrelated to backend *choice*, which no longer exists.
+# gb-synapse binds its own port (11435 by default, registry.py's "gb-synapse"
+# entry — separate from Ollama's 11434 since the 2026-07 port migration), but
+# both still compete for the same GPU VRAM. These manage the actual Ollama
+# SYSTEMD SERVICE so it steps aside before gb-synapse (or any other GPU-heavy
+# task, e.g. /gb-quant --serve) starts — unrelated to backend *choice*, which
+# no longer exists.
 
 def _ollama_service_running() -> bool:
     """Return True if the Ollama HTTP server is reachable."""
@@ -182,7 +183,8 @@ def _resolve_gguf_path(model_id: str) -> str:
 
 
 def _llamacpp_base_url(settings: dict) -> str:
-    return settings.get("llamacpp_base_url") or "http://localhost:11434/v1"
+    from greenboost_cli.inference.registry import BACKEND_REGISTRY
+    return settings.get("llamacpp_base_url") or BACKEND_REGISTRY["gb-synapse"]["base_url"]
 
 
 def _llamacpp_running_pid(settings: dict | None = None) -> int | None:

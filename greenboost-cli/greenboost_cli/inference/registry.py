@@ -10,12 +10,20 @@ from __future__ import annotations
 
 import os
 
+# gb-synapse's own default port (gb_synapse.py: DEFAULT_PORT, GB_SYNAPSE_PORT
+# env var) — kept in sync manually since this is a separate package from the
+# sibling greenboost/ repo. Was 11434 (collided with raw Ollama) until the
+# 2026-07 migration to 11435; this registry entry was missed at the time,
+# which meant `gb` fell back to querying Ollama's port on any gb-synapse
+# connection failure instead of reporting the real gb-synapse error.
+_GB_SYNAPSE_PORT = int(os.environ.get("GB_SYNAPSE_PORT", "11435"))
+
 BACKEND_REGISTRY: dict[str, dict] = {
     "gb-synapse": {
         "type":        "openai",
         "api_key_env": None,
         "api_key":     "",
-        "base_url":    "http://localhost:11434/v1",
+        "base_url":    f"http://localhost:{_GB_SYNAPSE_PORT}/v1",
         # Display/tab-complete only — the actual catalog is whatever's in the
         # manifest (`greenboost synapse list`). Run /llamaserve status to
         # probe the live server.

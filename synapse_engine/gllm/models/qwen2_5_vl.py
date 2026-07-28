@@ -408,7 +408,21 @@ class Qwen2_5_VisionRotaryEmbedding(nn.Module):
         super().__init__()
         self.dim = dim
         self.theta = theta
-        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+        # GREENBOOST PATCH (2026-07-28, see NOTICE): compute on CPU, then
+        # move to the active device with one explicit .to() call -- same
+        # fix, same reason, as gllm/layers/rotary_embedding.py's
+        # _compute_cos_sin_cache patch (see that NOTICE entry above): a
+        # tensor-creation op (torch.arange here) executed directly under
+        # torch.set_default_device("cuda") while the GreenBoost shim is
+        # active is unreliable -- a third confirmed instance of the same
+        # class of shim/torch.utils._device interaction bug, a different
+        # manifestation each time (NVML assert in the first, SIGFPE in
+        # gllm/model_loader.py's kaiming_uniform_ case, and here CUDA
+        # "invalid resource handle").
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float, device="cpu") / dim))
+        target_device = torch.get_default_device() if hasattr(torch, "get_default_device") else None
+        if target_device is not None and target_device.type != "cpu":
+            inv_freq = inv_freq.to(target_device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached = 0
         self._freqs_cached = None
@@ -417,19 +431,21 @@ class Qwen2_5_VisionRotaryEmbedding(nn.Module):
         if seqlen > self._seq_len_cached:
             seqlen *= 2
             self._seq_len_cached = seqlen
-            self.inv_freq = 1.0 / (
+            # Same CPU-compute-then-move pattern as __init__ above.
+            device = self.inv_freq.device
+            inv_freq = 1.0 / (
                 self.theta
                 ** (
-                    torch.arange(
-                        0, self.dim, 2, dtype=torch.float, device=self.inv_freq.device
-                    )
+                    torch.arange(0, self.dim, 2, dtype=torch.float, device="cpu")
                     / self.dim
                 )
             )
-            seq = torch.arange(
-                seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype
-            )
-            freqs = torch.outer(seq, self.inv_freq)
+            seq = torch.arange(seqlen, device="cpu", dtype=self.inv_freq.dtype)
+            freqs = torch.outer(seq, inv_freq)
+            if device.type != "cpu":
+                inv_freq = inv_freq.to(device)
+                freqs = freqs.to(device)
+            self.inv_freq = inv_freq
             self._freqs_cached = freqs
 
     def forward(self, seqlen: int) -> torch.Tensor:

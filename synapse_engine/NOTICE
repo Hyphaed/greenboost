@@ -185,6 +185,168 @@ own changes at a glance.
   synthesized, unregistered attribute per the awq.py note above, not a
   checkpoint key). No behavior change, comment-only.
 
+- 2026-07-27: `gllm/layers/rotary_embedding.py` —
+  `RotaryEmbedding._compute_cos_sin_cache()` now computes on CPU and does one
+  explicit `.to(device)` at the end, instead of creating tensors directly
+  under whatever device context `__init__` runs in. Found live serving
+  `Qwen/Qwen3-VL-8B-{Instruct,Thinking}-FP8` on a 12 GB card: the cache
+  (sized to `max_position_embeddings` — hundreds of MB for this model's
+  native 262144 context) is computed at the exact moment weights already
+  occupy ~96% of VRAM, and `torch.arange`/`.cos()`/`.sin()`/`torch.cat`
+  executed inside a `torch.utils._device` context hit a reproducible
+  `RuntimeError: NVML_SUCCESS == ...nvmlDeviceGetHandleByPciBusId_v2_
+  INTERNAL ASSERT FAILED` in this torch build (2.9.1+cu128) — confirmed
+  independent of allocation size (reproduced at both the final `torch.cat`
+  and the earlier `freqs.sin()` when a smaller ctx was requested) and
+  independent of the GreenBoost shim (reproduces shimless too, there as an
+  honest `CUDA out of memory` instead of the assert) — a genuine bug in this
+  code path's interaction with `torch.utils._device`'s factory-function
+  interception, not a transient resource issue. `.to(device)` is a tensor
+  method with an explicit target, which does not route through that same
+  interception (only argument-less factory calls like `torch.cat`/
+  `torch.arange` do), so it sidesteps the broken path rather than working
+  around its symptom. Matches upstream's own noted-but-skipped "more
+  correct" approach (see the NOTE already in that function about HF
+  implementation parity) — CPU computation costs nothing VRAM-wise, so this
+  is a straight improvement, not a tradeoff.
+
+- 2026-07-27 (later the same day): `gllm/layers/attention.py` —
+  `flash_attn_with_kvcache`/`flash_attn_varlen_func` folded into the same
+  guarded `try/except` already used for `is_fa3_supported` just below (and
+  the `flash_mla` import further down), instead of a bare top-level import.
+  Surfaced upgrading `synapse-torch-env`'s torch 2.9.1 -> 2.11.0 (see the
+  rotary_embedding.py entry above for why): `sgl-kernel==0.3.21` (latest on
+  PyPI at the time) ships one fixed wheel with no torch-version variants,
+  and its compiled extension doesn't load against torch 2.11's C10 ABI
+  (`ImportError: undefined symbol:
+  _ZN3c104cuda29c10_cuda_check_implementationEiPKcS2_ib`). A bare import
+  raising here took down the entire attention module — every torch-backend
+  model, not just whichever one exposed the mismatch — even though every
+  actual call site of these two functions already checks `_FA3_AVAILABLE`
+  (or `self.decode_backend`, itself derived from it) before calling either
+  one. `_FA3_AVAILABLE=False` now routes everything through the existing
+  SDPA/Triton fallbacks this file already had for the hardware-unsupported
+  case — same safety net, now also covering the ABI-mismatch case.
+  Building `sgl-kernel` from source against torch 2.11/CUDA 13 would restore
+  the fast flash-attn path; not done as part of this patch.
+
+- 2026-07-28: `gllm/_custom_ops.py` + `gllm/layers/sampler.py` — two more
+  fixes surfaced by the sgl-kernel version jump needed to actually resolve
+  the earlier ABI-mismatch entries below (`sgl-kernel==0.3.21` never loads
+  cleanly against torch 2.11/CUDA 13 no matter which build variant is
+  tried — PyPI default, the dedicated cu130 index, even a from-source-
+  matching torch==2.11.0 pin all hit the identical undefined-symbol error;
+  the project renamed its distribution to `sglang_kernel` starting at
+  v0.4.x while keeping the same `sgl_kernel` import name — installing
+  `sglang_kernel==0.4.5+cu130` finally loads cleanly). That version jump
+  (0.3.x -> 0.4.x) is a real API surface change, not just an ABI fix:
+  - `_custom_ops.py`: `moe_fused_gate`/`moe_wna16_marlin_gemm`/
+    `gptq_marlin_repack` no longer exist (verified: the other 12 sgl_kernel
+    names this file imports all still work unchanged). All three are
+    MoE-routing or GPTQ-quantization specific and unused by the dense,
+    FP8-quantized models this was fixed for — guarded with try/except so a
+    model that genuinely needs one fails clearly at its own call site
+    instead of breaking gllm's import for every model.
+  - `sampler.py`: the fused `top_k_top_p_sampling_from_probs` convenience
+    function was removed entirely (confirmed only living on in an unrelated
+    MUSA-specific submodule) — only the renormalization kernels
+    (`top_k_renorm_probs`/`top_p_renorm_probs`) remain, each documented in
+    sgl_kernel's own source as "should be equivalent to
+    `top_k_sampling_from_probs`" when paired with a separate sampling step.
+    Rewrote `_fused_top_k_top_p_sample` as sequential top-k-then-top-p
+    renorm + `torch.multinomial` — the standard composition (same ordering
+    HF transformers' `TopKLogitsWarper`->`TopPLogitsWarper` uses, and what
+    sgl_kernel's own sampling.py says it adapted from flashinfer), not a
+    novel algorithm.
+
+- 2026-07-28 (later the same day): `gllm/model_loader.py` — added
+  `_skip_random_init()`, wrapping `load_model()`'s `model = model_type(self.
+  config)` construction call. This is the final fix in the chain needed to
+  actually serve Qwen3-VL-8B-{Instruct,Thinking}-FP8 (all prior entries in
+  this file, plus the ones in `third_party/llama.cpp/NOTICE`'s sibling
+  gllm/rotary_embedding.py, gllm/layers/attention.py, gllm/_custom_ops.py,
+  gllm/layers/sampler.py entries, were prerequisites this one builds on).
+
+  Root cause (isolated with a minimal 6-line repro, zero gllm code
+  involved): constructing an `nn.Conv3d` under `torch.set_default_device
+  ("cuda")` — exactly what `load_model()` does before building the model —
+  triggers `reset_parameters()` -> `torch.nn.init.kaiming_uniform_` ->
+  `Tensor.uniform_()`, a CUDA curand-based RNG-fill kernel launch. This
+  crashes with `Fatal Python error: Floating-point exception` (SIGFPE)
+  whenever the GreenBoost shim's LD_PRELOAD is active; the identical code
+  works perfectly shimless. Confirmed via direct repro with and without the
+  shim, same stack trace both failing runs, deterministic every time — a
+  genuine bug in how the shim's `cuLaunchKernel` interception (heavily
+  hooked for the cluster/feeder data-driven dispatch — scans kernel
+  arguments for remote fake pointers) handles this particular kernel's
+  argument layout. RNG kernels pass an internal generator/state struct
+  unlike a typical elementwise-op kernel, which is the most likely point of
+  difference the shim's argument scanner mishandles — NOT root-caused at
+  the shim/C level yet, only isolated and worked around at the gllm level.
+
+  The fix does not touch the shim: the random values `kaiming_uniform_`
+  writes here are immediately discarded anyway — every parameter gets
+  overwritten by real checkpoint weights in `model.load_weights()` a few
+  lines later in the same function. `_skip_random_init()` monkey-patches
+  `torch.nn.init`'s RNG-based functions (`kaiming_uniform_`,
+  `kaiming_normal_`, `xavier_uniform_`, `xavier_normal_`, `normal_`,
+  `uniform_`, `trunc_normal_`) to no-ops for the scope of model
+  construction only, restoring the originals immediately after — the same
+  standard practice HuggingFace `transformers` uses in its own
+  `no_init_weights()` context manager to skip wasted random initialization
+  when loading a pretrained checkpoint. Verified this patches correctly
+  (module-attribute lookup at call time, not a pre-bound import — confirmed
+  by reading `torch/nn/modules/conv.py`'s own `from torch.nn import ...
+  init` and `init.kaiming_uniform_(...)` call site) and verified the crash
+  is avoided with a standalone repro before deploying to the real
+  `model_loader.py`.
+
+  **Follow-up not done**: the actual shim bug (whatever `cuLaunchKernel`
+  does wrong for curand-style kernels) is still open — this workaround
+  means gLLM never hits it during model construction, but any OTHER code
+  path that does RNG-based tensor fills directly under the shim (outside
+  `torch.nn.init`, or outside model construction) could still hit the same
+  SIGFPE. Worth root-causing at the shim level eventually, tracked as part
+  of the standing T1/T2/shim-ownership direction in
+  `workflow/known-issues.md`, not blocking anything today.
+
+- 2026-07-28 (later still): `gllm/models/qwen2_5_vl.py` —
+  `Qwen2_5_VisionRotaryEmbedding.__init__`/`update_freqs_cache` — same
+  CPU-compute-then-`.to(device)` patch as the `rotary_embedding.py` entry
+  above, applied to a second, separate rotary-embedding implementation
+  (this one vision-tower-specific, not the shared `RotaryEmbedding` base
+  class). A third confirmed instance of the same shim/`torch.utils._device`
+  interaction bug class, this time surfacing as `torch.AcceleratorError:
+  CUDA error: invalid resource handle` (not the NVML assert or SIGFPE the
+  other two instances hit) in `torch.arange(...)` executed with no explicit
+  `device=` under `torch.set_default_device("cuda")`. Searched both
+  `qwen3_vl.py` and `qwen2_5_vl.py` for any other `torch.arange(...)` calls
+  missing an explicit device — this was the only other one found.
+
+- 2026-07-28 (final fix in the Qwen3-VL chain): `gllm/model_loader.py` —
+  superseded the narrower `_skip_random_init()`-only patch above with a
+  more general fix once a FOURTH independent crash site was found
+  (`gllm/layers/linear.py`'s `create_weights()` calling `torch.rand()`
+  directly, bypassing the `torch.nn.init`-level patch entirely — proof the
+  whack-a-mole of patching individual call sites was unbounded, since
+  gllm's own custom parallel/quantized layers call raw torch factory
+  functions with no consistent chokepoint to intercept). `load_model()` now
+  constructs the model inside a SCOPED `with torch.device("cpu")` (nested
+  inside the existing `torch.set_default_device("cuda")` — the scoped
+  override only affects the one construction call, everything downstream
+  still sees "cuda" as the ambient default, unchanged from before), then
+  moves the finished model to CUDA with one bulk `.to("cuda")` call. CPU
+  construction never touches the buggy shim path at all (confirmed: none
+  of the four independent crash types — kaiming_uniform_/SIGFPE,
+  torch.arange/"invalid resource handle", ones_/"invalid resource handle",
+  torch.rand/SIGFPE — happen on CPU); `.to("cuda")` is a plain per-tensor
+  device copy, a different code path already confirmed safe in isolation.
+  Verified end-to-end with a standalone repro (nested device-context +
+  Conv3d + torch.rand + bulk `.to("cuda")`, shim active) before deploying.
+  `_skip_random_init()` itself is kept (skipping useless CPU random-init is
+  a free speed optimization even without the crash to avoid — no downside
+  to leaving it).
+
 Why `synapse_engine/logger.py` exists
 --------------------------------------
 Upstream `gllm/` does `from logger import logger` in ~22 files, expecting

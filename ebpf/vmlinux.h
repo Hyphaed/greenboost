@@ -9514,6 +9514,7 @@ enum {
 	TP_ERR_TOO_MANY_ARGS = 78,
 	TP_ERR_TOO_MANY_EARGS = 79,
 	TP_ERR_EVENT_TOO_BIG = 80,
+	TP_ERR_TYPECAST_NOT_EVENT = 81,
 };
 
 enum {
@@ -22089,6 +22090,12 @@ enum lsm_rule_types {
 	LSM_SUBJ_TYPE = 5,
 };
 
+enum luo_ioctl_type {
+	LUO_IOCTL_INCOMING = 0,
+	LUO_IOCTL_OUTGOING = 1,
+	LUO_IOCTL_ALL = 2,
+};
+
 enum lw_bits {
 	LW_URGENT = 0,
 };
@@ -22843,10 +22850,11 @@ enum mem_type {
 	MEM_DDR5 = 23,
 	MEM_RDDR5 = 24,
 	MEM_LRDDR5 = 25,
-	MEM_NVDIMM = 26,
-	MEM_WIO2 = 27,
-	MEM_HBM2 = 28,
-	MEM_HBM3 = 29,
+	MEM_LPDDR5 = 26,
+	MEM_NVDIMM = 27,
+	MEM_WIO2 = 28,
+	MEM_HBM2 = 29,
+	MEM_HBM3 = 30,
 };
 
 enum membarrier_cmd {
@@ -46874,7 +46882,7 @@ struct bitmap_operations {
 	void (*daemon_work)(struct mddev *);
 	void (*start_behind_write)(struct mddev *);
 	void (*end_behind_write)(struct mddev *);
-	void (*wait_behind_writes)(struct mddev *);
+	bool (*wait_behind_writes)(struct mddev *, bool);
 	md_bitmap_fn *start_write;
 	md_bitmap_fn *end_write;
 	md_bitmap_fn *start_discard;
@@ -48259,6 +48267,7 @@ struct bpf_map_owner;
 
 struct bpf_map {
 	u8 sha[32];
+	u32 excl;
 	const struct bpf_map_ops *ops;
 	struct bpf_map *inner_map_meta;
 	void *security;
@@ -48325,6 +48334,8 @@ struct bpf_arena {
 	rqspinlock_t spinlock;
 	struct list_head vma_list;
 	struct mutex lock;
+	u64 zap_gen;
+	struct mutex zap_mutex;
 	struct irq_work free_irq;
 	struct work_struct free_work;
 	struct llist_head free_spans;
@@ -48851,7 +48862,7 @@ struct bpf_lru_list {
 	struct list_head lists[3];
 	unsigned int counts[2];
 	struct list_head *next_inactive_rotation;
-	raw_spinlock_t lock;
+	rqspinlock_t lock;
 	long: 64;
 	long: 64;
 	long: 64;
@@ -50291,7 +50302,6 @@ struct bpf_htab {
 	long: 64;
 	long: 64;
 	long: 64;
-	long: 64;
 	union {
 		struct pcpu_freelist freelist;
 		struct bpf_lru lru;
@@ -51390,16 +51400,21 @@ struct bpf_lpm_trie_key_u8 {
 };
 
 struct bpf_lru_locallist {
-	struct list_head lists[2];
+	struct list_head pending_list;
+	struct llist_head free_llist;
 	u16 next_steal;
-	raw_spinlock_t lock;
+	rqspinlock_t lock;
 };
 
 struct bpf_lru_node {
-	struct list_head list;
+	union {
+		struct list_head list;
+		struct llist_node llist;
+	};
 	u16 cpu;
 	u8 type;
 	u8 ref;
+	u8 pending_free;
 };
 
 struct bpf_lwt_prog {
@@ -53954,7 +53969,6 @@ struct bpf_struct_ops_map {
 	void *image_pages[8];
 	struct btf *btf;
 	struct bpf_struct_ops_value *uvalue;
-	long: 64;
 	long: 64;
 	long: 64;
 	long: 64;
@@ -58007,6 +58021,7 @@ struct cgroup_iter_priv {
 struct cgroup_lsm_atype {
 	u32 attach_btf_id;
 	int refcnt;
+	bool returns_errno;
 };
 
 struct cgroup_taskset {
@@ -67721,6 +67736,7 @@ struct dma_buf {
 	const char *exp_name;
 	const char *name;
 	spinlock_t name_lock;
+	atomic_t priority;
 	struct module *owner;
 	struct list_head list_node;
 	void *priv;
@@ -67794,6 +67810,11 @@ struct dma_buf_ops {
 	int (*mmap)(struct dma_buf *, struct vm_area_struct *);
 	int (*vmap)(struct dma_buf *, struct iosys_map *);
 	void (*vunmap)(struct dma_buf *, struct iosys_map *);
+};
+
+struct dma_buf_priority {
+	__u32 priority;
+	__u32 pad;
 };
 
 struct dma_buf_sg_table_wrapper {
@@ -75448,7 +75469,7 @@ struct epitem {
 		struct callback_head rcu;
 	};
 	struct list_head rdllink;
-	struct epitem *next;
+	struct epitem *ovflist_next;
 	struct epoll_filefd ffd;
 	struct eppoll_entry *pwqlist;
 	struct eventpoll *ep;
@@ -76864,6 +76885,7 @@ struct eventpoll {
 	wait_queue_head_t poll_wait;
 	struct list_head rdllist;
 	spinlock_t lock;
+	seqcount_spinlock_t seq;
 	struct rb_root_cached rbr;
 	struct epitem *ovflist;
 	struct wakeup_source *ws;
@@ -80826,6 +80848,7 @@ struct firmware_map_entry {
 
 struct firmware_work {
 	struct work_struct work;
+	struct list_head list;
 	struct module *module;
 	const char *name;
 	struct device *device;
@@ -82542,13 +82565,19 @@ struct fscrypt_master_key {
 	struct callback_head mk_rcu_head;
 	struct fscrypt_master_key_secret mk_secret;
 	struct fscrypt_key_specifier mk_spec;
-	struct key *mk_users;
+	struct list_head mk_users;
 	struct list_head mk_decrypted_inodes;
 	spinlock_t mk_decrypted_inodes_lock;
 	struct list_head mk_mode_keys;
 	siphash_key_t mk_ino_hash_key;
 	bool mk_ino_hash_key_initialized;
 	bool mk_present;
+};
+
+struct fscrypt_master_key_user {
+	struct list_head link;
+	kuid_t uid;
+	struct key *quota_key;
 };
 
 struct fscrypt_mode {
@@ -95446,6 +95475,18 @@ struct ioam6_hdr {
 	__u8 type;
 };
 
+struct rt6_info {
+	struct dst_entry dst;
+	struct fib6_info *from;
+	int sernum;
+	struct rt6key rt6i_dst;
+	struct rt6key rt6i_src;
+	struct in6_addr rt6i_gateway;
+	struct inet6_dev *rt6i_idev;
+	u32 rt6i_flags;
+	short unsigned int rt6i_nfheader_len;
+};
+
 struct ioam6_lwt_freq {
 	u32 k;
 	u32 n;
@@ -95502,7 +95543,7 @@ struct ioam6_lwt_encap {
 };
 
 struct ioam6_lwt {
-	struct dst_entry null_dst;
+	struct rt6_info null_rt;
 	struct dst_cache cache;
 	struct ioam6_lwt_freq freq;
 	atomic_t pkt_cnt;
@@ -98402,11 +98443,11 @@ struct k_clock {
 	int (*timer_set)(struct k_itimer *, int, struct itimerspec64 *, struct itimerspec64 *);
 	int (*timer_del)(struct k_itimer *);
 	void (*timer_get)(struct k_itimer *, struct itimerspec64 *);
-	void (*timer_rearm)(struct k_itimer *);
+	bool (*timer_rearm)(struct k_itimer *);
 	s64 (*timer_forward)(struct k_itimer *, ktime_t);
 	ktime_t (*timer_remaining)(struct k_itimer *, ktime_t);
 	int (*timer_try_to_cancel)(struct k_itimer *);
-	void (*timer_arm)(struct k_itimer *, ktime_t, bool, bool);
+	bool (*timer_arm)(struct k_itimer *, ktime_t, bool, bool);
 	void (*timer_wait_running)(struct k_itimer *);
 };
 
@@ -98863,7 +98904,7 @@ struct kernfs_elem_symlink {
 };
 
 struct kernfs_global_locks {
-	struct mutex open_file_mutex[1024];
+	struct mutex node_mutex[1024];
 };
 
 struct simple_xattr_limits {
@@ -98871,15 +98912,13 @@ struct simple_xattr_limits {
 	atomic_t xattr_size;
 };
 
-struct simple_xattrs;
-
 struct kernfs_iattrs {
 	kuid_t ia_uid;
 	kgid_t ia_gid;
 	struct timespec64 ia_atime;
 	struct timespec64 ia_mtime;
 	struct timespec64 ia_ctime;
-	struct simple_xattrs *xattrs;
+	struct list_head xattrs;
 	struct simple_xattr_limits xattr_limits;
 };
 
@@ -98945,6 +98984,10 @@ struct kernfs_ops {
 	loff_t (*llseek)(struct kernfs_open_file *, loff_t, int);
 };
 
+struct simple_xattr_cache {
+	struct rhashtable *ht;
+};
+
 struct kernfs_syscall_ops;
 
 struct kernfs_root {
@@ -98962,6 +99005,7 @@ struct kernfs_root {
 	struct rw_semaphore kernfs_supers_rwsem;
 	rwlock_t kernfs_rename_lock;
 	struct callback_head rcu;
+	struct simple_xattr_cache xa_cache;
 };
 
 struct kernfs_super_info {
@@ -102091,6 +102135,7 @@ struct landlock_file_security {
 	deny_masks_t deny_masks;
 	u8 fown_layer;
 	struct landlock_cred_security fown_subject;
+	struct pid *fown_tg;
 };
 
 struct landlock_hierarchy {
@@ -102918,7 +102963,7 @@ struct liveupdate_file_ops {
 };
 
 struct luo_flb_private_state {
-	long int count;
+	refcount_t count;
 	u64 data;
 	void *obj;
 	struct mutex lock;
@@ -103980,6 +104025,7 @@ struct luo_ioctl_op___2 {
 	unsigned int size;
 	unsigned int min_size;
 	unsigned int ioctl_num;
+	enum luo_ioctl_type type;
 	int (*execute)(struct luo_session *, struct luo_ucmd *);
 };
 
@@ -109944,6 +109990,8 @@ struct multiprocess_signals {
 	struct hlist_node node;
 };
 
+typedef struct mutex *class_kernfs_node_lock_t;
+
 struct mutex_waiter {
 	struct list_head list;
 	struct task_struct *task;
@@ -110885,6 +110933,15 @@ struct nd_label_id {
 	char id[50];
 };
 
+struct nd_lane {
+	struct mutex lock;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+	long: 64;
+};
+
 struct nvdimm;
 
 struct nvdimm_drvdata;
@@ -111001,11 +111058,6 @@ struct nd_opt_hdr {
 	__u8 nd_opt_len;
 };
 
-struct nd_percpu_lane {
-	int count;
-	spinlock_t lock;
-};
-
 struct nd_pfn_sb {
 	u8 signature[16];
 	u8 uuid[16];
@@ -111049,7 +111101,7 @@ struct nd_region {
 	struct kernfs_node *bb_state;
 	struct badblocks bb;
 	struct nd_interleave_set *nd_set;
-	struct nd_percpu_lane *lane;
+	struct nd_lane *lane;
 	int (*flush)(struct nd_region *, struct bio *);
 	struct nd_mapping mapping[0];
 };
@@ -112091,18 +112143,6 @@ struct rtable {
 	u32 rt_pmtu: 31;
 };
 
-struct rt6_info {
-	struct dst_entry dst;
-	struct fib6_info *from;
-	int sernum;
-	struct rt6key rt6i_dst;
-	struct rt6key rt6i_src;
-	struct in6_addr rt6i_gateway;
-	struct inet6_dev *rt6i_idev;
-	u32 rt6i_flags;
-	short unsigned int rt6i_nfheader_len;
-};
-
 struct net_bridge;
 
 struct net_bridge_vlan;
@@ -112640,6 +112680,8 @@ struct net_device {
 	struct hlist_head qdisc_hash[16];
 	struct timer_list watchdog_timer;
 	int watchdog_timeo;
+	spinlock_t watchdog_lock;
+	bool watchdog_ref_held;
 	u32 proto_down_reason;
 	struct list_head todo_list;
 	int *pcpu_refcnt;
@@ -112707,7 +112749,6 @@ struct net_device {
 	struct net_shaper_hierarchy *net_shaper_hierarchy;
 	struct hlist_head neighbours[2];
 	struct hwtstamp_provider *hwprov;
-	long: 64;
 	long: 64;
 	long: 64;
 	long: 64;
@@ -114260,6 +114301,7 @@ struct nf_conntrack_expect {
 	struct hlist_node lnode;
 	struct hlist_node hnode;
 	possible_net_t net;
+	struct nf_conntrack_tuple master_tuple;
 	struct nf_conntrack_tuple tuple;
 	struct nf_conntrack_tuple_mask mask;
 	struct nf_conntrack_zone zone;
@@ -114270,7 +114312,7 @@ struct nf_conntrack_expect {
 	struct nf_conntrack_helper *helper;
 	struct nf_conntrack_helper *assign_helper;
 	struct nf_conn *master;
-	struct timer_list timeout;
+	u32 timeout;
 	union nf_inet_addr saved_addr;
 	union nf_conntrack_man_proto saved_proto;
 	enum ip_conntrack_dir dir;
@@ -114293,7 +114335,7 @@ struct nf_ct_event_notifier {
 struct nf_ct_ext {
 	u8 offset[10];
 	u8 len;
-	unsigned int gen_id;
+	long: 0;
 	char data[0];
 };
 
@@ -114395,6 +114437,7 @@ struct nf_queue_entry {
 	struct net_device *skb_dev;
 	unsigned int id;
 	unsigned int hook_index;
+	struct net_device *bridge_dev;
 	struct net_device *physin;
 	struct net_device *physout;
 	struct nf_hook_state state;
@@ -121494,7 +121537,7 @@ struct pidfs_anon_attr {
 };
 
 struct pidfs_attr {
-	struct simple_xattrs *xattrs;
+	struct list_head xattrs;
 	union {
 		struct pidfs_anon_attr;
 		struct llist_node pidfs_llist;
@@ -125720,6 +125763,10 @@ struct raw_sock {
 
 struct rawdata_f_data {
 	struct aa_loaddata *loaddata;
+	struct {
+		struct {} __empty_data;
+		char data[0];
+	};
 };
 
 struct rb_augment_callbacks {
@@ -134565,7 +134612,7 @@ struct shmem_inode_info {
 	};
 	struct timespec64 i_crtime;
 	struct shared_policy policy;
-	struct simple_xattrs *xattrs;
+	struct list_head xattrs;
 	long unsigned int fallocend;
 	unsigned int fsflags;
 	atomic_t stop_eviction;
@@ -134618,6 +134665,7 @@ struct shmem_sb_info {
 	struct list_head shrinklist;
 	long unsigned int shrinklist_len;
 	struct shmem_quota_limits qlimits;
+	struct simple_xattr_cache xa_cache;
 };
 
 struct shmid64_ds {
@@ -135073,16 +135121,12 @@ typedef struct simple_xattr *class_simple_xattr_t;
 
 struct simple_xattr {
 	struct rhash_head hash_node;
+	struct list_head *parent;
+	struct list_head node;
 	struct callback_head rcu;
 	char *name;
 	size_t size;
 	char value[0];
-};
-
-typedef struct simple_xattrs *class_simple_xattrs_t;
-
-struct simple_xattrs {
-	struct rhashtable ht;
 };
 
 struct simpledrm_device {
@@ -136097,9 +136141,8 @@ struct socket_smack {
 };
 
 struct sockfs_inode {
-	struct simple_xattrs *xattrs;
+	struct list_head xattrs;
 	struct simple_xattr_limits xattr_limits;
-	long: 64;
 	long: 64;
 	long: 64;
 	long: 64;
@@ -138841,6 +138884,11 @@ struct sx150x_pinctrl {
 	} irq;
 	struct mutex lock;
 	const struct sx150x_device_data *data;
+};
+
+struct sx_key {
+	const struct list_head *parent;
+	const char *name;
 };
 
 struct sym_count_ctx {
@@ -141616,22 +141664,20 @@ struct thermal_governor {
 
 struct thermal_hwmon_attr {
 	struct device_attribute attr;
-	char name[16];
-};
-
-struct thermal_hwmon_device {
-	char type[20];
-	struct device *device;
-	int count;
-	struct list_head tz_list;
-	struct list_head node;
 };
 
 struct thermal_hwmon_temp {
-	struct list_head hwmon_node;
 	struct thermal_zone_device *tz;
 	struct thermal_hwmon_attr temp_input;
 	struct thermal_hwmon_attr temp_crit;
+	bool temp_crit_present;
+};
+
+struct thermal_hwmon_device {
+	char name[31];
+	struct device *device;
+	struct list_head node;
+	struct thermal_hwmon_temp tz_temp;
 };
 
 struct thermal_instance {
@@ -144056,6 +144102,13 @@ struct trace_event_data_offsets_dma_buf_fd {
 };
 
 struct trace_event_data_offsets_dma_fence {
+	u32 driver;
+	const void *driver_ptr_;
+	u32 timeline;
+	const void *timeline_ptr_;
+};
+
+struct trace_event_data_offsets_dma_fence_ops {
 	u32 driver;
 	const void *driver_ptr_;
 	u32 timeline;
@@ -146803,6 +146856,15 @@ struct trace_event_raw_dma_buf_fd {
 };
 
 struct trace_event_raw_dma_fence {
+	struct trace_entry ent;
+	u32 __data_loc_driver;
+	u32 __data_loc_timeline;
+	unsigned int context;
+	unsigned int seqno;
+	char __data[0];
+};
+
+struct trace_event_raw_dma_fence_ops {
 	struct trace_entry ent;
 	u32 __data_loc_driver;
 	u32 __data_loc_timeline;
@@ -152917,7 +152979,9 @@ struct traceprobe_parse_context {
 	const struct btf_param *params;
 	s32 nr_params;
 	struct btf *btf;
+	struct btf *struct_btf;
 	const struct btf_type *last_type;
+	const struct btf_type *last_struct;
 	u32 last_bitoffs;
 	u32 last_bitsize;
 	struct trace_probe *tp;
@@ -156294,6 +156358,7 @@ struct user_event_enabler {
 	struct user_event *event;
 	long unsigned int addr;
 	long unsigned int values;
+	struct rcu_work put_rwork;
 };
 
 struct user_event_enabler_fault {
@@ -157620,11 +157685,13 @@ struct vcap_cache_data {
 	bool sticky;
 };
 
+struct vcap_control;
+
 struct vcap_admin {
 	struct list_head list;
 	struct list_head rules;
 	struct list_head enabled;
-	struct mutex lock;
+	struct vcap_control *vctrl;
 	enum vcap_type vtype;
 	int vinst;
 	int first_cid;
@@ -157639,8 +157706,6 @@ struct vcap_admin {
 	bool ingress;
 	struct vcap_cache_data cache;
 };
-
-struct vcap_control;
 
 struct vcap_admin_debugfs_info {
 	struct vcap_control *vctrl;
@@ -157778,6 +157843,7 @@ struct vcap_control {
 	const struct vcap_info *vcaps;
 	const struct vcap_statistics *stats;
 	struct list_head list;
+	struct mutex lock;
 };
 
 struct vcap_counter {
@@ -159529,6 +159595,7 @@ struct vma_list {
 	struct vm_area_struct *vma;
 	struct list_head head;
 	refcount_t mmap_count;
+	u64 zap_gen;
 };
 
 struct vma_merge_struct {

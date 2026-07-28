@@ -103,14 +103,48 @@ class RotaryEmbedding(nn.Module):
         return inv_freq
 
     def _compute_cos_sin_cache(self):
-        """Compute the cos and sin cache."""
-        inv_freq = self._compute_inv_freq(self.base)
-        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+        """Compute the cos and sin cache.
 
-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        GREENBOOST PATCH (2026-07-27): compute on CPU, then move the finished
+        cache to the active device with one explicit .to() call, instead of
+        creating the intermediate tensors directly under whatever device
+        context __init__ is called in. Two independent problems on a
+        VRAM-constrained card (this cache is sized to max_position_embeddings,
+        hundreds of MB for a long-context model like Qwen3-VL's native
+        262144, computed at the exact moment weights already occupy ~96% of
+        VRAM):
+          1. torch.arange/.cos()/.sin()/torch.cat executed inside a
+             torch.utils._device context manager hit a reproducible
+             `RuntimeError: NVML_SUCCESS == ...nvmlDeviceGetHandleByPciBusId_v2_
+             INTERNAL ASSERT FAILED` in this torch build (2.9.1+cu128) —
+             confirmed independent of allocation size (reproduced at both the
+             final torch.cat AND the earlier freqs.sin() call) and
+             independent of the GreenBoost shim (reproduces shimless too,
+             there as an honest CUDA OOM instead) — a genuine bug in this
+             code path, not a transient resource issue.
+          2. Even without the assert, creating this cache directly on an
+             already ~96%-full GPU risks OOM before the GreenBoost shim's
+             T1/T2 overflow can reliably engage for this allocation pattern
+             (observed inconsistent: sometimes clean overflow, sometimes
+             "local+remote full", sometimes the assert above).
+        Computing on CPU costs nothing VRAM-wise and matches upstream's own
+        noted-but-skipped "more correct" approach (see the NOTE above about
+        HF-implementation parity) — the .to(device) at the end is one plain,
+        well-trodden H2D copy that the shim's cudaMalloc hook handles like
+        any other allocation, sidestepping the broken path entirely.
+        """
+        inv_freq = self._compute_inv_freq(self.base)
+        t = torch.arange(self.max_position_embeddings, dtype=torch.float, device="cpu")
+        inv_freq_cpu = inv_freq.to("cpu") if inv_freq.is_cuda else inv_freq
+
+        freqs = torch.einsum("i,j -> ij", t, inv_freq_cpu)
         cos = freqs.cos()
         sin = freqs.sin()
         cache = torch.cat((cos, sin), dim=-1)
+
+        target_device = torch.get_default_device() if hasattr(torch, "get_default_device") else None
+        if target_device is not None and target_device.type != "cpu":
+            cache = cache.to(target_device)
         return cache
 
     def forward(

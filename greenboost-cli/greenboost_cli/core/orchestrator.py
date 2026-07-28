@@ -485,7 +485,7 @@ def _is_auto_approved(tc: dict, settings: dict, is_mcp: bool = False) -> bool:
 
     if perm_mode == "autonomous":
         # Reads, writes, edits all auto-approved in autonomous mode
-        if name in ("Read", "Glob", "Grep", "WebFetch", "WebSearch", "Write", "Edit"):
+        if name in ("Read", "Glob", "Grep", "WebFetch", "WebSearch", "Screenshot", "Write", "Edit"):
             return True
         if name == "Bash":
             return is_autonomous_safe(tc["input"].get("command", ""))
@@ -494,7 +494,7 @@ def _is_auto_approved(tc: dict, settings: dict, is_mcp: bool = False) -> bool:
         return False
 
     # "auto" mode: read-only operations only, ask for everything else
-    if name in ("Read", "Glob", "Grep", "WebFetch", "WebSearch"):
+    if name in ("Read", "Glob", "Grep", "WebFetch", "WebSearch", "Screenshot"):
         return True
     if name == "Bash":
         return is_readonly_command(tc["input"].get("command", ""))
