@@ -94,6 +94,7 @@ TOOL_ICONS: dict[str, str] = {
     "Glob":      "✦",    # pattern match
     "Grep":      "⌕",    # search
     "WebFetch":  "↓",    # fetch / download
+    "Screenshot": "▤",   # UI capture
     "WebSearch": "⊹",    # web search
     "TodoWrite":   "☑",   # task list write
     "TodoRead":    "☐",   # task list read

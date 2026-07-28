@@ -460,6 +460,11 @@ struct gb_net_response {
 #define GB_CLUSTER_CONF     "/etc/greenboost/cluster.conf"
 #define GB_NETD_PID_FILE    "/run/greenboost/netd.pid"
 #define GB_NETD_LOG_FILE    "/var/log/greenboost/netd.log"
+/* No rotation existed before 2026-07-27 — found live on a feeder with a
+ * 1+ GB netd.log growing since first boot, no logrotate.d drop-in, no
+ * internal size check. 50 MB keeps enough history for debugging a recent
+ * incident without letting a long-lived daemon fill the disk unbounded. */
+#define GB_NETD_LOG_MAX_BYTES (50UL * 1024 * 1024)
 
 /* ------------------------------------------------------------------ */
 /*  Single-GPU cluster: CUDA_EXEC with pointer relocation              */

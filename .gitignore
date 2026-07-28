@@ -41,9 +41,14 @@ tests/bench/results.jsonl
 # .mcp.json IS tracked (owner decision 2026-07-13): it's the project-scope MCP
 # registration for a fresh clone — 5 servers, relative python3 commands, no
 # machine paths or secrets. CLAUDE.md/workflow/ stay untracked below.
+# NB: /memory and /workflow below are anchored to repo root (leading slash) —
+# a bare `memory/`/`workflow/` pattern matches ANY directory with that name at
+# ANY depth, which silently dropped greenboost-cli/greenboost_cli/memory/ and
+# .../workflow/ (a real Python subpackage, holds the AI Factory) from git
+# entirely. Confirmed live 2026-07-27 during the greenboost-cli consolidation.
 CLAUDE.md
 MEMORY.md
-memory/
+/memory/
 *.claude.md
 .claude_*
 .continue/
@@ -71,7 +76,7 @@ venv/
 push_to_gitlab.sh
 
 # Claude working folder (session plans, agent docs) , never committed
-workflow/
+/workflow/
 greenboost_next.md
 
 # Runtime cache (index.db etc) , never expose

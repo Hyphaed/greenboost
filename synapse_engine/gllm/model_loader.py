@@ -1,3 +1,4 @@
+import contextlib
 import glob
 import os
 import threading
@@ -24,6 +25,45 @@ from gllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from gllm.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from gllm.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from gllm.utils import get_lock
+
+
+@contextlib.contextmanager
+def _skip_random_init():
+    """GREENBOOST PATCH (2026-07-28, see NOTICE): the values torch.nn.init's
+    initializers write during model construction are immediately discarded
+    -- every parameter gets overwritten by real checkpoint weights a few
+    lines below in load_model()'s model.load_weights() call. Skipping every
+    init call entirely (same standard practice as HuggingFace transformers'
+    own no_init_weights()) avoids a reproducible GreenBoost shim bug: ANY
+    CUDA kernel launched while a tensor op runs under
+    torch.set_default_device("cuda") + the shim's LD_PRELOAD is unreliable
+    -- confirmed across three independent, unrelated ops (not scoped to
+    RNG): torch.nn.init.kaiming_uniform_ -> Tensor.uniform_ (SIGFPE),
+    torch.arange in Qwen2_5_VisionRotaryEmbedding (CUDA "invalid resource
+    handle"), and torch.nn.init.ones_ -> Tensor.fill_ (also "invalid
+    resource handle") -- each works shimless and fails identically with the
+    shim active, every time. Started as a narrower RNG-only patch; widened
+    here to cover the full standard torch.nn.init surface once ones_/
+    fill_ (no RNG at all) also crashed, proving the bug isn't RNG-specific.
+    Root cause is presumably the shim's cuLaunchKernel argument-scanning/
+    relocation logic mishandling something about kernels dispatched via
+    this specific torch.utils._device code path -- not fixed at the shim
+    level yet; this sidesteps it instead since none of these values matter
+    here regardless of whether the shim mishandles them.
+    """
+    noop = lambda tensor, *a, **k: tensor
+    patched = ("kaiming_uniform_", "kaiming_normal_", "xavier_uniform_",
+              "xavier_normal_", "normal_", "uniform_", "trunc_normal_",
+              "ones_", "zeros_", "constant_", "eye_", "dirac_",
+              "orthogonal_", "sparse_")
+    originals = {name: getattr(torch.nn.init, name) for name in patched}
+    for name in patched:
+        setattr(torch.nn.init, name, noop)
+    try:
+        yield
+    finally:
+        for name, fn in originals.items():
+            setattr(torch.nn.init, name, fn)
 
 
 class _SafeOpenPool:
@@ -597,9 +637,35 @@ class ModelLoader:
 
         torch.set_default_device("cuda")
 
-        # Init model whose weights are on GPU memory
+        # GREENBOOST PATCH (2026-07-28, see NOTICE): construct on CPU (a
+        # SCOPED override via the nested `with torch.device("cpu")` below --
+        # does not change the ambient default set two lines above; every
+        # call outside this `with` block, including everything downstream
+        # in this function, still sees "cuda" as the default, unchanged
+        # from upstream expectations), then move the finished model to CUDA
+        # in one bulk .to() call.
+        #
+        # Four independent, unrelated ops crashed when constructed directly
+        # under torch.set_default_device("cuda") with the GreenBoost shim
+        # active: torch.nn.init.kaiming_uniform_ (SIGFPE), torch.arange in
+        # Qwen2_5_VisionRotaryEmbedding ("invalid resource handle"),
+        # torch.nn.init.ones_ ("invalid resource handle"), and
+        # gllm/layers/linear.py's create_weights() calling torch.rand()
+        # directly (SIGFPE again) -- see NOTICE for the full chain. Patching
+        # each call site individually proved unbounded: gllm's own custom
+        # layers (e.g. that create_weights()) call raw torch factory
+        # functions directly, bypassing the torch.nn.init-level
+        # _skip_random_init() patch entirely, and there is no way to know
+        # in advance how many more such call sites exist across the vendored
+        # model zoo. CPU construction never exercises the buggy shim path at
+        # all; model.to("cuda") is a plain per-tensor device copy, a
+        # different code path already confirmed safe in isolation (does not
+        # route through the same torch.utils._device interception every one
+        # of the four crashes above went through).
         free_gpu_memory_before, _ = torch.cuda.mem_get_info()
-        model = model_type(self.config)
+        with _skip_random_init(), torch.device("cpu"):
+            model = model_type(self.config)
+        model = model.to("cuda")
         free_gpu_memory_after, _ = torch.cuda.mem_get_info()
         model_size_gb = round(
             (free_gpu_memory_before - free_gpu_memory_after) / (2**30), 2

@@ -1982,11 +1982,7 @@ cmd_help() {
         echo -e ""
         echo -e "  ${C_CYAN}${C_BOLD}GAMING:${C_RESET}"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "gaming-mode enable|disable" "Suspend/restore Ollama before/after gaming"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-proton" "Install GreenBoost Proton for Steam"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "remove-proton"          "Remove GreenBoost Proton"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "steam-launch-guide"     "Show Steam launch options + Proton setup guide"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "install-mangohud"       "Build MangoHud from source + install GreenBoost config"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "uninstall-mangohud"     "Remove MangoHud"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "fix-steam"              "Install Steam launch wrapper (GTK2/XIM SIGBUS fix)"
         echo -e ""
         echo -e "  ${C_CYAN}${C_BOLD}━━━ Required: select the Proton version in Steam ━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
@@ -2491,12 +2487,6 @@ cmd_profile_wizard() {
     done
 }
 
-# Option 5 - Install GB Proton (delegates to main script)
-cmd_install_proton() {
-    local main_script="$MODULE_DIR/greenboost_setup.sh"
-    [[ -x "$main_script" ]] && exec "$main_script" install-proton || \
-        gb_warn_ui "greenboost_setup.sh not found"
-}
 
 # Option 6 - Install MangoHud (dnf / build-from-source)
 MANGOHUD_REPO="https://github.com/flightlessmango/MangoHud"
@@ -2624,16 +2614,15 @@ cmd_wizard() {
         gb_section "Configuration"
         gb_menu_item  4  "Profile management" "Interactive wizard: create, activate, diff profiles"
 
-        gb_section "Gaming"
-        gb_menu_item  5  "Install GB Proton"  "T1+T2 CUDA memory pool for Steam games. Select GreenBoost Proton on Steam"  root
-        gb_menu_item  6  "Remove GB Proton"   "Uninstall GreenBoost Proton from Steam compat tools"
-        gb_menu_item  7  "Install MangoHud"   "Build MangoHud from source + GreenBoost overlay for benchmarking"  root
-        gb_menu_item  8  "Remove MangoHud"    "Uninstall MangoHud binaries and MangoHud.conf"  root
-
         gb_section "Maintenance"
-        gb_menu_item  9  "GreenBoost Commands" "All commands reference (also: greenboost help)"
-        gb_menu_item  10 "Clear logs"          "Clear dmesg, journal, Proton logs, and Wine coredumps"
-        gb_menu_item  11 "Uninstall"           "Remove GreenBoost (module + all config)"        root
+        gb_menu_item  5  "GreenBoost Commands" "All commands reference (also: greenboost help)"
+        gb_menu_item  6  "Clear logs"          "Clear dmesg, journal, Proton logs, and Wine coredumps"
+        gb_menu_item  7  "Uninstall"           "Remove GreenBoost (module + all config)"        root
+
+        gb_separator
+        echo -e "  ${C_DIM}${C_GRAY}Gaming (Proton, DLSS, Vulkan/OpenGL layers, MangoHud) is now installed"
+        echo -e "  ${C_DIM}${C_GRAY}separately through GreenBoost Gaming Suite:${C_RESET}"
+        echo -e "  ${C_DIM}${C_CYAN}https://gitlab.com/IsolatedOctopi/greenboost_gaming${C_RESET}"
 
         gb_separator
         echo -e "  ${C_DIM}${C_GRAY}[Q]  Quit${C_RESET}"
@@ -2653,13 +2642,9 @@ cmd_wizard() {
             2)  cmd_status ;;
             3)  cmd_benchmark;                 gb_press_enter ;;
             4)  cmd_profile_wizard ;;
-            5)  cmd_install_proton;    gb_press_enter ;;
-            6)  cmd_uninstall_proton;          gb_press_enter ;;
-            7)  cmd_install_mangohud;          gb_press_enter ;;
-            8)  cmd_uninstall_mangohud;        gb_press_enter ;;
-            9)  cmd_show_commands;             gb_press_enter ;;
-            10) cmd_clear_logs;                gb_press_enter ;;
-            11) cmd_uninstall;                 gb_press_enter ;;
+            5)  cmd_show_commands;             gb_press_enter ;;
+            6)  cmd_clear_logs;                gb_press_enter ;;
+            7)  cmd_uninstall;                 gb_press_enter ;;
             q|Q|"") exit 0 ;;
             *) gb_warn_ui "Unknown option."; sleep 1 ;;
         esac
@@ -2701,8 +2686,6 @@ case "$COMMAND" in
     install-vulkan-layer)cmd_install_vulkan_layer ;;
     install-deps)        cmd_install_deps         ;;
     steam-launch-guide)  cmd_steam_launch_info    ;;
-    install-proton) cmd_install_proton ;;
-    install-mangohud)    cmd_install_mangohud     ;;
     setup-swap)          cmd_setup_swap "$@"    ;;
     full-install|setup)  cmd_full_install "$@"  ;;
     module-only)         GB_INSTALL_MODE="module" cmd_full_install "--module-only" "$@" ;;

@@ -126,6 +126,28 @@ INSTRUMENT_DEFINITIONS = [
         },
     },
     {
+        "name": "Screenshot",
+        "description": (
+            "Load a URL in headless Chromium and save a PNG screenshot to disk "
+            "(e.g. a running dev server, http://localhost:1420). You have no "
+            "vision capability, so you cannot judge the resulting image "
+            "yourself — use this to CAPTURE a UI state for a vision-capable "
+            "reviewer (a human, or another AI with vision), or to confirm a "
+            "page loads without error."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url":         {"type": "string"},
+                "output_path": {"type": "string", "description": "Absolute path to write the PNG"},
+                "width":       {"type": "integer", "description": "Viewport width (default 1280)"},
+                "height":      {"type": "integer", "description": "Viewport height (default 800)"},
+                "full_page":   {"type": "boolean", "description": "Capture the full scrollable page, not just the viewport"},
+            },
+            "required": ["url", "output_path"],
+        },
+    },
+    {
         "name": "MemoryRead",
         "description": (
             "Read from persistent CLAUDE.md memory files (project and/or global). "

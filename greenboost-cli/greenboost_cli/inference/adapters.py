@@ -441,7 +441,7 @@ def _stream_injected(
             or "NotFoundError" in type(_conn_err).__name__
         )
         if _is_refused:
-            _url = base_url or "http://localhost:11434"
+            _url = base_url or "http://localhost:11435"  # gb-synapse's own default (registry.py)
             raise RuntimeError(
                 f"\nCannot connect to gb-synapse at {_url}\n\n"
                 f"  • /llamaserve          — start the server\n"

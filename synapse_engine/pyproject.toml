@@ -9,10 +9,21 @@ description = "GreenBoost's torch-core inference engine (vendored gLLM, see NOTI
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
 dependencies = [
-    "torch==2.9.1",
-    "torchvision==0.24.1",
+    "torch==2.11.0",
+    "torchvision==0.26.0",
     "transformers==5.5.4",
-    "sgl-kernel==0.3.21",
+    # PyPI's "sgl-kernel" is frozen at 0.3.21 and never loads against torch
+    # 2.11/CUDA 13 (undefined symbol at import time, every build variant
+    # tried). The project renamed its distribution to "sglang_kernel"
+    # starting at v0.4.x (same `sgl_kernel` import name, no code changes
+    # needed) — install from the dedicated CUDA-13 wheel index instead of
+    # this package name:
+    #   pip install "sglang_kernel==0.4.5+cu130" \
+    #     --extra-index-url https://sgl-project.github.io/whl/cu130
+    # Not expressed as a normal dependency line here because pip's default
+    # resolver won't follow --extra-index-url from a dependency list alone.
+    # See NOTICE for the API-surface changes this version jump required
+    # (gllm/_custom_ops.py, gllm/layers/sampler.py).
     "flashinfer-python==0.6.12",
     "flashinfer-cubin==0.6.12",
     "fastapi[standard]>=0.115.0",

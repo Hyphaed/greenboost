@@ -159,6 +159,11 @@ def main() -> int:
                           "(Phase 3's gate: aggregate tok/s at 4 clients >= 1.5x at 1 client). "
                           "n_slots is left at serve()'s own default (-1 = llama.cpp auto, "
                           "n_parallel=4) regardless of this sweep, per Finding 10")
+    ap.add_argument("--cluster", action="store_true",
+                     help="use_cluster=True — include online feeders in the VRAM budget "
+                          "and --rpc tensor-split across them. Default is node-local only "
+                          "(False), so a plain run stays comparable to earlier host-only "
+                          "baselines; pass this explicitly to measure the RPC-split path")
     args = ap.parse_args()
 
     import gb_synapse as gs
@@ -172,7 +177,7 @@ def main() -> int:
     try:
         # n_slots=-1: serve()'s own default (Finding 10), llama.cpp's "auto"
         # (n_parallel=4, kv_unified=true), not hardcoded here either.
-        state = backend.serve(entry, args.port, ctx=args.ctx, use_cluster=False, n_slots=-1)
+        state = backend.serve(entry, args.port, ctx=args.ctx, use_cluster=args.cluster, n_slots=-1)
     except Exception as exc:
         print(f"[run_gguf_decode] serve() raised: {exc}", file=sys.stderr)
         gb_bench.emit_bench_result(
@@ -185,16 +190,21 @@ def main() -> int:
         # serve() already waited for readiness internally (state.ready); a
         # large GGUF can still legitimately still be loading (SERVE_READY_GRACE_S
         # timeout), poll /health a bit longer before giving up, same
-        # tolerance the CLI itself extends to a big model.
+        # tolerance the CLI itself extends to a big model. --cluster loads part
+        # of the weights over the feeder's network link (confirmed live
+        # 2026-07-27: ~9 GB over a 1 Gbps link alone is a couple minutes before
+        # GGUF parsing/placement even starts), so give it more patience than a
+        # local-only load — 180s was tuned against node-local loads only.
+        health_wait_s = 600 if args.cluster else 180
         if not state.ready:
-            for _ in range(180):
+            for _ in range(health_wait_s):
                 try:
                     urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1)
                     break
                 except Exception:
                     time.sleep(1)
             else:
-                raise RuntimeError("server never became ready within 180s past serve()'s own grace period")
+                raise RuntimeError(f"server never became ready within {health_wait_s}s past serve()'s own grace period")
         load_s = round(time.monotonic() - t_load0, 2)
 
         prompt_lens = [int(x) for x in args.prompt_tokens.split(",") if x.strip()]
@@ -207,15 +217,21 @@ def main() -> int:
         # same 503 window, which would just serialize on the retry sleeps).
         warm_prompt = _make_prompt(prompt_lens[0])
         result, exc = None, None
-        for attempt in range(10):
+        # A ready /health doesn't mean the first real request won't still see 503s —
+        # cross-device KV/compute-graph setup for a --cluster RPC split has its own
+        # cold-start cost on top of weight placement, confirmed live 2026-07-27 to
+        # exceed 150s (10x15s) on a 1 Gbps feeder link. Same reasoning as
+        # health_wait_s above.
+        chat_retries = 30 if args.cluster else 10
+        for attempt in range(chat_retries):
             try:
                 result = _stream_chat(port, entry.name, warm_prompt, args.max_new_tokens)
                 exc = None
                 break
             except Exception as e:
                 exc = e
-                if "503" in str(e) and attempt < 9:
-                    print(f"[run_gguf_decode] still loading (503), retry {attempt + 1}/10...")
+                if "503" in str(e) and attempt < chat_retries - 1:
+                    print(f"[run_gguf_decode] still loading (503), retry {attempt + 1}/{chat_retries}...")
                     time.sleep(15)
                     continue
                 break

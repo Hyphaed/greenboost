@@ -23,6 +23,7 @@ avoid a circular top-level import.
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 import shlex
@@ -509,7 +510,8 @@ class LlamaCppBackend(EngineBackend):
         kv_type = gs._pick_kv_type(ctx, entry, ctx_kv_budget_gb)
 
         kv_total_gb = gs.estimate_kv_gb(ctx, entry.n_bytes, entry.quant,
-                                        n_layers=entry.n_layers, n_kv_heads=entry.n_kv_heads,
+                                        n_layers=(entry.n_kv_layers or entry.n_layers),
+                                        n_kv_heads=entry.n_kv_heads,
                                         head_dim=entry.head_dim,
                                         kv_bytes_per_elem=2.0 if kv_type == "f16" else 1.0)
         tensor_split = gs._compute_tensor_split(host_free_mb, online_feeders, kv_total_gb)
@@ -528,9 +530,25 @@ class LlamaCppBackend(EngineBackend):
                # override needed here.
                "-np", str(n_slots), "--threads", str(gs._pcore_threads()),
                "--cache-type-k", kv_type, "--cache-type-v", kv_type,
+               # llama.cpp's own `-fit` auto-placement (default ON, common/fit.cpp)
+               # exists to size -ngl/--tensor-split itself when the caller leaves
+               # them unset. GreenBoost always sets -ngl explicitly (this function's
+               # whole job), which `-fit`'s own pre-flight check treats as "the user
+               # already decided, abort" the moment it needs to change ANYTHING —
+               # confirmed live 2026-07-27 against an RPC feeder split: it rejected
+               # every -ngl value tried (999 down to 11/65) with the identical
+               # "n_gpu_layers already set by user to N, abort", because the
+               # rejection fires on ANY explicit -ngl once the multi-device margin
+               # check wants an adjustment, independent of what N actually is (see
+               # common/fit.cpp's early-return-if-already-fits path vs. the
+               # unconditional throw once that path is missed). GreenBoost already
+               # owns this decision (_fit_gpu_layers/_compute_tensor_split), so
+               # llama.cpp's own redundant veto is disabled rather than raced.
+               "-fit", "off",
                "--jinja"]
 
         n_cpu_moe = 0
+        n_gpu = None
         if fits_vram:
             cmd += ["-ngl", "999"]        # all layers on GPU — the fast path
         elif cpu_quirk:
@@ -616,13 +634,15 @@ class LlamaCppBackend(EngineBackend):
                                                ctx=ctx, kv_type=kv_type, placement=placement,
                                                mtp=bool(gs._has_mtp(entry)), vision=bool(mmproj))
         except RuntimeError as e:
+            err_lower = str(e).lower()
+            is_oom = "out of memory" in err_lower
             # A desktop with many long-running GPU contexts can fragment VRAM badly
             # enough that a plain cudaMalloc for a buffer well UNDER the nominally-
             # free byte count still fails. The shim (which would otherwise absorb
             # this via T2 spill) is unusable with llama.cpp on this build — so a raw
             # -ngl 999 fragmentation OOM has no other net. Retry ONCE at whatever
             # layer count actually fits without a single giant weights allocation.
-            if fits_vram and "out of memory" in str(e).lower():
+            if fits_vram and is_oom:
                 fallback_ngl = gs._fit_gpu_layers(entry, budget_gb * 0.7, kv_total_gb,
                                                   1 + len(online_feeders))
                 print(f"  [gb-synapse] {entry.name}: all-GPU load hit a VRAM "
@@ -640,6 +660,34 @@ class LlamaCppBackend(EngineBackend):
                     tensor_split=tensor_split, feeders=[f.ip for f in online_feeders],
                     engine=self.name, ctx=ctx, kv_type=kv_type,
                     placement="PARTIAL CPU OFFLOAD (VRAM fragmentation fallback)",
+                    mtp=bool(gs._has_mtp(entry)), vision=bool(mmproj))
+            # The dense partial-offload branch (`_fit_gpu_layers`) sizes -ngl against
+            # the %-derived compute-graph reserve (`_compute_reserve_gb`), but that
+            # reserve is a flat per-device estimate tuned for plain attention-only
+            # architectures. A hybrid-attention arch (e.g. Gated Delta Net layers,
+            # confirmed live 2026-07-27 against the Qwen3.6-27B-Fable-Fusion
+            # reference model: `graph_reserve: failed to allocate compute buffers`
+            # at -ngl 25/65, OOM on a 183 MB allocation) can need more graph
+            # workspace than that estimate provides. Same fix as the fragmentation
+            # case above: back off the layer count and retry once rather than
+            # failing the load outright over a margin that's cheap to give back.
+            if n_gpu and is_oom:
+                fallback_ngl = max(0, n_gpu - max(1, math.ceil(n_gpu * 0.15)))
+                print(f"  [gb-synapse] {entry.name}: partial-GPU load (-ngl {n_gpu}) "
+                     f"still hit a VRAM OOM allocating compute-graph buffers on top "
+                     f"of the weights (hybrid-attention archs need more workspace "
+                     f"than the flat compute-reserve estimate) — retrying at "
+                     f"-ngl {fallback_ngl}/{entry.n_layers}.", flush=True)
+                retry_cmd = list(cmd)
+                retry_cmd[retry_cmd.index("-ngl") + 1] = str(fallback_ngl)
+                llama_log = open(gs._run_log_path(entry.name), "ab")
+                llama_proc = subprocess.Popen(retry_cmd, env=env, stdout=llama_log,
+                                              stderr=subprocess.STDOUT, start_new_session=True)
+                return gs._launch_proxy_and_record(
+                    entry, llama_proc, port, internal_port,
+                    tensor_split=tensor_split, feeders=[f.ip for f in online_feeders],
+                    engine=self.name, ctx=ctx, kv_type=kv_type,
+                    placement="PARTIAL CPU OFFLOAD (compute-buffer OOM fallback)",
                     mtp=bool(gs._has_mtp(entry)), vision=bool(mmproj))
             raise
 

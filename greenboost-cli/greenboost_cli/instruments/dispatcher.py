@@ -7,7 +7,7 @@ from greenboost_cli.instruments.handlers import (
     handle_read, handle_write, handle_edit, handle_shell,
     handle_glob, handle_grep, handle_semble, handle_fetch_url, handle_web_query,
     handle_todo_read, handle_todo_write,
-    handle_memory_read, handle_memory_write,
+    handle_memory_read, handle_memory_write, handle_screenshot,
 )
 from greenboost_cli.instruments.safety import is_readonly_command
 
@@ -31,6 +31,10 @@ _DISPATCH: dict[str, Callable] = {
                  ),
     "WebFetch":  lambda p: handle_fetch_url(p["url"], p.get("prompt")),
     "WebSearch": lambda p: handle_web_query(p["query"]),
+    "Screenshot": lambda p: handle_screenshot(
+                     p["url"], p["output_path"], p.get("width", 1280),
+                     p.get("height", 800), p.get("full_page", False),
+                 ),
     "TodoRead":    lambda p: handle_todo_read(),
     "TodoWrite":   lambda p: handle_todo_write(p.get("todos", [])),
     "MemoryRead":  lambda p: handle_memory_read(p.get("file")),
@@ -38,7 +42,7 @@ _DISPATCH: dict[str, Callable] = {
 }
 
 # These instruments never need user approval.
-_ALWAYS_APPROVED = {"Read", "Glob", "Grep", "Semble", "WebFetch", "WebSearch", "TodoRead", "TodoWrite", "MemoryRead"}
+_ALWAYS_APPROVED = {"Read", "Glob", "Grep", "Semble", "WebFetch", "WebSearch", "Screenshot", "TodoRead", "TodoWrite", "MemoryRead"}
 
 
 def dispatch(

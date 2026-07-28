@@ -1,5 +1,6 @@
 import torch
-from sgl_kernel import top_k_top_p_sampling_from_probs
+from sgl_kernel import top_k_renorm_prob as top_k_renorm_probs
+from sgl_kernel import top_p_renorm_prob as top_p_renorm_probs
 
 from gllm.input_data import InputData
 from gllm.layers.repetition_penalty import apply_scaling_penalties
@@ -10,13 +11,25 @@ def _fused_top_k_top_p_sample(
     top_ks: torch.Tensor,
     top_ps: torch.Tensor,
 ) -> torch.Tensor:
-    """Fused top-k / top-p sampling via sgl_kernel."""
-    return top_k_top_p_sampling_from_probs(
-        probs.float().contiguous(),
-        top_ks.to(torch.int32),
-        top_ps,
-        filter_apply_order="joint",
-    )
+    """Top-k / top-p sampling via sgl_kernel's renorm kernels + torch.multinomial.
+
+    GREENBOOST PATCH (2026-07-28, see NOTICE): sgl-kernel 0.4.x (the
+    sglang_kernel distribution) dropped the fused
+    `top_k_top_p_sampling_from_probs` convenience function 0.3.x exposed —
+    only the renormalization kernels remain (`top_k_renorm_probs`/
+    `top_p_renorm_probs`), each explicitly documented in sgl_kernel's own
+    sampling.py as "should be equivalent to `top_k_sampling_from_probs`"
+    when paired with a separate sampling step. Sequential top-k-then-top-p
+    renorm followed by torch.multinomial is the standard composition
+    (matches HF transformers' own TopKLogitsWarper -> TopPLogitsWarper
+    ordering, and flashinfer's reference implementation sgl_kernel's own
+    docstring says it adapts from) — not a novel algorithm, the documented
+    equivalent of what the old fused call did.
+    """
+    probs = probs.float().contiguous()
+    probs = top_k_renorm_probs(probs, top_ks.to(torch.int32))
+    probs = top_p_renorm_probs(probs, top_ps)
+    return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 
 class Sampler:

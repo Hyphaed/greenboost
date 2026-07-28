@@ -14,10 +14,20 @@ from typing import Optional
 import torch
 
 # sgl-kernel imports
+#
+# GREENBOOST PATCH (2026-07-28, see NOTICE): moe_fused_gate/
+# moe_wna16_marlin_gemm/gptq_marlin_repack no longer exist in sgl-kernel
+# 0.4.x (the sglang_kernel distribution — a real API surface change from
+# 0.3.x, not a build issue; the other 12 names below all still import fine).
+# All three are MoE-routing or GPTQ-quantization specific and are never
+# called for a dense, non-GPTQ model (verified: Qwen3-VL-8B-{Instruct,
+# Thinking}-FP8, the models this was fixed for, are dense + FP8, not MoE or
+# GPTQ) — guarded so a model that genuinely needs one of them fails with a
+# clear error at the actual call site instead of gllm's whole import chain
+# breaking for every model regardless of whether it uses these ops.
 from sgl_kernel import (
     fused_add_rmsnorm as _sgl_fused_add_rmsnorm,
     moe_align_block_size as _sgl_moe_align_block_size,
-    moe_fused_gate as _sgl_moe_fused_gate,
     moe_sum as _sgl_moe_sum,
     moe_sum_reduce as _sgl_moe_sum_reduce,
     rmsnorm as _sgl_rmsnorm,
@@ -27,10 +37,23 @@ from sgl_kernel import (
     topk_softmax as _sgl_topk_softmax,
     topk_sigmoid as _sgl_topk_sigmoid,
     merge_state_v2 as _sgl_merge_state_v2,
-    moe_wna16_marlin_gemm as _sgl_moe_wna16_marlin_gemm,
     sgl_per_token_quant_fp8 as _sgl_per_token_quant_fp8,
-    gptq_marlin_repack as _sgl_gptq_marlin_repack,
 )
+
+try:
+    from sgl_kernel import moe_fused_gate as _sgl_moe_fused_gate
+except ImportError:
+    _sgl_moe_fused_gate = None
+
+try:
+    from sgl_kernel import moe_wna16_marlin_gemm as _sgl_moe_wna16_marlin_gemm
+except ImportError:
+    _sgl_moe_wna16_marlin_gemm = None
+
+try:
+    from sgl_kernel import gptq_marlin_repack as _sgl_gptq_marlin_repack
+except ImportError:
+    _sgl_gptq_marlin_repack = None
 
 # Custom Triton kernels
 from gllm.layers.ops.cache_kernels import (

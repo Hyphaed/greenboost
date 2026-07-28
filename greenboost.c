@@ -949,6 +949,27 @@ static const struct dma_buf_ops gb_dma_buf_ops = {
 	.vunmap        = gb_vunmap_op,
 };
 
+/* Speed Program audit, 2026-07-26: consumer for the generic dma-buf
+ * reclaim-priority hint landed by patches/custom/0019-dma-buf-priority-hint.patch
+ * (DMA_BUF_IOCTL_SET_PRIORITY, dma_buf_set_priority()). Purely informational
+ * today, dma-buf core stores and reports the value, it implements no
+ * eviction policy of its own, so this call changes NO functional behavior
+ * of this driver (GreenBoost's own gaming_mode LRU-tail eviction, the thing
+ * that actually decides what gets reclaimed, is unaffected either way).
+ * What it does: make the same KV-cache-is-important signal GreenBoost
+ * already acts on internally (see the gaming_mode exemption check,
+ * "flags & (GB_ALLOC_KV_CACHE | GB_ALLOC_T1_PRIORITY)") also visible to any
+ * OTHER tool reading fdinfo's "priority:" line or the GET_PRIORITY ioctl,
+ * instead of every GreenBoost dma-buf reporting the generic default
+ * (DMA_BUF_PRIORITY_DEFAULT, 128) regardless of how important it actually
+ * is. Non-KV buffers are left at the default, dma_buf_export() already sets
+ * that, nothing to call here for them. */
+static void gb_apply_priority_hint(struct dma_buf *dmabuf, u32 alloc_flags)
+{
+	if (alloc_flags & (GB_ALLOC_KV_CACHE | GB_ALLOC_T1_PRIORITY))
+		dma_buf_set_priority(dmabuf, 200); /* DEFAULT=128, MAX=255; comfortably "keep longer" */
+}
+
 /* ------------------------------------------------------------------ */
 /*  Page pinning from userspace (FOLL_LONGTERM)                       */
 /* ------------------------------------------------------------------ */
@@ -1614,6 +1635,7 @@ static long gb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			return PTR_ERR(dmabuf);
 		}
 		buf->dmabuf = dmabuf;
+		gb_apply_priority_hint(dmabuf, buf->alloc_flags);
 
 		/* 3+4. Register in IDR and install fd (REF-01: shared helper) */
 		fd = gb_dmabuf_idr_and_install_fd(buf, dmabuf);
@@ -1714,6 +1736,7 @@ static long gb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			return PTR_ERR(dmabuf);
 		}
 		buf->dmabuf = dmabuf;
+		gb_apply_priority_hint(dmabuf, buf->alloc_flags);
 
 		/* 3+4. Register in IDR and install fd (REF-01: shared helper) */
 		fd = gb_dmabuf_idr_and_install_fd(buf, dmabuf);
@@ -2650,6 +2673,7 @@ static ssize_t alloc_trigger_store(struct device *dev,
 			mutex_unlock(&dra_trigger_lock);
 			return err;
 		}
+		gb_apply_priority_hint(gbuf->dmabuf, gbuf->alloc_flags);
 	}
 
 	fd = dma_buf_fd(gbuf->dmabuf, O_CLOEXEC);

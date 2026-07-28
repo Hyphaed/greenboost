@@ -8,15 +8,35 @@ from gllm.input_data import InputData, MLACommonMetadata, MLACommonPrefillMetada
 from gllm.layers.linear import ColumnParallelLinear, LinearBase
 from gllm.layers.ops.merge_attn_states import merge_attn_states
 from gllm.layers.ops.triton_decode_attention import decode_attention_fwd
-from sgl_kernel.flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
 
-# FA3 MLA decode (sgl_kernel flash_attn with qv=) — same path as SGLang ``fa3``.
+# GREENBOOST PATCH (2026-07-27, see NOTICE): flash_attn_with_kvcache/
+# flash_attn_varlen_func used to be a bare top-level import — if
+# sgl_kernel.flash_attn fails to import AT ALL (not just "unsupported on
+# this hardware", which is_fa3_supported() below already handles, but the
+# compiled extension refusing to load — e.g. a torch/sgl-kernel ABI
+# mismatch after a torch upgrade sgl-kernel hasn't caught up to yet: hit
+# live, "undefined symbol: ...c10_cuda_check_implementation..." after
+# upgrading torch 2.9.1->2.11.0), this bare import raised ImportError and
+# took down the ENTIRE attention module — every torch-backend model, not
+# just whichever one exposed the mismatch. Every actual call site of these
+# two functions already checks _FA3_AVAILABLE (or self.decode_backend,
+# itself derived from it) before calling either one, so folding this
+# import into the same guarded try/except already used for flash_mla just
+# below is sufficient: _FA3_AVAILABLE=False routes everything through the
+# existing SDPA/Triton fallbacks, exactly as it already does for the
+# hardware-unsupported case this file already handled.
 try:
-    from sgl_kernel.flash_attn import is_fa3_supported
+    from sgl_kernel.flash_attn import (
+        flash_attn_with_kvcache,
+        flash_attn_varlen_func,
+        is_fa3_supported,
+    )
 
     _FA3_AVAILABLE = bool(is_fa3_supported())
     _FA3_IMPORT_ERROR: Optional[Exception] = None
 except Exception as _e:  # pragma: no cover - depends on hardware / build
+    flash_attn_with_kvcache = None  # type: ignore[assignment]
+    flash_attn_varlen_func = None  # type: ignore[assignment]
     is_fa3_supported = None  # type: ignore[misc, assignment]
     _FA3_AVAILABLE = False
     _FA3_IMPORT_ERROR = _e

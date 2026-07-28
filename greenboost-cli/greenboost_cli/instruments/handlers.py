@@ -5,11 +5,25 @@ import json
 import os
 import glob as _glob_mod
 import subprocess
+import threading
 from pathlib import Path
 
 # Persistent working directory across Bash calls within one process lifetime.
 # The model can run `cd /some/dir` and subsequent calls stay in that directory.
+# REPL usage is single-threaded, so this module-global stays authoritative for
+# it (repl.py reads it directly for the prompt). The AI Factory runs multiple
+# agents concurrently as real OS threads in the same process (factory.py) — a
+# bare global here would let one task's `cd` bleed into another's shell calls.
+# _bash_cwd_tls carries the thread-local override; handle_shell prefers it
+# when present and only mirrors back to the module-global from the main
+# thread, so the REPL's own behavior is unchanged.
 _bash_cwd: str = ""
+_bash_cwd_tls = threading.local()
+
+
+def set_task_bash_cwd(path: str) -> None:
+    """Set the calling thread's Bash working directory (factory task scoping)."""
+    _bash_cwd_tls.value = path
 
 # ── In-session todo list (resets on restart, like Claude Code) ────────────────
 _session_todos: list = []
@@ -146,7 +160,9 @@ def handle_edit(
 
 def handle_shell(command: str, timeout: int = 120) -> str:
     global _bash_cwd
-    run_cwd = _bash_cwd if (_bash_cwd and os.path.isdir(_bash_cwd)) else os.getcwd()
+    thread_cwd = getattr(_bash_cwd_tls, "value", "")
+    effective_cwd = thread_cwd or _bash_cwd
+    run_cwd = effective_cwd if (effective_cwd and os.path.isdir(effective_cwd)) else os.getcwd()
 
     # Append a cwd sentinel so we can track `cd` across calls
     _MARKER = "::CWD::"
@@ -171,7 +187,10 @@ def handle_shell(command: str, timeout: int = 120) -> str:
             if line.startswith(_MARKER):
                 new_cwd = line[len(_MARKER):].strip()
                 if new_cwd and os.path.isdir(new_cwd):
-                    _bash_cwd = new_cwd
+                    if thread_cwd:
+                        _bash_cwd_tls.value = new_cwd
+                    else:
+                        _bash_cwd = new_cwd
             else:
                 clean.append(line)
         out = "\n".join(clean)
@@ -281,6 +300,13 @@ def handle_semble(query: str, repo: str = None, top_k: int = 5,
 def handle_fetch_url(url: str, prompt: str = None) -> str:
     from greenboost_cli.instruments.scrapling_utils import fetch_url as _scrapling_fetch
     return _scrapling_fetch(url)
+
+
+def handle_screenshot(url: str, output_path: str, width: int = 1280,
+                       height: int = 800, full_page: bool = False) -> str:
+    from greenboost_cli.instruments.screenshot_utils import capture_screenshot
+    return capture_screenshot(url, output_path, width=width, height=height,
+                               full_page=full_page)
 
 
 def handle_web_query(query: str) -> str:
