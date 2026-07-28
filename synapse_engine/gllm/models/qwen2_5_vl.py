@@ -28,6 +28,36 @@ from gllm.utils import cast_overflow_tensors
 from gllm.layers.rotary_embedding import apply_rotary_emb
 
 from .qwen2 import Qwen2ForCausalLM
+
+
+@lru_cache(maxsize=1)
+def _vision_attn_use_flash() -> bool:
+    """GREENBOOST PATCH (2026-07-28, see NOTICE): sgl-kernel's flash_attn
+    (FA3 build) hard-gates to compute capability {8, 9} — verified live via
+    sgl_kernel/flash_attn.py's own check — so it raises NotImplementedError
+    on Blackwell (sm_120, cc=12) despite the misleading "sm90 and above" in
+    its error message. Check once and cache; SDPA fallback below is
+    numerically equivalent for non-causal varlen attention."""
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability(0)[0] in (8, 9)
+
+
+def _vision_attn_sdpa_varlen(q: Tensor, k: Tensor, v: Tensor, cu_seqlens: Tensor) -> Tensor:
+    """GREENBOOST PATCH (2026-07-28, see NOTICE): SDPA-based fallback for
+    flash_attn_varlen_func on GPUs sgl-kernel's FA3 build doesn't support.
+    q/k/v: [total_tokens, heads, head_dim]; attention is windowed per
+    cu_seqlens segment (no cross-segment attention), matching flash_attn's
+    varlen semantics."""
+    bounds = cu_seqlens.tolist()
+    segments = []
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        qi = q[start:end].transpose(0, 1).unsqueeze(0)
+        ki = k[start:end].transpose(0, 1).unsqueeze(0)
+        vi = v[start:end].transpose(0, 1).unsqueeze(0)
+        oi = F.scaled_dot_product_attention(qi, ki, vi, is_causal=False)
+        segments.append(oi.squeeze(0).transpose(0, 1))
+    return torch.cat(segments, dim=0)
 from .weight_loader import (
     LoadContext,
     WeightRule,
@@ -268,19 +298,25 @@ class Qwen2_5_VisionAttention(nn.Module):
             k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
 
         q, k, v = (rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
-        
-        from sgl_kernel.flash_attn import flash_attn_varlen_func
 
-        output = flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-            causal=False,
-        )
+        # GREENBOOST PATCH (2026-07-28, see NOTICE): flash_attn_varlen_func
+        # unavailable on this GPU (see _vision_attn_use_flash) — fall back to
+        # SDPA, numerically equivalent for non-causal varlen attention.
+        if _vision_attn_use_flash():
+            from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+            output = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                causal=False,
+            )
+        else:
+            output = _vision_attn_sdpa_varlen(q, k, v, cu_seqlens)
 
         context_layer = rearrange(output, "(b s) ... -> b s ...", b=batch_size)
         context_layer = rearrange(context_layer, "b s h d -> s b (h d)").contiguous()
