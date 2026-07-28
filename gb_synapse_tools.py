@@ -498,10 +498,27 @@ def _absorb(call: "dict | None", calls: list, seen: set) -> None:
 # ── Text cleaning ──────────────────────────────────────────────────────────
 
 _STRIP_PATTERNS = [
+    # Balanced blocks first.
     re.compile(r"<\|tool_call_begin\|>[\s\S]*?<\|tool_call_end\|>"),
     re.compile(r"✿FUNCTION✿[\s\S]*?✿RESULT✿"),
     re.compile(r"<tool_call>[\s\S]*?</tool_call>"),
+    re.compile(r"<function=[^>]*>[\s\S]*?</function>"),
+    re.compile(r"<parameter=[^>]*>[\s\S]*?</parameter>"),
     re.compile(r"```(?:json)?\s*\n?[\s\S]*?\n?```"),
+    # Unterminated / stray fragments that survive the balanced strips above.
+    # _parse_qwen_xml_tool_call() already tolerates an unterminated
+    # <tool_call> and a </parameters> typo when PARSING (see its own
+    # fallback), so the cleaner must tolerate the same shapes when
+    # DISPLAYING — otherwise a call that parsed successfully still leaves
+    # its raw markup on screen (confirmed live: <tool_call>, <function=Glob>,
+    # <parameter=pattern> stayed visible for a whole turn). Order matters:
+    # these "to end of string" / bare patterns run LAST so they only catch
+    # what the balanced patterns above didn't.
+    re.compile(r"<tool_call>[\s\S]*$"),        # unterminated open, to end of text
+    re.compile(r"<function=[^>]*>[\s\S]*$"),   # unterminated bare <function=
+    re.compile(r"<parameter=[^>]*>"),          # stray unmatched open
+    re.compile(r"</parameters?>"),             # stray close (typo-tolerant)
+    re.compile(r"</function>"),                # stray close
 ]
 
 

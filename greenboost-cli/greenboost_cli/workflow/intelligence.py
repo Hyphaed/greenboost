@@ -31,7 +31,22 @@ _MAX_SKILLS_PER_TURN = 3
 
 
 def _estimate_tokens(session: "ConversationSession") -> int:
-    """Quick token estimate: ~1 token per 4 chars in message text."""
+    """Quick token estimate: ~1 token per 4 chars in message text + tool-call
+    payloads.
+
+    Previously counted only `content`, so an assistant message carrying a
+    tool_calls list and empty text (the common case — the model called a
+    tool and said nothing) counted as ZERO tokens, even though the
+    tool_calls JSON (name + full argument payload) is exactly what gets sent
+    to the server on the next request. This under-count is one of the
+    reasons compaction never fired before the real request overflowed the
+    server's context (confirmed live: request hit 8324 tokens against a
+    7680-token window). Does NOT include the system prompt or tool
+    schemas — callers that assemble those (see intelligence.py's
+    pre_process_query, orchestrator.py's mid-turn check) pass them via
+    `extra_tokens` to _compress_context instead, since they aren't part of
+    session.messages."""
+    import json as _json
     total = 0
     for msg in session.messages:
         content = msg.get("content", "")
@@ -41,6 +56,12 @@ def _estimate_tokens(session: "ConversationSession") -> int:
             for block in content:
                 if isinstance(block, dict):
                     total += len(block.get("text", "")) // 4
+        tool_calls = msg.get("tool_calls")
+        if tool_calls:
+            try:
+                total += len(_json.dumps(tool_calls)) // 4
+            except (TypeError, ValueError):
+                pass
     return total
 
 
@@ -218,7 +239,14 @@ def _compress_context(
     Pass extra_tokens to include fixed overhead (system context, RAG injections) in the
     threshold comparison so compaction fires before the real assembled prompt overflows.
     """
-    if len(session.messages) < 10:
+    # force=True MUST bypass this floor too — it exists to avoid summarizing a
+    # session that's still short, but the auto-compact callers (orchestrator's
+    # near-overflow retry, the mid-turn budget check) pass force=True
+    # precisely because a request is ABOUT to fail regardless of message
+    # count. A turn that grows to 8000+ tokens across 6 messages (one big
+    # tool result) used to be uncompactable no matter what, because this
+    # check ran unconditionally before force was even consulted.
+    if len(session.messages) < 10 and not force:
         return
 
     if not force:

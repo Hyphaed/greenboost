@@ -1,260 +1,117 @@
 # GreenBoost Changelog
 
-## Develop version (non tagged, already pushed to the repository)
+## v3.3 : 2026-07-28 (in development)
 
-- **`greenboost_netd.c`: added internal log rotation** (`GB_NETD_LOG_MAX_BYTES`,
-  50 MB, `features/net_fabric.h`). Found live on feeder `omen`: `netd.log`
-  had grown past 1 GB since first boot with no rotation anywhere. One-
-  generation rotation (`netd.log` → `netd.log.1`), checked at daemon
-  startup (`open_log()`) and per log line for a daemon that runs for
-  months without restarting (`netd_log()`, via `ftell()` — no added
-  syscall cost). `make netd` compiles clean; rotate-then-reopen mechanism
-  verified with a standalone functional test. See `workflow/known-issues.md`.
-- **`gb_synapse.py`: `estimate_kv_gb()` was overestimating KV cache size by
-  ~3.8x for hybrid recurrent/attention architectures, the real reason the
-  new reference model's context clamped to 2048 instead of a much larger,
-  genuinely-VRAM-supportable number.** Found because the owner correctly
-  pushed back on whether the model was really limited to 2048 tokens (it
-  isn't — 262,144 native, per the model's own datasheet). Root cause: the
-  formula multiplied by the full layer count uniformly, but this
-  architecture (`Hidden Layout: 16 × (3 × Gated DeltaNet → 1 × Gated
-  Attention)`) only gives 1 layer in 4 a real, context-length-scaling KV
-  cache — the other 3 hold a fixed-size recurrent state. Confirmed directly
-  from the GGUF's own `full_attention_interval=4`/`block_count=65` fields
-  (17 real KV layers, not 65) and cross-checked in llama.cpp's own loader
-  (`is_recr_impl`), which has always known this distinction internally.
-  Fixed by adding `ModelEntry.n_kv_layers` (from a new, generic
-  `{arch}.full_attention_interval` GGUF read, defaulting to `n_layers` for
-  a plain transformer — safe no-op for every other architecture) and using
-  it at all 4 `estimate_kv_gb()` call sites. **Live-verified: served ctx
-  went 2048 → 7680 (3.75x) on the same hardware/quant/budget** — enough to
-  cross GB-CLI's own baseline tool/context overhead (~4608 tokens), so a
-  real `gb -m <model> -p "..."` request now genuinely calls tools and reads
-  real project files for the first time this session, instead of being
-  rejected before any inference starts. See `workflow/known-issues.md` for
-  the full incident.
-- **`greenboost_setup.sh`: fixed a real installer bug found via an actual
-  reinstall, `third_party/X` rsync never created its own parent directory.**
-  `rsync -a` doesn't create missing intermediate parent directories; every
-  `third_party/X` sync block (`llama.cpp`, `auto_round`, `turboquant`, and
-  the just-added `gemlite`/`hqq`) assumed it would. One `mkdir -p
-  "$_dest/third_party"` before the first block fixes all five. This is a
-  pre-existing bug, not introduced by the gemlite/hqq fix, `llama.cpp`'s and
-  `auto_round`'s blocks have the identical gap and most likely never
-  actually synced on a box where `third_party/` didn't already exist.
-  Reproduced the failure and verified the fix in an isolated scratch test
-  before landing it. See `workflow/known-issues.md` for the full story.
-- **`greenboost.c`: real consumer for the `DMA_BUF_IOCTL_SET_PRIORITY` hint**
-  (`patches/custom/0019-dma-buf-priority-hint.patch` in the sibling
-  `kernel_inference` tree, already landed and live in the running kernel).
-  `gb_apply_priority_hint()` marks `GB_ALLOC_KV_CACHE`/`GB_ALLOC_T1_PRIORITY`
-  buffers with priority 200 at all three `dma_buf_export()` sites, matching
-  the existing `gaming_mode` eviction-exemption check exactly, so external
-  tools reading `fdinfo`'s `priority:` line see the same importance signal
-  GreenBoost's own LRU already acts on. Purely informational (the upstream
-  hint implements no eviction policy of its own), zero behavior change.
-  Built clean via `make module` against this box's real kernel headers,
-  `nm` confirms the symbol reference; not yet loaded, needs a Full Install.
-- **Speed Program audit: measurement harness + dead-code cleanup.** New
-  `tests/bench/gb_pathbench.cu`/`.py` (bulk H2D/D2H, VRAM d2d, zero-copy SM
-  read, 8-of-256 MoE-gather-pattern read, all logged via the new
-  `bench_result` dataflux kind) and `tests/bench/run_gguf_decode.py` (drives
-  the real `LlamaCppBackend.serve()` production path, streaming TTFT/decode
-  tok/s, unlike `run_real_model.py` which only covers the `transformers`
-  fallback). New `gb_bench.py` is the single `bench_result` emit site (kept
-  out of `tests/` deliberately, see its own docstring). Key finding: T2
-  zero-copy PCIe reads measure at ~24 GB/s, tracking bulk DMA within noise
-  even for the scattered MoE-gather access pattern, overturning an earlier
-  assumption that this path was latency-bound at ~5-12 GB/s. Removed
-  `gb_kv_compress_d2t2`/`gb_kv_decompress_t2tod` and the embedded-PTX absmax
-  K/V codec supporting them (~270 lines) from `greenboost_cuda_shim.c`,
-  confirmed zero callers; `GREENBOOST_KV_COMPRESS=1` now warns it's a no-op
-  instead of silently doing nothing. Shim capability blob's `expert_pool`
-  flag corrected `true`→`false` (the hot-expert VRAM cache it described was
-  removed after failing across ~4 sessions, see `workflow/known-issues.md`).
-  `third_party/gemlite`/`hqq` now rsync'd by `cmd_install_python_files`
-  (a Full Install previously shipped with no quantization backend at all).
-  `architecture.md` corrected: GDS's "~7 GB/s" and KV-compression's "2× at
-  eviction" were both aspirational, not measured, the code paths are dead
-  stubs with zero callers. **gb-synapse: continuous batching re-enabled by
-  default.** `n_slots` defaulted to `1` on every `serve()` call across all
-  backends, silently overriding llama.cpp's own `-np -1` "auto" mode
-  (`n_parallel=4, kv_unified=true`) with no code ever computing a real
-  value. Default changed to `-1` throughout (`gb_synapse.py`,
-  `gb_synapse_backends.py`, the CLI `--n-slots` default), letting
-  llama-server's own tested default take over. **Live-verified:** started a
-  real server and confirmed via `/slots`, 4 slots, each with the full
-  requested `n_ctx`, `kv_unified=true` genuinely active. Also added an M4
-  go/no-go mode to `gb_pathbench` (`cuMemCreate(HOST_NUMA_CURRENT)` SM
-  accessibility, the exact construct `GB_VRAM_FRONTLOAD`'s host-portion
-  backing depends on): **confirmed still fails**
-  (`CUDA_ERROR_INVALID_VALUE`) on CUDA 13.3 / cc 12.0, matching an earlier
-  finding on an older CUDA version. `GB_VRAM_FRONTLOAD` stays off for the
-  `llm` profile, permanently, not provisionally.
-- **gb-synapse: vLLM backend retired, GreenBoost's own torch-core engine
-  (vendored gLLM) is now the single safetensors serving path.**
-  `gb_llm.py`/`gb_llm_server.py` deleted, absorbed into
-  `gb_synapse_fallback.py` (the single-request transformers+gb-quant
-  fallback both `TransformersBackend` and `SynapseTorchBackend`'s own
-  per-checkpoint fallback branch now share). `entry.engine` values
-  `"vllm"`/`"gbquant"`/`"transformers"` are still accepted as deprecated
-  aliases, normalized to `"torch"` on manifest load — existing pulls keep
-  working unchanged. AWQ (4-bit) joins the already-shipped GPTQ loader,
-  reusing the same vendored Triton kernel. No installer/env changes needed
-  for existing users; `cmd_install_vllm`/`GB_INSTALL_VLLM` are gone (Full
-  Install's `install-synapse-engine` step already covers the torch core).
-- **gb-synapse: `--maxp` fix for small-context checkpoints.** The torch-core
-  engine's dummy profiling prefill defaulted to 8192 tokens regardless of a
-  checkpoint's real context window, crashing startup for any small-context
-  model (found via TinyLlama, ctx=2048). Now clamped to the checkpoint's own
-  `ctx_length` (or the requested `ctx`) whenever that's smaller.
-- **gb-synapse: post-ready stall detection.** A streaming request that sits
-  with zero output for `GB_SYNAPSE_STALL_THRESHOLD_S` (default 120s) after
-  `/health` already reported ready now emits a `synapse_stall` dataflux
-  event (model, engine, elapsed, upstream log tail) — closes the "client
-  sees a silent hang, not an error" gap from a hung first forward pass.
-- **gb-synapse default port 11434 → 11435** (`GB_SYNAPSE_PORT`). Ollama keeps
-  :11434 — the two no longer collide by default. Migration: re-run
-  `serve_and_repoint` (MCP `greenboost-synapse` / `gb_actuation.py`) or update
-  `FORGE_OLLAMA_URL` in `inference.env` to point at the new port.
-- **Reference workload changed: `DavidAU/Qwen3.6-27B-Fable-Fusion-711-
-  Uncensored-Heretic-NM-DAU-NEO-MAX-MTP-GGUF` replaces `satgeze/
-  qwen36-35b-uncensored-1m`** (and `rafw007/qwen36-a3b-claude-coder:latest`,
-  owner decision, 2026-07-27). Dense 27B (`arch=qwen35`, `is_moe=False`),
-  not MoE like the retired reference, so `--n-cpu-moe`/`-ot` expert offload
-  no longer applies to this workload, placement is about `-ngl` layer count
-  instead. Pulled at `MTP-Q4_K_M` (17.2 GiB, must use the `MTP-`-prefixed
-  quant name explicitly, the repo also ships a same-named non-MTP file and
-  `gb_synapse.pull()`'s quant matching is a plain substring match). Not on
-  `ARCH_CPU_SPLIT_BROKEN`.
-- **`gb_synapse_backends.py`: the OOM-retry-with-fewer-layers fallback now
-  also covers the dense partial-GPU-offload path, not just the fits-VRAM
-  fragmentation case.** Found live loading the new reference model above:
-  this hybrid-attention arch (Gated Delta Net layers) needs more
-  compute-graph workspace than `_compute_reserve_gb()`'s flat %-derived
-  estimate provides, so the `-ngl` count `_fit_gpu_layers()` computed
-  (24-25/65 layers) still OOM'd allocating a 183 MB compute buffer on top
-  of otherwise-successful weight placement. Generalized the existing
-  fragmentation-OOM retry (previously gated on `fits_vram` only) to also
-  back off 15% of the layer count and retry once when the dense
-  partial-offload branch OOMs. Live-verified twice: both runs OOM'd at
-  `-ngl 24`, retried at `-ngl 20`, served successfully. See
-  `workflow/known-issues.md` for the full incident.
-- **RPC-cluster load of the same reference model was rejected at every
-  `-ngl` value tried (999 down to 11/65) — two stacked, real bugs, both
-  fixed.** (1) `omen` feeder's `rpc-server` binary was stale (built
-  2026-07-12, `third_party/llama.cpp` checkout had no `PINNED_COMMIT` at
-  all), old enough to predate an upstream fix gating ggml's UMA
-  (Unified Memory Architecture) memory-reporting path on
-  `cudaDeviceProp.integrated` — confirmed via a compiled CUDA probe that
-  `integrated: 0` for this discrete laptop GPU in the current vendored
-  source. The stale binary reported free memory from `/proc/meminfo`'s
-  `MemAvailable` (system RAM, ~4 GB) instead of real VRAM (~7.3 GB free).
-  Fixed by syncing the feeder's checkout (`git pull` to the host's pinned
-  commit `e8f19cc0a`) and rebuilding its engine. (2) The REAL reason every
-  `-ngl` value was rejected regardless of the fix above: llama.cpp's own
-  `-fit` auto-placement (`common/fit.cpp`, default ON) refuses to run on a
-  multi-device load once ANY explicit `-ngl` is set — the flat number never
-  mattered. `gb_synapse_backends.py` always sets `-ngl` explicitly (that's
-  its job), so this fired every time. Fixed by adding `-fit off`
-  unconditionally to the `llama-server` command line; GreenBoost already
-  owns this placement decision. The bounded escalating-backoff retry loop
-  built while chasing bug (2) as a memory-sizing problem was simplified back
-  down to its original single-retry-per-branch shape once the real cause was
-  found.
-- **`gb_synapse.py`: `_wait_upstream_ready()` no longer silently hangs for
-  minutes when llama.cpp's pre-flight fit-check (or any future non-exiting
-  fatal error) rejects a load, AND no longer false-triggers on a stale match
-  from a previous retry attempt.** `common_fit_params`'s rejection above
-  logs a warning but does not exit the process — it sits alive, doing
-  nothing, past the readiness grace period. The wait loop now scans new log
-  output for this message and kills+raises if found. First version of this
-  fix scanned the log's file-tail, which — since the log path is the same
-  file across every retry attempt — found a STALE match from a PREVIOUS
-  attempt and killed a fresh one before it had written anything; fixed by
-  recording the log's byte offset when each wait starts and scanning only
-  bytes appended since.
-- **`tests/bench/run_gguf_decode.py --cluster`: health-wait patience raised
-  180s → 600s for cluster loads specifically.** Moving ~9 GB of weights to
-  a feeder over a 1 Gbps link alone is a couple of minutes before GGUF
-  parsing/placement even starts — the 180s default was tuned against
-  node-local loads only and gave up on a genuinely-still-loading cluster
-  serve. See `workflow/known-issues.md` for the full incident.
-- **Owner decision: the reference model stays on host-only serving, not the
-  RPC-split path above, for now.** Even with both real bugs fixed, load
-  followed by the first decode never completed cleanly within a 1500s
-  budget — a pattern (502 then minutes of 503s after weights had visibly
-  loaded) that looks like per-token cross-node round-trip latency on this
-  model's hybrid Gated Delta Net layers over a plain 1 Gbps link, not a
-  loading problem. The three fixes stay landed (correct regardless of which
-  placement wins); host-only remains the serving default (~5-7 tok/s,
-  20/65 layers on GPU) until someone measures RPC *decode* speed
-  specifically and it turns out faster.
-- **`gb_aviary.smoke_gate()` run against the new reference model's real
-  host-only serving path: PASS** (no repetition collapse, `max6gram=1`,
-  `uniq=1.0`). `niah_certify()` deliberately not run yet — the current
-  `ctx=2048` VRAM clamp is too small for a meaningful long-context needle
-  test; certifying at that context wouldn't reflect real usage.
-- **`docs/qwen36-35b-on-the-cluster.md` renamed to
-  `docs/qwen36-27b-fable-fusion-on-the-cluster.md` and rewritten from
-  scratch** (`git mv` + full content replacement, history preserved). The
-  old walkthrough was built entirely around MoE-specific mechanics
-  ("move the experts, not the layers") that don't exist for this dense
-  model; patching it in place would have left a document teaching the
-  wrong lesson. The new version covers this model's actual shape (dense
-  placement, the compute-reserve bug, the RPC investigation and both bugs
-  it found, and why RPC stays unused in production), reusing the original's
-  format (numbered lessons, real error snippets, honest "where we stand"
-  framing).
-- **`greenboost-cli`: fixed a real regression from this session's own
-  gb-synapse port migration (11434 → 11435) — the CLI's own backend
-  registry was never updated, so `gb` silently fell back to querying raw
-  Ollama's port on ANY gb-synapse connection failure instead of reporting
-  the real error.** Found live: `gb -m <model> -p "..."` hit an unrelated
-  gb-synapse load failure, then reported "model not found on the backend at
-  http://localhost:11434/v1" — a backend that was never even running.
-  `greenboost_cli/inference/registry.py`'s `BACKEND_REGISTRY["gb-synapse"]
-  ["base_url"]` was hardcoded to the pre-migration port; fixed to read
-  `GB_SYNAPSE_PORT` (default 11435) like `gb_synapse.py` itself does.
-  Propagated the same fix to `adapters.py`'s error-message fallback and
-  `backend_cmds.py`'s `_llamacpp_base_url()` (now a single source of truth
-  via the registry, not a third independent hardcoded literal). The
-  `_OLLAMA_BASE = "http://localhost:11434"` in `backend_cmds.py` is
-  unrelated and correct as-is (genuinely manages the raw Ollama service),
-  only its comment was stale and got corrected alongside.
-- **`greenboost_setup.sh`: the installed `gb`/`greenboost-cli` wrapper
-  scripts unconditionally overwrote `GB_PY_ROOT`, defeating the explicit
-  override `gb_paths.py` itself documents as priority 1 of 3.** Found while
-  trying to test the fix above against the installed CLI with `GB_PY_ROOT`
-  pointed at a dev checkout — had no effect at all, silently testing
-  against stale installed code. Fixed: `export GB_PY_ROOT=...` →
-  `export GB_PY_ROOT="${GB_PY_ROOT:-...}"`, same default for the normal
-  case, but now an explicit caller-set value survives.
-- **`gb_synapse.py`: `serve()` now retries host-only automatically when a
-  cluster/RPC serve raises**, instead of the caller (e.g. greenboost-cli)
-  needing to know to retry itself. A cluster failure can be unrelated to
-  whether the model runs at all (a feeder engine gap, a network-latency-
-  bound split); host-only is never a worse attempt than cluster (strictly
-  fewer devices), so falling back automatically is safe. This is also what
-  the port-fallback bug above was really covering for — surfacing a broken
-  OTHER backend instead of gb-synapse just trying its next-best option.
-- **Live end-to-end verification (2026-07-27, after a real Full Install
-  deployed everything above)**: `gb -m <reference-model> -p "..."` now
-  correctly starts gb-synapse, connects on the right port, and (once served
-  host-only, since the default cluster attempt was still measurably not
-  worth it per the RPC finding above) answers. Found one more real,
-  structural ceiling this way: GB-CLI's own baseline overhead (system
-  prompt + tool schemas) alone needs ~4608 tokens, more than this model's
-  current `ctx=2048` VRAM-budget clamp on this hardware — so a normal
-  agentic `gb` prompt is rejected outright (400, context exceeded) before
-  any inference runs. A raw completion that fits the budget does work:
-  26.4s wall time for a 138-token response (~5.2 tok/s decode), consistent
-  with every other measurement of this model this session. See CLAUDE.md's
-  Reference Workload Rule for the full write-up.
+### 🧠 The context window kept shrinking for the wrong reasons — now fixed, three times over
+
+GreenBoost's reference coding model changed to
+[`Qwen3.6-27B-Fable-Fusion`](https://huggingface.co/DavidAU) (a dense 27B
+model, replacing the older 35B mixture-of-experts one). 
+
+The model's own spec sheet advertises a 262,000-token memory, so something
+was very wrong. It turned out to be three separate, unrelated bugs, each one
+quietly shrinking how much conversation the model could actually hold:
+
+1. **GreenBoost was overestimating how much GPU memory the conversation
+   history needed**, by roughly 4x, for this model's architecture
+   specifically. Fixing that alone took the usable window from **2,048
+   tokens to 7,680** on the exact same hardware.
+2. That still wasn't right. GreenBoost was also reserving graphics-card
+   memory as if the *entire* model had to fit on the GPU, even in the very
+   common case where only part of it does (the rest quietly runs from
+   regular system RAM). Fixing that took the window from **7,680 tokens to
+   roughly 46,000** — about six times bigger than where it started, on the
+   same card, at the same speed.
+3. Separately, the assistant itself never actually asked the model server
+   how much room it had to work with — it just assumed a made-up number.
+   That meant it never knew to shorten a long conversation before hitting
+   the wall; it just found out the hard way, mid-answer. It now asks the
+   server directly, and trims older conversation history automatically
+   before a request would overflow, instead of failing.
+
+Put together: a `gb -m <model> -p "read this file and summarize it"` request
+that was flatly impossible at the start of this release now works, reads
+real files, and gives a grounded answer. The model's full 262K (or even its
+extended 1M) window is still reachable if you explicitly ask for it and have
+GreenBoost's memory-extension feature turned on — that trades some speed for
+the extra room, so it's opt-in, never automatic.
+
+### 💬 The `gb` terminal assistant got a cleanup pass
+
+- The chat window used to flash raw internal text (things like
+  `<tool_call><function=...>`) whenever the model decided to use a tool —
+  now that's filtered out live, so you only ever see the clean "running
+  tool…" card.
+- Tools provided by connected MCP servers (used for things like searching
+  project memory) sometimes came back as `Unknown instrument` even though
+  they were perfectly available — a naming mismatch, now fixed.
+- The little memory readout in the bottom-right corner (GPU VRAM / system
+  RAM / disk usage) was showing wrong numbers, mostly stuck at zero — it's
+  now pulled from GreenBoost's own live monitoring feed, and it visibly dims
+  instead of silently freezing if that feed goes stale.
+- Fixed a cosmetic glitch where the animated "thinking…" line could leave a
+  stray character or two behind on screen.
+- `ctrl+o` ("expand the full result") now actually does something — the
+  hint had been on screen for a while promising this with no button behind
+  it.
+- The permission-approval popup box now closes cleanly on the right side
+  instead of trailing off mid-line.
+
+### 🌐 Cluster / multi-machine serving
+
+Chasing a stubborn "this model refuses to load across two machines, no
+matter how I split it" error turned up two real, independent bugs: one
+machine was running an outdated build of the sharing engine, and a
+built-in safety check was rejecting GreenBoost's own placement decision
+every single time regardless of what that decision actually was. Both
+fixed.
+
+Decision for this specific model: splitting it across two machines over a
+plain network connection currently makes it *slower*, not faster — the
+per-token chatter between machines outweighs the benefit for this model's
+architecture. So it stays on a single machine for now; the fixes are in and
+ready for whichever future model the split genuinely helps. And if a
+multi-machine load ever fails for any reason, GreenBoost now automatically
+falls back to running on the local machine alone instead of just giving up.
+
+### 🗜️ Serving engine, consolidated
+
+- The vLLM backend has been retired. GreenBoost's own built-in engine
+  (previously an alternate path) is now the only one used for this class of
+  model — one engine to maintain instead of two, and nothing changes for
+  anyone already using it.
+- Continuous batching (serving more than one request to the same model at
+  once) is back on by default. It had been silently switched off.
+- The built-in model server's default network port moved from 11434 (which
+  collided with Ollama, if you also run that) to 11435, so both can run
+  side by side without a fight.
+
+### 🐛 Installer & stability fixes
+
+- Fixed an installer bug where a few third-party libraries (used for model
+  compression) could silently fail to copy into place on a machine that
+  didn't already have the destination folder — an easy way to end up with
+  a working install that was quietly missing a feature.
+- Fixed a real regression from this same release's own port change above:
+  the terminal assistant's list of known backends still pointed at the OLD
+  port, so on any unrelated failure it silently tried talking to a service
+  that was never running and reported a confusing, unrelated error instead
+  of the real one.
+- Fixed the installed `gb` command ignoring an explicit override of where
+  it should look for GreenBoost's own files — useful when testing a
+  development build instead of the installed one, previously had no effect
+  at all.
+- A machine acting as a "feeder" (lending its spare GPU/RAM to another
+  machine) could grow an internal log file past 1 GB with no cleanup — it
+  now rotates automatically like every other GreenBoost log.
+- A couple of crash-prevention fixes for loading models on GPUs with a
+  tighter memory budget.
+
 
 <details>
 <summary><strong>Jump to a version</strong></summary>
 
+- [v3.3 , 2026-07-28 (in development)](#v33--2026-07-28-in-development)
 - [v3.2 , 2026-07-12](#v32--2026-07-12)
 - [v3.1 , 2026-06-16](#v31--2026-06-16)
 - [v3.0 , 2026-06-13](#v30--2026-06-13)

@@ -308,13 +308,21 @@ def cmd_llamaserve(args: str, _session, settings) -> bool:
     ollama_suspend_for_gpu_task(reason="llama-server")
 
     try:
-        state = gb_synapse.serve(model, extra_args=settings.get("llamacpp_extra_args", ""))
+        state = gb_synapse.serve(
+            model,
+            ctx=int(settings.get("llamacpp_n_ctx") or 0),
+            n_slots=int(settings.get("llamacpp_np") or -1),
+            extra_args=settings.get("llamacpp_extra_args", ""))
     except Exception as e:
         emit_err(f"Could not start gb-synapse: {e}")
         return True
 
     emit_ok(f"gb-synapse started (pid {state.llama_pid})")
     console.print(f"  [{GRAY}]model:[/]  [{VIOLET}]{state.model}[/]")
+    if state.ctx:
+        console.print(f"  [{GRAY}]ctx:  [/]  [{GRAY}]{state.ctx:,} tokens"
+                       f"{f', kv={state.kv_type}' if state.kv_type else ''}"
+                       f"{f', ngl={state.n_gpu_layers}' if state.n_gpu_layers else ''}[/]")
     console.print(f"  [{GRAY}]url:  [/]  [{GRAY}]http://localhost:{state.port}/v1[/]")
     console.print(f"  [{GRAY}]log:  [/]  [{GRAY}]{gb_synapse.log_path(state.model)}[/]")
     if state.feeders:

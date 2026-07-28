@@ -35,7 +35,19 @@ def _IOWR(type_: int, nr: int, size: int) -> int:
     return (3 << 30) | (size << 16) | (type_ << 8) | nr
 
 class _GbInfo(ctypes.Structure):
-    """Mirrors struct gb_info from greenboost_ioctl.h (v2.6)."""
+    """Mirrors struct gb_info from greenboost_ioctl.h (v2.6).
+
+    Previously carried three phantom fields (kv_compressed_mb,
+    kv_compression_bits, kv_compression_sessions — not part of the real
+    kernel struct, TurboQuant stats are tracked client-side only, see
+    GreenBoostMonitor.set_turboquant) plus an anonymous _pad2 in place of
+    the real gaming_mode field. That made this struct 144 bytes against the
+    kernel's 136 (greenboost_ioctl.h's struct gb_info) — _IOR() encodes the
+    struct size into the ioctl command number, so every GB_IOCTL_GET_INFO
+    call with the wrong size returned ENOTTY and _try_ioctl() below silently
+    returned False 100% of the time, permanently falling back to the much
+    less reliable sysfs-regex path (confirmed live: this box's
+    /dev/greenboost ioctl always failed before this fix)."""
     _fields_ = [
         ("vram_physical_mb",     ctypes.c_uint64),
         ("total_ram_mb",         ctypes.c_uint64),
@@ -54,12 +66,9 @@ class _GbInfo(ctypes.Structure):
         ("kv_reserve_mb",        ctypes.c_uint32),
         ("kv_used_mb",           ctypes.c_uint32),
         ("kv_t2_mb",             ctypes.c_uint32),
-        ("kv_compressed_mb",         ctypes.c_uint32),
-        ("kv_compression_bits",      ctypes.c_uint32),
-        ("kv_compression_sessions",  ctypes.c_uint32),
-        ("t2_pressure",              ctypes.c_uint32),
+        ("t2_pressure",          ctypes.c_uint32),
         ("phase_reset_seq",      ctypes.c_uint32),
-        ("_pad2",                ctypes.c_uint32),
+        ("gaming_mode",          ctypes.c_uint32),
         ("total_combined_mb",    ctypes.c_uint64),
     ]
 
@@ -116,9 +125,13 @@ class GreenBoostStatus:
     kv_reserve_mb: int = 2048
     kv_used_mb: int = 0
     kv_t2_mb: int = 0
+    # TurboQuant KV-compression stats — tracked CLIENT-SIDE only (set by
+    # set_turboquant() below), never read from the kernel ioctl: the real
+    # struct gb_info has no such fields.
     kv_compressed_mb: int = 0
     kv_compression_bits: int = 0
     kv_compression_sessions: int = 0
+    gaming_mode: bool = False
     total_combined_mb: float = 0.0
     system_ram_gb: float = 0.0
     nvme_cache_gb: float = 0.0
@@ -210,6 +223,7 @@ class GreenBoostStatus:
             "kv_compression_bits": self.kv_compression_bits,
             "kv_compression_sessions": self.kv_compression_sessions,
             "kv_used_mb": self.kv_used_mb,
+            "gaming_mode": self.gaming_mode,
             "total_combined_mb": self.total_combined_mb,
             "kv_t3_stale": self._kv_t3_stale,
             "error": self.error,
@@ -404,9 +418,10 @@ class GreenBoostMonitor:
             s.kv_reserve_mb = info.kv_reserve_mb
             s.kv_used_mb = info.kv_used_mb
             s.kv_t2_mb = info.kv_t2_mb
-            s.kv_compressed_mb = info.kv_compressed_mb
-            s.kv_compression_bits = info.kv_compression_bits
-            s.kv_compression_sessions = info.kv_compression_sessions
+            # kv_compressed_mb/kv_compression_bits/kv_compression_sessions are
+            # NOT in the kernel struct — client-tracked only, set by
+            # set_turboquant(); leave s's current values untouched here.
+            s.gaming_mode = bool(info.gaming_mode)
             s.total_combined_mb = info.total_combined_mb
             s.system_ram_gb = round(info.total_ram_mb / 1024, 1)
             s.nvme_cache_gb = round(info.nvme_swap_total_mb / 1024, 1)
@@ -491,7 +506,12 @@ class GreenBoostMonitor:
                 if m:
                     s.nvme_swap_total_mb = int(m.group(1)) * 1024
             if s.nvme_swap_used_mb == 0:
-                m = _re.search(r'Swap used\s*:\s*(\d+)\s*MB', text)
+                # The kernel module (greenboost.c) prints "T3 allocated : N MB",
+                # never "Swap used" — that string doesn't exist anywhere in the
+                # kmod source, so this regex matched nothing and T3 usage was
+                # structurally pinned to 0 regardless of real T3 activity
+                # (confirmed: greenboost.c:2418 is the actual line format).
+                m = _re.search(r'T3 allocated\s*:\s*(\d+)\s*MB', text)
                 if m:
                     s.nvme_swap_used_mb = float(m.group(1))
             # KV T3: trust the kernel counter only when T3 is actually allocated.

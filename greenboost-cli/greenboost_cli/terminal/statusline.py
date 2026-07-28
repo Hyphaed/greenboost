@@ -128,6 +128,7 @@ class StatusLine:
         self._lock  = threading.Lock()
         self._stop_evt = threading.Event()
         self._thread: threading.Thread | None = None
+        self._prev_vis_len: int = 0   # widest frame painted so far this run — see _render
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -135,6 +136,7 @@ class StatusLine:
         self._phase    = phase
         self._start    = time.monotonic()
         self._frame    = 0
+        self._prev_vis_len = 0
         self._stop_evt.clear()
         if _use_pt():
             # pt app is live at the idle prompt — drive via toolbar repaint.
@@ -328,14 +330,23 @@ class StatusLine:
             sp_color = ANSI_TEAL
             lbl_color = ANSI_TEAL
 
-        # ── Dash fill (breathing sine-wave ±3 when not final) ─────────────
+        # ── Dash fill (breathing sine-wave, DOWNWARD only, when not final) ──
+        # Breathing by +/-3 let a frame render WIDER than safe_w; the next,
+        # narrower frame then padded only to safe_w, stranding 2-3 chars of
+        # the wider frame's tail at the right edge (the "1.8s8s"/"2.5sss"
+        # artifact, confirmed live) — and stop()'s final render used
+        # breath=0, so the widest frame's leftover tail could survive into
+        # the STATIC line too. Breathing only ever shrinks the dash run now,
+        # so a frame is never wider than base_dashes; padding against
+        # max(safe_w, prev_vis_len) is the belt-and-braces case where a
+        # shrinking frame still needs to overwrite a wider previous one.
         fixed_vis = 2 + 1 + 2 + len(phase) + 2 + 2 + len(right_plain)
         base_dashes = max(4, safe_w - fixed_vis)
         if final:
             dashes = base_dashes
         else:
-            breath = int(math.sin(frame * 0.35) * 3)
-            dashes = max(4, base_dashes + breath)
+            breath = -abs(int(math.sin(frame * 0.35) * 3))
+            dashes = max(4, min(base_dashes, base_dashes + breath))
 
         line = (
             f"  {sp_color}{sp_char}{ANSI_RESET}"
@@ -344,4 +355,6 @@ class StatusLine:
             f"  {right_ansi}"
         )
         vis_len = fixed_vis + dashes
-        return line + " " * max(0, safe_w - vis_len)
+        pad_to = max(safe_w, self._prev_vis_len)
+        self._prev_vis_len = vis_len
+        return line + " " * max(0, pad_to - vis_len)

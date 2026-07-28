@@ -48,7 +48,16 @@ DEFAULT_SETTINGS: dict = {
     # PCIe-bound overflow models. ~10 k chars ≈ 2500 tokens.
     "local_sys_ctx_chars": 10000,
     # gb-synapse (llama-server) tuning — see gb_synapse.serve()
-    "llamacpp_n_ctx":       65536,  # context window
+    # 0 = no override: gb-synapse solves ctx jointly against the live VRAM
+    # budget (gb_synapse._solve_ctx_and_layers). Set >0 to EXPLICITLY request
+    # a window (e.g. 262144, the model's native size) — that is also what
+    # gates the opt-in T2 KV extension when the shim is active; a nonzero
+    # default here would silently turn "explicit request" into "always", so
+    # 0 is the only safe default. 65536 was a guessed constant that was never
+    # actually sent to the server (serve() ignored ctx=0 the same way) — it
+    # only misled gb_synapse_ctx()'s client-side bookkeeping, now fixed to
+    # probe the live server instead (see gb_synapse_ctx()).
+    "llamacpp_n_ctx":       0,      # context window (0 = auto)
     "llamacpp_np":          1,      # parallel slots; 1 = no KV split for single-user
     "llamacpp_extra_args":  "",     # extra flags on top of gb-synapse's defaults
                                      # (--jinja is now always on — needed for correct
@@ -88,13 +97,87 @@ def save_settings(cfg: dict) -> None:
     SETTINGS_PATH.write_text(json.dumps(persisted, indent=2))
 
 
-def gb_synapse_ctx(settings: dict) -> int:
-    """Context-window size to assume for the currently-served gb-synapse
-    model, for CLIENT-SIDE bookkeeping only (auto-compact thresholds,
-    /status display) — never sent per-request. llama-server's actual
-    context is fixed at server-start time via gb_synapse.serve(ctx=...).
+_GB_SYNAPSE_CTX_CACHE: dict = {"val": 0, "ts": 0.0}
+_GB_SYNAPSE_CTX_TTL_S = 10.0
 
-    Priority: settings["llamacpp_n_ctx"] → 65536.
+
+def invalidate_gb_synapse_ctx_cache() -> None:
+    """Force the next gb_synapse_ctx() call to re-probe the server. Call this
+    after a 400 "exceeds the available context size" — the cached value is
+    proven wrong at that point, waiting out the TTL just delays recovery."""
+    _GB_SYNAPSE_CTX_CACHE["ts"] = 0.0
+
+
+def gb_synapse_ctx(settings: dict) -> int:
+    """Context-window size actually being served right now, for auto-compact
+    thresholds and /status display.
+
+    This used to return a hardcoded 65536 guess and never contact the
+    server — every compaction threshold in the CLI was a fraction of a
+    number that had nothing to do with reality, so compaction could never
+    fire before a real 400 (confirmed live: server served ctx=7680, this
+    returned 65536). Fixed to ask the server directly, short-TTL cached
+    since every caller (repl.py toolbar + pre-send check, intelligence.py
+    compaction, orchestrator.py overflow guard, /status) calls this often.
+
+    Priority: live GET /slots (n_ctx, ground truth) → the gb-synapse
+    run-state JSON's own `ctx` field (gb_synapse.ServerState, set at serve
+    time) → settings["llamacpp_n_ctx"] if the user explicitly requested a
+    window → 65536 as the last-resort fallback when nothing is running yet.
     """
-    val = settings.get("llamacpp_n_ctx")
-    return int(val) if val else 65536
+    import time as _time
+    now = _time.monotonic()
+    if now - _GB_SYNAPSE_CTX_CACHE["ts"] < _GB_SYNAPSE_CTX_TTL_S and _GB_SYNAPSE_CTX_CACHE["val"]:
+        return _GB_SYNAPSE_CTX_CACHE["val"]
+
+    ctx = _probe_synapse_slots_ctx()
+    if not ctx:
+        ctx = _read_run_state_ctx(settings)
+    if not ctx:
+        configured = settings.get("llamacpp_n_ctx")
+        ctx = int(configured) if configured else 0
+    if not ctx:
+        ctx = 65536
+
+    _GB_SYNAPSE_CTX_CACHE["val"] = ctx
+    _GB_SYNAPSE_CTX_CACHE["ts"] = now
+    return ctx
+
+
+def _probe_synapse_slots_ctx() -> int:
+    """GET /slots on the gb-synapse proxy — raw llama.cpp passthrough,
+    verified live to report the real per-slot n_ctx (e.g. 7680 today, wrong
+    before this fix). Short timeout: this runs on the UI/turn-prep path and
+    must never make a hung server stall the REPL."""
+    try:
+        import httpx
+        port = os.environ.get("GB_SYNAPSE_PORT", "11435")
+        r = httpx.get(f"http://127.0.0.1:{port}/slots", timeout=0.5)
+        if r.status_code == 200:
+            slots = r.json()
+            if slots and isinstance(slots, list):
+                n_ctx = slots[0].get("n_ctx")
+                if n_ctx:
+                    return int(n_ctx)
+    except Exception:
+        pass
+    return 0
+
+
+def _read_run_state_ctx(settings: dict) -> int:
+    """Fallback when /slots isn't reachable (proxy down, port unknown) but a
+    run-state JSON exists — gb_synapse.ServerState.ctx, written at serve time
+    (see gb_synapse.py's _launch_proxy_and_record)."""
+    try:
+        model = settings.get("model") or ""
+        if not model:
+            return 0
+        run_dir = Path("/run/greenboost/synapse")
+        safe_name = model.replace("/", "_").replace(":", "_")
+        state_path = run_dir / f"{safe_name}.json"
+        if state_path.exists():
+            data = json.loads(state_path.read_text())
+            return int(data.get("ctx") or 0)
+    except Exception:
+        pass
+    return 0
