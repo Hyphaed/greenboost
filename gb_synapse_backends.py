@@ -373,7 +373,7 @@ class EngineBackend:
     def can_serve(self, entry) -> bool:
         raise NotImplementedError
 
-    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args=""):
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None):
         """n_slots=-1 (default) means "let the engine decide" — for
         LlamaCppBackend this passes straight through to llama.cpp's own
         `-np -1` auto mode (n_parallel=4, kv_unified=true, a single shared
@@ -383,7 +383,17 @@ class EngineBackend:
         Finding 10, 2026-07-26: n_slots defaulted to 1 everywhere, disabling
         batching entirely with no one ever passing a real value). Backends
         that don't support concurrent slots (Transformers/Diffusers) ignore
-        this parameter regardless of its value."""
+        this parameter regardless of its value.
+
+        cuda_graph=None (default) means "use the GB_SYNAPSE_TORCH_CUDA_GRAPH
+        env var" (SynapseTorchBackend only — CUDA graph capture reserves
+        extra warmup buffers on top of the KV cache and can OOM on small
+        cards, off by default; see that backend's serve() for the full
+        rationale). An explicit True/False overrides the env var for this
+        one serve call — added so callers (the synapse_serve MCP tool
+        included) can opt a specific serve into graphs without mutating
+        process-wide environment state. Backends without a CUDA-graph
+        concept ignore this parameter regardless of its value."""
         raise NotImplementedError
 
     def serve_facts(self, entry) -> dict:
@@ -405,7 +415,7 @@ class LlamaCppBackend(EngineBackend):
     def can_serve(self, entry) -> bool:
         return entry.engine == "llama.cpp"
 
-    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args=""):
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None):
         import gb_synapse as gs
         import gb_cluster
         from gb_nvml import get_nvml
@@ -786,7 +796,7 @@ class SynapseTorchBackend(EngineBackend):
         facts["quant_below_floor"] = _quant_below_fp8_floor(entry)
         return facts
 
-    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args=""):
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None):
         import gb_synapse as gs
         import gb_cluster
 
@@ -887,8 +897,15 @@ class SynapseTorchBackend(EngineBackend):
             # OOM on a 12 GB card with this engine's default KV-cache
             # sizing. Off by default until that sizing is revisited
             # (workflow/gb-synapse.md); GB_SYNAPSE_TORCH_CUDA_GRAPH=1
-            # re-enables it for boxes with headroom to spare.
-            if os.environ.get("GB_SYNAPSE_TORCH_CUDA_GRAPH", "0") != "1":
+            # re-enables it process-wide, or pass cuda_graph=True to this
+            # one serve() call (see EngineBackend.serve()'s docstring —
+            # added 2026-07-28 so the synapse_serve MCP tool can opt in
+            # per-call instead of needing an env var no MCP tool exposed).
+            use_cuda_graph = (
+                cuda_graph if cuda_graph is not None
+                else os.environ.get("GB_SYNAPSE_TORCH_CUDA_GRAPH", "0") == "1"
+            )
+            if not use_cuda_graph:
                 cmd += ["--disable-cuda-graph"]
 
             # Cluster PP — see class docstring for why PP-only/TP=1. Host is
@@ -997,7 +1014,7 @@ class TransformersBackend(EngineBackend):
     def can_serve(self, entry) -> bool:
         return entry.engine in ("transformers", "gbquant")
 
-    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args=""):
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None):
         import gb_synapse as gs
 
         internal_port = port + 1000
@@ -1033,7 +1050,7 @@ class DiffusersBackend(EngineBackend):
     def can_serve(self, entry) -> bool:
         return entry.engine == "diffusers"
 
-    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args=""):
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None):
         import gb_synapse as gs
         import gb_cluster
 

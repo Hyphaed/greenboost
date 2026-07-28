@@ -391,6 +391,97 @@ own changes at a glance.
   Qwen3-VL): `gllm/models/kimi_k25_vision.py:245` has the identical
   unguarded call — flag for whoever next touches Kimi K2.5 support.
 
+- 2026-07-28 (sixth crash, a direct side effect of the CPU-construct fix
+  above, not a new independent bug): `gllm/model_loader.py`'s
+  `_move_stray_cpu_tensors()` — after the vision-attention fix above got
+  past `flash_attn_varlen_func`, the very next request crashed with
+  "Expected all tensors to be on the same device, but found at least two
+  devices, cuda:0 and cpu!" inside `qwen3_vl.py`'s `forward()`, adding
+  `hidden_states` (cuda) to `deepstack_input_embeds[...]` (cpu).
+  Root-caused to `qwen3_vl.py:540`: `self.deepstack_input_embeds =
+  [torch.zeros(...), ...]` — a PLAIN Python list of tensors (despite the
+  adjacent "register buffer for deepstack" comment; it never actually calls
+  `register_buffer()`). `model.to("cuda")` only walks `nn.Module`'s own
+  `_parameters`/`_buffers`/`_modules` bookkeeping, so this list — allocated
+  under the scoped `torch.device("cpu")` construction context along with
+  everything else — never gets moved, and stays stranded on CPU forever.
+  Fixed generally, not by special-casing this one attribute: added
+  `_move_stray_cpu_tensors()`, called right after `model.to("cuda")` in
+  `load_model()`, which walks every submodule's plain (non-underscore)
+  instance attributes and moves any CPU tensor or list/tuple of CPU tensors
+  it finds. This closes the whole "model class forgot to actually call
+  register_buffer" shape of bug, not just Qwen3-VL's deepstack path — the
+  CPU-construct architecture in this file makes ANY such attribute across
+  the whole vendored model zoo susceptible, the same "unbounded whack-a-
+  mole" reasoning that motivated CPU-construct itself now applies one level
+  up to this attribute-tracking gap.
+
+- 2026-07-28 (perf investigation, NOT a correctness bug — recorded so the
+  next person doesn't re-walk the same dead ends): Qwen3-VL-8B-Instruct-FP8
+  serves and generates correctly (see the sixth-crash entry above) but very
+  slowly — ~4-7s/token measured live. Investigated two candidate fixes,
+  both real dead ends, confirmed by measurement not assumption:
+  (a) `flash-attn-4` (CuTeDSL, has genuine dedicated sm_120 kernel files
+  — `flash_fwd_sm120.py`/`flash_bwd_sm120.py`, confirmed by inspecting the
+  installed package, not marketing copy) was pip-installed and benchmarked
+  directly against this GPU. Prefill-shaped (2048-seq self-attention):
+  0.92x vs torch SDPA (FA4 SLOWER). Decode-shaped (1 query token against a
+  2000-token KV cache — the actual bottleneck's shape): 0.46x vs SDPA (FA4
+  2.2x SLOWER). torch's built-in SDPA already dispatches to a solid backend
+  on this GPU for both shapes; FA4's sm_120 kernel is not competitive here.
+  More importantly: at ~0.05-0.1ms per attention call either way, attention
+  is nowhere near the ~4000ms/token bottleneck — swapping attention kernels
+  cannot fix this regardless of which one wins the microbenchmark. Reverted
+  the install (it also dragged in conflicting nvidia-cutlass-dsl 4.6.0.dev0
+  and protobuf 6.33.6, breaking this package's own ==4.5.0 pin and
+  gptqmodel's >=7.34.0 — restored both). One operational gotcha from the
+  revert worth remembering: `pip uninstall flash-attn-4` left an EMPTY
+  `flash_attn/` namespace-package directory behind in site-packages, which
+  made `transformers.utils.import_utils.is_flash_attn_2_available()` crash
+  with `KeyError: 'flash_attn'` on every subsequent launch (spec found via
+  the residual directory, but no matching installed-distribution metadata
+  in PACKAGE_DISTRIBUTION_MAPPING) — pip's uninstaller doesn't always clean
+  up empty namespace-package dirs; had to `rmdir` it manually.
+  (b) CUDA graph capture (`GB_SYNAPSE_TORCH_CUDA_GRAPH=1` /
+  `gb_synapse.serve(cuda_graph=True)`, see gb_synapse_backends.py) was
+  already off by default for a documented reason (2026-07-16: OOM on this
+  12GB card). Retested now that ctx=8192 (down from the 65536 default)
+  leaves real headroom, in case the OOM was ctx-specific. It is NOT
+  ctx-specific: capture crashes immediately at "Capturing CUDA Graphs: 0%"
+  with `CUDA error: an illegal memory access was encountered` (from
+  `createEvent`, `c10/cuda/CUDAEvent.h:261`), a fatal C-level abort, not an
+  OOM. This is a DIFFERENT, more fundamental incompatibility than the one
+  already on record — CUDA graph capture and this GreenBoost shim build
+  (LD_PRELOAD CUDA/NVML interception) do not coexist AT ALL on this box,
+  independent of available VRAM. Do not re-attempt cuda_graph=True here
+  without first root-causing the shim's interaction with CUDA event/stream
+  capture APIs specifically (a different code path than the ambient-
+  default-device kernel-launch bug documented above, so likely a distinct
+  root cause, not the same one recurring).
+  RESOLVED, same day, by direct measurement — the "~4-7s/token" framing
+  above was itself wrong, not just the two ruled-out fixes. `py-spy dump
+  --native` sampling (15 samples at 1Hz, sudo, against the live worker PID
+  during a real vision request) caught the worker sitting IDLE in
+  `recv_ipc_package`/zmq poll the large majority of the time, with every
+  "active" sample in scheduler bookkeeping (`check_abort_seqs`,
+  `_build_prefetched_input`, `schedule_once`) — never once inside a vision-
+  tower or attention forward pass, which would be impossible if those ops
+  genuinely cost seconds each. That contradiction prompted re-timing
+  fresh: the ORIGINAL 152s/38-token measurement was the FIRST-EVER
+  inference call on a just-loaded server (Triton/cuBLAS kernel autotuning
+  for never-before-seen shapes pays a real one-time cost). Two more vision
+  requests on the SAME already-warm server, timed directly: 9.3s/31 tokens
+  and 11.3s/40 tokens — both ≈0.28s/token (~3.6 tok/s), consistent with
+  each other and with the earlier text-only measurement (26.4s/100 tokens
+  ≈ 0.26s/token). Steady-state throughput was never the problem; the
+  original number was a cold-start artifact mistaken for a sustained rate.
+  ~3.6 tok/s for an 8B FP8 model on a 12GB consumer card via the SDPA
+  fallback (no flash-attn, no CUDA graphs) is reasonable, not a regression
+  to chase further. Neither the flash-attn-4 revert nor the CUDA-graph
+  finding above needed to happen for this model to be usable — both are
+  still true and still worth keeping on record (real, reproducible
+  findings), just not the fix this investigation was looking for.
+
 Why `synapse_engine/logger.py` exists
 --------------------------------------
 Upstream `gllm/` does `from logger import logger` in ~22 files, expecting
