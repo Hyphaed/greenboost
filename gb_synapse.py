@@ -2588,7 +2588,8 @@ def _launch_proxy_and_record(entry: ModelEntry, upstream: subprocess.Popen, port
 
 
 def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
-          use_cluster: bool = True, n_slots: int = -1, extra_args: str = "") -> ServerState:
+          use_cluster: bool = True, n_slots: int = -1, extra_args: str = "",
+          cuda_graph: "bool | None" = None) -> ServerState:
     """Resolve `model` (manifest name, "org/repo[:quant]", or a bare Ollama
     model name) and hand it to whichever engine backend its manifest entry
     calls for (gb_synapse_backends.select_backend) — llama.cpp (default,
@@ -2600,6 +2601,14 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
     racing a second launch (Ollama's scheduler solves this with a queue +
     refcounted runners; gb-synapse only ever runs one model at a time, so
     "return the existing one" is the equivalent guarantee).
+
+    cuda_graph: per-call override for the synapse torch engine's CUDA-graph
+    capture (ignored by other backends). None (default) falls back to the
+    GB_SYNAPSE_TORCH_CUDA_GRAPH env var, off by default because graph
+    capture's warmup buffers can OOM small cards (see EngineBackend.serve()'s
+    docstring in gb_synapse_backends.py). Pass explicitly to try graphs for
+    one serve without mutating process env — e.g. after lowering ctx enough
+    to free the headroom graphs need.
 
     A THIRD case, not just alive/dead: the engine can be alive while only
     its proxy died (another process squatted the port, an OOM-killer got the
@@ -2632,7 +2641,8 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
     backend = gb_synapse_backends.select_backend(entry)
     try:
         state = backend.serve(entry, port, ctx=ctx, use_cluster=use_cluster,
-                              n_slots=n_slots, extra_args=extra_args)
+                              n_slots=n_slots, extra_args=extra_args,
+                              cuda_graph=cuda_graph)
     except RuntimeError:
         # A cluster/RPC load can fail for reasons that have nothing to do with
         # whether the model can run at all — a feeder's engine build gap, a
@@ -2653,7 +2663,8 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
         print(f"  [gb-synapse] {entry.name}: cluster/RPC serve failed — "
               f"retrying host-only before giving up.", flush=True)
         state = backend.serve(entry, port, ctx=ctx, use_cluster=False,
-                              n_slots=n_slots, extra_args=extra_args)
+                              n_slots=n_slots, extra_args=extra_args,
+                              cuda_graph=cuda_graph)
     return _maybe_serve_embedding(state)
 
 

@@ -27,6 +27,36 @@ from gllm.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from gllm.utils import get_lock
 
 
+def _move_stray_cpu_tensors(model: torch.nn.Module) -> None:
+    """GREENBOOST PATCH (2026-07-28, see NOTICE): model.to("cuda") only
+    moves torch.nn.Parameter/register_buffer()-tracked tensors. Some model
+    classes (e.g. Qwen3VLForConditionalGeneration's `self.deepstack_input_
+    embeds = [torch.zeros(...), ...]`, a plain Python list of tensors
+    despite its own "register buffer" comment) stash tensors as ordinary
+    instance attributes instead, so model.to("cuda") never touches them and
+    they stay on CPU (a side effect of constructing the whole model under
+    the scoped `torch.device("cpu")` above -- necessary to dodge the shim
+    bug documented on _skip_random_init(), but it means EVERY tensor
+    allocated during __init__, tracked or not, starts out on CPU). Hit live:
+    "Expected all tensors to be on the same device, but found at least two
+    devices, cuda:0 and cpu!" from Qwen3-VL's deepstack path at inference
+    time. Sweep every module's plain (non-underscore-prefixed, i.e. not
+    nn.Module's own _parameters/_buffers/_modules bookkeeping) instance
+    attributes for CPU tensors or lists/tuples of them and move in place --
+    general fix for this whole attribute shape, not just this one model."""
+    for module in model.modules():
+        for key, value in list(vars(module).items()):
+            if key.startswith("_"):
+                continue
+            if torch.is_tensor(value) and value.device.type == "cpu":
+                setattr(module, key, value.to("cuda"))
+            elif isinstance(value, (list, tuple)) and value and all(
+                torch.is_tensor(t) and t.device.type == "cpu" for t in value
+            ):
+                moved = [t.to("cuda") for t in value]
+                setattr(module, key, moved if isinstance(value, list) else tuple(moved))
+
+
 @contextlib.contextmanager
 def _skip_random_init():
     """GREENBOOST PATCH (2026-07-28, see NOTICE): the values torch.nn.init's
@@ -666,6 +696,7 @@ class ModelLoader:
         with _skip_random_init(), torch.device("cpu"):
             model = model_type(self.config)
         model = model.to("cuda")
+        _move_stray_cpu_tensors(model)
         free_gpu_memory_after, _ = torch.cuda.mem_get_info()
         model_size_gb = round(
             (free_gpu_memory_before - free_gpu_memory_after) / (2**30), 2

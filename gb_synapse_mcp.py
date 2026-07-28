@@ -116,7 +116,8 @@ def synapse_doctor(probe_feeders: bool = True) -> dict:
 
 @mcp.tool()
 def synapse_serve(model: str, ctx: int = 65536, use_cluster: bool = True,
-                  engine: str = "", confirm: bool = False) -> dict:
+                  engine: str = "", confirm: bool = False,
+                  cuda_graph: "bool | None" = None) -> dict:
     """Serve a model through gb-synapse (engine backend + the gb-synapse
     proxy, default port 11435, GB_SYNAPSE_PORT; tensor-split across the
     cluster when use_cluster and feeders are up for the llama.cpp backend).
@@ -125,6 +126,14 @@ def synapse_serve(model: str, ctx: int = 65536, use_cluster: bool = True,
     preview's backend name — it does NOT override the manifest's own engine
     for an actual (confirm=True) serve; re-pull with --engine to change
     that durably.
+
+    cuda_graph: synapse torch engine only (ignored by llama.cpp/diffusers).
+    None (default) = GB_SYNAPSE_TORCH_CUDA_GRAPH env var (off by default,
+    graph-capture warmup buffers can OOM small cards on top of the KV
+    cache). True/False overrides per-call — e.g. worth trying once ctx is
+    small enough to leave headroom (added 2026-07-28: this MCP tool had no
+    way to reach this env-gated knob at all before, the exact kind of gap
+    CLAUDE.md's MCP-tool-gap rule now says to close, not work around).
 
     DRY-RUN unless confirm=True: without it, returns the resolved model entry,
     which backend would serve it, and a warning about whatever is currently
@@ -145,12 +154,13 @@ def synapse_serve(model: str, ctx: int = 65536, use_cluster: bool = True,
             type(entry)(**{**asdict(entry), "engine": preview_engine})).name
         if not confirm:
             return {"dry_run": True, "would_serve": asdict(entry), "backend": backend_name,
-                    "ctx": ctx, "use_cluster": use_cluster,
+                    "ctx": ctx, "use_cluster": use_cluster, "cuda_graph": cuda_graph,
                     "currently_serving": current,
                     "warning": f"the gb-synapse port ({gb_synapse.DEFAULT_PORT}) may "
                                "have live consumers (ai-forge FORGE_OLLAMA_URL, ollama "
                                "clients). Pass confirm=True to actually serve."}
-        st = gb_synapse.serve(entry.name, ctx=ctx, use_cluster=use_cluster)
+        st = gb_synapse.serve(entry.name, ctx=ctx, use_cluster=use_cluster,
+                              cuda_graph=cuda_graph)
         return {"serving": asdict(st)}
     except Exception as e:
         return {"error": str(e)}
