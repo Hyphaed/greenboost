@@ -1724,6 +1724,18 @@ class ServerState:
     # still parses.
     embed_pid: int = 0
     embed_internal_port: int = 0
+    # Served context window + KV precision + GPU layer count actually used —
+    # 0/""/0 for backends that don't report them (torch/transformers/diffusers)
+    # or old persisted run-state JSON. Before this field existed, ctx/kv_type/
+    # placement were passed into _launch_proxy_and_record's **serve_facts and
+    # went ONLY into the dataflux synapse_serve event, never into the
+    # run-state itself — so a client asking "what window is actually being
+    # served right now" (gb-cli's gb_synapse_ctx(), synapse_ps) had no
+    # authoritative answer and fell back to a guessed constant. See
+    # gb_synapse_ctx() in greenboost-cli/greenboost_cli/environment/settings.py.
+    ctx: int = 0
+    kv_type: str = ""
+    n_gpu_layers: int = 0
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -2208,6 +2220,96 @@ def _clamp_ctx_to_budget(requested_ctx: int, entry: ModelEntry, budget_gb: float
     return safe_ctx
 
 
+# GB-CLI's own baseline overhead (system prompt + tool schemas) — see
+# CLAUDE.md's Reference Workload Rule. Below this, a real `gb -p "..."` turn
+# is rejected outright before inference starts, not just slow.
+CTX_FLOOR_TOKENS = int(os.environ.get("GB_SYNAPSE_CTX_FLOOR", "16384"))
+
+
+def _solve_ctx_and_layers(entry: ModelEntry, vram_gb: float, requested_ctx: int,
+                          n_devices: int = 1, t2_gb: float = 0.0,
+                          kv_bytes_per_elem: float = 1.0) -> "tuple[int, int]":
+    """Jointly solve --ctx-size and -ngl against the REAL VRAM budget, for the
+    partial-CPU-offload case _clamp_ctx_to_budget gets wrong.
+
+    _clamp_ctx_to_budget() subtracts the model's FULL weight size from the
+    budget even when only a fraction of layers actually land in VRAM (the
+    rest are on the CPU) — so a 14 GB model against a 9.6 GB budget always
+    goes negative, kv_budget_gb collapses to its 0.25 GiB floor, and ctx gets
+    clamped to a few thousand tokens regardless of how many layers really
+    fit. Confirmed live 2026-07-28: qwen3.6-27b, weights=14.09GB,
+    budget=9.63GB, kv_budget floored to 0.25GB -> ctx=7680, while only 33/65
+    layers (~7.2GB) were actually on the GPU, leaving ~2.4GB truly free.
+
+    -ngl is fixed FIRST (against a near-zero KV assumption — the "how many
+    layers fit at all" question, independent of how large a ctx is asked
+    for), then ctx is solved from whatever VRAM that leaves over. This is
+    deliberately a ONE-SHOT computation, not a fixed-point loop that lets
+    ctx and -ngl chase each other: an earlier version of this function DID
+    iterate (recompute -ngl from the newly-solved ctx's KV cost, then
+    re-solve ctx from the new -ngl, repeat) — measured against this exact
+    model it does not converge to the "keep ngl, grow ctx" outcome the
+    owner asked for, it OSCILLATES: each pass trades a few more layers off
+    the GPU for a bigger ctx, which demands more KV, which trades away more
+    layers, walking all the way down to a degenerate ngl=7/65,
+    ctx=212992 corner instead of the intended ngl=33ish/ctx=46080ish
+    balance. Fixing -ngl once and solving ctx as the leftover-budget
+    quantity is what "no speed loss" actually means: GPU layers are the
+    primary speed lever (Rule #1), ctx only grows into whatever's left over,
+    it never bids layers away. The ONLY place -ngl is deliberately traded
+    down for ctx is the floor-rescue block below, and only until the floor
+    is cleared — never as an ongoing optimization target.
+
+    t2_gb: extra KV budget when the shim's T2 pool is being used to extend
+    ctx past the VRAM-only ceiling (opt-in — see gb_synapse_backends.py's
+    T2 KV extension gate). 0 = VRAM-only ceiling, always safe.
+    """
+    n_layers = entry.n_layers or 0
+    if n_layers <= 0 or requested_ctx <= 0:
+        return requested_ctx, 999
+    n_kv_layers = entry.n_kv_layers or n_layers
+    per_layer_gb = (entry.n_bytes / (1024 ** 3)) / n_layers
+    bytes_per_tok = 2 * n_kv_layers * (entry.n_kv_heads or 0) * (entry.head_dim or 0) * kv_bytes_per_elem
+    if bytes_per_tok <= 0:
+        # Geometry unknown (old manifest entry) — degrade to the previous
+        # behavior rather than divide by zero.
+        ctx = _clamp_ctx_to_budget(requested_ctx, entry, vram_gb + t2_gb)
+        return ctx, _fit_gpu_layers(entry, vram_gb, 0.0, n_devices)
+
+    n_dev = max(1, n_devices)
+    ngl = _fit_gpu_layers(entry, vram_gb, 0.0, n_devices)
+    reserve_gb = _compute_reserve_gb(vram_gb * 1024.0 / n_dev) * n_dev
+    kv_budget_gb = max(vram_gb - per_layer_gb * ngl - reserve_gb, 0.0) + t2_gb
+    max_ctx = max(0, int((kv_budget_gb * (1024 ** 3)) / bytes_per_tok) // 256 * 256)
+    ctx = max(2048, min(requested_ctx, max_ctx)) if max_ctx > 0 else 2048
+    if ctx < requested_ctx:
+        print(f"  [gb-synapse] {entry.name}: ctx={requested_ctx} solved down to ctx={ctx} "
+              f"jointly with -ngl {ngl}/{n_layers} against a {vram_gb:.2f} GB VRAM budget"
+              f"{f' + {t2_gb:.2f} GB T2' if t2_gb else ''}.", flush=True)
+
+    # A window below GB-CLI's own baseline overhead (~4608 tokens for the
+    # system prompt + tool schemas) can't hold one real agentic turn — a
+    # silently-served tiny window is exactly the failure the owner hit
+    # (7680, barely above that floor, from an unrelated bug). Trade GPU
+    # layers for KV room, loudly, rather than ship a ctx too small to use.
+    if 0 < ctx < CTX_FLOOR_TOKENS and ngl > 0:
+        traded = 0
+        while ctx < CTX_FLOOR_TOKENS and ngl > 0:
+            ngl -= 1
+            traded += 1
+            reserve_gb = _compute_reserve_gb(vram_gb * 1024.0 / n_dev) * n_dev
+            kv_budget_gb = max(vram_gb - per_layer_gb * ngl - reserve_gb, 0.0) + t2_gb
+            ctx = max(0, int((kv_budget_gb * (1024 ** 3)) / bytes_per_tok) // 256 * 256)
+            ctx = min(requested_ctx, ctx)
+        ctx = max(2048, ctx)
+        print(f"  [gb-synapse] {entry.name}: ctx={ctx} was still below the "
+              f"{CTX_FLOOR_TOKENS:,}-token floor (an agentic turn's own baseline "
+              f"overhead) — traded {traded} GPU layer(s) for KV room, now "
+              f"-ngl {ngl}/{n_layers}. Add VRAM (a feeder) or a smaller quant to "
+              f"recover those layers.", flush=True)
+    return ctx, ngl
+
+
 def _compute_tensor_split(host_free_mb: int, online_feeders: list,
                           kv_total_gb: float = 0.0) -> str:
     """--tensor-split ratios from REAL free VRAM per device — not the shim's
@@ -2570,7 +2672,10 @@ def _launch_proxy_and_record(entry: ModelEntry, upstream: subprocess.Popen, port
     state = ServerState(model=entry.name, llama_pid=upstream.pid, proxy_pid=proxy_proc.pid,
                          port=port, internal_port=internal_port, tensor_split=tensor_split,
                          feeders=feeders or [], started_ts=time.time(), engine=engine,
-                         ready=ready, proxy_error=proxy_error)
+                         ready=ready, proxy_error=proxy_error,
+                         ctx=int(serve_facts.get("ctx") or 0),
+                         kv_type=str(serve_facts.get("kv_type") or ""),
+                         n_gpu_layers=int(serve_facts.get("n_gpu_layers") or 0))
     _write_run_state(state)
     if proxy_error:
         # The engine loaded a real model into memory (upstream.pid is alive);

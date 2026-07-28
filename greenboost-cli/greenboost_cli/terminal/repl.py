@@ -34,52 +34,132 @@ from greenboost_cli.terminal.theme import (
 
 # ── GB memory stats — background refresh for toolbar right corner ─────────────
 # Updated every 5 s by _gb_stats_updater (daemon thread). The toolbar reads
-# this without blocking — the nvidia-smi call stays off the UI thread.
+# this without blocking.
 #
 # _gb_stats_segs: list of (plain_text, pt_style_str) pairs, one per tier.
 #   T1 = ("T1 x/yG", "fg:<teal>")
-#   T2 = ("T2 zG",   "fg:<lavender>")  — only when GreenBoost loaded + T2 pool active
-#   T3 = ("T3 wG",   "fg:<coral>")     — only when T3 pool active
+#   T2 = ("T2 x/yG", "fg:<lavender>")  — only when GreenBoost loaded + T2 pool active
+#   T3 = ("T3 x/yG", "fg:<coral>")     — only when T3 pool active
+# A tier's style dims (theme.DIM) when the underlying snapshot is stale,
+# instead of silently freezing the last good render forever.
 _gb_stats_segs: list[tuple[str, str]] = []
 _gb_stats_lock: threading.Lock        = threading.Lock()
 
+# T3 pool total (MB) rarely changes at runtime — the dataflux snapshot event
+# doesn't carry it (only t3_used_mb), so cache it once from gb_monitor
+# instead of re-probing every 5s tick.
+_gb_t3_total_mb_cache: float = 0.0
+
+_GB_STATS_STALE_S = 30.0   # matches gb_monitor's own shim-stats staleness gate
+
+
+def _read_gb_snapshot() -> "tuple[dict | None, bool]":
+    """(snapshot_dict, is_stale). snapshot_dict is None if nothing usable was
+    found anywhere.
+
+    Per the owner's standing dataflux rule, live GreenBoost state should
+    come from the SAME dataflux SnapshotRecorder the greenboost-dataflux/
+    orchestrator MCP servers already write every 5s
+    (gb_dataflux.py:SnapshotRecorder), not re-derived less reliably.
+    Previously this toolbar used its own broken ioctl struct (T2 showed
+    *allocated*, not *available* — genuinely 0 but uninformative — and T3
+    was hardcoded to 0 by a regex matching a string the kernel module never
+    prints; both fixed in greenboost/monitor.py, but dataflux is still the
+    better live source since it already aggregates local + feeder state).
+
+    Tail-reads the last ~64KB of the log and scans backwards for the most
+    recent "snapshot" event — no subprocess, no torch (gb_dataflux itself is
+    stdlib-only for this path). Falls back to gb_monitor.tier_stats()
+    (still torch-free — do NOT use gb_tiering here, it imports torch, ~1.3s)
+    only when the log is stale or absent, normalized into the same key
+    shape used by the primary path below.
+    """
+    import time as _t
+    import json as _json
+    try:
+        from greenboost_cli.gb_paths import gb_module
+        gb_dataflux = gb_module("gb_dataflux")
+        log_path = gb_dataflux._log_path()
+        if log_path.exists():
+            with open(log_path, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 65536))
+                chunk = f.read().decode("utf-8", errors="ignore")
+            for line in reversed(chunk.splitlines()):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = _json.loads(line)
+                except ValueError:
+                    continue
+                if ev.get("kind") == "snapshot":
+                    age = _t.time() - float(ev.get("ts", 0))
+                    return ev, age > _GB_STATS_STALE_S
+    except Exception:
+        pass
+    # Fallback: log stale/absent (e.g. neither MCP server is running, so
+    # nothing is writing snapshots) — gb_monitor.tier_stats() directly.
+    try:
+        from greenboost_cli.gb_paths import gb_module
+        gb_monitor = gb_module("gb_monitor")
+        ts = gb_monitor.tier_stats()
+        if ts:
+            return {
+                "fb_used_mb":       ts.get("t1_used_mb"),
+                "fb_total_mb":      ts.get("t1_vram_mb"),
+                "t2_allocated_mb":  ts.get("t2_allocated_mb"),
+                "t2_available_mb":  ts.get("t2_available_mb"),
+                "t3_used_mb":       ts.get("t3_swap_used_mb"),
+                "t3_total_mb":      ts.get("t3_swap_total_mb"),
+            }, False
+    except Exception:
+        pass
+    return None, True
+
 
 def _gb_stats_updater() -> None:
-    """Daemon: poll nvidia-smi (T1) + GreenBoost monitor (T2/T3) every 5 s."""
-    import subprocess as _sp
+    """Daemon: poll GreenBoost tier occupancy (dataflux-first) every 5 s."""
     import time as _t
-    global _gb_stats_segs
+    global _gb_stats_segs, _gb_t3_total_mb_cache
     while True:
         try:
             segs: list[tuple[str, str]] = []
-            # T1 — nvidia-smi is ground truth for physical VRAM usage
-            r = _sp.run(
-                ["nvidia-smi",
-                 "--query-gpu=memory.used,memory.total",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=2,
-            )
-            if r.returncode == 0:
-                parts = r.stdout.strip().split(",")
-                used_mib  = int(parts[0].strip())
-                total_mib = int(parts[1].strip())
-                used_g  = round(used_mib  / 1024, 1)
-                total_g = round(total_mib / 1024, 1)
-                segs.append((f"T1 {used_g}/{total_g}G", f"fg:{TEAL}"))
-            # T2 / T3 — GreenBoost monitor (refresh to get live values)
-            try:
-                from greenboost_cli.greenboost.monitor import get_monitor
-                mon = get_monitor()
-                mon.refresh()
-                st = mon.status
-                if st.loaded:
-                    t2_g = round(st.ram_allocated_mb / 1024, 1)
-                    t3_g = round(st.nvme_swap_used_mb / 1024, 1)
-                    segs.append((f"T2 {t2_g}G", f"fg:{LAVENDER}"))
-                    if st.nvme_swap_total_mb > 0:
-                        segs.append((f"T3 {t3_g}G", f"fg:{CORAL}"))
-            except Exception:
-                pass
+            snap, stale = _read_gb_snapshot()
+            if snap:
+                dim = f"fg:{DIM}"
+
+                t1_used  = snap.get("fb_phys_used_mb")  or snap.get("fb_used_mb")
+                t1_total = snap.get("fb_phys_total_mb") or snap.get("fb_total_mb")
+                if t1_used is not None and t1_total:
+                    used_g, total_g = round(t1_used / 1024, 1), round(t1_total / 1024, 1)
+                    segs.append((f"T1 {used_g}/{total_g}G", dim if stale else f"fg:{TEAL}"))
+
+                t2_alloc = snap.get("t2_allocated_mb")
+                t2_avail = snap.get("t2_available_mb")
+                if t2_alloc is not None and t2_avail is not None:
+                    used_g  = round(t2_alloc / 1024, 1)
+                    total_g = round((t2_alloc + t2_avail) / 1024, 1)
+                    segs.append((f"T2 {used_g}/{total_g}G", dim if stale else f"fg:{LAVENDER}"))
+
+                t3_used = snap.get("t3_used_mb")
+                if t3_used is not None:
+                    t3_total = snap.get("t3_total_mb")
+                    if t3_total:
+                        _gb_t3_total_mb_cache = t3_total
+                    elif not _gb_t3_total_mb_cache:
+                        try:
+                            from greenboost_cli.gb_paths import gb_module
+                            _gb_t3_total_mb_cache = gb_module("gb_monitor").snapshot(
+                                probe_gpu=False).t3_total_mb
+                        except Exception:
+                            pass
+                    if _gb_t3_total_mb_cache:
+                        used_g  = round(t3_used / 1024, 1)
+                        total_g = round(_gb_t3_total_mb_cache / 1024, 1)
+                        segs.append((f"T3 {used_g}/{total_g}G", dim if stale else f"fg:{CORAL}"))
+
             if segs:
                 with _gb_stats_lock:
                     _gb_stats_segs = segs
@@ -94,6 +174,7 @@ try:
     from prompt_toolkit.history import FileHistory
     from prompt_toolkit.completion import Completer, Completion
     from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.application import run_in_terminal
     from prompt_toolkit.formatted_text import FormattedText
     from prompt_toolkit.styles import Style
     from prompt_toolkit.patch_stdout import patch_stdout as _pt_patch_stdout
@@ -853,8 +934,11 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
             registry = MCPRegistry.from_mcp_json(mcp_path)
             if not registry.server_names():
                 return
-            session.mcp_registry = registry
+            # connect_all() BEFORE publishing the registry to the session — a
+            # turn starting in the old window between these two lines could
+            # see an empty/half-populated tool_schemas and _tool_to_server.
             results = registry.connect_all()
+            session.mcp_registry = registry
             ok = sum(1 for v in results.values() if v)
             if ok:
                 n_tools = len(registry.tool_schemas)
@@ -944,6 +1028,19 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
                 buf.cancel_completion()
             else:
                 buf.reset()
+
+        # Ctrl+O → expand the last truncated tool result. The truncation hint
+        # itself ("… +N lines (ctrl+o to expand)") has always said this, but
+        # no binding ever existed to trigger it — confirmed nothing bound
+        # "c-o" anywhere in this file before this. run_in_terminal is needed
+        # (not a plain console.print) because a pt app is live here; printing
+        # directly would corrupt the toolbar/prompt redraw.
+        @_pt_kb.add("c-o")
+        def _expand_result(event):
+            def _do_print():
+                from greenboost_cli.terminal import renderer as _renderer_mod
+                _renderer_mod.expand_last_result()
+            run_in_terminal(_do_print)
 
         # Shift+Tab → cycle default → plan → auto → default
         @_pt_kb.add("s-tab")

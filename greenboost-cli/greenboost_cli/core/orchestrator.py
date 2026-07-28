@@ -124,17 +124,45 @@ def execute_turn(
             tool_schemas.extend(session.mcp_registry.tool_schemas)
 
         _turn_t0 = time.monotonic()
-        for event in generate(
-            model=settings["model"],
-            system=system_context,
-            messages=session.messages,
-            tool_schemas=tool_schemas,
-            settings=settings,
-        ):
-            if isinstance(event, (StreamFragment, ReasoningFragment)):
-                yield event
-            elif isinstance(event, CompletedResponse):
-                completed = event
+        try:
+            for event in generate(
+                model=settings["model"],
+                system=system_context,
+                messages=session.messages,
+                tool_schemas=tool_schemas,
+                settings=settings,
+            ):
+                if isinstance(event, (StreamFragment, ReasoningFragment)):
+                    yield event
+                elif isinstance(event, CompletedResponse):
+                    completed = event
+        except Exception as _gen_err:
+            # A context-overflow 400 used to become a generic RuntimeError
+            # with no retry, dead-ending the turn (confirmed live: "request
+            # exceeds the available context size"). The near-overflow guard
+            # below only catches it BEFORE it happens (a short/empty 200
+            # response) — this is the "it already happened" counterpart:
+            # force-compact once and retry the same user turn.
+            from greenboost_cli.inference.adapters import ContextOverflowError
+            if isinstance(_gen_err, ContextOverflowError) and not _auto_compact_done:
+                try:
+                    from greenboost_cli.environment.settings import invalidate_gb_synapse_ctx_cache
+                    invalidate_gb_synapse_ctx_cache()
+                except Exception:
+                    pass
+                if (session.messages
+                        and session.messages[-1].get("role") == "assistant"):
+                    session.messages.pop()  # drop the failed assistant turn, if any
+                from greenboost_cli.workflow.intelligence import _compress_context
+                _compress_context(session, settings, force=True)
+                _auto_compact_done = True
+                yield LoopGuardTriggered(
+                    "auto_compact",
+                    "Request exceeded the server's context window — "
+                    "auto-compacted history and retrying.",
+                )
+                continue
+            raise
         _elapsed = time.monotonic() - _turn_t0
 
         if completed is None:
@@ -389,6 +417,28 @@ def execute_turn(
                 "name":         tc["name"],
                 "content":      result,
             })
+
+            # ── Mid-turn budget check ─────────────────────────────────────
+            # Tool results were appended verbatim with no size check and no
+            # re-estimate before this — a single wide result (a 71-line
+            # `find`, confirmed live) could push the NEXT request straight
+            # past the server's context window with nothing in between to
+            # catch it. Re-estimate after every tool result, not just at the
+            # top of the next generate() call, and compact proactively
+            # before that request is even attempted — the 400-triggered
+            # retry above is the safety net for whatever this misses (a
+            # single result alone exceeding the post-compaction floor).
+            if not _auto_compact_done:
+                try:
+                    from greenboost_cli.environment.settings import gb_synapse_ctx
+                    from greenboost_cli.workflow.intelligence import (
+                        _estimate_tokens, _compress_context,
+                    )
+                    _ctx_budget = int(settings.get("context_window", 0)) or gb_synapse_ctx(settings)
+                    if _ctx_budget and _estimate_tokens(session) > int(_ctx_budget * 0.85):
+                        _compress_context(session, settings, force=True)
+                except Exception:
+                    pass
 
         if _guard_triggered:
             break

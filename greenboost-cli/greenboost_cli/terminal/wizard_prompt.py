@@ -382,8 +382,15 @@ def run_approval_picker(description: str) -> str:
 
     inner = w - 4
     console.print(f"  [{DIM}]{BOX_TL}{BOX_H * inner}{BOX_TR}[/]")
+    # Body rows previously printed only the LEFT border with no padding or
+    # closing BOX_V, so the box rendered open-ended on the right (confirmed
+    # in the screenshots — every "Permission required" row trails off with
+    # no right edge). Pad each row to `inner` and close it, matching the top
+    # rule's width (2 leading spaces + BOX_TL/BOX_V + inner + BOX_TR/BOX_V).
+    header_text = "⚠  Permission required"
+    header_pad  = " " * max(0, inner - 2 - len(header_text))
     console.print(
-        f"  [{DIM}]{BOX_V}[/]  [{AMBER}]⚠  Permission required[/]"
+        f"  [{DIM}]{BOX_V}[/]  [{AMBER}]{header_text}[/]{header_pad}[{DIM}]{BOX_V}[/]"
     )
     from rich.markup import escape
     summary = _summarize_call(description)
@@ -392,7 +399,8 @@ def run_approval_picker(description: str) -> str:
     if overflow:
         shown[-1] = shown[-1].rstrip() + "…"
     for ln in shown:
-        console.print(f"  [{DIM}]{BOX_V}[/]  [{GRAY}]{escape(ln)}[/]")
+        pad = " " * max(0, inner - 2 - len(ln))
+        console.print(f"  [{DIM}]{BOX_V}[/]  [{GRAY}]{escape(ln)}[/]{pad}[{DIM}]{BOX_V}[/]")
     console.print(f"  [{DIM}]{BOX_BL}{BOX_H * inner}{BOX_BR}[/]")
     console.print()
 

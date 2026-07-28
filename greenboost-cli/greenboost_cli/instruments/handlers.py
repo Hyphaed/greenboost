@@ -29,6 +29,31 @@ def set_task_bash_cwd(path: str) -> None:
 _session_todos: list = []
 
 
+def _ctx_char_budget(default_chars: int, floor_chars: int = 2000) -> int:
+    """Scale a per-tool-result char cap to the LIVE served context window,
+    instead of a fixed constant sized for a large window.
+
+    Before this, every cap here (_READ_MAX_CHARS=30_000, Bash's 30_000,
+    Grep/Semble's 20_000, Glob's unbounded 500 paths) was enormous relative
+    to a small window: 30_000 chars is ~7_500 tokens, which alone is ~98%
+    of the 7_680-token window this box was actually serving (confirmed
+    live) — one Read call could consume the whole budget. A single tool
+    result is capped at ~15% of the live window (4 chars/token, matching
+    workflow/intelligence.py's _estimate_tokens), leaving room for the
+    system prompt, other results in the same turn, and the response itself.
+    `default_chars` stays the ceiling on large windows, so nothing shrinks
+    for a box that can actually afford it."""
+    try:
+        from greenboost_cli.environment.settings import load_settings, gb_synapse_ctx
+        ctx = gb_synapse_ctx(load_settings())
+        if ctx:
+            budget = int(ctx * 0.15 * 4)
+            return max(floor_chars, min(default_chars, budget))
+    except Exception:
+        pass
+    return default_chars
+
+
 def handle_memory_read(file: str = None) -> str:
     """Read CLAUDE.md memory files (project + global)."""
     targets: list[Path] = []
@@ -108,11 +133,12 @@ def handle_read(file_path: str, limit: int = None, offset: int = None) -> str:
         if not chunk:
             return "(empty file)"
         result = "".join(f"{start + i + 1}\t{l}" for i, l in enumerate(chunk))
-        if len(result) > _READ_MAX_CHARS:
+        _cap = _ctx_char_budget(_READ_MAX_CHARS)
+        if len(result) > _cap:
             result = (
-                result[:_READ_MAX_CHARS]
-                + f"\n\n[... output truncated at {_READ_MAX_CHARS:,} chars; "
-                f"use offset={start + result[:_READ_MAX_CHARS].count(chr(10))} to read more ...]\n"
+                result[:_cap]
+                + f"\n\n[... output truncated at {_cap:,} chars; "
+                f"use offset={start + result[:_cap].count(chr(10))} to read more ...]\n"
             )
         return result
     except Exception as e:
@@ -198,13 +224,14 @@ def handle_shell(command: str, timeout: int = 120) -> str:
         if r.stderr:
             out += ("\n" if out.strip() else "") + "[stderr]\n" + r.stderr
         out = out.strip() or "(no output)"
-        # Truncate to prevent context explosion (matches Claude Code's 30K limit)
-        _LIMIT = 30_000
-        if len(out) > _LIMIT:
-            half = _LIMIT // 2
+        # Truncate to prevent context explosion (30K matches Claude Code's
+        # default; _ctx_char_budget shrinks it against a small served window)
+        _limit = _ctx_char_budget(30_000)
+        if len(out) > _limit:
+            half = _limit // 2
             out = (
                 out[:half]
-                + f"\n\n[... {len(out) - _LIMIT:,} chars truncated ...]\n\n"
+                + f"\n\n[... {len(out) - _limit:,} chars truncated ...]\n\n"
                 + out[-half:]
             )
         return out
@@ -220,7 +247,15 @@ def handle_glob(pattern: str, path: str = None) -> str:
         matches = sorted(base.glob(pattern))
         if not matches:
             return "No files matched"
-        return "\n".join(str(m) for m in matches[:500])
+        # 500 absolute paths has no char cap at all — on a small served
+        # window that alone can be ~20_000 chars (~5_000 tokens). Cap chars
+        # the same way every other tool result is capped, not just count.
+        out = "\n".join(str(m) for m in matches[:500])
+        _cap = _ctx_char_budget(20_000)
+        if len(out) > _cap:
+            shown = out[:_cap].count("\n") + 1
+            out = out[:_cap] + f"\n\n[... {len(matches) - shown} more matches truncated ...]\n"
+        return out
     except Exception as e:
         return f"Error: {e}"
 
@@ -265,7 +300,7 @@ def handle_grep(
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         out = r.stdout.strip()
-        return out[:20000] if out else "No matches found"
+        return out[:_ctx_char_budget(20_000)] if out else "No matches found"
     except Exception as e:
         return f"Error: {e}"
 
@@ -294,7 +329,7 @@ def handle_semble(query: str, repo: str = None, top_k: int = 5,
         if chunk.get("content"):
             out.append(chunk["content"].rstrip())
         out.append("")
-    return "\n".join(out)[:20000]
+    return "\n".join(out)[:_ctx_char_budget(20_000)]
 
 
 def handle_fetch_url(url: str, prompt: str = None) -> str:

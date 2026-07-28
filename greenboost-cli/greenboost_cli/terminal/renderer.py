@@ -55,6 +55,12 @@ _turn_tool_names: list[str] = []   # accumulated per turn for tally footer
 
 # ── Streaming line tracker (for cursor-up Markdown replacement) ────────────────
 _stream_line_count: int = 0   # number of \n written via emit_text_fragment this turn
+# True once replace_text_buffer() swaps the streamed buffer for cleaned text
+# this turn (adapters.py does this whenever a tool call was parsed out of the
+# streamed text) — finalize_response() uses this to know the raw stream and
+# the final buffer can differ, which is exactly when the erase-and-repaint
+# must run even if the final text is empty or non-markdown.
+_buffer_was_replaced: bool = False
 
 # ── Tool spinner state ─────────────────────────────────────────────────────────
 _tool_t0: float                    = 0.0
@@ -151,6 +157,12 @@ _SPINNER_TIPS = [
 
 def _spinner_worker(stop: threading.Event, t0: float) -> None:
     frame = 0
+    # Widest line painted so far this run. The >3s "tip" branch used to
+    # append NO trailing pad at all (unlike the <3s branch), so crossing the
+    # 3s threshold — or the tip text changing length on its 5s rotation —
+    # could strand characters from a wider previous line at the right edge,
+    # the same class of bug as statusline.py's breathing-dash artifact.
+    prev_vis_len = 0
     while not stop.is_set():
         elapsed = time.monotonic() - t0
         t      = _fmt_t(elapsed)
@@ -166,6 +178,7 @@ def _spinner_worker(stop: threading.Event, t0: float) -> None:
                 f"\r  {ANSI_TEAL}{sp}{ANSI_RESET}"
                 f"  {ANSI_DIM}running {'─' * left_d}  {tip}  {'─' * right_d}  {t}{ANSI_RESET}"
             )
+            vis_len = 2 + 1 + 2 + len("running") + 2 + left_d + 2 + len(tip) + 2 + right_d + 2 + len(t)
         else:
             label_vis = 2 + 1 + 2 + len("running") + 2
             right_vis = len(t) + 2
@@ -174,8 +187,11 @@ def _spinner_worker(stop: threading.Event, t0: float) -> None:
                 f"\r  {ANSI_TEAL}{sp}{ANSI_RESET}"
                 f"  {ANSI_DIM}running {'─' * dashes}  {t}{ANSI_RESET}"
             )
-            pad = max(0, safe_w - (label_vis + dashes + right_vis))
-            line += " " * pad
+            vis_len = label_vis + dashes + right_vis
+
+        pad_to = max(safe_w, prev_vis_len)
+        prev_vis_len = vis_len
+        line += " " * max(0, pad_to - vis_len)
 
         sys.stdout.write(line)
         sys.stdout.flush()
@@ -249,49 +265,70 @@ def emit_reasoning(chunk: str, verbose: bool) -> None:
 
 
 def replace_text_buffer(clean_text: str) -> None:
+    global _buffer_was_replaced
     _text_buffer.clear()
     if clean_text:
         _text_buffer.append(clean_text)
+    _buffer_was_replaced = True
 
 
 def finalize_response() -> None:
-    global _stream_line_count, _group_tool
+    global _stream_line_count, _group_tool, _buffer_was_replaced
     full = "".join(_text_buffer)
     _text_buffer.clear()
     if full.strip():
         _group_tool = ""  # assistant text between tool calls breaks the group
 
-    if full.strip() and has_markdown(full):
-        if _pt_live():
-            # pt app is live — nothing was streamed to stdout (buffered only);
-            # just render the markdown once, no cursor-up erase needed.
+    # replace_text_buffer() was called this turn (adapters.py does this
+    # whenever it parsed a tool call out of the streamed text) — the raw
+    # stream and `full` can differ, so the erase-and-repaint below must run
+    # even if `full` ends up EMPTY or non-markdown.
+    needs_erase = _buffer_was_replaced
+    _buffer_was_replaced = False
+
+    if _pt_live():
+        # pt app is live — nothing was streamed to stdout (buffered only);
+        # just render once, no cursor-up erase needed.
+        if full.strip():
             print()
             sys.stdout.write(f"  {ANSI_LIME}{_CC_BULLET}{ANSI_RESET}  ")
-            render_markdown(full)
-            _stream_line_count = 0
-            return
+            if has_markdown(full):
+                render_markdown(full)
+            else:
+                print(full)
+        _stream_line_count = 0
+        return
+
+    if needs_erase or (full.strip() and has_markdown(full)):
+        # Erase raw streamed text and re-render cleanly. The old gate here
+        # was `full.strip() and has_markdown(full)`, which skipped this
+        # entirely for a pure tool-call turn (full == "") — exactly the case
+        # that left raw <tool_call>/<function=.../<parameter=... markup on
+        # screen forever (confirmed live, before the incremental suppressor
+        # in adapters.py existed; this stays the second line of defense for
+        # whatever slips past it).
+        # \x1b[nA  = move cursor up n lines
+        # \r        = go to column 0
+        # \x1b[J   = clear from cursor to end of screen
         if sys.stdout.isatty():
-            # Erase raw streamed text and re-render as Markdown.
-            # \x1b[nA  = move cursor up n lines
-            # \r        = go to column 0
-            # \x1b[J   = clear from cursor to end of screen
             if _stream_line_count > 0:
                 sys.stdout.write(f"\x1b[{_stream_line_count}A")
             sys.stdout.write("\r\x1b[J")
             sys.stdout.flush()
-        else:
+        elif _stream_line_count > 0:
             print()
-        print()
-        sys.stdout.write(f"  {ANSI_LIME}{_CC_BULLET}{ANSI_RESET}  ")
-        render_markdown(full)
+        if full.strip():
+            print()
+            sys.stdout.write(f"  {ANSI_LIME}{_CC_BULLET}{ANSI_RESET}  ")
+            if has_markdown(full):
+                render_markdown(full)
+            else:
+                print(full)
         _stream_line_count = 0
         return
 
-    if full.strip() and not _pt_live():
+    if full.strip():
         print()
-    elif full.strip() and _pt_live():
-        sys.stdout.write(f"  {ANSI_LIME}{_CC_BULLET}{ANSI_RESET}  ")
-        print(full)
     _stream_line_count = 0
 
 
@@ -309,6 +346,13 @@ _last_tool_badge:   str = ""
 # Grouped file-op state (Read/Write/Edit defer to a single summary line)
 _pending_file_ops:   int       = 0
 _pending_file_names: list[str] = []
+_pending_file_tools: list[str] = []   # which of Read/Write/Edit each entry was
+
+# Last truncated tool result — the "(ctrl+o to expand)" hint printed by
+# show_instrument_result() advertised this affordance since before it had any
+# keybinding to trigger it. expand_last_result() (bound to ctrl+o in
+# repl.py) reprints the lines that were cut.
+_last_truncated: dict | None = None
 
 # Consecutive Grep/Glob calls coalesce into one updating block
 _GROUP_TOOLS  = {"Grep", "Glob"}
@@ -330,21 +374,34 @@ def _badge(n: int) -> str:
     return _CIRCLED[n - 1] if 1 <= n <= len(_CIRCLED) else f"({n})"
 
 
+_FILE_VERBS = {"Read": "Read", "Write": "Wrote", "Edit": "Edited"}
+
+
 def _flush_file_group() -> None:
     """Print the pending Read/Write/Edit summary line and reset state."""
-    global _pending_file_ops, _pending_file_names
+    global _pending_file_ops, _pending_file_names, _pending_file_tools, _last_truncated
     if _pending_file_ops <= 0:
         return
     n     = _pending_file_ops
+    names = _pending_file_names
+    tools = _pending_file_tools
     _pending_file_ops   = 0
     _pending_file_names = []
-    w     = _w()
-    label = f"Read {n} file{'s' if n > 1 else ''}"
-    pad   = " " * max(0, w - len(label) - 24)
+    _pending_file_tools = []
+    w = _w()
+    # The verb used to be hardcoded "Read" even for a batch of Write/Edit
+    # calls — derive it from what was actually in the group; "Modified" for
+    # a mixed batch (Read+Edit in the same turn is common).
+    distinct = set(tools)
+    verb = _FILE_VERBS.get(next(iter(distinct)), "Modified") if len(distinct) == 1 else "Modified"
+    label = f"{verb} {n} file{'s' if n > 1 else ''}"
+    suffix = "  (ctrl+o to expand)"
+    pad    = " " * max(0, w - len(label) - len(suffix))
     sys.stdout.write(
         f"\r  {ANSI_DIM}{label}  {ANSI_GRAY}(ctrl+o to expand){ANSI_RESET}{pad}\n"
     )
     sys.stdout.flush()
+    _last_truncated = {"name": "Files", "lines": list(names), "is_diff": False, "shown": 0}
 
 
 _TODO_STATUS_ICONS = {
@@ -487,7 +544,8 @@ def show_instrument_start(name: str, inputs: dict, verbose: bool) -> None:
 
 def show_instrument_result(name: str, result: str, verbose: bool) -> None:
     """Stop spinner and display tool output in Claude Code tree style."""
-    global _pending_file_ops, _pending_file_names, _group_rows
+    global _pending_file_ops, _pending_file_names, _pending_file_tools
+    global _group_rows, _last_truncated
     elapsed  = _stop_tool_spinner()
     t        = _fmt_elapsed(elapsed)
     safe_w   = _w() - 2
@@ -558,6 +616,7 @@ def show_instrument_result(name: str, result: str, verbose: bool) -> None:
         else:
             _pending_file_ops  += 1
             _pending_file_names.append(_last_tool_summary)
+            _pending_file_tools.append(name)
         return
 
     if is_error:
@@ -610,38 +669,64 @@ def show_instrument_result(name: str, result: str, verbose: bool) -> None:
 
     for i, line in enumerate(shown):
         tree_pfx = f"  {_CC_TREE} " if i == 0 else "     "
-        safe_ln  = escape(line[:safe_w])
-        if _is_diff:
-            if line.startswith("+") and not line.startswith("+++"):
-                console.print(f"{tree_pfx}[{LIME}]{safe_ln}[/]")
-            elif line.startswith("-") and not line.startswith("---"):
-                console.print(f"{tree_pfx}[red]{safe_ln}[/]")
-            elif line.startswith("@@"):
-                console.print(f"{tree_pfx}[{CYAN}]{safe_ln}[/]")
-            else:
-                console.print(f"{tree_pfx}[{DIM}]{safe_ln}[/]")
-        elif name == "Glob":
-            console.print(f"{tree_pfx}[{CYAN}]{safe_ln}[/]")
-        elif name == "Grep":
-            parts = line.split(":", 2)
-            if len(parts) >= 3:
-                console.print(
-                    f"{tree_pfx}[{DIM}]{escape(parts[0])}:{escape(parts[1])}[/]"
-                    f"  [{GRAY}]{escape(parts[2][:safe_w])}[/]"
-                )
-            else:
-                console.print(f"{tree_pfx}[{GRAY}]{safe_ln}[/]")
-        else:
-            console.print(f"{tree_pfx}[{GRAY}]{safe_ln}[/]")
+        console.print(_style_result_line(tree_pfx, name, line, _is_diff, safe_w))
 
     if remaining > 0:
         console.print(f"    [{DIM}]… +{remaining} lines (ctrl+o to expand)[/]")
+        _last_truncated = {"name": name, "lines": lines, "is_diff": _is_diff, "shown": limit}
+    else:
+        _last_truncated = None
 
-    # Timing for slow Bash (≥5s shown, ≥10s adds ctrl+b hint)
+    # Timing for slow Bash (≥5s shown)
     if name == "Bash" and elapsed >= 5.0:
         console.print(f"  [{DIM}]  ({t})[/]")
-        if elapsed >= 10.0:
-            console.print(f"  [{DIM}]  (ctrl+b to run in background)[/]")
+
+
+def _style_result_line(tree_pfx: str, name: str, line: str, is_diff: bool, safe_w: int) -> str:
+    """Rich-markup for one line of a tool result, shared by the initial
+    (truncated) print and expand_last_result()'s reprint of the rest."""
+    from rich.markup import escape
+    safe_ln = escape(line[:safe_w])
+    if is_diff:
+        if line.startswith("+") and not line.startswith("+++"):
+            return f"{tree_pfx}[{LIME}]{safe_ln}[/]"
+        if line.startswith("-") and not line.startswith("---"):
+            return f"{tree_pfx}[red]{safe_ln}[/]"
+        if line.startswith("@@"):
+            return f"{tree_pfx}[{CYAN}]{safe_ln}[/]"
+        return f"{tree_pfx}[{DIM}]{safe_ln}[/]"
+    if name == "Glob":
+        return f"{tree_pfx}[{CYAN}]{safe_ln}[/]"
+    if name == "Grep":
+        parts = line.split(":", 2)
+        if len(parts) >= 3:
+            return (f"{tree_pfx}[{DIM}]{escape(parts[0])}:{escape(parts[1])}[/]"
+                    f"  [{GRAY}]{escape(parts[2][:safe_w])}[/]")
+        return f"{tree_pfx}[{GRAY}]{safe_ln}[/]"
+    return f"{tree_pfx}[{GRAY}]{safe_ln}[/]"
+
+
+def expand_last_result() -> None:
+    """Reprint the lines truncated from the last tool result (ctrl+o).
+
+    The truncation hint itself has always said "(ctrl+o to expand)" but no
+    keybinding ever called this — confirmed no `c-o` binding existed
+    anywhere in repl.py. Bound in repl.py alongside the other REPL
+    shortcuts (c-j, escape, s-tab)."""
+    global _last_truncated
+    if _last_truncated is None:
+        console.print(f"  [{DIM}](nothing to expand)[/]")
+        return
+    name    = _last_truncated["name"]
+    lines   = _last_truncated["lines"]
+    is_diff = _last_truncated["is_diff"]
+    shown   = _last_truncated["shown"]
+    rest    = lines[shown:]
+    safe_w  = _w() - 2
+    console.print(f"  [{DIM}]── expanded: {len(rest)} more line(s) ──[/]")
+    for line in rest:
+        console.print(_style_result_line("     ", name, line, is_diff, safe_w))
+    _last_truncated = None
 
 
 
@@ -652,7 +737,7 @@ def _result_summary(name: str, result: str) -> str:
     n_bytes = len(result.encode())
     size    = f"{n_bytes / 1024:.1f}kb" if n_bytes >= 1024 else f"{n_bytes}b"
     if name in ("Glob", "Grep"):
-        return f"{n_lines} results"
+        return f"{n_lines} result{'s' if n_lines != 1 else ''}"
     if name == "Bash":
         return f"{n_lines}L output"
     if name == "Read":
@@ -672,7 +757,7 @@ def _result_summary(name: str, result: str) -> str:
         return f"{len(result):,} chars"
     if name == "WebSearch":
         n_results = result.count("\n\n") + 1
-        return f"{n_results} results"
+        return f"{n_results} result{'s' if n_results != 1 else ''}"
     return f"{n_lines}L · {size}"
 
 
@@ -741,6 +826,7 @@ def open_response_block(
     global _turn_tool_names, _stream_line_count, _last_tool_summary, _last_tool_badge
     global _pending_file_ops, _pending_file_names, _active_loaded_skills
     global _group_tool, _group_count, _group_rows, _prev_todo_snapshot
+    global _buffer_was_replaced
 
     _block_start_t      = time.monotonic()
     _block_model        = model
@@ -748,6 +834,7 @@ def open_response_block(
     _quiet_mode         = quiet
     _turn_tool_names    = []
     _stream_line_count  = 0
+    _buffer_was_replaced = False
     _last_tool_summary  = ""
     _last_tool_badge    = ""
     _pending_file_ops   = 0

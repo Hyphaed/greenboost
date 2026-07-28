@@ -5656,8 +5656,23 @@ WRAPEOF
 
     # Register GreenBoost MCP servers with the Claude CLI (per-user) so an LLM
     # assistant can query cluster/dataflux/orchestrator/synapse state. The
-    # gb_*_mcp.py modules were just deployed to $GB_PY_DEST above. Best-effort.
-    cmd_register_mcp || gb_warn "MCP registration failed , run: greenboost register-mcp"
+    # gb_*_mcp.py modules were just deployed to $GB_PY_DEST above , but ONLY
+    # when this cmd_install call actually did that deployment. When
+    # GB_SKIP_INSTALL_PY_CLI=1 (full-install's step-2 kernel/shim sub-call,
+    # deliberately skipping cmd_install_python_files/cmd_install_cli here
+    # since step 4/5 does the real install later), the modules under
+    # $GB_PY_DEST don't exist yet , registering here always warned "module
+    # missing" for all 5 servers, and full-install's outer driver never
+    # called cmd_register_mcp again after step 4/5 actually deployed them, so
+    # a fresh Full Install never ended up with any MCP server registered at
+    # all (confirmed live, 2026-07-28). The real registration for that path
+    # now happens once, right after step 4/5's cmd_install_cli, in the outer
+    # full-install driver below , skip it here in that case, best-effort
+    # otherwise (standalone `install`/`full-install` module-only runs, which
+    # never set this flag, still register immediately as before).
+    if [[ "${GB_SKIP_INSTALL_PY_CLI:-0}" -ne 1 ]]; then
+        cmd_register_mcp || gb_warn "MCP registration failed , run: greenboost register-mcp"
+    fi
 
     gb_ok "Installation complete"
     gb_info "Load:    sudo modprobe greenboost"
@@ -13075,6 +13090,15 @@ cmd_full_install() {
     gb_ok "GreenBoost Python orchestration stack installed"
 
     cmd_install_cli
+
+    # Register GreenBoost MCP servers with the Claude CLI now that the
+    # gb_*_mcp.py modules ($GB_PY_DEST) and the greenboost-cli venv both
+    # actually exist. Step 2's cmd_install call (above) skips this itself
+    # (GB_SKIP_INSTALL_PY_CLI=1) specifically so it happens here, once,
+    # after its real dependencies are in place , previously nothing called
+    # it a second time, so a fresh Full Install warned "MCP module missing"
+    # for all 5 servers at step 2 and never actually registered any of them.
+    cmd_register_mcp || gb_warn "MCP registration failed , run: greenboost register-mcp"
 
     cmd_install_optional_pkgs
     gb_ok "Optional AI/compute libraries installed"

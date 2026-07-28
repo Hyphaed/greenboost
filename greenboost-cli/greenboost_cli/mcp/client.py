@@ -199,6 +199,9 @@ class MCPRegistry:
     def __init__(self):
         self._clients: dict[str, MCPStdioClient | MCPHttpClient] = {}
         self._tool_to_server: dict[str, str] = {}
+        # Advertised (mcp__<server>__<tool>) name -> the RAW tool name the
+        # underlying MCP client actually needs for tools/call.
+        self._raw_tool_name: dict[str, str] = {}
         self.tool_schemas: list[dict] = []
         self._mcp_json_path: Path | None = None
 
@@ -225,19 +228,59 @@ class MCPRegistry:
             results[name] = ok
             if ok:
                 for tool in client.tools:
-                    tname = tool["name"]
-                    self._tool_to_server[tname] = name
-                    self.tool_schemas.append(tool)
+                    raw_name = tool["name"]
+                    # Advertise under the Claude-Code-style mcp__<server>__
+                    # <tool> name — the model already knows this convention
+                    # from pretraining/RAG text and emits it unprompted
+                    # (confirmed live: mcp__knowledge-rag__search_knowledge
+                    # against a registry that only knew the bare
+                    # "search_knowledge" and fell through to "Unknown
+                    # instrument"). Also prevents two servers exposing the
+                    # same bare tool name from colliding in _tool_to_server.
+                    prefixed = f"mcp__{name}__{raw_name}"
+                    schema = dict(tool)
+                    schema["name"] = prefixed
+                    # MCP tools/list returns inputSchema (camelCase); every
+                    # builtin tool schema and schemas_to_openai_functions()
+                    # index input_schema (snake_case) — without this an MCP
+                    # tool's schema had NO argument names on the native-FC
+                    # path (KeyError) and an empty <parameters> block on the
+                    # injection path.
+                    if "inputSchema" in schema and "input_schema" not in schema:
+                        schema["input_schema"] = schema.pop("inputSchema")
+                    self._tool_to_server[prefixed] = name
+                    self._raw_tool_name[prefixed] = raw_name
+                    self.tool_schemas.append(schema)
         return results
 
+    def _normalize_tool_name(self, tool_name: str) -> str | None:
+        """Resolve whatever the model called into our internal
+        mcp__<server>__<tool> key: exact match, a bare tool name (unique
+        suffix match), or a "<server>__<tool>" missing only the mcp__
+        prefix. Keeps older sessions / hand-typed names working alongside
+        the new prefixed advertising."""
+        if tool_name in self._tool_to_server:
+            return tool_name
+        suffix = f"__{tool_name}"
+        matches = [k for k in self._tool_to_server if k.endswith(suffix)]
+        if len(matches) == 1:
+            return matches[0]
+        if not tool_name.startswith("mcp__"):
+            candidate = f"mcp__{tool_name}"
+            if candidate in self._tool_to_server:
+                return candidate
+        return None
+
     def call_tool(self, tool_name: str, arguments: dict) -> str:
-        server = self._tool_to_server.get(tool_name)
-        if not server:
+        key = self._normalize_tool_name(tool_name)
+        if key is None:
             return f"ERROR: Unknown MCP tool '{tool_name}'"
-        return self._clients[server].call_tool(tool_name, arguments)
+        server = self._tool_to_server[key]
+        raw_name = self._raw_tool_name.get(key, key)
+        return self._clients[server].call_tool(raw_name, arguments)
 
     def has_tool(self, tool_name: str) -> bool:
-        return tool_name in self._tool_to_server
+        return self._normalize_tool_name(tool_name) is not None
 
     def close_all(self):
         for client in self._clients.values():

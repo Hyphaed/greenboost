@@ -78,6 +78,63 @@ SLEEP_LOOP_MAX_TASKS_HOUR   = 12      # hard cap per agent per hour
 SLEEP_LOOP_MAX_PARSE_LINES  = 8       # at most N tasks parsed from one plan
 SLEEP_LOOP_DEFAULT_PRIORITY = 15      # autonomous tasks sit below manual ones
 
+# ── gb-synapse HTTP helper (brief expansion + visual QC) ────────────────────
+# Same base URL convention as inference/registry.py's "gb-synapse" entry,
+# reused here rather than reinvented so both paths track a port override
+# (GB_SYNAPSE_PORT) identically.
+_GB_SYNAPSE_PORT = int(os.environ.get("GB_SYNAPSE_PORT", "11435"))
+_GB_SYNAPSE_URL  = f"http://localhost:{_GB_SYNAPSE_PORT}/v1/chat/completions"
+
+def _gb_synapse_chat(
+    messages: list[dict], model: str = "", max_tokens: int = 500, timeout: int = 180,
+) -> str:
+    """POST to gb-synapse's OpenAI-compatible endpoint and return the reply
+    text. `model` is advisory (gb-synapse serves one model at a time and
+    ignores a mismatched name rather than erroring, pass the model you
+    already confirmed is being served via synapse_serve/synapse_ps). Raises
+    RuntimeError with the response body on a non-2xx or malformed reply, so
+    callers (both new pipeline stages below) can fold it into their normal
+    failure/retry path instead of a raw urllib traceback.
+
+    THINKING-MODEL WARNING (confirmed live, 2026-07-28, building this exact
+    pipeline for gb_lunar_calendar): a reasoning-tuned model (e.g. the
+    Fable-Fusion default coding model) can burn the entire max_tokens budget
+    on its `reasoning_content` before ever writing `content`, returning
+    empty text with finish_reason="length", a "/no_think" suffix on the
+    user message did NOT suppress this on that model. For prompt-expansion
+    (short, low-reasoning-value output), prefer serving a plain instruct
+    model for this call (e.g. Qwen3-VL-8B-Instruct-FP8's text path) over a
+    thinking model, rather than just raising max_tokens further."""
+    import urllib.request
+
+    payload = {"model": model, "messages": messages, "max_tokens": max_tokens, "stream": False}
+    req = urllib.request.Request(
+        _GB_SYNAPSE_URL, data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode())
+    except Exception as e:
+        raise RuntimeError(f"gb-synapse request failed: {e}") from e
+
+    try:
+        msg = body["choices"][0]["message"]
+    except (KeyError, IndexError) as e:
+        raise RuntimeError(f"gb-synapse returned an unexpected shape: {body}") from e
+
+    content = (msg.get("content") or "").strip()
+    if not content:
+        reason = body["choices"][0].get("finish_reason", "?")
+        reasoning_len = len(msg.get("reasoning_content") or "")
+        raise RuntimeError(
+            f"gb-synapse returned empty content (finish_reason={reason}, "
+            f"reasoning_content={reasoning_len} chars), likely a thinking "
+            f"model that exhausted max_tokens={max_tokens} on reasoning "
+            f"before writing an answer; see _gb_synapse_chat's docstring."
+        )
+    return content
+
 # ── Data Models ───────────────────────────────────────────────────────────────
 
 @dataclass(order=True)
@@ -116,6 +173,41 @@ class Task:
     @property
     def gate_cwd(self) -> str:
         return self.metadata.get("gate_cwd", "") or self.cwd
+
+    # brief/expand_model/visual_check ride in `metadata` for the same reason
+    # cwd/gate_cmd do (see comment above), added 2026-07-28 for the
+    # brief-expansion + vision-QC pipeline, gb-app-builder skill.
+
+    @property
+    def brief(self) -> str:
+        """A short, human-written goal (NOT a precise implementation prompt)
+        for _expand_brief() to turn into one before the agent ever sees it.
+        Empty means `prompt` is already the real instruction, expansion is
+        opt-in per task, existing callers are unaffected."""
+        return self.metadata.get("brief", "")
+
+    @property
+    def expand_model(self) -> str:
+        """Model to expand `brief` with, should be a plain instruct model,
+        not a thinking one (see _gb_synapse_chat's docstring). Empty = use
+        whatever gb-synapse currently has served."""
+        return self.metadata.get("expand_model", "")
+
+    @property
+    def expand_context_files(self) -> list[str]:
+        """Paths (relative to `cwd`) whose current content gets included as
+        context for the brief → prompt expansion call, e.g. the one file
+        the resulting task is expected to edit, so the expanded prompt can
+        reference real symbol/class names instead of guessing them."""
+        return self.metadata.get("expand_context_files", [])
+
+    @property
+    def visual_check(self) -> dict:
+        """{"url": "http://...", "must_show": ["optional", "keywords"]}.
+        When set, _run_visual_check() captures a screenshot of `url` after
+        the build gate passes and asks a vision-capable gb-synapse model to
+        judge it. Empty dict = no visual check for this task."""
+        return self.metadata.get("visual_check", {})
 
 
 class FactoryGateFailure(Exception):
@@ -697,19 +789,47 @@ class AIFactory:
 
     def submit(
         self,
-        prompt: str,
+        prompt: str = "",
         agent_name: str = "",
         priority: int = 10,
         autonomous: bool = True,
         delegated_by: str = "",
         delegation_depth: int = 0,
         metadata: dict | None = None,
+        brief: str = "",
+        expand_model: str = "",
+        expand_context_files: list[str] | None = None,
+        visual_check_url: str = "",
+        visual_check_must_show: list[str] | None = None,
+        visual_check_model: str = "",
     ) -> str:
+        """`prompt` OR `brief`, not both, `brief` is a short goal that
+        _expand_brief() turns into the real prompt at run time (see Task.brief
+        and _gb_synapse_chat's docstring re: picking a non-thinking
+        expand_model). `visual_check_url` opts the task into a post-gate
+        screenshot + vision-model judgment (Task.visual_check) instead of
+        (or in addition to) a text-only gate_cmd in `metadata`. Both are
+        additive convenience kwargs over `metadata`, equivalent to setting
+        metadata["brief"]/["visual_check"] by hand."""
         priority = max(self.min_priority, int(priority))
         if delegation_depth > self.max_depth:
-            self._log.warning("Delegation depth exceeded for: %s", prompt[:60])
-            _emit("alert", {"level": "warning", "msg": f"Max delegation depth reached: {prompt[:40]}"})
+            self._log.warning("Delegation depth exceeded for: %s", (prompt or brief)[:60])
+            _emit("alert", {"level": "warning", "msg": f"Max delegation depth reached: {(prompt or brief)[:40]}"})
             return ""
+
+        full_metadata = dict(metadata or {})
+        if brief:
+            full_metadata["brief"] = brief
+            if expand_model:
+                full_metadata["expand_model"] = expand_model
+            if expand_context_files:
+                full_metadata["expand_context_files"] = expand_context_files
+        if visual_check_url:
+            full_metadata["visual_check"] = {
+                "url": visual_check_url,
+                "must_show": visual_check_must_show or [],
+                "model": visual_check_model,
+            }
 
         task = Task(
             priority=priority,
@@ -718,11 +838,11 @@ class AIFactory:
             autonomous=autonomous,
             delegated_by=delegated_by,
             delegation_depth=delegation_depth,
-            metadata=metadata or {},
+            metadata=full_metadata,
         )
         self._task_q.put(task)
         self.db.save_task(task)
-        _emit("task_submitted", {"task_id": task.task_id, "prompt": prompt[:80]})
+        _emit("task_submitted", {"task_id": task.task_id, "prompt": (prompt or brief)[:80]})
         return task.task_id
 
     # ── VRAM-aware agent selection ────────────────────────────────────────────
@@ -737,7 +857,8 @@ class AIFactory:
         if not candidates:
             return None
 
-        task_type = task.prompt.split()[0].lower() if task.prompt else "unknown"
+        task_words = (task.prompt or task.brief).split()
+        task_type = task_words[0].lower() if task_words else "unknown"
 
         best: Optional[str] = None
         best_score = float("inf")
@@ -809,23 +930,31 @@ class AIFactory:
         start    = time.time()
         vram_before = self.vram.used_mb(agent.gpu_id)
 
+        display_prompt = task.prompt or task.brief
+
         with self._lock:
-            agent.current_task    = task.prompt[:60]
+            agent.current_task    = display_prompt[:60]
             agent.current_task_id = task.task_id
             agent.task_start      = start
             agent.progress        = 0
 
         _emit("task_started", {
             "agent": agent_name, "task_id": task.task_id,
-            "prompt": task.prompt[:80],
+            "prompt": display_prompt[:80],
         })
 
         try:
+            if task.brief and not task.prompt:
+                task.prompt = self._expand_brief(task)
             output = self._invoke_agent(agent, task)
             if task.gate_cmd:
                 gate_ok, gate_report = self._run_gate(task)
                 if not gate_ok:
                     raise FactoryGateFailure(gate_report)
+            if task.visual_check:
+                visual_ok, visual_report = self._run_visual_check(task)
+                if not visual_ok:
+                    raise FactoryGateFailure(visual_report)
             success = True
             with self._lock:
                 agent.total_tasks += 1
@@ -872,7 +1001,8 @@ class AIFactory:
 
         duration  = time.time() - start
         vram_used = max(0, self.vram.used_mb(agent.gpu_id) - vram_before)
-        task_type = task.prompt.split()[0].lower()
+        task_words = (task.prompt or task.brief).split()
+        task_type = task_words[0].lower() if task_words else "unknown"
 
         self.history.record(agent_name, task_type, duration, vram_used, success)
         self.db.save_history(agent_name, task_type, duration, vram_used, success)
@@ -960,6 +1090,92 @@ class AIFactory:
             return ("\n\n".join(chunks) + "\n\n") if chunks else ""
         except Exception:
             return ""
+
+    def _expand_brief(self, task: Task) -> str:
+        """Turn task.brief (a short human goal) into a precise implementation
+        prompt for the coding agent, the "prompt generates prompt" step of
+        the gb-app-builder pipeline (owner directive 2026-07-28: Fable-Fusion
+        should generate the task prompt, not just execute a hand-written
+        one). Includes task.expand_context_files' CURRENT content so the
+        expansion can name real symbols instead of inventing them, mirroring
+        why app_spec.py reads real files rather than working from the brief
+        alone. Raises (via _gb_synapse_chat) rather than silently falling
+        back to the raw brief, a silent fallback would hide a broken
+        expansion step behind a plausible-looking but underspecified prompt,
+        exactly the failure mode this whole pipeline exists to avoid."""
+        context = ""
+        for rel in task.expand_context_files:
+            path = Path(task.cwd) / rel if task.cwd else Path(rel)
+            try:
+                context += f"\n\nCurrent content of {rel}:\n```\n{path.read_text()}\n```"
+            except OSError as e:
+                context += f"\n\n(could not read {rel}: {e})"
+
+        meta_prompt = (
+            "You are writing a precise implementation instruction (a task "
+            "prompt) for a coding agent. The agent will act on your "
+            "instruction alone, it will not see this message. Be exact "
+            "about file paths, class/element names, and what NOT to touch. "
+            f"Output ONLY the instruction text, max 150 words.\n\nGoal: "
+            f"{task.brief}{context}"
+        )
+        return _gb_synapse_chat(
+            [{"role": "user", "content": meta_prompt}],
+            model=task.expand_model,
+            max_tokens=int(task.metadata.get("expand_max_tokens", 500)),
+        )
+
+    def _run_visual_check(self, task: Task) -> tuple[bool, str]:
+        """Screenshot task.visual_check['url'] and ask a vision-capable
+        gb-synapse model to judge it, the visual-QA half of "Evaluate" a
+        text-only build gate cannot cover (owner directive 2026-07-28: the
+        quality check must go through an actual vision model looking at the
+        rendered page, not Claude reading JSX). The model MUST answer
+        PASS or FAIL: <reason> on its first line, parsed strictly so a
+        FAIL becomes a real FactoryGateFailure that feeds the exact same
+        retry-with-feedback loop _run_gate's failures already use, not just
+        a logged opinion nobody acts on.
+
+        For a Tauri app, only point this at a view that renders without a
+        Tauri `invoke()` call, a plain `npm run dev` URL has no Tauri IPC
+        bridge, so any view depending on backend data will screenshot as an
+        error state, not a real bug, see screenshot_utils.py's docstring."""
+        from greenboost_cli.instruments.screenshot_utils import capture_screenshot
+
+        vc = task.visual_check
+        shot_path = str(Path(task.cwd or ".") / f".gb_visual_check_{task.task_id}.png")
+        capture_result = capture_screenshot(vc["url"], shot_path)
+        if capture_result.startswith("Error:"):
+            return False, capture_result
+
+        import base64
+        b64 = base64.b64encode(Path(shot_path).read_bytes()).decode()
+        must_show = vc.get("must_show", [])
+        checklist = f"\nIt must visibly show: {', '.join(must_show)}." if must_show else ""
+        prompt = (
+            "Judge this screenshot of a web/desktop app UI for visual "
+            "correctness, layout broken, unstyled/raw elements, missing "
+            "content, obviously wrong colors or overlap." + checklist +
+            "\nAnswer with PASS on the first line if it looks correct, or "
+            "FAIL: <short reason> on the first line if not. Nothing else "
+            "on that line."
+        )
+        try:
+            verdict = _gb_synapse_chat(
+                [{"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                ]}],
+                model=vc.get("model", ""),
+                max_tokens=120,
+            )
+        except RuntimeError as e:
+            return False, f"visual check request failed: {e}"
+
+        first_line = verdict.strip().splitlines()[0] if verdict.strip() else ""
+        if first_line.upper().startswith("PASS"):
+            return True, verdict
+        return False, verdict
 
     def _run_gate(self, task: Task) -> tuple[bool, str]:
         """Run the task's build/test gate commands. Real "Evaluate" stage:

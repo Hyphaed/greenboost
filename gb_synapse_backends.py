@@ -509,15 +509,45 @@ class LlamaCppBackend(EngineBackend):
                 budget_gb,
                 ram_free_mb / 1024 + sum(f.t2_free_mb for f in online_feeders) / 1024)
 
+        explicit_ctx = ctx > 0
         if ctx <= 0:
             ctx = entry.ctx_length or 65536
-        ctx = gs._clamp_ctx_to_budget(ctx, entry, ctx_kv_budget_gb)
+
+        # Dense partial-CPU-offload is where the ctx/-ngl split has to be
+        # SOLVED jointly, not clamped in one direction: _clamp_ctx_to_budget
+        # subtracts the model's FULL weight size from the budget even though
+        # only some layers land in VRAM here, which collapses its kv budget to
+        # a hardcoded 0.25 GiB floor regardless of how many layers actually
+        # fit (confirmed live: 14.09GB weights vs 9.63GB budget -> ctx clamped
+        # to 7680 while only 33/65 layers, ~7.2GB, were really on the GPU).
+        # fits_vram / cpu_quirk / MoE-expert-offload all size ctx against a
+        # budget where the clamp's weights-subtraction is already correct
+        # (weights genuinely occupy that whole budget, or aren't being
+        # charged against it at all) — only this branch needs the joint solve.
+        dense_partial_offload = (not fits_vram and not cpu_quirk and not entry.is_moe)
+        n_gpu_solved = None
+        t2_kv_extra_gb = 0.0
+        if dense_partial_offload:
+            # T2 KV extension: opt-in, only when the caller explicitly asked
+            # for more ctx than the plain VRAM/RAM budget provides AND the
+            # shim is actually active — never a silent default, and never a
+            # substitute for VRAM that's genuinely free (Rule #1).
+            shim_active = os.environ.get("GB_SYNAPSE_SHIM", "0") == "1"
+            if explicit_ctx and shim_active:
+                _, _, t2_facts = effective_vram_budget_mb()
+                t2_kv_extra_gb = (t2_facts.get("t2_free_mb", 0.0) *
+                                  t2_facts.get("t2_fraction", 0.5)) / 1024.0
+            ctx, n_gpu_solved = gs._solve_ctx_and_layers(
+                entry, ctx_kv_budget_gb, ctx, 1 + len(online_feeders),
+                t2_gb=t2_kv_extra_gb)
+        else:
+            ctx = gs._clamp_ctx_to_budget(ctx, entry, ctx_kv_budget_gb)
 
         # KV precision is a QUALITY tier, not a memory knob, so it is chosen against
         # the budget rather than hardcoded: f16 is certification grade, q8_0 is a
         # budget config. Take f16 whenever it fits; drop to q8_0 only to make the
         # context reachable at all.
-        kv_type = gs._pick_kv_type(ctx, entry, ctx_kv_budget_gb)
+        kv_type = gs._pick_kv_type(ctx, entry, ctx_kv_budget_gb + t2_kv_extra_gb)
 
         kv_total_gb = gs.estimate_kv_gb(ctx, entry.n_bytes, entry.quant,
                                         n_layers=(entry.n_kv_layers or entry.n_layers),
@@ -559,8 +589,10 @@ class LlamaCppBackend(EngineBackend):
 
         n_cpu_moe = 0
         n_gpu = None
+        n_gpu_layers_reported = 0
         if fits_vram:
             cmd += ["-ngl", "999"]        # all layers on GPU — the fast path
+            n_gpu_layers_reported = entry.n_layers or 999
         elif cpu_quirk:
             # Upstream llama.cpp CUDA regression: for this arch ANY CPU/GPU split
             # aborts at the first batched prompt. -ngl 0 alone is NOT CPU-only:
@@ -574,9 +606,16 @@ class LlamaCppBackend(EngineBackend):
             n_cpu_moe = gs._fit_cpu_moe_layers(entry, budget_gb, kv_total_gb,
                                                1 + len(online_feeders))
             cmd += ["-ngl", "999", "--n-cpu-moe", str(n_cpu_moe)]
+            n_gpu_layers_reported = entry.n_layers or 999
         else:
-            n_gpu = gs._fit_gpu_layers(entry, budget_gb, kv_total_gb, 1 + len(online_feeders))
+            # n_gpu_solved came from _solve_ctx_and_layers above, jointly with
+            # ctx — re-deriving it from _fit_gpu_layers here would use the
+            # ORIGINAL (unsolved) kv_total_gb and could disagree with the ctx
+            # that was actually chosen.
+            n_gpu = n_gpu_solved if n_gpu_solved is not None else \
+                gs._fit_gpu_layers(entry, budget_gb, kv_total_gb, 1 + len(online_feeders))
             cmd += ["-ngl", str(n_gpu)]
+            n_gpu_layers_reported = n_gpu
 
         # No mmap: DMA-BUF pinning needs owned pages. Without the shim there is
         # nothing to pin, and mmap lets the page cache serve a 20 GB GGUF instead of
@@ -626,11 +665,11 @@ class LlamaCppBackend(EngineBackend):
                   f"{entry.n_experts} experts fire per token, so this is the cheapest "
                   f"weight in the model to keep out of VRAM.", flush=True)
         elif not fits_vram:
-            _fit = gs._fit_gpu_layers(entry, budget_gb, kv_total_gb, 1 + len(online_feeders))
             print(f"  [gb-synapse] {weights_gb:.1f} GB of weights do not fit "
-                  f"{budget_gb:.1f} GB of VRAM: {_fit}/{entry.n_layers} layers on GPU, the "
-                  f"rest on CPU. CPU layers cost far more than any memory transfer — add "
-                  f"VRAM (another feeder) or a smaller quant to close the gap.", flush=True)
+                  f"{budget_gb:.1f} GB of VRAM: {n_gpu}/{entry.n_layers} layers on GPU "
+                  f"(ctx={ctx} solved jointly), the rest on CPU. CPU layers cost far more "
+                  f"than any memory transfer — add VRAM (another feeder) or a smaller quant "
+                  f"to close the gap.", flush=True)
 
         llama_log = open(gs._run_log_path(entry.name), "ab")
         llama_proc = subprocess.Popen(cmd, env=env, stdout=llama_log, stderr=subprocess.STDOUT,
@@ -642,6 +681,7 @@ class LlamaCppBackend(EngineBackend):
                                                feeders=[f.ip for f in online_feeders],
                                                engine=self.name,
                                                ctx=ctx, kv_type=kv_type, placement=placement,
+                                               n_gpu_layers=n_gpu_layers_reported,
                                                mtp=bool(gs._has_mtp(entry)), vision=bool(mmproj))
         except RuntimeError as e:
             err_lower = str(e).lower()
@@ -670,6 +710,7 @@ class LlamaCppBackend(EngineBackend):
                     tensor_split=tensor_split, feeders=[f.ip for f in online_feeders],
                     engine=self.name, ctx=ctx, kv_type=kv_type,
                     placement="PARTIAL CPU OFFLOAD (VRAM fragmentation fallback)",
+                    n_gpu_layers=fallback_ngl,
                     mtp=bool(gs._has_mtp(entry)), vision=bool(mmproj))
             # The dense partial-offload branch (`_fit_gpu_layers`) sizes -ngl against
             # the %-derived compute-graph reserve (`_compute_reserve_gb`), but that
@@ -698,6 +739,7 @@ class LlamaCppBackend(EngineBackend):
                     tensor_split=tensor_split, feeders=[f.ip for f in online_feeders],
                     engine=self.name, ctx=ctx, kv_type=kv_type,
                     placement="PARTIAL CPU OFFLOAD (compute-buffer OOM fallback)",
+                    n_gpu_layers=fallback_ngl,
                     mtp=bool(gs._has_mtp(entry)), vision=bool(mmproj))
             raise
 

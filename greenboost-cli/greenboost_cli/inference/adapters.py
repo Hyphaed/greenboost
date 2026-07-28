@@ -18,6 +18,22 @@ _DISCONNECT_MARKERS = (
 )
 
 
+class ContextOverflowError(RuntimeError):
+    """The backend rejected the request because it exceeds the server's
+    context window (llama-server: 400 "request (N tokens) exceeds the
+    available context size (M tokens)"). Distinguished from a generic
+    BadRequestError so orchestrator.py can force a compaction and retry once
+    instead of surfacing a dead end — see execute_turn's overflow handling.
+    Previously every 400 (this one included) became an identical generic
+    RuntimeError with no retry, which is exactly the failure the owner hit
+    live (8324 tokens against a 7680-token window)."""
+    pass
+
+
+def _is_context_overflow(err_str: str) -> bool:
+    return "exceeds the available context size" in err_str
+
+
 def guarded_stream(stream_obj, model: str, base_url: str):
     """Yield stream chunks, turning a mid-stream disconnect into an explanation.
 
@@ -112,6 +128,88 @@ class _ThinkFilter:
 
     def flush(self) -> list[tuple[str, bool]]:
         result = [(self._buf, self._in_think)] if self._buf else []
+        self._buf = ""
+        return result
+
+
+# ── Tool-call XML filter (injection mode streams raw <tool_call> markup) ───────
+
+class _ToolTagFilter:
+    """Withholds Qwen/Hermes-style tool-call XML from the live stream, the
+    same way _ThinkFilter withholds <think> blocks.
+
+    Injection mode (gb_synapse_tools.should_inject_tools — the path this
+    exact reference model uses) teaches the model to emit tool calls as raw
+    XML in its own text output. Before this filter, that XML streamed
+    straight to the terminal as it arrived: confirmed live,
+    <tool_call>, <function=Glob>, <parameter=pattern>... stayed on screen
+    for the whole turn. The post-hoc cleaner (clean_text_from_tool_blocks)
+    and the finalize_response() erase only run AFTER the stream ends, and
+    both can miss a pure-tool-call turn (empty cleaned text never triggers
+    the markdown-erase gate) — suppressing the markup before it's ever
+    written is the actual fix; the other two stay as a second line of
+    defense for whatever slips past this one.
+
+    Unlike a think block, an opened tool-call block that never sees its
+    close tag is dropped entirely rather than surfaced on flush() — the
+    Qwen parser (_parse_qwen_xml_tool_call) already tolerates an
+    unterminated <tool_call>, so anything between an open marker and
+    end-of-stream is guaranteed to be tool-call markup, never real prose.
+    """
+
+    _OPEN_TAGS = ("<tool_call>", "<tool_call ", "<function=", "<parameter=",
+                 "<|tool_call|>", "<|tool_call_start|>", "✿FUNCTION✿")
+    _CLOSE_TAGS = ("</tool_call>",)
+    _LOOKAHEAD = 24   # longest open/close tag
+
+    def __init__(self) -> None:
+        self._buf     = ""
+        self._in_tool = False
+
+    def feed(self, chunk: str) -> str:
+        """Returns the VISIBLE portion of `chunk` — tool-call markup withheld."""
+        self._buf += chunk
+        visible = ""
+        while True:
+            if not self._in_tool:
+                best = None
+                for tag in self._OPEN_TAGS:
+                    pos = self._buf.find(tag)
+                    if pos >= 0 and (best is None or pos < best[0]):
+                        best = (pos, tag)
+                if best is None:
+                    safe = self._buf[: -self._LOOKAHEAD] if len(self._buf) > self._LOOKAHEAD else ""
+                    if safe:
+                        visible += safe
+                        self._buf = self._buf[len(safe):]
+                    break
+                pos, tag = best
+                if pos > 0:
+                    visible += self._buf[:pos]
+                self._buf = self._buf[pos + len(tag):]
+                self._in_tool = True
+            else:
+                best = None
+                for tag in self._CLOSE_TAGS:
+                    pos = self._buf.find(tag)
+                    if pos >= 0 and (best is None or pos < best[0]):
+                        best = (pos, tag)
+                if best is None:
+                    # Still inside a tool block — nothing here is displayable;
+                    # keep only a small lookahead tail in case the close tag
+                    # is split across this chunk boundary.
+                    if len(self._buf) > self._LOOKAHEAD:
+                        self._buf = self._buf[-self._LOOKAHEAD:]
+                    break
+                pos, tag = best
+                self._buf = self._buf[pos + len(tag):]
+                self._in_tool = False
+        return visible
+
+    def flush(self) -> str:
+        """End of stream: return buffered prose; drop anything still inside
+        an opened-but-never-closed tool block."""
+        result = "" if self._in_tool else self._buf
         self._buf = ""
         return result
 
@@ -247,6 +345,12 @@ def _stream_openai_api(
         or "localhost" in base_url
     )
     _think_filter = _ThinkFilter() if _is_local else None
+    # Defense-in-depth on the native-FC path: real tool calls arrive via
+    # delta.tool_calls, but a backend/template that still emits XML tool-call
+    # markup as plain content text (this reference model's chat template does
+    # exactly that in injection mode — see _stream_injected) must not leak it
+    # here either.
+    _tool_filter = _ToolTagFilter() if _is_local else None
 
     try:
         stream = client.chat.completions.create(**kwargs)
@@ -275,6 +379,8 @@ def _stream_openai_api(
                 f"  • Check available models:  curl {base_url}/models\n"
                 f"  • Switch model:            /model <name>\n"
             ) from _conn_err
+        if _is_context_overflow(_e):
+            raise ContextOverflowError(_e) from _conn_err
         _status = getattr(_conn_err, "status_code", None)
         if _status is not None or "BadRequestError" in _cls or "InternalServerError" in _cls or "APIStatusError" in _cls:
             raise RuntimeError(
@@ -301,7 +407,9 @@ def _stream_openai_api(
                         yield ReasoningFragment(seg)
                     else:
                         text += seg
-                        yield StreamFragment(seg)
+                        visible = _tool_filter.feed(seg) if _tool_filter else seg
+                        if visible:
+                            yield StreamFragment(visible)
             else:
                 text += delta.content
                 yield StreamFragment(delta.content)
@@ -330,7 +438,13 @@ def _stream_openai_api(
                 yield ReasoningFragment(seg)
             else:
                 text += seg
-                yield StreamFragment(seg)
+                visible = _tool_filter.feed(seg) if _tool_filter else seg
+                if visible:
+                    yield StreamFragment(visible)
+    if _tool_filter:
+        tail = _tool_filter.flush()
+        if tail:
+            yield StreamFragment(tail)
 
     tool_calls = []
     for idx in sorted(tool_buf):
@@ -418,11 +532,18 @@ def _stream_injected(
     prose_text = ""   # displayable prose (think-stripped + tool-stripped)
     in_tok = out_tok = 0
     think_filter = _ThinkFilter()
+    tool_filter  = _ToolTagFilter()
 
     try:
         stream_obj = client.chat.completions.create(**kwargs)
     except Exception as _conn_err:
         err_str = str(_conn_err)
+        if _is_context_overflow(err_str):
+            # This is the path the reference model (qwen3.6, injection mode)
+            # actually goes through. Before this check it had NO 400 handler
+            # at all — even the generic one below — so a context-overflow 400
+            # here reached the REPL as a raw, unwrapped openai.BadRequestError.
+            raise ContextOverflowError(err_str) from _conn_err
         _is_refused = (
             "Connection refused" in err_str
             or "ConnectError"    in type(_conn_err).__name__
@@ -479,7 +600,15 @@ def _stream_injected(
                     yield ReasoningFragment(seg_text)
                 else:
                     prose_text += seg_text
-                    yield StreamFragment(seg_text)
+                    # This is the path the reference model actually streams
+                    # through — withhold <tool_call>/<function=.../<parameter=
+                    # markup from the terminal as it arrives instead of only
+                    # cleaning it up after the fact (full_text above still
+                    # accumulates the RAW text unfiltered, for
+                    # parse_tool_calls_from_text below).
+                    visible = tool_filter.feed(seg_text)
+                    if visible:
+                        yield StreamFragment(visible)
         if hasattr(chunk, "usage") and chunk.usage:
             in_tok  = chunk.usage.prompt_tokens  or in_tok
             out_tok = chunk.usage.completion_tokens or out_tok
@@ -490,7 +619,12 @@ def _stream_injected(
             yield ReasoningFragment(seg_text)
         else:
             prose_text += seg_text
-            yield StreamFragment(seg_text)
+            visible = tool_filter.feed(seg_text)
+            if visible:
+                yield StreamFragment(visible)
+    _tool_tail = tool_filter.flush()
+    if _tool_tail:
+        yield StreamFragment(_tool_tail)
 
     tool_calls = parse_tool_calls_from_text(full_text, tool_schemas, model)
     if tool_calls:

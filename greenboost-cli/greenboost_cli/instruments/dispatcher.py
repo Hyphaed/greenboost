@@ -61,7 +61,13 @@ def dispatch(
     """
     handler = _DISPATCH.get(name)
     if handler is None:
-        return f"Unknown instrument: {name}"
+        # "Error:" prefix matters: orchestrator.py's consecutive-error guard
+        # (result.startswith("Error")) and renderer.py's is_error detection
+        # both key off it — an unprefixed "Unknown instrument" rendered as an
+        # ordinary grey result and never tripped the guard, so a model stuck
+        # calling a name that will never resolve (e.g. a wrong MCP prefix)
+        # ran to the turn cap instead of stopping early.
+        return f"Error: Unknown instrument: {name}"
 
     # Pre-tool hooks (Claude Code compatible)
     try:
