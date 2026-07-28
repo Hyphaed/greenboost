@@ -347,6 +347,50 @@ own changes at a glance.
   a free speed optimization even without the crash to avoid — no downside
   to leaving it).
 
+- 2026-07-28 (installer parity fix): `greenboost_setup.sh`'s
+  `cmd_install_synapse_engine` never installed `sglang_kernel` — it was a
+  manual, one-off `pip install` run during this debugging session, not
+  wired into the installer. A same-day Full Install (which rebuilds
+  `synapse-torch-env` from `pyproject.toml`'s declared deps only) silently
+  lost it, breaking `gllm/layers/sampler.py`'s `from sgl_kernel import
+  top_k_renorm_prob` import (`ModuleNotFoundError: No module named
+  'sgl_kernel'`) — a real Installer/Uninstaller Parity violation per this
+  repo's own CLAUDE.md. Fixed by adding the `sglang_kernel==0.4.5+cu130`
+  install step (via `--extra-index-url
+  https://sgl-project.github.io/whl/cu130`, same command documented as a
+  comment in `pyproject.toml` since pip's resolver won't follow
+  `--extra-index-url` from a dependency list alone) directly into
+  `cmd_install_synapse_engine`, right after the main package install and
+  before the `import torch, gllm, sgl_kernel` smoke test that was already
+  there expecting it. Non-fatal on failure (warns, points at
+  `sudo greenboost install-synapse-engine` to retry), consistent with the
+  rest of this function.
+
+- 2026-07-28 (fifth crash, first one at INFERENCE time not model-load
+  time): `gllm/models/qwen2_5_vl.py`'s `Qwen2_5_VisionAttention.forward()`
+  called `sgl_kernel.flash_attn.flash_attn_varlen_func` unconditionally,
+  unlike `gllm/layers/attention.py` (the main LLM text-attention path,
+  already fixed 2026-07-27) which correctly gates on the library's own
+  `is_fa3_supported()` before choosing flash vs. SDPA/Triton. Hit live on
+  the first real image-critique request after the model finally loaded and
+  served successfully (weight-load + Triton FP8 GEMM autotune + Uvicorn
+  startup all completed clean for the first time this session) —
+  `NotImplementedError: flash_attn at sgl-kernel is only supported on sm90
+  and above`, which crashed the whole engine process (parent went
+  defunct), not just the one request. The error message is misleading:
+  read `sgl_kernel/flash_attn.py`'s actual check directly — it hard-gates
+  to `torch.cuda.get_device_capability(device)[0] in (8, 9)`, an allowlist
+  that excludes Blackwell (sm_120, cc=12) entirely rather than a `>=`
+  comparison against sm90. Fixed with the same pattern as the text path:
+  added `_vision_attn_use_flash()` (the same capability check, cached) and
+  `_vision_attn_sdpa_varlen()` (SDPA run per `cu_seqlens` segment — matches
+  flash_attn_varlen's no-cross-segment-attention semantics exactly for
+  non-causal attention), and branch on it in
+  `Qwen2_5_VisionAttention.forward()`. NOT yet fixed (found by grep,
+  same-shaped bug, different model, not in the critical path for
+  Qwen3-VL): `gllm/models/kimi_k25_vision.py:245` has the identical
+  unguarded call — flag for whoever next touches Kimi K2.5 support.
+
 Why `synapse_engine/logger.py` exists
 --------------------------------------
 Upstream `gllm/` does `from logger import logger` in ~22 files, expecting

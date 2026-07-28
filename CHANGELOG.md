@@ -1,6 +1,6 @@
 # GreenBoost Changelog
 
-## Unreleased
+## Develop version (non tagged, already pushed to the repository)
 
 - **`greenboost_netd.c`: added internal log rotation** (`GB_NETD_LOG_MAX_BYTES`,
   50 MB, `features/net_fabric.h`). Found live on feeder `omen`: `netd.log`
