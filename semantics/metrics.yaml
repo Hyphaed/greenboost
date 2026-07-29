@@ -1,0 +1,361 @@
+# semantics/metrics.yaml , GB-Semantics governed metric registry.
+#
+# One name per concept. Every `resolver` names a `_res_<resolver>()` function
+# in gb_semantics.py; `checks/check_semantics_coverage.py` fails the build if
+# the function doesn't exist, if a `source_fields` entry doesn't exist on the
+# named class, or if a `never_use` field has been renamed/removed upstream.
+#
+# `threshold.derive` values are ALWAYS %-of-live-topology, per this repo's
+# hardcoded-hardware-values rule , never a literal GB/MB figure. Where a
+# concrete number appears below it is a REFERENCE observation for the eval
+# fixtures (Phase 6), not a threshold.
+#
+# Reference workload for every synapse-group metric's eval fixture (per
+# CLAUDE.md's Reference Workload Rule): DavidAU/Qwen3.6-27B-Fable-Fusion-711-
+# Uncensored-Heretic-NM-DAU-NEO-MAX-MTP-GGUF (`MTP-Q4_K_M`, dense 27B, hybrid
+# attention: 16 x (3x Gated DeltaNet -> 1x Gated Attention), so
+# n_kv_layers = ceil(n_layers/4), NOT n_layers) on a single 12 GB RTX 5070
+# host. That 12 GB figure is real hardware on THIS box, still read live via
+# NVML at runtime by every resolver below , it is written here only so a
+# human maintaining this file knows which box the reference numbers came from.
+
+- name: vram_fill_pct
+  entity: gpu
+  unit: percent
+  doc: >
+    Real physical VRAM occupancy , THE Rule #1 signal ("fill every GPU to
+    ~90%"). Prefers the dataflux flight recorder's `snapshot.fb_phys_used_pct`
+    (matches gb_telemetry.GpuMetrics exactly); falls back to
+    gb_monitor.snapshot()'s NVML-sourced used/total (also physical, just
+    without the T2/T3 pressure context) when no recent snapshot event exists.
+  resolver: vram_fill_pct
+  source_fields: ["gb_dataflux.snapshot.fb_phys_used_pct", "gb_monitor.GbSnapshot.gpu_mem_used_mb", "gb_monitor.GbSnapshot.vram_physical_mb"]
+  source_tier: measured
+  direction: target_band
+  threshold: {target_band: [85, 92], derive: pct_of_physical_vram}
+  owner: GB-Tiering
+  never_use:
+    - field: fb_used_pct
+      why: >
+        Virtual , shim-inflated with T2+T3+feeder bytes so Ollama/gb-synapse
+        see one big device (Cluster Compute Architecture). Reading this for
+        a Rule #1 check reports "full" while physical VRAM sits half-empty;
+        this is the exact trap in the 2026-07-12 incident this rule's own
+        text describes (17.5GB to T2, `vram_headroom_mb=244` while ~8GB
+        physically free).
+  aliases: [vram_used_pct, gpu_memory_pct, fill_pct, rule1_pct]
+
+- name: t2_pressure_level
+  entity: pool
+  unit: enum_0_1_2
+  doc: >
+    T2 DDR pressure as the KERNEL POOL reports it (ok=0 / warn=1 /
+    critical=2). Two different fields in this codebase are both named
+    "t2_pressure" at two different scales , this metric pins down which one.
+  resolver: t2_pressure_level
+  source_fields: ["gb_monitor.GbSnapshot.t2_pressure", "gb_dataflux.snapshot.t2_pressure"]
+  source_tier: measured
+  direction: lower_is_better
+  threshold: {warn_at: 1, critical_at: 2}
+  owner: GB-Tiering
+  never_use:
+    - field: gb_dataflux.snapshot.t2_pressure (as a 0..1 float)
+      why: >
+        `SnapshotRecorder` also writes a continuous 0.0-1.0 pressure fraction
+        under the SAME key name in the `snapshot` event body , comparing it
+        against the enum's 0/1/2 thresholds silently misclassifies "elevated"
+        as "nominal". This metric's resolver reads the pool's own enum field,
+        never the continuous one; use `t2_pressure_fraction` (below) for the
+        continuous view.
+  aliases: [t2_pressure, ddr_pressure]
+
+- name: t2_pressure_fraction
+  entity: pool
+  unit: fraction_0_1
+  doc: The continuous 0.0-1.0 T2 pressure SnapshotRecorder trends over time (distinct scale from t2_pressure_level , see that metric's never_use).
+  resolver: t2_pressure_fraction
+  source_fields: ["gb_dataflux.snapshot.t2_pressure"]
+  source_tier: measured
+  direction: lower_is_better
+  threshold: {warn_at: 0.6, critical_at: 0.9}
+  owner: GB-Tiering
+  aliases: [t2_fraction]
+
+- name: t3_spill_active_mb
+  entity: pool
+  unit: megabytes
+  doc: >
+    NVMe (T3) bytes currently holding WEIGHTS (not KV). Nonzero here during
+    active inference is a Placement Floor violation , weights must never
+    live on T3 (quantize_to_fit refuses this by design).
+  resolver: t3_spill_active_mb
+  source_fields: ["gb_monitor.GbSnapshot.t3_used_mb", "gb_dataflux.snapshot.t3_used_mb"]
+  source_tier: measured
+  direction: zero_is_healthy
+  threshold: {critical_above: 0}
+  owner: GB-Tiering
+  aliases: [t3_used_mb, weights_on_disk]
+
+- name: kv_resident_share
+  entity: pool
+  unit: fraction_0_1
+  doc: Share of the model's total KV cache currently resident in T1 VRAM vs spilled to T2. Low share under active generation = the Memory Orchestration rule's "KV must be placed and kept in T1 first" is not holding.
+  resolver: kv_resident_share
+  source_fields: ["gb_monitor.GbSnapshot.kv_used_mb", "gb_dataflux.snapshot.kv_used_mb", "gb_dataflux.snapshot.kv_t2_mb"]
+  source_tier: derived
+  direction: higher_is_better
+  threshold: {warn_below: 0.5}
+  owner: GB-Tiering
+
+- name: effective_bits
+  entity: model
+  unit: bits
+  doc: The bit-width a model checkpoint was ACTUALLY quantized/served at, from gb-quant's own decision log , not the nominal quant name in its filename (a Q4_K_M file can still be served bf16-escalated on OOM fallback).
+  resolver: effective_bits
+  source_fields: ["gb_dataflux.kernel_backend.bits", "gb_dataflux.quantize.bits"]
+  source_tier: measured
+  direction: informational
+  owner: GB-Quant
+
+- name: meets_fp8_floor
+  entity: model
+  unit: boolean
+  doc: >
+    Whether effective_bits satisfies the quality floor (fp8/16/bf16/fp16
+    qualify; anything below needs an explicit surfaced tradeoff , see
+    CLAUDE.md's Quality Floor rule). This is a SEGMENT-shaped question
+    answered as a metric because it's asked standalone constantly; see
+    `below_quality_floor` in segments.yaml for the evidence-bearing form.
+  resolver: meets_fp8_floor
+  source_fields: ["effective_bits"]
+  source_tier: derived
+  direction: higher_is_better
+  owner: GB-Quant
+
+- name: kv_bits_by_layer
+  entity: model
+  unit: bits_per_layer_map
+  doc: >
+    Per-layer K/V TurboQuant bit assignment. Governed because this
+    reference workload is a HYBRID architecture (16 x (3x Gated DeltaNet ->
+    1x Gated Attention)): only 1 layer in `full_attention_interval` carries a
+    real, growing KV cache , the other 3 hold a fixed-size recurrent state.
+    `n_kv_layers` (ModelEntry, gb_synapse.py:465) is the field that already
+    encodes this; treating `n_layers` as the KV layer count is the exact bug
+    that clamped this model to ctx=2048 before the 2026-07-27 fix.
+  resolver: kv_bits_by_layer
+  source_fields: ["gb_synapse.ModelEntry.n_kv_layers", "gb_dataflux.turboquant_activate.k_bits", "gb_dataflux.turboquant_activate.v_bits"]
+  source_tier: measured
+  direction: informational
+  owner: GB-Quant
+  never_use:
+    - field: gb_synapse.ModelEntry.n_layers (as the KV layer count)
+      why: "Overcounts KV cache ~4x on this hybrid architecture (real incident: clamped ctx to 2048 before the full_attention_interval fix, see CLAUDE.md 2026-07-27)."
+
+- name: quant_rel_error
+  entity: model
+  unit: fraction
+  doc: >
+    gb_quant.plan_quality()'s MEASURED mean/max relative error for the
+    per-layer bit-assignment it actually chose for this model -- the real
+    answer to "did quantizing to the target bit width cost meaningful
+    accuracy", per CLAUDE.md's own quality-floor culture ("Quality must be
+    held by MEASUREMENT, not assumption... when proxy and measurement
+    disagree, trust the measurement"). Governed because the nominal target
+    bit-width alone is a proxy, not the answer: plan_quality() can silently
+    bf16-escalate individual layers above the target (see bf16_kept_layers
+    in this metric's own resolved value) to hold the error_ceiling, so
+    neither "what bit-width did I ask for" nor "what bit-width does the
+    filename say" tells you the actual measured error -- only this does.
+  resolver: quant_rel_error
+  source_fields: ["dataflux.quant_plan.mean_rel_err", "dataflux.quant_plan.max_rel_err"]
+  source_tier: measured
+  direction: informational
+  owner: GB-Quant
+  never_use:
+    - field: a bit-width or model-card claim (e.g. "Q4_K_M", "int4") read as the actual achieved error
+      why: "A quant token or checkpoint name is a proxy for quality, not a measurement of it -- plan_quality()'s own per-layer bf16 escalation means the same nominal bit-width can carry very different real error across two models. Only quant_plan's measured mean_rel_err/max_rel_err answer the actual question."
+
+- name: ssm_state_gb
+  entity: model
+  unit: gigabytes
+  doc: >
+    Selective-SSM (Mamba/Mamba2/hybrid Gated-DeltaNet) recurrent-state
+    footprint — the counterpart to kv_bits_by_layer for the layers
+    n_kv_layers EXCLUDES. Per arXiv:2312.00752 (the Mamba paper) this is
+    CONSTANT in context length, unlike KV cache: it must be added once
+    alongside weights, never scaled by ctx. Governed because before the
+    2026-07-29 fix this was silently charged as ZERO everywhere, hitting the
+    primary reference workload (Brian6145/Qwen3.6-27B-Claude-Opus-Sonnet-
+    Distilled-NVFP4-MTP, a Qwen3.6 hybrid: 3 GDN layers per 1 real-attention
+    layer) directly.
+  resolver: ssm_state_gb
+  source_fields: ["gb_synapse.ModelEntry.n_recurrent_layers", "gb_synapse.ModelEntry.ssm_d_conv", "gb_synapse.ModelEntry.ssm_conv_width", "gb_synapse.ModelEntry.ssm_state_elems"]
+  source_tier: derived
+  direction: informational
+  owner: GB-Synapse
+  never_use:
+    - field: kv_gb (as covering recurrent-layer memory too)
+      why: "kv_gb only accounts for n_kv_layers (real attention). Recurrent layers' state is a SEPARATE fixed cost this metric carries — omitting it undercounts a hybrid model's real VRAM footprint at the exact placement step (_solve_ctx_and_layers/_fit_gpu_layers) that matters."
+
+- name: recurrent_layer_fraction
+  entity: model
+  unit: fraction
+  doc: >
+    n_recurrent_layers / n_layers. 0.0 for a plain transformer, 1.0 for a
+    pure-Mamba/Mamba2 architecture (is_recurrent_only=true — n_kv_layers==0
+    is then the CORRECT count, not "unknown"), the hybrid ratio in between
+    (0.75 for the primary reference workload's 3-GDN-to-1-attention mix).
+  resolver: recurrent_layer_fraction
+  source_fields: ["gb_synapse.ModelEntry.n_recurrent_layers", "gb_synapse.ModelEntry.n_layers"]
+  source_tier: derived
+  direction: informational
+  owner: GB-Synapse
+  never_use:
+    - field: "gb_synapse.ModelEntry.n_kv_layers == 0 (treated as \"unknown, assume every layer is real attention\")"
+      why: "Correct for an is_recurrent_only architecture (a pure Mamba/Mamba2 model genuinely has zero real-attention layers) — treating 0 as a metadata gap and falling back to n_layers reintroduces the exact ~4x KV overestimate the full_attention_interval fix (2026-07-27) closed, just for a different architecture family."
+
+- name: tok_s_decode
+  entity: serve_session
+  unit: tokens_per_second
+  doc: Client-OBSERVED decode throughput (gb_synapse.record_measured_tok_s(), fed from real GB-CLI turns) , never a synapse_recommend() estimate, which is a pre-serve fit projection, not a measurement.
+  resolver: tok_s_decode
+  source_fields: ["gb_dataflux.tok_s_measured.tok_s"]
+  source_tier: measured
+  direction: higher_is_better
+  owner: GB-Synapse
+  never_use:
+    - field: synapse_recommend()'s fit-report estimate
+      why: "A pre-serve projection based on VRAM fit math, not an observed rate. CLAUDE.md is explicit that measured tok/s beats estimated whenever they disagree."
+  aliases: [tok_s, decode_speed, tokens_per_second]
+
+- name: ttft_ms
+  entity: serve_session
+  unit: milliseconds
+  doc: Time-to-first-token for the CURRENT serve session, split by prompt-cache hit vs miss. Governed because it's the metric the new host-memory prompt-cache actuation (Phase 5) exists to move.
+  resolver: ttft_ms
+  source_fields: ["gb_dataflux.prompt_cache.ttft_ms"]
+  source_tier: measured
+  direction: lower_is_better
+  owner: GB-Synapse
+
+- name: prompt_cache_hit_pct
+  entity: serve_session
+  unit: percent
+  doc: Share of requests whose prompt prefix was served from llama.cpp's `--cache-reuse`/`--cache-ram` host-memory cache rather than recomputed. Requires a stable token prefix (system prompt + tool schema); see the `prompt_cache_cold` segment for the failure mode.
+  resolver: prompt_cache_hit_pct
+  source_fields: ["gb_dataflux.prompt_cache.hit_pct"]
+  source_tier: measured
+  direction: higher_is_better
+  owner: GB-Synapse
+
+- name: served_ctx
+  entity: serve_session
+  unit: tokens
+  doc: >
+    The ACTUAL context window this serve session is running at right now.
+    Ground truth is the live server (`GET /slots`), then the run-state JSON
+    gb_synapse.serve() writes at launch , never a client-side constant.
+  resolver: served_ctx
+  source_fields: ["llama.cpp /slots", "gb_synapse.ServerState.ctx"]
+  source_tier: measured
+  direction: informational
+  owner: GB-Synapse
+  never_use:
+    - field: greenboost-cli environment/settings.py gb_synapse_ctx() hardcoded 65536
+      why: "Fixed 2026-07-27 , used to return a constant that never asked the server. Every auto-compact threshold in GB-CLI was computed against a number unrelated to reality until this fix landed."
+
+- name: n_gpu_layers_effective
+  entity: serve_session
+  unit: layer_count
+  doc: Layers actually placed on GPU for THIS serve session (the `-ngl` value gb_synapse_backends chose), out of the model's total. Dense-model placement question, distinct from MoE expert-tier placement (`gb_plan`) which does not apply to this reference workload.
+  resolver: n_gpu_layers_effective
+  source_fields: ["gb_dataflux.synapse_serve", "gb_synapse.ServerState.n_gpu_layers"]
+  source_tier: measured
+  direction: higher_is_better
+  owner: GB-Synapse
+
+- name: cluster_vram_fill_pct
+  entity: node
+  unit: percent
+  doc: vram_fill_pct extended across every node in the cluster (host + online feeders) , the "maximize the WHOLE cluster" rule's own signal, one row per node.
+  resolver: cluster_vram_fill_pct
+  source_fields: ["gb_cluster.cluster_snapshot"]
+  source_tier: measured
+  direction: target_band
+  threshold: {target_band: [85, 92], derive: pct_of_physical_vram_per_node}
+  owner: GB-Cluster
+
+- name: feeder_items
+  entity: feeder
+  unit: count
+  doc: Work items a feeder actually processed in the window (dataflux `items` per node). The tripwire for "feeder holds bytes but runs no kernels" , items:0 while the host is saturated is the rule violation, not an acceptable fallback.
+  resolver: feeder_items
+  source_fields: ["gb_dataflux.summarize.nodes"]
+  source_tier: measured
+  direction: higher_is_better
+  owner: GB-Cluster
+
+- name: link_bw_gbps
+  entity: link
+  unit: gigabits_per_second
+  doc: Measured host<->feeder transfer bandwidth from real `link_transfer` events (nbytes/seconds), never a nominal NIC speed.
+  resolver: link_bw_gbps
+  source_fields: ["gb_dataflux.link_transfer.nbytes", "gb_dataflux.link_transfer.seconds"]
+  source_tier: derived
+  direction: higher_is_better
+  owner: GB-Cluster
+
+- name: swap_pressure
+  entity: node
+  unit: enum_or_pct
+  doc: >
+    Host-side OS swap usage + iowait , the signal that gets misread as "GPU
+    thermal throttling" (real incident, 2026-07-09: 8GB swap, 90% iowait,
+    generation stalled 6+ minutes). Governed specifically so that trap can't
+    repeat; see the `swap_thrash_not_gpu_throttle` segment for the full
+    evidence bundle.
+  resolver: swap_pressure
+  source_fields: ["free -h", "vmstat wa column", "gb_monitor.GbSnapshot.swap_pressure"]
+  source_tier: measured
+  direction: lower_is_better
+  owner: Health
+  never_use:
+    - field: "a log line containing clock_throttled=True, read alone"
+      why: "Describes one internal shim signal, not a diagnosis. CLAUDE.md's own standing rule: never diagnose GPU/perf from inference alone; always pull real telemetry first (system_status, nvidia-smi, free/vmstat, lsmod)."
+
+- name: iowait_pct
+  entity: node
+  unit: percent
+  doc: CPU iowait percentage (vmstat `wa` column) , the other half of the swap_pressure evidence bundle.
+  resolver: iowait_pct
+  source_fields: ["vmstat wa column"]
+  source_tier: measured
+  direction: lower_is_better
+  threshold: {warn_above: 20, critical_above: 50}
+  owner: Health
+
+- name: kmod_loaded
+  entity: node
+  unit: boolean
+  doc: >
+    Whether greenboost.ko is actually loaded right now (`lsmod | grep
+    greenboost`), NOT whether it was installed. Real incident: a fresh
+    reinstall does not reload the kernel module automatically, so "spill to
+    T2" silently degrades into ordinary OS swap while every log line still
+    says "GreenBoost active".
+  resolver: kmod_loaded
+  source_fields: ["lsmod", "/dev/greenboost"]
+  source_tier: measured
+  direction: higher_is_better
+  owner: Health
+
+- name: shim_fresh
+  entity: node
+  unit: boolean
+  doc: Whether /run/greenboost/shim_stats was written within the last 30s , the freshness gate every resolver in this file that reads a "live" field must also honor.
+  resolver: shim_fresh
+  source_fields: ["/run/greenboost/shim_stats mtime"]
+  source_tier: measured
+  direction: higher_is_better
+  owner: Health

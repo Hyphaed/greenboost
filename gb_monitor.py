@@ -398,6 +398,11 @@ def context_summary(stats: "dict | None" = None) -> str:
         warnings.append("NOTICE: T2 DDR pressure is elevated (warn level).")
     if warnings:
         line += "".join(f"- {w}\n" for w in warnings)
+    try:
+        import gb_semantics
+        line += gb_semantics.card()
+    except Exception:
+        pass  # GB-Semantics unavailable (e.g. pyyaml missing) — tier banner still stands alone
     return line
 
 

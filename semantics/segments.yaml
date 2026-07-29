@@ -1,0 +1,75 @@
+# semantics/segments.yaml , GB-Semantics named canonical filters.
+#
+# Anthropic's finding this file exists to act on: hand-rolled population
+# filters (their "active users" example) are the single biggest source of
+# wrong answers, because an agent re-derives the filter logic slightly
+# differently every time it's asked. Every segment below returns
+# {matched: bool, evidence: [...]} , the evidence list is what makes a
+# verdict checkable rather than a bare claim.
+#
+# `swap_thrash_not_gpu_throttle` and `kmod_missing_silent_degrade` are two
+# real historical misdiagnoses (documented in CLAUDE.md) encoded as
+# executable filters , the actual point of this file.
+
+- name: rule1_underfilled
+  doc: >
+    Rule #1 violation: physical VRAM sits well below the 85-92% target band
+    while overflow to T2/T3 is active , the RULE #1 TRIPWIRE per
+    CLAUDE.md's own definition ("a shim_transition must fire when VRAM is
+    under-filled while overflow to T2/T3 is active").
+  evaluator: rule1_underfilled
+  reads: [vram_fill_pct, t2_pressure_fraction, t3_spill_active_mb]
+  severity: violation
+
+- name: weights_on_t3
+  doc: Model weights (not KV) resident on T3 NVMe , the Placement Floor rule this repo's own quantize_to_fit() refuses to allow.
+  evaluator: weights_on_t3
+  reads: [t3_spill_active_mb]
+  severity: violation
+
+- name: feeder_idle_while_host_saturated
+  doc: A connected feeder shows near-zero item throughput while the host node is at/above its VRAM fill target , the Cluster rule's own tripwire ("a connected feeder sitting idle while the host is the bottleneck is a rule violation").
+  evaluator: feeder_idle_while_host_saturated
+  reads: [cluster_vram_fill_pct, feeder_items]
+  severity: violation
+
+- name: below_quality_floor
+  doc: Currently-served model's effective_bits is below the fp8 floor without a surfaced tradeoff , CLAUDE.md's Quality Floor rule.
+  evaluator: below_quality_floor
+  reads: [meets_fp8_floor, effective_bits]
+  severity: warning
+
+- name: swap_thrash_not_gpu_throttle
+  doc: >
+    High OS swap usage + high iowait, WHILE something in the logs suggests
+    "GPU thermal throttling". This segment exists because that exact
+    misread happened for real (2026-07-09: 8GB swap, 90% iowait, generation
+    stalled 6+ min, initially blamed on GPU thermal throttling until real
+    telemetry was pulled). Matching this segment means: the bottleneck is
+    host memory/disk, not the GPU , don't recommend a GPU-side fix.
+  evaluator: swap_thrash_not_gpu_throttle
+  reads: [swap_pressure, iowait_pct]
+  severity: diagnosis
+
+- name: kmod_missing_silent_degrade
+  doc: >
+    greenboost.ko is not loaded (kmod_loaded=false) but the shim/logs still
+    describe normal operation , the silent-degrade failure mode where "spill
+    to T2" has no real kernel-backed reservation and falls back to ordinary
+    OS swap while looking like a generic slowdown. Matching this segment
+    means: stop, don't diagnose further, the fix is `sudo greenboost load`.
+  evaluator: kmod_missing_silent_degrade
+  reads: [kmod_loaded, shim_fresh]
+  severity: violation
+
+- name: prompt_cache_cold
+  doc: prompt_cache_hit_pct is near zero across recent serve requests despite --cache-reuse/--cache-ram being active , usually an unstable prefix (system prompt or tool schema changed between turns).
+  evaluator: prompt_cache_cold
+  reads: [prompt_cache_hit_pct]
+  severity: warning
+
+- name: serve_healthy
+  doc: The positive case , no other segment matches, shim is fresh and kmod is loaded, and the current serve session is within its VRAM target band at/above the quality floor. The "everything's fine" verdict is itself governed so an agent doesn't have to synthesize it from silence.
+  evaluator: serve_healthy
+  reads: [kmod_loaded, shim_fresh, vram_fill_pct, meets_fp8_floor]
+  severity: ok

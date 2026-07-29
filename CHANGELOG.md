@@ -36,6 +36,48 @@ extended 1M) window is still reachable if you explicitly ask for it and have
 GreenBoost's memory-extension feature turned on — that trades some speed for
 the extra room, so it's opt-in, never automatic.
 
+### 🧠🌀 The same memory bug, on a different kind of model — and a piece of memory that was never counted at all
+
+The previous fix (above) only covered models loaded as GGUF files. GreenBoost
+is now also being used with models loaded a different way (safetensors,
+served through GreenBoost's own built-in engine) that have the exact same
+"part of every reply is a lightweight summary instead of full attention"
+design — and that path had the identical bug the GGUF fix already closed,
+just never patched there. Fixed the same way: GreenBoost now correctly counts
+how much of the model actually needs the expensive, growing memory, instead
+of assuming all of it does.
+
+Separately, this uncovered a piece of memory that GreenBoost was not
+accounting for AT ALL. Models built this way keep a small, fixed-size
+"working notebook" per conversation (its size doesn't grow the longer the
+conversation gets — unlike everything else GreenBoost tracks), and it's
+read and rewritten on every single word the model produces, making it some
+of the most performance-critical memory in the whole system. GreenBoost now
+sizes it correctly and — optionally — pins it in the GPU's fastest memory
+tier so it's never evicted to slower memory by mistake.
+
+### 🐍 GreenBoost's own model server can now run Mamba-2 models natively
+
+Two fixes above closed the accounting gap for models that mix regular
+attention with the newer "linear attention" style. This entry is about
+the other end of that spectrum: models built ENTIRELY out of the newer
+style, with no regular attention at all. GreenBoost's built-in model
+server didn't know how to run one at all before now — it does today.
+
+The model math itself was borrowed from, and checked against, the same
+well-tested open-source code other serving engines use (not hand-written
+from scratch), because getting this kind of model's internal math even
+slightly wrong doesn't crash — it just quietly produces fluent-looking
+nonsense, which is a much easier mistake to ship by accident. That
+caution paid off during testing: the very first attempt DID produce
+fluent-looking nonsense, traced back to two internal steps that were
+wired up in the wrong order, fixed, and re-verified word-for-word against
+a trusted reference implementation before being called done. Along the
+way, four separate scheduling assumptions that had never been tested
+against a model with no regular attention memory at all were found and
+fixed too — one of which caused every request to simply hang forever
+with no error, rather than fail loudly.
+
 ### 💬 The `gb` terminal assistant got a cleanup pass
 
 - The chat window used to flash raw internal text (things like
@@ -85,6 +127,44 @@ falls back to running on the local machine alone instead of just giving up.
 - The built-in model server's default network port moved from 11434 (which
   collided with Ollama, if you also run that) to 11435, so both can run
   side by side without a fight.
+
+### 🧭 GB-Semantics — one governed answer, not a guess
+
+A new subsystem, GB-Semantics, gives GreenBoost's own AI assistants (and any
+MCP client) ONE correct answer per question about GreenBoost's current state
+— "is Rule #1 satisfied", "why is it slow", "is the quality floor met" — the
+same way a data team builds a semantic layer so an analytics AI stops
+guessing which table means "revenue". Several internal signals in GreenBoost
+mean two different things depending on where they're read from (a
+shim-inflated "how full does VRAM *look*" number vs. the real physical one;
+a pressure reading that's sometimes a 0/1/2 severity level and sometimes a
+0.0-1.0 fraction under the same name) — GB-Semantics defines each concept
+once, resolves it deterministically, and explicitly flags the field an
+assistant should NOT read instead. Reachable over MCP
+(`semantic_resolve`/`semantic_answer`/`semantic_segments`/`semantic_metrics`
+on `greenboost-orchestrator`) and via a plain `gb_semantics.py` CLI for
+anything without MCP. A 40-case eval suite, pinned to a frozen test scenario,
+runs on every change, and a build-blocking check catches a definition losing
+its resolver.
+
+### ⚡ Faster repeated prompts (host-memory prompt cache)
+
+`gb-synapse`'s serving engine now sizes and enables its host-memory prompt
+cache (previously left at the engine's own default), so a long, unchanging
+system prompt — exactly what `gb`'s terminal assistant resends every turn —
+can be reused instead of reprocessed from scratch. Sized automatically from
+whatever RAM is actually free on the machine, never a fixed number. Every
+request's cache-hit rate and response latency now show up in GreenBoost's
+telemetry feed, so the effect is measurable, not just assumed.
+
+**Verified against a real, running instance of the reference model**: a
+repeated prompt went from taking about 1.9-2.1 seconds to process to about
+0.35 seconds — roughly 5-6x faster on the part of the request that reuses
+the cache, with 9 out of every 10 prompt tokens pulled from the cache
+instead of recomputed. That same check also caught the measurement itself
+undercounting the cache-hit rate for real usage of the terminal assistant
+(it was reading the right idea from the wrong place in the response) — now
+fixed, and covered by a permanent automated test so it can't quietly regress.
 
 ### 🐛 Installer & stability fixes
 

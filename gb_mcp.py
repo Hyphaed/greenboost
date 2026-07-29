@@ -53,59 +53,25 @@ _GBCONTROL_LEVER_ALLOWLIST = {
     "set_gpu_persistence", "set_gpu_power_limit", "set_proc_priority",
 }
 
-_RULES = {
-    "rule_1_vram": "Fill every GPU's physical VRAM to ~90% (10% headroom so the "
-                   "system never collapses under pressure). GPU VRAM is the "
-                   "fastest RAM — T2 DDR/T3 NVMe are overflow only.",
-    "quality_floor": "Minimum quality = fp8 for hot (T1) weights. Quality-first "
-                     "path: GB_QUALITY=near_lossless (rel-err ceiling 3.0%, fp8 "
-                     "qualifies). Ladder 16 → fp8 → nvfp4 → 8 → 4. Dynamic "
-                     "quantization is allowed, but any option below fp8 MUST "
-                     "carry an explicit quality tradeoff surfaced to the owner.",
-    "placement_floor": "Weights NEVER on T3 NVMe (quantize_to_fit refuses; "
-                       "t3_used_mb>0 during inference is a critical finding).",
-    "cluster": "Maximize the WHOLE cluster: host + every feeder toward ~90% VRAM "
-               "AND compute (unified CUDA device). A connected idle feeder while "
-               "the host bottlenecks is a rule violation.",
-    "backend": "Prefer gb-synapse over raw ollama (cross-GPU --rpc tensor-split, "
-               "gb-quant, proxy-side dataflux tok/s).",
-    "actuation": "All levers double-gated: apply=True AND GB_ORCH_ACTUATE=1. "
-                 "Server lifecycle is never auto-applied.",
-}
+# `_RULES`/`_TAXONOMY` used to be hardcoded here. GB-Semantics (gb_semantics.py
+# + semantics/*.yaml) is now the single source of truth: `_RULES`'s 4
+# measurable rules are the docs of the corresponding semantics/segments.yaml
+# entries (rule1_underfilled/below_quality_floor/weights_on_t3/
+# feeder_idle_while_host_saturated , each is now an EXECUTABLE filter, not
+# just prose); the 2 non-measurable policy statements (backend preference,
+# actuation gating) stay as static strings in gb_semantics.rules(). Taxonomy
+# moved verbatim to gb_semantics.TAXONOMY. See _rules_and_taxonomy() below.
 
-_TAXONOMY = {
-    "GB-Tiering": {"does": "T1 VRAM / T2 DDR / T3 NVMe as one virtual pool",
-                   "module": "gb_tiering.py (engine: shim + greenboost.ko)",
-                   "mcp": "greenboost-orchestrator: tiering via greenboost_status; "
-                          "greenboost-dataflux: tiering_status, dataflux_tier_moves"},
-    "GB-Quant": {"does": "weights (gb_quant) + KV cache (TurboQuant/gb_attn) "
-                         "compression so models fit VRAM at quality; "
-                         "gb_placement.plan_experts (CB-3) plans the MoE "
-                         "dense/hot-expert/warm-expert/cold-expert tier split",
-                 "module": "gb_quant.py + gb_attn.py + gb_placement.py",
-                 "mcp": "greenboost-orchestrator: quant_advisor, gb_plan; "
-                        "greenboost-dataflux: dataflux_quantization"},
-    "GB-Dataflux": {"does": "flight recorder: every subsystem emits events; "
-                            "web UI via `greenboost dataflux-ui`",
-                    "module": "gb_dataflux.py",
-                    "mcp": "greenboost-dataflux (full drill-down); headline via "
-                           "dataflux_summary here"},
-    "GB-Cluster": {"does": "borrow LAN GPUs+RAM (feeders); unified virtual GPU; "
-                           "cluster_map/ensure_feeder_ready dispatch",
-                   "module": "gb_cluster.py (fabric: greenboost-netd)",
-                   "mcp": "greenboost-cluster (live state); headline via "
-                          "cluster_status here"},
-    "GB-Synapse": {"does": "own model server: llama.cpp --rpc tensor-split "
-                           "across cluster + Ollama/OpenAI proxy on :11434",
-                   "module": "gb_synapse.py + gb_synapse_api.py",
-                   "mcp": "greenboost-synapse (serve/stop/models + CLI bridge); "
-                          "headline via synapse_status here"},
-    "GB-CLI": {"does": "agentic terminal client (`gb`, `greenboost-cli`), "
-               "always talks to gb-synapse :11434",
-               "module": "greenboost-cli (installed by Full Install)",
-               "mcp": "greenboost (rag/goals/factory); cli bridge in "
-                      "greenboost-synapse"},
-}
+def _rules_and_taxonomy() -> tuple[dict, dict]:
+    """Lazy import (matches this file's own pattern for every other gb_*
+    dependency) so a missing pyyaml doesn't break MCP server startup , falls
+    back to an error marker instead of crashing greenboost_overview()."""
+    try:
+        import gb_semantics
+        return gb_semantics.rules(), gb_semantics.TAXONOMY
+    except Exception as e:
+        return {"error": f"gb_semantics unavailable: {e}"}, {}
+
 
 
 def _read_shim_stats() -> dict:
@@ -145,10 +111,22 @@ def _read_orch_state() -> dict:
 def greenboost_overview() -> dict:
     """FULL GreenBoost awareness in one call: capabilities, live status, tier
     state, cluster state, synapse (engine/models/serving), dataflux topline,
-    the subsystem taxonomy (which MCP server owns what), and the operating
-    rules (Rule #1 ~90% VRAM, fp8 quality floor, never-T3 weights, maximize
-    cluster, prefer gb-synapse). Start here when asked to 'use greenboost'."""
-    out: dict = {"taxonomy": _TAXONOMY, "rules": _RULES}
+    the subsystem taxonomy (which MCP server owns what), the operating rules
+    (Rule #1 ~90% VRAM, fp8 quality floor, never-T3 weights, maximize
+    cluster, prefer gb-synapse , now backed live by GB-Semantics' executable
+    segments, not just prose), and a `semantics` verdict block (which named
+    segments are currently matched , progressive disclosure: check verdicts
+    here first, drill into `semantic_resolve`/a subsystem MCP only for the
+    ones that matter). Start here when asked to 'use greenboost'."""
+    rules, taxonomy = _rules_and_taxonomy()
+    out: dict = {"taxonomy": taxonomy, "rules": rules}
+    try:
+        import gb_semantics
+        out["semantics"] = {
+            seg: gb_semantics.evaluate_segment(seg)["matched"]
+            for seg in gb_semantics.load()["segments"]}
+    except Exception as e:
+        out["semantics_error"] = str(e)
     try:
         import gb_monitor
         out["capabilities"] = gb_monitor.capabilities()
@@ -170,7 +148,13 @@ def greenboost_overview() -> dict:
         out["synapse"] = gb_synapse.status()
         out["synapse"]["models"] = [
             {"name": m.name, "quant": m.quant,
-             "gib": round(m.n_bytes / 2**30, 2), "source": m.source}
+             "gib": round(m.n_bytes / 2**30, 2), "source": m.source,
+             # Hybrid/pure-recurrent (Mamba/Mamba2/GDN) visibility at a
+             # glance — 0/False for a plain transformer. See semantics'
+             # ssm_state_gb/recurrent_layer_fraction for the governed form.
+             "ssm_state_gb": round(gb_synapse._entry_ssm_gb(m), 3),
+             "n_recurrent_layers": m.n_recurrent_layers,
+             "is_recurrent_only": m.is_recurrent_only}
             for m in gb_synapse.list_models()]
         out["synapse"]["serving"] = gb_synapse.ps()
     except Exception as e:
@@ -668,6 +652,67 @@ def synapse_status() -> dict:
     return gb_mcp_common.synapse_status()
 
 
+# ── GB-Semantics , the governed semantic layer ──────────────────────────────
+# MANDATORY DEFAULT PATH for any question about GreenBoost's own state: use
+# these 4 tools BEFORE reading a raw telemetry/dataflux field directly. See
+# gb_semantics.py's module docstring and .claude/skills/gb-semantics/SKILL.md
+# for why , several raw fields in this codebase are traps (same name,
+# different meaning, or a virtual number that looks like the real one).
+
+@mcp.tool()
+def semantic_metrics(query: str = "") -> dict:
+    """Discover governed metrics/segments by keyword (e.g. 'vram', 'rule 1',
+    'throttl'). Returns names + docs + `never_use` traps , NOT resolved
+    values, call `semantic_resolve`/`semantic_segments` for those. Empty
+    query lists every governed metric name. This is the retrieval-failure
+    fix: narrows GreenBoost's ~60-tool MCP surface to a handful of named
+    answers before any other tool is called."""
+    import gb_semantics
+    if not query:
+        L = gb_semantics.load()
+        return {"metrics": sorted(L["metrics"].keys()),
+                "segments": sorted(L["segments"].keys())}
+    return {"matches": gb_semantics.discover(query, k=8)}
+
+
+@mcp.tool()
+def semantic_resolve(metric: str, entity: "str | None" = None,
+                      window_s: "float | None" = None) -> dict:
+    """THE one governed number for `metric` (by name or alias) , value, unit,
+    threshold verdict, and provenance (which raw field it came from, its
+    owner, freshness). Use this instead of reading a dataflux/telemetry
+    field directly; the response's `never_use` list names the specific
+    fields that look plausible but are wrong for this metric."""
+    import gb_semantics
+    return gb_semantics.resolve(metric, entity_id=entity, window_s=window_s)
+
+
+@mcp.tool()
+def semantic_segments(name: "str | None" = None) -> dict:
+    """Evaluate named canonical filters (e.g. `rule1_underfilled`,
+    `swap_thrash_not_gpu_throttle`, `kmod_missing_silent_degrade`) , each
+    returns {matched, evidence}, evidence being the resolved metrics that
+    fed the verdict. `name=None` evaluates every governed segment."""
+    import gb_semantics
+    if name:
+        return gb_semantics.evaluate_segment(name)
+    L = gb_semantics.load()
+    return {seg: gb_semantics.evaluate_segment(seg) for seg in L["segments"]}
+
+
+@mcp.tool()
+def semantic_answer(question: str) -> dict:
+    """Full route: a natural-language question about GreenBoost's own state
+    -> matching intent -> resolved metrics + evaluated segments + a
+    provenance footer ('Source: semantic layer (...) · Owner: ... ·
+    Governed: true'). Returns `governed: false` with a raw-tool suggestion
+    when no route covers the question , that footer MUST be surfaced to the
+    user verbatim per the gb-semantics SKILL.md's mandatory-default-path
+    rule, never silently answered from a raw field instead."""
+    import gb_semantics
+    return gb_semantics.answer(question)
+
+
 # ── live kernel⇄LLM resources (cheap polling surface) ───────────────────────
 
 @mcp.resource("greenboost://shim-stats")
@@ -680,14 +725,33 @@ def res_shim_stats() -> str:
 @mcp.resource("greenboost://rules")
 def res_rules() -> str:
     """The operating constraint box (Rule #1, fp8 floor, placement floor,
-    cluster rule, backend rule, actuation gates)."""
-    return json.dumps(_RULES)
+    cluster rule, backend rule, actuation gates). Backed live by
+    gb_semantics.rules() , see greenboost://semantics for the executable form."""
+    rules, _ = _rules_and_taxonomy()
+    return json.dumps(rules)
 
 
 @mcp.resource("greenboost://taxonomy")
 def res_taxonomy() -> str:
     """Subsystem taxonomy: what each GB-* module does and which MCP owns it."""
-    return json.dumps(_TAXONOMY)
+    _, taxonomy = _rules_and_taxonomy()
+    return json.dumps(taxonomy)
+
+
+@mcp.resource("greenboost://semantics")
+def res_semantics() -> str:
+    """Full GB-Semantics registry dump: every governed metric, segment,
+    entity, and route , the machine-readable form of semantics/*.yaml, for
+    an LLM client that wants the whole schema in one read instead of
+    discovering it incrementally via `semantic_metrics`."""
+    import gb_semantics
+    L = gb_semantics.load()
+    return json.dumps({
+        "metrics": {n: m.__dict__ for n, m in L["metrics"].items()},
+        "segments": {n: s.__dict__ for n, s in L["segments"].items()},
+        "entities": {n: e.__dict__ for n, e in L["entities"].items()},
+        "routes": [r.__dict__ for r in L["routes"]],
+    }, default=str)
 
 
 if __name__ == "__main__":

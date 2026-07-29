@@ -510,6 +510,16 @@ class InputData:
         out = torch.empty(
             total, dtype=torch.int64, device="cpu", pin_memory=True
         )
+        # GREENBOOST PATCH (2026-07-29, see NOTICE): a pure-recurrent model
+        # (Mamba-2, num_pages=0) has no real KV cache -- every seq's
+        # page_table is (correctly) empty, so the page_table_np[page_idx]
+        # indexing below always crashed with an IndexError. The resulting
+        # slot mapping is never consumed by anything for this model (no
+        # FlashAttention layer reads it), so zero-fill and skip the
+        # page-table math entirely rather than indexing into empty tables.
+        if getattr(self.memory_manager, "num_pages", 0) == 0:
+            out.zero_()
+            return out
         out_np = out.numpy()
         offset = 0
         for seq in seqs:

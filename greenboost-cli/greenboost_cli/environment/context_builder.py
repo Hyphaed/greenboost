@@ -343,6 +343,16 @@ def _gather_mcp_context() -> str:
             " Call them by name when generating game assets, 3D models, video, audio, or images."
             " Use `forge gen/doctor/game/list` for batch manifest workflows."
         )
+        if any(n.startswith("greenboost") for n in servers):
+            lines.append(
+                "\nGB-Semantics is the MANDATORY DEFAULT PATH for any question about "
+                "GreenBoost's own state (VRAM fill, tier pressure, tok/s, quality floor, "
+                "cluster health, etc.): call `semantic_resolve`/`semantic_answer`/"
+                "`semantic_segments` (greenboost-orchestrator) FIRST. Reading a raw "
+                "dataflux/telemetry field directly is the fallback ONLY, and the answer "
+                "must say so — several raw fields in this codebase look plausible but are "
+                "wrong (see semantics/metrics.yaml's `never_use` entries)."
+            )
         return "\n".join(lines) + "\n"
     except Exception:
         return ""

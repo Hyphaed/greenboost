@@ -177,6 +177,73 @@ def _record_tok_s(model: str, t_first: "float | None", t_last: "float | None",
         pass
 
 
+def _record_prompt_cache(model: str, t_start: float, t_first: "float | None",
+                         prompt_tokens: int, tokens_cached: "int | None") -> None:
+    """Companion to _record_tok_s: TTFT (t_start->t_first) + reused-vs-total
+    prompt token share, from llama-server's own `tokens_cached`/`timings`
+    fields (see _cache_info_from_chunk). Feeds GB-Semantics' ttft_ms/
+    prompt_cache_hit_pct metrics (semantics/metrics.yaml) — the measurement
+    the --cache-ram/--cache-idle-slots actuation (gb_synapse_backends.py)
+    exists to move. Best-effort, never raises."""
+    try:
+        ttft_ms = (t_first - t_start) * 1000 if t_first is not None else None
+        hit_pct = (100.0 * tokens_cached / prompt_tokens
+                   if tokens_cached is not None and prompt_tokens else None)
+        import gb_synapse
+        gb_synapse.record_prompt_cache_sample(model, ttft_ms, hit_pct, tokens_cached or 0)
+    except Exception:
+        pass
+
+
+def _cache_info_from_chunk(chunk: dict, prev: "int | None") -> "int | None":
+    """Pull the reused-prompt-token count from llama-server's own response
+    fields when present (typically only the final SSE frame carries it) —
+    best-effort, keeps the last non-null value seen, same shape as
+    _usage_counts. Two real shapes, live-verified 2026-07-29 against this
+    engine's actual OpenAI-compat streaming output:
+      - top-level `tokens_cached` — llama-server's native /completion
+        endpoint (server-task.cpp's to_json_non_oaicompat()).
+      - `usage.prompt_tokens_details.cached_tokens` — the OpenAI-compat
+        /v1/chat/completions shape GB-CLI's BACKEND_REGISTRY actually talks
+        to (openai_passthrough(), not the Ollama-compat routes) — the one
+        that matters for real GB-CLI traffic; this was checked-in without
+        the nested lookup and silently produced reused_tokens=0/no hit_pct
+        on every real request until this fix."""
+    tc = chunk.get("tokens_cached")
+    if tc is None:
+        tc = (chunk.get("usage") or {}).get("prompt_tokens_details", {}).get("cached_tokens")
+    return int(tc) if tc is not None else prev
+
+
+def _parse_sse_telemetry_buffer(buf: bytes) -> "tuple[int, int, int | None]":
+    """Best-effort (completion_tokens, prompt_tokens, tokens_cached) from a
+    RAW SSE byte buffer, for telemetry only — used by openai_passthrough(),
+    which forwards raw_chunk bytes to the client UNCHANGED and separately
+    accumulates the same bytes here purely to observe them. A parse failure
+    here must never be able to affect what was already forwarded, so this
+    never raises; malformed/partial lines are silently skipped."""
+    ctok = ptok = 0
+    tokens_cached = None
+    try:
+        text = buf.decode("utf-8", "ignore")
+    except Exception:
+        return ctok, ptok, tokens_cached
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if payload == "[DONE]" or not payload:
+            continue
+        try:
+            chunk = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        ctok, ptok = _usage_counts(chunk, (ctok, ptok))
+        tokens_cached = _cache_info_from_chunk(chunk, tokens_cached)
+    return ctok, ptok, tokens_cached
+
+
 def _usage_counts(chunk: dict, prev: "tuple[int, int]") -> "tuple[int, int]":
     """Pull (completion_tokens, prompt_tokens) from an OpenAI-style streamed
     chunk's `usage` (llama-server emits it in the final chunk when
@@ -497,6 +564,7 @@ async def ollama_generate(request: web.Request) -> web.StreamResponse:
             await resp.prepare(request)
             t_first = t_last = None
             ctok = ptok = 0
+            tokens_cached = None
             async with _StallWatch(model) as watch:
                 async for chunk in _sse_lines(r):
                     choice = (chunk.get("choices") or [{}])[0]
@@ -510,6 +578,7 @@ async def ollama_generate(request: web.Request) -> web.StreamResponse:
                         await resp.write((json.dumps({"model": model, "created_at": _iso_now(),
                                                        "response": piece, "done": False}) + "\n").encode())
                     ctok, ptok = _usage_counts(chunk, (ctok, ptok))
+                    tokens_cached = _cache_info_from_chunk(chunk, tokens_cached)
     except _UpstreamError as e:
         return web.json_response(_failure_body(model, e.body.decode("utf-8", "ignore")),
                                   status=_upstream_status(e))
@@ -518,6 +587,7 @@ async def ollama_generate(request: web.Request) -> web.StreamResponse:
                                    **_ollama_durations(t_start, t_first, t_last, ctok, ptok)}) + "\n").encode())
     await resp.write_eof()
     _record_tok_s(model, t_first, t_last, ctok)
+    _record_prompt_cache(model, t_start, t_first, ptok, tokens_cached)
     return resp
 
 
@@ -587,6 +657,7 @@ async def ollama_chat(request: web.Request) -> web.StreamResponse:
             await resp.prepare(request)
             t_first = t_last = None
             ctok = ptok = 0
+            tokens_cached = None
             async with _StallWatch(model) as watch:
                 async for chunk in _sse_lines(r):
                     delta = (chunk.get("choices") or [{}])[0].get("delta", {})
@@ -613,6 +684,7 @@ async def ollama_chat(request: web.Request) -> web.StreamResponse:
                         if fn.get("arguments"):
                             entry["function"]["arguments"] += fn["arguments"]
                     ctok, ptok = _usage_counts(chunk, (ctok, ptok))
+                    tokens_cached = _cache_info_from_chunk(chunk, tokens_cached)
     except _UpstreamError as e:
         return web.json_response(_failure_body(model, e.body.decode("utf-8", "ignore")),
                                   status=_upstream_status(e))
@@ -627,6 +699,7 @@ async def ollama_chat(request: web.Request) -> web.StreamResponse:
     await resp.write((json.dumps(final) + "\n").encode())
     await resp.write_eof()
     _record_tok_s(model, t_first, t_last, ctok)
+    _record_prompt_cache(model, t_start, t_first, ptok, tokens_cached)
     return resp
 
 
@@ -874,6 +947,18 @@ async def openai_passthrough(request: web.Request) -> web.StreamResponse:
     # the client-facing stream, not after — previously this route prepared a
     # 200 SSE response before even opening the upstream connection, so any
     # upstream 4xx/5xx was relayed as a 200 with an empty body.
+    # Telemetry (tok_s_measured/prompt_cache) for THIS route: GB-CLI talks
+    # /v1/* directly (BACKEND_REGISTRY's base_url), so this passthrough — not
+    # ollama_generate/ollama_chat — carries its real traffic. raw_chunk is
+    # still written to the client immediately and unmodified on every
+    # iteration (true byte-for-byte passthrough, untouched); _telemetry_buf
+    # is a SEPARATE accumulation of the same bytes, parsed only after the
+    # response completes, so a parse failure can never affect what was
+    # already forwarded.
+    is_completions_path = path in ("chat/completions", "completions")
+    t_start = time.monotonic()
+    t_first = t_last = None
+    _telemetry_buf = bytearray() if is_completions_path else None
     try:
         async with SESSION.post(url, data=body, headers=headers) as r:
             if r.status >= 400:
@@ -885,10 +970,20 @@ async def openai_passthrough(request: web.Request) -> web.StreamResponse:
                 async for raw_chunk in r.content.iter_any():
                     if raw_chunk:
                         watch.mark()
+                        now = time.monotonic()
+                        if t_first is None:
+                            t_first = now
+                        t_last = now
+                        if _telemetry_buf is not None:
+                            _telemetry_buf.extend(raw_chunk)
                     await resp.write(raw_chunk)
     except (aiohttp.ClientError, TimeoutError) as e:
         return web.json_response(_failure_body(req_model, str(e)), status=502)
     await resp.write_eof()
+    if _telemetry_buf is not None:
+        ctok, ptok, tokens_cached = _parse_sse_telemetry_buffer(bytes(_telemetry_buf))
+        _record_tok_s(req_model, t_first, t_last, ctok)
+        _record_prompt_cache(req_model, t_start, t_first, ptok, tokens_cached)
     return resp
 
 

@@ -215,8 +215,15 @@ class Scheduler:
         return ipc_package
 
     def check_preempt(self, num_tokens_to_allocate):
+        # GREENBOOST PATCH (2026-07-29, see NOTICE): a pure-recurrent model
+        # (Mamba-2, num_pages=0) has no page-based cache to preempt at all
+        # -- there is nothing this function's page-pressure logic applies
+        # to. Guards the case robustly even though the len(seqs_to_decode)
+        # == 0 check already happens to short-circuit this on a fresh
+        # server's very first request.
         if (
-            self.get_num_free_pages() >= num_tokens_to_allocate
+            self.memory_manager.num_pages == 0
+            or self.get_num_free_pages() >= num_tokens_to_allocate
             or len(self.seqs_to_decode) == 0
         ):
             return
@@ -445,7 +452,15 @@ class Scheduler:
                 seq.computed_token_num + seq.to_compute_token_num + self.page_size - 1
             ) // self.page_size
             pages_to_alloc = max(0, pages_needed_total - pages_have)
-            if pages_to_alloc > self.get_num_free_pages() - reserve_pages:
+            # GREENBOOST PATCH (2026-07-29, see NOTICE): a pure-recurrent
+            # model (Mamba-2, num_pages=0 -- no KV cache at all) has no
+            # page-based capacity constraint; this guard always fired (0
+            # free pages, any positive requirement exceeds it), permanently
+            # blocking admission -- an infinite silent hang (#wait stuck at
+            # 1, #run stuck at 0), not a crash. The SSM working-slot check
+            # above (ssm_seg.num_free_working()) is this model's real, and
+            # already-enforced, admission gate.
+            if self.memory_manager.num_pages > 0 and pages_to_alloc > self.get_num_free_pages() - reserve_pages:
                 # Undo the per-step bookkeeping and park this seq for a later
                 # round. Its cached-prefix pages stay in ``page_table`` (a
                 # sibling in this batch may share them); they are reclaimed
@@ -511,10 +526,18 @@ class Scheduler:
 
         # prefill: only admit into the page headroom left *after* reserving for
         # the in-flight decode batch's projected growth (anti-preemption).
-        num_tokens_budget = min(
-            num_tokens_budget,
-            self.page_size * max(self.get_num_free_pages() - reserve_pages, 0),
-        )
+        # GREENBOOST PATCH (2026-07-29, see NOTICE): a pure-recurrent model
+        # (Mamba-2, num_pages=0) has no page-based capacity at all -- this
+        # clamp always computed 0 (0 free pages, any positive reserve),
+        # zeroing the prefill token budget on every tick and permanently
+        # starving admission. Skip the clamp entirely when there is no page
+        # pool; schedule_prefill_batch's own SSM-slot check is this model's
+        # real admission gate.
+        if self.memory_manager.num_pages > 0:
+            num_tokens_budget = min(
+                num_tokens_budget,
+                self.page_size * max(self.get_num_free_pages() - reserve_pages, 0),
+            )
 
         prefill_batch, prefill_batched_token_nums = self.schedule_prefill_batch(
             num_tokens_budget,

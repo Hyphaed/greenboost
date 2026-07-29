@@ -10,6 +10,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import gb_synapse as gs
@@ -150,6 +152,15 @@ def test_pull_torch_gptq_checkpoint_ignores_conflicting_token(monkeypatch, tmp_p
     import huggingface_hub
     monkeypatch.setattr(huggingface_hub, "snapshot_download",
                         _fake_snapshot_download(str(tmp_path)))
+    # _check_torch_engine_capability's pre-download gate (2026-07-28) calls
+    # read_quant_config(repo) BEFORE snapshot_download — for a bare repo id
+    # that resolves to hf_hub_download(filename="config.json"), which this
+    # test previously left unmocked (only snapshot_download was), so it made
+    # a real, unmocked HF Hub network call. Point it at the same local
+    # config.json the rest of this test already sets up.
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download",
+                        lambda repo_id, filename, token=None, cache_dir=None:
+                        str(tmp_path / filename))
     monkeypatch.setattr(gs, "_load_manifest", lambda: {})
     monkeypatch.setattr(gs, "_save_manifest", lambda m: None)
 
@@ -169,6 +180,12 @@ def test_pull_torch_plain_checkpoint_uses_requested_token(monkeypatch, tmp_path)
     import huggingface_hub
     monkeypatch.setattr(huggingface_hub, "snapshot_download",
                         _fake_snapshot_download(str(tmp_path)))
+    # See test_pull_torch_gptq_checkpoint_ignores_conflicting_token's comment:
+    # the pre-download capability gate needs hf_hub_download mocked too, not
+    # just snapshot_download, to stay hermetic.
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download",
+                        lambda repo_id, filename, token=None, cache_dir=None:
+                        str(tmp_path / filename))
     monkeypatch.setattr(gs, "_load_manifest", lambda: {})
     monkeypatch.setattr(gs, "_save_manifest", lambda m: None)
 
@@ -184,8 +201,178 @@ def test_pull_torch_plain_checkpoint_no_token_defaults_bf16(monkeypatch, tmp_pat
     import huggingface_hub
     monkeypatch.setattr(huggingface_hub, "snapshot_download",
                         _fake_snapshot_download(str(tmp_path)))
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download",
+                        lambda repo_id, filename, token=None, cache_dir=None:
+                        str(tmp_path / filename))
     monkeypatch.setattr(gs, "_load_manifest", lambda: {})
     monkeypatch.setattr(gs, "_save_manifest", lambda m: None)
 
     entry = gs._pull_torch("org/plain-repo", "", None)
     assert entry.quant == "BF16"
+
+
+# ---------------------------------------------------------------------------
+# _manifest_lookup / _resolve_model — repo-aware, offline resolution
+#
+# Real incident, 2026-07-28: every HF-pulled manifest entry is keyed by the
+# repo's BARE name (`name or repo.split("/")[-1]`), never by "org/name", but
+# _resolve_model only ever checked `spec in manifest` — so typing a model's
+# real "org/repo" spelling (exactly what `pull()`/`list`/the model card show)
+# missed the manifest entirely and fell into the "/" in spec branch, which
+# calls pull() — a network operation — for a model already on disk. A model
+# pulled and served OK 18 times failed with a bare
+# "No module named 'huggingface_hub'" the moment its org prefix was typed.
+# ---------------------------------------------------------------------------
+
+def _entry(name, repo="", quant="", **kw):
+    return gs.ModelEntry(name=name, path=f"/fake/{name}", source="hf",
+                         repo=repo, quant=quant, engine="llama.cpp", **kw)
+
+
+def test_manifest_lookup_finds_entry_by_repo_field(monkeypatch):
+    manifest = {
+        "Qwen3.6-27B-Fable-Fusion-711-GGUF": _entry(
+            "Qwen3.6-27B-Fable-Fusion-711-GGUF",
+            repo="DavidAU/Qwen3.6-27B-Fable-Fusion-711-Uncensored-Heretic-NM-DAU-NEO-MAX-MTP-GGUF",
+            quant="LOW-MTP-IQ4_XS"),
+    }
+    hit = gs._manifest_lookup(
+        "DavidAU/Qwen3.6-27B-Fable-Fusion-711-Uncensored-Heretic-NM-DAU-NEO-MAX-MTP-GGUF",
+        manifest)
+    assert hit is not None
+    assert hit.name == "Qwen3.6-27B-Fable-Fusion-711-GGUF"
+
+
+def test_manifest_lookup_is_case_insensitive(monkeypatch):
+    manifest = {"Foo-GGUF": _entry("Foo-GGUF", repo="Org/Foo-GGUF")}
+    assert gs._manifest_lookup("org/foo-gguf", manifest) is not None
+    assert gs._manifest_lookup("FOO-GGUF", manifest) is not None
+
+
+def test_manifest_lookup_repo_quant_spec_matches_single_candidate():
+    manifest = {"Foo-GGUF": _entry("Foo-GGUF", repo="org/Foo-GGUF", quant="Q4_K_M")}
+    hit = gs._manifest_lookup("org/Foo-GGUF:Q4_K_M", manifest)
+    assert hit is not None and hit.name == "Foo-GGUF"
+
+
+def test_manifest_lookup_ambiguous_quant_raises_value_error():
+    manifest = {
+        "variant-a": _entry("variant-a", repo="org/Foo-GGUF", quant="MTP-Q4_K_M"),
+        "variant-b": _entry("variant-b", repo="org/Foo-GGUF", quant="Q4_K_M"),
+    }
+    with pytest.raises(ValueError, match="matches more than one manifest entry"):
+        gs._manifest_lookup("org/Foo-GGUF:Q4_K_M", manifest)
+
+
+def test_manifest_lookup_no_match_returns_none():
+    manifest = {"Foo-GGUF": _entry("Foo-GGUF", repo="org/Foo-GGUF")}
+    assert gs._manifest_lookup("org/Bar-GGUF", manifest) is None
+
+
+def test_resolve_model_org_prefixed_spec_resolves_offline(monkeypatch):
+    """The exact reported failure: an already-pulled model's real
+    "org/repo" spelling must resolve from the manifest ALONE — with
+    huggingface_hub import forcibly broken, proving no network path is
+    touched."""
+    entry = _entry("Qwen3.6-27B-Fable-Fusion-711-GGUF",
+                   repo="DavidAU/Qwen3.6-27B-Fable-Fusion-711-Uncensored-Heretic-NM-DAU-NEO-MAX-MTP-GGUF",
+                   quant="LOW-MTP-IQ4_XS")
+    monkeypatch.setattr(gs, "_load_manifest", lambda: {entry.name: entry})
+
+    def _boom():
+        raise AssertionError("must not import huggingface_hub for an already-pulled model")
+    monkeypatch.setattr(gs, "_require_huggingface_hub", _boom)
+
+    hit = gs._resolve_model(
+        "DavidAU/Qwen3.6-27B-Fable-Fusion-711-Uncensored-Heretic-NM-DAU-NEO-MAX-MTP-GGUF")
+    assert hit.name == entry.name
+
+
+def test_resolve_model_unknown_bare_name_suggests_org_prefix(monkeypatch):
+    monkeypatch.setattr(gs, "_load_manifest", lambda: {})
+    monkeypatch.setattr(gs, "ollama_model_blob", lambda spec: None)
+    with pytest.raises(KeyError, match="include the org prefix"):
+        gs._resolve_model("Some-Model-Nobody-Has")
+
+
+def test_resolve_model_unknown_name_hints_similar_entry(monkeypatch):
+    entry = _entry("Qwen3.6-27B-Fable-Fusion-711-GGUF",
+                   repo="DavidAU/Qwen3.6-27B-Fable-Fusion-711-GGUF")
+    monkeypatch.setattr(gs, "_load_manifest", lambda: {entry.name: entry})
+    monkeypatch.setattr(gs, "ollama_model_blob", lambda spec: None)
+    with pytest.raises(KeyError, match="did you mean"):
+        gs._resolve_model("Qwen3.6-27B-Fable-Fusion-711")
+
+
+# ---------------------------------------------------------------------------
+# _check_torch_engine_capability — refuse before download, not after
+#
+# gLLM's own layer dispatch (gllm/layers/linear.py) only has real code paths
+# for quant_method in {None, "fp8", "gptq", "awq"} — anything else (verified
+# live against Brian6145/Qwen3.6-27B-Claude-Opus-Sonnet-Distilled-NVFP4-MTP's
+# raw config.json: quantization_config.quant_method == "compressed-tensors")
+# hits gLLM's own `raise Exception("gLLM do not support quant_method ...")`.
+# These tests point `read_quant_config` at a real local directory (its
+# `Path(path_or_repo).is_dir()` branch) so nothing here touches the network.
+# ---------------------------------------------------------------------------
+
+def _write_config(tmp_path, quantization_config):
+    (tmp_path / "config.json").write_text(json.dumps(
+        {"model_type": "qwen3", "quantization_config": quantization_config}))
+    return str(tmp_path)
+
+
+def test_capability_gate_refuses_nvfp4_compressed_tensors(monkeypatch, tmp_path):
+    monkeypatch.setattr(gsb, "_torch_env_dir", lambda: Path("/fake/torch-env"))
+    repo_dir = _write_config(tmp_path, {
+        "quant_method": "compressed-tensors", "format": "nvfp4-pack-quantized",
+        "config_groups": {"group_0": {"weights": {"type": "float", "num_bits": 4}}}})
+    with pytest.raises(RuntimeError, match="nvfp4"):
+        gs._check_torch_engine_capability(repo_dir, "torch")
+
+
+def test_capability_gate_allows_real_fp8_compressed_tensors(monkeypatch, tmp_path):
+    monkeypatch.setattr(gsb, "_torch_env_dir", lambda: Path("/fake/torch-env"))
+    repo_dir = _write_config(tmp_path, {
+        "quant_method": "compressed-tensors",
+        "config_groups": {"group_0": {"weights": {"type": "float", "num_bits": 8}}}})
+    gs._check_torch_engine_capability(repo_dir, "torch")  # must not raise
+
+
+def test_capability_gate_allows_gptq(monkeypatch, tmp_path):
+    monkeypatch.setattr(gsb, "_torch_env_dir", lambda: Path("/fake/torch-env"))
+    repo_dir = _write_config(tmp_path, {"quant_method": "gptq", "bits": 4})
+    gs._check_torch_engine_capability(repo_dir, "torch")  # must not raise
+
+
+def test_capability_gate_skipped_when_torch_engine_not_installed(monkeypatch, tmp_path):
+    """No gLLM installed -> select_backend would fall back to
+    TransformersBackend, which may genuinely load compressed-tensors/nvfp4
+    via `transformers`+`compressed_tensors` — untested, out of scope, so the
+    gate must not block that fallback path."""
+    monkeypatch.setattr(gsb, "_torch_env_dir", lambda: None)
+    repo_dir = _write_config(tmp_path, {
+        "quant_method": "compressed-tensors", "format": "nvfp4-pack-quantized",
+        "config_groups": {"group_0": {"weights": {"type": "float", "num_bits": 4}}}})
+    gs._check_torch_engine_capability(repo_dir, "torch")  # must not raise
+
+
+def test_read_quant_config_distinguishes_nvfp4_from_real_fp8(tmp_path):
+    """Both nvfp4 and real fp8 compressed-tensors exports carry
+    weights.type == "float" — only num_bits (4 vs 8) tells them apart. Before
+    this fix, any float-typed group was bucketed as "fp8", which would have
+    defeated the capability gate for exactly the nvfp4 checkpoint it exists
+    to catch (confirmed live, 2026-07-28)."""
+    nvfp4_dir = tmp_path / "nvfp4"
+    nvfp4_dir.mkdir()
+    _write_config(nvfp4_dir, {
+        "quant_method": "compressed-tensors", "format": "nvfp4-pack-quantized",
+        "config_groups": {"group_0": {"weights": {"type": "float", "num_bits": 4}}}})
+    assert gs.read_quant_config(str(nvfp4_dir)) == {"quant_method": "nvfp4", "quant_bits": 4}
+
+    fp8_dir = tmp_path / "fp8"
+    fp8_dir.mkdir()
+    _write_config(fp8_dir, {
+        "quant_method": "compressed-tensors",
+        "config_groups": {"group_0": {"weights": {"type": "float", "num_bits": 8}}}})
+    assert gs.read_quant_config(str(fp8_dir)) == {"quant_method": "fp8", "quant_bits": 8}

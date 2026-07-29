@@ -11,6 +11,7 @@ names as the first positional argument:
   gb compress           [--target-chars N] (reads stdin)
   gb skill-route "<q>"  --skills-dir PATH [--top-k N] [--min-score X] [--json]
   gb tokens [show|reset] [--project NAME] [--json]
+  gb semantics <answer|resolve|segments|metrics|card> ["<query>"] [--entity ID] [--json]
 
 Each handler:
   - Parses its own argv (everything after the subcommand name).
@@ -41,7 +42,7 @@ HEADLESS_SUBCOMMANDS = {
     "clear-memory-pool",
     "crag-add", "crag-search", "crag-status", "crag-clear",
     "convert",
-    "compress", "skill-route", "tokens",
+    "compress", "skill-route", "tokens", "semantics",
     # AI Factory plane
     "factory-submit", "factory-status", "factory-list",
     "factory-pause", "factory-resume", "factory-agents",
@@ -431,6 +432,56 @@ def cmd_skill_route(argv: list[str]) -> int:
         for h in hits:
             print(f"  {h.score:>5.2f}  {h.name:<40}  ({h.reason})")
             print(f"         {h.description[:120]}")
+    return 0
+
+
+# ── semantics ─────────────────────────────────────────────────────────────────
+# Bridge into the sibling greenboost repo's GB-Semantics engine (gb_semantics.py
+# + semantics/*.yaml) via gb_paths.gb_module — the same resolution
+# (GB_PY_ROOT -> Full Install destination -> dev checkout) context_builder.py's
+# _greenboost_context() already uses for gb_monitor. This is the mandatory
+# default path for any GreenBoost-state question (.claude/skills/gb-semantics/
+# SKILL.md); optimal-claude's build_system_extras() calls `gb semantics card`
+# for its own system-prompt injection.
+
+def cmd_semantics(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="gb semantics", add_help=True)
+    p.add_argument("action", choices=["answer", "resolve", "segments", "metrics", "card"])
+    p.add_argument("query", nargs="?", default="")
+    p.add_argument("--entity", default=None)
+    p.add_argument("--json", action="store_true")
+    args = p.parse_args(argv)
+
+    from greenboost_cli.gb_paths import gb_module, gb_root_hint
+    try:
+        gs = gb_module("gb_semantics")
+    except Exception as e:
+        _emit_err(f"GB-Semantics unavailable ({e}) — {gb_root_hint()}")
+        return 1
+
+    query = _cap(args.query, _MAX_QUERY_LEN) if args.query else ""
+
+    if args.action == "card":
+        print(gs.card())
+        return 0
+
+    if args.action == "answer":
+        result = gs.answer(query)
+    elif args.action == "resolve":
+        result = gs.resolve(query, entity_id=args.entity)
+    elif args.action == "segments":
+        L = gs.load()
+        result = (gs.evaluate_segment(query) if query else
+                  {seg: gs.evaluate_segment(seg) for seg in L["segments"]})
+    else:  # metrics
+        L = gs.load()
+        result = ({"matches": gs.discover(query)} if query else
+                  {"metrics": sorted(L["metrics"]), "segments": sorted(L["segments"])})
+
+    if args.json:
+        _emit_json(result)
+    else:
+        print(json.dumps(result, indent=2, default=str))
     return 0
 
 
@@ -871,6 +922,7 @@ _DISPATCH = {
     "compress":     cmd_compress,
     "skill-route":  cmd_skill_route,
     "tokens":       cmd_tokens,
+    "semantics":    cmd_semantics,
     # Skill management
     "skill-list":   cmd_skill_list,
     "skill-show":   cmd_skill_show,

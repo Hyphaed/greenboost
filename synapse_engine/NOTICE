@@ -482,6 +482,188 @@ own changes at a glance.
   still true and still worth keeping on record (real, reproducible
   findings), just not the fix this investigation was looking for.
 
+- 2026-07-29: Mamba-2 native support added -- `gllm/models/mamba.py` (new
+  file, GreenBoost addition, not an upstream file): `Mamba2Mixer`/
+  `Mamba2DecoderLayer`/`Mamba2Model`/`Mamba2ForCausalLM`, following
+  `models/qwen3_5.py`'s structure for the pure-recurrent case (no
+  interleaved full-attention layers, `num_kv_layers=0` always). Registered
+  in `model_loader.py` (import + `get_model_type()` branch +
+  `use_hybrid_state` list).
+
+  Kernel vendoring, `gllm/layers/ops/mamba/` (new files, GreenBoost
+  additions): the SSD (structured state-space duality) chunked prefill
+  scan (`ssd_bmm.py`, `ssd_chunk_state.py`, `ssd_chunk_scan.py`,
+  `ssd_state_passing.py`, `ssd_combined.py`, `triton_helpers.py`) and the
+  fused-recurrent decode-step kernel (`mamba2_decode.py`, renamed from
+  upstream's `mamba_ssm.py` to avoid confusion with the PyPI `mamba_ssm`
+  package, which this repo does not depend on) are vendored VERBATIM from
+  `vllm/model_executor/layers/mamba/ops/` (Apache-2.0, itself adapted from
+  `https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/`),
+  not hand-written -- a subtly-wrong SSD scan produces silently-corrupt
+  output, not a crash, so reusing Tri Dao/Albert Gu's own battle-tested
+  Triton source (the same reuse-validated-kernel pattern already used for
+  GPTQ/AWQ dequant via the vendored `gptqmodel` Triton kernel) was the
+  deliberate choice over writing new numerically-sensitive kernel math
+  under time pressure. Zero new pip dependencies -- `einops`/`packaging`
+  were already present. Two deliberate deviations from upstream, both
+  GPU-only-appropriate for this codebase:
+    1. `ssd_combined.py`: the trailing `current_platform.is_cpu()` override
+       block (swaps in a CPU-only kernel) is dropped entirely --
+       GreenBoost's Immutable Design Rule forbids CPU tensor compute
+       outright, so the Triton-only path is always used, unconditionally.
+    2. `mamba2_decode.py`: `selective_scan_fn` (the older Mamba-1 API) and
+       its CPU/XPU fallback branches are dropped -- Mamba-2's decode only
+       needs `selective_state_update`, and `selective_scan_fn` pulled in a
+       compiled-CUDA-extension dependency (`vllm._custom_ops.
+       selective_scan_fwd`) with no reason to build here. Also simplified:
+       the benchmark-tuned per-GPU JSON config lookup for the decode
+       kernel's launch config is replaced by calling the hard-coded
+       `_get_default_ssm_launch_config` heuristic directly -- upstream
+       itself falls back to exactly this heuristic whenever no config file
+       is found, which is the *only* outcome possible here since the
+       tuned-config JSON tree was never vendored (a real, documented
+       perf-tuning gap, not a correctness one).
+  `causal_conv1d_triton.py` (already vendored for GDN) is reused as-is --
+  GDN and Mamba-2 use the identical short causal depthwise convolution.
+
+  A chunk-boundary metadata helper, `_compute_chunk_metadata()` in
+  `mamba.py` itself (plain Python, not vendored), derives
+  `cu_chunk_seqlens`/`last_chunk_indices`/`seq_idx` from the packed varlen
+  `query_start_loc` gLLM already computes for FlashAttention/GDN -- vLLM
+  precomputes the equivalent in its own attention-metadata builder, a
+  scheduler-integrated component gLLM has no equivalent of for the SSD
+  chunk boundary specifically.
+
+  **Two real correctness bugs found via a live next-token divergence
+  investigation** (gLLM predicted " assertEquals"/garbage-repetition for
+  "The capital of France is" against `AntonV/mamba2-130m-hf`; HF's own
+  reference predicted the sane " a"/" in"/" the") — isolated by a direct
+  tensor-level comparison against `transformers/models/mamba2/
+  modeling_mamba2.py` (fetched and read directly, not assumed), calling
+  the vendored kernels with HF's own weights to prove the KERNELS were
+  correct before concluding the bug was in the model-file glue code:
+    1. `Mamba2Mixer.norm` was constructed with `norm_before_gate=True,
+       group_size=self.head_dim` — copied verbatim from
+       `Qwen3_5GatedDeltaNet`'s gated-norm convention without re-deriving
+       it for Mamba-2. HF's real `MambaRMSNormGated.forward()` computes
+       `norm(x * silu(gate))` (gate applied BEFORE norm, variance over the
+       FULL width) — the OPPOSITE order, and NOT grouped. Fixed:
+       `group_size=None, norm_before_gate=False`.
+    2. `_rmsnorm_for()` (the plain decoder-level pre-mixer/final norm) used
+       `gllm.layers.layernorm.GemmaRMSNorm` purely for its convenient
+       `(x)->x`/`(x,residual)->(x,residual)` call signature, without
+       checking its NORMALIZATION MATH: `GemmaRMSNorm` interprets its
+       stored weight as `(weight + 1)` at runtime (correct for Qwen3.5,
+       trained Gemma-style) — wrong for Mamba-2's real checkpoints (plain
+       `weight * normalize(x)`, confirmed against the HF source). Fixed:
+       swapped to `gllm.layers.layernorm.RMSNorm` (same file, identical
+       call signature, standard math).
+  Live-verified after both fixes: a direct tensor comparison of layer 0's
+  mixer output against HF's own `mixer_ref()` call on identical input
+  (weights copied verbatim, bypassing gLLM's own weight loader) matched to
+  `mean abs diff: 0.0046` (bf16 rounding noise). End-to-end: real
+  `/v1/completions` requests through the live gb-synapse proxy now produce
+  coherent English ("a city of the French people, and the capital of the
+  French Republic...") at ~77 tok/s on an RTX 5070, confirmed via
+  `nvidia-smi` polling to be genuine GPU compute (not a silent CPU
+  fallback — a hypothesis raised and disproven with concrete evidence: the
+  "Triton is not supported on current platform, roll back to CPU"
+  warning seen in logs is real but gates only unrelated tuning flags
+  (TF32, Hopper-specific paths) in `gllm/layers/ops/fla/utils.py`, not
+  actual compute placement — verified by reading every kernel file's own
+  CPU-branch gating, all of which are either absent (this vendored SSD/
+  decode/conv code) or dead-code (`layernorm_gated.py`'s `_use_cpu`, which
+  requires `cpu_has_amx_support()`, a hardcoded-`False` stub).
+
+  **Four orthogonal, pre-existing gLLM engine bugs found and fixed along
+  the way** — none specific to Mamba-2's math, all hit because this was
+  the first-ever `num_kv_layers=0` (truly zero real KV cache, not just a
+  hybrid with fewer KV layers) model to run through this engine:
+    - `model_loader.py:load_config()`: a bare `assert hasattr(self.config,
+      "text_config")` crashed on checkpoints with neither `dtype` nor
+      `text_config` (confirmed live: `AntonV/mamba2-130m-hf`'s config.json
+      has neither). Now falls back to `torch.bfloat16` with a logged
+      warning instead of asserting.
+    - `memory_manager.py`: `MemoryManager.init()` divided by
+      `get_sizeof_KV_per_page()` (legitimately 0 when `num_layers=0`) —
+      `ZeroDivisionError` on every load. `Segment.get_memory_util()` and
+      `MemoryManager.get_memory_free()` had the same unguarded-zero-
+      denominator shape for their own scheduler-logging divisions.
+      `pre_allocate_page()` (both the base and `PrefixMemoryManager`
+      overrides) now no-ops when `num_pages == 0` instead of calling
+      `segment.allocate()` on an empty pool.
+    - `scheduler.py` (`chunked_prefill`/`schedule_prefill_batch`/
+      `check_preempt`): three page-budget admission checks unconditionally
+      computed `page_size * max(free_pages - reserve_pages, 0)`-shaped
+      expressions that always evaluate to zero when there is no page pool
+      at all, permanently starving admission — an infinite silent hang
+      (`#wait` stuck at 1, `#run` stuck at 0), not a crash. All three now
+      skip the page-budget clamp when `self.memory_manager.num_pages == 0`
+      and rely on the SSM working-slot check (already present, already
+      correct) as the real admission gate for a pure-recurrent model.
+    - `input_data.py::_cal_slot_mapping()`: indexed into every seq's
+      (correctly empty) `page_table` unconditionally —
+      `IndexError: index 0 is out of bounds for axis 0 with size 0`. Now
+      zero-fills and returns early when there's no real KV cache (the
+      slot mapping is never consumed by anything for a model with no
+      FlashAttention layer). The zero-page check here uses
+      `getattr(self.memory_manager, "num_pages", 0)` rather than a direct
+      attribute access — matching this same file's own existing
+      `getattr(self.memory_manager, "segment", None)` pattern a few lines
+      up — because this code runs in the overlap-worker subprocess, where
+      `num_pages` was observed not yet present as a plain attribute at the
+      point this runs (a cross-process initialization-order detail not
+      fully root-caused; the defensive default is safe and sufficient
+      regardless of the exact cause).
+
+- 2026-07-29 (later the same day): quantized (GPTQ/AWQ/FP8) in_proj weight
+  loading added to `mamba.py`. The bf16 path above never handled this:
+  `_load_mamba2_layer_weights` only knew a plain float `in_proj.weight`/
+  `in_proj.bias`, and for GPTQ/AWQ (`in_proj.weight` registered `None`,
+  real data under `qweight`/`qzeros`/`scales`/`g_idx`) the pre-pass's
+  existence guard checked only for `in_proj.weight` — a quantized
+  checkpoint's ENTIRE mixer (in_proj + A_log/D/dt_bias) was silently
+  skipped, left at random init, no crash. New `_split_tp_concat()`
+  generalizes the existing split-before-TP-slice principle to any axis;
+  `_load_mamba2_in_proj_gptq_awq()` and `_load_mamba2_in_proj_fp8()`
+  dispatch per `quant_method`, each handling its own tensor kind's real
+  packing/out-axis convention (GPTQ packs qweight on the input axis, AWQ
+  and both methods' qzeros pack the output axis, fp8 weight is byte-per-
+  value like plain float, fp8 block-quant `weight_scale_inv` is a real
+  block grid) — see `workflow/known-issues.md`'s "quantized Mamba-2 weight
+  loading" entry for the full per-tensor breakdown. `_require_divisible()`
+  raises `NotImplementedError` rather than silently corrupting a
+  checkpoint whose segment boundaries don't align to a pack_factor/
+  block_n word, matching `gptq.py`/`awq.py`'s own existing "raise, don't
+  guess" convention for unsupported formats.
+
+  No real GPTQ/AWQ/FP8 Mamba-2 checkpoint exists publicly to verify this
+  end-to-end (unlike the bf16 path's real live-served checkpoint above) —
+  verified instead via `tests/test_synapse_engine_mamba2_quant.py` (15
+  tests: hand-computed reference slices for the split/TP-chunk math,
+  full GPTQ/AWQ/FP8-block round-trips against synthetic tensors at
+  tp_size 1 and 2, and the divisibility guard actually raising on a
+  misaligned boundary). Index-math verification, not a real-checkpoint
+  correctness proof.
+
+- 2026-07-29 (later still): `model_loader.py::load_config()` patch #2 —
+  `self.architecture = self.config.architectures[0]` had no fallback for a
+  checkpoint with no `architectures` key at all. Found live serving a
+  genuinely larger Mamba-2 checkpoint (`AntonV/mamba2-2.7b-hf`, the first
+  Phase-2 follow-up item) than the 130M one already verified: HF's
+  `PretrainedConfig.architectures` defaults to `None` (not `[]`) when the
+  config omits the key, so `None[0]` crashed the load with `TypeError`
+  before this file's own Mamba-2 registration ever got a chance to run.
+  Fixed with a small `model_type -> real class name` fallback map (see
+  `gb_synapse.py`'s matching `_ARCH_FROM_MODEL_TYPE` fix and
+  `workflow/known-issues.md`'s "larger Mamba-2 checkpoint" entry for the
+  full account, including a second, unrelated `gb_synapse_backends.py` fix
+  the same investigation needed — gLLM's `--maxd` was never wired from
+  `n_slots`, so its hardcoded 512-slot default demanded 81.1 GB of
+  recurrent-state pool against ~4 GB actually free after loading this
+  model's weights). Live-verified: coherent generation at 24.35 tok/s on
+  an RTX 5070 after both fixes.
+
 Why `synapse_engine/logger.py` exists
 --------------------------------------
 Upstream `gllm/` does `from logger import logger` in ~22 files, expecting

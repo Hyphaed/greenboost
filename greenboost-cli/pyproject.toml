@@ -18,6 +18,17 @@ dependencies = [
     "numpy>=1.26.0",
     "scrapling[fetchers]>=0.4.8",
     "prompt_toolkit>=3.0",
+    # gb_synapse.py runs in-process inside this venv (backend_cmds.py's
+    # greenboost.pth bridge) — both are genuine runtime deps of that import,
+    # not optional extras: huggingface_hub for pulling/inspecting HF models
+    # (gb_synapse.py's list_repo_gguf/_pull_torch/_pull_diffusers/pull/
+    # read_quant_config), aiohttp for gb_synapse_api.py, the proxy gb_synapse
+    # spawns under this same interpreter (sys.executable) to front :11435.
+    # Real incident, 2026-07-28: both were missing from cli-venv — the first
+    # broke every HF pull with a bare ModuleNotFoundError, the second let the
+    # proxy die on startup while gb-synapse still reported "started".
+    "huggingface_hub>=0.23",
+    "aiohttp>=3.9",
 ]
 
 [project.optional-dependencies]

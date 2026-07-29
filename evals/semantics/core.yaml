@@ -1,0 +1,311 @@
+# evals/semantics/core.yaml — GB-Semantics eval set.
+#
+# Ground truth is pinned to tests/fixtures/semantics/events.py's fixture
+# scenario (a single frozen snapshot of Fable-Fusion-27B serving on a 12 GB
+# RTX 5070, mid-generation, with a deliberate Rule #1 violation baked in —
+# see that file's docstring). tests/test_semantics_evals.py loads the
+# fixture into an isolated dataflux log per test and runs every entry below
+# against the REAL gb_semantics engine — no mocking of resolve()/
+# evaluate_segment()/answer() themselves.
+#
+# `kind: metric` entries with `source: fixture` assert an EXACT value (the
+# resolver reads only the injected fixture events, so the outcome is
+# deterministic on any machine). `source: live` entries only assert the
+# resolver runs without raising and returns a well-formed dict — those
+# resolvers read the ACTUAL box's kernel module / free RAM / running
+# servers, which legitimately differs machine to machine; check_semantics_
+# coverage.py plus these structural checks jointly guard against a renamed/
+# missing resolver, which is the regression class this suite exists to catch.
+#
+# `category: trap` entries additionally carry `trap_raw_field` — the field a
+# naive, ungoverned answer would read instead, and `trap_raw_wrong: true`
+# asserting that field's fixture value, read alone, gives the WRONG verdict.
+# The test runner tallies these as GreenBoost's own before/after number, the
+# local analogue of Anthropic's 21% -> 95%.
+
+# ── metrics, fixture-exact ───────────────────────────────────────────────
+- id: vram_fill_pct_reads_physical_not_virtual
+  kind: metric
+  name: vram_fill_pct
+  source: fixture
+  category: trap
+  question: "Is Rule #1 (90% VRAM) satisfied right now?"
+  expect: {value: 42.3, threshold_state: below_target}
+  trap_raw_field: fb_used_pct
+  trap_raw_value: 97.0
+  trap_raw_wrong: true
+  trap_why: >
+    fb_used_pct=97.0 (virtual, shim-inflated) reads as "essentially full" /
+    Rule #1 satisfied. The real physical figure is 42.3% — Rule #1 is being
+    VIOLATED. Reading the raw field alone reports the opposite of the truth.
+
+- id: t2_pressure_fraction_exact
+  kind: metric
+  name: t2_pressure_fraction
+  source: fixture
+  category: trap
+  question: "What's the current T2 DDR pressure (continuous)?"
+  expect: {value: 0.72, threshold_state: warn}
+  trap_raw_field: t2_pressure_level_thresholds
+  trap_raw_wrong: true
+  trap_why: >
+    0.72 read against the ENUM scale's thresholds (warn_at=1, critical_at=2)
+    would misclassify as "nominal" (0.72 < 1) when the fraction scale's own
+    thresholds (warn_at=0.6) correctly call this "warn". Same field name,
+    two incompatible scales — the exact collision t2_pressure_level's
+    never_use entry documents.
+
+- id: kv_resident_share_exact
+  kind: metric
+  name: kv_resident_share
+  source: fixture
+  expect: {value: 0.3}
+  question: "What share of KV cache is resident in VRAM vs spilled to T2?"
+
+- id: effective_bits_exact
+  kind: metric
+  name: effective_bits
+  source: fixture
+  expect: {value: 8}
+  question: "What bit-width is the served model actually running at?"
+
+- id: meets_fp8_floor_true
+  kind: metric
+  name: meets_fp8_floor
+  source: fixture
+  expect: {value: true}
+  question: "Does the currently-served model meet the fp8 quality floor?"
+
+- id: kv_bits_by_layer_exact
+  kind: metric
+  name: kv_bits_by_layer
+  source: fixture
+  expect: {value_subset: {k_bits: 4, v_bits: 3}}
+  question: "What K/V bit-widths is TurboQuant using?"
+
+- id: tok_s_decode_exact
+  kind: metric
+  name: tok_s_decode
+  source: fixture
+  expect: {value: 5.2}
+  question: "What's the measured decode speed right now?"
+
+- id: ttft_ms_exact
+  kind: metric
+  name: ttft_ms
+  source: fixture
+  expect: {value: 4200.0}
+  question: "What's the time-to-first-token for the current serve session?"
+
+- id: prompt_cache_hit_pct_exact
+  kind: metric
+  name: prompt_cache_hit_pct
+  source: fixture
+  expect: {value: 3.0}
+  question: "What's the prompt-cache hit rate right now?"
+
+- id: feeder_items_exact
+  kind: metric
+  name: feeder_items
+  source: fixture
+  expect: {value_subset: {"feeder1 (192.0.2.10)": 0}}
+  question: "How many items has the connected feeder actually processed?"
+
+- id: link_bw_gbps_no_data
+  kind: metric
+  name: link_bw_gbps
+  source: fixture
+  expect: {value: null}
+  question: "What's the measured host<->feeder link bandwidth?"
+
+# ── metrics, live (structural: resolver runs, well-formed dict) ──────────
+- id: t2_pressure_level_structural
+  kind: metric
+  name: t2_pressure_level
+  source: live
+
+- id: t3_spill_active_mb_structural
+  kind: metric
+  name: t3_spill_active_mb
+  source: live
+
+- id: served_ctx_structural
+  kind: metric
+  name: served_ctx
+  source: live
+
+- id: n_gpu_layers_effective_structural
+  kind: metric
+  name: n_gpu_layers_effective
+  source: live
+
+- id: cluster_vram_fill_pct_structural
+  kind: metric
+  name: cluster_vram_fill_pct
+  source: live
+
+- id: swap_pressure_structural
+  kind: metric
+  name: swap_pressure
+  source: live
+
+- id: iowait_pct_structural
+  kind: metric
+  name: iowait_pct
+  source: live
+
+- id: kmod_loaded_structural
+  kind: metric
+  name: kmod_loaded
+  source: live
+
+- id: shim_fresh_structural
+  kind: metric
+  name: shim_fresh
+  source: live
+
+- id: ssm_state_gb_structural
+  kind: metric
+  name: ssm_state_gb
+  source: live
+
+- id: recurrent_layer_fraction_structural
+  kind: metric
+  name: recurrent_layer_fraction
+  source: live
+
+- id: quant_rel_error_structural
+  kind: metric
+  name: quant_rel_error
+  source: live
+
+# ── segments, fixture-exact ──────────────────────────────────────────────
+- id: rule1_underfilled_matches
+  kind: segment
+  name: rule1_underfilled
+  source: fixture
+  category: trap
+  question: "Is Rule #1 currently violated?"
+  expect: {matched: true}
+
+- id: feeder_idle_while_host_saturated_no_match
+  kind: segment
+  name: feeder_idle_while_host_saturated
+  source: fixture
+  expect: {matched: false}
+  question: "Is a feeder idle while the host is saturated?"
+
+- id: below_quality_floor_no_match
+  kind: segment
+  name: below_quality_floor
+  source: fixture
+  expect: {matched: false}
+  question: "Is the served model below the quality floor?"
+
+- id: prompt_cache_cold_matches
+  kind: segment
+  name: prompt_cache_cold
+  source: fixture
+  expect: {matched: true}
+  question: "Is the prompt cache running cold?"
+
+- id: serve_healthy_no_match
+  kind: segment
+  name: serve_healthy
+  source: fixture
+  expect: {matched: false}
+  question: "Is everything healthy right now?"
+
+# ── segments, live (structural) ───────────────────────────────────────────
+- id: weights_on_t3_structural
+  kind: segment
+  name: weights_on_t3
+  source: live
+
+- id: swap_thrash_not_gpu_throttle_structural
+  kind: segment
+  name: swap_thrash_not_gpu_throttle
+  source: live
+
+- id: kmod_missing_silent_degrade_structural
+  kind: segment
+  name: kmod_missing_silent_degrade
+  source: live
+
+# ── aliases ────────────────────────────────────────────────────────────
+- id: alias_vram_used_pct
+  kind: metric
+  name: vram_used_pct
+  source: fixture
+  expect: {value: 42.3}
+  question: "(alias check) vram_used_pct should resolve the same as vram_fill_pct"
+
+- id: alias_tok_s
+  kind: metric
+  name: tok_s
+  source: fixture
+  expect: {value: 5.2}
+  question: "(alias check) tok_s should resolve the same as tok_s_decode"
+
+- id: alias_t2_fraction
+  kind: metric
+  name: t2_fraction
+  source: fixture
+  expect: {value: 0.72}
+  question: "(alias check) t2_fraction should resolve the same as t2_pressure_fraction"
+
+# ── error paths ───────────────────────────────────────────────────────────
+- id: unknown_metric_errors_cleanly
+  kind: metric
+  name: totally_bogus_metric_xyz
+  source: fixture
+  expect: {governed: false, has_error: true}
+
+- id: unknown_segment_errors_cleanly
+  kind: segment
+  name: totally_bogus_segment_xyz
+  source: fixture
+  expect: {has_error: true}
+
+# ── discovery ─────────────────────────────────────────────────────────────
+- id: discover_finds_vram_metric
+  kind: discover
+  query: "physical vram rule 1"
+  expect: {contains_name: vram_fill_pct}
+
+# ── question routing (answer()) ──────────────────────────────────────────
+- id: answer_rule1_question
+  kind: answer
+  question: "is rule 1 satisfied?"
+  source: fixture
+  expect: {governed: true, intent: is_rule1_satisfied, segment_matched: {rule1_underfilled: true}}
+
+- id: answer_prompt_cache_question
+  kind: answer
+  question: "why is the prompt cache hit rate so low"
+  source: fixture
+  expect: {governed: true, intent: prompt_cache, segment_matched: {prompt_cache_cold: true}}
+
+- id: answer_quality_question
+  kind: answer
+  question: "quality floor check"
+  source: fixture
+  expect: {governed: true, intent: quality_and_quant, segment_matched: {below_quality_floor: false}}
+
+- id: answer_unroutable_question
+  kind: answer
+  question: "what is the meaning of life"
+  source: fixture
+  expect: {governed: false}
+
+- id: answer_cluster_health_question
+  kind: answer
+  question: "how healthy is the cluster right now"
+  source: fixture
+  expect: {governed: true, intent: cluster_health, segment_matched: {feeder_idle_while_host_saturated: false}}
+
+- id: answer_kmod_question
+  kind: answer
+  question: "is greenboost kernel module loaded"
+  source: live
+  expect: {governed: true, intent: kernel_module_state}

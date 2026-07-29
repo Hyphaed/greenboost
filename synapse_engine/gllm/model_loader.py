@@ -14,6 +14,7 @@ from gllm.models.chatglm import ChatGLMForCausalLM
 from gllm.models.deepseek_v2 import DeepseekV2ForCausalLM
 from gllm.models.kimi_k25 import KimiK25ForConditionalGeneration
 from gllm.models.llama import LlamaForCausalLM
+from gllm.models.mamba import Mamba2ForCausalLM
 from gllm.models.mixtral import MixtralForCausalLM
 from gllm.models.qwen2 import Qwen2ForCausalLM
 from gllm.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
@@ -504,10 +505,41 @@ class ModelLoader:
             self.generation_config = GenerationConfig.from_model_config(self.config)
         if self.config.dtype is not None:
             self.dtype = self.config.dtype
-        else:
-            assert hasattr(self.config, "text_config")
+        elif hasattr(self.config, "text_config"):
             self.dtype = self.config.text_config.dtype
-        self.architecture = self.config.architectures[0]
+        else:
+            # GREENBOOST PATCH (2026-07-29, see NOTICE): some real HF
+            # checkpoints (verified live: AntonV/mamba2-130m-hf) set neither
+            # `dtype` nor `torch_dtype` in config.json and have no
+            # `text_config` (plain dense text model, not a VL wrapper) --
+            # this assert crashed the load outright rather than falling
+            # back to a sane default the way every other torch-backend
+            # serve path in this codebase already does. bf16 matches the
+            # GPU-serving default used elsewhere (gb_synapse_backends.py's
+            # own dtype resolution, this repo's fp8-floor quality culture).
+            logger.warning(
+                "config has no dtype/torch_dtype and no text_config -- "
+                "defaulting to bfloat16 (checkpoint: %s)", self.model_path,
+            )
+            self.dtype = torch.bfloat16
+        # GREENBOOST PATCH (2026-07-29, see NOTICE): `architectures` is HF's
+        # real PyTorch class name (e.g. "Mamba2ForCausalLM") but is not
+        # always present -- verified live: AntonV/mamba2-2.7b-hf's
+        # config.json has no `architectures` key at all (unlike the smaller
+        # AntonV/mamba2-130m-hf, which happens to ship one), so
+        # `self.config.architectures` is HF's own `None` default, and
+        # `None[0]` crashed the load outright. `model_type` (a short
+        # lowercase config identifier, e.g. "mamba2") is a DIFFERENT string
+        # from the class name this file's if/elif chain below compares
+        # against -- only mapped for the one model_type this engine's
+        # Mamba-2 support actually targets; add another entry if/when a real
+        # checkpoint needs it, not speculatively.
+        architectures = self.config.architectures
+        if architectures:
+            self.architecture = architectures[0]
+        else:
+            model_type = getattr(self.config, "model_type", "")
+            self.architecture = {"mamba2": "Mamba2ForCausalLM"}.get(model_type, model_type)
         self.vocab_size = get_attr_from_config(self.config, "vocab_size")
         self.hidden_size = get_attr_from_config(self.config, "hidden_size")
         # Mirror ``quantization_config`` across the top-level config and
@@ -560,9 +592,16 @@ class ModelLoader:
     def use_hybrid_state(self):
         """Whether the model has linear-attention (Mamba/GDN) layers that need
         a recurrent-state cache *in addition to* the regular KV cache.
+
+        ``Mamba2ForCausalLM`` is PURE recurrent (num_kv_layers=0, no regular
+        KV cache at all -- see models/mamba.py's module docstring), not
+        "in addition to" like the GDN hybrids this property was originally
+        named for, but it still needs the SAME ssm_cache_config/SSM-pool
+        machinery this flag gates, so it belongs in this list too.
         """
         return self.architecture in ["Qwen3_5ForConditionalGeneration",
-                                     "Qwen3_5MoeForConditionalGeneration"]
+                                     "Qwen3_5MoeForConditionalGeneration",
+                                     "Mamba2ForCausalLM"]
 
     def get_model_type(self):
         model_type = None
@@ -597,6 +636,8 @@ class ModelLoader:
             model_type = Qwen3_5MoeForConditionalGeneration
         elif self.architecture == "KimiK25ForConditionalGeneration":
             model_type = KimiK25ForConditionalGeneration
+        elif self.architecture == "Mamba2ForCausalLM":
+            model_type = Mamba2ForCausalLM
         else:
             raise Exception(f"Unsupported model: {self.architecture}")
         return model_type

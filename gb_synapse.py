@@ -100,6 +100,29 @@ LLAMA_CPP_REMOTE = "https://github.com/ggml-org/llama.cpp"
 CONFIG_DIR = Path("/etc/greenboost/synapse")
 HF_TOKEN_FILE = CONFIG_DIR / "hf_token"
 
+
+def _require_huggingface_hub():
+    """Import and return the huggingface_hub module, or raise an actionable
+    RuntimeError naming the interpreter and the sanctioned fix.
+
+    Real incident, 2026-07-28: gb_synapse runs in-process inside GB-CLI's
+    cli-venv (backend_cmds.py's greenboost.pth bridge), and a bare
+    `from huggingface_hub import ...` surfaced as a bare
+    "No module named 'huggingface_hub'" with no indication of WHICH
+    interpreter was missing it or how to fix it — pip-installing it into the
+    wrong environment (or the developer's own miniforge) would look like a
+    fix but never touch the venv `gb` actually runs under."""
+    try:
+        import huggingface_hub
+        return huggingface_hub
+    except ImportError as e:
+        raise RuntimeError(
+            f"huggingface_hub is not installed in this interpreter "
+            f"({sys.executable}). gb-synapse needs it to pull models from "
+            f"HuggingFace. Reinstall via:\n"
+            f"  sudo ./greenboost_setup.sh   -> option 1 \"Full Install\""
+        ) from e
+
 MODEL_STORE_DIR = Path(os.environ.get("GB_SYNAPSE_MODEL_DIR", "/var/lib/greenboost/synapse/models"))
 MANIFEST_FILE = MODEL_STORE_DIR / "manifest.json"
 
@@ -440,6 +463,40 @@ class ModelEntry:
     # a ~4x KV-size overestimate that was clamping ctx far below what the
     # hardware can actually hold. See gguf_summary()'s computation.
     n_kv_layers: int = 0
+    # Selective-SSM (Mamba/Mamba2/hybrid Gated-DeltaNet) recurrent-state
+    # accounting — the counterpart to n_kv_layers above, added 2026-07-29
+    # for the primary reference workload (Brian6145/Qwen3.6-27B-Claude-
+    # Opus-Sonnet-Distilled-NVFP4-MTP, a Qwen3.6 hybrid: 3 GDN layers per 1
+    # real-attention layer). n_kv_layers alone only EXCLUDES these layers
+    # from the KV-cache term; without these fields their own state — small,
+    # fixed-size, and (per the Mamba paper, arXiv:2312.00752) the hottest
+    # bytes in the model since they're read+written every decode step — is
+    # silently charged as zero everywhere. All default to 0/False so a
+    # manifest entry pulled before this field existed round-trips unchanged
+    # through _load_manifest() (same TypeError trap as dense_bytes/
+    # expert_bytes above, and n_kv_layers before it).
+    #
+    # n_recurrent_layers: layers holding a fixed-size recurrent state
+    # (n_layers - n_kv_layers, but stored explicitly rather than derived so
+    # 0 can mean "no recurrent layers" instead of "field not populated").
+    n_recurrent_layers: int = 0
+    # is_recurrent_only: PURELY recurrent architecture (plain Mamba/Mamba2 —
+    # llama.cpp's llm_arch_is_recurrent()), n_kv_layers == 0 is then the
+    # CORRECT answer (no attention layer at all), not "unknown, assume every
+    # layer is real attention" — see estimate_kv_gb()'s bytes_per_tok==0
+    # fallback and _solve_ctx_and_layers(), both of which must not treat
+    # this case as a metadata gap.
+    is_recurrent_only: bool = False
+    # Recurrent-state geometry, normalized to the same two quantities
+    # regardless of source (see gguf_summary()'s and safetensors_summary()'s
+    # own comments for the per-architecture formula each is derived from):
+    #   ssm_d_conv      — causal-conv1d kernel size
+    #   ssm_conv_width  — channels fed into that conv
+    #   ssm_state_elems — per-layer scalar element count of the temporal/
+    #                     recurrent state tensor (excludes the conv state)
+    ssm_d_conv: int = 0
+    ssm_conv_width: int = 0
+    ssm_state_elems: int = 0
     added_ts: float = 0.0
 
 
@@ -532,7 +589,7 @@ def list_repo_gguf(repo: str) -> list[dict]:
     live: satgeze/Qwen3.6-35B-Uncensored-HauhauCS-1M-GGUF's manifest entry
     pointed at mmproj-qwen36-hauhau-f16.gguf, arch "clip", 0.84 GB — not the
     35B model at all)."""
-    from huggingface_hub import HfApi
+    HfApi = _require_huggingface_hub().HfApi
     api = HfApi(token=hf_token())
     info = api.model_info(repo, files_metadata=True)
     return [{"filename": s.rfilename, "size": s.size or 0}
@@ -620,7 +677,7 @@ def _pull_and_convert(repo: str, quant: str, name: str | None) -> ModelEntry:
                             "built — run: greenboost synapse build-engine")
     quant = (quant or "Q4_K_M").upper()
 
-    from huggingface_hub import snapshot_download
+    snapshot_download = _require_huggingface_hub().snapshot_download
     cache_dir = str(MODEL_STORE_DIR / "_hf_cache")
     converted_dir = MODEL_STORE_DIR / "_converted"
     safe_stem = repo.replace("/", "__")
@@ -682,6 +739,57 @@ def _quant_display_token(quant_method: str, quant_bits: int) -> str:
     return tmpl.format(bits=quant_bits) if tmpl else ""
 
 
+# Quant-method families gLLM's own layer dispatch cannot consume.
+# gllm/layers/linear.py's create_weights/dispatch_quant_method only has real
+# code paths for quant_method in {None, "fp8", "gptq", "awq"} — anything else
+# hits `raise Exception(f"gLLM do not support quant_method {...}")`.
+# Confirmed literally (not just via gb_synapse's own normalization) against
+# Brian6145/Qwen3.6-27B-Claude-Opus-Sonnet-Distilled-NVFP4-MTP's raw HF
+# config.json: quantization_config.quant_method == "compressed-tensors"
+# (format "nvfp4-pack-quantized"), 26.59 GiB — that literal string is exactly
+# what would reach gLLM's final `else: raise` after a full snapshot_download.
+# gllm/model_loader.py's own docstring agrees: "gLLM does not consume
+# compressed-tensors metadata directly" (the only exception is a Kimi-K2.5-
+# specific int4-MoE normalization, not a general compressed-tensors path).
+_GLLM_UNSUPPORTED_QUANT_METHODS = {"compressed-tensors", "nvfp4", "bitsandbytes"}
+
+
+def _check_torch_engine_capability(repo: str, engine: str) -> None:
+    """Refuse, before any snapshot_download, a checkpoint whose OWN
+    quant_method the engine that will actually serve it is known in advance
+    to reject — see _GLLM_UNSUPPORTED_QUANT_METHODS. Only gates the "torch"
+    engine when gLLM (SynapseTorchBackend) is actually installed and would be
+    selected; when it isn't, select_backend() falls back to
+    TransformersBackend, which may genuinely load these formats via
+    `transformers`+`compressed_tensors` — untested here and out of scope, so
+    that fallback path is deliberately not gated.
+
+    Best-effort like read_quant_config itself: a metadata gap (network
+    failure, unparseable config, unrecognized shape) returns {} and this
+    silently permits the pull rather than blocking on ambiguity."""
+    if engine != "torch" or not gb_synapse_backends.SynapseTorchBackend().available():
+        return
+    qc = read_quant_config(repo)
+    method = qc.get("quant_method", "")
+    if method not in _GLLM_UNSUPPORTED_QUANT_METHODS:
+        return
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({"kind": "synapse_serve", "status": "capability_refused",
+                          "model": repo, "quant_method": method,
+                          "quant_bits": qc.get("quant_bits", 0), "engine": engine})
+    except Exception:
+        pass
+    raise RuntimeError(
+        f"{repo}: checkpoint is quantized with {method!r} "
+        f"({qc.get('quant_bits', 0)}-bit) — gb-synapse's torch engine (gLLM) "
+        f"only serves fp8/gptq/awq checkpoints natively (gllm/layers/"
+        f"linear.py's quant dispatch has no path for {method!r}). Refusing "
+        f"before downloading rather than failing after. See "
+        f"workflow/known-issues.md."
+    )
+
+
 def _pull_torch(repo: str, quant: str, name: str | None, engine: str = "torch") -> ModelEntry:
     """Fetch the safetensors (or `.bin`) snapshot for torch-core serving
     (the synapse torch engine's on-the-fly native quantization, or the
@@ -700,7 +808,8 @@ def _pull_torch(repo: str, quant: str, name: str | None, engine: str = "torch") 
     engine, falling back to transformers automatically when the torch venv
     isn't installed); pass "transformers" explicitly to pin the fallback
     engine regardless of torch-engine availability."""
-    from huggingface_hub import snapshot_download
+    _check_torch_engine_capability(repo, engine)
+    snapshot_download = _require_huggingface_hub().snapshot_download
     cache_dir = str(MODEL_STORE_DIR / "_hf_cache")
     local_dir = snapshot_download(
         repo_id=repo, token=hf_token(), cache_dir=cache_dir,
@@ -744,7 +853,8 @@ def _pull_diffusers(repo: str, name: str | None) -> ModelEntry:
     `snapshot_download` dedupes by content hash PER cache_dir, so pointing
     straight at MODEL_STORE_DIR/_hf_cache would silently re-download every
     blob into a second location instead of reusing what's already on disk."""
-    from huggingface_hub import constants as _hf_constants, snapshot_download
+    _hf = _require_huggingface_hub()
+    _hf_constants, snapshot_download = _hf.constants, _hf.snapshot_download
     patterns = ["*.safetensors", "*.json", "*.txt", "*.model", "tokenizer*"]
     try:
         local_dir = snapshot_download(
@@ -835,7 +945,7 @@ def pull(repo_spec: str, name: str | None = None, engine: str = "") -> ModelEntr
             else [min(files, key=lambda f: f["size"] or 0)]
 
     target = matches[0]
-    from huggingface_hub import hf_hub_download
+    hf_hub_download = _require_huggingface_hub().hf_hub_download
     cache_dir = str(MODEL_STORE_DIR / "_hf_cache")
 
     shard_m = re.match(r'(.+)-(\d{5})-of-(\d{5})\.gguf$', target["filename"])
@@ -1187,7 +1297,39 @@ def gguf_summary(path: str) -> dict:
     # src/models/qwen35.cpp (`full_attn_interval = 4` there is qwen35-
     # specific; the GENERIC GGUF key read here is 1 for a plain transformer).
     full_attn_interval = int(_field_scalar(reader, f"{arch}.full_attention_interval") or 1)
-    n_kv_layers = math.ceil(n_layers / full_attn_interval) if full_attn_interval > 1 else n_layers
+    # Some hybrids (falcon-h1, granitehybrid, nemotron_h) list recurrent layer
+    # indices explicitly instead of a uniform interval (llama-arch.cpp:260,
+    # `%s.attention.recurrent_layers`) — prefer it over the interval math when
+    # present, since an explicit list can be non-uniform in a way an interval
+    # can't express.
+    recurrent_layers_field = reader.get_field(f"{arch}.attention.recurrent_layers")
+    n_recurrent_layers = 0
+    if recurrent_layers_field is not None and recurrent_layers_field.data:
+        # GGUFReader array fields: `.data` holds one index per element (see
+        # gguf_reader.py's _get_field_parts — `.parts` additionally carries a
+        # 2-entry [type, length] header, so `.data` is the correct count).
+        n_recurrent_layers = len(recurrent_layers_field.data)
+    elif full_attn_interval > 1:
+        n_recurrent_layers = n_layers - math.ceil(n_layers / full_attn_interval)
+    is_recurrent_only = arch in _engine_recurrent_archs()
+    if is_recurrent_only:
+        n_recurrent_layers = n_layers
+    n_kv_layers = n_layers - n_recurrent_layers
+    # Selective-SSM recurrent-state geometry (Mamba/Mamba2/hybrid GDN archs):
+    # the GGUF `ssm.*` keys llama.cpp's own loader reads (llama-arch.cpp:290-
+    # 295), normalized to the same (ssm_d_conv, ssm_conv_width, ssm_state_elems)
+    # shape safetensors_summary() produces so estimate_ssm_state_gb() has one
+    # formula for both metadata sources — see llama-hparams.cpp's n_embd_r()/
+    # n_embd_s() (conv_width = d_inner + 2*n_group*d_state, state_elems =
+    # d_state*d_inner), the formula this engine's own recurrent-memory
+    # allocator actually uses. Absent on a plain transformer GGUF — 0 is
+    # correct there (no recurrent state to size), not a metadata gap.
+    ssm_d_conv = int(_field_scalar(reader, f"{arch}.ssm.conv_kernel") or 0)
+    _ssm_d_inner = int(_field_scalar(reader, f"{arch}.ssm.inner_size") or 0)
+    _ssm_d_state = int(_field_scalar(reader, f"{arch}.ssm.state_size") or 0)
+    _ssm_n_group = int(_field_scalar(reader, f"{arch}.ssm.group_count") or 1)
+    ssm_conv_width = _ssm_d_inner + 2 * _ssm_n_group * _ssm_d_state
+    ssm_state_elems = _ssm_d_state * _ssm_d_inner
     quant = ""
     weight_types = Counter(t.tensor_type.name for t in reader.tensors if "weight" in t.name)
     if weight_types:
@@ -1199,6 +1341,10 @@ def gguf_summary(path: str) -> dict:
         "ctx_length": ctx_length, "quant": quant, "arch": arch,
         "n_kv_heads": head_count_kv, "head_dim": head_dim,
         "n_kv_layers": n_kv_layers,
+        "n_recurrent_layers": n_recurrent_layers,
+        "is_recurrent_only": is_recurrent_only,
+        "ssm_d_conv": ssm_d_conv, "ssm_conv_width": ssm_conv_width,
+        "ssm_state_elems": ssm_state_elems,
     }
     if cache_key is not None:
         _GGUF_SUMMARY_CACHE[path] = (cache_key[0], cache_key[1], result)
@@ -1211,7 +1357,7 @@ def read_quant_config(path_or_repo: str) -> dict:
     of a local checkpoint dir's `config.json`, or (for a bare "org/repo" that
     doesn't exist locally) fetch just that one file from the HF Hub.
 
-    Returns `{"quant_method": "gptq"|"awq"|"fp8"|"compressed-tensors"|
+    Returns `{"quant_method": "gptq"|"awq"|"fp8"|"nvfp4"|"compressed-tensors"|
     "bitsandbytes"|"", "quant_bits": int}` — best-effort, `{}` on any
     failure (missing config, malformed JSON, network error, unrecognized
     shape). Never raises: this feeds routing decisions (P1.6's `pull()`),
@@ -1221,7 +1367,7 @@ def read_quant_config(path_or_repo: str) -> dict:
         if Path(path_or_repo).is_dir():
             cfg = json.loads((Path(path_or_repo) / "config.json").read_text())
         else:
-            from huggingface_hub import hf_hub_download
+            hf_hub_download = _require_huggingface_hub().hf_hub_download
             local = hf_hub_download(repo_id=path_or_repo, filename="config.json",
                                     token=hf_token())
             cfg = json.loads(Path(local).read_text())
@@ -1250,10 +1396,21 @@ def read_quant_config(path_or_repo: str) -> dict:
         elif method == "compressed-tensors":
             groups = [g for g in (qc.get("config_groups") or {}).values()
                       if isinstance(g, dict)]
-            # A float-quantized (fp8) group carries no meaningful int "bits"
-            # the way int schemes do — normalize to fp8's own bucket rather
-            # than reporting a misleading bit count.
-            if any(g.get("weights", {}).get("type") == "float" for g in groups):
+            # A float-quantized group's own num_bits distinguishes real fp8
+            # (8-bit float) from nvfp4 (4-bit float, "nvfp4-pack-quantized"
+            # format) — both carry weights.type == "float", so a blanket
+            # "any float group -> fp8" bucket silently misclassified nvfp4
+            # checkpoints as fp8 (confirmed live 2026-07-28:
+            # Brian6145/Qwen3.6-27B-Claude-Opus-Sonnet-Distilled-NVFP4-MTP,
+            # weights.num_bits=4, reported quant_method="fp8" before this
+            # fix) — which would have defeated pull()'s below-fp8/
+            # unsupported-quant gate for exactly the checkpoint it exists to
+            # catch.
+            float_groups = [g.get("weights", {}) for g in groups
+                            if g.get("weights", {}).get("type") == "float"]
+            if float_groups and all(int(w.get("num_bits") or 8) <= 4 for w in float_groups):
+                method, bits = "nvfp4", 4
+            elif float_groups:
                 method, bits = "fp8", 8
             else:
                 group_bits = [int(g["weights"]["num_bits"]) for g in groups
@@ -1265,6 +1422,22 @@ def read_quant_config(path_or_repo: str) -> dict:
         return {"quant_method": method, "quant_bits": bits}
     except Exception:
         return {}
+
+
+# HF's `model_type` (a short lowercase config identifier, e.g. "mamba2")
+# and `architectures` (the real PyTorch class name, e.g. "Mamba2ForCausalLM")
+# are NOT the same string -- falling back to model_type verbatim when
+# architectures[] is absent silently produces a class name nothing matches
+# (gb_synapse_backends.select_backend() and gllm/model_loader.py's
+# get_model_type() both compare against real class names). Found live
+# 2026-07-29: AntonV/mamba2-2.7b-hf's config.json has no `architectures` key
+# at all (only the smaller AntonV/mamba2-130m-hf checkpoint happens to ship
+# one) -- resolved to "mamba2" instead of "Mamba2ForCausalLM", routing a
+# genuinely-supported checkpoint to the transformers fallback server instead
+# of the vendored torch engine. Only the model_type this repo's Mamba-2
+# support actually targets is mapped here -- add another entry if/when a
+# real checkpoint needs it, not speculatively.
+_ARCH_FROM_MODEL_TYPE = {"mamba2": "Mamba2ForCausalLM"}
 
 
 def safetensors_summary(local_dir: str) -> dict:
@@ -1284,7 +1457,9 @@ def safetensors_summary(local_dir: str) -> dict:
     result = {"n_bytes": 0, "n_layers": 0, "is_moe": False, "n_experts": 0,
               "n_experts_used": 0, "dense_bytes": 0, "expert_bytes": 0,
               "ctx_length": 0, "arch": "", "n_kv_heads": 0, "head_dim": 0,
-              "quant_method": "", "quant_bits": 0}
+              "quant_method": "", "quant_bits": 0,
+              "n_kv_layers": 0, "n_recurrent_layers": 0, "is_recurrent_only": False,
+              "ssm_d_conv": 0, "ssm_conv_width": 0, "ssm_state_elems": 0}
     try:
         n_bytes = sum(f.stat().st_size for f in root.glob("*.safetensors"))
         n_bytes += sum(f.stat().st_size for f in root.glob("*.bin")
@@ -1296,16 +1471,85 @@ def safetensors_summary(local_dir: str) -> dict:
     # under text_config; text-only configs carry them at the top level.
     tc = cfg.get("text_config", cfg)
     n_experts = int(tc.get("num_experts") or tc.get("num_local_experts") or 0)
+    # Hybrid recurrent/attention configs (Qwen3.5/3.6's Gated DeltaNet mix,
+    # the primary reference workload as of 2026-07-29 — see CLAUDE.md's
+    # Reference Workload Rule) list a per-layer schedule under `layer_types`
+    # (or the older `layers_block_type` spelling) — same key gllm's own
+    # Qwen3_5Model reads (synapse_engine/gllm/models/qwen3_5.py:107-121,
+    # `_get_layer_types`/`_GLOBAL_LAYER_TYPE_ATTRS`). Counting it directly is
+    # exact — no interval-arithmetic guess needed, unlike the GGUF path where
+    # `full_attention_interval` is the only signal available.
+    layer_types = tc.get("layer_types") or tc.get("layers_block_type") or []
+    n_layers = int(tc.get("num_hidden_layers") or len(layer_types) or 0)
+    n_recurrent_layers = 0
+    if layer_types:
+        n_recurrent_layers = sum(1 for t in layer_types if t in ("linear_attention", "linear_attn"))
+    is_recurrent_only = (cfg.get("model_type") or "").lower() in ("mamba", "mamba2", "falcon_mamba")
+    if is_recurrent_only:
+        n_recurrent_layers = n_layers
+    n_kv_layers = n_layers - n_recurrent_layers
+    # Recurrent-state geometry, normalized to the same two quantities
+    # estimate_ssm_state_gb() uses regardless of architecture family:
+    #   ssm_conv_width  = channels fed into the causal conv1d
+    #   ssm_state_elems = per-layer scalar element count of the temporal/
+    #                     recurrent state tensor (excludes the conv state)
+    # Qwen3.5/3.6 Gated DeltaNet (synapse_engine/gllm/models/qwen3_5.py:
+    # `_build_ssm_cache_config`, the authoritative shapes gLLM actually
+    # allocates): conv_dim = 2*key_dim + value_dim, state = num_v_heads *
+    # head_v_dim * head_k_dim. Plain Mamba/Mamba2 HF configs spell the same
+    # geometry as `conv_kernel`/`intermediate_size`/`state_size`/`n_groups`,
+    # matching llama.cpp's ssm_d_inner/ssm_d_state/ssm_n_group naming, where
+    # conv_width = d_inner + 2*n_group*d_state and state_elems = d_state*d_inner.
+    ssm_d_conv = 0
+    ssm_conv_width = 0
+    ssm_state_elems = 0
+    if tc.get("linear_conv_kernel_dim") is not None:
+        key_dim = int(tc.get("linear_num_key_heads") or 0) * int(tc.get("linear_key_head_dim") or 0)
+        value_dim = int(tc.get("linear_num_value_heads") or 0) * int(tc.get("linear_value_head_dim") or 0)
+        ssm_d_conv = int(tc.get("linear_conv_kernel_dim") or 0)
+        ssm_conv_width = 2 * key_dim + value_dim
+        ssm_state_elems = (int(tc.get("linear_num_value_heads") or 0)
+                            * int(tc.get("linear_value_head_dim") or 0)
+                            * int(tc.get("linear_key_head_dim") or 0))
+    elif tc.get("conv_kernel") is not None or tc.get("ssm_conv_kernel") is not None:
+        d_conv = int(tc.get("conv_kernel") or tc.get("ssm_conv_kernel") or 0)
+        # Live-verified 2026-07-29 against a real Mamba-2 checkpoint
+        # (AntonV/mamba2-130m-hf): HF's actual Mamba2Config does NOT always
+        # spell out `intermediate_size` explicitly -- this checkpoint's
+        # config only has `expand`+`hidden_size`, from which
+        # `intermediate_size` is DERIVED (`expand * hidden_size`, the same
+        # formula gllm.models.mamba._mamba2_intermediate_size() uses). Without
+        # this fallback, d_inner silently resolved to 0, and so did
+        # ssm_state_elems (`d_state * d_inner`) -- the exact zero-charged-
+        # recurrent-state bug this whole Phase-1 fix exists to close, just
+        # reintroduced on the one config-field-naming variant this branch's
+        # original two aliases didn't anticipate.
+        d_inner = int(
+            tc.get("intermediate_size") or tc.get("ssm_intermediate_size")
+            or (int(tc.get("expand") or 0) * int(tc.get("hidden_size") or 0))
+            or 0
+        )
+        d_state = int(tc.get("state_size") or tc.get("ssm_state_size") or 0)
+        n_group = int(tc.get("n_groups") or tc.get("ssm_n_groups") or 1)
+        ssm_d_conv = d_conv
+        ssm_conv_width = d_inner + 2 * n_group * d_state
+        ssm_state_elems = d_state * d_inner
     result.update({
         "n_bytes": n_bytes,
-        "n_layers": int(tc.get("num_hidden_layers") or len(tc.get("layer_types", ())) or 0),
+        "n_layers": n_layers,
         "ctx_length": int(tc.get("max_position_embeddings") or 0),
-        "arch": (cfg.get("architectures") or [cfg.get("model_type", "")])[0],
+        "arch": (cfg.get("architectures") or [_ARCH_FROM_MODEL_TYPE.get(
+            cfg.get("model_type", ""), cfg.get("model_type", ""))])[0],
         "n_kv_heads": int(tc.get("num_key_value_heads") or 0),
         "head_dim": int(tc.get("head_dim") or 0),
         "n_experts": n_experts,
         "n_experts_used": int(tc.get("num_experts_per_tok") or 0),
         "is_moe": n_experts > 0,
+        "n_kv_layers": n_kv_layers,
+        "n_recurrent_layers": n_recurrent_layers,
+        "is_recurrent_only": is_recurrent_only,
+        "ssm_d_conv": ssm_d_conv, "ssm_conv_width": ssm_conv_width,
+        "ssm_state_elems": ssm_state_elems,
         # No per-tensor expert/dense split available without opening the
         # safetensors headers (unlike GGUF's per-tensor names) — a real,
         # accepted granularity gap, not guessed: dense_bytes/expert_bytes
@@ -1336,6 +1580,42 @@ def _engine_supported_archs() -> set[str]:
     except (OSError, IndexError):
         pass  # source not vendored/found — skip the check rather than false-block
     _ARCH_CACHE = archs
+    return archs
+
+
+_RECURRENT_ARCH_CACHE: set[str] | None = None
+
+
+def _engine_recurrent_archs() -> set[str]:
+    """Architectures the vendored llama.cpp build treats as PURELY recurrent
+    (llm_arch_is_recurrent() in src/llama-arch.cpp — mamba, mamba2, the RWKV
+    family): every layer holds a fixed-size recurrent state, none hold a
+    real, context-length-scaling KV cache. Distinct from the HYBRID archs
+    (jamba, falcon-h1, nemotron_h, granitehybrid, qwen35, ...) where only
+    SOME layers are recurrent — those are detected per-file via
+    `attention.recurrent_layers` / `full_attention_interval` above, since the
+    hybrid split isn't fixed per-architecture the way it is here.
+
+    Parsed from the engine's own two tables (LLM_ARCH_NAMES for the enum <->
+    GGUF-name mapping, llm_arch_is_recurrent()'s switch for which enums
+    qualify) so this can never drift from whatever engine version is
+    actually built, same rationale as _engine_supported_archs()."""
+    global _RECURRENT_ARCH_CACHE
+    if _RECURRENT_ARCH_CACHE is not None:
+        return _RECURRENT_ARCH_CACHE
+    archs: set[str] = set()
+    try:
+        text = (ENGINE_SRC_DIR / "src" / "llama-arch.cpp").read_text()
+        names_table = text.split("LLM_ARCH_NAMES = {", 1)[1].split("};", 1)[0]
+        enum_to_name = dict(re.findall(r'\{\s*(LLM_ARCH_\w+)\s*,\s*"([a-z0-9_.\-]+)"', names_table))
+        fn_body = text.split("bool llm_arch_is_recurrent(", 1)[1].split("default:", 1)[0]
+        for enum_name in re.findall(r'case\s+(LLM_ARCH_\w+)\s*:', fn_body):
+            gguf_name = enum_to_name.get(enum_name)
+            if gguf_name:
+                archs.add(gguf_name)
+    except (OSError, IndexError):
+        pass  # source not vendored/found — degrade to "no arch is recurrent-only"
+    _RECURRENT_ARCH_CACHE = archs
     return archs
 
 
@@ -1479,6 +1759,55 @@ def estimate_kv_gb(ctx: int, n_bytes: int, quant: str,
     return (ctx * bytes_per_tok) / (1024 ** 3)
 
 
+def estimate_ssm_state_gb(n_recurrent_layers: int, ssm_d_conv: int, ssm_conv_width: int,
+                          ssm_state_elems: int, n_seq_max: int = 1) -> float:
+    """Selective-SSM recurrent-state size (GiB) — the counterpart to
+    estimate_kv_gb() for the layers n_kv_layers EXCLUDES. Unlike KV cache,
+    this is CONSTANT in ctx (arXiv:2312.00752, the Mamba paper: the whole
+    point of a selective SSM's recurrence is a fixed-size state instead of a
+    growing cache) — callers must add this once, never multiply it by ctx.
+
+    Formula ported verbatim from the vendored llama.cpp's own allocator
+    (llama-hparams.cpp:183-221, `n_embd_r()`/`n_embd_s()`; the ctor call at
+    llama-model.cpp:2091-2099 hardcodes GGML_TYPE_F32 for both tensors, so
+    this is NOT parameterized by kv_bytes_per_elem the way estimate_kv_gb()
+    is — `--cache-type-k/v` does not apply to recurrent state):
+
+        n_embd_r = (ssm_d_conv - 1) * ssm_conv_width     # conv_state
+        n_embd_s = ssm_state_elems                        # temporal/ssm_state
+        bytes    = 4 * n_recurrent_layers * (n_embd_r + n_embd_s) * n_seq_max
+
+    `n_seq_max` mirrors llama.cpp's `cparams.n_seq_max` (`--parallel`);
+    gb-synapse's serve_gguf() never passes `--parallel` so this is 1 in
+    practice today. F32 is also a safe, slightly-conservative choice for the
+    torch/gLLM path (SynapseTorchBackend): gLLM's own SSMCacheConfig uses F32
+    for the temporal state but the checkpoint's activation dtype (typically
+    bf16, half the bytes) for the conv state — this estimator's F32-for-both
+    assumption overestimates the conv term rather than risking OOM by
+    underestimating it, consistent with `_compute_reserve_gb`'s "undershooting
+    is a failed load, overshooting only costs a layer" principle elsewhere in
+    this file.
+
+    Returns 0.0 when geometry is unknown (old manifest entry, or a plain
+    transformer with no recurrent layers) — correct in both cases, not a gap:
+    a plain transformer genuinely has no recurrent state to size."""
+    if n_recurrent_layers <= 0 or ssm_d_conv <= 0:
+        return 0.0
+    n_embd_r = (ssm_d_conv - 1) * ssm_conv_width
+    n_embd_s = ssm_state_elems
+    total_bytes = 4 * n_recurrent_layers * (n_embd_r + n_embd_s) * max(1, n_seq_max)
+    return total_bytes / (1024 ** 3)
+
+
+def _entry_ssm_gb(entry: "ModelEntry", n_seq_max: int = 1) -> float:
+    """estimate_ssm_state_gb() from a ModelEntry's own fields — the call
+    every placement site below needs, factored out so each one doesn't
+    repeat the same 4-field unpack."""
+    return estimate_ssm_state_gb(entry.n_recurrent_layers, entry.ssm_d_conv,
+                                  entry.ssm_conv_width, entry.ssm_state_elems,
+                                  n_seq_max=n_seq_max)
+
+
 @dataclass
 class FitReport:
     name: str
@@ -1492,6 +1821,7 @@ class FitReport:
     ctx: int
     note: str = ""
     measured: bool = False   # est_tok_s is a real client-measured average, not the heuristic
+    ssm_state_gb: float = 0.0  # recurrent-state footprint, constant in ctx (see estimate_ssm_state_gb)
 
 
 MEASURED_TOK_S_FILE = MODEL_STORE_DIR / "measured_tok_s.json"
@@ -1537,6 +1867,30 @@ def record_measured_tok_s(model: str, tok_s: float) -> None:
         MODEL_STORE_DIR.mkdir(parents=True, exist_ok=True)
         MEASURED_TOK_S_FILE.write_text(json.dumps(samples, indent=2))
     except PermissionError:
+        pass
+
+
+def record_prompt_cache_sample(model: str, ttft_ms: "float | None",
+                                hit_pct: "float | None", reused_tokens: int = 0) -> None:
+    """Record one proxy-observed host-memory prompt-cache outcome (TTFT +
+    reused-vs-total prompt token share) — the measurement GB-Semantics'
+    `ttft_ms`/`prompt_cache_hit_pct` metrics resolve from. Fed by
+    gb_synapse_api.py right where record_measured_tok_s already is, same
+    best-effort/never-raise contract; silently skips when neither value is
+    known (e.g. a non-streaming request that never reached a first token)."""
+    if ttft_ms is None and hit_pct is None:
+        return
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({
+            "node": "host", "label": "gb_synapse", "kind": "prompt_cache",
+            "n_items": 1, "items": [model], "duration_s": 0.0, "status": "ok",
+            "model": model,
+            **({"ttft_ms": round(ttft_ms, 1)} if ttft_ms is not None else {}),
+            **({"hit_pct": round(hit_pct, 1)} if hit_pct is not None else {}),
+            "reused_tokens": reused_tokens,
+        })
+    except Exception:
         pass
 
 
@@ -1634,11 +1988,16 @@ def recommend(ctx: int = 65536, probe_feeders: bool = True) -> list[FitReport]:
     reports = []
     for entry in list_models():
         weights_gb = entry.n_bytes / (1024 ** 3)
+        # is_recurrent_only: n_kv_layers==0 is the CORRECT count (no real
+        # attention layer at all) — `or entry.n_layers` must not paper over
+        # that with "unknown, assume every layer is real attention".
+        kv_layers = 0 if entry.is_recurrent_only else (entry.n_kv_layers or entry.n_layers)
         kv_gb = estimate_kv_gb(ctx, entry.n_bytes, entry.quant,
-                               n_layers=(entry.n_kv_layers or entry.n_layers),
+                               n_layers=kv_layers,
                                n_kv_heads=entry.n_kv_heads,
                                head_dim=entry.head_dim)
-        total_gb = weights_gb + kv_gb
+        ssm_gb = _entry_ssm_gb(entry)
+        total_gb = weights_gb + kv_gb + ssm_gb
         active_gb = weights_gb
         note = ""
         if entry.is_moe and entry.n_experts and entry.n_experts_used:
@@ -1685,7 +2044,7 @@ def recommend(ctx: int = 65536, probe_feeders: bool = True) -> list[FitReport]:
             note = f"{note}; {_adv}" if note else _adv
         reports.append(FitReport(entry.name, entry.quant, round(weights_gb, 2), round(kv_gb, 2),
                                   round(total_gb, 2), fits, round(overflow_gb, 2), est, ctx, note,
-                                  measured=measured is not None))
+                                  measured=measured is not None, ssm_state_gb=round(ssm_gb, 3)))
     return sorted(reports, key=lambda r: (not r.fits_vram, r.overflow_gb))
 
 
@@ -1848,11 +2207,63 @@ MODEL_ALIASES = {
 }
 
 
+def _manifest_lookup(spec: str, manifest: dict) -> "ModelEntry | None":
+    """Resolve `spec` against the manifest by key OR by the `repo` field an
+    HF-pulled entry stores. `pull()`/`_pull_torch` key every HF-sourced entry
+    by the repo's bare name (`name or repo.split("/")[-1]`), never by
+    "org/name" — so before this helper existed, typing the model's real
+    "org/repo" spelling (as printed by `pull`, `list`, and the model card)
+    missed the manifest entirely and fell into `_resolve_model`'s "/" in spec
+    branch, triggering a network `pull()` for a model already on disk.
+    Real incident, 2026-07-28: DavidAU/Qwen3.6-27B-Fable-Fusion-...-GGUF,
+    already pulled and served OK 18 times, failed with
+    "No module named 'huggingface_hub'" the moment the org prefix was typed.
+
+    Also accepts "org/repo:QUANT" when an entry's own `repo` matches and
+    QUANT substring-matches its `quant` (mirrors `pull()`'s own quant
+    matching ahead of `hf_hub_download`). Raises ValueError naming the
+    candidates if more than one entry's quant matches — this repo already
+    ships ambiguously-substring-matching quants for the reference model
+    (MTP-Q4_K_M vs Q4_K_M, see the Reference Workload Rule in CLAUDE.md), so
+    silently picking one here would repeat the exact mistake `pull()`
+    already guards against for a fresh download.
+
+    Case-insensitive throughout."""
+    if spec in manifest:
+        return manifest[spec]
+
+    spec_lower = spec.lower()
+    for entry in manifest.values():
+        if spec_lower == entry.name.lower():
+            return entry
+    for entry in manifest.values():
+        if entry.repo and entry.repo.lower() == spec_lower:
+            return entry
+
+    if ":" in spec:
+        repo_part, _, quant_part = spec.rpartition(":")
+        repo_lower, quant_upper = repo_part.lower(), quant_part.upper()
+        candidates = [e for e in manifest.values()
+                      if e.repo and e.repo.lower() == repo_lower
+                      and quant_upper in (e.quant or "").upper()]
+        if len(candidates) > 1:
+            names = ", ".join(sorted(e.name for e in candidates))
+            raise ValueError(
+                f"{spec!r} matches more than one manifest entry by quant "
+                f"substring: {names} — use the exact manifest name instead."
+            )
+        if candidates:
+            return candidates[0]
+
+    return None
+
+
 def _resolve_model(spec: str) -> ModelEntry:
     spec = MODEL_ALIASES.get(spec, spec)
     manifest = _load_manifest()
-    if spec in manifest:
-        return manifest[spec]
+    hit = _manifest_lookup(spec, manifest)
+    if hit is not None:
+        return hit
     if "/" in spec:  # looks like an HF repo spec — pull it
         return pull(spec)
     blob = ollama_model_blob(spec)
@@ -1862,7 +2273,17 @@ def _resolve_model(spec: str) -> ModelEntry:
         manifest[spec] = entry
         _save_manifest(manifest)
         return entry
-    raise KeyError(f"no such model: {spec} (not in manifest, not an HF repo, not an Ollama model)")
+
+    spec_lower = spec.lower()
+    similar = sorted({e.name for e in manifest.values()
+                       if spec_lower in e.name.lower() or spec_lower in (e.repo or "").lower()})
+    if similar:
+        hint = f" — did you mean: {', '.join(similar[:3])}?"
+    else:
+        hint = (" — if this is meant to be a HuggingFace repo, include the "
+                "org prefix (e.g. \"org/repo\")")
+    raise KeyError(f"no such model: {spec} (not in manifest, not an HF repo, "
+                   f"not an Ollama model){hint}")
 
 
 def _feeder_ssh_target(feeder) -> str:
@@ -2149,8 +2570,9 @@ def _pick_kv_type(ctx: int, entry: ModelEntry, budget_gb: float) -> str:
     if pin:
         return pin
     weights_gb = entry.n_bytes / (1024 ** 3)
+    kv_layers = 0 if entry.is_recurrent_only else (entry.n_kv_layers or entry.n_layers)
     kv_f16_gb = estimate_kv_gb(ctx, entry.n_bytes, entry.quant,
-                               n_layers=(entry.n_kv_layers or entry.n_layers),
+                               n_layers=kv_layers,
                                n_kv_heads=entry.n_kv_heads,
                                head_dim=entry.head_dim,
                                kv_bytes_per_elem=2.0)     # f16: 2 bytes/elem
@@ -2206,9 +2628,12 @@ def _clamp_ctx_to_budget(requested_ctx: int, entry: ModelEntry, budget_gb: float
     in the hundreds of thousands, and requesting that much KV cache OOMs
     before generation ever starts."""
     weights_gb = entry.n_bytes / (1024 ** 3)
-    kv_budget_gb = max(budget_gb - weights_gb, 0.25)
+    kv_layers = 0 if entry.is_recurrent_only else (entry.n_kv_layers or entry.n_layers)
+    # Recurrent state is fixed-size (constant in ctx, unlike KV) — subtract it
+    # alongside weights, once, never scaled by requested_ctx.
+    kv_budget_gb = max(budget_gb - weights_gb - _entry_ssm_gb(entry), 0.25)
     kv_gb = estimate_kv_gb(requested_ctx, entry.n_bytes, entry.quant,
-                           n_layers=(entry.n_kv_layers or entry.n_layers),
+                           n_layers=kv_layers,
                            n_kv_heads=entry.n_kv_heads,
                            head_dim=entry.head_dim)
     if kv_gb <= kv_budget_gb:
@@ -2267,25 +2692,40 @@ def _solve_ctx_and_layers(entry: ModelEntry, vram_gb: float, requested_ctx: int,
     n_layers = entry.n_layers or 0
     if n_layers <= 0 or requested_ctx <= 0:
         return requested_ctx, 999
-    n_kv_layers = entry.n_kv_layers or n_layers
+    # is_recurrent_only: n_kv_layers==0 is the CORRECT count (no real
+    # attention layer at all, arXiv:2312.00752's whole thesis) — `or
+    # n_layers` must not paper over that with "unknown, assume attention".
+    n_kv_layers = 0 if entry.is_recurrent_only else (entry.n_kv_layers or n_layers)
     per_layer_gb = (entry.n_bytes / (1024 ** 3)) / n_layers
     bytes_per_tok = 2 * n_kv_layers * (entry.n_kv_heads or 0) * (entry.head_dim or 0) * kv_bytes_per_elem
+    # Recurrent state is FIXED-size, never scaled by ctx (the paper's O(1)
+    # claim) — computed once, subtracted alongside weights/reserve wherever
+    # the KV budget is, added to _fit_gpu_layers' kv_gb wherever ngl is fit.
+    ssm_gb = _entry_ssm_gb(entry)
     if bytes_per_tok <= 0:
+        if entry.is_recurrent_only:
+            # No per-token KV cost at all — ctx is unconstrained by cache
+            # growth (only the fixed ssm_gb competes with weights for VRAM).
+            # Fit layers against budget minus that fixed cost and serve the
+            # requested ctx as-is; nothing here trades ctx for layers.
+            ngl = _fit_gpu_layers(entry, vram_gb, ssm_gb, n_devices)
+            return requested_ctx, ngl
         # Geometry unknown (old manifest entry) — degrade to the previous
         # behavior rather than divide by zero.
         ctx = _clamp_ctx_to_budget(requested_ctx, entry, vram_gb + t2_gb)
-        return ctx, _fit_gpu_layers(entry, vram_gb, 0.0, n_devices)
+        return ctx, _fit_gpu_layers(entry, vram_gb, ssm_gb, n_devices)
 
     n_dev = max(1, n_devices)
-    ngl = _fit_gpu_layers(entry, vram_gb, 0.0, n_devices)
+    ngl = _fit_gpu_layers(entry, vram_gb, ssm_gb, n_devices)
     reserve_gb = _compute_reserve_gb(vram_gb * 1024.0 / n_dev) * n_dev
-    kv_budget_gb = max(vram_gb - per_layer_gb * ngl - reserve_gb, 0.0) + t2_gb
+    kv_budget_gb = max(vram_gb - per_layer_gb * ngl - reserve_gb - ssm_gb, 0.0) + t2_gb
     max_ctx = max(0, int((kv_budget_gb * (1024 ** 3)) / bytes_per_tok) // 256 * 256)
     ctx = max(2048, min(requested_ctx, max_ctx)) if max_ctx > 0 else 2048
     if ctx < requested_ctx:
         print(f"  [gb-synapse] {entry.name}: ctx={requested_ctx} solved down to ctx={ctx} "
               f"jointly with -ngl {ngl}/{n_layers} against a {vram_gb:.2f} GB VRAM budget"
-              f"{f' + {t2_gb:.2f} GB T2' if t2_gb else ''}.", flush=True)
+              f"{f' + {t2_gb:.2f} GB T2' if t2_gb else ''}"
+              f"{f' (minus {ssm_gb:.2f} GB recurrent state)' if ssm_gb else ''}.", flush=True)
 
     # A window below GB-CLI's own baseline overhead (~4608 tokens for the
     # system prompt + tool schemas) can't hold one real agentic turn — a
@@ -2298,7 +2738,7 @@ def _solve_ctx_and_layers(entry: ModelEntry, vram_gb: float, requested_ctx: int,
             ngl -= 1
             traded += 1
             reserve_gb = _compute_reserve_gb(vram_gb * 1024.0 / n_dev) * n_dev
-            kv_budget_gb = max(vram_gb - per_layer_gb * ngl - reserve_gb, 0.0) + t2_gb
+            kv_budget_gb = max(vram_gb - per_layer_gb * ngl - reserve_gb - ssm_gb, 0.0) + t2_gb
             ctx = max(0, int((kv_budget_gb * (1024 ** 3)) / bytes_per_tok) // 256 * 256)
             ctx = min(requested_ctx, ctx)
         ctx = max(2048, ctx)
@@ -2694,7 +3134,7 @@ def _launch_proxy_and_record(entry: ModelEntry, upstream: subprocess.Popen, port
 
 def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
           use_cluster: bool = True, n_slots: int = -1, extra_args: str = "",
-          cuda_graph: "bool | None" = None) -> ServerState:
+          cuda_graph: "bool | None" = None, cache_ram: "int | None" = None) -> ServerState:
     """Resolve `model` (manifest name, "org/repo[:quant]", or a bare Ollama
     model name) and hand it to whichever engine backend its manifest entry
     calls for (gb_synapse_backends.select_backend) — llama.cpp (default,
@@ -2714,6 +3154,12 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
     docstring in gb_synapse_backends.py). Pass explicitly to try graphs for
     one serve without mutating process env — e.g. after lowering ctx enough
     to free the headroom graphs need.
+
+    cache_ram: per-call override (MiB) for llama.cpp's host-memory prompt
+    cache (--cache-ram; LlamaCppBackend only, ignored by other backends).
+    None (default) derives it from live free host RAM (see
+    LlamaCppBackend.serve()'s comment) — never a literal MiB figure per this
+    repo's hardcoded-hardware-values rule.
 
     A THIRD case, not just alive/dead: the engine can be alive while only
     its proxy died (another process squatted the port, an OOM-killer got the
@@ -2747,7 +3193,7 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
     try:
         state = backend.serve(entry, port, ctx=ctx, use_cluster=use_cluster,
                               n_slots=n_slots, extra_args=extra_args,
-                              cuda_graph=cuda_graph)
+                              cuda_graph=cuda_graph, cache_ram=cache_ram)
     except RuntimeError:
         # A cluster/RPC load can fail for reasons that have nothing to do with
         # whether the model can run at all — a feeder's engine build gap, a
@@ -2769,7 +3215,7 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
               f"retrying host-only before giving up.", flush=True)
         state = backend.serve(entry, port, ctx=ctx, use_cluster=False,
                               n_slots=n_slots, extra_args=extra_args,
-                              cuda_graph=cuda_graph)
+                              cuda_graph=cuda_graph, cache_ram=cache_ram)
     return _maybe_serve_embedding(state)
 
 

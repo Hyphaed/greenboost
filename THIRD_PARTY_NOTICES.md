@@ -70,3 +70,31 @@ warn threshold, re-queue rather than push T2 past cap) is inspired by
 ZeRO-Infinity's overlap-centric, bandwidth-aware offload design, applied
 to GreenBoost's own explicit T1/T2/T3 tiers rather than ZeRO's
 GPU/CPU/NVMe training-state partitioning.
+
+---
+
+## vLLM Mamba-2 Triton kernels
+
+- **Authors:** the vLLM project (itself adapted from Tri Dao and Albert
+  Gu's reference `mamba_ssm` implementation, state-spaces/mamba v2.2.4)
+- **Source:** https://github.com/vllm-project/vllm ,
+  `vllm/model_executor/layers/mamba/ops/` (`ssd_bmm.py`,
+  `ssd_chunk_state.py`, `ssd_chunk_scan.py`, `ssd_state_passing.py`,
+  `ssd_combined.py`, `triton_helpers.py`, `mamba_ssm.py`)
+- **License:** Apache-2.0 (full text: `LICENSE-APACHE` in this repo)
+- **Used in:** `synapse_engine/gllm/layers/ops/mamba/ssd_*.py` +
+  `triton_helpers.py` + `mamba2_decode.py` (renamed from upstream's
+  `mamba_ssm.py` to avoid confusion with the separate PyPI `mamba_ssm`
+  package, which GreenBoost does not depend on)
+
+Vendored near-verbatim (import lines adapted to drop the `vllm.*` module
+prefix this repo doesn't have; two deliberate deviations documented in
+`synapse_engine/NOTICE`) rather than hand-written: the SSD (structured
+state-space duality) chunked prefill scan and the fused-recurrent decode
+kernel that `synapse_engine/gllm/models/mamba.py`'s native Mamba-2 support
+calls into. A subtly-wrong selective-state-space kernel produces
+silently-corrupt output rather than a crash, so reusing this
+battle-tested, widely-deployed source was the deliberate choice over
+writing new numerically-sensitive kernel math from scratch , the same
+reuse-tested-kernel principle already applied to the vendored
+`gptqmodel` Triton dequant kernel (`third_party/`) for GPTQ/AWQ.

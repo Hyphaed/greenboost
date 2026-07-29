@@ -4155,6 +4155,8 @@ do_purge() {
     # no separate rm needed for any of them). Also covers gb_llm.py/
     # gb_llm_server.py orphans left by a pre-2026-07-26 install (absorbed
     # into gb_synapse_fallback.py, no longer shipped — see cmd_install_python_files).
+    # Also takes gb_semantics.py + semantics/*.yaml (GB-Semantics, 2026-07-29)
+    # with it — same reasoning, no separate rm needed.
     rm -rf /usr/local/lib/greenboost
 
     # Legacy daemon scripts (all known names across all versions)
@@ -4405,6 +4407,12 @@ cmd_install_python_files() {
         # manifest broke those tools post-install with "No module named
         # 'gb_mcp_common'" despite the file existing in the repo).
         gb_mcp_common.py
+        # GB-Semantics (2026-07-29): governed metric/segment/route engine.
+        # Definitions live in semantics/*.yaml (synced as a directory below,
+        # same pattern as synapse_engine/) — gb_semantics.py is the module
+        # that compiles and resolves them; gb_mcp.py's semantic_* tools and
+        # gb_monitor.context_summary()'s prompt card both import it lazily.
+        gb_semantics.py
         # Agent surface (2026-07-13): shared gated-actuation verbs + A2A gateway.
         # gb_mcp/gb_cluster_mcp/gb_synapse_mcp import gb_actuation; gb_a2a serves
         # the AgentCard + JSON-RPC over the same VERBS table.
@@ -4478,6 +4486,34 @@ cmd_install_python_files() {
         fi
     else
         gb_warn "synapse_engine/ not found in $MODULE_DIR — install-synapse-engine will have nothing to install"
+    fi
+
+    # semantics/ (GB-Semantics YAML definitions — entities/metrics/segments/
+    # routes) is a directory, same reasoning as synapse_engine/ above: sync
+    # as a tree, rsync --delete so a removed/renamed definition file doesn't
+    # linger on an upgraded install.
+    if [[ -d "$MODULE_DIR/semantics" ]]; then
+        if command -v rsync >/dev/null 2>&1; then
+            rsync -a --delete "$MODULE_DIR/semantics/" "$_dest/semantics/" 2>/tmp/gb_semantics_sync.log \
+                || gb_warn "semantics/ sync failed (see /tmp/gb_semantics_sync.log)"
+        else
+            rm -rf "$_dest/semantics"
+            cp -r "$MODULE_DIR/semantics" "$_dest/semantics"
+        fi
+    else
+        gb_warn "semantics/ not found in $MODULE_DIR — gb_semantics.py will have no definitions to load"
+    fi
+
+    # gb_semantics.py's only dependency this Python layer doesn't already
+    # assume system-wide is pyyaml (same "assumed present on system python3"
+    # precedent as the `mcp` SDK the other gb_*_mcp.py servers already
+    # require without this installer pip-installing it) — non-fatal check,
+    # loud warning with the exact fix, so a fresh box finds out at install
+    # time rather than the first time an agent calls semantic_resolve.
+    if ! python3 -c "import yaml" &>/dev/null; then
+        gb_warn "python3 'yaml' module (pyyaml) not found — GB-Semantics " \
+                "(gb_semantics.py) will fail to import until it's installed: " \
+                "sudo python3 -m pip install pyyaml (or your distro's python3-yaml package)"
     fi
 
     # Speed Program audit, 2026-07-26: rsync -a does NOT create missing

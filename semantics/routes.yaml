@@ -1,0 +1,68 @@
+# semantics/routes.yaml , intent -> metric/segment routing.
+#
+# The retrieval-failure fix: narrows ~60 MCP tools across 5 servers down to a
+# handful of named metrics/segments BEFORE any tool is called, the same job
+# Anthropic's skill router plays for their warehouse. `gb_semantics.discover()`
+# does keyword+alias matching over these `triggers` lists; `answer()` uses the
+# first route whose triggers match, in listed order (most specific first).
+#
+# Each route may name metrics, segments, or both. `raw_tool_fallback` names
+# the MCP tool to fall back to when nothing here covers the question , this
+# is the one field allowed to point outside the governed layer, and every
+# answer built from it MUST carry `governed: false` in its provenance footer.
+
+- intent: is_rule1_satisfied
+  triggers: ["rule 1", "rule #1", "90%", "vram full", "is vram filled", "physical vram"]
+  metrics: [vram_fill_pct]
+  segments: [rule1_underfilled]
+
+- intent: why_is_it_slow
+  triggers: ["slow", "throttl", "stall", "why is generation slow", "performance problem", "tok/s dropped"]
+  metrics: [tok_s_decode, swap_pressure, iowait_pct]
+  segments: [swap_thrash_not_gpu_throttle, kmod_missing_silent_degrade]
+
+- intent: memory_pressure
+  triggers: ["t2 pressure", "ddr pressure", "memory pressure", "swap", "oom"]
+  metrics: [t2_pressure_level, t2_pressure_fraction, kv_resident_share]
+  segments: [rule1_underfilled]
+
+- intent: weights_placement
+  triggers: ["weights on disk", "t3", "nvme spill", "placement floor"]
+  metrics: [t3_spill_active_mb]
+  segments: [weights_on_t3]
+
+- intent: quality_and_quant
+  triggers: ["quant", "quality floor", "fp8", "bits", "precision"]
+  metrics: [effective_bits, meets_fp8_floor, kv_bits_by_layer]
+  segments: [below_quality_floor]
+
+- intent: serve_throughput
+  triggers: ["tok/s", "tokens per second", "decode speed", "how fast"]
+  metrics: [tok_s_decode]
+  segments: []
+  raw_tool_fallback: "greenboost-synapse.synapse_recommend"
+
+- intent: context_and_ctx
+  triggers: ["context window", "ctx", "how much context", "served ctx"]
+  metrics: [served_ctx, n_gpu_layers_effective]
+  segments: []
+
+- intent: prompt_cache
+  triggers: ["prompt cache", "cache hit", "ttft", "time to first token", "cache-reuse", "cache-ram"]
+  metrics: [prompt_cache_hit_pct, ttft_ms]
+  segments: [prompt_cache_cold]
+
+- intent: cluster_health
+  triggers: ["cluster", "feeder", "feeders", "whole cluster vram"]
+  metrics: [cluster_vram_fill_pct, feeder_items, link_bw_gbps]
+  segments: [feeder_idle_while_host_saturated]
+
+- intent: kernel_module_state
+  triggers: ["kernel module", "kmod", "greenboost.ko", "lsmod", "is greenboost loaded"]
+  metrics: [kmod_loaded, shim_fresh]
+  segments: [kmod_missing_silent_degrade]
+
+- intent: overall_health
+  triggers: ["health", "status", "is everything ok", "overview", "how is it doing"]
+  metrics: [vram_fill_pct, kmod_loaded, shim_fresh, meets_fp8_floor]
+  segments: [serve_healthy, rule1_underfilled, kmod_missing_silent_degrade, swap_thrash_not_gpu_throttle]

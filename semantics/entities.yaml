@@ -1,0 +1,89 @@
+# semantics/entities.yaml , GB-Semantics entity registry.
+#
+# What a "row" IS before any metric is computed against it. Every metric in
+# metrics.yaml declares an `entity:` from this file. This is what fixes the
+# `basename $PWD` project-key collision claude_workflow's project store
+# (~/.claude_workflow/projects/{greenboost,greenboost-cli,greenboost_gaming})
+# currently relies on: those are three different `node` identities that
+# happen to share a machine, not three different entities.
+#
+# Human-owned. Claude may draft additions here; a human (Ferran) approves the
+# definition before it's merged , see gb-semantics SKILL.md and the
+# Anthropic finding this whole layer is built on: LLM-authored metric
+# definitions reproduce the exact ambiguity they're meant to remove.
+
+node:
+  grain: "one row = one machine participating in the GreenBoost cluster (host or feeder)"
+  identity_key: node_label   # canonical_node() in gb_dataflux.py , "host" | "feeder<N> (ip)"
+  doc: >
+    A physical machine. The host is always node "host"; feeders are named by
+    gb_dataflux.canonical_node() from their connect-time label. NOT the same
+    key as claude_workflow's `basename $PWD` project directory , a node is
+    hardware identity, a claude_workflow project is a source-tree identity.
+    Two different greenboost source trees (greenboost/, greenboost-cli/,
+    greenboost_gaming/) all resolve to the SAME node when run on this box.
+
+gpu:
+  grain: "one row = one GPU device on one node at one instant"
+  identity_key: [node, device_index]
+  doc: >
+    A single CUDA device as GreenBoost's shim presents it. Note the shim
+    presents exactly ONE virtual device per node regardless of feeder count
+    (Cluster Compute Architecture v3.1) , so `device_index` is 0 on every
+    node today, but the key stays composite for when multi-local-GPU support
+    lands.
+
+tier:
+  grain: "one row = one memory tier (T1 VRAM / T2 DDR / T3 NVMe) on one node"
+  identity_key: [node, tier_name]
+  doc: >
+    T1 = local GPU VRAM (real cudaMalloc). T2 = local DDR (DMA-BUF pinned).
+    T3 = local NVMe swap. Each tier also has a *_feeder variant in the
+    cluster overflow order (see CLAUDE.md's "Memory tier priority") , those
+    are rows on the FEEDER node's own tier entity, not a fourth tier on the
+    host.
+
+pool:
+  grain: "one row = greenboost.ko's live T1/T2/T3 pool state on one node, right now"
+  identity_key: node
+  doc: >
+    The kernel module's `GbPoolInfo` snapshot , not a metric itself, but the
+    entity most tiering metrics (`t2_pressure_level`, `t3_spill_active_mb`,
+    `kv_resident_share`) are computed against. Grain is instantaneous: a pool
+    row has no history of its own, only what gb_dataflux's `snapshot` events
+    accumulate over time.
+
+model:
+  grain: "one row = one served model checkpoint (by manifest name + quant)"
+  identity_key: [model_name, quant]
+  doc: >
+    A ModelEntry from gb_synapse.py's manifest. `quant` is part of the key
+    because the SAME model name can resolve to multiple GGUF files that
+    differ only by quant suffix (see the MTP-Q4_K_M vs Q4_K_M substring-match
+    ambiguity documented in CLAUDE.md's Reference Workload Rule , exactly the
+    kind of concept<>entity collision this layer exists to prevent).
+
+serve_session:
+  grain: "one row = one gb-synapse llama-server process instance, from serve() to stop()"
+  identity_key: [node, model, port, started_ts]
+  doc: >
+    The live serving unit. `tok_s_decode`, `ttft_ms`, `served_ctx`,
+    `prompt_cache_hit_pct`, `n_gpu_layers_effective` are all serve_session
+    metrics , they describe THIS instance's placement decision, not the
+    model's static properties (those live on `model`).
+
+feeder:
+  grain: "one row = one remote greenboost-netd machine reachable from the host"
+  identity_key: [ip, port]
+  doc: >
+    A `node` that is specifically NOT the host , the distinction matters for
+    `feeder_idle_while_host_saturated` and the whole-cluster VRAM rule.
+    Every feeder is a node; not every node is a feeder.
+
+link:
+  grain: "one row = one host<->feeder network path"
+  identity_key: [node_a, node_b]
+  doc: >
+    The TCP fabric connection (`greenboost_netc.c`/`greenboost_netd.c`)
+    between two nodes. `link_bw_gbps` is a link metric, not a node metric ,
+    it can differ per feeder even on the same host.
