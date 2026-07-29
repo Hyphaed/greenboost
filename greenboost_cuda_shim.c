@@ -58,6 +58,16 @@
  *                                GB_ALLOC_WEIGHTS default for all overflow allocs.
  *   GREENBOOST_KV_SIZE_THRESHOLD_MB  Allocs >= this size classified as KV cache in the
  *                                inference phase (default: 64 MB; covers small models).
+ *   GREENBOOST_SSM_STATE_MB      Allocs AT OR BELOW this size, during INFERENCE/STEADY,
+ *                                classified as selective-SSM recurrent state (Mamba/
+ *                                Mamba2/hybrid Gated-DeltaNet conv_state+ssm_state) and
+ *                                pinned T1 (GB_ALLOC_KV_CACHE|GB_ALLOC_T1_PRIORITY) the
+ *                                same as KV cache — small but, per arXiv:2312.00752, read
+ *                                AND written every decode step. Default: 0 (disabled; a
+ *                                recurrent-state alloc falls to GB_ALLOC_ACTIVATIONS,
+ *                                same as before this existed). gb_synapse_backends.py
+ *                                exports it from gb_synapse.estimate_ssm_state_gb() at
+ *                                serve time for a model with recurrent layers.
  *   GREENBOOST_IDLE_TIMEOUT_MS   ms of inactivity in STEADY phase before phase
  *                                transitions to IDLE (default: 120000 = 2 min; 0 = disabled).
  *   GREENBOOST_DEEP_IDLE_TIMEOUT_MS  ms of additional inactivity in IDLE phase before
@@ -2296,6 +2306,15 @@ static int g_kv_reserve_from_env = 0;
  * Incremented when a large alloc that matches the quiet-gap / phase heuristic
  * succeeds in T1; decremented when that pointer is freed via CAS loop. */
 static _Atomic size_t g_kv_allocated_t1_bytes;
+/* Cumulative (lifetime, not current-usage — same semantics as tier_*_lifetime_mb
+ * below) bytes classified via the GREENBOOST_SSM_STATE_MB size heuristic
+ * (selective-SSM recurrent state, see g_ssm_state_max_bytes). Observability
+ * only: functionally these allocs already get real T1-pin behavior for free
+ * by reusing the GB_ALLOC_KV_CACHE flag (gb_needs_overflow's adaptive
+ * reserve, GB_IOCTL_PIN_USER_PTR's "never spills to T3" — greenboost_ioctl.h:29
+ * — apply identically), this counter exists purely so a live run can be
+ * verified as actually taking the SSM-pin path instead of ACTIVATIONS. */
+static _Atomic size_t g_ssm_state_t1_bytes;
 /* N11: SWA sliding-window KV eviction - track live KV bytes in T2 overflow.
  * When g_kv_t2_live_bytes > g_swa_window_bytes (set from GREENBOOST_SWA_WINDOW),
  * proactively evict oldest KV blocks before each new T2 KV alloc. */
@@ -2414,6 +2433,20 @@ static void gb_kv_prefetch_tick(void)
 }
 /* Allocs above this threshold during INFERENCE phase are classified KV */
 static size_t                 g_kv_size_threshold_bytes = 64ULL * 1024 * 1024;  /* 64 MB - catches small-model KV allocs */
+
+/* Allocs AT OR BELOW this size during INFERENCE/STEADY are the selective-SSM
+ * recurrent state (Mamba/Mamba2/hybrid Gated-DeltaNet conv_state+ssm_state —
+ * see gb_synapse.estimate_ssm_state_gb()), a SIZE-INDEPENDENT signal on top
+ * of g_kv_size_threshold_bytes rather than a replacement for it: this state
+ * is small (well under the 64 MB KV-size floor, unlike a real KV cache) but
+ * per arXiv:2312.00752 it is read AND written every single decode step —
+ * the hottest bytes in the model — so it must be classified
+ * GB_ALLOC_KV_CACHE|GB_ALLOC_T1_PRIORITY (pinned in T1, never T2/T3-spill-
+ * eligible) the same as KV, not fall through to GB_ALLOC_ACTIVATIONS where
+ * ordinary transient buffers land. 0 (default) = disabled: without this env
+ * set, a recurrent-state alloc is classified ACTIVATIONS exactly as before.
+ * GREENBOOST_SSM_STATE_MB env var. */
+static size_t                 g_ssm_state_max_bytes = 0;  /* 0 = disabled */
 
 /* Rolling average of overflow alloc sizes (exponential moving average,
  * α = 1/8) - used to detect the KV alloc as anomalously large. */
@@ -2963,6 +2996,17 @@ static uint32_t gb_phase_classify(size_t bytesize)
             GB_NVTX_EVENT("PHASE_STEADY", "PHASE", bytesize >> 20, 0, "inference_to_steady_kv_placed");
             return GB_ALLOC_KV_CACHE | GB_ALLOC_T1_PRIORITY;
         }
+        /* Selective-SSM recurrent state (conv_state+ssm_state): small, below
+         * g_kv_size_threshold_bytes, but per arXiv:2312.00752 read+written
+         * every decode step — must pin in T1 like KV, not fall to
+         * ACTIVATIONS. Disabled (bytesize<=0 never matches) unless
+         * GREENBOOST_SSM_STATE_MB is set. */
+        if (g_ssm_state_max_bytes > 0 && bytesize > 0 && bytesize <= g_ssm_state_max_bytes) {
+            atomic_fetch_add_explicit(&g_ssm_state_t1_bytes, bytesize, memory_order_relaxed);
+            gb_log("Phase classify: INFERENCE SSM-state alloc %zu MB → GB_ALLOC_KV_CACHE|T1_PRIORITY",
+                   bytesize >> 20);
+            return GB_ALLOC_KV_CACHE | GB_ALLOC_T1_PRIORITY;
+        }
         gb_log("Phase classify: INFERENCE small alloc %zu MB → GB_ALLOC_ACTIVATIONS",
                bytesize >> 20);
         return GB_ALLOC_ACTIVATIONS;
@@ -2972,6 +3016,12 @@ static uint32_t gb_phase_classify(size_t bytesize)
         if (bytesize >= g_kv_size_threshold_bytes) {
             /* Unexpected large alloc in steady state - could be a new KV context */
             gb_log("Phase classify: STEADY large alloc %zu MB → GB_ALLOC_KV_CACHE|T1_PRIORITY",
+                   bytesize >> 20);
+            return GB_ALLOC_KV_CACHE | GB_ALLOC_T1_PRIORITY;
+        }
+        if (g_ssm_state_max_bytes > 0 && bytesize > 0 && bytesize <= g_ssm_state_max_bytes) {
+            atomic_fetch_add_explicit(&g_ssm_state_t1_bytes, bytesize, memory_order_relaxed);
+            gb_log("Phase classify: STEADY SSM-state alloc %zu MB → GB_ALLOC_KV_CACHE|T1_PRIORITY",
                    bytesize >> 20);
             return GB_ALLOC_KV_CACHE | GB_ALLOC_T1_PRIORITY;
         }
@@ -3573,6 +3623,8 @@ static void gb_write_stats(void)
     fprintf(f, "kv_reserve_effective_mb=%zu\n", _kv_eff >> 20);
     fprintf(f, "kv_t1_tracked_mb=%zu\n",      _kv_t1 >> 20);
     fprintf(f, "kv_t1_effective_mb=%zu\n",    _kv_t1_eff >> 20);
+    fprintf(f, "ssm_state_t1_lifetime_mb=%zu\n",
+            atomic_load_explicit(&g_ssm_state_t1_bytes, memory_order_relaxed) >> 20);
     fprintf(f, "kv_prefetch_mode=%d\n",       g_kv_prefetch_mode);
     fprintf(f, "kv_prefetch_ticks=%llu\n",
             (unsigned long long)atomic_load_explicit(&g_kv_prefetch_ticks, memory_order_relaxed));
@@ -4655,6 +4707,21 @@ static void gb_shim_init(void)
 
     env = getenv("GREENBOOST_KV_SIZE_THRESHOLD_MB");
     if (env) g_kv_size_threshold_bytes = (size_t)gb_atoll(env) * 1024ULL * 1024ULL;
+
+    /* Selective-SSM recurrent state T1 pin — see g_ssm_state_max_bytes'
+     * declaration comment. gb_synapse_backends.py exports this from
+     * estimate_ssm_state_gb() at serve time for a model with recurrent
+     * layers; unset for a plain transformer, so this is a no-op there. */
+    env = getenv("GREENBOOST_SSM_STATE_MB");
+    if (env) {
+        long ssm_mb = gb_atoll(env);
+        if (ssm_mb > 0) {
+            g_ssm_state_max_bytes = (size_t)ssm_mb * 1024ULL * 1024ULL;
+            GB_INIT_LOG_ONCE("[GreenBoost] GREENBOOST_SSM_STATE_MB=%ld: recurrent-state "
+                              "allocs <= this size pinned to T1 (GB_ALLOC_KV_CACHE|T1_PRIORITY)\n",
+                              ssm_mb);
+        }
+    }
 
     /* GREENBOOST_KV_COMPRESS: no-op (Speed Program audit, 2026-07-26). The
      * mechanism it used to enable was dead code with zero callers, see the

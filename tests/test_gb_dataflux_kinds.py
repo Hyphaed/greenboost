@@ -39,7 +39,7 @@ def log_path(tmp_path, monkeypatch):
 def test_registry_covers_every_known_group():
     assert set(kinds.GROUPS) == {
         "placement", "quant", "synapse", "cluster", "shim",
-        "pipeline", "health", "agent", "eval",
+        "pipeline", "health", "agent", "eval", "bench",
     }
 
 
@@ -63,7 +63,8 @@ def test_schema_unknown_kind_returns_empty():
 def test_kinds_in_group():
     shim_kinds = kinds.kinds_in_group("shim")
     assert set(shim_kinds) == {
-        "snapshot", "shim_decision", "shim_transition", "tier_move", "mem_pool_trim"}
+        "snapshot", "shim_decision", "shim_transition", "tier_move", "mem_pool_trim",
+        "ssm_state"}
 
 
 # ---------------------------------------------------------------------------

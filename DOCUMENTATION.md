@@ -85,6 +85,50 @@ existing Python script does not change.
 
 ---
 
+## What's new in v3.3 (in development)
+
+- **Selective-SSM (Mamba/Mamba-2) support, both phases.** GreenBoost's
+  memory model, telemetry, and semantics layer now understand recurrent
+  (fixed-size, non-KV-growing) state as a first-class thing across BOTH
+  the GGUF/llama.cpp path (`gguf_summary()`) and the safetensors/torch-core
+  path (`safetensors_summary()`), for hybrid architectures (Qwen3.5/3.6
+  Gated DeltaNet) and pure-recurrent ones alike:
+  - `gb_synapse.ModelEntry` gained `n_recurrent_layers`, `ssm_d_conv`,
+    `ssm_conv_width`, `ssm_state_elems`, `is_recurrent_only` -
+    `n_kv_layers == 0` is now distinguishable as "genuinely no attention"
+    vs. the old silent "unknown, assume every layer is attention" ~4x
+    KV-cache overestimate.
+  - `estimate_ssm_state_gb()` sizes the recurrent state itself (previously
+    charged as zero bytes everywhere), wired as a fixed cost (never
+    scaled by ctx) into `_solve_ctx_and_layers`/`_clamp_ctx_to_budget`/
+    `_fit_gpu_layers`/`recommend()`.
+  - The shim gained `GREENBOOST_SSM_STATE_MB` - a size-independent
+    classification signal that pins small recurrent-state allocations in
+    T1 (`GB_ALLOC_KV_CACHE|GB_ALLOC_T1_PRIORITY`) instead of leaving them
+    `GB_ALLOC_ACTIVATIONS`-classified and T2/T3-spill-eligible.
+  - New `ssm_state` dataflux kind + `ssm_state_gb`/`recurrent_layer_fraction`
+    governed GB-Semantics metrics (with `never_use` traps for the exact
+    misreads this fix closes).
+  - **Native Mamba-2 model support in gb-synapse's own torch-core engine**
+    (`synapse_engine/gllm/models/mamba.py`, new) - not just accounting for
+    recurrent state, but actually serving a pure-recurrent checkpoint
+    end to end. The SSD chunked-scan and decode kernels are vendored
+    verbatim from vLLM's own Triton port (itself from the Mamba-2
+    reference implementation) rather than hand-written, on the same
+    reuse-tested-kernel principle as the existing GPTQ/AWQ Triton dequant
+    path. Four pre-existing gLLM engine assumptions (every one some
+    variant of "a real KV page pool always exists") were found and fixed
+    along the way - the first time any purely-recurrent model has run
+    through this engine at all.
+- **`gb_synapse.pull()`'s GGUF quant matching** is a plain substring
+  match against an unordered file listing - confirmed live to be
+  ambiguous for more quant-name variants than previously documented
+  (`:MTP-IQ4_XS` matched three different files in one real repo). Pass
+  the exact, full quant token for any repo shipping multiple
+  `-XXX-<quant>` suffixed files of the same base quant.
+
+---
+
 ## What's new in v3.2
 
 The 3.2 cycle's headline is `greenboost cluster`: the first release where it
@@ -317,7 +361,7 @@ describe that release's delta only — this section is the live count.
 | Server | Entry file | Tools |
 |---|---|---|
 | `greenboost-dataflux` | `gb_dataflux_mcp.py` | 19 — event-log queries (`dataflux_*`), plus mirrored `greenboost_status`/`greenboost_capabilities`/`greenboost_pilot`/`synapse_status`/`tiering_status` |
-| `greenboost-orchestrator` | `gb_mcp.py` | 16 — `greenboost_overview`, `optimize_inference`, `quant_advisor`, `gb_plan` (CB-3 tier-plan), gated actuation (`tier_actuate`, `set_quant_policy`, `run_under_greenboost`, `a2a_gateway`), `shim_env`, plus mirrors of the status/capabilities/pilot/synapse_status/cluster_status/dataflux_summary tools (shared impl in `gb_mcp_common.py`) for "one server suffices" |
+| `greenboost-orchestrator` | `gb_mcp.py` | 20 — `greenboost_overview`, `optimize_inference`, `quant_advisor`, `gb_plan` (CB-3 tier-plan), gated actuation (`tier_actuate`, `set_quant_policy`, `run_under_greenboost`, `a2a_gateway`), `shim_env`, the GB-Semantics governed layer (`semantic_metrics`/`semantic_resolve`/`semantic_segments`/`semantic_answer`, backed by `gb_semantics.py`), plus mirrors of the status/capabilities/pilot/synapse_status/cluster_status/dataflux_summary tools (shared impl in `gb_mcp_common.py`) for "one server suffices" |
 | `greenboost-cluster` | `gb_cluster_mcp.py` | 7 — live feeder/VRAM/T2/T3 state, gated `cluster_dispatch`/`cluster_ensure_feeder_ready` |
 | `greenboost-synapse` | `gb_synapse_mcp.py` | 10 — serving control, `synapse_recommend`, gated `serve_and_repoint`, CLI bridge |
 | `greenboost` (CLI) | `greenboost-cli/greenboost_cli/mcp/server.py` | 16 — RAG/goals/history/factory |

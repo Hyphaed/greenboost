@@ -276,6 +276,13 @@ class _FakeSynapseEntry:
         self.arch = ""
         self.source = "hf"
         self.ctx_length = 0
+        self.n_layers = 0
+        self.n_kv_layers = 0
+        self.n_recurrent_layers = 0
+        self.is_recurrent_only = False
+        self.ssm_d_conv = 0
+        self.ssm_conv_width = 0
+        self.ssm_state_elems = 0
 
 
 def _patch_torch_serve_common(monkeypatch, tmp_path, mode="gllm", reason=""):

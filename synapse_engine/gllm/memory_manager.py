@@ -291,6 +291,14 @@ class Segment:
 
     # return percent of used memory
     def get_memory_util(self):
+        # GREENBOOST PATCH (2026-07-29, see NOTICE): a pure-recurrent model
+        # (Mamba-2, num_layers=0) has a zero-sized KV segment -- there is no
+        # KV cache to report utilization for at all, so 0% is the correct
+        # answer, not a crash. Same root cause as the get_sizeof_KV_per_page
+        # fix in MemoryManager.init(): this code path was never exercised
+        # with a truly empty KV segment before.
+        if self.id_allocator.size == 0:
+            return 0.0
         return round(
             100 * self.id_allocator.get_num_used_ids() / self.id_allocator.size, 2
         )
@@ -380,7 +388,15 @@ class MemoryManager:
         self._init_ssm_segment_if_needed()
 
         free_mem_size, _ = torch.cuda.mem_get_info()
-        num_max_pages = free_mem_size // self.get_sizeof_KV_per_page()
+        sizeof_kv_per_page = self.get_sizeof_KV_per_page()
+        # GREENBOOST PATCH (2026-07-29, see NOTICE): a PURE-recurrent model
+        # (Mamba-2: num_layers=0, no real attention layer at all -- unlike
+        # Qwen3.5's GDN hybrid, which always keeps num_layers>0 for its
+        # full-attention layers) makes this legitimately 0, not an error --
+        # there is no KV cache to page at all, the recurrent state is fully
+        # handled by the SSM pool allocated just above. Dividing by zero
+        # here crashed every pure-recurrent model's load outright.
+        num_max_pages = free_mem_size // sizeof_kv_per_page if sizeof_kv_per_page > 0 else 0
         num_pages = int(num_max_pages * self.gpu_memory_util)
 
         if not dist.is_initialized():
@@ -496,6 +512,25 @@ class MemoryManager:
             total / (1 << 30),
             cfg.num_layers,
         )
+        # GreenBoost local patch (see synapse_engine/NOTICE): this is a real
+        # placement decision (can disable prefix-state reuse entirely) and
+        # was previously invisible to dataflux — the Observability Must-Rule
+        # gap this closes. Same best-effort import pattern as
+        # async_llm_engine.py's synapse_engine_error emit (gb_dataflux is
+        # only importable under gb-synapse's torch venv).
+        try:
+            import gb_dataflux
+            gb_dataflux.emit({
+                "kind": "ssm_state", "status": "warn" if snapshot_slots < requested_snapshot else "ok",
+                "working_slots": working_slots,
+                "requested_snapshot_slots": requested_snapshot,
+                "snapshot_slots": snapshot_slots,
+                "per_slot_mb": round(per_slot / (1 << 20), 3),
+                "total_gb": round(total / (1 << 30), 3),
+                "n_recurrent_layers": cfg.num_layers,
+            })
+        except Exception:
+            pass
 
     def get_sizeof_KV_per_page(self):  # Bytes
         if not self.use_mla:
@@ -537,6 +572,13 @@ class MemoryManager:
         )
 
     def pre_allocate_page(self, seqs: List[Sequence]):
+        # GREENBOOST PATCH (2026-07-29, see NOTICE): a pure-recurrent model
+        # (Mamba-2, num_pages=0) has no KV page pool to allocate from at
+        # all -- self.segment.allocate() on an empty IDAllocator would
+        # assert/crash. No-op here (not at every call site) so scheduler.py's
+        # prefill AND decode paths are both covered by this one guard.
+        if self.num_pages == 0:
+            return
         for seq in seqs:
             num_page = (seq.seq_len + self.page_size - 1) // self.page_size - len(
                 seq.page_table
@@ -686,6 +728,12 @@ class MemoryManager:
         return self.segment.get_memory_util()
 
     def get_memory_free(self):
+        # GREENBOOST PATCH (2026-07-29, see NOTICE): same zero-KV-cache case
+        # as Segment.get_memory_util() above -- num_pages=0 for a pure-
+        # recurrent model, "100% free" (nothing to fill) is the correct
+        # answer, not a crash.
+        if self.num_pages == 0:
+            return 1.0
         return self.get_num_free_pages() / self.num_pages
 
 
@@ -897,6 +945,10 @@ class PrefixMemoryManager(MemoryManager):
             self.segment.update(seq, n, seq.page_table[page_idx])
 
     def pre_allocate_page(self, seqs: List[Sequence]):
+        # GREENBOOST PATCH (2026-07-29, see NOTICE): same pure-recurrent
+        # (num_pages=0) no-op as the base MemoryManager.pre_allocate_page.
+        if self.num_pages == 0:
+            return
         for seq in seqs:
             len_page_table = len(seq.page_table)
             num_page = (

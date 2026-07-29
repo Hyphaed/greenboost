@@ -139,6 +139,7 @@ shim owns the tiers *within* each one.
 | `greenboost recommend [ctx] [--llm]` | Fit + throughput estimate for every pulled model against the live cluster VRAM budget |
 | `sudo greenboost synapse login [TOKEN]` | Store a HuggingFace token (masked prompt if omitted, or set `HF_TOKEN`) |
 | `sudo greenboost pull <repo>[:quant] [name]` | Download a GGUF from HuggingFace; auto-picks the largest quant that fits the cluster if none given |
+| `sudo greenboost pull <repo> --engine torch [name]` | Pull a safetensors checkpoint for gb-synapse's own torch-core engine instead of GGUF/llama.cpp - includes native **Mamba-2** (pure selective-SSM, no regular attention at all) alongside the existing bf16/GPTQ/AWQ/FP8 dense and MoE support |
 | `greenboost synapse list [--llm]` | List all known models (HuggingFace-pulled + indexed Ollama blobs) |
 | `sudo greenboost synapse rm <name>` | Remove an HF-pulled model (refuses Ollama-managed blobs - use `ollama rm`) |
 | `sudo greenboost synapse index-ollama` | Register every GGUF Ollama has already downloaded so `synapse list`/`recommend` see them |

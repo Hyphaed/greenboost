@@ -373,7 +373,7 @@ class EngineBackend:
     def can_serve(self, entry) -> bool:
         raise NotImplementedError
 
-    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None):
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None):
         """n_slots=-1 (default) means "let the engine decide" — for
         LlamaCppBackend this passes straight through to llama.cpp's own
         `-np -1` auto mode (n_parallel=4, kv_unified=true, a single shared
@@ -393,7 +393,14 @@ class EngineBackend:
         one serve call — added so callers (the synapse_serve MCP tool
         included) can opt a specific serve into graphs without mutating
         process-wide environment state. Backends without a CUDA-graph
-        concept ignore this parameter regardless of its value."""
+        concept ignore this parameter regardless of its value.
+
+        cache_ram=None (default) means "derive from live free host RAM"
+        (LlamaCppBackend only — see that backend's serve() for the %-derived
+        sizing; the hardcoded-hardware-values rule forbids a literal MiB
+        figure here). Pass an explicit MiB value to override the derivation
+        for one serve call. Backends without llama.cpp's host-memory
+        prompt-cache concept ignore this parameter regardless of its value."""
         raise NotImplementedError
 
     def serve_facts(self, entry) -> dict:
@@ -415,7 +422,7 @@ class LlamaCppBackend(EngineBackend):
     def can_serve(self, entry) -> bool:
         return entry.engine == "llama.cpp"
 
-    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None):
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None):
         import gb_synapse as gs
         import gb_cluster
         from gb_nvml import get_nvml
@@ -549,12 +556,49 @@ class LlamaCppBackend(EngineBackend):
         # context reachable at all.
         kv_type = gs._pick_kv_type(ctx, entry, ctx_kv_budget_gb + t2_kv_extra_gb)
 
+        kv_layers = 0 if entry.is_recurrent_only else (entry.n_kv_layers or entry.n_layers)
         kv_total_gb = gs.estimate_kv_gb(ctx, entry.n_bytes, entry.quant,
-                                        n_layers=(entry.n_kv_layers or entry.n_layers),
+                                        n_layers=kv_layers,
                                         n_kv_heads=entry.n_kv_heads,
                                         head_dim=entry.head_dim,
                                         kv_bytes_per_elem=2.0 if kv_type == "f16" else 1.0)
+        # Recurrent state is VRAM-resident too (Rule #1 — pin in T1, see
+        # GREENBOOST_SSM_STATE_MB) and must be counted alongside KV when
+        # sizing the tensor split, or a hybrid/Mamba GGUF's real footprint
+        # is undercounted at the exact placement step that matters.
+        ssm_gb = gs._entry_ssm_gb(entry)
+        kv_total_gb += ssm_gb
         tensor_split = gs._compute_tensor_split(host_free_mb, online_feeders, kv_total_gb)
+        if ssm_gb > 0:
+            # llama.cpp allocates the whole recurrent-memory buffer as ONE
+            # ggml-backend alloc spanning every layer, so the shim sees one
+            # cudaMalloc close to the FULL aggregate — pass that (+25%
+            # margin, rounded up) rather than trying to divide by layer count.
+            env["GREENBOOST_SSM_STATE_MB"] = str(max(1, int(ssm_gb * 1024 * 1.25) + 1))
+
+        # Host-memory prompt-cache size: %-derived from LIVE free host RAM
+        # (hardcoded-hardware rule: max(small_floor, pct x capacity), never a
+        # literal MiB figure). This is the flag pair (--cache-ram +
+        # llama.cpp's own default-on --cache-idle-slots) responsible for up
+        # to ~93% TTFT reduction on a cached prefix — exactly GB-CLI's
+        # workload, which resends a long, stable system prompt + tool-schema
+        # prefix every agentic turn. 15% of currently-free RAM, floor 512
+        # MiB: big enough to hold several turns' worth of this reference
+        # workload's prefix without competing with T2 DDR weight/KV spill
+        # for the same RAM (see the Memory Orchestration rule , T2 spill
+        # takes priority over a nice-to-have cache).
+        #
+        # KNOWN CAVEAT (needs live verification before this is trusted
+        # unconditionally): upstream reports --cache-reuse + --kv-unified
+        # (the default when -np is left at -1, as it is here) can cancel
+        # newly allocated tasks under some load patterns. --cache-reuse 256
+        # already shipped before this change with the same -np=-1 default,
+        # so this isn't a NEW interaction, but --cache-ram makes host-memory
+        # reuse active far more often, which could surface it. Verify via
+        # dataflux's prompt_cache events (hit_pct staying sane, no dropped
+        # requests) the first time this serves real traffic.
+        cache_ram_mb = (cache_ram if cache_ram is not None
+                        else max(512, int(gs._read_ram_available_mb() * 0.15)))
 
         gs.SLOT_DIR.mkdir(parents=True, exist_ok=True)
         cmd = [str(gs.ENGINE_DIR / "llama-server"), "-m", entry.path,
@@ -563,6 +607,7 @@ class LlamaCppBackend(EngineBackend):
                "--slot-save-path", str(gs.SLOT_DIR), "--no-webui",
                "--flash-attn", "auto",
                "--cache-reuse", "256",
+               "--cache-ram", str(cache_ram_mb),
                "--no-mmap",  # DMA-BUF pinning (Path A) is incompatible with mmap-backed pages
                # n_slots defaults to -1 (EngineBackend.serve's docstring):
                # passed straight through, llama.cpp's own arg parser treats
@@ -682,7 +727,9 @@ class LlamaCppBackend(EngineBackend):
                                                engine=self.name,
                                                ctx=ctx, kv_type=kv_type, placement=placement,
                                                n_gpu_layers=n_gpu_layers_reported,
-                                               mtp=bool(gs._has_mtp(entry)), vision=bool(mmproj))
+                                               mtp=bool(gs._has_mtp(entry)), vision=bool(mmproj),
+                                               ssm_state_gb=round(ssm_gb, 3),
+                                               n_recurrent_layers=entry.n_recurrent_layers)
         except RuntimeError as e:
             err_lower = str(e).lower()
             is_oom = "out of memory" in err_lower
@@ -711,7 +758,8 @@ class LlamaCppBackend(EngineBackend):
                     engine=self.name, ctx=ctx, kv_type=kv_type,
                     placement="PARTIAL CPU OFFLOAD (VRAM fragmentation fallback)",
                     n_gpu_layers=fallback_ngl,
-                    mtp=bool(gs._has_mtp(entry)), vision=bool(mmproj))
+                    mtp=bool(gs._has_mtp(entry)), vision=bool(mmproj),
+                    ssm_state_gb=round(ssm_gb, 3), n_recurrent_layers=entry.n_recurrent_layers)
             # The dense partial-offload branch (`_fit_gpu_layers`) sizes -ngl against
             # the %-derived compute-graph reserve (`_compute_reserve_gb`), but that
             # reserve is a flat per-device estimate tuned for plain attention-only
@@ -740,7 +788,8 @@ class LlamaCppBackend(EngineBackend):
                     engine=self.name, ctx=ctx, kv_type=kv_type,
                     placement="PARTIAL CPU OFFLOAD (compute-buffer OOM fallback)",
                     n_gpu_layers=fallback_ngl,
-                    mtp=bool(gs._has_mtp(entry)), vision=bool(mmproj))
+                    mtp=bool(gs._has_mtp(entry)), vision=bool(mmproj),
+                    ssm_state_gb=round(ssm_gb, 3), n_recurrent_layers=entry.n_recurrent_layers)
             raise
 
     def serve_embedding(self, entry, primary_port: int) -> "tuple[subprocess.Popen, int]":
@@ -833,12 +882,19 @@ class SynapseTorchBackend(EngineBackend):
         return entry.engine in ("torch", "vllm", "transformers", "gbquant")
 
     def serve_facts(self, entry) -> dict:
+        import gb_synapse as gs
         _, _, facts = effective_vram_budget_mb()
         facts["quant_method"] = entry.quant_method
         facts["quant_below_floor"] = _quant_below_fp8_floor(entry)
+        # Recurrent-state footprint, surfaced in the same synapse_serve event
+        # as everything else this serve decided — the primary reference
+        # workload (Brian6145/Qwen3.6-27B-...-NVFP4-MTP) is exactly the
+        # hybrid case this makes visible.
+        facts["ssm_state_gb"] = round(gs._entry_ssm_gb(entry), 3)
+        facts["n_recurrent_layers"] = entry.n_recurrent_layers
         return facts
 
-    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None):
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None):
         import gb_synapse as gs
         import gb_cluster
 
@@ -871,6 +927,18 @@ class SynapseTorchBackend(EngineBackend):
         cuda_home = _cuda_home_for_torch()
         if cuda_home:
             env["CUDA_HOME"] = cuda_home
+        if shim_on and entry.n_recurrent_layers > 0:
+            # Unlike llama.cpp's one-big-buffer recurrent memory, gLLM's
+            # SSMCacheConfig allocates conv_state/temporal_state as SEPARATE
+            # per-layer tensors (memory_manager.py:107-115 — one torch.zeros()
+            # call per layer, each its own cudaMalloc), so the shim sees N
+            # small allocs rather than one large one. Size the threshold to
+            # roughly one layer's share of the aggregate (+50% margin — wider
+            # than the llama.cpp path's since per-layer sizes aren't uniform
+            # across conv_state vs temporal_state vs the snapshot-pool
+            # variant), not the full aggregate.
+            per_layer_gb = gs._entry_ssm_gb(entry) / entry.n_recurrent_layers
+            env["GREENBOOST_SSM_STATE_MB"] = str(max(1, int(per_layer_gb * 1024 * 1.5) + 1))
 
         facts = self.serve_facts(entry)
         mode, reason = _torch_serve_mode(entry)
@@ -914,6 +982,41 @@ class SynapseTorchBackend(EngineBackend):
                    "--gpu-memory-util", f"{util:.2f}"]
             if ctx and ctx > 0:
                 cmd += ["--model-max-length", str(ctx)]
+
+            # gLLM's own --maxd (max concurrent decode slots) was never
+            # threaded through from n_slots -- silently dropped on the floor
+            # despite EngineBackend.serve()'s own docstring documenting this
+            # backend as one that supports it. Found live, 2026-07-29
+            # (AntonV/mamba2-2.7b-hf): --maxd's hardcoded gLLM-side default
+            # (512) reserves a working-slot pool sized for the checkpoint's
+            # recurrent state per slot -- for a plain KV-cache model that
+            # pool is cheap, but for a real Mamba-2 checkpoint's much larger
+            # per-slot conv_state+temporal_state, 512 slots demanded 81.1 GB
+            # against 4 GB actually free after loading weights, and gLLM
+            # fails loudly rather than auto-shrinking ("Lower --maxd").
+            # Explicit n_slots always wins; the -1 "let the engine decide"
+            # default only gets an auto-derived cap for recurrent/hybrid
+            # checkpoints, where gLLM's own hardcoded 512 is provably unsafe
+            # -- a plain attention model's KV pool sizing already comes from
+            # --gpu-memory-util correctly, so this must not change that path.
+            if n_slots > 0:
+                cmd += ["--maxd", str(n_slots)]
+            elif entry.n_recurrent_layers > 0:
+                per_slot_gb = gs.estimate_ssm_state_gb(
+                    entry.n_recurrent_layers, entry.ssm_d_conv,
+                    entry.ssm_conv_width, entry.ssm_state_elems, n_seq_max=1,
+                )
+                if per_slot_gb > 0:
+                    from gb_nvml import get_nvml
+                    _, _, host_total_mb, _ = get_nvml(0).mem()
+                    budget_gb = (util * host_total_mb / 1024.0) - (entry.n_bytes / 1e9)
+                    # Conservative margin (0.7x) -- per_slot_gb (F32-for-both
+                    # conv+temporal state) is itself already a conservative
+                    # over-estimate (see estimate_ssm_state_gb's own
+                    # docstring), but activation/CUDA-graph/profiling
+                    # overhead during warmup isn't accounted for here at all.
+                    safe_maxd = max(1, int((budget_gb * 0.7) / per_slot_gb))
+                    cmd += ["--maxd", str(safe_maxd)]
 
             # gLLM's own --maxp (max prefill tokens per batch, used to size
             # profile_run()'s dummy warmup sequence) defaults to 8192
@@ -1056,7 +1159,7 @@ class TransformersBackend(EngineBackend):
     def can_serve(self, entry) -> bool:
         return entry.engine in ("transformers", "gbquant")
 
-    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None):
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None):
         import gb_synapse as gs
 
         internal_port = port + 1000
@@ -1092,7 +1195,7 @@ class DiffusersBackend(EngineBackend):
     def can_serve(self, entry) -> bool:
         return entry.engine == "diffusers"
 
-    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None):
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None):
         import gb_synapse as gs
         import gb_cluster
 

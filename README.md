@@ -28,11 +28,12 @@
 | 🌐 **GB-Cluster** | Borrow idle GPU and RAM resources from other machines on your local network. |
 | 🔗 **GB-Synapse** | Translation proxy exposing Ollama-compatible endpoints (`/api/generate`, `/api/chat`, `/api/tags`, `/api/ps`) and the OpenAI-compatible `/v1/*` API on port `11434`. It sits in front of `gb-synapse` (`llama-server --rpc`), enabling cross-GPU RPC execution, GB-Quant, and proxy-side Dataflux telemetry (including tokens/sec). A genuine drop-in replacement for Ollama. |
 | 🖥️ **GB-CLI** | Agentic terminal client, installed by Full Install — no separate setup. Open it with `gb` (or `greenboost-cli`); one-shot prompts with `gb -p "…"`; headless JSON subcommands for scripts (`gb rag-search …`). Always talks to GB-Synapse on `:11435` (Ollama **and** HuggingFace models via `greenboost synapse pull` / `index-ollama`). |
+| 🧭 **GB-Semantics** | Governed metric/segment layer for GreenBoost's own state (VRAM fill, tier pressure, tok/s, quality floor, cluster health, prompt-cache hit rate…) — one name, one deterministic resolver, per concept, with explicit "never read this raw field instead" traps. The mandatory default path any LLM client resolves through before touching a raw dataflux/telemetry field. |
 </div>
 
 <div align="center">
 
-**MCP servers** (LLM-facing): `greenboost-orchestrator` (central , full awareness via `greenboost_overview`, `optimize_inference`, `quant_advisor`, `flux_health`) · `greenboost-dataflux` (event log) · `greenboost-cluster` (live cluster state) · `greenboost-synapse` (serving control + CLI bridge) · `greenboost` (GB-CLI: rag/goals/factory)
+**MCP servers** (LLM-facing): `greenboost-orchestrator` (central , full awareness via `greenboost_overview`, `optimize_inference`, `quant_advisor`, `flux_health`, and the GB-Semantics `semantic_*` tools) · `greenboost-dataflux` (event log) · `greenboost-cluster` (live cluster state) · `greenboost-synapse` (serving control + CLI bridge) · `greenboost` (GB-CLI: rag/goals/factory)
 
 </div>
 
@@ -48,6 +49,7 @@
 [GB-Cluster](#-gb-cluster) ·
 [GB-Synapse](#-gb-synapse) ·
 [GB-CLI](#-gb-cli) ·
+[GB-Semantics](#-gb-semantics) ·
 [Changelog](CHANGELOG.md)
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/greenboost)
@@ -512,6 +514,18 @@ isn't installed), GB-Synapse falls back to `gb_synapse_fallback.py`, a
 minimal single-request OpenAI-compatible server (transformers + gb-quant) -
 same API surface, no extra dependency.
 
+The torch-core engine's own model zoo also now covers **Mamba-2** -- a
+different family of model that replaces regular attention's growing,
+per-token memory with a small, fixed-size recurrent state instead. Pull one
+straight from HuggingFace the same way as anything else and it serves
+through the same `/v1/*` API, cluster telemetry, and shim placement rules as
+every other model here:
+
+```bash
+sudo greenboost pull <mamba2-repo> --engine torch
+greenboost synapse run <model>
+```
+
 ---
 
 ## 🖥️ GB-CLI
@@ -533,6 +547,38 @@ Full Install deploys it into `/usr/local/lib/greenboost/cli-venv` and puts
 `gb` + `greenboost-cli` on your PATH; the `greenboost` MCP server exposes its
 rag/goals/factory surface to other assistants.
 
+
+---
+
+## 🧭 GB-Semantics
+
+**A governed metric/segment layer so an LLM gets one deterministic answer per
+question about GreenBoost's own state — never a guess.**
+
+Several raw fields in this codebase mean two different things depending on
+where they're read from (a shim-inflated "virtual" VRAM figure vs. the real
+physical one; a 0/1/2 pressure enum vs. a 0.0-1.0 pressure fraction under the
+same field name). GB-Semantics defines each governed concept ONCE
+(`semantics/*.yaml`: entities, metrics, segments, question-routing), binds it
+to a resolver that wraps GreenBoost's existing accessors (`gb_semantics.py`),
+and documents every trap explicitly (`never_use`) so an agent that reads the
+raw field anyway at least knows it's the wrong one.
+
+```bash
+python3 gb_semantics.py answer "is rule 1 satisfied?"
+python3 gb_semantics.py resolve vram_fill_pct
+```
+
+Over MCP: `semantic_metrics` (discover), `semantic_resolve` (one governed
+value + provenance), `semantic_segments` (named canonical filters, e.g.
+`rule1_underfilled`, `swap_thrash_not_gpu_throttle`), `semantic_answer` (full
+question routing) — all on `greenboost-orchestrator`. Every non-MCP consumer
+(GB-CLI, ai-forge) gets a bounded summary card for free via
+`gb_monitor.context_summary()`.
+
+`checks/check_semantics_coverage.py` blocks a merge if a metric/segment loses
+its resolver, and `tests/test_semantics_evals.py` runs a trap-weighted eval
+set against a frozen fixture on every run.
 
 ---
 

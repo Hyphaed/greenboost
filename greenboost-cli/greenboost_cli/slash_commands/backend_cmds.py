@@ -317,6 +317,22 @@ def cmd_llamaserve(args: str, _session, settings) -> bool:
         emit_err(f"Could not start gb-synapse: {e}")
         return True
 
+    if state.proxy_error:
+        # gb_synapse.py deliberately keeps the engine alive and records this
+        # distinctly (ServerState.proxy_error, a "proxy_error" dataflux
+        # status) rather than silently reporting full success — see
+        # _launch_proxy_and_record's own comment. Real incident, 2026-07-28:
+        # this branch didn't exist, so a dead proxy (missing aiohttp in
+        # cli-venv) still printed "✓ gb-synapse started" with a :11435 URL
+        # that nothing was listening on, and the failure only surfaced on
+        # the NEXT prompt as a confusing "Cannot connect" three steps later.
+        emit_err(f"gb-synapse's engine loaded but its proxy failed to start: "
+                 f"{state.proxy_error.splitlines()[0]}")
+        console.print(f"  [{GRAY}]model:[/]  [{VIOLET}]{state.model}[/]  "
+                       f"[{GRAY}](engine alive, pid {state.llama_pid} — front door is down)[/]")
+        console.print(f"  [{GRAY}]log:  [/]  [{GRAY}]{gb_synapse.log_path(state.model + '_proxy')}[/]")
+        return True
+
     emit_ok(f"gb-synapse started (pid {state.llama_pid})")
     console.print(f"  [{GRAY}]model:[/]  [{VIOLET}]{state.model}[/]")
     if state.ctx:

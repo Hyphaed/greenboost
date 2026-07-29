@@ -117,7 +117,8 @@ def synapse_doctor(probe_feeders: bool = True) -> dict:
 @mcp.tool()
 def synapse_serve(model: str, ctx: int = 65536, use_cluster: bool = True,
                   engine: str = "", confirm: bool = False,
-                  cuda_graph: "bool | None" = None) -> dict:
+                  cuda_graph: "bool | None" = None,
+                  cache_ram: "int | None" = None) -> dict:
     """Serve a model through gb-synapse (engine backend + the gb-synapse
     proxy, default port 11435, GB_SYNAPSE_PORT; tensor-split across the
     cluster when use_cluster and feeders are up for the llama.cpp backend).
@@ -134,6 +135,11 @@ def synapse_serve(model: str, ctx: int = 65536, use_cluster: bool = True,
     small enough to leave headroom (added 2026-07-28: this MCP tool had no
     way to reach this env-gated knob at all before, the exact kind of gap
     CLAUDE.md's MCP-tool-gap rule now says to close, not work around).
+
+    cache_ram: llama.cpp backend only (ignored by torch/diffusers) — MiB
+    size of the --cache-ram host-memory prompt cache. None (default) derives
+    it from live free host RAM (see LlamaCppBackend.serve()); pass an
+    explicit value to override for one serve call.
 
     DRY-RUN unless confirm=True: without it, returns the resolved model entry,
     which backend would serve it, and a warning about whatever is currently
@@ -155,12 +161,12 @@ def synapse_serve(model: str, ctx: int = 65536, use_cluster: bool = True,
         if not confirm:
             return {"dry_run": True, "would_serve": asdict(entry), "backend": backend_name,
                     "ctx": ctx, "use_cluster": use_cluster, "cuda_graph": cuda_graph,
-                    "currently_serving": current,
+                    "cache_ram": cache_ram, "currently_serving": current,
                     "warning": f"the gb-synapse port ({gb_synapse.DEFAULT_PORT}) may "
                                "have live consumers (ai-forge FORGE_OLLAMA_URL, ollama "
                                "clients). Pass confirm=True to actually serve."}
         st = gb_synapse.serve(entry.name, ctx=ctx, use_cluster=use_cluster,
-                              cuda_graph=cuda_graph)
+                              cuda_graph=cuda_graph, cache_ram=cache_ram)
         return {"serving": asdict(st)}
     except Exception as e:
         return {"error": str(e)}

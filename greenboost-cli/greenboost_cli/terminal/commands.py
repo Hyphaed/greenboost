@@ -284,6 +284,7 @@ def _switch_model(m: str, _session, settings: dict) -> None:
     """Persist the model choice and (re)start gb-synapse serving it — gb-synapse
     is the only backend, so picking a model must make it live immediately
     rather than leaving llama-server stopped until the next full CLI restart."""
+    previous = settings.get("model")
     settings["model"] = m
     emit_ok(f"Model → [{VIOLET}]{m}[/]")
     from greenboost_cli.environment.settings import save_settings
@@ -293,6 +294,22 @@ def _switch_model(m: str, _session, settings: dict) -> None:
     from greenboost_cli.slash_commands.backend_cmds import cmd_llamaserve, _llamacpp_running_pid
     action = "restart" if _llamacpp_running_pid(settings) else "start"
     cmd_llamaserve(action, _session, settings)
+
+    # A resolution/gate failure (unknown model, capability-refused quant,
+    # etc.) never gets as far as a running engine — cmd_llamaserve prints its
+    # own error and returns, but until now settings["model"] was already
+    # durably saved above, leaving the CLI pointed at a model that can never
+    # start until the user notices and switches again. Real incident,
+    # 2026-07-28: this had no rollback at all. Only reverts when the engine
+    # itself never came up (not when the engine loaded but the proxy alone
+    # died — that's a real running model with a front-door problem, not a
+    # bad model choice, and belongs to the caller to fix, not to revert).
+    if not _llamacpp_running_pid(settings):
+        settings["model"] = previous
+        save_settings(settings)
+        if previous:
+            emit_warn(f"Reverted model back to [{VIOLET}]{previous}[/] "
+                       f"(the switch above failed to start).")
 
 
 def _cmd_model_remove(name: str, settings: dict) -> bool:

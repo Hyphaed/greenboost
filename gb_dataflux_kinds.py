@@ -121,6 +121,12 @@ KINDS: dict[str, KindSpec] = {
     "model_rotation": KindSpec(
         group="synapse", doc="gb_rotator.py overnight rotation phase event.",
         fields=("model", "phase")),
+    "prompt_cache": KindSpec(
+        group="synapse", doc="Proxy-observed llama.cpp host-memory prompt-cache "
+                             "outcome for one request (--cache-reuse/--cache-ram): "
+                             "TTFT and the reused-vs-total prompt token share. "
+                             "Feeds GB-Semantics' ttft_ms/prompt_cache_hit_pct metrics.",
+        fields=("model",), numeric_fields=("ttft_ms", "hit_pct", "reused_tokens")),
 
     # ── cluster ──────────────────────────────────────────────────────────
     "node_topology": KindSpec(
@@ -164,6 +170,14 @@ KINDS: dict[str, KindSpec] = {
     "mem_pool_trim": KindSpec(
         group="shim", doc="gb_mem_pool.MemPoolManager.trim()/trim_all() pool-reclaim result.",
         fields=("pool",), numeric_fields=("allocated_before_mb", "allocated_after_mb", "reclaimed_mb")),
+    "ssm_state": KindSpec(
+        group="shim", doc="Selective-SSM (Mamba/Mamba2/hybrid Gated-DeltaNet) recurrent-"
+                          "state cache-pool sizing decision (synapse_engine/gllm/"
+                          "memory_manager.py's MemoryManager._clamp_ssm_pools) — working/"
+                          "snapshot slot counts, and whether the snapshot pool (prefix-"
+                          "state reuse) was clamped or disabled to fit the memory budget.",
+        fields=("working_slots", "requested_snapshot_slots", "snapshot_slots"),
+        numeric_fields=("per_slot_mb",), incident_when=("warn",)),
 
     # ── pipeline (mostly ai-forge-emitted; GreenBoost is the consumer/query side) ──
     "stage_profile": KindSpec(

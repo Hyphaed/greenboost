@@ -186,6 +186,62 @@ different, much better problem than "can't start at all."
 labelled as such in telemetry, same rule as always: a retrieval score is
 meaningless without knowing which tier produced it.
 
+**2026-07-29 addendum — the safetensors path had the identical bug, unfixed
+until now.** Everything above was fixed on `gb_synapse.gguf_summary()` (the
+GGUF/llama.cpp path). The same hybrid architecture served as safetensors
+(e.g. `Brian6145/Qwen3.6-27B-Claude-Opus-Sonnet-Distilled-NVFP4-MTP`, NVFP4,
+routed through `SynapseTorchBackend`/gLLM instead of llama.cpp) went through
+`gb_synapse.safetensors_summary()`, which read the config's `layer_types`
+field only for its LENGTH, never its per-layer contents — so `n_kv_layers`
+stayed 0 on every hybrid safetensors model, and every consumer's
+`entry.n_kv_layers or entry.n_layers` fallback silently treated that as
+"assume every layer is real attention," reintroducing the same ~4x
+overestimate this section describes fixing for GGUF. Fixed the same day by
+counting `layer_types` directly — exact, not an interval approximation,
+since the config already lists each layer's type.
+
+That fix also surfaced a second gap that was ALREADY wrong for both GGUF and
+safetensors: the recurrent layers' own state (Gated DeltaNet's `conv_state` +
+temporal state — small, fixed-size, but per arXiv:2312.00752 read and
+rewritten every decode step) was charged as **zero bytes**, everywhere.
+`gb_synapse.estimate_ssm_state_gb()` now sizes it (formula ported from
+llama.cpp's own `n_embd_r()`/`n_embd_s()`) and `_solve_ctx_and_layers()`
+subtracts it from the VRAM budget as a fixed cost alongside weights — never
+scaled by ctx, since unlike KV cache it doesn't grow with context length.
+The shim can now pin it in T1 (`GREENBOOST_SSM_STATE_MB`, opt-in) instead of
+leaving it `GB_ALLOC_ACTIVATIONS`-classified and T2/T3-spill-eligible.
+
+**2026-07-29, later the same day — re-verified live, with one real limit
+found.** Metadata: confirmed against the actual
+`Brian6145/Qwen3.6-27B-Claude-Opus-Sonnet-Distilled-NVFP4-MTP` config
+(`config.json` pulled standalone, no weights) — `n_kv_layers=16` (=
+`n_layers/4`, not `0`, not `64`), `n_recurrent_layers=48`,
+`ssm_state_gb=0.146`, `quant_method=nvfp4` all detected correctly by
+`safetensors_summary()`. `synapse_recommend` on the sibling FP8 checkpoint
+(`bottlecapai/ThinkingCap-Qwen3.6-27B-FP8`, identical architecture) confirms
+the win live: `kv_gb` 8.0→2.0 GB (exact 4x) with `ssm_state_gb=0.146` now
+present where it was always `0` before.
+
+**The end-to-end `synapse_serve` step for THIS checkpoint is blocked, but
+not by anything this fix touches**: `gb_synapse.pull()` refuses the NVFP4
+repo before downloading — `SynapseTorchBackend`/gLLM has no dispatch path
+for `nvfp4` at all (`gllm/layers/linear.py`'s quant dispatch only knows
+fp8/gptq/awq), so this is a pre-existing engine-capability gate doing its
+job (loud refusal beats a silent bad load), not a Phase-1 regression. See
+`workflow/known-issues.md` for the standing gap.
+
+The GGUF path (§5's `LOW-MTP-IQ4_XS` reference numbers) WAS re-served live
+end to end: `ctx` moved from the previously-recorded 45824 to **49408**
+(host-only, no shim) at `-ngl 33/65` (previously 34/65) — a pre-existing,
+documented compute-graph-reserve OOM-retry (`workflow/known-issues.md`,
+2026-07-27 entry) fired on the first placement attempt and settled one layer
+lower; the freed weight VRAM more than covered the newly-correct 0.146 GB
+SSM charge, netting a ctx *increase*, not the "clamps slightly" outcome a
+naive read of the fix would predict. `GET /slots` confirmed `n_ctx=49408`
+live. The GGUF numbers in this section (2048 → 7680 → ~46K) still do not
+carry over exactly to the NVFP4/safetensors checkpoint — different engine,
+different placement mechanics — treat them as the GGUF path's own record.
+
 ---
 
 ## 6. Quality floor: measured, and honestly incomplete
@@ -240,13 +296,72 @@ gb  →  GB-CLI
    llama-server  (HOST ONLY — see §3 for why the RPC path stays unused)
       ├── -ngl 28                              as many layers as VRAM allows
       ├── --cache-type-k/v q8_0                budget grade (f16 doesn't fit at native ctx)
-      ├── --ctx-size 2048                       clamped from 262144, see §5
+      ├── --ctx-size 2048                       clamped from 262144 at the time this doc's
+      │                                         pipeline snapshot was taken — see §5's own
+      │                                         later updates for the fixed, much larger value
+      ├── --cache-ram <%-derived from free RAM> host-memory prompt cache — see §9
       ├── --spec-type draft-mtp                 +free decode, ~64% acceptance, identical output
       └── --fit off                             GreenBoost owns placement, not llama.cpp's auto-fit
       │
       ▼
-   GB-Dataflux  ──► MCP (synapse_serve, bench_result, smoke_gate, ...)
+   GB-Dataflux  ──► MCP (synapse_serve, bench_result, smoke_gate, prompt_cache, ...)
 ```
+
+---
+
+## 9. GB-Semantics governs this model's own metrics now
+
+This model is the reference workload for GB-Semantics' eval fixture
+(`tests/fixtures/semantics/events.py`) precisely because it has produced so
+many of the raw-field traps that layer exists to catch — the ctx clamp
+history in §5 is three consecutive corrections of the same kind of misread
+(`n_layers` vs `n_kv_layers`, a budget computed against the wrong weights
+figure, a client-side constant that never asked the server). Querying this
+model's state should now go through `semantic_resolve`/`semantic_answer`
+rather than reading `synapse_status()`/dataflux fields directly:
+
+```python
+semantic_resolve("served_ctx")            # the live server's actual ctx, not a guess
+semantic_resolve("kv_bits_by_layer")      # k_bits/v_bits + n_kv_layers, hybrid-arch aware
+semantic_resolve("tok_s_decode")          # measured, never synapse_recommend()'s estimate
+semantic_resolve("prompt_cache_hit_pct")  # new: how well --cache-ram is actually working
+semantic_segments("below_quality_floor")  # {matched, evidence} instead of eyeballing bits
+```
+
+**The `--cache-ram` addition** (`gb_synapse_backends.py`'s `LlamaCppBackend.
+serve()`) targets exactly this model's own agentic use case: `gb`'s terminal
+assistant resends a long, stable system prompt + tool schema on every turn,
+which is precisely what llama.cpp's host-memory prompt cache is for. Sized
+as a percentage of live free host RAM (never a literal MiB figure, per the
+hardcoded-hardware-values rule).
+
+**Live-verified 2026-07-29** against this exact model on this exact box
+(`--cache-ram 7325 --cache-reuse 256 -np -1`, `LOW-MTP-IQ4_XS`, host-only,
+`-ngl 32/65`): two back-to-back `/v1/chat/completions` requests sharing a
+system-prompt prefix went from **TTFT ≈1866-2086 ms (cold) to ≈336-354 ms
+(warm)** — a ~5-6x drop, `prompt_tokens_details.cached_tokens` confirming
+33/37 prompt tokens reused (89.2% hit rate). No cancelled/dropped requests
+across 4 real requests, so the `--cache-reuse` + `-np -1` (`kv_unified=true`)
+caveat noted upstream did not manifest here — still worth re-checking under
+real concurrent multi-slot load, which this single-client test didn't exercise.
+
+This same test surfaced a real bug in the first cut of this telemetry:
+GB-CLI's `BACKEND_REGISTRY` talks straight to `/v1/*`
+(`openai_passthrough()` in `gb_synapse_api.py`), not the Ollama-compat
+routes the `prompt_cache` dataflux kind was originally wired into only — so
+the cache-hit measurement was silently blind to all real GB-CLI traffic
+until `openai_passthrough()` got the same instrumentation (a side-channel
+byte buffer, parsed only after each response is forwarded unchanged, so the
+"genuine passthrough" behavior on that route is untouched). A second,
+smaller bug in the same fix: the actual field this engine's OpenAI-compat
+responses use is `usage.prompt_tokens_details.cached_tokens`, not the
+top-level `tokens_cached` llama-server's native `/completion` endpoint uses
+— `_cache_info_from_chunk` now checks both shapes. Regression-guarded in
+`tests/test_gb_synapse_api_prompt_cache.py`.
+
+Verify the real hit rate via `semantic_resolve("prompt_cache_hit_pct")` /
+`dataflux_events(kind="prompt_cache")` — confirmed live to match, not just
+assumed from the flag being present.
 
 Nothing here is a heuristic someone liked the sound of, including the parts
 that didn't work: the RPC split is real, tested, and its two blocking bugs
