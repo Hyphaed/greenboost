@@ -361,6 +361,61 @@ def _validate_placement(entry, util: float, budget_facts: dict, engine: str) -> 
 
 
 # ---------------------------------------------------------------------------
+# "Never CPU offload" gate (CLAUDE.md Immutable Design Rule, owner directive
+# 2026-08-01)
+# ---------------------------------------------------------------------------
+
+def _gate_cpu_offload(*, entry, engine: str, event_status: str,
+                      shim_active: bool, shim_reason: str, extra: dict) -> None:
+    """Enforce the owner's standing rule: weights that exceed VRAM must
+    spill T1 -> T2 (through the shim) -> T3, never fall back to CPU-resident
+    layers. Called at every LlamaCppBackend.serve() site that is about to
+    reduce -ngl below all layers as a CAPACITY decision (dense partial
+    offload, and the two OOM-triggered -ngl-reduction retries) — NOT at the
+    `cpu_quirk` (ARCH_CPU_SPLIT_BROKEN, a measured upstream regression) or
+    `--n-cpu-moe` (the CLAUDE.md 2026-07-26 amendment's own example of a
+    measured, deliberate CPU placement) sites, which this rule already
+    exempts by name.
+
+    Always emits a `cpu_spillover` dataflux event first (Observability
+    Must-Rule: a refusal must be as followable in the MCP as a serve is) —
+    then raises RuntimeError unless the caller opted into the escape hatch,
+    GB_SYNAPSE_ALLOW_CPU_OFFLOAD=1 (a debugging override, not a production
+    default: this rule exists precisely because "shim was off, fell back to
+    CPU" was accepted silently for the reference workload on 2026-08-01,
+    hiding a one-character shim bug — see greenboost_cuda_shim.c's
+    2026-08-01 fix note — behind an unremarkable-looking slow serve)."""
+    try:
+        _, _, t2_facts = effective_vram_budget_mb()
+        t2_free_mb = t2_facts.get("t2_free_mb", 0.0)
+    except Exception:
+        t2_free_mb = 0.0
+    allowed = os.environ.get("GB_SYNAPSE_ALLOW_CPU_OFFLOAD") == "1"
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({
+            "kind": "cpu_spillover", "status": event_status,
+            "model": entry.name, "engine": engine,
+            "shim_active": shim_active, "shim_reason": shim_reason,
+            "t2_free_mb": round(t2_free_mb, 1), "allowed_override": allowed,
+            **extra,
+        })
+    except Exception:
+        pass
+    if allowed:
+        return
+    raise RuntimeError(
+        f"'{entry.name}' would fall back to CPU offload ({event_status}) — "
+        f"CLAUDE.md's T2-spill rule forbids this by default (owner directive, "
+        f"2026-08-01: GreenBoost must always spill through the shim to T2, "
+        f"never to CPU). shim={'on' if shim_active else 'off'} ({shim_reason}), "
+        f"t2_free={t2_free_mb:.0f} MB. Fix the shim (gb_shim_probe.py) or free "
+        f"more T2 before retrying; as a deliberate debugging override only, "
+        f"set GB_SYNAPSE_ALLOW_CPU_OFFLOAD=1."
+    )
+
+
+# ---------------------------------------------------------------------------
 # EngineBackend
 # ---------------------------------------------------------------------------
 
@@ -487,6 +542,11 @@ class LlamaCppBackend(EngineBackend):
             shim_note = f"off ({shim_reason})"
         else:
             shim_note = f"on ({shim_reason})"
+        # "Active" means the probe (or an explicit GB_SYNAPSE_SHIM override)
+        # actually left LD_PRELOAD in env above — reading the raw env var
+        # would silently disable T2 accounting whenever the probe turns the
+        # shim on WITHOUT an explicit override set.
+        shim_active = "LD_PRELOAD" in env
 
         # -ngl 999 ("every layer on the GPU") is right only when the weights can
         # actually LAND there. Without the shim inflating VRAM, forcing all layers
@@ -519,9 +579,26 @@ class LlamaCppBackend(EngineBackend):
                 budget_gb,
                 ram_free_mb / 1024 + sum(f.t2_free_mb for f in online_feeders) / 1024)
 
-        explicit_ctx = ctx > 0
         if ctx <= 0:
             ctx = entry.ctx_length or 65536
+
+        # T2 KV/weights extension: whenever the shim is actually active, its
+        # T2 DDR pool is real extra capacity for both weight overflow and KV
+        # cache — never a silent default (gated on shim_active, which is only
+        # true when the probe or an explicit override actually kept
+        # LD_PRELOAD in env), and never counted for cpu_quirk (that path runs
+        # with CUDA_VISIBLE_DEVICES="" — no GPU, no shim-reachable T2 at all).
+        # Owner rule (2026-08-01): GreenBoost must always spill through the
+        # shim to T2, never fall back to CPU offload — this is what makes
+        # that rule actually reachable instead of just reachable in theory:
+        # without it, ctx still collapsed to the _clamp_ctx_to_budget floor
+        # the instant `fits_vram` went true via "LD_PRELOAD" in env, because
+        # ctx_kv_budget_gb itself stayed at physical-VRAM-only.
+        t2_kv_extra_gb = 0.0
+        if shim_active and not cpu_quirk:
+            _, _, t2_facts = effective_vram_budget_mb()
+            t2_kv_extra_gb = (t2_facts.get("t2_free_mb", 0.0) *
+                              t2_facts.get("t2_fraction", 0.5)) / 1024.0
 
         # Dense partial-CPU-offload is where the ctx/-ngl split has to be
         # SOLVED jointly, not clamped in one direction: _clamp_ctx_to_budget
@@ -536,26 +613,19 @@ class LlamaCppBackend(EngineBackend):
         # charged against it at all) — only this branch needs the joint solve.
         dense_partial_offload = (not fits_vram and not cpu_quirk and not entry.is_moe)
         n_gpu_solved = None
-        t2_kv_extra_gb = 0.0
         if dense_partial_offload:
-            # T2 KV extension: opt-in, only when the caller explicitly asked
-            # for more ctx than the plain VRAM/RAM budget provides AND the
-            # shim is actually active — never a silent default, and never a
-            # substitute for VRAM that's genuinely free (Rule #1).
-            # "Active" means the probe (or an explicit GB_SYNAPSE_SHIM
-            # override) actually left LD_PRELOAD in env above — reading the
-            # raw env var here would silently disable this whenever the
-            # probe turns the shim on WITHOUT an explicit override set.
-            shim_active = "LD_PRELOAD" in env
-            if explicit_ctx and shim_active:
-                _, _, t2_facts = effective_vram_budget_mb()
-                t2_kv_extra_gb = (t2_facts.get("t2_free_mb", 0.0) *
-                                  t2_facts.get("t2_fraction", 0.5)) / 1024.0
+            # _solve_ctx_and_layers/_fit_gpu_layers take t2_gb as a SEPARATE
+            # argument (added to the KV/usable budget only, never blended
+            # into the VRAM figure used to fit layer count) — pass
+            # ctx_kv_budget_gb unblended here, matching that contract.
             ctx, n_gpu_solved = gs._solve_ctx_and_layers(
                 entry, ctx_kv_budget_gb, ctx, 1 + len(online_feeders),
                 t2_gb=t2_kv_extra_gb)
         else:
-            ctx = gs._clamp_ctx_to_budget(ctx, entry, ctx_kv_budget_gb)
+            # _clamp_ctx_to_budget only takes a single budget figure, so the
+            # T2 share is folded in directly here (same shape as
+            # _solve_ctx_and_layers' own degenerate-geometry fallback).
+            ctx = gs._clamp_ctx_to_budget(ctx, entry, ctx_kv_budget_gb + t2_kv_extra_gb)
 
         # KV precision is a QUALITY tier, not a memory knob, so it is chosen against
         # the budget rather than hardcoded: f16 is certification grade, q8_0 is a
@@ -722,16 +792,11 @@ class LlamaCppBackend(EngineBackend):
                   f"(ctx={ctx} solved jointly), the rest on CPU. CPU layers cost far more "
                   f"than any memory transfer — add VRAM (another feeder) or a smaller quant "
                   f"to close the gap.", flush=True)
-            try:
-                import gb_dataflux
-                gb_dataflux.emit({
-                    "kind": "cpu_spillover", "status": "dense_partial_offload",
-                    "model": entry.name, "engine": self.name,
-                    "weights_gb": round(weights_gb, 2), "budget_gb": round(budget_gb, 2),
-                    "n_gpu_layers": n_gpu, "n_layers": entry.n_layers, "ctx": ctx,
-                })
-            except Exception:
-                pass
+            _gate_cpu_offload(
+                entry=entry, engine=self.name, event_status="dense_partial_offload",
+                shim_active=shim_active, shim_reason=shim_reason,
+                extra={"weights_gb": round(weights_gb, 2), "budget_gb": round(budget_gb, 2),
+                       "n_gpu_layers": n_gpu, "n_layers": entry.n_layers, "ctx": ctx})
 
         llama_log = open(gs._run_log_path(entry.name), "ab")
         llama_proc = subprocess.Popen(cmd, env=env, stdout=llama_log, stderr=subprocess.STDOUT,
@@ -764,16 +829,11 @@ class LlamaCppBackend(EngineBackend):
                      f"contiguous block was actually free) — retrying at "
                      f"-ngl {fallback_ngl}/{entry.n_layers} (partial GPU offload).",
                      flush=True)
-                try:
-                    import gb_dataflux
-                    gb_dataflux.emit({
-                        "kind": "cpu_spillover", "status": "vram_fragmentation_oom_retry",
-                        "model": entry.name, "engine": self.name,
-                        "weights_gb": round(weights_gb, 2), "budget_gb": round(budget_gb, 2),
-                        "n_gpu_layers": fallback_ngl, "n_layers": entry.n_layers,
-                    })
-                except Exception:
-                    pass
+                _gate_cpu_offload(
+                    entry=entry, engine=self.name, event_status="vram_fragmentation_oom_retry",
+                    shim_active=shim_active, shim_reason=shim_reason,
+                    extra={"weights_gb": round(weights_gb, 2), "budget_gb": round(budget_gb, 2),
+                           "n_gpu_layers": fallback_ngl, "n_layers": entry.n_layers})
                 retry_cmd = list(cmd)
                 retry_cmd[retry_cmd.index("-ngl") + 1] = str(fallback_ngl)
                 llama_log = open(gs._run_log_path(entry.name), "ab")
@@ -804,16 +864,11 @@ class LlamaCppBackend(EngineBackend):
                      f"of the weights (hybrid-attention archs need more workspace "
                      f"than the flat compute-reserve estimate) — retrying at "
                      f"-ngl {fallback_ngl}/{entry.n_layers}.", flush=True)
-                try:
-                    import gb_dataflux
-                    gb_dataflux.emit({
-                        "kind": "cpu_spillover", "status": "compute_graph_oom_retry",
-                        "model": entry.name, "engine": self.name,
-                        "n_gpu_layers_before": n_gpu, "n_gpu_layers_after": fallback_ngl,
-                        "n_layers": entry.n_layers,
-                    })
-                except Exception:
-                    pass
+                _gate_cpu_offload(
+                    entry=entry, engine=self.name, event_status="compute_graph_oom_retry",
+                    shim_active=shim_active, shim_reason=shim_reason,
+                    extra={"n_gpu_layers_before": n_gpu, "n_gpu_layers_after": fallback_ngl,
+                           "n_layers": entry.n_layers})
                 retry_cmd = list(cmd)
                 retry_cmd[retry_cmd.index("-ngl") + 1] = str(fallback_ngl)
                 llama_log = open(gs._run_log_path(entry.name), "ab")

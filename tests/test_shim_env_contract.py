@@ -28,6 +28,11 @@ _REQUIRED_DIFFUSION_KEYS = {
 def _shim_present(monkeypatch):
     monkeypatch.setattr(gc, "shim_supported", lambda: True)
     monkeypatch.setattr(gc, "GREENBOOST_SHIM", "/usr/local/lib/libgreenboost_cuda.so")
+    # Default: vmm_override absent, so existing LD_PRELOAD assertions below
+    # (written before vmm_override was preloaded) stay deterministic
+    # regardless of what's actually installed on the box running the tests.
+    monkeypatch.setattr(gc, "GREENBOOST_VMM_OVERRIDE",
+                        "/nonexistent/libgreenboost_vmm_override.so")
     # default: no kernel pool visible (isolate T2_POOL sizing per-test)
     monkeypatch.setattr(gc, "_local_t2_pool_total_mb", lambda: None)
 
@@ -100,13 +105,83 @@ def test_cudart_path_set_for_torch():
     assert env["GREENBOOST_CUDART_PATH"] == "/env/nvidia/cu13/lib/libcudart.so.13"
 
 
-def test_cudart_and_t2_not_applied_to_llm(monkeypatch):
+def test_llm_profile_has_frontload_and_cluster(monkeypatch):
+    monkeypatch.setattr(gc, "_local_t2_pool_total_mb", lambda: None)
+    env = gc.shim_env("llm", base_env=_clean_base())
+    assert env["GREENBOOST_CLUSTER"] == "1"
+    # Owner rule 2026-08-01 (T2 spill through the shim, never CPU offload):
+    # llm gets the same Rule #1 front-load split "diffusion" already had —
+    # a weights buffer bigger than free VRAM must fill VRAM to ~90% first,
+    # not dump the whole buffer into T2 while T1 sits part-empty.
+    assert env["GB_VRAM_FRONTLOAD"] == "1"
+
+
+def test_ggml_alias_matches_llm():
+    a = gc.shim_env("ggml", base_env=_clean_base())
+    b = gc.shim_env("llm", base_env=_clean_base())
+    assert a.get("GB_VRAM_FRONTLOAD") == b.get("GB_VRAM_FRONTLOAD") == "1"
+
+
+def test_llm_joined_t2_pool_workloads(monkeypatch):
+    """2026-08-01: an LLM spilling weights/KV to T2 through the shim needs
+    the same %-derived safety/pool sizing diffusion and torch already get —
+    llm was previously excluded, leaving the shim's flat defaults in place
+    for every gb-synapse llama.cpp serve."""
     monkeypatch.setattr(gc, "_local_t2_pool_total_mb", lambda: 42 * 1024)
     env = gc.shim_env("llm", base_env=_clean_base(),
                       cudart_path="/env/lib/libcudart.so.13")
-    assert "GREENBOOST_T2_POOL_MB" not in env
-    assert "GREENBOOST_CUDART_PATH" not in env
-    assert env["GREENBOOST_CLUSTER"] == "1"
+    assert env["GREENBOOST_T2_POOL_MB"] == str(43008 * 85 // 100)
+    assert int(env["GREENBOOST_HOST_RAM_SAFETY_MB"]) >= 2048
+    # cudart_path is accepted (harmless — gb-synapse's own llm serve calls
+    # never pass it), not specifically excluded now that llm is T2-pooled.
+    assert env["GREENBOOST_CUDART_PATH"] == "/env/lib/libcudart.so.13"
+
+
+def test_llm_disables_pdl_by_default():
+    """2026-08-01: ggml_cuda_kernel_can_use_pdl's cudaFuncGetAttributes probe
+    aborts under this shim (split-brain libcudart — gb_shim_probe.py's
+    docstring), confirmed on both Blackwell cc 12.0 and Ada cc 8.9. Default
+    off so a fresh gb-synapse llama.cpp serve doesn't crash on first decode."""
+    env = gc.shim_env("llm", base_env=_clean_base())
+    assert env["GGML_CUDA_PDL"] == "0"
+
+
+def test_llm_pdl_caller_override_wins():
+    base = _clean_base()
+    base["GGML_CUDA_PDL"] = "1"      # caller has verified PDL is safe here
+    env = gc.shim_env("llm", base_env=base)
+    assert env["GGML_CUDA_PDL"] == "1"
+
+
+def test_vmm_override_preloaded_first_when_present(monkeypatch, tmp_path):
+    vmm = tmp_path / "libgreenboost_vmm_override.so"
+    vmm.write_bytes(b"")
+    monkeypatch.setattr(gc, "GREENBOOST_VMM_OVERRIDE", str(vmm))
+
+    env = gc.shim_env("llm", base_env=_clean_base())
+
+    entries = env["LD_PRELOAD"].split(":")
+    assert entries[0] == str(vmm)
+    assert entries[1] == gc.GREENBOOST_SHIM
+
+
+def test_vmm_override_absent_skipped(monkeypatch):
+    monkeypatch.setattr(gc, "GREENBOOST_VMM_OVERRIDE",
+                        "/nonexistent/libgreenboost_vmm_override.so")
+    env = gc.shim_env("llm", base_env=_clean_base())
+    assert env["LD_PRELOAD"] == gc.GREENBOOST_SHIM
+
+
+def test_disabled_strips_vmm_override_too(monkeypatch, tmp_path):
+    vmm = tmp_path / "libgreenboost_vmm_override.so"
+    vmm.write_bytes(b"")
+    monkeypatch.setattr(gc, "GREENBOOST_VMM_OVERRIDE", str(vmm))
+    base = _clean_base()
+    base["LD_PRELOAD"] = f"{vmm}:{gc.GREENBOOST_SHIM}:/other/lib.so"
+
+    env = gc.shim_env("llm", enabled=False, base_env=base)
+
+    assert env["LD_PRELOAD"] == "/other/lib.so"
 
 
 def test_unknown_workload_raises():

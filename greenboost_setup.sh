@@ -1405,12 +1405,27 @@ detect_hardware() {
 
     local dmi_mem
     dmi_mem=$(dmidecode -t memory 2>/dev/null)
+    # [[:space:]]* not \s - \s is a GNU-awk extension; mawk (Debian/Ubuntu
+    # default) silently matches nothing, sending RAM_TYPE/RAM_SPEED_MT down
+    # the "unknown" path even when dmidecode output is present and parseable.
     RAM_TYPE=$(echo "$dmi_mem" \
-        | awk '/^\s*Type:/{t=$2} /^\s*Configured Memory Speed:/{if(t && t!="Unknown") {print t; exit}}')
+        | awk '/^[[:space:]]*Type:/{t=$2} /^[[:space:]]*Configured Memory Speed:/{if(t && t!="Unknown") {print t; exit}}')
     [[ -z "$RAM_TYPE" || "$RAM_TYPE" == "Unknown" ]] && RAM_TYPE="DDR"
     RAM_SPEED_MT=$(echo "$dmi_mem" \
-        | awk '/^\s*Configured Memory Speed:/{print $4; exit}')
-    [[ -z "$RAM_SPEED_MT" || "$RAM_SPEED_MT" == "Unknown" ]] && RAM_SPEED_MT="?"
+        | awk '/^[[:space:]]*Configured Memory Speed:/{print $4; exit}')
+    # "0", not "?": write_profile()'s ${RAM_SPEED_MT:-0} only substitutes on
+    # unset/empty, so a literal "?" was passing straight through into
+    # ram_speed_mt: ? in the written profile - unparseable by the shim's
+    # atoi() (silently reads as 0 anyway) but also unparseable by a human
+    # rereading the file, and the shim's fallback message wrongly reported
+    # the profile as "unavailable" instead of "present but no usable value".
+    [[ -z "$RAM_SPEED_MT" || "$RAM_SPEED_MT" == "Unknown" ]] && RAM_SPEED_MT="0"
+    # Human-facing display form only - ram_speed_mt in the written profile and
+    # the node_topology dataflux event keep the raw numeric (0 = "not
+    # detected", machine-parseable); "DDR5-0 MT/s" printed to a terminal reads
+    # as a real value instead of "we couldn't detect this".
+    RAM_SPEED_DISPLAY="$RAM_SPEED_MT"
+    [[ "$RAM_SPEED_DISPLAY" == "0" ]] && RAM_SPEED_DISPLAY="unknown"
 
     # ── PCIe link (GPU slot) ──────────────────────────────────────────────
     # current_link_speed is unreliable - PCIe ASPM downclock to Gen 1 when the
@@ -1726,7 +1741,7 @@ print_detected_hardware() {
     info "Detected hardware:"
     info "  GPU   : ${GPU_NAME}  (${GB_PHYS} GB VRAM)"
     info "  PCIe  : ${pcie_info}"
-    info "  RAM   : ${RAM_TYPE}-${RAM_SPEED_MT} MT/s  ->  pool ${GB_VIRT} GB  (reserve ${GB_RESERVE} GB)"
+    info "  RAM   : ${RAM_TYPE}-${RAM_SPEED_DISPLAY} MT/s  ->  pool ${GB_VIRT} GB  (reserve ${GB_RESERVE} GB)"
     info "  CPU   : ${CPU_NAME}"
     local _t3_store="/var/lib/greenboost/t3_store"
     if [[ -f "$_t3_store" ]]; then
@@ -5488,7 +5503,7 @@ cmd_install() {
     cat > /etc/modprobe.d/greenboost.conf << MODEOF
 # GreenBoost - cuda memory pool (auto-configured for detected hardware)
 # GPU   : ${GPU_NAME}  (${GB_PHYS} GB VRAM)
-# RAM   : ${RAM_TYPE}-${RAM_SPEED_MT}  (pool ${GB_VIRT} GB, reserve ${GB_RESERVE} GB)
+# RAM   : ${RAM_TYPE}-${RAM_SPEED_DISPLAY}  (pool ${GB_VIRT} GB, reserve ${GB_RESERVE} GB)
 # T3    : file-backed (/var/lib/greenboost/t3_store, cap ${GB_NVME_POOL} GB)
 options greenboost physical_vram_gb=${GB_PHYS} virtual_vram_gb=${GB_VIRT} safety_reserve_gb=${GB_RESERVE} nvme_pool_gb=${GB_NVME_POOL} t3_max_gb=${GB_NVME_POOL} t3_file_path=/var/lib/greenboost/t3_store pcores_max_cpu=${GB_PCORES_MAX} golden_cpu_min=${GB_GOLDEN_MIN} golden_cpu_max=${GB_GOLDEN_MAX} ecores_only=${GB_PCORES_ONLY}
 MODEOF
@@ -5571,7 +5586,12 @@ greenboost() {
         run) shift
             _gb_preload="\${GREENBOOST_VMM_OVERRIDE}:\${GREENBOOST_SHIM}"
             [[ ! -f "\${GREENBOOST_VMM_OVERRIDE}" ]] && _gb_preload="\${GREENBOOST_SHIM}"
-            GREENBOOST_ACTIVE=1 LD_PRELOAD="\${_gb_preload}" "\$@"
+            # GGML_CUDA_PDL=0: ggml's PDL kernel-attribute probe aborts under
+            # this shim (split-brain libcudart, see gb_cluster.py's "llm"
+            # profile comment) - confirmed on Blackwell AND Ada. Caller's own
+            # export still wins (parameter-expansion default, not an
+            # unconditional set).
+            GREENBOOST_ACTIVE=1 GGML_CUDA_PDL="\${GGML_CUDA_PDL:-0}" LD_PRELOAD="\${_gb_preload}" "\$@"
             unset _gb_preload
             ;;
         # Fall through to the CLI wrapper , without this the exported function
@@ -5645,7 +5665,9 @@ case "\$1" in
         _gb_vmm="$SHIM_DEST/libgreenboost_vmm_override.so"
         _gb_preload="\${_gb_vmm}:$SHIM_DEST/$SHIM_LIB"
         [[ ! -f "\${_gb_vmm}" ]] && _gb_preload="$SHIM_DEST/$SHIM_LIB"
-        GREENBOOST_ACTIVE=1 LD_PRELOAD="\${_gb_preload}" "\$@"
+        # GGML_CUDA_PDL=0: see the matching comment in /etc/profile.d/greenboost.sh's
+        # 'run' path above - same shim/PDL incompatibility, same override escape hatch.
+        GREENBOOST_ACTIVE=1 GGML_CUDA_PDL="\${GGML_CUDA_PDL:-0}" LD_PRELOAD="\${_gb_preload}" "\$@"
         ;;
     help|--help|-h|"") exec "\$GB_SETUP" show-commands ;;
     *)            echo "Unknown command: '\$1'  - run: greenboost help" >&2; exit 1 ;;
@@ -6013,7 +6035,7 @@ cmd_tune() {
     detect_hardware
 
     info "Tuning workstation for GreenBoost / LLM workloads..."
-    info "Hardware: ${CPU_NAME} | ${GPU_NAME} | ${RAM_TYPE}-${RAM_SPEED_MT} MT/s | PCIe Gen ${PCIE_GEN} ${PCIE_WIDTH} (~${PCIE_BW_GBS} GB/s) | ${NVME_SIZE_GB} GB NVMe"
+    info "Hardware: ${CPU_NAME} | ${GPU_NAME} | ${RAM_TYPE}-${RAM_SPEED_DISPLAY} MT/s | PCIe Gen ${PCIE_GEN} ${PCIE_WIDTH} (~${PCIE_BW_GBS} GB/s) | ${NVME_SIZE_GB} GB NVMe"
     echo ""
 
     # ── CPU governor → performance (P-cores run at max boost, not idle) ──
@@ -6220,7 +6242,7 @@ cmd_tune_grub() {
 
     [[ -f "$grub_file" ]] || die "GRUB config not found: $grub_file"
 
-    info "Validating GRUB flags for: ${CPU_NAME} | ${GPU_NAME} | ${RAM_TYPE}-${RAM_SPEED_MT} MT/s | PCIe Gen ${PCIE_GEN} ${PCIE_WIDTH}"
+    info "Validating GRUB flags for: ${CPU_NAME} | ${GPU_NAME} | ${RAM_TYPE}-${RAM_SPEED_DISPLAY} MT/s | PCIe Gen ${PCIE_GEN} ${PCIE_WIDTH}"
     info "Kernel: $kver"
     echo ""
 
@@ -6360,7 +6382,7 @@ cmd_tune_sysctl() {
     local dest="/etc/sysctl.d/99-zzz-greenboost.conf"
 
     info "Writing definitive sysctl config: $dest"
-    info "Hardware: ${CPU_NAME} | ${GPU_NAME} | ${RAM_TYPE}-${RAM_SPEED_MT} MT/s | PCIe Gen ${PCIE_GEN} ${PCIE_WIDTH} (~${PCIE_BW_GBS} GB/s) | ${NVME_SIZE_GB} GB NVMe"
+    info "Hardware: ${CPU_NAME} | ${GPU_NAME} | ${RAM_TYPE}-${RAM_SPEED_DISPLAY} MT/s | PCIe Gen ${PCIE_GEN} ${PCIE_WIDTH} (~${PCIE_BW_GBS} GB/s) | ${NVME_SIZE_GB} GB NVMe"
     info "This file loads last (99-zzz) and wins over all conflicting files."
     echo ""
 
@@ -12710,7 +12732,7 @@ cmd_help() {
     detect_hardware 2>/dev/null || true
     gb_header
 
-    echo -e "  ${C_GRAY}${CPU_NAME:-Unknown CPU}  ·  ${GPU_NAME:-Unknown GPU} ${GB_PHYS} GB  ·  ${RAM_TYPE:-DDR4}-${RAM_SPEED_MT} MT/s  ·  ${NVME_SIZE_GB} GB NVMe${C_RESET}"
+    echo -e "  ${C_GRAY}${CPU_NAME:-Unknown CPU}  ·  ${GPU_NAME:-Unknown GPU} ${GB_PHYS} GB  ·  ${RAM_TYPE:-DDR4}-${RAM_SPEED_DISPLAY:-unknown} MT/s  ·  ${NVME_SIZE_GB} GB NVMe${C_RESET}"
     echo -e "  ${C_DIM}T1 ${GB_PHYS} GB VRAM  |  T2 ${GB_VIRT} GB DDR  |  T3 ${GB_NVME_SWAP} GB NVMe  =  $((GB_PHYS + GB_VIRT + GB_NVME_SWAP)) GB combined${C_RESET}"
     echo -e ""
     gb_separator
