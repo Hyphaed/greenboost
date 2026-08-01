@@ -354,7 +354,12 @@ def _build_index(project: str, chunks: list[dict]) -> None:
     if not chunks:
         return
 
-    from greenboost_cli.rag.memory_pool import _ollama_unload  # noqa: PLC0415
+    # _ollama_unload moved to the sibling greenboost repo's gb_reclaim.py
+    # (task #7 consolidation , it's also gb_reclaim's own graceful-unload
+    # step now, one implementation instead of two). Same cross-repo import
+    # convention as slash_commands/backend_cmds.py's _import_gb_synapse.
+    from greenboost_cli.gb_paths import gb_module  # noqa: PLC0415
+    _ollama_unload = gb_module("gb_reclaim")._ollama_unload
 
     enriched_texts = [c["enriched"] or c["text"] for c in chunks]
 

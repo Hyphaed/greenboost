@@ -187,6 +187,53 @@ def test_kv_layer_undercounting_trap():
         f"or this regression guard needs updating")
 
 
+def test_serve_healthy_idle_branch(monkeypatch):
+    """Regression guard for the 2026-07-30 fix: serve_healthy previously
+    required shim_fresh unconditionally, so it could never match on a
+    genuinely idle-but-healthy box (reproduced live: kmod loaded, zero
+    errors, nothing being served, yet serve_healthy resolved false). Mocks
+    resolve()/_latest_event() directly rather than fighting this file's
+    autouse fixture-log machinery, since the true "no recent tok_s_measured"
+    idle case can't be expressed by writing MORE events into the shared
+    fixture (which always includes an active tok_s_measured event)."""
+    import gb_semantics
+
+    def _fake_resolve(name, *a, **kw):
+        return {
+            "kmod_loaded": {"value": True},
+            "shim_fresh": {"value": False},
+            "vram_fill_pct": {"value": 22.0},
+            "meets_fp8_floor": {"value": None},
+        }[name]
+
+    monkeypatch.setattr(gb_semantics, "resolve", _fake_resolve)
+    monkeypatch.setattr(gb_semantics, "_latest_event", lambda *a, **kw: None)
+    matched, evidence = gb_semantics._seg_serve_healthy()
+    assert matched is True
+    assert len(evidence) == 4
+
+
+def test_serve_healthy_active_session_still_gates_on_vram(monkeypatch):
+    """The active branch (a recent tok_s_measured event found) must still
+    require shim_fresh + VRAM in band + quality floor , the idle-branch fix
+    must not accidentally make serve_healthy always true."""
+    import gb_semantics
+
+    def _fake_resolve(name, *a, **kw):
+        return {
+            "kmod_loaded": {"value": True},
+            "shim_fresh": {"value": False},
+            "vram_fill_pct": {"value": 22.0},
+            "meets_fp8_floor": {"value": True},
+        }[name]
+
+    monkeypatch.setattr(gb_semantics, "resolve", _fake_resolve)
+    monkeypatch.setattr(gb_semantics, "_latest_event",
+                         lambda *a, **kw: {"kind": "tok_s_measured"})
+    matched, evidence = gb_semantics._seg_serve_healthy()
+    assert matched is False  # shim not fresh + vram below 60 while actively serving
+
+
 def test_eval_set_size_and_coverage():
     """Guard against the eval set silently shrinking, and against a metric/
     segment in semantics/*.yaml having zero eval coverage."""

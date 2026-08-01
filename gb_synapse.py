@@ -2314,12 +2314,17 @@ def ensure_feeder_rpc(feeder, rpc_port: int = RPC_PORT_BASE, device: int = 0) ->
     if _rpc_reachable(feeder.ip, rpc_port):
         return True
 
-    # rpc-server is ggml/CUDA, so it hits the SAME shim incompatibility as
-    # llama-server (SIGABRT: "invalid device function"). Preloading the shim
-    # here would take the feeder's GPU down with it, which is the opposite of
-    # the point. Gate it on the same switch as the host engine.
+    # rpc-server is ggml/CUDA, so it hits the same shim compat question as
+    # llama-server (see gb_shim_probe.py — a real, cached, evidence-based
+    # verdict, not a hardcoded assumption). Preloading a shim that breaks
+    # rpc-server would take the feeder's GPU down with it, which is the
+    # opposite of the point. Gate it on the same switch as the host engine —
+    # the probe doesn't reach the feeder itself, but host and feeder run the
+    # same engine build against the same shim build, so the host's verdict
+    # is the best evidence available short of a feeder-side probe.
+    import gb_shim_probe
     shim_pre = (f'LD_PRELOAD={gb_cluster.GREENBOOST_SHIM} GREENBOOST_ACTIVE=1 '
-                if os.environ.get("GB_SYNAPSE_SHIM", "0") == "1" else "")
+                if gb_shim_probe.shim_works_for_llama(ENGINE_DIR)[0] else "")
 
     # Resolve the engine ON the feeder: a Full-Install feeder has it in the
     # system dir, a dev/user build in the user dir. Assuming one path is why
@@ -2527,7 +2532,7 @@ def _fit_cpu_moe_layers(entry: ModelEntry, budget_gb: float, kv_gb: float,
 
 
 def _fit_gpu_layers(entry: ModelEntry, budget_gb: float, kv_gb: float,
-                    n_devices: int = 1) -> int:
+                    n_devices: int = 1, t2_gb: float = 0.0) -> int:
     """How many layers actually fit the cluster's free VRAM.
 
     llama.cpp puts EVERY layer on the GPU unless told otherwise, and
@@ -2537,6 +2542,17 @@ def _fit_gpu_layers(entry: ModelEntry, budget_gb: float, kv_gb: float,
     Sizing the layer count to the real budget is what turns "won't load" into
     "loads, with the tail on the CPU": every layer we can keep on a GPU is one
     that isn't paying the CPU penalty.
+
+    t2_gb: extra headroom from the shim's T2 pool — opt-in (0.0 default),
+    only meaningful when the caller already confirmed the shim is active
+    (see gb_synapse_backends.py's T2 KV extension gate; _solve_ctx_and_layers
+    threads its own t2_gb parameter through to here for the same reason:
+    weight-layer overflow spills to T2 exactly like KV overflow does, so
+    -ngl sizing that ignores T2 while ctx sizing counts it under-uses GPU
+    layers whenever the shim is genuinely extending this box's VRAM).
+    Added to the AVAILABLE budget only, never to the reserve calculation —
+    compute-graph workspace is sized off real per-device VRAM regardless of
+    what a DDR-backed pool can absorb.
     """
     n_layers = entry.n_layers or 0
     if n_layers <= 0:
@@ -2548,7 +2564,8 @@ def _fit_gpu_layers(entry: ModelEntry, budget_gb: float, kv_gb: float,
     # not a spill: the feeder was handed a 9.5 GB share of a 7.5 GB card.
     # %-derived per device, budget/n_dev as the per-device VRAM proxy (rule).
     n_dev = max(1, n_devices)
-    usable = budget_gb - kv_gb - _compute_reserve_gb(budget_gb * 1024.0 / n_dev) * n_dev
+    usable = (budget_gb - kv_gb - _compute_reserve_gb(budget_gb * 1024.0 / n_dev) * n_dev
+              + t2_gb)
     if usable <= 0:
         return 0
     # An MoE's layers are not uniform: the expert-carrying ones are far larger
@@ -2708,15 +2725,15 @@ def _solve_ctx_and_layers(entry: ModelEntry, vram_gb: float, requested_ctx: int,
             # growth (only the fixed ssm_gb competes with weights for VRAM).
             # Fit layers against budget minus that fixed cost and serve the
             # requested ctx as-is; nothing here trades ctx for layers.
-            ngl = _fit_gpu_layers(entry, vram_gb, ssm_gb, n_devices)
+            ngl = _fit_gpu_layers(entry, vram_gb, ssm_gb, n_devices, t2_gb=t2_gb)
             return requested_ctx, ngl
         # Geometry unknown (old manifest entry) — degrade to the previous
         # behavior rather than divide by zero.
         ctx = _clamp_ctx_to_budget(requested_ctx, entry, vram_gb + t2_gb)
-        return ctx, _fit_gpu_layers(entry, vram_gb, ssm_gb, n_devices)
+        return ctx, _fit_gpu_layers(entry, vram_gb, ssm_gb, n_devices, t2_gb=t2_gb)
 
     n_dev = max(1, n_devices)
-    ngl = _fit_gpu_layers(entry, vram_gb, ssm_gb, n_devices)
+    ngl = _fit_gpu_layers(entry, vram_gb, ssm_gb, n_devices, t2_gb=t2_gb)
     reserve_gb = _compute_reserve_gb(vram_gb * 1024.0 / n_dev) * n_dev
     kv_budget_gb = max(vram_gb - per_layer_gb * ngl - reserve_gb - ssm_gb, 0.0) + t2_gb
     max_ctx = max(0, int((kv_budget_gb * (1024 ** 3)) / bytes_per_tok) // 256 * 256)

@@ -52,6 +52,23 @@ def _stub_gb_cluster(monkeypatch):
                         lambda workload, enabled: {"GREENBOOST_ACTIVE": "1", "LD_PRELOAD": "/x.so"})
 
 
+@pytest.fixture(autouse=True)
+def _stub_gb_shim_probe(monkeypatch):
+    """serve_embedding() (and serve()) call gb_shim_probe.shim_works_for_llama()
+    whenever GB_SYNAPSE_SHIM isn't explicitly set — a REAL probe subprocess
+    launch otherwise, which is both slow and unsafe to let loose in a unit
+    test (it would share these tests' own subprocess.Popen monkeypatch,
+    crashing on _FakeProc lacking the real probe's .terminate()/.poll()
+    shape). Default False matches every test below's actual behavior before
+    this fixture existed: none of them set GB_SYNAPSE_SHIM=1, so the old
+    hardcoded off-switch always stripped the shim for every one of them —
+    autouse keeps that default true for every test, not just the one
+    explicitly testing shim-stripping."""
+    import gb_shim_probe
+    monkeypatch.setattr(gb_shim_probe, "shim_works_for_llama",
+                        lambda engine_dir=None: (False, "test-default: probe not run"))
+
+
 def test_serve_embedding_port_is_primary_plus_2000(backend, entry, _stub_gb_synapse,
                                                      _stub_gb_cluster, monkeypatch):
     captured = {}
@@ -115,6 +132,9 @@ def test_serve_embedding_ngl_env_override(backend, entry, _stub_gb_synapse, _stu
 def test_serve_embedding_strips_shim_when_disabled(backend, entry, _stub_gb_synapse,
                                                      _stub_gb_cluster, monkeypatch):
     monkeypatch.delenv("GB_SYNAPSE_SHIM", raising=False)
+    import gb_shim_probe
+    monkeypatch.setattr(gb_shim_probe, "shim_works_for_llama",
+                        lambda engine_dir=None: (False, "incompatible"))
     captured = {}
     monkeypatch.setattr(gsb.subprocess, "Popen",
                         lambda cmd, **kw: captured.update(env=kw.get("env")) or _FakeProc())
@@ -123,6 +143,22 @@ def test_serve_embedding_strips_shim_when_disabled(backend, entry, _stub_gb_syna
 
     assert "LD_PRELOAD" not in captured["env"]
     assert "GREENBOOST_ACTIVE" not in captured["env"]
+
+
+def test_serve_embedding_keeps_shim_when_probe_reports_working(backend, entry, _stub_gb_synapse,
+                                                                 _stub_gb_cluster, monkeypatch):
+    monkeypatch.delenv("GB_SYNAPSE_SHIM", raising=False)
+    import gb_shim_probe
+    monkeypatch.setattr(gb_shim_probe, "shim_works_for_llama",
+                        lambda engine_dir=None: (True, "cached: compatible"))
+    captured = {}
+    monkeypatch.setattr(gsb.subprocess, "Popen",
+                        lambda cmd, **kw: captured.update(env=kw.get("env")) or _FakeProc())
+
+    backend.serve_embedding(entry, primary_port=11435)
+
+    assert captured["env"]["LD_PRELOAD"] == "/x.so"
+    assert captured["env"]["GREENBOOST_ACTIVE"] == "1"
 
 
 def test_serve_embedding_raises_when_engine_not_built(backend, entry, monkeypatch):

@@ -106,6 +106,43 @@ def test_registered_in_verbs_table():
     assert ga.VERBS["run_under_greenboost"] is ga.run_under_greenboost
 
 
+# ── tier_actuate (ActuatorResult.applied, not .ok) ───────────────────────────
+
+def test_tier_actuate_reports_real_applied_state_not_none(monkeypatch):
+    """ActuatorResult (gb_control.py) has a field named `applied`, never
+    `ok`. tier_actuate used to read `getattr(res, "ok", None)`, which always
+    fell through to None regardless of whether GbControl actually applied
+    the lever — an agent double-gating a real actuation could never tell
+    success from failure via the `applied` field."""
+    import gb_control
+
+    class _FakeGbControl:
+        def set_pool_cap_mb(self, mb, reason=""):
+            return gb_control.ActuatorResult(
+                lever="pool_cap_mb", applied=True, old=1000, new=mb, reason="applied ok")
+
+    monkeypatch.setattr(gb_control, "GbControl", _FakeGbControl)
+    monkeypatch.setenv("GB_ORCH_ACTUATE", "1")
+    plan = ga.tier_actuate("pool_cap_mb", 4096, confirm=True)
+    assert plan["applied"] is True
+    assert plan["result"] == "applied ok"
+
+
+def test_tier_actuate_reports_false_when_actuator_declines(monkeypatch):
+    import gb_control
+
+    class _FakeGbControl:
+        def set_pool_cap_mb(self, mb, reason=""):
+            return gb_control.ActuatorResult(
+                lever="pool_cap_mb", applied=False, old=1000, new=1000, reason="rejected")
+
+    monkeypatch.setattr(gb_control, "GbControl", _FakeGbControl)
+    monkeypatch.setenv("GB_ORCH_ACTUATE", "1")
+    plan = ga.tier_actuate("pool_cap_mb", 4096, confirm=True)
+    assert plan["applied"] is False
+    assert plan["result"] == "rejected"
+
+
 def test_run_id_present_in_every_response():
     dry = ga.run_under_greenboost(["true"], confirm=False)
     assert "run_id" in dry and dry["run_id"].startswith("run_")

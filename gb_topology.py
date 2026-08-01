@@ -466,9 +466,15 @@ def _build_profile(raw: dict, *, live: bool, src: str) -> TopologyProfile:
         return result
 
     def _hw_int(k: str, detect) -> int:
-        """Hardware-shaped field: profile → (live) detection → 0 sentinel, LOUD."""
+        """Hardware-shaped field: profile → (live) detection → 0 sentinel, LOUD.
+        A profile value of exactly 0 is treated the same as "missing" (no real
+        hardware-shaped field is legitimately 0) so a stale/failed-detection 0
+        baked into the profile at install time doesn't permanently shadow live
+        detection that could otherwise succeed on this process."""
         try:
-            return int(raw[k])
+            v = int(raw[k])
+            if v:
+                return v
         except (KeyError, ValueError, TypeError):
             pass
         v = detect() if live else 0
@@ -479,7 +485,9 @@ def _build_profile(raw: dict, *, live: bool, src: str) -> TopologyProfile:
     def _hw_float(k: str, detect) -> float:
         """Float variant of _hw_int (e.g. bandwidth GB/s)."""
         try:
-            return float(raw[k])
+            v = float(raw[k])
+            if v:
+                return v
         except (KeyError, ValueError, TypeError):
             pass
         v = detect() if live else 0.0

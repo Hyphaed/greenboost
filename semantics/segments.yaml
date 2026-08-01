@@ -30,7 +30,11 @@
 - name: feeder_idle_while_host_saturated
   doc: A connected feeder shows near-zero item throughput while the host node is at/above its VRAM fill target , the Cluster rule's own tripwire ("a connected feeder sitting idle while the host is the bottleneck is a rule violation").
   evaluator: feeder_idle_while_host_saturated
-  reads: [cluster_vram_fill_pct, feeder_items]
+  # 2026-07-30: corrected to match what the evaluator actually calls
+  # (resolve("vram_fill_pct", entity_id="host") , this segment is
+  # deliberately HOST-scoped, not cluster-wide; see cluster_vram_fill_pct
+  # for the cluster-wide equivalent metric).
+  reads: [vram_fill_pct, feeder_items]
   severity: violation
 
 - name: below_quality_floor
@@ -69,7 +73,34 @@
   severity: warning
 
 - name: serve_healthy
-  doc: The positive case , no other segment matches, shim is fresh and kmod is loaded, and the current serve session is within its VRAM target band at/above the quality floor. The "everything's fine" verdict is itself governed so an agent doesn't have to synthesize it from silence.
+  doc: The positive case , no other segment matches, shim is fresh and kmod is loaded, and the current serve session is within its VRAM target band at/above the quality floor. The "everything's fine" verdict is itself governed so an agent doesn't have to synthesize it from silence. Fixed 2026-07-30 to also account for the idle case , no recent decode activity means the VRAM/freshness/quality-floor gates don't apply, healthy iff kmod is loaded.
   evaluator: serve_healthy
   reads: [kmod_loaded, shim_fresh, vram_fill_pct, meets_fp8_floor]
   severity: ok
+
+- name: feeder_unreachable
+  doc: >
+    A configured feeder did not answer the fabric probe or SSH fallback ,
+    distinct from feeder_idle_while_host_saturated, which assumes the feeder
+    IS connected and only checks whether it's doing work. An unreachable
+    feeder gives zero work-item signal to explain why it's idle, so without
+    this segment an agent reading only feeder_idle_while_host_saturated
+    (matched: false because there's no throughput data at all) could
+    wrongly conclude the cluster has no problem.
+  evaluator: feeder_unreachable
+  reads: [feeder_reachable]
+  severity: violation
+
+- name: gaming_inference_contention
+  doc: >
+    A game session is active (per greenboost_gaming's gaming_session
+    dataflux events) WHILE T2 DDR pressure from AI inference is genuinely
+    elevated , the coexistence conflict `gaming_mode`'s VRAM-eviction
+    reprioritization exists to reduce but can't eliminate, since GreenBoost
+    is a single-virtual-GPU design (both workloads share the same physical
+    VRAM/T2 pool). Matching this segment means: the game's frame-time
+    stutter or the inference session's latency (or both) may be explained
+    by real resource contention, not a bug in either subsystem alone.
+  evaluator: gaming_inference_contention
+  reads: [gaming_session_active, t2_pressure_fraction]
+  severity: diagnosis

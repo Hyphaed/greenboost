@@ -297,6 +297,43 @@ def test_critic_report_feeder_active_false_when_feeder_idle():
     assert ctx["feeder_nodes"] == ["omen"]
 
 
+def test_critic_report_recommendations_not_misleading_when_incident_undiagnosed():
+    """Regression: an incident that exists but matches no diagnosis rule
+    (diagnosis_hints == ["no rule matched , ..."]) used to fall through to
+    the SAME fallback message as a genuinely-empty window ("no incidents or
+    pressure flags in the window , cluster inference nominal") , directly
+    contradicting the report's own incident_count field. Verified live
+    2026-07-30: two real `bw_undetectable` incidents (incident_count=2) with
+    recommendations still claiming "no incidents ... nominal"."""
+    t0 = time.time()
+    gdf.emit({"ts": t0, "node": "host", "label": "misc", "kind": "job_local",
+             "status": "error", "error": "disk full"})
+
+    report = gdf.critic_report(days=1)
+    assert report["incident_count"] == 1
+    assert report["incidents"][0]["diagnosis_hints"][0].startswith("no rule matched")
+    assert not any("nominal" in r for r in report["recommendations"])
+    assert any("1 incident" in r for r in report["recommendations"])
+
+
+def test_critic_report_bw_undetectable_has_diagnosis_rule():
+    """bw_undetectable is explicitly named in _is_incident's own docstring as
+    an incident-worthy warn kind, but _diagnosis_hints had no rule for it ,
+    every occurrence fell through to the generic "no rule matched" hint
+    despite the root cause (gb_topology bandwidth detection) being well
+    understood. Verified live 2026-07-30 via dataflux_critic on a real box
+    with a stale profile-pinned vram_bandwidth_gb_s: 0."""
+    t0 = time.time()
+    gdf.emit({"ts": t0, "node": "host", "label": "synapse", "kind": "bw_undetectable",
+             "status": "warn", "reason": "vram"})
+
+    report = gdf.critic_report(days=1)
+    assert report["incident_count"] == 1
+    hints = report["incidents"][0]["diagnosis_hints"]
+    assert not any(h.startswith("no rule matched") for h in hints)
+    assert any("bandwidth undetectable" in h for h in hints)
+
+
 def test_dataflux_tier_moves_merges_tier_move_and_shim_decision():
     """dataflux_tier_moves used to query ONLY `kind == "tier_move"` (emitted
     by gb_model_tier.py's explicit Python-API moves, which nothing in

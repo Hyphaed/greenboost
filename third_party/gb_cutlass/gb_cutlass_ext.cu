@@ -20,6 +20,7 @@
 // but-unvalidated extension can never silently route a production GEMM. Flip
 // that env only after tests/bench/bench_cutlass_nvfp4.py passes on the box.
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 
 #include "cutlass/cutlass.h"

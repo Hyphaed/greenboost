@@ -22,6 +22,12 @@ build_cutlass_nvfp4_processor + set GB_CUTLASS_ENABLE=1.
 """
 import sys
 import time
+from pathlib import Path
+
+# gb_cutlass lives under <repo_root>/third_party/, which is only on sys.path
+# in the real product path via gb_quant._ensure_vendored_paths() — add it
+# here too so this script works standalone per its own docstring.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "third_party"))
 
 
 def main() -> int:

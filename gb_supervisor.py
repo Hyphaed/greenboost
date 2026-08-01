@@ -732,8 +732,8 @@ class GreenBoostSupervisor:
                 log.debug("dataflux recorder unavailable: %s", exc)
 
         # Periodic dataflux archive compaction , emit()'s rotation only ever
-        # moves bytes out of the hot write path (a size-capped ".jsonl.1"),
-        # it never deletes anything; something has to apply the
+        # moves bytes out of the hot write path (a size-capped, gzip-compressed
+        # ".jsonl.1.gz"), it never deletes anything; something has to apply the
         # GB_DATAFLUX_RETAIN_DAYS trim, and it belongs on this already-
         # installed daemon's tick, not a new systemd unit (no new install/
         # purge parity debt for a periodic housekeeping task). Gated to run

@@ -13,8 +13,14 @@ cluster" , read by this file's web UI, by `gb_dataflux_mcp.py` (so an LLM
 can query it), and by any ad-hoc script.
 
 Log location: ~/.local/share/greenboost/dataflux.jsonl (override with
-GREENBOOST_DATAFLUX_LOG). Never raises on a logging failure , recording
-history must never break a real dispatch.
+GREENBOOST_DATAFLUX_LOG), rotating at 69 MiB (GB_DATAFLUX_MAX_BYTES) into a
+gzip-compressed ~/.local/share/greenboost/dataflux.jsonl.1.gz archive. The
+archive itself is kept to ~7 days by default (GB_DATAFLUX_RETAIN_DAYS) and
+additionally hard-capped at the same ~69 MiB ceiling as a size backstop , see
+compact_archive() , so total on-disk footprint (live log + archive) stays
+bounded regardless of emission volume, not just under normal-volume
+assumptions. Never raises on a logging failure , recording history must
+never break a real dispatch.
 
 CLI:
     python3 gb_dataflux.py serve [--port 8799] [--days 5]   # web UI
@@ -24,6 +30,7 @@ CLI:
 from __future__ import annotations
 
 import contextlib
+import gzip
 import http.server
 import json
 import os
@@ -120,15 +127,19 @@ def _log_path() -> Path:
 
 
 def _archive_path(log_path: Path) -> Path:
-    return log_path.parent / (log_path.name + ".1")
+    # .gz: the archive is gzip-compressed (see _rotate_log()) — JSONL
+    # telemetry (repeated keys, mostly-numeric snapshot fields) commonly
+    # compresses 10-20x, so this is the real lever on disk footprint, not
+    # just the rotation trigger below.
+    return log_path.parent / (log_path.name + ".1.gz")
 
 
-_DEFAULT_MAX_LOG_BYTES = 512 * 1024 * 1024  # 512 MiB hard ceiling
+_DEFAULT_MAX_LOG_BYTES = 69 * 1024 * 1024  # 69 MiB hard ceiling (2026-07-30, Ferran)
 
 
 def _max_log_bytes(log_path: Path) -> int:
     """Rotation trigger size. Never a bare hardcoded literal (project rule):
-    min(512 MiB, 1% of the log filesystem's free space). GB_DATAFLUX_MAX_BYTES
+    min(69 MiB, 1% of the log filesystem's free space). GB_DATAFLUX_MAX_BYTES
     overrides with an explicit absolute value when set."""
     override = os.environ.get("GB_DATAFLUX_MAX_BYTES")
     if override:
@@ -463,12 +474,12 @@ def emit(event: dict) -> None:
     Size-capped rotation: the log grows unbounded otherwise (no MCP tool or
     web UI request ever asked for anything but the recent past, yet every
     read scanned the whole file). Once the file exceeds _max_log_bytes(),
-    this call atomically os.replace()s it to a single ".jsonl.1" archive —
-    a concurrent writer that already has this call in flight just lands its
+    this call gzip-compresses it into a single ".jsonl.1.gz" archive — a
+    concurrent writer that already has this call in flight just lands its
     line in whichever file existed at the moment IT opened the path (same
     tradeoff gb_cluster.py's feeder-sync dedup already accepts explicitly).
-    Exactly one archive generation is kept; older history is dropped by the
-    supervisor's periodic compact_archive() call, not here.
+    Rotations append a new gzip member rather than overwrite; older history
+    is dropped by the supervisor's periodic compact_archive() call, not here.
     """
     try:
         log_path = _log_path()
@@ -494,29 +505,25 @@ def emit(event: dict) -> None:
 
 
 def _rotate_log(log_path: Path) -> None:
-    """Move the just-capped log out of the hot write path.
+    """Move the just-capped log out of the hot write path, gzip-compressed.
 
-    If no archive exists yet, a plain os.replace() is enough (atomic;
-    a concurrent writer's next open() lands in the fresh empty file). If an
-    archive ALREADY exists , meaning a previous rotation fired before
-    compact_archive() ever got to trim it (a burst of emits blowing through
-    the cap many times faster than the supervisor's periodic compaction
-    runs) , os.replace() would silently CLOBBER everything already in it.
-    So this appends the current log's bytes onto the existing archive
-    instead: history is never lost, only compact_archive()'s retention-day
-    trim is allowed to bound the archive's eventual size."""
+    gzip.open(archive, "ab") appends a new gzip MEMBER rather than
+    clobbering or re-compressing what's already there — concatenated gzip
+    members decompress transparently as one stream (Python's gzip module
+    reads across member boundaries automatically), so this gets the same
+    "never clobber a prior rotation" guarantee the old raw-byte-append had,
+    at a fraction of the disk footprint. compact_archive() still owns
+    bounding the archive's eventual size via retention-day trim (which
+    rewrites it as a single fresh member)."""
     archive = _archive_path(log_path)
     try:
-        if archive.exists():
-            with open(log_path, "rb") as src, open(archive, "ab") as dst:
-                while True:
-                    chunk = src.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    dst.write(chunk)
-            log_path.unlink()
-        else:
-            os.replace(log_path, archive)
+        with open(log_path, "rb") as src, gzip.open(archive, "ab") as dst:
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+        log_path.unlink()
     except OSError:
         pass
 
@@ -596,13 +603,23 @@ def _tail_seek_start(path: Path, cutoff: float) -> int:
 
 def _read_jsonl_file(path: Path, cutoff: "float | None") -> list[dict]:
     """Parse one JSONL file into events, honoring `cutoff` via
-    _tail_seek_start() instead of a full linear scan when it's set."""
+    _tail_seek_start() instead of a full linear scan when it's set.
+
+    The gzip-compressed archive (see _rotate_log()) skips the tail-seek:
+    a compressed stream has no byte offset that maps to a decompressed-line
+    boundary, so backward seeking isn't meaningful there. This only costs a
+    full decompress+scan on the (already uncommon) case of a query whose
+    window actually reaches into the archive — read_events()'s mtime
+    fast-path already skips the archive entirely for the common recent-only
+    query, and compression keeps the archive itself small to scan."""
+    is_gz = path.suffix == ".gz"
     start = 0
-    if cutoff is not None:
+    if cutoff is not None and not is_gz:
         start = _tail_seek_start(path, cutoff)
     out: list[dict] = []
     try:
-        with open(path) as f:
+        opener = gzip.open if is_gz else open
+        with opener(path, "rt") as f:
             if start:
                 f.seek(start)
                 f.readline()  # discard the partial line landed on at `start`
@@ -639,7 +656,7 @@ def _stat_key(p: Path) -> "tuple | None":
 def read_events(since_hours: float | None = None) -> list[dict]:
     """All logged events, optionally filtered to the last `since_hours`.
 
-    Reads the rotated archive (.jsonl.1) THEN the current log, so rotation
+    Reads the rotated archive (.jsonl.1.gz) THEN the current log, so rotation
     never punches a history hole in an existing query; the archive is
     skipped entirely once its mtime (the time of its LAST write, so
     necessarily >= every event's ts inside it) predates the query window ,
@@ -669,15 +686,28 @@ def read_events(since_hours: float | None = None) -> list[dict]:
     return list(out)
 
 
-_DEFAULT_RETAIN_DAYS = 30.0
+_DEFAULT_RETAIN_DAYS = 7.0
 
 
 def compact_archive(retain_days: "float | None" = None) -> "int | None":
-    """Drop events older than `retain_days` (default 30,
-    GB_DATAFLUX_RETAIN_DAYS) from the rotated ".jsonl.1" archive and rewrite
-    it , this is what actually bounds the archive's size; emit()'s rotation
-    only ever moves bytes out of the hot write path, it never deletes
-    anything. Meant to be called periodically by a long-lived process (the
+    """Drop events older than `retain_days` (default 7,
+    GB_DATAFLUX_RETAIN_DAYS) from the rotated ".jsonl.1.gz" archive, THEN , if
+    the archive is still over _max_log_bytes() (the same 69 MiB-ish ceiling
+    emit()'s rotation trigger uses) , drop the oldest surviving events until
+    it's back under that too. The age-based trim alone can't actually
+    guarantee "dataflux.jsonl never exceeds ~69 MiB on disk": it bounds
+    *time*, not *bytes*, so a burst in emission volume (several concurrent
+    gb_init-importing processes, a debug session with tighter snapshot
+    polling) could in principle still produce more than 69 MiB of archived
+    history within `retain_days`. The size backstop closes that gap , this
+    is what actually makes "≤69 MiB total, ~7 days" a real guarantee rather
+    than something only true under normal-volume assumptions. (Compares
+    raw/uncompressed line bytes against the ceiling, not the gzip-compressed
+    on-disk size , conservative in the safe direction, since compression
+    only ever shrinks the real footprint further below the cap.)
+
+    Rewrites the archive whenever either trim actually dropped something.
+    Meant to be called periodically by a long-lived process (the
     supervisor's tick, not emit() itself , this can be an O(archive size)
     rewrite and must never sit on the hot path a real dispatch is waiting
     on). Best-effort: never raises. Returns the number of events dropped,
@@ -689,9 +719,9 @@ def compact_archive(retain_days: "float | None" = None) -> "int | None":
         if not archive.exists():
             return None
         cutoff = time.time() - retain_days * 86400
-        kept: list[str] = []
+        kept: list[tuple[float, str]] = []
         total = 0
-        with open(archive) as f:
+        with gzip.open(archive, "rt") as f:
             for line in f:
                 stripped = line.strip()
                 if not stripped:
@@ -701,20 +731,31 @@ def compact_archive(retain_days: "float | None" = None) -> "int | None":
                     ev = json.loads(stripped)
                 except json.JSONDecodeError:
                     continue  # corrupt line , dropped by omission below
-                if ev.get("ts", 0) >= cutoff:
-                    kept.append(stripped)
+                ts = ev.get("ts", 0)
+                if ts >= cutoff:
+                    kept.append((ts, stripped))
+        # Size backstop: sort oldest-first (events from concurrent writers or
+        # feeder-sync appends can be locally out of chronological order, so
+        # "drop the oldest" needs an explicit sort, not just file order) and
+        # pop from the front until under budget.
+        kept.sort(key=lambda kv: kv[0])
+        max_bytes = _max_log_bytes(archive)
+        raw_size = sum(len(s) + 1 for _, s in kept)
+        while raw_size > max_bytes and kept:
+            _, dropped_line = kept.pop(0)
+            raw_size -= len(dropped_line) + 1
         # Dropped = anything that didn't survive into `kept`, whether it was
-        # past retention OR simply unparseable , both need the rewrite below,
-        # so this can't be tracked only via the retention branch (a corrupt
-        # line that never increments a separate counter would otherwise make
-        # `dropped == 0` skip rewriting a file that still needs the corrupt
-        # line stripped out).
+        # past retention, past the size backstop, or simply unparseable , all
+        # three need the rewrite below, so this can't be tracked only via the
+        # retention branch (a corrupt line that never increments a separate
+        # counter would otherwise make `dropped == 0` skip rewriting a file
+        # that still needs the corrupt line stripped out).
         dropped = total - len(kept)
         if dropped == 0:
             return 0
         tmp = archive.with_suffix(archive.suffix + ".compact_tmp")
-        with open(tmp, "w") as f:
-            for line in kept:
+        with gzip.open(tmp, "wt") as f:
+            for _, line in kept:
                 f.write(line + "\n")
         os.replace(tmp, archive)
         _READ_EVENTS_MEMO.clear()
@@ -963,6 +1004,14 @@ def _diagnosis_hints(ev: dict, before: dict | None, after: dict | None,
             "greenboost-netd on the feeder (`greenboost feeders diag`), the "
             "SSH link, and whether an upgrade/restart raced the transfer")
 
+    if ev.get("kind") == "bw_undetectable":
+        hints.append(
+            f"bandwidth undetectable ({ev.get('reason', '?')}): tok/s estimates "
+            f"are the 0.0 sentinel until this resolves , check gb_topology's "
+            f"NVML probe on the affected node and confirm "
+            f"/etc/greenboost/profiles/*.md doesn't pin the field to a stale 0 "
+            f"(a literal 0 in the profile shadows live detection)")
+
     if not hints:
         hints.append("no rule matched , compare snapshot_before/after deltas "
                      "(VRAM, t2/t3, phase) manually")
@@ -1077,9 +1126,15 @@ def critic_report(days: float = 1.0, limit: int = 50) -> dict:
     except Exception:
         pass
     if not recommendations:
-        recommendations.append(
-            "no incidents or pressure flags in the window , cluster inference "
-            "nominal; keep quantization at or above the fp8 quality floor")
+        if total_incidents:
+            recommendations.append(
+                f"{total_incidents} incident(s) in the window but no diagnosis "
+                f"rule matched any of them , inspect incidents[].diagnosis_hints "
+                f"and snapshot_before/after manually")
+        else:
+            recommendations.append(
+                "no incidents or pressure flags in the window , cluster inference "
+                "nominal; keep quantization at or above the fp8 quality floor")
 
     return {
         "window_days": days,

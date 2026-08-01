@@ -17,6 +17,7 @@ Tests for gb_dataflux.py's log durability fixes:
 Redirects GREENBOOST_DATAFLUX_LOG at a tmp_path file per test (same pattern
 tests/conftest.py's autouse fixture uses) so the real log is never touched.
 """
+import gzip
 import json
 import sys
 import time
@@ -202,14 +203,15 @@ def test_memo_invalidates_on_new_write(log_path):
 def test_compact_archive_drops_events_past_retention(log_path):
     archive = gdf._archive_path(log_path)
     now = time.time()
-    with open(archive, "w") as f:
+    with gzip.open(archive, "wt") as f:
         f.write(json.dumps({"ts": now - 40 * 86400, "kind": "old"}) + "\n")   # past 30d retain
         f.write(json.dumps({"ts": now - 1 * 86400, "kind": "recent"}) + "\n")  # kept
 
     dropped = gdf.compact_archive(retain_days=30.0)
 
     assert dropped == 1
-    kept = [json.loads(line) for line in archive.read_text().splitlines()]
+    with gzip.open(archive, "rt") as f:
+        kept = [json.loads(line) for line in f.read().splitlines()]
     assert len(kept) == 1
     assert kept[0]["kind"] == "recent"
 
@@ -220,23 +222,25 @@ def test_compact_archive_no_archive_returns_none(log_path):
 
 def test_compact_archive_nothing_to_drop_returns_zero(log_path):
     archive = gdf._archive_path(log_path)
-    with open(archive, "w") as f:
+    with gzip.open(archive, "wt") as f:
         f.write(json.dumps({"ts": time.time(), "kind": "recent"}) + "\n")
 
     assert gdf.compact_archive(retain_days=30.0) == 0
-    assert len(archive.read_text().splitlines()) == 1
+    with gzip.open(archive, "rt") as f:
+        assert len(f.read().splitlines()) == 1
 
 
 def test_compact_archive_never_raises_on_corrupt_line(log_path):
     archive = gdf._archive_path(log_path)
-    with open(archive, "w") as f:
+    with gzip.open(archive, "wt") as f:
         f.write("not json at all\n")
         f.write(json.dumps({"ts": time.time(), "kind": "recent"}) + "\n")
 
     # Corrupt lines are dropped silently, not counted as an error.
     result = gdf.compact_archive(retain_days=30.0)
     assert result is not None
-    kept = archive.read_text().splitlines()
+    with gzip.open(archive, "rt") as f:
+        kept = f.read().splitlines()
     assert len(kept) == 1
 
 
@@ -244,8 +248,63 @@ def test_compact_archive_env_override(log_path, monkeypatch):
     monkeypatch.setenv("GB_DATAFLUX_RETAIN_DAYS", "1")
     archive = gdf._archive_path(log_path)
     now = time.time()
-    with open(archive, "w") as f:
+    with gzip.open(archive, "wt") as f:
         f.write(json.dumps({"ts": now - 2 * 86400, "kind": "old"}) + "\n")
 
     dropped = gdf.compact_archive()  # retain_days=None -> reads the env
     assert dropped == 1
+
+
+def test_compact_archive_default_retain_is_seven_days(log_path):
+    """GB_DATAFLUX_RETAIN_DAYS unset, retain_days unset -> the default (7,
+    not the old 30) is what actually governs the cutoff."""
+    archive = gdf._archive_path(log_path)
+    now = time.time()
+    with gzip.open(archive, "wt") as f:
+        f.write(json.dumps({"ts": now - 10 * 86400, "kind": "past_7d_not_30d"}) + "\n")
+        f.write(json.dumps({"ts": now - 1 * 86400, "kind": "recent"}) + "\n")
+
+    dropped = gdf.compact_archive()  # both args unset -> _DEFAULT_RETAIN_DAYS
+    assert dropped == 1
+    with gzip.open(archive, "rt") as f:
+        kept = [json.loads(line) for line in f.read().splitlines()]
+    assert len(kept) == 1
+    assert kept[0]["kind"] == "recent"
+
+
+def test_compact_archive_size_backstop_trims_even_within_retention(log_path, monkeypatch):
+    """Every event is well within retain_days, but the archive still exceeds
+    GB_DATAFLUX_MAX_BYTES , the size backstop must drop the oldest ones
+    anyway, since age-based trimming alone can't bound bytes."""
+    monkeypatch.setenv("GB_DATAFLUX_MAX_BYTES", "500")  # small, deterministic cap
+    archive = gdf._archive_path(log_path)
+    now = time.time()
+    with gzip.open(archive, "wt") as f:
+        for i in range(50):
+            f.write(json.dumps({"ts": now - i, "kind": "recent", "seq": i,
+                                 "pad": "x" * 20}) + "\n")
+
+    dropped = gdf.compact_archive(retain_days=30.0)  # generous age window
+    assert dropped is not None and dropped > 0
+
+    with gzip.open(archive, "rt") as f:
+        kept = [json.loads(line) for line in f.read().splitlines()]
+    raw_size = sum(len(line) + 1 for line in
+                    (json.dumps(e) for e in kept))
+    assert raw_size <= 500
+    # The newest events (lowest seq, since ts = now - i) must be the ones
+    # that survived , the backstop drops OLDEST first, not arbitrarily.
+    kept_seqs = sorted(e["seq"] for e in kept)
+    assert kept_seqs == list(range(len(kept)))
+
+
+def test_compact_archive_size_backstop_noop_when_under_budget(log_path):
+    """Recent, small archive: the size backstop must not drop anything the
+    age-based trim wouldn't already have dropped."""
+    archive = gdf._archive_path(log_path)
+    with gzip.open(archive, "wt") as f:
+        f.write(json.dumps({"ts": time.time(), "kind": "recent"}) + "\n")
+
+    assert gdf.compact_archive(retain_days=30.0) == 0
+    with gzip.open(archive, "rt") as f:
+        assert len(f.read().splitlines()) == 1

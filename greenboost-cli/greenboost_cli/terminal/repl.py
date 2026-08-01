@@ -884,6 +884,22 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
 
     atexit.register(_autosave_session)
 
+    def _reclaim_residue_on_exit() -> None:
+        """Best-effort: reclaim any orphaned GreenBoost GPU residue this
+        session's own subprocess launches may have left behind (e.g. a
+        llama-server child whose parent CLI exited without its own cleanup
+        running — see the studio-orphaned-subprocess-on-restart incident
+        class). scope="residue" only — never touches another genuinely
+        in-progress GreenBoost job on this box (gb_reclaim.py's own
+        classification is what makes that distinction; see task #5/#6)."""
+        try:
+            from greenboost_cli.gb_paths import gb_module
+            gb_module("gb_reclaim").run_reclaim(scope="residue")
+        except Exception:
+            pass
+
+    atexit.register(_reclaim_residue_on_exit)
+
     # ── GreenBoost pool auto-tune ──────────────────────────────────────────
     try:
         from greenboost_cli.greenboost.monitor import get_monitor
