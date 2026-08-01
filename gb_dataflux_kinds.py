@@ -115,6 +115,18 @@ KINDS: dict[str, KindSpec] = {
     "bw_undetectable": KindSpec(
         group="synapse", doc="recommend()'s link-bandwidth probe could not determine feeder link speed.",
         incident_when=("warn",)),
+    "cpu_spillover": KindSpec(
+        group="synapse", doc="gb_synapse_backends.py LlamaCppBackend.serve() put some of a "
+                             "model's layers on the CPU instead of GPU (dense partial-offload, "
+                             "or an OOM retry backing off -ngl) — the state that used to be "
+                             "invisible to dataflux, root cause of the 2026-08-01 6 tok/s "
+                             "incident. status is one of dense_partial_offload/"
+                             "vram_fragmentation_oom_retry/compute_graph_oom_retry, all of "
+                             "which are the incident itself, not a side detail.",
+        fields=("model", "engine"),
+        numeric_fields=("weights_gb", "budget_gb", "n_gpu_layers", "n_layers"),
+        incident_when=("dense_partial_offload", "vram_fragmentation_oom_retry",
+                       "compute_graph_oom_retry")),
     "tok_s_measured": KindSpec(
         group="synapse", doc="Real, client-observed decode tokens/sec for one model.",
         fields=("model",), numeric_fields=("tok_s",)),
@@ -170,6 +182,14 @@ KINDS: dict[str, KindSpec] = {
     "mem_pool_trim": KindSpec(
         group="shim", doc="gb_mem_pool.MemPoolManager.trim()/trim_all() pool-reclaim result.",
         fields=("pool",), numeric_fields=("allocated_before_mb", "allocated_after_mb", "reclaimed_mb")),
+    "reclaim": KindSpec(
+        group="shim", doc="gb_reclaim.py run_reclaim() outcome — classified GPU/T2/T3 process "
+                          "reclaim (scope=residue|ambiguous|all), the shared implementation "
+                          "behind `greenboost clear memory-pool` and the greenboost-orchestrator "
+                          "reclaim_run MCP tool (see docs/reclaim.md).",
+        fields=("scope", "targets"),
+        numeric_fields=("n_killed", "n_unloaded", "n_failed"),
+        incident_when=("partial",)),
     "ssm_state": KindSpec(
         group="shim", doc="Selective-SSM (Mamba/Mamba2/hybrid Gated-DeltaNet) recurrent-"
                           "state cache-pool sizing decision (synapse_engine/gllm/"
@@ -190,6 +210,51 @@ KINDS: dict[str, KindSpec] = {
         group="pipeline", doc="ai-forge best-of-N candidate selection rollup event.", planned=True),
     "model_call": KindSpec(
         group="pipeline", doc="ai-forge forge/gb_models.py per-call model usage event.", planned=True),
+    # Found live 2026-07-30 (dataflux_kinds() showed real 14-day counts for
+    # both — qc_summary=79, finish_summary=26 — with zero registry entry):
+    # ai-forge's conduir_art_jobs pipeline emits its own QC-sweep/finish
+    # summary rollups directly into the shared dataflux log.
+    "qc_summary": KindSpec(
+        group="pipeline", doc="ai-forge tools/conduir_art_jobs/qc_sweep.py quality-control sweep rollup.",
+        planned=True),
+    "finish_summary": KindSpec(
+        group="pipeline", doc="ai-forge tools/conduir_art_jobs/finish_assets.py asset-finishing rollup.",
+        planned=True),
+
+    # ── gaming (emitted by greenboost_gaming, a separate repo, not GreenBoost itself) ──
+    # Found live 2026-07-30 alongside qc_summary/finish_summary — same class
+    # of gap: real events (gaming_session=1, gaming_vram_pressure=1 in the
+    # 14-day window) with no registry entry. Correction 2026-07-30: NOT
+    # live_stats.rs (that Rust file only READS dataflux.jsonl for the Live
+    # view, e.g. get_dataflux_recent_impl) — the real emit site is the
+    # Python Proton wrapper, greenboost_gaming/greenboost_proton/proton's
+    # own _df_emit() helper (gaming_session at launch/exit, gaming_vram_pressure
+    # from _check_t2t3_pressure() polling /sys/class/greenboost/greenboost/pool_brief).
+    "gaming_session": KindSpec(
+        group="gaming", doc="greenboost_gaming/greenboost_proton/proton (Python Proton wrapper): "
+                            "a game session's start/stop lifecycle event.",
+        planned=True),
+    "gaming_vram_pressure": KindSpec(
+        group="gaming", doc="greenboost_gaming/greenboost_proton/proton (Python Proton wrapper): "
+                            "VRAM pressure observed during a game session (informs fan-daemon/"
+                            "gaming_mode coexistence tuning).",
+        planned=True),
+    # Added 2026-07-30 (greenboost_gaming_polish.md): gb_gaming/fan_daemon.py
+    # now emits this whenever it writes a new fan speed WHILE gaming_mode=1
+    # (gated, not every idle-desktop fan tick) — lets dataflux correlate
+    # thermal/fan behavior against gaming_vram_pressure events from the same
+    # session.
+    "gaming_fan_curve": KindSpec(
+        group="gaming", doc="greenboost_gaming/gb_gaming/fan_daemon.py: a fan-speed change applied "
+                            "during an active game session.",
+        fields=("temp_c", "fan_pct", "held"), planned=True),
+    # Added 2026-07-30: gb_gaming/gpu_profile.py's apply_profile() now emits
+    # this on every successful (non-dry-run) clock/power/fan profile apply.
+    "gaming_gpu_profile_applied": KindSpec(
+        group="gaming", doc="greenboost_gaming/gb_gaming/gpu_profile.py: a GPU clock/power/fan "
+                            "profile was applied (via nvidia-smi/nvidia-settings).",
+        fields=("gpu_index", "power_limit_w", "core_offset_mhz", "mem_offset_mhz", "has_fan_curve"),
+        planned=True),
 
     # ── health ─────────────────────────────────────────────────────────
     "pcie_degraded": KindSpec(

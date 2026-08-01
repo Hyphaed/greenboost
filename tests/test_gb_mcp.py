@@ -73,3 +73,30 @@ def test_a2a_gateway_unknown_action_errors():
 def test_run_under_greenboost_mcp_wrapper_dry_run():
     result = gb_mcp.run_under_greenboost(["true"], confirm=False)
     assert result["gate"]["allowed"] is False
+
+
+def test_optimize_inference_snapshot_uses_real_gbsnapshot_keys(monkeypatch):
+    """Regression: optimize_inference's snapshot projection used to ask for
+    "phase"/"pressure", keys that have never existed on GbSnapshot.as_dict()
+    (the real keys are "shim_phase"/"swap_pressure"/"t2_pressure") , the
+    `if k in snap` guard silently dropped both every time instead of raising,
+    so result["snapshot"] was permanently missing phase/pressure. Verified
+    live via the greenboost-orchestrator MCP server before this fix."""
+    import gb_monitor
+
+    class _FakeSnap:
+        def as_dict(self):
+            return {
+                "loaded": True, "vram_physical_mb": 11264, "t2_pool_mb": 43008,
+                "t2_allocated_mb": 0, "t3_used_mb": 0,
+                "shim_phase": "SERVING", "swap_pressure": 2, "t2_pressure": 1,
+            }
+
+    monkeypatch.setattr(gb_monitor, "snapshot", lambda: _FakeSnap())
+    result = gb_mcp.optimize_inference()
+    snap = result["snapshot"]
+    assert snap["shim_phase"] == "SERVING"
+    assert snap["swap_pressure"] == 2
+    assert snap["t2_pressure"] == 1
+    assert "phase" not in snap
+    assert "pressure" not in snap

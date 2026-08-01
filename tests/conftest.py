@@ -131,6 +131,27 @@ def tmp_psk_file(tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_snapshot_topology_globally(monkeypatch):
+    """SnapshotRecorder._emit_local_topology() reads REAL system hardware
+    (gb_topology.get_topology() -> /etc/greenboost/profiles/default.md,
+    NVML, dmidecode) and emits a genuine node_topology event the first time
+    any SnapshotRecorder fires — a real production code path, same class of
+    issue _isolate_dataflux_log_globally already exists for. Tests that
+    construct a SnapshotRecorder with a fake telemetry manager (no CUDA, no
+    real GPU, per this file's own docstring) got an EXTRA, unmocked
+    node_topology event polluting read_events() the moment the real system
+    profile happened to parse successfully (previously masked on any box
+    where the profile was stale/broken enough to raise inside
+    _emit_local_topology's own try/except — see the 2026-08-01 gb_topology
+    bandwidth-sentinel fix, which made the profile valid and surfaced this).
+    Autouse + session-wide so every test gets a real system state's
+    unpredictability out of the snapshot path for free."""
+    import gb_dataflux
+    monkeypatch.setattr(gb_dataflux.SnapshotRecorder, "_emit_local_topology",
+                        lambda self, node: None)
+
+
+@pytest.fixture(autouse=True)
 def _skip_feeder_ready_gate(monkeypatch):
     """ensure_feeder_ready (dispatch self-provisioning gate) does real SSH —
     tests must never depend on a live feeder. GB_SKIP_FEEDER_READY=1 restores

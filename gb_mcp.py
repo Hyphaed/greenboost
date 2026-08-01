@@ -330,8 +330,8 @@ def optimize_inference(model: str | None = None, ctx: int = 65536,
         snap = gb_monitor.snapshot().as_dict()
         result["snapshot"] = {k: snap.get(k) for k in
                               ("loaded", "vram_physical_mb", "t2_pool_mb",
-                               "t2_allocated_mb", "t3_used_mb", "phase",
-                               "pressure") if k in snap}
+                               "t2_allocated_mb", "t3_used_mb", "shim_phase",
+                               "swap_pressure", "t2_pressure") if k in snap}
         t3 = int(snap.get("t3_used_mb") or 0)
         if t3 > 0:
             result["findings"].append(
@@ -540,6 +540,31 @@ def run_under_greenboost(command: "list[str] | str", workload: str = "llm",
     import gb_actuation
     return gb_actuation.run_under_greenboost(command, workload=workload, cwd=cwd,
                                              timeout_s=timeout_s, confirm=confirm)
+
+
+@mcp.tool()
+def reclaim_plan(scope: str = "residue", kill_min_mb: int = 512) -> dict:
+    """QUERY (no gate): classify every GreenBoost-held GPU/T2/T3 process into
+    live/ambiguous/residue and report what scope ("residue"|"ambiguous"|
+    "all") WOULD reclaim, without touching anything. "residue" (default) is
+    orphaned processes only — a genuinely in-progress gb-synapse server
+    never shows up until scope="all"."""
+    import gb_actuation
+    return gb_actuation.reclaim_plan(scope=scope, kill_min_mb=kill_min_mb)
+
+
+@mcp.tool()
+def reclaim_run(scope: str = "residue", kill_min_mb: int = 512,
+                confirm: bool = False) -> dict:
+    """ACTUATE (double-gated): reclaim GreenBoost-held GPU/T2/T3 memory at
+    `scope`. Default scope="residue" only kills orphaned processes; a
+    genuinely in-progress gb-synapse server is left running. scope="all"
+    reproduces the old `greenboost clear memory-pool` nuke's full blast
+    radius — never the default, explicit opt-in only (CLAUDE.md: never run
+    against another genuinely-in-progress GreenBoost job without explicit
+    authorization). DRY-RUN unless confirm=True AND GB_ORCH_ACTUATE=1."""
+    import gb_actuation
+    return gb_actuation.reclaim_run(scope=scope, kill_min_mb=kill_min_mb, confirm=confirm)
 
 
 @mcp.tool()

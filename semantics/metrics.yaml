@@ -296,6 +296,26 @@
   direction: higher_is_better
   owner: GB-Cluster
 
+- name: feeder_reachable
+  entity: feeder
+  unit: boolean
+  doc: Whether a configured feeder answered the fabric probe (GB_MSG_FEEDER_STATUS) or SSH fallback just now , distinct from feeder_items, which assumes the feeder IS connected and only asks whether it's doing work. A feeder can be unreachable (network/netd down) with no work-item signal to explain why.
+  resolver: feeder_reachable
+  source_fields: ["gb_cluster.cluster_snapshot.feeders[].online"]
+  source_tier: measured
+  direction: higher_is_better
+  owner: GB-Cluster
+
+- name: gaming_session_active
+  entity: node
+  unit: boolean
+  doc: Whether the most recent gaming_session dataflux event (emitted by greenboost_gaming/greenboost_proton/proton at game launch/exit, a separate repo) was a "start" not yet followed by a "stop" , the governed signal for "is a game currently running on this box's GPU."
+  resolver: gaming_session_active
+  source_fields: ["gb_dataflux.gaming_session (latest event)"]
+  source_tier: measured
+  direction: informational
+  owner: GB-Cluster
+
 - name: link_bw_gbps
   entity: link
   unit: gigabits_per_second

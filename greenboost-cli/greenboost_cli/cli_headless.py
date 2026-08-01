@@ -900,7 +900,22 @@ from greenboost_cli.cluster.cli import (
 )
 
 from greenboost_cli.rag.contextualize import cmd_contextualize
-from greenboost_cli.rag.memory_pool import cmd_clear_memory_pool
+
+
+# `gb clear-memory-pool` is retired (task #7 consolidation , it duplicated a
+# narrower, Ollama-only slice of what `sudo greenboost clear memory-pool`
+# already does via the shared gb_reclaim.py). One-release deprecation
+# notice instead of a bare "unknown command" so anyone with muscle memory
+# or an existing script gets pointed at the real command; remove this stub
+# entirely in the release after next.
+def cmd_clear_memory_pool(argv: list[str]) -> int:
+    _emit_err(
+        "'gb clear-memory-pool' has been removed , it duplicated a narrower "
+        "slice of what the real command already covers. Use: "
+        "sudo greenboost clear memory-pool  (add --all to also stop a "
+        "genuinely in-progress server, not just orphaned processes)."
+    )
+    return 1
 
 _DISPATCH = {
     "rag-search":       cmd_rag_search,

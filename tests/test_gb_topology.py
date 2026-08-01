@@ -113,6 +113,25 @@ def test_parse_missing_file_returns_defaults(monkeypatch):
     assert t.golden_cpu_min == -1
 
 
+def test_profile_zero_hw_value_falls_through_to_live_detection(tmp_path, monkeypatch):
+    """Regression: a profile value of exactly 0 for a hardware-shaped field
+    used to be treated as authoritative (int()/float() on raw[k] succeeded,
+    so _hw_int/_hw_float returned immediately) and permanently blocked live
+    detection , even when live detection could succeed on this process. Real
+    trigger: greenboost_setup.sh's install-time nvidia-smi probe queries the
+    invalid `memory.bus_width` field (not a real nvidia-smi key) and always
+    writes vram_bandwidth_gb_s: 0 into the profile, which then silently
+    disabled every downstream tok/s estimate (gb_synapse._link_bandwidths)
+    even though this process's own NVML probe works fine. Verified live via
+    cluster_topology returning vram_bw_gb_s=0.0 while a direct
+    _detect_vram_bw_gb_s() call on the same box returned 672.0."""
+    import gb_topology as gt
+    p = _write_profile(tmp_path, "vram_gb: 11\nvram_bandwidth_gb_s: 0\n")
+    monkeypatch.setattr(gt, "_detect_vram_bw_gb_s", lambda: 672.0)
+    t = _parse_profile(p)
+    assert t.vram_bw_gb_s == 672.0
+
+
 def test_parse_partial_profile(tmp_path, monkeypatch):
     """Only GPU section present , CPU fields fall back to defaults."""
     monkeypatch.delenv("GREENBOOST_KV_RESERVE_MB", raising=False)

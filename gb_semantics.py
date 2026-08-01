@@ -497,21 +497,39 @@ def _res_n_gpu_layers_effective(entity_id, window_s):
 
 
 def _res_cluster_vram_fill_pct(entity_id, window_s):
+    """Fixed 2026-07-30: this previously read snap.get("nodes", {}), a key
+    gb_cluster.cluster_snapshot() has never produced — it returns
+    {"host": {...}, "feeders": [...]}, each carrying t1_free_mb/t1_total_mb
+    (see _host_metrics_dict/Feeder). The old code silently always resolved
+    an empty dict regardless of real cluster state."""
     try:
         import gb_cluster
         snap = gb_cluster.cluster_snapshot()
-        nodes = snap.get("nodes", {}) if isinstance(snap, dict) else {}
-        out = {}
-        for name, info in (nodes or {}).items():
-            total = info.get("vram_total_mb") or info.get("t1_vram_mb")
-            used = info.get("vram_used_mb") or info.get("t1_used_mb")
-            if total:
-                out[name] = round(100.0 * used / total, 1)
-        if entity_id:
-            return {"value": out.get(entity_id), "unit": "percent", "raw_source": "gb_cluster.cluster_snapshot"}
-        return {"value": out, "unit": "percent", "raw_source": "gb_cluster.cluster_snapshot"}
     except Exception as e:
         return {"value": None, "unit": "percent", "raw_source": "unavailable", "error": str(e)}
+    if not isinstance(snap, dict):
+        return {"value": {}, "unit": "percent", "raw_source": "gb_cluster.cluster_snapshot"}
+
+    def _fill_pct(total, free) -> "float | None":
+        if not total:
+            return None
+        return round(100.0 * (total - (free or 0)) / total, 1)
+
+    out: dict = {}
+    host = snap.get("host") or {}
+    v = _fill_pct(host.get("t1_total_mb"), host.get("t1_free_mb"))
+    if v is not None:
+        out["host"] = v
+    for f in snap.get("feeders") or []:
+        if not f.get("online"):
+            continue
+        name = f.get("hostname") or f.get("ip") or "?"
+        v = _fill_pct(f.get("t1_total_mb"), f.get("t1_free_mb"))
+        if v is not None:
+            out[name] = v
+    if entity_id:
+        return {"value": out.get(entity_id), "unit": "percent", "raw_source": "gb_cluster.cluster_snapshot"}
+    return {"value": out, "unit": "percent", "raw_source": "gb_cluster.cluster_snapshot"}
 
 
 def _res_feeder_items(entity_id, window_s):
@@ -527,6 +545,31 @@ def _res_feeder_items(entity_id, window_s):
                 "raw_source": "dataflux.summarize.nodes"}
     except Exception as e:
         return {"value": None, "unit": "count", "raw_source": "unavailable", "error": str(e)}
+
+
+def _res_feeder_reachable(entity_id, window_s):
+    try:
+        import gb_cluster
+        snap = gb_cluster.cluster_snapshot()
+    except Exception as e:
+        return {"value": None, "unit": "boolean", "raw_source": "unavailable", "error": str(e)}
+    out: dict = {}
+    for f in (snap or {}).get("feeders") or []:
+        name = f.get("hostname") or f.get("ip") or "?"
+        out[name] = bool(f.get("online"))
+    if entity_id:
+        return {"value": out.get(entity_id), "unit": "boolean",
+                "raw_source": "gb_cluster.cluster_snapshot.feeders[].online"}
+    return {"value": out, "unit": "boolean",
+            "raw_source": "gb_cluster.cluster_snapshot.feeders[].online"}
+
+
+def _res_gaming_session_active(entity_id, window_s):
+    ev = _latest_event("gaming_session", max_age_s=window_s or 6 * 3600.0)
+    if ev is None:
+        return {"value": False, "unit": "boolean", "raw_source": "no gaming_session events yet"}
+    return {"value": ev.get("action") == "start", "unit": "boolean",
+            "raw_source": "dataflux.gaming_session (latest event)"}
 
 
 def _res_link_bw_gbps(entity_id, window_s):
@@ -764,13 +807,45 @@ def _seg_prompt_cache_cold():
 
 
 def _seg_serve_healthy():
+    """Fixed 2026-07-30: this previously required shim_fresh unconditionally,
+    so it could never match on a genuinely idle-but-healthy box (shim_fresh
+    is only true while a CUDA process is actively writing shim_stats within
+    the last 30s) — reproduced live on a box with kmod loaded and zero
+    errors, just idle. shim_fresh/vram-in-band/quality-floor only make sense
+    while something is actually being served; use a dataflux-event-sourced
+    "is anything actively decoding" signal (tok_s_measured, NOT
+    kmod_loaded/shim_fresh, which are OS-resolved and not fixture-
+    controllable) so the idle branch stays deterministic under the eval
+    fixture in tests/fixtures/semantics/events.py, whose scenario represents
+    an ACTIVE Rule#1-violating session, not an idle one."""
     kmod = resolve("kmod_loaded")
     fresh = resolve("shim_fresh")
     vram = resolve("vram_fill_pct")
     floor = resolve("meets_fp8_floor")
-    matched = (kmod.get("value") is True and fresh.get("value") is True
+    if kmod.get("value") is not True:
+        return False, [kmod, fresh, vram, floor]
+    if _latest_event("tok_s_measured", max_age_s=60.0) is None:
+        # No recent decode activity — idle GPU. Healthy iff kmod is loaded;
+        # the VRAM target band / freshness gate / quality floor only apply
+        # to an active serve session.
+        return True, [kmod, fresh, vram, floor]
+    matched = (fresh.get("value") is True
                and (vram.get("value") or 0) >= 60.0 and floor.get("value") is not False)
     return matched, [kmod, fresh, vram, floor]
+
+
+def _seg_feeder_unreachable():
+    reachable = resolve("feeder_reachable")
+    values = reachable.get("value") or {}
+    matched = any(v is False for v in values.values())
+    return matched, [reachable]
+
+
+def _seg_gaming_inference_contention():
+    gaming = resolve("gaming_session_active")
+    t2f = resolve("t2_pressure_fraction")
+    matched = gaming.get("value") is True and (t2f.get("value") or 0) > 0.3
+    return matched, [gaming, t2f]
 
 
 def evaluate_segment(name: str) -> dict:

@@ -469,21 +469,24 @@ class LlamaCppBackend(EngineBackend):
         env["LD_LIBRARY_PATH"] = str(gs.ENGINE_DIR) + (
             ":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
 
-        # The shim currently aborts llama.cpp's CUDA backend on this host:
-        # LD_PRELOAD of libgreenboost_cuda.so makes cudaFuncGetAttributes return
-        # "invalid device function" inside ggml_cuda_kernel_can_use_pdl (reproduced
-        # with GREENBOOST_ACTIVE=0, so it is the interposition itself, not a
-        # GreenBoost code path; a plain cudart-12 test binary is unaffected, so the
-        # trigger is ggml's late-dlopen'ed backend). Serving through a shim that
-        # kills the engine is strictly worse than serving without it: RPC still
-        # splits across the cluster and gb-quant still holds quality, we only lose
-        # per-node T2/T3 spill. Probe once, then decide — never assume.
-        if os.environ.get("GB_SYNAPSE_SHIM", "0") != "1":
+        # Whether the shim actually works with llama.cpp on THIS box, right
+        # now, is not a fact that stays true — it is a real, evidence-based
+        # verdict from gb_shim_probe.py (cached, keyed on shim/engine/cudart
+        # so a rebuild or upgrade invalidates it automatically). This used to
+        # be a hardcoded off-switch behind a comment blaming one specific,
+        # now-fixed failure; that comment's own words were "Probe once, then
+        # decide — never assume," and no probe existed. One now does.
+        # Serving through a shim that kills the engine is strictly worse than
+        # serving without it: RPC still splits across the cluster and
+        # gb-quant still holds quality, we only lose per-node T2/T3 spill.
+        import gb_shim_probe
+        shim_works, shim_reason = gb_shim_probe.shim_works_for_llama(gs.ENGINE_DIR)
+        if not shim_works:
             for k in ("LD_PRELOAD", "GREENBOOST_ACTIVE"):
                 env.pop(k, None)
-            shim_note = "off (known llama.cpp/CUDA incompatibility)"
+            shim_note = f"off ({shim_reason})"
         else:
-            shim_note = "on (GB_SYNAPSE_SHIM=1)"
+            shim_note = f"on ({shim_reason})"
 
         # -ngl 999 ("every layer on the GPU") is right only when the weights can
         # actually LAND there. Without the shim inflating VRAM, forcing all layers
@@ -539,7 +542,11 @@ class LlamaCppBackend(EngineBackend):
             # for more ctx than the plain VRAM/RAM budget provides AND the
             # shim is actually active — never a silent default, and never a
             # substitute for VRAM that's genuinely free (Rule #1).
-            shim_active = os.environ.get("GB_SYNAPSE_SHIM", "0") == "1"
+            # "Active" means the probe (or an explicit GB_SYNAPSE_SHIM
+            # override) actually left LD_PRELOAD in env above — reading the
+            # raw env var here would silently disable this whenever the
+            # probe turns the shim on WITHOUT an explicit override set.
+            shim_active = "LD_PRELOAD" in env
             if explicit_ctx and shim_active:
                 _, _, t2_facts = effective_vram_budget_mb()
                 t2_kv_extra_gb = (t2_facts.get("t2_free_mb", 0.0) *
@@ -715,6 +722,16 @@ class LlamaCppBackend(EngineBackend):
                   f"(ctx={ctx} solved jointly), the rest on CPU. CPU layers cost far more "
                   f"than any memory transfer — add VRAM (another feeder) or a smaller quant "
                   f"to close the gap.", flush=True)
+            try:
+                import gb_dataflux
+                gb_dataflux.emit({
+                    "kind": "cpu_spillover", "status": "dense_partial_offload",
+                    "model": entry.name, "engine": self.name,
+                    "weights_gb": round(weights_gb, 2), "budget_gb": round(budget_gb, 2),
+                    "n_gpu_layers": n_gpu, "n_layers": entry.n_layers, "ctx": ctx,
+                })
+            except Exception:
+                pass
 
         llama_log = open(gs._run_log_path(entry.name), "ab")
         llama_proc = subprocess.Popen(cmd, env=env, stdout=llama_log, stderr=subprocess.STDOUT,
@@ -747,6 +764,16 @@ class LlamaCppBackend(EngineBackend):
                      f"contiguous block was actually free) — retrying at "
                      f"-ngl {fallback_ngl}/{entry.n_layers} (partial GPU offload).",
                      flush=True)
+                try:
+                    import gb_dataflux
+                    gb_dataflux.emit({
+                        "kind": "cpu_spillover", "status": "vram_fragmentation_oom_retry",
+                        "model": entry.name, "engine": self.name,
+                        "weights_gb": round(weights_gb, 2), "budget_gb": round(budget_gb, 2),
+                        "n_gpu_layers": fallback_ngl, "n_layers": entry.n_layers,
+                    })
+                except Exception:
+                    pass
                 retry_cmd = list(cmd)
                 retry_cmd[retry_cmd.index("-ngl") + 1] = str(fallback_ngl)
                 llama_log = open(gs._run_log_path(entry.name), "ab")
@@ -777,6 +804,16 @@ class LlamaCppBackend(EngineBackend):
                      f"of the weights (hybrid-attention archs need more workspace "
                      f"than the flat compute-reserve estimate) — retrying at "
                      f"-ngl {fallback_ngl}/{entry.n_layers}.", flush=True)
+                try:
+                    import gb_dataflux
+                    gb_dataflux.emit({
+                        "kind": "cpu_spillover", "status": "compute_graph_oom_retry",
+                        "model": entry.name, "engine": self.name,
+                        "n_gpu_layers_before": n_gpu, "n_gpu_layers_after": fallback_ngl,
+                        "n_layers": entry.n_layers,
+                    })
+                except Exception:
+                    pass
                 retry_cmd = list(cmd)
                 retry_cmd[retry_cmd.index("-ngl") + 1] = str(fallback_ngl)
                 llama_log = open(gs._run_log_path(entry.name), "ab")
@@ -820,7 +857,8 @@ class LlamaCppBackend(EngineBackend):
         env["GREENBOOST_CLUSTER"] = "0"
         env["LD_LIBRARY_PATH"] = str(gs.ENGINE_DIR) + (
             ":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
-        if os.environ.get("GB_SYNAPSE_SHIM", "0") != "1":
+        import gb_shim_probe
+        if not gb_shim_probe.shim_works_for_llama(gs.ENGINE_DIR)[0]:
             for k in ("LD_PRELOAD", "GREENBOOST_ACTIVE"):
                 env.pop(k, None)
 

@@ -1767,9 +1767,35 @@ write_profile() {
 
     # T1 VRAM bandwidth GB/s = mem clock (MHz) × 2 (DDR) × bus width (bit) / 8 /
     # 1000. So a remote feeder's profile carries its own VRAM speed (host-side
-    # NVML can't see the feeder). 0 when nvidia-smi lacks the fields.
+    # NVML can't see the feeder). 0 when neither method below works.
+    #
+    # Primary: shell out to gb_topology's own _detect_vram_bw_gb_s(), which
+    # calls nvmlDeviceGetMemoryBusWidth() directly. Confirmed live (2026-08-01)
+    # that the nvidia-smi CSV fallback below is permanently broken on at
+    # least one real driver version: `nvidia-smi --query-gpu=...,memory.
+    # bus_width` fails outright ("Field 'memory.bus_width' is not a valid
+    # field to query" , exit 2, no help-query-gpu entry, no -q text field
+    # either) even though the plain NVML API call for the exact same value
+    # works fine on the SAME box/driver. Baked a permanent `vram_bandwidth_
+    # gb_s: 0` into this profile every time it regenerated, on host AND any
+    # feeder using this same generator, with no self-heal for feeders (their
+    # profile text is parsed live=False by design , see gb_topology.py's
+    # parse_profile_text). The nvidia-smi path stays only as a fallback for a
+    # bash-only environment with no python3/pynvml available.
     local _vram_bw_gbs=0
-    if command -v nvidia-smi &>/dev/null; then
+    local _py_bw; _py_bw=$(python3 -c "
+import sys
+sys.path.insert(0, '${MODULE_DIR}')
+try:
+    import gb_topology
+    v = gb_topology._detect_vram_bw_gb_s()
+    print(v if v else '')
+except Exception:
+    pass
+" 2>/dev/null)
+    if [[ -n "$_py_bw" ]]; then
+        _vram_bw_gbs="$_py_bw"
+    elif command -v nvidia-smi &>/dev/null; then
         local _smi_bw; _smi_bw=$(timeout 15 nvidia-smi \
             --query-gpu=clocks.max.memory,memory.bus_width \
             --format=csv,noheader,nounits 2>/dev/null | head -1)
@@ -3058,12 +3084,21 @@ HPEOF
     # 11. tmpfiles.d - Audit F-L4-06: mode 0775 (was 0777) with the `ollama`
     #     group (or `root` if missing).  Ollama and the shim need to write
     #     metrics/NVTX/phase here, but no unprivileged third-party user should.
-    local _tmpfiles_group="root"
-    if getent group ollama >/dev/null 2>&1; then _tmpfiles_group="ollama"; fi
+    #     Found live 2026-07-30: baking the group NAME "ollama" into the
+    #     static conf makes systemd-tmpfiles-setup.service re-resolve it via
+    #     NSS on every boot; that resolution intermittently fails this early
+    #     in boot ("Failed to resolve group 'ollama'" in journalctl) even
+    #     though the group exists in /etc/group and resolves fine once the
+    #     system is up. Baking in the numeric GID instead removes the NSS
+    #     lookup at boot entirely - group ownership is identical either way.
+    local _tmpfiles_group="0"
+    if getent group ollama >/dev/null 2>&1; then
+        _tmpfiles_group="$(getent group ollama | cut -d: -f3)"
+    fi
     printf 'd /run/greenboost 0775 root %s -\n' "$_tmpfiles_group" \
         > /etc/tmpfiles.d/greenboost.conf
     systemd-tmpfiles --create /etc/tmpfiles.d/greenboost.conf 2>/dev/null
-    gb_ok "tmpfiles.d/greenboost.conf installed - /run/greenboost mode 0775 root:${_tmpfiles_group}"
+    gb_ok "tmpfiles.d/greenboost.conf installed - /run/greenboost mode 0775 root:${_tmpfiles_group} (gid, avoids boot-time NSS race)"
 
     # 12. gb-diag-read - narrow read-only diagnostic helper (dmesg, /proc/<pid>/{maps,environ})
     # plus a NOPASSWD sudoers rule scoped to ONLY this binary (no argument wildcards,
@@ -4448,6 +4483,15 @@ cmd_install_python_files() {
         # unmodified against $GB_PY_DEST the same way it does against a dev
         # checkout.
         gb_bench.py
+        # Shim-compat probe + selective GPU/T2/T3 reclaim (2026-08-01):
+        # gb_synapse_backends.py imports gb_shim_probe at call time,
+        # gb_synapse.py/greenboost_setup.sh's own cmd_clear_memory_pool and
+        # the greenboost-orchestrator MCP reclaim_plan/reclaim_run tools
+        # import gb_reclaim — both root modules, same installer-parity rule
+        # as everything else in this list (missing them here means
+        # `install-python` silently ships without either capability).
+        gb_shim_probe.py
+        gb_reclaim.py
     )
     local _installed=0
     for _f in "${_py_files[@]}"; do
@@ -7314,10 +7358,28 @@ cmd_clear_memory_pool() {
     local GB_DEV=/dev/greenboost
     local SYSFS=/sys/class/greenboost/greenboost
 
+    # scope: default "residue" only reclaims orphaned processes (see
+    # gb_reclaim.py's own docstring) - gb-synapse's own tracked, genuinely-
+    # in-progress servers are never touched. --all reproduces this
+    # command's old, unconditional blast radius (every non-protected
+    # candidate, tracked or not) - explicit opt-in only, per CLAUDE.md's own
+    # "Never run it while other genuinely-in-progress GreenBoost work is on
+    # the SAME node unless the owner explicitly authorizes it" rule.
+    local scope="residue" arg
+    for arg in "$@"; do
+        [[ "$arg" == "--all" ]] && scope="all"
+    done
+
     gb_header
     echo -e "  ${C_CYAN}${C_BOLD}Clear Memory Pool${C_RESET}"
     echo -e "  ${C_DIM}Releases GPU + T2/T3 memory held by inference processes."
-    echo -e "  Kills heavy GPU compute jobs (CUDA / GreenBoost); desktop & GNOME processes are protected.${C_RESET}"
+    if [[ "$scope" == "all" ]]; then
+        echo -e "  Kills EVERY GPU compute job (CUDA / GreenBoost), including genuinely"
+        echo -e "  in-progress servers (--all); desktop & GNOME processes are protected.${C_RESET}"
+    else
+        echo -e "  Kills orphaned GPU inference processes only; a genuinely in-progress"
+        echo -e "  gb-synapse server is left running (pass --all to override).${C_RESET}"
+    fi
     echo -e ""
 
     local module_loaded=0
@@ -7344,69 +7406,44 @@ cmd_clear_memory_pool() {
     # Override with GB_KILL_MIN_MB.
     local kill_min_mb="${GB_KILL_MIN_MB:-512}"
 
-    # Never target our own process tree.
-    local self_pids=" $$ ${PPID:-0} ${GB_SELF_PID:-0} "
+    # Classification (live/ambiguous/residue), the protected-comm filter, and
+    # the unload-API/SIGTERM/SIGKILL escalation all live in gb_reclaim.py now
+    # (task #5) - one shared implementation instead of this shell script
+    # duplicating the same logic gb-synapse's Python side also needs.
+    local recl_json
+    recl_json=$(python3 "${MODULE_DIR}/gb_reclaim.py" run --scope="$scope" \
+                --kill-min-mb="$kill_min_mb" --json 2>/dev/null || echo '{}')
 
-    # ── Map every CUDA compute process → GPU MiB (graphics-only desktop procs
-    #    such as gnome-shell never appear in this query). ────────────────────
-    local -A gpu_mb=()
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        local cpid cmem
-        while IFS=',' read -r cpid cmem; do
-            cpid="${cpid//[[:space:]]/}"; cmem="${cmem//[[:space:]]/}"
-            [[ "$cpid" =~ ^[0-9]+$ ]] || continue
-            [[ "$cmem" =~ ^[0-9]+$ ]] || cmem=0
-            gpu_mb["$cpid"]="$cmem"
-        done < <(nvidia-smi --query-compute-apps=pid,used_memory \
-                     --format=csv,noheader,nounits 2>/dev/null || true)
-    fi
-
-    # ── Build candidate set ─────────────────────────────────────────────────
-    #   (a) processes holding /dev/greenboost open  → GreenBoost pool users
-    #       (always candidates, any size - that's what "clear pool" targets)
-    #   (b) CUDA compute processes using >= kill_min_mb MiB
-    local -A cand=()
-    local p
-    for p in $(fuser "$GB_DEV" 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+$' || true); do
-        cand["$p"]=1
-    done
-    for p in "${!gpu_mb[@]}"; do
-        if (( ${gpu_mb[$p]:-0} >= kill_min_mb )); then cand["$p"]=1; fi
-    done
-
-    # ── Filter: drop self, PID 1, and protected desktop/system processes ────
-    local kill_list=() comm
-    for p in "${!cand[@]}"; do
-        [[ "$p" == "1" ]] && continue
-        case "$self_pids" in *" $p "*) continue ;; esac
-        comm=$(cat "/proc/$p/comm" 2>/dev/null || true)
-        [[ -z "$comm" ]] && continue                 # already gone
-        if _gb_proc_is_protected "$comm"; then
-            gb_info "Protected (skipped): PID $p (${comm}, ${gpu_mb[$p]:-0} MiB)"
-            continue
-        fi
-        kill_list+=("$p")
-    done
+    local kill_list=()
+    while IFS= read -r p; do
+        [[ -n "$p" ]] && kill_list+=("$p")
+    done < <(printf '%s' "$recl_json" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+for e in d.get('killed', []):
+    print(e['pid'])
+" 2>/dev/null)
 
     if (( ${#kill_list[@]} == 0 )); then
-        gb_info "No killable GPU inference processes found (desktop/GNOME processes are protected)."
+        gb_info "No killable GPU inference processes found (scope=${scope}; desktop/GNOME processes are always protected)."
     else
-        echo -e "  ${C_AMBER}Terminating GPU inference processes:${C_RESET}"
-        for p in "${kill_list[@]}"; do
-            comm=$(cat "/proc/$p/comm" 2>/dev/null || echo "?")
-            echo -e "    ${C_AMBER}• PID $p (${comm}) - ${gpu_mb[$p]:-?} MiB${C_RESET}"
-        done
-        # SIGTERM first for a clean CUDA teardown, then SIGKILL any stragglers.
-        for p in "${kill_list[@]}"; do kill -TERM "$p" 2>/dev/null || true; done
-        sleep 2
-        for p in "${kill_list[@]}"; do
-            if kill -0 "$p" 2>/dev/null; then
-                kill -9 "$p" 2>/dev/null && gb_info "  SIGKILL PID $p" || gb_info "  PID $p unkillable"
-            else
-                gb_info "  PID $p exited"
-            fi
-        done
-        sleep 1
+        echo -e "  ${C_AMBER}Terminated GPU inference processes (scope=${scope}):${C_RESET}"
+        printf '%s' "$recl_json" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+for e in d.get('killed', []):
+    print(f\"    • PID {e['pid']} ({e['comm']}) - {e.get('gpu_mb', '?')} MiB\")
+for e in d.get('failed', []):
+    print(f\"    ! PID {e['pid']} ({e['comm']}) - could not be killed (permission?)\")
+for m in d.get('unloaded', []):
+    print(f\"    • unloaded Ollama model: {m}\")
+" 2>/dev/null
     fi
 
     # Root path: force-release T2/T3 buffers via GB_IOCTL_RELEASE_PID
@@ -13394,7 +13431,7 @@ case "$COMMAND" in
             logs)            cmd_clear_logs ;;
 
             inference-logs)  cmd_clear_inference_logs ;;
-            memory-pool)     cmd_clear_memory_pool ;;
+            memory-pool)     cmd_clear_memory_pool "${@:3}" ;;
             host-ram)        cmd_clear_host_ram ;;
             cluster-workers) cmd_clear_cluster_workers ;;
             nvtx-logs)       cmd_clear_nvtx_logs ;;

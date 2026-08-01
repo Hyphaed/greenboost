@@ -15103,6 +15103,82 @@ enum da9063_variant_codes {
 	PMIC_DA9063_EA = 8,
 };
 
+enum damon_ops_id {
+	DAMON_OPS_VADDR = 0,
+	DAMON_OPS_FVADDR = 1,
+	DAMON_OPS_PADDR = 2,
+	NR_DAMON_OPS = 3,
+};
+
+enum damon_sysfs_cmd {
+	DAMON_SYSFS_CMD_ON = 0,
+	DAMON_SYSFS_CMD_OFF = 1,
+	DAMON_SYSFS_CMD_COMMIT = 2,
+	DAMON_SYSFS_CMD_COMMIT_SCHEMES_QUOTA_GOALS = 3,
+	DAMON_SYSFS_CMD_UPDATE_SCHEMES_STATS = 4,
+	DAMON_SYSFS_CMD_UPDATE_SCHEMES_TRIED_BYTES = 5,
+	DAMON_SYSFS_CMD_UPDATE_SCHEMES_TRIED_REGIONS = 6,
+	DAMON_SYSFS_CMD_CLEAR_SCHEMES_TRIED_REGIONS = 7,
+	DAMON_SYSFS_CMD_UPDATE_SCHEMES_EFFECTIVE_QUOTAS = 8,
+	DAMON_SYSFS_CMD_UPDATE_TUNED_INTERVALS = 9,
+	NR_DAMON_SYSFS_CMDS = 10,
+};
+
+enum damos_action {
+	DAMOS_WILLNEED = 0,
+	DAMOS_COLD = 1,
+	DAMOS_PAGEOUT = 2,
+	DAMOS_HUGEPAGE = 3,
+	DAMOS_NOHUGEPAGE = 4,
+	DAMOS_LRU_PRIO = 5,
+	DAMOS_LRU_DEPRIO = 6,
+	DAMOS_MIGRATE_HOT = 7,
+	DAMOS_MIGRATE_COLD = 8,
+	DAMOS_STAT = 9,
+	NR_DAMOS_ACTIONS = 10,
+};
+
+enum damos_filter_type {
+	DAMOS_FILTER_TYPE_ANON = 0,
+	DAMOS_FILTER_TYPE_ACTIVE = 1,
+	DAMOS_FILTER_TYPE_MEMCG = 2,
+	DAMOS_FILTER_TYPE_YOUNG = 3,
+	DAMOS_FILTER_TYPE_HUGEPAGE_SIZE = 4,
+	DAMOS_FILTER_TYPE_UNMAPPED = 5,
+	DAMOS_FILTER_TYPE_ADDR = 6,
+	DAMOS_FILTER_TYPE_TARGET = 7,
+	NR_DAMOS_FILTER_TYPES = 8,
+};
+
+enum damos_quota_goal_metric {
+	DAMOS_QUOTA_USER_INPUT = 0,
+	DAMOS_QUOTA_SOME_MEM_PSI_US = 1,
+	DAMOS_QUOTA_NODE_MEM_USED_BP = 2,
+	DAMOS_QUOTA_NODE_MEM_FREE_BP = 3,
+	DAMOS_QUOTA_NODE_MEMCG_USED_BP = 4,
+	DAMOS_QUOTA_NODE_MEMCG_FREE_BP = 5,
+	DAMOS_QUOTA_ACTIVE_MEM_BP = 6,
+	DAMOS_QUOTA_INACTIVE_MEM_BP = 7,
+	NR_DAMOS_QUOTA_GOAL_METRICS = 8,
+};
+
+enum damos_quota_goal_tuner {
+	DAMOS_QUOTA_GOAL_TUNER_CONSIST = 0,
+	DAMOS_QUOTA_GOAL_TUNER_TEMPORAL = 1,
+};
+
+enum damos_sysfs_filter_handle_layer {
+	DAMOS_SYSFS_FILTER_HANDLE_LAYER_CORE = 0,
+	DAMOS_SYSFS_FILTER_HANDLE_LAYER_OPS = 1,
+	DAMOS_SYSFS_FILTER_HANDLE_LAYER_BOTH = 2,
+};
+
+enum damos_wmark_metric {
+	DAMOS_WMARK_NONE = 0,
+	DAMOS_WMARK_FREE_MEM_RATE = 1,
+	NR_DAMOS_WMARK_METRICS = 2,
+};
+
 enum data_formats {
 	DATA_FMT_DIGEST = 0,
 	DATA_FMT_DIGEST_WITH_ALGO = 1,
@@ -64325,6 +64401,515 @@ struct da_monitor_storage {
 	union rv_task_monitor rv;
 	struct hlist_node node;
 	struct callback_head rcu;
+};
+
+struct damon_addr_range {
+	long unsigned int start;
+	long unsigned int end;
+};
+
+struct damon_intervals_goal {
+	long unsigned int access_bp;
+	long unsigned int aggrs;
+	long unsigned int min_sample_us;
+	long unsigned int max_sample_us;
+};
+
+struct damon_attrs {
+	long unsigned int sample_interval;
+	long unsigned int aggr_interval;
+	long unsigned int ops_update_interval;
+	struct damon_intervals_goal intervals_goal;
+	long unsigned int min_nr_regions;
+	long unsigned int max_nr_regions;
+	long unsigned int aggr_samples;
+};
+
+struct damon_call_control {
+	int (*fn)(void *);
+	void *data;
+	bool repeat;
+	int return_code;
+	bool dealloc_on_cancel;
+	struct completion completion;
+	bool canceled;
+	struct list_head list;
+};
+
+struct damon_ctx;
+
+struct damon_region;
+
+struct damos;
+
+struct damon_target;
+
+struct damon_operations {
+	enum damon_ops_id id;
+	void (*init)(struct damon_ctx *);
+	void (*update)(struct damon_ctx *);
+	void (*prepare_access_checks)(struct damon_ctx *);
+	unsigned int (*check_accesses)(struct damon_ctx *);
+	int (*get_scheme_score)(struct damon_ctx *, struct damon_region *, struct damos *);
+	long unsigned int (*apply_scheme)(struct damon_ctx *, struct damon_target *, struct damon_region *, struct damos *, long unsigned int *);
+	bool (*target_valid)(struct damon_target *);
+	void (*cleanup_target)(struct damon_target *);
+};
+
+struct damos_walk_control;
+
+struct damon_ctx {
+	struct damon_attrs attrs;
+	long unsigned int passed_sample_intervals;
+	long unsigned int next_aggregation_sis;
+	long unsigned int next_ops_update_sis;
+	long unsigned int next_intervals_tune_sis;
+	struct completion kdamond_started;
+	long unsigned int *regions_score_histogram;
+	struct list_head call_controls;
+	bool call_controls_obsolete;
+	struct mutex call_controls_lock;
+	struct damos_walk_control *walk_control;
+	bool walk_control_obsolete;
+	struct mutex walk_control_lock;
+	bool maybe_corrupted;
+	struct task_struct *kdamond;
+	struct mutex kdamond_lock;
+	struct damon_operations ops;
+	long unsigned int addr_unit;
+	long unsigned int min_region_sz;
+	struct list_head adaptive_targets;
+	struct list_head schemes;
+};
+
+struct damon_region {
+	struct damon_addr_range ar;
+	long unsigned int sampling_addr;
+	unsigned int nr_accesses;
+	unsigned int nr_accesses_bp;
+	struct list_head list;
+	unsigned int age;
+	unsigned int last_nr_accesses;
+};
+
+struct damon_size_range {
+	long unsigned int min;
+	long unsigned int max;
+};
+
+struct damon_stat_system_ram_range_walk_arg {
+	bool walked;
+	struct resource res;
+};
+
+struct damon_sysfs_ul_range;
+
+struct damon_sysfs_access_pattern {
+	struct kobject kobj;
+	struct damon_sysfs_ul_range *sz;
+	struct damon_sysfs_ul_range *nr_accesses;
+	struct damon_sysfs_ul_range *age;
+};
+
+struct damon_sysfs_intervals;
+
+struct damon_sysfs_attrs {
+	struct kobject kobj;
+	struct damon_sysfs_intervals *intervals;
+	struct damon_sysfs_ul_range *nr_regions_range;
+};
+
+struct damon_sysfs_targets;
+
+struct damon_sysfs_schemes;
+
+struct damon_sysfs_context {
+	struct kobject kobj;
+	enum damon_ops_id ops_id;
+	long unsigned int addr_unit;
+	struct damon_sysfs_attrs *attrs;
+	struct damon_sysfs_targets *targets;
+	struct damon_sysfs_schemes *schemes;
+};
+
+struct damon_sysfs_contexts {
+	struct kobject kobj;
+	struct damon_sysfs_context **contexts_arr;
+	int nr;
+};
+
+struct damon_sysfs_intervals_goal;
+
+struct damon_sysfs_intervals {
+	struct kobject kobj;
+	long unsigned int sample_us;
+	long unsigned int aggr_us;
+	long unsigned int update_us;
+	struct damon_sysfs_intervals_goal *intervals_goal;
+};
+
+struct damon_sysfs_intervals_goal {
+	struct kobject kobj;
+	long unsigned int access_bp;
+	long unsigned int aggrs;
+	long unsigned int min_sample_us;
+	long unsigned int max_sample_us;
+};
+
+struct damon_sysfs_kdamond {
+	struct kobject kobj;
+	struct damon_sysfs_contexts *contexts;
+	struct damon_ctx *damon_ctx;
+	unsigned int refresh_ms;
+};
+
+struct damon_sysfs_kdamonds {
+	struct kobject kobj;
+	struct damon_sysfs_kdamond **kdamonds_arr;
+	int nr;
+};
+
+struct damon_sysfs_ops_name {
+	enum damon_ops_id ops_id;
+	char *name;
+};
+
+struct damon_sysfs_weights;
+
+struct damos_sysfs_quota_goals;
+
+struct damon_sysfs_quotas {
+	struct kobject kobj;
+	struct damon_sysfs_weights *weights;
+	struct damos_sysfs_quota_goals *goals;
+	long unsigned int ms;
+	long unsigned int sz;
+	long unsigned int reset_interval_ms;
+	long unsigned int effective_sz;
+	enum damos_quota_goal_tuner goal_tuner;
+};
+
+struct damon_sysfs_region {
+	struct kobject kobj;
+	struct damon_addr_range ar;
+};
+
+struct damon_sysfs_regions {
+	struct kobject kobj;
+	struct damon_sysfs_region **regions_arr;
+	int nr;
+};
+
+struct damon_sysfs_watermarks;
+
+struct damon_sysfs_scheme_filters;
+
+struct damon_sysfs_stats;
+
+struct damon_sysfs_scheme_regions;
+
+struct damos_sysfs_dests;
+
+struct damon_sysfs_scheme {
+	struct kobject kobj;
+	enum damos_action action;
+	struct damon_sysfs_access_pattern *access_pattern;
+	long unsigned int apply_interval_us;
+	struct damon_sysfs_quotas *quotas;
+	struct damon_sysfs_watermarks *watermarks;
+	struct damon_sysfs_scheme_filters *core_filters;
+	struct damon_sysfs_scheme_filters *ops_filters;
+	struct damon_sysfs_scheme_filters *filters;
+	struct damon_sysfs_stats *stats;
+	struct damon_sysfs_scheme_regions *tried_regions;
+	int target_nid;
+	struct damos_sysfs_dests *dests;
+};
+
+struct damon_sysfs_scheme_filter {
+	struct kobject kobj;
+	enum damos_sysfs_filter_handle_layer handle_layer;
+	enum damos_filter_type type;
+	bool matching;
+	bool allow;
+	char *memcg_path;
+	struct damon_addr_range addr_range;
+	struct damon_size_range sz_range;
+	int target_idx;
+};
+
+struct damon_sysfs_scheme_filters {
+	struct kobject kobj;
+	enum damos_sysfs_filter_handle_layer handle_layer;
+	struct damon_sysfs_scheme_filter **filters_arr;
+	int nr;
+};
+
+struct damon_sysfs_scheme_region {
+	struct kobject kobj;
+	struct damon_addr_range ar;
+	unsigned int nr_accesses;
+	unsigned int age;
+	long unsigned int sz_filter_passed;
+	struct list_head list;
+};
+
+struct damon_sysfs_scheme_regions {
+	struct kobject kobj;
+	struct list_head regions_list;
+	int nr_regions;
+	long unsigned int total_bytes;
+};
+
+struct damon_sysfs_schemes {
+	struct kobject kobj;
+	struct damon_sysfs_scheme **schemes_arr;
+	int nr;
+};
+
+struct damon_sysfs_schemes_walk_data {
+	struct damon_sysfs_kdamond *sysfs_kdamond;
+	bool total_bytes_only;
+};
+
+struct damon_sysfs_stats {
+	struct kobject kobj;
+	long unsigned int nr_tried;
+	long unsigned int sz_tried;
+	long unsigned int nr_applied;
+	long unsigned int sz_applied;
+	long unsigned int sz_ops_filter_passed;
+	long unsigned int qt_exceeds;
+	long unsigned int nr_snapshots;
+	long unsigned int max_nr_snapshots;
+};
+
+struct damon_sysfs_target {
+	struct kobject kobj;
+	struct damon_sysfs_regions *regions;
+	int pid;
+	bool obsolete;
+};
+
+struct damon_sysfs_targets {
+	struct kobject kobj;
+	struct damon_sysfs_target **targets_arr;
+	int nr;
+};
+
+struct damon_sysfs_ui_dir {
+	struct kobject kobj;
+	struct damon_sysfs_kdamonds *kdamonds;
+};
+
+struct damon_sysfs_ul_range {
+	struct kobject kobj;
+	long unsigned int min;
+	long unsigned int max;
+};
+
+struct damon_sysfs_watermarks {
+	struct kobject kobj;
+	enum damos_wmark_metric metric;
+	long unsigned int interval_us;
+	long unsigned int high;
+	long unsigned int mid;
+	long unsigned int low;
+};
+
+struct damon_sysfs_weights {
+	struct kobject kobj;
+	unsigned int sz;
+	unsigned int nr_accesses;
+	unsigned int age;
+};
+
+struct damon_target {
+	struct pid *pid;
+	unsigned int nr_regions;
+	struct list_head regions_list;
+	struct list_head list;
+	bool obsolete;
+};
+
+struct damon_young_walk_private {
+	long unsigned int *folio_sz;
+	bool young;
+};
+
+struct damos_access_pattern {
+	long unsigned int min_sz_region;
+	long unsigned int max_sz_region;
+	unsigned int min_nr_accesses;
+	unsigned int max_nr_accesses;
+	unsigned int min_age_region;
+	unsigned int max_age_region;
+};
+
+struct damos_quota {
+	long unsigned int reset_interval;
+	long unsigned int ms;
+	long unsigned int sz;
+	struct list_head goals;
+	enum damos_quota_goal_tuner goal_tuner;
+	long unsigned int esz;
+	unsigned int weight_sz;
+	unsigned int weight_nr_accesses;
+	unsigned int weight_age;
+	long unsigned int total_charged_sz;
+	long unsigned int total_charged_ns;
+	long unsigned int charged_sz;
+	long unsigned int charged_from;
+	struct damon_target *charge_target_from;
+	long unsigned int charge_addr_from;
+	unsigned int min_score;
+	long unsigned int esz_bp;
+};
+
+struct damos_watermarks {
+	enum damos_wmark_metric metric;
+	long unsigned int interval;
+	long unsigned int high;
+	long unsigned int mid;
+	long unsigned int low;
+	bool activated;
+};
+
+struct damos_migrate_dests {
+	unsigned int *node_id_arr;
+	unsigned int *weight_arr;
+	size_t nr_dests;
+};
+
+struct damos_stat {
+	long unsigned int nr_tried;
+	long unsigned int sz_tried;
+	long unsigned int nr_applied;
+	long unsigned int sz_applied;
+	long unsigned int sz_ops_filter_passed;
+	long unsigned int qt_exceeds;
+	long unsigned int nr_snapshots;
+};
+
+struct damos {
+	struct damos_access_pattern pattern;
+	enum damos_action action;
+	long unsigned int apply_interval_us;
+	long unsigned int next_apply_sis;
+	bool walk_completed;
+	bool core_filters_allowed;
+	bool core_filters_default_reject;
+	bool ops_filters_default_reject;
+	struct damos_quota quota;
+	struct damos_watermarks wmarks;
+	union {
+		struct {
+			int target_nid;
+			struct damos_migrate_dests migrate_dests;
+		};
+	};
+	struct list_head core_filters;
+	struct list_head ops_filters;
+	void *last_applied;
+	struct damos_stat stat;
+	long unsigned int max_nr_snapshots;
+	struct list_head list;
+};
+
+struct damos_filter {
+	enum damos_filter_type type;
+	bool matching;
+	bool allow;
+	union {
+		u64 memcg_id;
+		struct damon_addr_range addr_range;
+		int target_idx;
+		struct damon_size_range sz_range;
+	};
+	struct list_head list;
+};
+
+struct damos_quota_goal {
+	enum damos_quota_goal_metric metric;
+	long unsigned int target_value;
+	long unsigned int current_value;
+	union {
+		u64 last_psi_total;
+		struct {
+			int nid;
+			u64 memcg_id;
+		};
+	};
+	struct list_head list;
+};
+
+struct damos_sysfs_action_name {
+	enum damos_action action;
+	char *name;
+};
+
+struct damos_sysfs_dest {
+	struct kobject kobj;
+	unsigned int id;
+	unsigned int weight;
+};
+
+struct damos_sysfs_dests {
+	struct kobject kobj;
+	struct damos_sysfs_dest **dests_arr;
+	int nr;
+};
+
+struct damos_sysfs_filter_type_name {
+	enum damos_filter_type type;
+	char *name;
+};
+
+struct damos_sysfs_qgoal_metric_name {
+	enum damos_quota_goal_metric metric;
+	char *name;
+};
+
+struct damos_sysfs_qgoal_tuner_name {
+	enum damos_quota_goal_tuner tuner;
+	char *name;
+};
+
+struct damos_sysfs_quota_goal {
+	struct kobject kobj;
+	enum damos_quota_goal_metric metric;
+	long unsigned int target_value;
+	long unsigned int current_value;
+	int nid;
+	char *path;
+};
+
+struct damos_sysfs_quota_goals {
+	struct kobject kobj;
+	struct damos_sysfs_quota_goal **goals_arr;
+	int nr;
+};
+
+struct damos_sysfs_wmark_metric_name {
+	enum damos_wmark_metric metric;
+	char *name;
+};
+
+struct damos_va_migrate_private {
+	struct list_head *migration_lists;
+	struct damos *scheme;
+};
+
+struct damos_va_stat_private {
+	struct damos *scheme;
+	long unsigned int *sz_filter_passed;
+};
+
+struct damos_walk_control {
+	void (*walk_fn)(void *, struct damon_ctx *, struct damon_target *, struct damon_region *, struct damos *, long unsigned int);
+	void *data;
+	struct completion completion;
+	bool canceled;
 };
 
 struct data_chunk {
@@ -143952,6 +144537,16 @@ struct trace_event_data_offsets_ctime {};
 
 struct trace_event_data_offsets_ctime_ns_xchg {};
 
+struct trace_event_data_offsets_damon_aggregated {};
+
+struct trace_event_data_offsets_damon_monitor_intervals_tune {};
+
+struct trace_event_data_offsets_damos_before_apply {};
+
+struct trace_event_data_offsets_damos_esz {};
+
+struct trace_event_data_offsets_damos_stat_after_apply_interval {};
+
 struct trace_event_data_offsets_dax_pmd_fault_class {};
 
 struct trace_event_data_offsets_dax_pmd_load_hole_class {};
@@ -146623,6 +147218,58 @@ struct trace_event_raw_ctime_ns_xchg {
 	u32 old;
 	u32 new;
 	u32 cur;
+	char __data[0];
+};
+
+struct trace_event_raw_damon_aggregated {
+	struct trace_entry ent;
+	long unsigned int target_id;
+	unsigned int nr_regions;
+	long unsigned int start;
+	long unsigned int end;
+	unsigned int nr_accesses;
+	unsigned int age;
+	char __data[0];
+};
+
+struct trace_event_raw_damon_monitor_intervals_tune {
+	struct trace_entry ent;
+	long unsigned int sample_us;
+	char __data[0];
+};
+
+struct trace_event_raw_damos_before_apply {
+	struct trace_entry ent;
+	unsigned int context_idx;
+	unsigned int scheme_idx;
+	long unsigned int target_idx;
+	long unsigned int start;
+	long unsigned int end;
+	unsigned int nr_accesses;
+	unsigned int age;
+	unsigned int nr_regions;
+	char __data[0];
+};
+
+struct trace_event_raw_damos_esz {
+	struct trace_entry ent;
+	unsigned int context_idx;
+	unsigned int scheme_idx;
+	long unsigned int esz;
+	char __data[0];
+};
+
+struct trace_event_raw_damos_stat_after_apply_interval {
+	struct trace_entry ent;
+	unsigned int context_idx;
+	unsigned int scheme_idx;
+	long unsigned int nr_tried;
+	long unsigned int sz_tried;
+	long unsigned int nr_applied;
+	long unsigned int sz_applied;
+	long unsigned int sz_ops_filter_passed;
+	long unsigned int qt_exceeds;
+	long unsigned int nr_snapshots;
 	char __data[0];
 };
 
@@ -165692,6 +166339,16 @@ typedef void (*btf_trace_csd_queue_cpu)(void *, const unsigned int, long unsigne
 typedef void (*btf_trace_ctime_ns_xchg)(void *, struct inode *, u32, u32, u32);
 
 typedef void (*btf_trace_ctime_xchg_skip)(void *, struct inode *, struct timespec64 *);
+
+typedef void (*btf_trace_damon_aggregated)(void *, unsigned int, struct damon_region *, unsigned int);
+
+typedef void (*btf_trace_damon_monitor_intervals_tune)(void *, long unsigned int);
+
+typedef void (*btf_trace_damos_before_apply)(void *, unsigned int, unsigned int, unsigned int, struct damon_region *, unsigned int, bool);
+
+typedef void (*btf_trace_damos_esz)(void *, unsigned int, unsigned int, long unsigned int);
+
+typedef void (*btf_trace_damos_stat_after_apply_interval)(void *, unsigned int, unsigned int, struct damos_stat *);
 
 typedef void (*btf_trace_dax_insert_pfn_mkwrite)(void *, struct inode *, struct vm_fault *, int);
 

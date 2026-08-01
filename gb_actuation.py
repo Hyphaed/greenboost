@@ -214,7 +214,13 @@ def tier_actuate(lever: str, value: int, confirm: bool = False) -> dict:
         from gb_control import GbControl
         method, coerce, _unit = _TIER_LEVERS[lever]
         res = getattr(GbControl(), method)(coerce(value), reason="mcp/a2a tier_actuate")
-        plan["applied"] = getattr(res, "ok", None)
+        # ActuatorResult (gb_control.py) has no `ok` field — only `applied`.
+        # getattr(res, "ok", None) always fell through to the None default,
+        # so this MCP-facing field silently reported None for every real
+        # tier_actuate call, success or failure indistinguishable from a
+        # dry-run refusal (found 2026-07-30, same silent-wrong-field class
+        # as gb_mcp.py::optimize_inference's earlier snap-key bug).
+        plan["applied"] = getattr(res, "applied", None)
         plan["result"] = getattr(res, "reason", str(res))
         _emit("tier_actuate", True, lever=lever, value=value)
     except Exception as e:
@@ -335,6 +341,48 @@ def run_under_greenboost(command: "list[str] | str", workload: str = "llm",
         _emit("run_under_greenboost", True, kind="agent_run", run_id=run_id,
               status="error", error=str(e))
     return plan
+
+
+def reclaim_plan(scope: str = "residue", kill_min_mb: int = 512) -> dict:
+    """QUERY (no gate): classify every GreenBoost-held GPU/T2/T3 process into
+    live/ambiguous/residue and report what scope ("residue"|"ambiguous"|
+    "all") WOULD reclaim, without touching anything. See gb_reclaim.py's own
+    docstring for the classification rules — "residue" (the default) is
+    orphaned processes only, "all" is gb-synapse's own tracked servers too."""
+    import gb_reclaim
+    return gb_reclaim.plan_reclaim(scope=scope, kill_min_mb=kill_min_mb)
+
+
+def reclaim_run(scope: str = "residue", kill_min_mb: int = 512,
+                confirm: bool = False) -> dict:
+    """Reclaim GreenBoost-held GPU/T2/T3 memory at `scope`. Default
+    scope="residue" only touches orphaned processes — never a genuinely
+    in-progress gb-synapse server. scope="all" reproduces the old
+    `greenboost clear memory-pool` nuke's full blast radius (CLAUDE.md's own
+    rule: never run against another genuinely-in-progress GreenBoost job
+    without explicit authorization — "all" is exactly that authorization).
+    DRY-RUN (plan only, nothing killed) unless confirm=True AND
+    GB_ORCH_ACTUATE=1 (the double gate) — this verb kills real processes, so
+    it gets the same gate every other actuating verb here does. gb_reclaim's
+    own run_reclaim() already emits a kind="reclaim" dataflux event with the
+    outcome; this adds the standard kind="actuation" event every verb here
+    emits, for the agent-audit trail."""
+    import gb_reclaim
+    gate = actuation_gate(confirm)
+    plan = gb_reclaim.plan_reclaim(scope=scope, kill_min_mb=kill_min_mb)
+    result = {"verb": "reclaim_run", "scope": scope, "gate": gate,
+              "targets": plan["targets"]}
+    if not gate["allowed"]:
+        result["dry_run"] = f"would reclaim {len(plan['targets'])} process(es) at scope={scope}"
+        return result
+    outcome = gb_reclaim.run_reclaim(scope=scope, kill_min_mb=kill_min_mb)
+    result["applied"] = True
+    result["killed"] = outcome["killed"]
+    result["unloaded"] = outcome["unloaded"]
+    result["failed"] = outcome["failed"]
+    _emit("reclaim_run", True, scope=scope, n_killed=len(outcome["killed"]),
+          n_failed=len(outcome["failed"]))
+    return result
 
 
 def run_capped(argv: list[str], *, mem_max_mb: "float | None" = None,
@@ -500,4 +548,6 @@ VERBS = {
     "serve_and_repoint": serve_and_repoint,
     "shim_env": shim_env,
     "run_under_greenboost": run_under_greenboost,
+    "reclaim_plan": reclaim_plan,
+    "reclaim_run": reclaim_run,
 }

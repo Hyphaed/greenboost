@@ -144,6 +144,16 @@
   name: cluster_vram_fill_pct
   source: live
 
+- id: feeder_reachable_structural
+  kind: metric
+  name: feeder_reachable
+  source: live
+
+- id: gaming_session_active_structural
+  kind: metric
+  name: gaming_session_active
+  source: live
+
 - id: swap_pressure_structural
   kind: metric
   name: swap_pressure
@@ -220,6 +230,16 @@
 - id: weights_on_t3_structural
   kind: segment
   name: weights_on_t3
+  source: live
+
+- id: feeder_unreachable_structural
+  kind: segment
+  name: feeder_unreachable
+  source: live
+
+- id: gaming_inference_contention_structural
+  kind: segment
+  name: gaming_inference_contention
   source: live
 
 - id: swap_thrash_not_gpu_throttle_structural

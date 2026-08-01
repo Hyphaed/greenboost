@@ -1,18 +1,24 @@
-"""gb clear-memory-pool — unload Ollama models from VRAM after batch work.
+"""gb clear-memory-pool — LEGACY module, superseded (task #7 consolidation).
 
-After contextual RAG ingest (LLM contextualize + embedding), the Ollama
-server keeps models warm in VRAM for its keep_alive window (default 5 min).
-On a 12 GB GPU this blocks subsequent work. This module:
+The `gb clear-memory-pool` command is gone: `cli_headless.py` now points
+that verb at a one-release deprecation notice pointing to `sudo greenboost
+clear memory-pool`, which itself delegates to the sibling greenboost repo's
+gb_reclaim.py (classification + escalation, shared with the bash nuke —
+see gb_reclaim.py's own docstring for why two similarly-named-but-different
+"clear memory pool" commands existed in the first place).
 
-  1. Exposes _ollama_unload(model) used internally after ingest phases.
-  2. Exposes cmd_clear_memory_pool(argv) for the `gb clear-memory-pool` command.
+_ollama_unload/_ollama_list_loaded's canonical home is now gb_reclaim.py
+too (contextual_rag.py's ingest-phase VRAM release imports it from there via
+greenboost_cli.gb_paths.gb_module, the same cross-repo convention
+backend_cmds.py uses for gb_synapse). The copies below are kept only in case
+an external caller still imports this module directly — do not add new
+callers; import gb_reclaim instead.
 
 Ollama unload mechanism: POST /api/generate with keep_alive=0 instructs the
 server to release the model immediately rather than waiting for keep_alive.
 """
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import sys
@@ -65,75 +71,3 @@ def _ollama_list_loaded(*, base_url: str | None = None) -> list[dict]:
         return data.get("models", [])
     except Exception:       # noqa: BLE001
         return []
-
-
-# ── CLI handler ───────────────────────────────────────────────────────────────
-
-def cmd_clear_memory_pool(argv: list[str]) -> int:
-    """Handler for `gb clear-memory-pool [--model NAME] [--all] [--json]`."""
-    p = argparse.ArgumentParser(
-        prog="gb clear-memory-pool",
-        description="Unload Ollama model(s) from VRAM immediately.",
-        add_help=True,
-    )
-    p.add_argument(
-        "--model", default=None,
-        help="Model to unload (default: active model from gb settings).",
-    )
-    p.add_argument(
-        "--all", action="store_true",
-        help="Unload ALL currently loaded models (reads /api/ps).",
-    )
-    p.add_argument("--json", action="store_true")
-    args = p.parse_args(argv)
-
-    base_url = _ollama_base_url()
-    results: list[dict] = []
-
-    if args.all:
-        loaded = _ollama_list_loaded(base_url=base_url)
-        if not loaded:
-            if args.json:
-                _emit_json({"unloaded": [], "note": "no models loaded"})
-            else:
-                print("  ·  no models currently loaded in Ollama")
-            return 0
-        for entry in loaded:
-            m = entry.get("name", "")
-            if not m:
-                continue
-            ok = _ollama_unload(m, base_url=base_url)
-            results.append({"model": m, "ok": ok})
-            if not args.json:
-                status = "✓" if ok else "✗"
-                print(f"  \033[{'32' if ok else '31'}m{status}\033[0m  unloaded {m}")
-    else:
-        model = args.model
-        if not model:
-            from greenboost_cli.environment.settings import load_settings   # noqa: PLC0415
-            model = load_settings().get("model", "")
-        if not model:
-            _emit_err("no model specified; pass --model or configure gb settings")
-            if args.json:
-                _emit_json({"error": "no model specified", "unloaded": []})
-            return 1
-        ok = _ollama_unload(model, base_url=base_url)
-        results.append({"model": model, "ok": ok})
-        if not args.json:
-            status = "\033[32m✓\033[0m" if ok else "\033[31m✗\033[0m"
-            verb = "unloaded" if ok else "failed to unload"
-            print(f"  {status}  {verb} {model}")
-
-    if args.json:
-        _emit_json({"unloaded": [r["model"] for r in results if r["ok"]],
-                    "failed":   [r["model"] for r in results if not r["ok"]]})
-    return 0 if all(r["ok"] for r in results) else 1
-
-
-def _emit_json(payload: dict) -> None:
-    json.dump(payload, sys.stdout, ensure_ascii=False)
-    sys.stdout.write("\n")
-
-
-def _emit_err(msg: str) -> None:
-    sys.stderr.write(f"gb: {msg}\n")
