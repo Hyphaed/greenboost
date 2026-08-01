@@ -6865,6 +6865,9 @@ static uint32_t get_local_ddr_speed(void) {
      * root, so the value is reliably available to every user-space process
      * via a world-readable file - no dmidecode (which needs CAP_SYS_RAWIO)
      * and no popen() per process. */
+    int profile_seen = 0;   /* did we successfully open a profile file at all -
+                              * distinguishes "no profile" from "profile present
+                              * but nothing usable in it" in the Source 3 message. */
     {
         static const char * const profile_paths[] = {
             "/etc/greenboost/active_profile.md",
@@ -6874,18 +6877,40 @@ static uint32_t get_local_ddr_speed(void) {
         for (int i = 0; profile_paths[i] && cached_speed == 0; i++) {
             FILE *pf = fopen(profile_paths[i], "r");
             if (!pf) continue;
+            profile_seen = 1;
             char line[256];
             while (fgets(line, sizeof(line), pf)) {
                 /* Match `ram_speed_mt: <integer>` (YAML-style frontmatter).
                  * Tolerates whitespace and quotes around the value. */
                 const char *p = strstr(line, "ram_speed_mt");
-                if (!p) continue;
-                p = strchr(p, ':');
-                if (!p) continue;
-                p++;
-                while (*p == ' ' || *p == '\t' || *p == '"' || *p == '\'') p++;
-                int val = atoi(p);
-                if (val > 0) { cached_speed = (uint32_t)val; break; }
+                if (p) {
+                    p = strchr(p, ':');
+                    if (p) {
+                        p++;
+                        while (*p == ' ' || *p == '\t' || *p == '"' || *p == '\'') p++;
+                        int val = atoi(p);
+                        if (val > 0) { cached_speed = (uint32_t)val; break; }
+                    }
+                    continue;
+                }
+                /* Fallback shape: a raw dmidecode-style profile with no
+                 * `ram_speed_mt` frontmatter key at all (e.g. an older
+                 * greenboost_setup.sh that pasted `dmidecode -t memory`
+                 * output directly, or a hand-edited profile) - "Speed:" /
+                 * "Configured Memory Speed:" followed by "<int> MT/s", the
+                 * same shapes the dmidecode fallback below already greps
+                 * for. Requiring "MT/s" on the line guards against an
+                 * unrelated "Speed:"-bearing line with no unit. */
+                p = strstr(line, "Speed:");
+                if (p && strstr(line, "MT/s")) {
+                    p = strchr(p, ':');
+                    if (p) {
+                        p++;
+                        while (*p == ' ' || *p == '\t') p++;
+                        int val = atoi(p);
+                        if (val > 0) { cached_speed = (uint32_t)val; break; }
+                    }
+                }
             }
             fclose(pf);
         }
@@ -6908,10 +6933,19 @@ static uint32_t get_local_ddr_speed(void) {
     /* Source 3: conservative default biased toward local T2 routing. */
     if (cached_speed == 0) {
         cached_speed = 2400;
-        GB_INIT_LOG_ONCE(
-                "[GreenBoost] DDR speed lookup failed (profile + dmidecode both "
-                "unavailable) - defaulting to 2400 MT/s.  Run `sudo greenboost "
-                "profile create` to populate /etc/greenboost/profiles/default.md.\n");
+        if (profile_seen)
+            GB_INIT_LOG_ONCE(
+                    "[GreenBoost] DDR speed lookup failed (profile file found "
+                    "but no ram_speed_mt/Speed: MT/s value in it, and dmidecode "
+                    "unavailable) - defaulting to 2400 MT/s.  Re-run `sudo "
+                    "greenboost profile create`, or check "
+                    "/etc/greenboost/profiles/default.md by hand.\n");
+        else
+            GB_INIT_LOG_ONCE(
+                    "[GreenBoost] DDR speed lookup failed (no profile file and "
+                    "dmidecode unavailable) - defaulting to 2400 MT/s.  Run "
+                    "`sudo greenboost profile create` to populate "
+                    "/etc/greenboost/profiles/default.md.\n");
     }
     return cached_speed;
 }
@@ -8974,14 +9008,25 @@ CUresult cuDeviceGetAttribute(int *value, int attrib, CUdevice dev)
     }
 
     /* On Blackwell (cc >= 12) desktop PCIe, ggml-cuda uses
-     * CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED (193) to
+     * CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED (102) to
      * decide whether to use its cuMemCreate/cuMemMap VMM pool.  That pool's
      * HOST_NUMA_CURRENT T2 fallback returns DMA-only handles on Blackwell
      * PCIe - any kernel reading from it crashes with invalid_resource_handle.
      * Report VMM=0 so ggml falls back to the cudaMalloc legacy pool, whose
      * T1-overflow path correctly routes through gb_vmm_t2_alloc_blackwell_managed
-     * (managed-UVM, SM-accessible).  Override: GREENBOOST_BLACKWELL_ALLOW_VMM=1. */
-#define CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED 193
+     * (managed-UVM, SM-accessible).  Override: GREENBOOST_BLACKWELL_ALLOW_VMM=1.
+     *
+     * INCIDENT (2026-08-01): this was previously defined as 193, which is
+     * outside CU_DEVICE_ATTRIBUTE_MAX (cuda.h) - the real driver call fails,
+     * this whole branch never executes, ggml sees vmm=1 and picks pool_vmm,
+     * and only the defence-in-depth cuMemAddressReserve intercept below then
+     * fires - but ggml wraps that call in CU_CHECK, so it aborts the process
+     * (ggml_cuda_pool_vmm::alloc -> ggml_abort) instead of falling back to
+     * pool_leg. One wrong enum turned a graceful fallback into a hard crash,
+     * which gb_shim_probe.py correctly detected and reported as "shim
+     * broken" - it wasn't; this one constant was. Fixed to the real value
+     * from cuda.h: CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED = 102. */
+#define CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED 102
     if (attrib == CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED) {
         CUresult r = real_cuDeviceGetAttribute(value, attrib, dev);
         if (r == CUDA_SUCCESS && *value != 0) {
@@ -9011,10 +9056,17 @@ CUresult cuDeviceGetAttribute(int *value, int attrib, CUdevice dev)
 }
 
 /* cudaDeviceGetAttribute - runtime-API companion to cuDeviceGetAttribute.
- * ggml-cuda 0.23+ calls cudaDeviceGetAttribute@libcudart.so.13 (not the driver
- * API cuDeviceGetAttribute) to read CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_
- * SUPPORTED (attr=193) for the VMM pool selection.  We must hook the runtime
- * path too - same Blackwell VMM=0 override applies. */
+ *
+ * NOTE (2026-08-01): ggml-cuda's VMM pool selection
+ * (ggml_backend_cuda_context::new_pool_for_device(), ggml-cuda.cu) reads
+ * CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED via the DRIVER API
+ * (cuDeviceGetAttribute, hooked above), not this runtime-API function - the
+ * CUDA runtime headers (driver_types.h's cudaDeviceAttr enum) have no VMM-
+ * supported member at all (the numeric slot is reserved, driver-API-only).
+ * A previous version of this hook matched a nonexistent
+ * "cudaDevAttrVirtualMemoryManagementSupported = 193" here; it could never
+ * fire since no real caller ever queries that attribute over the runtime
+ * API. Removed rather than "fixed" - there is nothing to intercept here. */
 cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device)
 {
     GB_CUDART_ENSURE();
@@ -9046,28 +9098,6 @@ cudaError_t cudaDeviceGetAttribute(int *value, int attr, int device)
     }
 
     cudaError_t ret = fn(value, attr, device);
-
-    if (ret == 0 /* cudaSuccess */ && attr == 193 /* cudaDevAttrVirtualMemoryManagementSupported */
-            && value && *value != 0) {
-        int cc = gb_cc_major;
-        if (cc == 0 && real_cuDeviceGetAttribute)
-            real_cuDeviceGetAttribute(&cc, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device);
-        if (cc >= 12) {
-            static int gb_rt_allow_vmm = -1;
-            if (__builtin_expect(gb_rt_allow_vmm < 0, 0)) {
-                const char *e = getenv("GREENBOOST_BLACKWELL_ALLOW_VMM");
-                gb_rt_allow_vmm = (e && e[0] != '0') ? 1 : 0;
-                if (!gb_rt_allow_vmm)
-                    fprintf(stderr,
-                        "[GreenBoost] cudaDeviceGetAttribute: Blackwell cc=%d - "
-                        "reporting VMM=0 (cuMemCreate HOST_NUMA T2 is DMA-only on "
-                        "desktop PCIe; cudaMalloc→managed-UVM used instead). "
-                        "Override: GREENBOOST_BLACKWELL_ALLOW_VMM=1\n", cc);
-            }
-            if (!gb_rt_allow_vmm)
-                *value = 0;
-        }
-    }
     return ret;
 }
 

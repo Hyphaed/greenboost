@@ -27,7 +27,7 @@
  *   etc.) while leaving all other symbol lookups unaffected.
  *
  * WHAT THESE OVERRIDES DO:
- *   cuDeviceGetAttribute(attr=193 "VMM_SUPPORTED"):
+ *   cuDeviceGetAttribute(attr=102 "VMM_SUPPORTED"):
  *     Returns 0 on Blackwell (cc >= 12) desktop PCIe.  ggml-cuda checks this
  *     attribute to decide between pool_vmm (cuMemCreate/cuMemMap) and pool_leg
  *     (cudaMalloc).  pool_vmm's HOST_NUMA_CURRENT T2 fallback is DMA-only on
@@ -71,8 +71,16 @@ extern __attribute__((weak)) void *__libc_dlsym(void *map, const char *name);
 #define CUDA_ERROR_NOT_SUPPORTED      801
 #define CUDA_ERROR_INVALID_VALUE       1
 
-/* CU_DEVICE_ATTRIBUTE values */
-#define GB_ATTR_VMM_SUPPORTED         193  /* CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED */
+/* CU_DEVICE_ATTRIBUTE values.
+ *
+ * INCIDENT (2026-08-01): GB_ATTR_VMM_SUPPORTED was previously 193, which is
+ * outside CU_DEVICE_ATTRIBUTE_MAX (cuda.h) - the real driver call always
+ * failed, this override never actually suppressed anything, and ggml-cuda's
+ * VMM pool crashed on Blackwell the moment cuMemAddressReserve's own
+ * defence-in-depth intercept returned CUDA_ERROR_NOT_SUPPORTED (ggml wraps
+ * that call in CU_CHECK -> ggml_abort, it does not fall back). Fixed to the
+ * real value from cuda.h. See greenboost_cuda_shim.c's matching fix. */
+#define GB_ATTR_VMM_SUPPORTED         102  /* CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED */
 #define GB_ATTR_CC_MAJOR               75  /* CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR */
 
 typedef int (*pfn_cuDGA_t)(int *, int, int);

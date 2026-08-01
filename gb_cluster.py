@@ -57,6 +57,16 @@ sys.path.insert(0, str(_REPO_DIR))  # for gb_feeder_diag when imported from a co
 
 GREENBOOST_SHIM = os.environ.get(
     "GREENBOOST_SHIM", "/usr/local/lib/libgreenboost_cuda.so")
+# Wins the glibc versioned-vs-unversioned PLT race for cuDeviceGetAttribute /
+# cuMemAddressReserve against libcuda.so.1 on Blackwell (see
+# greenboost_vmm_override.c's header) — without it loaded FIRST in
+# LD_PRELOAD, the main shim's Blackwell VMM=0 override never reaches
+# ggml-cuda's dlsym-based CUDA loader (the same class of gap that let the
+# 193-vs-102 attribute-constant bug go undetected, 2026-08-01). The Ollama
+# systemd unit has preloaded this ahead of the shim since v3.0.1; shim_env()
+# below now matches that ordering for every workload.
+GREENBOOST_VMM_OVERRIDE = os.environ.get(
+    "GREENBOOST_VMM_OVERRIDE", "/usr/local/lib/libgreenboost_vmm_override.so")
 
 # Proven per-workload shim profiles. Every entry is applied with setdefault so
 # an explicit caller env always wins.
@@ -106,6 +116,25 @@ _WORKLOAD_PROFILES: dict[str, dict[str, str]] = {
     "llm": {
         "GREENBOOST_ACTIVE": "1",
         "GREENBOOST_CLUSTER": "1",
+        # Same Rule #1 front-load split as "diffusion" above (owner rule,
+        # 2026-08-01: T2 spill must go through the shim, never CPU offload —
+        # a weights buffer bigger than free VRAM must fill VRAM to ~90%
+        # first and spill only the remainder to T2, not dump the whole
+        # buffer into T2 while T1 sits part-empty).
+        "GB_VRAM_FRONTLOAD": "1",
+        # ggml's Programmatic Dependent Launch probe (cudaFuncGetAttributes,
+        # ggml/src/ggml-cuda/common.cuh's ggml_cuda_kernel_can_use_pdl) aborts
+        # with "invalid resource handle"/"invalid device function" under this
+        # shim: __cudaRegisterFunction is hooked and can register a kernel
+        # against a different libcudart than the one ggml later queries
+        # (gb_cudart_rebind() split-brain, see gb_shim_probe.py's docstring).
+        # Confirmed on two independent architectures — Blackwell cc 12.0 (see
+        # workflow/known-issues.md) and Ada cc 8.9 (external report,
+        # 2026-07-13) — so this is not card-specific. GGML_CUDA_PDL=0 skips
+        # the probe entirely; set via setdefault below so a caller that
+        # exports GGML_CUDA_PDL=1 (wants PDL, has verified it's safe on their
+        # box) still wins.
+        "GGML_CUDA_PDL": "0",
     },
 }
 _WORKLOAD_PROFILES["torch"] = _WORKLOAD_PROFILES["diffusion"]
@@ -117,8 +146,11 @@ _WORKLOAD_PROFILES["ggml"] = _WORKLOAD_PROFILES["llm"]
 # are dynamic (read from sysfs / discovered per env), not static profile
 # entries. Both lived only in ai-forge until now — the same drift class that
 # caused the 2026-07-07 fp8 OOM; centralised here so every consumer and every
-# feeder dispatch gets them (see workflow/known-issues.md).
-_T2_POOL_WORKLOADS = ("diffusion", "torch")
+# feeder dispatch gets them (see workflow/known-issues.md). "llm" joined
+# 2026-08-01: gb-synapse's llama.cpp backend spills weights to T2 through
+# this same shim (never CPU offload — owner rule) and needs the identical
+# %-derived pool/safety sizing, not the shim's flat defaults.
+_T2_POOL_WORKLOADS = ("diffusion", "torch", "llm")
 
 
 def _local_t2_pool_total_mb() -> int | None:
@@ -888,7 +920,17 @@ def shim_env(workload: str = "diffusion", enabled: bool = True,
     env = dict(base_env if base_env is not None else os.environ)
     if enabled and shim_supported():
         prior = env.get("LD_PRELOAD", "")
-        env["LD_PRELOAD"] = f"{GREENBOOST_SHIM}:{prior}" if prior else GREENBOOST_SHIM
+        # vmm_override MUST load before the main shim (glibc's dynamic linker
+        # prefers unversioned symbol definitions for an unversioned PLT
+        # reference — see greenboost_vmm_override.c's header; without this
+        # ordering the shim's Blackwell VMM=0 override never reaches
+        # dlsym-based CUDA loaders like ggml-cuda). Optional: only prepended
+        # when actually built/installed, so a box without it still gets the
+        # main shim.
+        preload_libs = [GREENBOOST_SHIM]
+        if Path(GREENBOOST_VMM_OVERRIDE).is_file():
+            preload_libs.insert(0, GREENBOOST_VMM_OVERRIDE)
+        env["LD_PRELOAD"] = ":".join(preload_libs + [prior]) if prior else ":".join(preload_libs)
         profile = _WORKLOAD_PROFILES.get(workload)
         if profile is None:
             raise ValueError(f"unknown workload {workload!r} , "
