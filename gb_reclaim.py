@@ -312,7 +312,20 @@ def run_reclaim(scope: str = "residue", kill_min_mb: int = DEFAULT_KILL_MIN_MB,
         except (ProcessLookupError, PermissionError):
             failed.append(entry)
 
-    result = {"scope": scope, "killed": killed, "unloaded": unloaded, "failed": failed}
+    # "spared" = real GPU/T2 holders this scope deliberately did NOT target
+    # (genuinely-in-progress gb-synapse servers at scope="residue", say) —
+    # without this, "0 killed" and "genuinely nothing is using GPU memory"
+    # were indistinguishable to whoever ran the command. Real incident
+    # (2026-08-01): scope=residue correctly spared a live gb-synapse server
+    # holding 7GB VRAM + 6.7GB RAM, but the command's own output ("No
+    # killable GPU inference processes found") read as if nothing was using
+    # that memory at all.
+    classes = plan["classes"]
+    spared = list(classes["live"])
+    if scope == "residue":
+        spared += list(classes["ambiguous"])
+    result = {"scope": scope, "killed": killed, "unloaded": unloaded, "failed": failed,
+              "spared": spared}
     try:
         import gb_dataflux
         gb_dataflux.emit({

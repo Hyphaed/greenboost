@@ -172,7 +172,7 @@ def _record_tok_s(model: str, t_first: "float | None", t_last: "float | None",
         # decode rate: tokens after the first, over the inter-token span
         tok_s = (completion_tokens - 1) / dt
         import gb_synapse
-        gb_synapse.record_measured_tok_s(model, tok_s)
+        gb_synapse.record_measured_tok_s(model, tok_s, source="proxy")
     except Exception:
         pass
 
@@ -215,33 +215,65 @@ def _cache_info_from_chunk(chunk: dict, prev: "int | None") -> "int | None":
     return int(tc) if tc is not None else prev
 
 
-def _parse_sse_telemetry_buffer(buf: bytes) -> "tuple[int, int, int | None]":
-    """Best-effort (completion_tokens, prompt_tokens, tokens_cached) from a
-    RAW SSE byte buffer, for telemetry only — used by openai_passthrough(),
-    which forwards raw_chunk bytes to the client UNCHANGED and separately
-    accumulates the same bytes here purely to observe them. A parse failure
-    here must never be able to affect what was already forwarded, so this
-    never raises; malformed/partial lines are silently skipped."""
+def _parse_sse_telemetry_timed(
+        chunks: "list[tuple[float, bytes]]") -> "tuple[int, int, int | None, float | None, float | None]":
+    """Best-effort (completion_tokens, prompt_tokens, tokens_cached, t_first,
+    t_last) from a list of (arrival_timestamp, raw_chunk) pairs — used by
+    openai_passthrough(), which forwards raw_chunk bytes to the client
+    UNCHANGED and separately observes the same bytes here purely for
+    telemetry. A parse failure here must never affect what was already
+    forwarded, so this never raises; malformed/partial lines are silently
+    skipped. t_first/t_last are latched on the SSE event that actually
+    carries generated content, not on whichever raw TCP chunk arrived
+    first —
+    actually carries generated content (delta.content or
+    delta.reasoning_content — GB-CLI's own orchestrator.py counts both as
+    "generation started", see StreamFragment/ReasoningFragment), not on
+    whichever raw TCP chunk happened to arrive first at the transport layer.
+
+    Real incident (2026-08-01): openai_passthrough()'s old t_first latched on
+    ANY non-empty raw_chunk, which counts llama.cpp's role-only opening delta
+    (`{"delta":{"role":"assistant"}}`, no content yet) as "decode started".
+    For a turn with heavy prompt-eval (fills most of the request), that
+    opening delta can arrive within the SAME first chunk as the very start of
+    streaming — but the true decode span (last token minus FIRST real token)
+    is what _record_tok_s needs. Live-verified against llama-server's own
+    timing block for the incident that prompted this fix: engine truth was
+    2.18 tok/s (43.2s / 94 tokens); the old latch reported 0.3 tok/s (~310s
+    span) — reasoning/role frames arriving well before first real content
+    inflated the measured span roughly 7x.
+
+    Never raises — a parse failure just means (None, None) for the
+    timestamps, same fallback shape _record_tok_s already handles."""
     ctok = ptok = 0
     tokens_cached = None
-    try:
-        text = buf.decode("utf-8", "ignore")
-    except Exception:
-        return ctok, ptok, tokens_cached
-    for line in text.splitlines():
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
-        payload = line[len("data:"):].strip()
-        if payload == "[DONE]" or not payload:
-            continue
+    t_first = t_last = None
+    partial = ""
+    for ts, raw in chunks:
         try:
-            chunk = json.loads(payload)
-        except json.JSONDecodeError:
+            partial += raw.decode("utf-8", "ignore")
+        except Exception:
             continue
-        ctok, ptok = _usage_counts(chunk, (ctok, ptok))
-        tokens_cached = _cache_info_from_chunk(chunk, tokens_cached)
-    return ctok, ptok, tokens_cached
+        while "\n" in partial:
+            line, partial = partial.split("\n", 1)
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if payload == "[DONE]" or not payload:
+                continue
+            try:
+                chunk = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            ctok, ptok = _usage_counts(chunk, (ctok, ptok))
+            tokens_cached = _cache_info_from_chunk(chunk, tokens_cached)
+            delta = (chunk.get("choices") or [{}])[0].get("delta", {})
+            if delta.get("content") or delta.get("reasoning_content"):
+                if t_first is None:
+                    t_first = ts
+                t_last = ts
+    return ctok, ptok, tokens_cached, t_first, t_last
 
 
 def _usage_counts(chunk: dict, prev: "tuple[int, int]") -> "tuple[int, int]":
@@ -957,8 +989,13 @@ async def openai_passthrough(request: web.Request) -> web.StreamResponse:
     # already forwarded.
     is_completions_path = path in ("chat/completions", "completions")
     t_start = time.monotonic()
-    t_first = t_last = None
-    _telemetry_buf = bytearray() if is_completions_path else None
+    # (timestamp, raw_chunk) pairs, not a flat byte buffer — t_first/t_last
+    # must be latched on the SSE event that actually carries generated
+    # content, not on whichever raw TCP chunk arrives first (see
+    # _parse_sse_telemetry_timed's docstring for the incident this fixes).
+    # Still a pure observe-after-write: raw_chunk is forwarded unmodified
+    # below regardless of what this list holds.
+    _telemetry_chunks = [] if is_completions_path else None
     try:
         async with SESSION.post(url, data=body, headers=headers) as r:
             if r.status >= 400:
@@ -970,18 +1007,14 @@ async def openai_passthrough(request: web.Request) -> web.StreamResponse:
                 async for raw_chunk in r.content.iter_any():
                     if raw_chunk:
                         watch.mark()
-                        now = time.monotonic()
-                        if t_first is None:
-                            t_first = now
-                        t_last = now
-                        if _telemetry_buf is not None:
-                            _telemetry_buf.extend(raw_chunk)
+                        if _telemetry_chunks is not None:
+                            _telemetry_chunks.append((time.monotonic(), raw_chunk))
                     await resp.write(raw_chunk)
     except (aiohttp.ClientError, TimeoutError) as e:
         return web.json_response(_failure_body(req_model, str(e)), status=502)
     await resp.write_eof()
-    if _telemetry_buf is not None:
-        ctok, ptok, tokens_cached = _parse_sse_telemetry_buffer(bytes(_telemetry_buf))
+    if _telemetry_chunks is not None:
+        ctok, ptok, tokens_cached, t_first, t_last = _parse_sse_telemetry_timed(_telemetry_chunks)
         _record_tok_s(req_model, t_first, t_last, ctok)
         _record_prompt_cache(req_model, t_start, t_first, ptok, tokens_cached)
     return resp
@@ -1193,6 +1226,37 @@ def build_app() -> web.Application:
     return app
 
 
+_TELEMETRY = None  # module-level ref, kept alive for the process lifetime
+
+
+def _start_flight_recorder() -> None:
+    """Best-effort: start the dataflux SnapshotRecorder (continuous VRAM/
+    GPU-util/KV-pressure history) for the lifetime of this proxy process.
+
+    gb_init.py normally owns this bootstrap, but gb_init also enforces
+    PYTORCH_CUDA_ALLOC_CONF and monkeypatches torch.cuda.empty_cache — side
+    effects that make no sense for this lightweight aiohttp proxy, which
+    never touches torch. So this replicates only gb_init's telemetry-start
+    step (gb_telemetry has no torch import at module scope), not the whole
+    module. Real gap this closes (2026-08-01): a gb-synapse serve running
+    llama-server (no Python process ever imports gb_init) produced ZERO
+    dataflux `snapshot` events for the entire 12+ hour serve — the only
+    process alive that outlives every request IS this proxy, so it's the
+    natural owner. Opt-out: GREENBOOST_DATAFLUX=0, same convention as
+    gb_init.py. Never blocks serving on failure."""
+    global _TELEMETRY
+    if os.environ.get("GREENBOOST_DATAFLUX", "1") == "0":
+        return
+    try:
+        from gb_telemetry import TelemetryManager
+        import gb_dataflux
+        _TELEMETRY = TelemetryManager(device=0, poll_ms=500, enable_dcgm=True)
+        _TELEMETRY.start()
+        gb_dataflux.start_snapshot_recorder(_TELEMETRY, interval_s=5.0)
+    except Exception as exc:
+        print(f"[gb-synapse-api] flight recorder unavailable: {exc}", flush=True)
+
+
 def main() -> None:
     global UPSTREAM, MODEL_NAME, ENGINE
     ap = argparse.ArgumentParser(description="gb-synapse API proxy")
@@ -1206,6 +1270,7 @@ def main() -> None:
     UPSTREAM = f"http://127.0.0.1:{args.upstream_port}"
     MODEL_NAME = args.model_name
     ENGINE = args.engine
+    _start_flight_recorder()
     web.run_app(build_app(), host="0.0.0.0", port=args.port, print=None)
 
 

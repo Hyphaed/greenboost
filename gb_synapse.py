@@ -1828,23 +1828,33 @@ MEASURED_TOK_S_FILE = MODEL_STORE_DIR / "measured_tok_s.json"
 _MEASURED_TOK_S_MAX_SAMPLES = 20
 
 
-def _df_emit_tok_s(model: str, tok_s: float) -> None:
+def _df_emit_tok_s(model: str, tok_s: float, source: str = "") -> None:
     """Record a real measured tok/s sample to the dataflux log , the one
     number that closes the loop between orchestration decisions (tier_move/
     quantize/turboquant_activate) and what they actually bought. Best-effort,
-    never raises, same contract as every other dataflux emit call site."""
+    never raises, same contract as every other dataflux emit call site.
+
+    `source` identifies WHICH measurement this is: gb_synapse_api.py (the
+    proxy, "proxy") measures every client on the gb-synapse port from
+    first-content-token to last; greenboost-cli (repl.py, "cli") measures
+    its own turn end-to-end. These are two different, both-valid vantage
+    points on the SAME turn, not duplicate samples of one true number — see
+    summarize()'s per-source rollup in gb_dataflux.py for why blending them
+    into one average was wrong (real incident 2026-08-01: proxy=0.3,
+    cli=2.4, engine truth=2.18 — the blended avg matched neither)."""
     try:
         import gb_dataflux
         gb_dataflux.emit({
             "node": "host", "label": "gb_synapse", "kind": "tok_s_measured",
             "n_items": 1, "items": [model], "duration_s": 0.0, "status": "ok",
             "model": model, "tok_s": round(tok_s, 1),
+            **({"source": source} if source else {}),
         })
     except Exception:
         pass
 
 
-def record_measured_tok_s(model: str, tok_s: float) -> None:
+def record_measured_tok_s(model: str, tok_s: float, source: str = "") -> None:
     """Append a real, client-observed decode speed for `model` — fed by
     greenboost-cli after each final answer (TurnComplete.tok_s), closing the
     gap _estimate_tok_s()'s docstring flags: "A --measure mode that runs a
@@ -1852,10 +1862,15 @@ def record_measured_tok_s(model: str, tok_s: float) -> None:
     over the bandwidth heuristic whenever samples exist for a model.
     Best-effort: silently skipped without write access to MODEL_STORE_DIR,
     same as index_ollama_models()'s persistence — this is a nice-to-have
-    calibration aid, not something worth failing a turn over."""
+    calibration aid, not something worth failing a turn over.
+
+    `source` (optional, "proxy" | "cli") — see _df_emit_tok_s's docstring.
+    The rolling MEASURED_TOK_S_FILE average stays source-blind (it already
+    only exists as an estimator input for recommend(), not a precision
+    metric) — only the dataflux event itself carries the distinction."""
     if tok_s <= 0:
         return
-    _df_emit_tok_s(model, tok_s)
+    _df_emit_tok_s(model, tok_s, source)
     try:
         samples = json.loads(MEASURED_TOK_S_FILE.read_text())
     except (OSError, json.JSONDecodeError):
@@ -2204,6 +2219,22 @@ MODEL_ALIASES = {
     "qwen36-coder:studio": "Qwen3.6-27B-Fable-Fusion-711-Uncensored-Heretic-NM-DAU-NEO-MAX-MTP-GGUF",
     "rafw007/qwen36-a3b-claude-coder:latest": "Qwen3.6-27B-Fable-Fusion-711-Uncensored-Heretic-NM-DAU-NEO-MAX-MTP-GGUF",
     "satgeze/qwen36-35b-uncensored-1m": "Qwen3.6-27B-Fable-Fusion-711-Uncensored-Heretic-NM-DAU-NEO-MAX-MTP-GGUF",
+}
+
+# Owner-chosen default ctx/KV for specific models, applied only when the
+# caller left ctx unset (<=0) and didn't pin GB_SYNAPSE_KV. Not a general
+# algorithm change to _pick_kv_type/_solve_ctx_and_layers — a per-model
+# override for cases where the auto-picker's answer is technically correct
+# but not what's wanted. Real incident (2026-08-01): this box's single
+# 11.2GB Blackwell card has no feeder online, so the reference workload's
+# 14.1GB weights only partly fit; _pick_kv_type saw the shim's T2-inflated
+# "budget" and chose ctx=65536/kv=f16 (4.4GB of KV), leaving ~3.4GB of
+# VRAM headroom that could instead hold more of the weights. Owner chose
+# ctx=32768/q8_0 (KV ~1.1GB) to trade context length for placement headroom
+# — still comfortably above GB-CLI's own baseline overhead (~12k tokens).
+MODEL_CTX_KV_DEFAULTS = {
+    "Qwen3.6-27B-Fable-Fusion-711-Uncensored-Heretic-NM-DAU-NEO-MAX-MTP-GGUF":
+        (32768, "q8_0"),
 }
 
 
@@ -3095,6 +3126,86 @@ def _start_proxy(entry: ModelEntry, port: int, internal_port: int,
     return proxy_proc, proxy_error
 
 
+_CACHE_REUSE_REJECT = "cache_reuse is not supported by this context, it will be disabled"
+
+
+def _check_cache_reuse_support(entry: ModelEntry, common: dict) -> None:
+    """--cache-reuse 256 is passed to every llama.cpp serve (see
+    LlamaCppBackend.serve()) to cut prompt-eval cost on GB-CLI's repeated
+    system-prompt+tool-schema prefix, but llama.cpp silently refuses it for
+    architectures where kv_unified=false (hybrid-recurrent models, e.g. this
+    repo's Qwen3.6-27B-Fable-Fusion reference — see CLAUDE.md's Reference
+    Workload Rule) and just logs one warning line, no error, no field on
+    anything queryable. Real cost this hides (2026-08-01, this exact model):
+    every agentic turn re-pays FULL prompt eval — 279s at ~12.8k tokens in
+    the incident that prompted this fix. Best-effort: a missing/short log
+    just means "can't tell", not "supported"."""
+    try:
+        log_path = _run_log_path(entry.name)
+        if not log_path.exists():
+            return
+        text = log_path.read_text(errors="replace")
+        rejected = _CACHE_REUSE_REJECT in text
+        if rejected:
+            print(f"  [gb-synapse] NOTE: {entry.name} rejected --cache-reuse "
+                  f"(\"{_CACHE_REUSE_REJECT}\") — this architecture can't "
+                  f"reuse a cached prompt prefix, so every turn re-pays full "
+                  f"prompt-eval cost. Not a bug in this serve, just a fact "
+                  f"worth knowing before blaming decode speed for a slow turn.",
+                  flush=True)
+            common["cache_reuse_rejected"] = True
+    except Exception:
+        pass
+
+
+def _verify_placement(entry: ModelEntry, common: dict) -> None:
+    """Rule #1 sanity check, run once right after a single-node (no feeder)
+    engine reports ready: does tracked VRAM + shim overflow actually add up
+    to this model's real weight size? Best-effort, never raises — a missing
+    or stale shim_stats file just skips the check silently.
+
+    Real incident this closes (2026-08-01): a cc>=12 (Blackwell) serve spilled
+    weights correctly through gb_vmm_t2_alloc_blackwell_zerocopy(), but that
+    path's byte total wasn't written to shim_stats at all (t2_overflow_total_mb
+    fixed the same day in greenboost_cuda_shim.c), so there was previously no
+    way for Python to tell "spilled via a path we don't track" apart from
+    "actually missing" — this check would have reported a false Rule #1
+    violation before that fix and stayed silent (wrongly) after it without
+    this call existing at all. Only meaningful for llama.cpp / whole-model-
+    in-one-process engines; skipped by the caller whenever feeders are in
+    play (RPC split means no single node's shim_stats reflects the total)."""
+    try:
+        import gb_dataflux
+        import gb_monitor
+        snap = gb_monitor.snapshot(probe_gpu=False)
+        if not snap.loaded or snap.shim_stale:
+            return
+        shim = snap.shim or {}
+        t1_mb = int(float(shim.get("tier_t1_local_cur_mb", 0)))
+        t2_overflow_mb = int(float(shim.get("t2_overflow_total_mb", 0)))
+        tracked_gb = (t1_mb + t2_overflow_mb) / 1024.0
+        weights_gb = entry.n_bytes / (1024 ** 3)
+        # 15% slack for CUDA context overhead, alignment padding, and the
+        # workspace/compute-buffer reserve that legitimately isn't "weights".
+        if tracked_gb < weights_gb * 0.85:
+            gb_dataflux.emit({
+                "node": "host", "label": "shim", "kind": "shim_transition",
+                "stage": "placement_verify", "from": "expected", "to": "underfilled",
+                "n_items": 0, "items": [], "duration_s": 0.0, "status": "warn",
+                "weights_gb": round(weights_gb, 2), "tracked_gb": round(tracked_gb, 2),
+                "t1_mb": t1_mb, "t2_overflow_mb": t2_overflow_mb,
+                "model": entry.name,
+            })
+            print(f"  [gb-synapse] WARNING: only {tracked_gb:.1f} GB of "
+                  f"{weights_gb:.1f} GB of weights are accounted for in "
+                  f"shim telemetry (T1={t1_mb}MB + T2-overflow={t2_overflow_mb}MB) — "
+                  f"placement may be worse than reported, or shim_stats is "
+                  f"missing a tracking path. See dataflux shim_transition events.",
+                  flush=True)
+    except Exception:
+        pass
+
+
 def _launch_proxy_and_record(entry: ModelEntry, upstream: subprocess.Popen, port: int,
                               internal_port: int, tensor_split: str = "",
                               feeders: list | None = None, engine: str = "",
@@ -3123,6 +3234,11 @@ def _launch_proxy_and_record(entry: ModelEntry, upstream: subprocess.Popen, port
         _emit_serve(entry, "error", error=str(e).splitlines()[0],
                     load_s=round(time.time() - t0, 1), **common)
         raise
+
+    if ready:
+        _check_cache_reuse_support(entry, common)
+        if not (feeders or []):
+            _verify_placement(entry, common)
 
     proxy_proc, proxy_error = _start_proxy(entry, port, internal_port, engine)
 
