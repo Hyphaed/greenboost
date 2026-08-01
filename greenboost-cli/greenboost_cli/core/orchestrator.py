@@ -13,6 +13,7 @@ All three yield a LoopGuardTriggered event before stopping.
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass
 from typing import Generator
@@ -27,6 +28,106 @@ from greenboost_cli.inference.router import generate, StreamFragment, ReasoningF
 _DEFAULT_MAX_TURNS   = 50
 _REPEAT_LIMIT        = 3   # same tool+args repeated this many times → stop
 _CONSEC_ERROR_LIMIT  = 4   # this many consecutive Denied/ERROR results → stop
+_INTENT_NUDGE_CAP    = 1   # at most this many "you said you would, now do it" nudges
+
+# Matches a model announcing a build/task ("I'll build X", "Let me create Y")
+# without having called any tool yet. Narrow on purpose: two-part match
+# (first-person forward-looking phrase, THEN an action verb within a short
+# span) so it doesn't fire on prose that merely mentions "build" or
+# "create" in passing. Real incident this targets (2026-08-01): a turn
+# whose entire output was an intent paragraph ("I'll build a complete Snake
+# game in Godot 4...") with zero tool calls — the loop treated it as a
+# finished answer and stopped, having written nothing.
+_INTENT_RE = re.compile(
+    r"\b(I'?ll|I will|Let me|I'?m going to|I am going to)\b"
+    r"[^.\n]{0,120}\b(build|create|write|implement|develop|generate|"
+    r"set up|scaffold|start (building|working|coding))\b",
+    re.IGNORECASE,
+)
+
+
+def _capped_mcp_schemas(mcp_schemas: list, settings: dict) -> list:
+    """Cap the MCP portion of the tool-schema block to a fraction of the
+    LIVE served context window, instead of sending every connected server's
+    full tool schema on every turn unconditionally.
+
+    Before this, a 233-tool session (10 MCP servers) sent ~64k tokens of
+    tool schemas as a FIXED PREFIX on every turn — confirmed live 2026-08-01
+    via a prompt_cache dataflux event (64,144 reused tokens, 97.9% hit,
+    against a 65,536-token window: ~50 tokens left to think or generate in).
+    History compaction (_compress_context) only rewrites session.messages,
+    never this prefix, so once the prefix alone approached the window the
+    turn could never produce more than a few dozen output tokens no matter
+    how many times it "auto-compacted" — the empty_response loop guard that
+    silently killed an 88-minute unattended build session with zero useful
+    output.
+
+    Small MCP surfaces (few servers connected) keep full schemas — never
+    shrink for a session that can afford them, same convention as
+    instruments/handlers.py's `_ctx_char_budget`. Only once the full set
+    would exceed ~15% of the live window (that fraction chosen to match
+    `_ctx_char_budget`'s existing precedent) do entries degrade to name +
+    first-sentence description, no input_schema — the model must call the
+    ToolSearch builtin to fetch the real parameters before calling an
+    unfamiliar mcp__ tool with arguments, the same deferred-schema pattern
+    Claude Code's own harness uses for its MCP tool surface. This never
+    changes what a tool call actually DOES — the real MCP server still gets
+    whatever arguments the model sends regardless of the schema shown to it,
+    so a model that guesses right on an obvious tool still works fine."""
+    if not mcp_schemas:
+        return []
+    try:
+        from greenboost_cli.environment.settings import gb_synapse_ctx
+        ctx = gb_synapse_ctx(settings)
+    except Exception:
+        ctx = 0
+    budget_chars = max(4_000, int(ctx * 0.15 * 4)) if ctx else 30_000
+
+    full_chars = sum(len(json.dumps(s)) for s in mcp_schemas)
+    if full_chars <= budget_chars:
+        return mcp_schemas
+
+    light = []
+    for schema in mcp_schemas:
+        name = schema.get("name", "")
+        desc = (schema.get("description") or "").strip()
+        first_sentence = desc.split(". ")[0][:160]
+        light.append({
+            "name": name,
+            "description": (
+                f"{first_sentence}. Call ToolSearch(query=\"{name}\") for its "
+                "full parameter schema before calling it with arguments."
+            ),
+            "input_schema": {"type": "object", "properties": {}},
+        })
+    return light
+
+
+def _tool_search(mcp_registry, query: str, max_results: int = 6) -> str:
+    """Handler for the ToolSearch builtin: look up full MCP tool schemas
+    (from the registry's uncapped list, unaffected by _capped_mcp_schemas)
+    by name or description keyword."""
+    if mcp_registry is None:
+        return "No MCP servers connected."
+    q = (query or "").lower().strip()
+    if not q:
+        return "ToolSearch needs a non-empty query (a tool name or keyword)."
+    scored = []
+    for schema in mcp_registry.tool_schemas:
+        name = schema.get("name", "")
+        desc = schema.get("description", "") or ""
+        if q in name.lower():
+            scored.append((0, schema))
+        elif q in desc.lower():
+            scored.append((1, schema))
+    scored.sort(key=lambda pair: pair[0])
+    matches = [s for _, s in scored[:max_results]]
+    if not matches:
+        return (
+            f"No tools matched '{query}'. Try a shorter or different keyword "
+            "(e.g. part of the server name, like 'forge3d' or 'greenboost')."
+        )
+    return json.dumps(matches, indent=2)
 
 
 # ── Event types yielded to the caller ─────────────────────────────────────
@@ -107,6 +208,7 @@ def execute_turn(
     consec_errors = 0        # consecutive Denied/ERROR results
     _auto_compact_done = False  # guard: at most one auto-compact per invocation
     _empty_retries = 0           # spurious-empty nudge retries (cap: 2)
+    _intent_nudges = 0           # "you said you would, now do it" nudges (cap: _INTENT_NUDGE_CAP)
 
     while True:
         # ── Turn cap ──────────────────────────────────────────────────────
@@ -121,9 +223,10 @@ def execute_turn(
 
         tool_schemas = list(INSTRUMENT_DEFINITIONS)
         if session.mcp_registry is not None:
-            tool_schemas.extend(session.mcp_registry.tool_schemas)
+            tool_schemas.extend(_capped_mcp_schemas(session.mcp_registry.tool_schemas, settings))
 
         _turn_t0 = time.monotonic()
+        _first_token_t = None  # set on the first streamed fragment — marks TTFT boundary
         try:
             for event in generate(
                 model=settings["model"],
@@ -133,6 +236,8 @@ def execute_turn(
                 settings=settings,
             ):
                 if isinstance(event, (StreamFragment, ReasoningFragment)):
+                    if _first_token_t is None:
+                        _first_token_t = time.monotonic()
                     yield event
                 elif isinstance(event, CompletedResponse):
                     completed = event
@@ -185,7 +290,23 @@ def execute_turn(
 
         session.total_input_tokens  += in_tok
         session.total_output_tokens += out_tok
-        tok_s = out_tok / _elapsed if _elapsed > 0 and out_tok > 0 else 0.0
+        # tok_s must measure DECODE speed only (this dataclass's own field doc:
+        # "decode speed for this turn's generation span") — dividing out_tok by
+        # _elapsed (turn start → completion) folds prompt-eval/TTFT into the
+        # denominator. For a huge or barely-cached prompt, TTFT can be 30s+ on
+        # its own; a turn that then emits only a handful of tokens collapses to
+        # a near-zero tok_s that looks like a GPU/shim performance problem when
+        # it is actually a prompt-processing cost (confirmed live 2026-08-01:
+        # dataflux recorded tok_s=0.2 during a context-overflow turn whose real
+        # decode throughput, measured directly against the backend, was ~4.9
+        # tok/s — a measurement artifact, not a slow serve). Use the generation
+        # span (first streamed token → completion) when we saw any streaming;
+        # fall back to full _elapsed only for non-streamed/tool-only turns
+        # where no generation span was observed.
+        _decode_elapsed = (
+            (time.monotonic() - _first_token_t) if _first_token_t is not None else _elapsed
+        )
+        tok_s = out_tok / _decode_elapsed if _decode_elapsed > 0 and out_tok > 0 else 0.0
         yield TurnComplete(in_tok, out_tok, tok_s=tok_s, elapsed_s=_elapsed,
                             is_final=not completed.tool_calls)
 
@@ -293,6 +414,31 @@ def execute_turn(
                 )
                 break
 
+            # ── Intent without action ────────────────────────────────────
+            # First model turn this invocation (turn_count == 1, i.e. no
+            # tool has been called yet at all) reads as "I'll build/create/
+            # write X" but called no tool. Narrow and bounded (see
+            # _INTENT_RE / _INTENT_NUDGE_CAP above) so ordinary short Q&A
+            # answers ("What's 2+2?" -> "4") are never touched — those don't
+            # match the intent phrasing, and a turn past the first no longer
+            # qualifies (the model has had its chance to act).
+            if (turn_count == 1 and _intent_nudges < _INTENT_NUDGE_CAP
+                    and _INTENT_RE.search(completed.text)):
+                _intent_nudges += 1
+                session.messages.append({
+                    "role": "user",
+                    "content": (
+                        "(You described a plan but didn't call any tool. "
+                        "Start now: call the tool for the first concrete "
+                        "step instead of describing it.)"
+                    ),
+                })
+                yield LoopGuardTriggered(
+                    "auto_compact",   # non-fatal reason, UI shows "Retrying"
+                    "Model stated intent without acting — nudging to start.",
+                )
+                continue
+
             # ── Non-empty, no tool calls: genuine final answer ─────────────
             # Also handle the legacy context-full case: empty + context was
             # already compacted once (shouldn't reach here now, kept as safety).
@@ -357,6 +503,26 @@ def execute_turn(
                 })
                 # Questions don't count as errors; reset guards so they never
                 # trip the repeat / consecutive-error limits.
+                consec_errors = 0
+                last_key      = ""
+                repeat_count  = 0
+                continue
+
+            # ── ToolSearch intercept ────────────────────────────────────────
+            # Local lookup against the registry's full/uncapped schemas
+            # (_capped_mcp_schemas only shrinks what's shown to the model,
+            # never the registry itself) — never goes through dispatch() or
+            # session.mcp_registry.call_tool(), it isn't a real MCP call.
+            if tc["name"] == "ToolSearch":
+                tool_result = _tool_search(
+                    session.mcp_registry, tc["input"].get("query", ""))
+                yield InstrumentResult(tc["name"], tool_result, True)
+                session.messages.append({
+                    "role":         "tool",
+                    "tool_call_id": tc.get("id", "toolsearch"),
+                    "name":         tc["name"],
+                    "content":      tool_result,
+                })
                 consec_errors = 0
                 last_key      = ""
                 repeat_count  = 0

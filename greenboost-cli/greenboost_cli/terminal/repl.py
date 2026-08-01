@@ -216,17 +216,51 @@ _pt_suspend_hook = None   # type: ignore  # callable() -> None, set by run_inter
 # after the live app has already been torn down.
 _shutdown_evt = threading.Event()
 
+# The _stdin_reader daemon thread handle, registered by run_interactive() right
+# after starting it — request_shutdown() joins this (see below) so the process
+# can't exit while that thread is still mid-way through prompt_toolkit's own
+# exit-triggered render/cleanup. Exit-path only: do NOT join this from the
+# shared wizard-suspend path (_suspend_pt_for_wizard/_pt_suspend) — a wizard
+# only makes the live prompt() call release stdin and loop back to wait, it
+# never terminates the thread, so joining there would hang forever.
+_stdin_thread_ref: "threading.Thread | None" = None
+
 
 def set_pt_suspend_hook(hook) -> None:
     global _pt_suspend_hook
     _pt_suspend_hook = hook
 
 
+def set_stdin_thread_ref(thread: "threading.Thread") -> None:
+    global _stdin_thread_ref
+    _stdin_thread_ref = thread
+
+
 def request_shutdown() -> None:
     """Signal the stdin reader to stop and force the live prompt_toolkit app
-    to exit so it restores the terminal before the process exits."""
+    to exit so it restores the terminal before the process exits.
+
+    _suspend_pt_for_wizard() only waits for app.is_running to flip False —
+    that flag is set on the _stdin_reader thread, and this function runs on
+    a DIFFERENT thread (the main event loop, where cmd_exit()/dispatch_command
+    run). Polling a flag from another thread doesn't guarantee that thread
+    has finished the few remaining lines after the flag flips — in
+    particular, prompt_toolkit's own render/cleanup pass that erases the
+    bottom toolbar and restores the terminal. Confirmed live 2026-08-01:
+    /exit reliably left the bottom status bar ("T1 …/T2 …/T3 …",
+    "shift+tab · ctrl+j=newline …") stuck on screen below the returned shell
+    prompt — the process really did exit (sys.exit(0) right after this
+    call), just before that cleanup had actually flushed. Joining the real
+    thread (not polling a flag) closes the race: .prompt() only returns
+    None once prompt_toolkit's own exit-triggered cleanup has fully run,
+    and _stdin_reader returns immediately after (the shutdown check at its
+    loop top), so by the time join() returns the terminal is genuinely
+    restored. Bounded timeout as a safety net, matching the join(timeout=0.5)
+    already used for the identical class of problem in statusline.py."""
     _shutdown_evt.set()
     _suspend_pt_for_wizard()   # app.exit(result=None) -> prompt() returns None
+    if _stdin_thread_ref is not None and _stdin_thread_ref is not threading.current_thread():
+        _stdin_thread_ref.join(timeout=0.5)
 
 
 def _suspend_pt_for_wizard() -> None:
@@ -784,7 +818,7 @@ def _record_measured_tok_s(tok_s: float, settings: dict) -> None:
         from greenboost_cli.slash_commands.backend_cmds import _import_gb_synapse, _llamaserve_model_name
         model = _llamaserve_model_name(settings)
         if model:
-            _import_gb_synapse().record_measured_tok_s(model, tok_s)
+            _import_gb_synapse().record_measured_tok_s(model, tok_s, source="cli")
     except Exception:
         pass
 
@@ -1365,6 +1399,7 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
         target=_stdin_reader, daemon=True, name="gb-stdin"
     )
     _stdin_thread.start()
+    set_stdin_thread_ref(_stdin_thread)
 
     # ── Main event loop ────────────────────────────────────────────────────
     while True:

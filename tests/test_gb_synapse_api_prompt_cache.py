@@ -44,26 +44,32 @@ def test_cache_info_from_chunk_null_keeps_previous():
     assert api._cache_info_from_chunk(chunk, 15) == 15
 
 
-def test_parse_sse_telemetry_buffer_realistic_stream():
+def test_parse_sse_telemetry_timed_realistic_stream():
     """A realistic OpenAI-compat SSE byte stream, as actually forwarded by
-    openai_passthrough — content chunks, then a final usage/cache frame."""
-    buf = (
-        b'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n'
-        b'data: {"choices":[{"delta":{"content":" there"}}]}\n\n'
-        b'data: {"choices":[],"usage":{"completion_tokens":8,"prompt_tokens":120,'
-        b'"prompt_tokens_details":{"cached_tokens":115}}}\n\n'
-        b'data: [DONE]\n\n'
-    )
-    ctok, ptok, tokens_cached = api._parse_sse_telemetry_buffer(buf)
+    openai_passthrough — a role-only opening delta (no content — must NOT
+    move t_first, this is the 2026-08-01 regression this replaces
+    _parse_sse_telemetry_buffer to fix), then content chunks, then a final
+    usage/cache frame."""
+    chunks = [
+        (100.0, b'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'),
+        (100.2, b'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n'),
+        (100.7, b'data: {"choices":[{"delta":{"content":" there"}}]}\n\n'),
+        (100.9, b'data: {"choices":[],"usage":{"completion_tokens":8,"prompt_tokens":120,'
+                b'"prompt_tokens_details":{"cached_tokens":115}}}\n\n'),
+        (100.9, b'data: [DONE]\n\n'),
+    ]
+    ctok, ptok, tokens_cached, t_first, t_last = api._parse_sse_telemetry_timed(chunks)
     assert (ctok, ptok, tokens_cached) == (8, 120, 115)
+    assert t_first == pytest.approx(100.2)   # NOT the 100.0 role-only frame
+    assert t_last == pytest.approx(100.7)
 
 
-def test_parse_sse_telemetry_buffer_malformed_is_safe():
+def test_parse_sse_telemetry_timed_malformed_is_safe():
     """Malformed/partial lines must never raise — telemetry parsing runs
     AFTER the real bytes were already forwarded to the client unchanged."""
-    buf = b"data: {not json}\n\ngarbage\n\ndata: [DONE]\n\n"
-    assert api._parse_sse_telemetry_buffer(buf) == (0, 0, None)
-    assert api._parse_sse_telemetry_buffer(b"") == (0, 0, None)
+    assert api._parse_sse_telemetry_timed(
+        [(1.0, b"data: {not json}\n\ngarbage\n\ndata: [DONE]\n\n")]) == (0, 0, None, None, None)
+    assert api._parse_sse_telemetry_timed([]) == (0, 0, None, None, None)
 
 
 def test_record_prompt_cache_emits_hit_pct(monkeypatch):

@@ -27,18 +27,21 @@ def test_usage_counts_extracts_and_keeps_last():
 
 def test_record_tok_s_computes_decode_rate(monkeypatch):
     captured = {}
-    monkeypatch.setattr("gb_synapse.record_measured_tok_s",
-                        lambda model, tok_s: captured.update(model=model, tok_s=tok_s))
+    monkeypatch.setattr(
+        "gb_synapse.record_measured_tok_s",
+        lambda model, tok_s, source="": captured.update(model=model, tok_s=tok_s, source=source))
     # 101 tokens, first→last span 1.0s → 100 tok after the first / 1.0s = 100 tok/s
     api._record_tok_s("qwen3", t_first=10.0, t_last=11.0, completion_tokens=101)
     assert captured["model"] == "qwen3"
     assert abs(captured["tok_s"] - 100.0) < 1e-6
+    assert captured["source"] == "proxy"
 
 
 def test_record_tok_s_skips_incomplete(monkeypatch):
     calls = []
-    monkeypatch.setattr("gb_synapse.record_measured_tok_s",
-                        lambda model, tok_s: calls.append((model, tok_s)))
+    monkeypatch.setattr(
+        "gb_synapse.record_measured_tok_s",
+        lambda model, tok_s, source="": calls.append((model, tok_s, source)))
     api._record_tok_s("m", None, 5.0, 10)          # no first-token time
     api._record_tok_s("m", 1.0, 1.0, 10)           # zero interval
     api._record_tok_s("m", 1.0, 2.0, 1)            # single token
@@ -47,7 +50,7 @@ def test_record_tok_s_skips_incomplete(monkeypatch):
 
 
 def test_record_tok_s_never_raises(monkeypatch):
-    def _boom(model, tok_s):
+    def _boom(model, tok_s, source=""):
         raise RuntimeError("store down")
     monkeypatch.setattr("gb_synapse.record_measured_tok_s", _boom)
     api._record_tok_s("m", 1.0, 2.0, 100)          # must swallow the error
@@ -57,8 +60,9 @@ def test_stream_loop_simulation(monkeypatch):
     """Mirror the ollama_chat accumulation: content chunks then a final usage
     chunk, and assert the recorded rate matches the observed span."""
     captured = {}
-    monkeypatch.setattr("gb_synapse.record_measured_tok_s",
-                        lambda model, tok_s: captured.update(model=model, tok_s=tok_s))
+    monkeypatch.setattr(
+        "gb_synapse.record_measured_tok_s",
+        lambda model, tok_s, source="": captured.update(model=model, tok_s=tok_s, source=source))
 
     chunks = [
         {"choices": [{"delta": {"content": "a"}}]},

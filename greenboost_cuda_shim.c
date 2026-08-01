@@ -3635,6 +3635,16 @@ static void gb_write_stats(void)
     fprintf(f, "cluster_remote_vram_mb=%zu\n",    g_cluster_remote_vram_bytes >> 20);
     fprintf(f, "cluster_virtual_vram_mb=%zu\n",   (gb_physical_vram_bytes + g_cluster_remote_vram_bytes) >> 20);
     fprintf(f, "active_path=%s\n",                active);
+    /* t2_ovf is the cumulative byte total across Path A + Path B + both
+     * Blackwell overflow sub-paths (zerocopy and managed-VMM) — already
+     * tracked correctly via gb_t2_try_reserve/gb_t2_release_reserved, just
+     * never surfaced here before. Without this field, weights served via
+     * active_path=blackwell_zerocopy (this box's own path, cc>=12) were
+     * invisible to shim_stats: tier_t2_local_cur_mb stays 0 by design
+     * (that counter is specifically the non-Blackwell DMA-BUF pool), so a
+     * caller comparing weights_gb against tier_t1_local_cur_mb +
+     * tier_t2_local_cur_mb alone would wrongly conclude the spill failed. */
+    fprintf(f, "t2_overflow_total_mb=%zu\n",      t2_ovf >> 20);
     fprintf(f, "phase=%s\n",                  _phase_names[_phase_idx]);
     fprintf(f, "kv_reserve_nominal_mb=%zu\n", _kv_rsv >> 20);
     fprintf(f, "kv_reserve_effective_mb=%zu\n", _kv_eff >> 20);

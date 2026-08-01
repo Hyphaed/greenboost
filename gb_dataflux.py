@@ -237,8 +237,24 @@ class SnapshotRecorder:
         # still free , a Rule #1 violation. Only evaluable when the shim
         # supplies a physical fill %; None → skip (seeded/ignored by the loop).
         _phys_total = getattr(m, "fb_phys_total_mb", 0)
+        # gb.t2_allocated_mb is the KERNEL-tracked DMA-BUF pool (ioctl) — it
+        # cannot see the Blackwell zero-copy overflow path (mmap +
+        # cuMemHostRegister, no kernel module involvement at all, see
+        # greenboost_cuda_shim.c's gb_vmm_t2_alloc_blackwell_zerocopy). Real
+        # incident (2026-08-01): 14.1GB of weights on a cc>=12 card served
+        # correctly via that path while t2_allocated_mb/t3_used_mb both
+        # stayed 0, so this tripwire never fired despite VRAM sitting at
+        # 68.8% fill with headroom free — read the shim's own
+        # t2_overflow_total_mb (added the same day) so this rule sees every
+        # overflow mechanism, not just the kernel-DMA-BUF one.
+        try:
+            _shim_dict = getattr(gb, "shim", None) or {}
+            _shim_t2_overflow_mb = int(float(_shim_dict.get("t2_overflow_total_mb", 0)))
+        except (TypeError, ValueError):
+            _shim_t2_overflow_mb = 0
         _overflow_active = bool((gb.t2_allocated_mb if gb else 0)
-                                or (gb.t3_used_mb if gb else 0))
+                                or (gb.t3_used_mb if gb else 0)
+                                or _shim_t2_overflow_mb)
         rule1_underfill = (
             (getattr(m, "fb_phys_used_pct", 0.0) < 85.0 and _overflow_active)
             if _phys_total else None)
@@ -795,7 +811,18 @@ def summarize(events: list[dict]) -> dict:
         _node_prefix = f"{_ev_node}:" if _ev_node not in ("", "host", None, "?") else ""
 
         if ev.get("kind") == "tok_s_measured":
-            model = _node_prefix + ev.get("model", "?")
+            # Two different, both-valid vantage points on the same turn
+            # (gb_synapse_api.py's proxy measures first-content-token→last
+            # across ANY client; greenboost-cli measures its own turn
+            # end-to-end) used to blend into one average that matched
+            # neither — real incident 2026-08-01 (proxy=0.3, cli=2.4, engine
+            # truth=2.18, blended avg=0.6). Same additive-prefix pattern as
+            # _node_prefix above: events with no "source" (older data, or a
+            # future caller that doesn't set one) keep the old unprefixed
+            # key, so this is backward compatible with existing dashboards.
+            _src = ev.get("source") or ""
+            _src_prefix = f"[{_src}]" if _src else ""
+            model = _node_prefix + _src_prefix + ev.get("model", "?")
             t = tok_s.setdefault(model, {"latest": 0.0, "samples": 0, "_sum": 0.0, "last_ts": 0})
             t["latest"] = ev.get("tok_s", 0.0)
             t["samples"] += 1

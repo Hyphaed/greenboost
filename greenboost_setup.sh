@@ -7468,6 +7468,27 @@ for m in d.get('unloaded', []):
 " 2>/dev/null
     fi
 
+    # "Still held": real GPU/T2 holders this scope deliberately spared (a
+    # genuinely in-progress gb-synapse server at the default scope=residue)
+    # — without this, "0 killed" reads as "nothing is using GPU memory" even
+    # while a multi-GB server is still running. Reporting only; changes no
+    # kill behavior.
+    local spared_lines
+    spared_lines=$(printf '%s' "$recl_json" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+for e in d.get('spared', []):
+    print(f\"    • PID {e['pid']} ({e['comm']}) - {e.get('gpu_mb', '?')} MiB — genuinely in-progress, spared\")
+" 2>/dev/null)
+    if [[ -n "$spared_lines" ]]; then
+        echo -e "  ${C_CYAN}Still held (spared, scope=${scope}):${C_RESET}"
+        echo -e "${C_DIM}${spared_lines}${C_RESET}"
+        echo -e "  ${C_DIM}Run with --all, or 'greenboost-synapse stop', to release these.${C_RESET}"
+    fi
+
     # Root path: force-release T2/T3 buffers via GB_IOCTL_RELEASE_PID
     # struct gb_release_pid_req { uint32_t pid; uint32_t _pad; }  magic=0x47, nr=16
     if [[ $EUID -ne 0 ]]; then

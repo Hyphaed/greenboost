@@ -305,4 +305,29 @@ INSTRUMENT_DEFINITIONS = [
             "required": ["questions"],
         },
     },
+    {
+        "name": "ToolSearch",
+        "description": (
+            "Fetch the full parameter schema for one or more MCP tools by name or "
+            "keyword. When many MCP servers are connected, most MCP tools are "
+            "advertised to you with only a name and short description (no "
+            "input_schema) to keep the prompt small — call ToolSearch first to get "
+            "the real argument names/types before calling an unfamiliar mcp__ tool. "
+            "Builtin tools (Read, Write, Bash, Edit, Grep, Glob, …) already have "
+            "full schemas and never need this."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Tool name (exact or partial) or a keyword from its "
+                        "description, e.g. 'generate_image' or 'mcp__forge3d'."
+                    ),
+                },
+            },
+            "required": ["query"],
+        },
+    },
 ]

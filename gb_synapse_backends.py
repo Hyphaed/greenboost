@@ -579,8 +579,11 @@ class LlamaCppBackend(EngineBackend):
                 budget_gb,
                 ram_free_mb / 1024 + sum(f.t2_free_mb for f in online_feeders) / 1024)
 
+        # Per-model ctx/KV override (gs.MODEL_CTX_KV_DEFAULTS) — only when the
+        # caller left ctx unset, so an explicit --ctx/ctx= request still wins.
+        _model_default = gs.MODEL_CTX_KV_DEFAULTS.get(entry.name)
         if ctx <= 0:
-            ctx = entry.ctx_length or 65536
+            ctx = (_model_default[0] if _model_default else None) or entry.ctx_length or 65536
 
         # T2 KV/weights extension: whenever the shim is actually active, its
         # T2 DDR pool is real extra capacity for both weight overflow and KV
@@ -631,7 +634,10 @@ class LlamaCppBackend(EngineBackend):
         # the budget rather than hardcoded: f16 is certification grade, q8_0 is a
         # budget config. Take f16 whenever it fits; drop to q8_0 only to make the
         # context reachable at all.
-        kv_type = gs._pick_kv_type(ctx, entry, ctx_kv_budget_gb + t2_kv_extra_gb)
+        if _model_default and not os.environ.get("GB_SYNAPSE_KV"):
+            kv_type = _model_default[1]
+        else:
+            kv_type = gs._pick_kv_type(ctx, entry, ctx_kv_budget_gb + t2_kv_extra_gb)
 
         kv_layers = 0 if entry.is_recurrent_only else (entry.n_kv_layers or entry.n_layers)
         kv_total_gb = gs.estimate_kv_gb(ctx, entry.n_bytes, entry.quant,
@@ -752,8 +758,24 @@ class LlamaCppBackend(EngineBackend):
             cmd += ["--mmproj", str(mmproj)]
 
         # MTP: models carrying a grafted multi-token-prediction layer decode ~34%
-        # faster through llama.cpp's speculative path, with identical output.
-        if gs._has_mtp(entry):
+        # faster through llama.cpp's speculative path, with identical output —
+        # but only when every layer actually lands on the GPU (fits_vram: the
+        # all-GPU/T2-zerocopy fast path, or entry.is_moe: -ngl 999 with only
+        # inactive experts offloaded). A genuine dense-partial-offload split
+        # (this function's `else` branch below, cpu_quirk's --no-op-offload
+        # CUDA_VISIBLE_DEVICES="" mode, and the two OOM-driven -ngl-reduction
+        # retries further down that copy this same `cmd`) crashes: confirmed
+        # via journalctl + addr2line against the installed libllama.so 2026-08-01
+        # — `llama-server segfault at 8 ... in libllama.so.0` at exactly
+        # `llama_context::n_ctx()`, a NULL-pointer-plus-8-byte-offset read,
+        # i.e. graph_mtp's draft llama_context was never wired up for that
+        # placement and something still unconditionally calls ->n_ctx() on
+        # it. Real crash event: ctx=48640, kv=q8_0, -ngl 36/65 (dense partial
+        # offload), mtp=true, rc=-11. The all-GPU config this same model runs
+        # today (-ngl 65/65, mtp=true) is unaffected — confirmed live via a
+        # direct benchmark request (100% SM util, 4.86 tok/s, no crash).
+        mtp_active = gs._has_mtp(entry) and (fits_vram or entry.is_moe)
+        if mtp_active:
             cmd += ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(gs.MTP_DRAFT_N)]
 
         if rpc_args:
@@ -771,7 +793,7 @@ class LlamaCppBackend(EngineBackend):
         print(f"  [gb-synapse] {entry.name}: ctx={ctx} kv={kv_type} ({kv_grade}) "
               f"weights={weights_gb:.1f}GB/{budget_gb:.1f}GB budget → {placement}, "
               f"shim={shim_note}"
-              f"{' +mtp' if gs._has_mtp(entry) else ''}{' +vision' if mmproj else ''}"
+              f"{' +mtp' if mtp_active else ''}{' +vision' if mmproj else ''}"
               f"{' rpc=' + ','.join(rpc_args) if rpc_args else ''}", flush=True)
         if cpu_quirk:
             print(f"  [gb-synapse] {weights_gb:.1f} GB of weights vs {budget_gb:.1f} GB VRAM "
@@ -809,7 +831,7 @@ class LlamaCppBackend(EngineBackend):
                                                engine=self.name,
                                                ctx=ctx, kv_type=kv_type, placement=placement,
                                                n_gpu_layers=n_gpu_layers_reported,
-                                               mtp=bool(gs._has_mtp(entry)), vision=bool(mmproj),
+                                               mtp=mtp_active, vision=bool(mmproj),
                                                ssm_state_gb=round(ssm_gb, 3),
                                                n_recurrent_layers=entry.n_recurrent_layers)
         except RuntimeError as e:
@@ -845,7 +867,7 @@ class LlamaCppBackend(EngineBackend):
                     engine=self.name, ctx=ctx, kv_type=kv_type,
                     placement="PARTIAL CPU OFFLOAD (VRAM fragmentation fallback)",
                     n_gpu_layers=fallback_ngl,
-                    mtp=bool(gs._has_mtp(entry)), vision=bool(mmproj),
+                    mtp=mtp_active, vision=bool(mmproj),
                     ssm_state_gb=round(ssm_gb, 3), n_recurrent_layers=entry.n_recurrent_layers)
             # The dense partial-offload branch (`_fit_gpu_layers`) sizes -ngl against
             # the %-derived compute-graph reserve (`_compute_reserve_gb`), but that
@@ -880,7 +902,7 @@ class LlamaCppBackend(EngineBackend):
                     engine=self.name, ctx=ctx, kv_type=kv_type,
                     placement="PARTIAL CPU OFFLOAD (compute-buffer OOM fallback)",
                     n_gpu_layers=fallback_ngl,
-                    mtp=bool(gs._has_mtp(entry)), vision=bool(mmproj),
+                    mtp=mtp_active, vision=bool(mmproj),
                     ssm_state_gb=round(ssm_gb, 3), n_recurrent_layers=entry.n_recurrent_layers)
             raise
 
