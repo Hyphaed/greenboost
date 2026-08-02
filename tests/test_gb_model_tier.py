@@ -362,7 +362,8 @@ def test_t3_codec_roundtrip(tmp_path, monkeypatch, force_backend):
     state = {"w": torch.arange(64, dtype=torch.float32).reshape(8, 8),
              "b": torch.randn(8)}
     base = str(tmp_path / "comp.pt")
-    path, disk_bytes = gb_model_tier._t3_save(state, base)
+    path, disk_bytes, kv_stats = gb_model_tier._t3_save(state, base)
+    assert kv_stats == {}   # kv_bits=None -> byte-identical to pre-KV behavior
 
     if force_backend == "none":
         assert path.endswith(".pt") and not path.endswith(".zst")

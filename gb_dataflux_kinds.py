@@ -178,7 +178,10 @@ KINDS: dict[str, KindSpec] = {
         group="shim", doc="Discrete shim_phase/t3_spill/t2_pressure/rule1_underfill transition.",
         incident_when=("warn",), sync_scope="host"),
     "tier_move": KindSpec(
-        group="shim", doc="Explicit gb_model_tier.py promote/demote/evict call (rare; most placement is shim_decision)."),
+        group="shim", doc="Explicit gb_model_tier.py promote/demote/evict call (rare; most placement is shim_decision). evict() may carry KV-cache tier-serde compression fields (missing_features.md item (e)) when the entry was registered with kv_bits.",
+        fields=("from_tier", "to_tier", "kv_codec", "kv_skip_reasons"),
+        numeric_fields=("size_gb", "disk_mb", "compress_ratio", "kv_bits", "kv_tensors",
+                        "kv_tensors_skipped", "kv_ratio")),
     "mem_pool_trim": KindSpec(
         group="shim", doc="gb_mem_pool.MemPoolManager.trim()/trim_all() pool-reclaim result.",
         fields=("pool",), numeric_fields=("allocated_before_mb", "allocated_after_mb", "reclaimed_mb")),
