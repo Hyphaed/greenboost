@@ -1,6 +1,6 @@
 # 📦 GreenBoost in Containers, VMs, and WSL2
 
-*Applies to GreenBoost v3.2. See [README.md](README.md) for the general
+*Applies to GreenBoost v3.3. See [README.md](README.md) for the general
 overview and [DOCUMENTATION.md](DOCUMENTATION.md) for the full architecture.*
 
 > **TL;DR:** Can't load a kernel module (Docker, LXC, KVM, WSL2, shared HPC)?

@@ -106,7 +106,7 @@ GB_SWAP_FILE="/var/lib/greenboost/swapfile"
 GB_SWAP_MIN_GB=8      # minimum existing swap to consider adequate (skip provisioning)
 GB_SWAP_MAX_GB=120    # cap for auto-provisioned swapfile
 
-GB_VERSION="3.2"
+GB_VERSION="3.3"
 GB_REPO_API="https://gitlab.com/api/v4/projects/IsolatedOctopi%2Fgreenboost/repository/tags"
 
 # Colours
@@ -3356,7 +3356,7 @@ cmd_install_llama_configs() {
     # Keep the feature set in sync with gb_write_capabilities_file() in the shim.
     cat > "$SHIM_DEST/greenboost_capabilities.json" << 'CAPEOF'
 {
-  "shim_version": "3.2",
+  "shim_version": "3.3",
   "abi": 1,
   "source": "install",
   "features": {

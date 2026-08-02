@@ -1,1 +1,0 @@
- bring gb-synapse to the next level, clean/polish/fix/enhance/evolve it

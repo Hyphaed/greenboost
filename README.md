@@ -4,7 +4,7 @@
 
 ### CUDA Memory & Compute Orchestrator for NVIDIA GPUs
 
-![Version](https://img.shields.io/badge/version-3.2-6C4FF6?style=flat-square)
+![Version](https://img.shields.io/badge/version-3.3-6C4FF6?style=flat-square)
 ![License](https://img.shields.io/badge/license-GPLv2%20%2B%20Commercial-blue?style=flat-square)
 ![CUDA](https://img.shields.io/badge/CUDA-12%20%7C%2013-76B900?style=flat-square&logo=nvidia&logoColor=white)
 ![Linux](https://img.shields.io/badge/Linux-supported-333333?style=flat-square&logo=linux)
@@ -27,8 +27,8 @@
 | 📡 **GB-Dataflux** | Live telemetry exposed through the GreenBoost Dataflux MCP server and a web dashboard. Launch the UI with `greenboost dataflux-ui`. |
 | 🌐 **GB-Cluster** | Borrow idle GPU and RAM resources from other machines on your local network. |
 | 🔗 **GB-Synapse** | Translation proxy exposing Ollama-compatible endpoints (`/api/generate`, `/api/chat`, `/api/tags`, `/api/ps`) and the OpenAI-compatible `/v1/*` API on port `11434`. It sits in front of `gb-synapse` (`llama-server --rpc`), enabling cross-GPU RPC execution, GB-Quant, and proxy-side Dataflux telemetry (including tokens/sec). A genuine drop-in replacement for Ollama. |
-| 🖥️ **GB-CLI** | Agentic terminal client, installed by Full Install — no separate setup. Open it with `gb` (or `greenboost-cli`); one-shot prompts with `gb -p "…"`; headless JSON subcommands for scripts (`gb rag-search …`). Always talks to GB-Synapse on `:11435` (Ollama **and** HuggingFace models via `greenboost synapse pull` / `index-ollama`). |
-| 🧭 **GB-Semantics** | Governed metric/segment layer for GreenBoost's own state (VRAM fill, tier pressure, tok/s, quality floor, cluster health, prompt-cache hit rate…) — one name, one deterministic resolver, per concept, with explicit "never read this raw field instead" traps. The mandatory default path any LLM client resolves through before touching a raw dataflux/telemetry field. |
+| 🖥️ **GB-CLI** | Agentic terminal client, installed by Full Install , no separate setup. Open it with `gb` (or `greenboost-cli`); one-shot prompts with `gb -p "…"`; headless JSON subcommands for scripts (`gb rag-search …`). Always talks to GB-Synapse on `:11435` (Ollama **and** HuggingFace models via `greenboost synapse pull` / `index-ollama`). |
+| 🧭 **GB-Semantics** | Governed metric/segment layer for GreenBoost's own state (VRAM fill, tier pressure, tok/s, quality floor, cluster health, prompt-cache hit rate…) , one name, one deterministic resolver, per concept, with explicit "never read this raw field instead" traps. The mandatory default path any LLM client resolves through before touching a raw dataflux/telemetry field. |
 </div>
 
 <div align="center">
@@ -288,6 +288,12 @@ End-to-end, you get something close to "GPU with 2-4× more VRAM" rather than "G
 
 GreenBoost applies techniques to avoid CPU spillover always that harms ai inference speed and/or quality. It provdies a direct VRAM <> System RAM + GPU transfer of data, without need for a copy at CPU which only adds more latency. 
 
+New in v3.3: a wrong CUDA attribute constant was silently disabling this
+T2 spill path for a class of hybrid-architecture models, degrading straight to
+partial CPU offload with no warning. Fixed at the source, and a new refusal
+gate now blocks any capacity-driven GPU-layer reduction by default, only
+serving degraded under an explicit debugging override.
+
 ---
 
 ## 🗜️ GB-Quant
@@ -328,7 +334,7 @@ report = gb_quant.quantize_to_fit(pipe_or_model, budget_gb=11.0)
   nothing extra.
 - **Works with**: diffusers pipelines (two-phase text-encoder recipe
   included), HF causal LLMs (`gb_synapse_fallback.py`'s `load_causal_lm`/
-  `generate`, or natively through gb-synapse's own torch-core engine —
+  `generate`, or natively through gb-synapse's own torch-core engine ,
   bf16/GPTQ/AWQ/FP8), and pipelines you don't own via the
   `GB_QUANT_BUDGET_GB` environment hook.
 - Measured on an RTX 5070 12 GB: a 9 B image model that needed ~7 min/image
@@ -526,6 +532,15 @@ sudo greenboost pull <mamba2-repo> --engine torch
 greenboost synapse run <model>
 ```
 
+New in v3.3: the usable conversation window for GB-Synapse's reference model
+went from 2,048 tokens to roughly 46,000 on the same card, three separate
+context-accounting bugs closed in one cycle (a ~4x KV overestimate for
+hybrid attention, a budget that charged for weight bytes never placed on the
+GPU, and a client that never actually asked the server how much room it had).
+The KV cache reservation itself is now measurement-backed: GreenBoost caches
+the real shim-observed size per model/context/precision and reuses it on the
+next serve, instead of re-estimating from a formula every time.
+
 ---
 
 ## 🖥️ GB-CLI
@@ -553,7 +568,7 @@ rag/goals/factory surface to other assistants.
 ## 🧭 GB-Semantics
 
 **A governed metric/segment layer so an LLM gets one deterministic answer per
-question about GreenBoost's own state — never a guess.**
+question about GreenBoost's own state , never a guess.**
 
 Several raw fields in this codebase mean two different things depending on
 where they're read from (a shim-inflated "virtual" VRAM figure vs. the real
@@ -572,7 +587,7 @@ python3 gb_semantics.py resolve vram_fill_pct
 Over MCP: `semantic_metrics` (discover), `semantic_resolve` (one governed
 value + provenance), `semantic_segments` (named canonical filters, e.g.
 `rule1_underfilled`, `swap_thrash_not_gpu_throttle`), `semantic_answer` (full
-question routing) — all on `greenboost-orchestrator`. Every non-MCP consumer
+question routing) , all on `greenboost-orchestrator`. Every non-MCP consumer
 (GB-CLI, ai-forge) gets a bounded summary card for free via
 `gb_monitor.context_summary()`.
 

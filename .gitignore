@@ -117,9 +117,19 @@ greenboost-ebpf-trace
 enhancements.md
 greenboost_next_check_polishroundup.md
 greenboost_jul12_1.md
+greenboost_polish.md
+missing_features.md
+magic_prompt.md
+greenboost-cli/PRODUCT.md
+greenboost-cli/architecture.md
+greenboost-cli/debug_documentation.md
 
 
 # Checks
 checks/
 docs/
 AGENTS.md
+# hyperresearch (per-project research vault)
+.hyperresearch/
+research/temp/
+research/index/
