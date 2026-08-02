@@ -1247,7 +1247,9 @@ def plan_quality(module: "torch.nn.Module",
                  group_size: int = 64,
                  skip_modules: "tuple" = _DEFAULT_SKIP_MODULES,
                  model_id: str = "model",
-                 verbose: bool = True) -> QualityFitReport:
+                 verbose: bool = True,
+                 sensitivity_source: "Optional[str]" = None,
+                 run_calibration: "Optional[Callable[[], None]]" = None) -> QualityFitReport:
     """Build a per-layer bit-assignment that minimises quantization error
     subject to (t1_budget_gb + t2_budget_gb) total memory.
 
@@ -1263,6 +1265,21 @@ def plan_quality(module: "torch.nn.Module",
     - Quantized (non-BF16) layers → assigned to T1 pool first.
     - BF16 layers and T1 overflow → assigned to T2.
     - shim_required = True when any T2 usage > 50 MB.
+
+    sensitivity_source (only consulted when `sensitivity` is None , the lazy
+    auto-calibration path; explicit `sensitivity=` always wins outright):
+    explicit arg > GB_QUANT_CALIB env > "frobenius" (default, unchanged
+    behavior , gb_quant_calib.calibrate_sensitivity's zero-data weight-only
+    proxy). "activation" (missing_features.md item (d)) uses
+    gb_quant_calib.calibrate_activations instead , a REAL forward pass's
+    per-layer output error, closer to true end-to-end drift than the weight-
+    only proxy, at the cost of needing an explicit `run_calibration=<zero-arg
+    callable that drives a real forward pass through `module`>` (there is no
+    way to auto-derive real inputs). See gb_quant_calib.calibrate_diffusion
+    for a ready-made diffusion-loop-driven sensitivity source , its output
+    already matches this parameter's shape, so it can be passed directly via
+    `sensitivity=calibrate_diffusion(pipe)["transformer"]` without touching
+    sensitivity_source/run_calibration at all.
     """
     import torch.nn as nn
 
@@ -1277,13 +1294,35 @@ def plan_quality(module: "torch.nn.Module",
 
     if sensitivity is None:
         # Lazy calibration , falls through to cache on second call.
-        from gb_quant_calib import calibrate_sensitivity
         # Build precision set: all profile precisions except BF16.
         calib_precs = tuple(b for b in profile.precisions if b != 16)
-        sensitivity = calibrate_sensitivity(
-            module, precisions=calib_precs, model_id=model_id,
-            group_size=group_size, verbose=verbose,
-        )
+        source = sensitivity_source or os.environ.get("GB_QUANT_CALIB", "frobenius")
+        if source == "frobenius":
+            from gb_quant_calib import calibrate_sensitivity
+            sensitivity = calibrate_sensitivity(
+                module, precisions=calib_precs, model_id=model_id,
+                group_size=group_size, verbose=verbose,
+            )
+        elif source == "activation":
+            if run_calibration is None:
+                raise ValueError(
+                    "plan_quality: sensitivity_source='activation' (or "
+                    "GB_QUANT_CALIB=activation) needs an explicit "
+                    "run_calibration=<zero-arg callable that drives a real "
+                    "forward pass through `module`> , there is no way to "
+                    "auto-derive real inputs.")
+            from gb_quant_calib import calibrate_activations
+            sensitivity = calibrate_activations(
+                module, run_calibration, precisions=calib_precs, model_id=model_id,
+                group_size=group_size, verbose=verbose,
+            )
+        else:
+            raise ValueError(
+                f"plan_quality: sensitivity_source={source!r} not in "
+                "('frobenius', 'activation') , 'delta_loss' produces a "
+                "per-layer bits ASSIGNMENT, not an error table, and does not "
+                "slot into this ladder walk (see "
+                "gb_quant_calib.calibrate_with_prompts's own docstring).")
 
     per_layer_bits: Dict[str, object] = {}
     layer_sizes: Dict[str, int] = {}

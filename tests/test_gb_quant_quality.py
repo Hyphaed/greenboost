@@ -423,3 +423,93 @@ def test_dp_plan_dataflux_event_carries_planner_field():
     event = fake_dataflux.emit.call_args[0][0]
     assert event["kind"] == "quant_plan"
     assert event["planner"] == "dp"
+
+
+# ── sensitivity_source wiring (missing_features.md item (d)) ──────────────
+#
+# plan_quality's lazy-calibration path (sensitivity=None) previously always
+# called calibrate_sensitivity (the zero-data Frobenius proxy) with no way
+# to route to a real-forward-pass source instead. sensitivity_source=
+# "activation" (or GB_QUANT_CALIB=activation) now closes that gap.
+
+def test_sensitivity_source_default_calls_calibrate_sensitivity():
+    module = _OneLayer()
+    with patch("gb_quant_calib.calibrate_sensitivity",
+               return_value={"a": {"fp8": 0.01}}) as mock_frob:
+        report = gb_quant.plan_quality(
+            module, target="near_lossless", profile=_profile(),
+            t1_budget_gb=100.0, t2_budget_gb=100.0, verbose=False)
+    mock_frob.assert_called_once()
+    assert report.per_layer_bits["a"] == "fp8"
+
+
+def test_sensitivity_source_activation_requires_run_calibration():
+    module = _OneLayer()
+    with pytest.raises(ValueError, match="run_calibration"):
+        gb_quant.plan_quality(
+            module, target="near_lossless", profile=_profile(),
+            t1_budget_gb=100.0, t2_budget_gb=100.0, verbose=False,
+            sensitivity_source="activation")
+
+
+def test_sensitivity_source_activation_calls_calibrate_activations():
+    module = _OneLayer()
+    ran = {"n": 0}
+    def _run():
+        ran["n"] += 1
+    with patch("gb_quant_calib.calibrate_activations",
+               return_value={"a": {"fp8": 0.02}}) as mock_act:
+        report = gb_quant.plan_quality(
+            module, target="near_lossless", profile=_profile(),
+            t1_budget_gb=100.0, t2_budget_gb=100.0, verbose=False,
+            sensitivity_source="activation", run_calibration=_run)
+    mock_act.assert_called_once()
+    assert mock_act.call_args[0][1] is _run
+    assert report.per_layer_bits["a"] == "fp8"
+
+
+def test_sensitivity_source_env_var_routes_to_activation(monkeypatch):
+    module = _OneLayer()
+    monkeypatch.setenv("GB_QUANT_CALIB", "activation")
+    with patch("gb_quant_calib.calibrate_activations",
+               return_value={"a": {"fp8": 0.02}}) as mock_act:
+        gb_quant.plan_quality(
+            module, target="near_lossless", profile=_profile(),
+            t1_budget_gb=100.0, t2_budget_gb=100.0, verbose=False,
+            run_calibration=lambda: None)
+    mock_act.assert_called_once()
+
+
+def test_sensitivity_source_explicit_arg_overrides_env(monkeypatch):
+    module = _OneLayer()
+    monkeypatch.setenv("GB_QUANT_CALIB", "activation")
+    with patch("gb_quant_calib.calibrate_sensitivity",
+               return_value={"a": {"fp8": 0.02}}) as mock_frob:
+        gb_quant.plan_quality(
+            module, target="near_lossless", profile=_profile(),
+            t1_budget_gb=100.0, t2_budget_gb=100.0, verbose=False,
+            sensitivity_source="frobenius")
+    mock_frob.assert_called_once()
+
+
+def test_sensitivity_source_explicit_sensitivity_bypasses_source_entirely():
+    """An explicit sensitivity= dict must never touch calibrate_sensitivity
+    OR calibrate_activations, regardless of sensitivity_source/env."""
+    module = _OneLayer()
+    with patch("gb_quant_calib.calibrate_sensitivity") as mock_frob, \
+         patch("gb_quant_calib.calibrate_activations") as mock_act:
+        gb_quant.plan_quality(
+            module, target="near_lossless", profile=_profile(),
+            t1_budget_gb=100.0, t2_budget_gb=100.0, verbose=False,
+            sensitivity={"a": {"fp8": 0.01}}, sensitivity_source="activation")
+    mock_frob.assert_not_called()
+    mock_act.assert_not_called()
+
+
+def test_sensitivity_source_unknown_value_raises_with_delta_loss_explanation():
+    module = _OneLayer()
+    with pytest.raises(ValueError, match="delta_loss"):
+        gb_quant.plan_quality(
+            module, target="near_lossless", profile=_profile(),
+            t1_budget_gb=100.0, t2_budget_gb=100.0, verbose=False,
+            sensitivity_source="delta_loss")
