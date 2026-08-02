@@ -289,3 +289,137 @@ def test_maybe_quantize_from_env_gb_quant_bits_auto_resolves_via_profile(monkeyp
         gb_quant.maybe_quantize_from_env(_OneLayer(), verbose=False)
 
     assert captured["prefer_bits"] == "fp8"
+
+
+# ── GB_QUANT_DP_PLAN=1 wiring (missing_features.md item (c)) ──────────────
+#
+# plan_quality's greedy ladder walk picks bits per layer against that
+# layer's OWN error ceiling, independent of every other layer , the total
+# (t1_budget_gb + t2_budget_gb) never affects WHICH bits get picked, only
+# the after-the-fact T1/T2 split. GB_QUANT_DP_PLAN=1 replaces bit selection
+# with gb_quant_dp.plan_bits_dp: a global knapsack that minimizes total loss
+# subject to that SAME total as a hard budget. These fixtures are sized so
+# the two planners provably disagree, proving the wiring actually changes
+# behavior rather than silently falling through to the greedy path.
+
+class _TwoLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a = nn.Linear(4096, 4096, bias=False)   # bf16=32u fp8/int8=17u int4=9u
+        self.b = nn.Linear(1024, 1024, bias=False)    # bf16= 2u fp8/int8= 1u int4=1u
+        # (u = plan_bits_dp's internal 1/1024 GiB cost unit, verified via
+        # gb_quant._BYTES_PER_PARAM against these exact shapes.)
+
+
+_DP_SENSITIVITY = {
+    "a": {"fp8": 0.01, 8: 0.01, 4: 0.05},   # low-sensitivity: tolerates fp8/int8 fine
+    "b": {"fp8": 0.02, 8: 0.02, 4: 0.90},   # high-sensitivity: int4 wrecks it
+}
+
+
+def test_dp_plan_disabled_by_default_uses_greedy(monkeypatch):
+    monkeypatch.delenv("GB_QUANT_DP_PLAN", raising=False)
+    module = _TwoLayer()
+    report = gb_quant.plan_quality(
+        module, target="near_lossless", sensitivity=_DP_SENSITIVITY,
+        profile=_profile(), t1_budget_gb=100.0, t2_budget_gb=100.0, verbose=False)
+    assert report.planner == "greedy"
+    # Greedy's reversed-ladder walk (int4, int8, fp8) picks the first hit
+    # under the 3% ceiling for EACH layer independently: "a" and "b" both
+    # land on int8 (0.01 and 0.02, both <= 0.03) , budget is irrelevant.
+    assert report.per_layer_bits == {"a": 8, "b": 8}
+
+
+def test_dp_plan_enabled_generous_budget_prefers_bf16(monkeypatch):
+    monkeypatch.setenv("GB_QUANT_DP_PLAN", "1")
+    module = _TwoLayer()
+    report = gb_quant.plan_quality(
+        module, target="near_lossless", sensitivity=_DP_SENSITIVITY,
+        profile=_profile(), t1_budget_gb=100.0, t2_budget_gb=100.0, verbose=False)
+    assert report.planner == "dp"
+    assert report.per_layer_bits == {"a": 16, "b": 16}
+    assert report.mean_rel_err == 0.0
+
+
+def test_dp_plan_enabled_tight_budget_trades_layers_globally(monkeypatch):
+    """The headline case: budget=19 units (0.01855 GiB) can't hold both
+    layers at bf16 (34u) or "a" at fp8 + "b" at bf16 (19u exactly) AND
+    "a"+"b" both at fp8 (18u, loss 0.03) , the true minimum-loss feasible
+    combo is "a"->fp8 (drops the low-sensitivity layer), "b" stays bf16
+    (the high-sensitivity layer keeps full precision), total loss 0.01.
+    This is the exact trade the greedy walk (previous test) cannot make ,
+    it picked int8 for BOTH regardless of the combined budget."""
+    monkeypatch.setenv("GB_QUANT_DP_PLAN", "1")
+    module = _TwoLayer()
+    report = gb_quant.plan_quality(
+        module, target="near_lossless", sensitivity=_DP_SENSITIVITY,
+        profile=_profile(), t1_budget_gb=19 / 1024, t2_budget_gb=0.0,
+        verbose=False)
+    assert report.planner == "dp"
+    assert report.per_layer_bits == {"a": "fp8", "b": 16}
+    assert report.mean_rel_err == pytest.approx(0.01)
+
+
+def test_dp_plan_skipped_for_compact_target(monkeypatch):
+    """compact has no error budget to trade against (every layer already
+    goes to floor_default) , DP is skipped regardless of the env var."""
+    monkeypatch.setenv("GB_QUANT_DP_PLAN", "1")
+    module = _TwoLayer()
+    report = gb_quant.plan_quality(
+        module, target="compact", sensitivity=_DP_SENSITIVITY,
+        profile=_profile(floor_default=4), t1_budget_gb=100.0,
+        t2_budget_gb=100.0, verbose=False)
+    assert report.planner == "greedy"
+    assert report.per_layer_bits == {"a": 4, "b": 4}
+
+
+def test_dp_plan_infeasible_budget_falls_back_to_greedy(monkeypatch):
+    """A budget too tight for even the cheapest option on every layer must
+    fall back to the greedy result, not crash or return an empty plan."""
+    monkeypatch.setenv("GB_QUANT_DP_PLAN", "1")
+    module = _TwoLayer()
+    report = gb_quant.plan_quality(
+        module, target="near_lossless", sensitivity=_DP_SENSITIVITY,
+        profile=_profile(), t1_budget_gb=0.0, t2_budget_gb=0.0, verbose=False)
+    assert report.planner == "greedy"
+    assert report.per_layer_bits == {"a": 8, "b": 8}   # identical to the greedy-only test
+
+
+def test_dp_plan_respects_group_size_int4_exclusion(monkeypatch):
+    """A layer whose in_features isn't divisible by group_size must never be
+    assigned int4 by the DP planner either , mirrors the greedy walk's own
+    fallback (gb_quant.py's "For INT4: check group_size divisibility")."""
+    monkeypatch.setenv("GB_QUANT_DP_PLAN", "1")
+
+    class _OddGroupModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            # 96 % 32 == 0 (passes the >=32-and-%32==0 gate) but
+            # 96 % 64 != 0 (fails the default group_size=64 check).
+            self.c = nn.Linear(96, 96, bias=False)
+
+    module = _OddGroupModule()
+    # int4 has the LOWEST loss , if exclusion didn't work, DP would pick it.
+    sensitivity = {"c": {"fp8": 0.02, 8: 0.02, 4: 0.001}}
+    report = gb_quant.plan_quality(
+        module, target="near_lossless", sensitivity=sensitivity,
+        profile=_profile(), t1_budget_gb=100.0, t2_budget_gb=100.0,
+        group_size=64, verbose=False)
+    assert report.planner == "dp"
+    assert report.per_layer_bits["c"] != 4
+
+
+def test_dp_plan_dataflux_event_carries_planner_field():
+    from unittest.mock import MagicMock
+    module = _TwoLayer()
+    fake_dataflux = MagicMock()
+    with patch.dict(sys.modules, {"gb_dataflux": fake_dataflux}), \
+         patch.dict("os.environ", {"GB_QUANT_DP_PLAN": "1"}):
+        gb_quant.plan_quality(
+            module, target="near_lossless", sensitivity=_DP_SENSITIVITY,
+            profile=_profile(), t1_budget_gb=100.0, t2_budget_gb=100.0,
+            verbose=False)
+    assert fake_dataflux.emit.called
+    event = fake_dataflux.emit.call_args[0][0]
+    assert event["kind"] == "quant_plan"
+    assert event["planner"] == "dp"

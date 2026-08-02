@@ -50,8 +50,11 @@ def test_gpu_profile_cached():
 # existed — must be filtered in the planner, not left as a CLI-only opt-out.
 
 def test_gate_nvfp4_drops_it_from_precisions_by_default(monkeypatch):
+    """Neither GB_ALLOW_NVFP4 nor a fixed Triton -> strip nvfp4 entirely
+    (today's crash-avoidance path, unchanged)."""
     import gb_quant
     monkeypatch.delenv("GB_ALLOW_NVFP4", raising=False)
+    monkeypatch.setattr(gb_quant, "_triton_version_ok", lambda *a, **k: False)
     blackwell = gb_quant.GpuProfile(
         family="blackwell", cc=(12, 0),
         precisions=(16, "fp8", "nvfp4", 8, 4, "tq3", "tq2"),
@@ -68,8 +71,11 @@ def test_gate_nvfp4_drops_it_from_precisions_by_default(monkeypatch):
 
 
 def test_gate_nvfp4_opt_out_env_var_keeps_it(monkeypatch):
+    """GB_ALLOW_NVFP4=1 is a full explicit opt-in , nvfp4 stays the default
+    too, untouched object, regardless of Triton version."""
     import gb_quant
     monkeypatch.setenv("GB_ALLOW_NVFP4", "1")
+    monkeypatch.setattr(gb_quant, "_triton_version_ok", lambda *a, **k: False)
     blackwell = gb_quant.GpuProfile(
         family="blackwell", cc=(12, 0),
         precisions=(16, "fp8", "nvfp4", 8, 4, "tq3", "tq2"),
@@ -77,6 +83,69 @@ def test_gate_nvfp4_opt_out_env_var_keeps_it(monkeypatch):
     )
     gated = gb_quant._gate_nvfp4(blackwell)
     assert gated is blackwell  # untouched, same object
+
+
+def test_gate_nvfp4_fixed_triton_keeps_it_listed_but_not_default(monkeypatch):
+    """missing_features.md item (a): Triton >=3.8 makes nvfp4 compile cleanly
+    (stays IN precisions, reachable via explicit bits="nvfp4"), but the
+    live-measured verdict (fp8 faster AND higher-fidelity even with the fix)
+    means it must NOT become the automatic floor/quality default."""
+    import gb_quant
+    monkeypatch.delenv("GB_ALLOW_NVFP4", raising=False)
+    monkeypatch.setattr(gb_quant, "_triton_version_ok", lambda *a, **k: True)
+    blackwell = gb_quant.GpuProfile(
+        family="blackwell", cc=(12, 0),
+        precisions=(16, "fp8", "nvfp4", 8, 4, "tq3", "tq2"),
+        floor_default="nvfp4", quality_default="nvfp4", t2_tolerance_gb=1.0,
+    )
+    gated = gb_quant._gate_nvfp4(blackwell)
+    assert "nvfp4" in gated.precisions
+    assert gated.precisions == blackwell.precisions
+    assert gated.quality_default == "fp8"
+    assert gated.floor_default == 4
+
+
+def test_triton_version_ok_parses_real_version_string():
+    import gb_quant
+    try:
+        import triton  # noqa: F401
+    except Exception:
+        pytest.skip("triton not installed in this env")
+    assert gb_quant._triton_version_ok((0, 0)) is True   # trivially satisfied if triton imports
+    assert gb_quant._triton_version_ok((999, 0)) is False  # trivially unsatisfiable
+
+
+def test_triton_version_ok_false_on_import_failure(monkeypatch):
+    import gb_quant
+    import builtins
+    real_import = builtins.__import__
+    def _blocked(name, *a, **k):
+        if name == "triton":
+            raise ImportError("no triton")
+        return real_import(name, *a, **k)
+    monkeypatch.setattr(builtins, "__import__", _blocked)
+    assert gb_quant._triton_version_ok() is False
+
+
+def test_nvfp4_compileable_true_when_env_set(monkeypatch):
+    import gb_quant
+    monkeypatch.setenv("GB_ALLOW_NVFP4", "1")
+    monkeypatch.setattr(gb_quant, "_triton_version_ok", lambda *a, **k: False)
+    assert gb_quant._nvfp4_compileable() is True
+
+
+def test_nvfp4_compileable_true_when_triton_fixed(monkeypatch):
+    import gb_quant
+    monkeypatch.delenv("GB_ALLOW_NVFP4", raising=False)
+    monkeypatch.setattr(gb_quant, "_triton_version_ok", lambda *a, **k: True)
+    assert gb_quant._nvfp4_compileable() is True
+
+
+def test_nvfp4_compileable_false_when_neither(monkeypatch):
+    import gb_quant
+    monkeypatch.delenv("GB_ALLOW_NVFP4", raising=False)
+    monkeypatch.setattr(gb_quant, "_triton_version_ok", lambda *a, **k: False)
+    assert gb_quant._nvfp4_compileable() is False
 
 
 def test_gate_nvfp4_is_a_noop_for_non_blackwell_profiles(monkeypatch):
@@ -324,6 +393,93 @@ def test_plan_fit_total_bf16_gb_positive():
     mod = nn.Linear(128, 128, bias=False)
     report = plan_fit(mod, budget_gb=1.0)
     assert report.total_bf16_gb >= 0
+
+
+# ── preflight_fit , side-effect-free byte-count query (missing_features.md h)
+
+def test_preflight_fit_returns_dict_shape():
+    """preflight_fit() returns the documented dict keys, no GPU allocation."""
+    from gb_quant import preflight_fit
+    mod = nn.Linear(64, 64, bias=False)
+    result = preflight_fit(mod, budget_gb=1.0, prefer_bits=4, emit=False)
+    assert set(result) == {
+        "budget_gb", "total_bf16_gb", "total_quant_gb", "fits",
+        "t1_gb", "t2_overflow_gb", "headroom_gb", "per_component",
+    }
+    assert len(result["per_component"]) == 1
+    comp = result["per_component"][0]
+    assert set(comp) == {"name", "params", "bf16_gb", "bits", "quant_gb"}
+
+
+def test_preflight_fit_fits_true_with_generous_budget():
+    from gb_quant import preflight_fit
+    mod = nn.Linear(64, 64, bias=False)
+    result = preflight_fit(mod, budget_gb=100.0, prefer_bits=4, emit=False)
+    assert result["fits"] is True
+    assert result["t2_overflow_gb"] == 0.0
+
+
+def test_preflight_fit_fits_false_and_reports_overflow_with_tiny_budget():
+    from gb_quant import preflight_fit, _BYTES_PER_PARAM
+    # 4096-param Linear forced to bf16 via skip_components="model" so total_quant_gb
+    # is deterministic and budget=0 guarantees overflow.
+    mod = nn.Linear(4096, 4096, bias=False)
+    result = preflight_fit(mod, budget_gb=0.0, prefer_bits=4,
+                           skip_components=("model",), emit=False)
+    assert result["fits"] is False
+    assert result["t2_overflow_gb"] > 0.0
+    assert result["headroom_gb"] == 0.0
+
+
+def test_preflight_fit_matches_plan_fit_totals():
+    """preflight_fit is a pure wrapper , its totals must equal plan_fit's."""
+    from gb_quant import preflight_fit, plan_fit
+    mod = nn.Linear(128, 128, bias=False)
+    pf = preflight_fit(mod, budget_gb=1.0, prefer_bits=4, emit=False)
+    report = plan_fit(mod, budget_gb=1.0, prefer_bits=4)
+    assert pf["total_bf16_gb"] == report.total_bf16_gb
+    assert pf["total_quant_gb"] == report.total_quant_gb
+    assert pf["fits"] == report.fits_vram
+
+
+def test_preflight_fit_no_gpu_allocation():
+    """preflight_fit never touches torch.cuda , CPU-only, side-effect-free."""
+    from gb_quant import preflight_fit
+    mod = nn.Linear(64, 64, bias=False)
+    with patch("torch.cuda.is_available", return_value=False):
+        result = preflight_fit(mod, budget_gb=1.0, prefer_bits=4, emit=False)
+    assert result["fits"] is True
+
+
+def test_preflight_fit_auto_budget_uses_auto_budgets(monkeypatch):
+    """budget_gb=None derives from _auto_budgets(), not a hardcoded literal."""
+    import gb_quant
+    monkeypatch.setattr(gb_quant, "_auto_budgets", lambda: (5.0, 3.0))
+    mod = nn.Linear(64, 64, bias=False)
+    result = gb_quant.preflight_fit(mod, prefer_bits=4, emit=False)
+    assert result["budget_gb"] == 5.0
+
+
+def test_preflight_fit_emit_true_sends_dry_run_quant_plan_event():
+    """emit=True (the default) emits kind=quant_plan with dry_run=True."""
+    import gb_quant
+    mod = nn.Linear(64, 64, bias=False)
+    fake_dataflux = MagicMock()
+    with patch.dict(sys.modules, {"gb_dataflux": fake_dataflux}):
+        gb_quant.preflight_fit(mod, budget_gb=1.0, prefer_bits=4)
+    assert fake_dataflux.emit.called
+    event = fake_dataflux.emit.call_args[0][0]
+    assert event["kind"] == "quant_plan"
+    assert event["dry_run"] is True
+
+
+def test_preflight_fit_emit_false_sends_nothing():
+    import gb_quant
+    mod = nn.Linear(64, 64, bias=False)
+    fake_dataflux = MagicMock()
+    with patch.dict(sys.modules, {"gb_dataflux": fake_dataflux}):
+        gb_quant.preflight_fit(mod, budget_gb=1.0, prefer_bits=4, emit=False)
+    assert not fake_dataflux.emit.called
 
 
 # ── quantize_to_fit , telemetry budget gate ───────────────────────────────────

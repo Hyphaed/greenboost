@@ -4417,7 +4417,7 @@ cmd_install_python_files() {
     # must be listed first so downstream modules find it on import.
     local _py_files=(
         gb_init.py
-        gb_quant.py gb_quant_tq.py gb_quant_calib.py
+        gb_quant.py gb_quant_tq.py gb_quant_calib.py gb_quant_dp.py
         gb_kernel_backends.py gb_placement.py
         gb_attn.py
         gb_telemetry.py
