@@ -85,8 +85,8 @@ falls back to running on the local machine alone instead of just giving up.
 
 A new subsystem, GB-Semantics, gives GreenBoost's own AI assistants (and any
 MCP client) ONE correct answer per question about GreenBoost's current state,
-things like "is Rule #1 satisfied", "why is it slow", or "is the quality
-floor met", the same way a data team builds a semantic layer so an analytics
+things like "why is it slow", or "is the quality floor met", 
+the same way a data team builds a semantic layer so an analytics
 AI stops guessing which table means "revenue". Several internal signals in
 GreenBoost mean two different things depending on where they're read from (a
 shim-inflated "how full does VRAM *look*" number vs. the real physical one;
@@ -96,9 +96,7 @@ once, resolves it deterministically, and explicitly flags the field an
 assistant should NOT read instead. Reachable over MCP
 (`semantic_resolve`/`semantic_answer`/`semantic_segments`/`semantic_metrics`
 on `greenboost-orchestrator`) and via a plain `gb_semantics.py` CLI for
-anything without MCP. A 40-case eval suite, pinned to a frozen test scenario,
-runs on every change, and a build-blocking check catches a definition losing
-its resolver.
+anything without MCP. 
 
 ### ⚡ Faster repeated prompts (host-memory prompt cache)
 
