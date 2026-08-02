@@ -96,6 +96,15 @@ class _ModelEntry:
     tier: str = Tier.T1
     last_used: float = field(default_factory=time.time)
     t3_path: Optional[str] = None   # path when evicted to NVMe
+    # KV-cache tier-serde opt-in (missing_features.md item (e)). None
+    # (default) , byte-identical to pre-KV-compression behavior. Only set
+    # these for a component whose state_dict holds attention cache tensors;
+    # passing kv_bits for a weight-bearing module WILL degrade the weights ,
+    # see gb_tier_kv.py's module docstring for why this is opt-in only, no
+    # name/shape heuristics.
+    kv_bits: Optional[int] = None
+    kv_keys: Optional[tuple] = None
+    kv_codec: Optional[str] = None
 
 
 def _module_size_gb(module) -> float:
@@ -154,10 +163,25 @@ def _t3_zstd_backend() -> str:
     return _T3_ZSTD_BACKEND
 
 
-def _t3_save(state: dict, base_path: str) -> "tuple[str, int]":
+def _t3_save(state: dict, base_path: str, kv_bits: "Optional[int]" = None,
+            kv_keys: "Optional[tuple]" = None, kv_codec: "Optional[str]" = None,
+            device: str = "cpu") -> "tuple[str, int, dict]":
     """Save `state` to T3, compressing when a backend is available.  `base_path`
     ends in '.pt'; the compressed variant appends '.zst'.  Returns
-    (actual_path, bytes_on_disk)."""
+    (actual_path, bytes_on_disk, kv_stats).
+
+    kv_bits=None (default) , byte-identical to the pre-KV-compression
+    behavior, kv_stats is empty. kv_bits set , KV-cache-shaped tensors in
+    `state` are quantized FIRST (gb_tier_kv.encode_state), THEN the result
+    goes through the existing zstd path below unchanged , order matters:
+    zstd on packed uint8 indices still earns a little (norms + framing),
+    and non-KV tensors in the same state_dict stay untouched and bit-exact
+    either way (missing_features.md item (e))."""
+    kv_stats: dict = {}
+    if kv_bits is not None:
+        import gb_tier_kv
+        state, kv_stats = gb_tier_kv.encode_state(
+            state, kv_bits, keys=kv_keys, codec=kv_codec, device=device)
     backend = _t3_zstd_backend()
     if backend == "py":
         import zstandard
@@ -165,7 +189,7 @@ def _t3_save(state: dict, base_path: str) -> "tuple[str, int]":
         cctx = zstandard.ZstdCompressor(level=3)
         with open(zpath, "wb") as fh, cctx.stream_writer(fh) as comp:
             torch.save(state, comp)   # streamed, no full in-memory copy
-        return zpath, os.path.getsize(zpath)
+        return zpath, os.path.getsize(zpath), kv_stats
     if backend == "cli":
         import subprocess
         zpath = base_path + ".zst"
@@ -174,18 +198,20 @@ def _t3_save(state: dict, base_path: str) -> "tuple[str, int]":
             subprocess.run(["zstd", "-q", "-3", "-f", "-o", zpath, base_path],
                            check=True)
             os.remove(base_path)
-            return zpath, os.path.getsize(zpath)
+            return zpath, os.path.getsize(zpath), kv_stats
         except Exception:
             # CLI failed mid-flight: keep the plain file we already wrote.
             if os.path.exists(zpath):
                 os.remove(zpath)
-            return base_path, os.path.getsize(base_path)
+            return base_path, os.path.getsize(base_path), kv_stats
     torch.save(state, base_path)
-    return base_path, os.path.getsize(base_path)
+    return base_path, os.path.getsize(base_path), kv_stats
 
 
-def _t3_load(path: str) -> dict:
-    """Load a T3 checkpoint written by `_t3_save` (or a legacy plain '.pt').
+def _t3_load_raw(path: str) -> dict:
+    """Load a T3 checkpoint written by `_t3_save` (or a legacy plain '.pt'),
+    WITHOUT reversing any KV-cache tier-serde encoding , see `_t3_load` for
+    the public entry point that also does that.
 
     A '.zst' on disk MUST be decompressed regardless of the current
     GB_T3_COMPRESS setting, so decompression is capability-driven (try the
@@ -212,6 +238,17 @@ def _t3_load(path: str) -> dict:
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
+
+
+def _t3_load(path: str) -> dict:
+    """Load a T3 checkpoint written by `_t3_save`, reversing KV-cache
+    tier-serde encoding when present (gb_tier_kv.decode_state is a no-op ,
+    returns its argument by identity , for every checkpoint that doesn't
+    carry a "__gb_kv__" manifest, i.e. every legacy checkpoint on disk
+    today)."""
+    raw = _t3_load_raw(path)
+    import gb_tier_kv
+    return gb_tier_kv.decode_state(raw)
 
 
 class ModelTierManager:
@@ -254,9 +291,27 @@ class ModelTierManager:
         os.makedirs(t3_dir, exist_ok=True)
         _gb_session(active=True)
 
-    def register(self, name: str, module: torch.nn.Module, tier: str = Tier.T1):
-        """Register a model component for tier management."""
-        self._entries[name] = _ModelEntry(name=name, module=module, tier=tier)
+    def register(self, name: str, module: torch.nn.Module, tier: str = Tier.T1,
+                *, kv_bits: "Optional[int]" = None,
+                kv_keys: "Optional[tuple]" = None,
+                kv_codec: "Optional[str]" = None):
+        """Register a model component for tier management.
+
+        kv_bits: opt in to KV-cache tier-serde compression (T3 spill only ,
+            missing_features.md item (e)) for THIS component. None (default)
+            leaves behavior byte-identical to before this feature existed.
+            Only pass it for a module whose state_dict holds attention cache
+            tensors , passing it for a weight-bearing module WILL degrade
+            the weights (gb_tier_kv has no name/shape heuristics; this
+            kwarg IS the classification). kv_keys restricts encoding to
+            state_dict keys starting with one of these prefixes (e.g.
+            ("k_cache", "v_cache") on a module that also holds non-cache
+            buffers); None encodes every eligible tensor in the module.
+            kv_codec: "polarquant" | "turboquant" | None (env-resolved via
+            GB_TIER_KV_PRESET, see gb_tier_kv.resolve_codec)."""
+        self._entries[name] = _ModelEntry(
+            name=name, module=module, tier=tier,
+            kv_bits=kv_bits, kv_keys=kv_keys, kv_codec=kv_codec)
 
     # ── tier transitions ──────────────────────────────────────────────────────
 
@@ -345,7 +400,9 @@ class ModelTierManager:
 
         size_gb = _module_size_gb(e.module)
         base_path = os.path.join(self.t3_dir, f"{name}.pt")
-        t3_path, disk_bytes = _t3_save(e.module.state_dict(), base_path)
+        t3_path, disk_bytes, kv_stats = _t3_save(
+            e.module.state_dict(), base_path, kv_bits=e.kv_bits,
+            kv_keys=e.kv_keys, kv_codec=e.kv_codec)
         # Move to meta device: frees all parameter memory while preserving shapes
         # so _load_from_t3 can use to_empty()+load_state_dict(assign=True) later.
         e.module.to("meta")
@@ -353,12 +410,27 @@ class ModelTierManager:
         e.t3_path = t3_path
         compressed = t3_path.endswith(".zst")
         ratio = (size_gb * 2**30 / disk_bytes) if compressed and disk_bytes else 1.0
+        kv_note = ""
+        extra = {"compressed": compressed,
+                "disk_mb": round(disk_bytes / 2**20, 1),
+                "compress_ratio": round(ratio, 2)}
+        if kv_stats:
+            kv_pre = kv_stats.get("pre_bytes", 0)
+            kv_post = kv_stats.get("post_bytes", 0)
+            kv_ratio = round(kv_pre / kv_post, 2) if kv_post else 0.0
+            extra.update({
+                "kv_codec": kv_stats.get("codec"), "kv_bits": kv_stats.get("bits"),
+                "kv_tensors": kv_stats.get("tensors", 0),
+                "kv_tensors_skipped": kv_stats.get("tensors_skipped", 0),
+                "kv_skip_reasons": kv_stats.get("skip_reasons", {}),
+                "kv_ratio": kv_ratio,
+            })
+            if kv_stats.get("tensors"):
+                kv_note = f" (kv {kv_stats['tensors']}x {kv_stats['codec']}@{kv_stats['bits']}b {kv_ratio:.2f}x)"
         print(f"[gb_tier] evicted '{name}' → T3 (NVMe) at {t3_path}"
-              f"{f' (zstd {ratio:.2f}x)' if compressed else ''}", flush=True)
+              f"{f' (zstd {ratio:.2f}x)' if compressed else ''}{kv_note}", flush=True)
         _df_emit_tier(name, from_tier, Tier.T3, size_gb, time.time() - t0,
-                      extra={"compressed": compressed,
-                             "disk_mb": round(disk_bytes / 2**20, 1),
-                             "compress_ratio": round(ratio, 2)})
+                      extra=extra)
 
     def _load_from_t3(self, e: _ModelEntry):
         if not e.t3_path or not os.path.exists(e.t3_path):

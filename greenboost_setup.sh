@@ -4422,7 +4422,7 @@ cmd_install_python_files() {
         gb_attn.py
         gb_telemetry.py
         gb_stream_sched.py
-        gb_model_tier.py
+        gb_model_tier.py gb_tier_kv.py
         gb_mem_pool.py
         gb_diffusion_orch.py
         gb_stability_monitor.py
