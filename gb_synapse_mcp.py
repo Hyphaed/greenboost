@@ -122,8 +122,8 @@ def synapse_serve(model: str, ctx: int = 65536, use_cluster: bool = True,
     """Serve a model through gb-synapse (engine backend + the gb-synapse
     proxy, default port 11435, GB_SYNAPSE_PORT; tensor-split across the
     cluster when use_cluster and feeders are up for the llama.cpp backend).
-    `engine` ("llama.cpp"/"torch"/"diffusers" — "vllm"/"transformers" still
-    accepted as deprecated aliases for "torch") only affects the DRY-RUN
+    `engine` ("llama.cpp"/"torch"/"diffusers"/"video" — "vllm"/"transformers"
+    still accepted as deprecated aliases for "torch") only affects the DRY-RUN
     preview's backend name — it does NOT override the manifest's own engine
     for an actual (confirm=True) serve; re-pull with --engine to change
     that durably.
