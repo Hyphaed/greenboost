@@ -927,8 +927,29 @@ def shim_env(workload: str = "diffusion", enabled: bool = True,
         # dlsym-based CUDA loaders like ggml-cuda). Optional: only prepended
         # when actually built/installed, so a box without it still gets the
         # main shim.
+        #
+        # SCOPED to llm/ggml only (2026-08-02 fix, real incident): vmm_override
+        # exists purely to force ggml-cuda's VMM_SUPPORTED attribute check to 0
+        # on Blackwell (its own header — never queried by PyTorch/diffusers at
+        # all), but blanket-applying it to EVERY workload broke gb-quant fp8 on
+        # diffusion: its cuDeviceGetAttribute interposition (the bare-unversioned
+        # PLT-preemption trick, needed for ggml-cuda's dlsym-based loader) is
+        # process-wide once loaded, and Triton's own device-property query
+        # (CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, called during
+        # FLUX.2-klein text-encoder quantization's RoPE kernel) came back as 0
+        # through it — "triton.runtime.errors.OutOfResources: out of resource:
+        # shared memory, Required: 512, Hardware limit: 0" — reproduced live,
+        # and confirmed to disappear the instant vmm_override was excluded from
+        # LD_PRELOAD (identical manifest/quality/env otherwise, fp8 generation
+        # completed clean in both TE-encode and transformer-quantize phases).
+        # Root cause not fully isolated inside greenboost_vmm_override.c's own
+        # logic (its cuDeviceGetAttribute wrapper reads correct on inspection
+        # for non-VMM attributes) — but the fix doesn't need to be: this shim
+        # has zero purpose for a workload that never touches ggml-cuda, so
+        # scoping it out removes the entire risk surface rather than chasing
+        # one specific reentrancy path that may recur elsewhere.
         preload_libs = [GREENBOOST_SHIM]
-        if Path(GREENBOOST_VMM_OVERRIDE).is_file():
+        if workload in ("llm", "ggml") and Path(GREENBOOST_VMM_OVERRIDE).is_file():
             preload_libs.insert(0, GREENBOOST_VMM_OVERRIDE)
         env["LD_PRELOAD"] = ":".join(preload_libs + [prior]) if prior else ":".join(preload_libs)
         profile = _WORKLOAD_PROFILES.get(workload)

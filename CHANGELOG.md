@@ -1,60 +1,13 @@
 # GreenBoost Changelog
 
-## v3.3 : 2026-07-28 (in development)
+## v3.3 : 2026-08-02
 
-### 🧠 The context window kept shrinking for the wrong reasons — now fixed, three times over
+### 🧠 The context window kept shrinking for the wrong reasons , now fixed, three times over
 
 GreenBoost's reference coding model changed to
 [`Qwen3.6-27B-Fable-Fusion`](https://huggingface.co/DavidAU) (a dense 27B
 model, replacing the older 35B mixture-of-experts one). 
 
-The model's own spec sheet advertises a 262,000-token memory, so something
-was very wrong. It turned out to be three separate, unrelated bugs, each one
-quietly shrinking how much conversation the model could actually hold:
-
-1. **GreenBoost was overestimating how much GPU memory the conversation
-   history needed**, by roughly 4x, for this model's architecture
-   specifically. Fixing that alone took the usable window from **2,048
-   tokens to 7,680** on the exact same hardware.
-2. That still wasn't right. GreenBoost was also reserving graphics-card
-   memory as if the *entire* model had to fit on the GPU, even in the very
-   common case where only part of it does (the rest quietly runs from
-   regular system RAM). Fixing that took the window from **7,680 tokens to
-   roughly 46,000** — about six times bigger than where it started, on the
-   same card, at the same speed.
-3. Separately, the assistant itself never actually asked the model server
-   how much room it had to work with — it just assumed a made-up number.
-   That meant it never knew to shorten a long conversation before hitting
-   the wall; it just found out the hard way, mid-answer. It now asks the
-   server directly, and trims older conversation history automatically
-   before a request would overflow, instead of failing.
-
-Put together: a `gb -m <model> -p "read this file and summarize it"` request
-that was flatly impossible at the start of this release now works, reads
-real files, and gives a grounded answer. The model's full 262K (or even its
-extended 1M) window is still reachable if you explicitly ask for it and have
-GreenBoost's memory-extension feature turned on — that trades some speed for
-the extra room, so it's opt-in, never automatic.
-
-### 🧠🌀 The same memory bug, on a different kind of model — and a piece of memory that was never counted at all
-
-The previous fix (above) only covered models loaded as GGUF files. GreenBoost
-is now also being used with models loaded a different way (safetensors,
-served through GreenBoost's own built-in engine) that have the exact same
-"part of every reply is a lightweight summary instead of full attention"
-design — and that path had the identical bug the GGUF fix already closed,
-just never patched there. Fixed the same way: GreenBoost now correctly counts
-how much of the model actually needs the expensive, growing memory, instead
-of assuming all of it does.
-
-Separately, this uncovered a piece of memory that GreenBoost was not
-accounting for AT ALL. Models built this way keep a small, fixed-size
-"working notebook" per conversation (its size doesn't grow the longer the
-conversation gets — unlike everything else GreenBoost tracks), and it's
-read and rewritten on every single word the model produces, making it some
-of the most performance-critical memory in the whole system. GreenBoost now
-sizes it correctly and — optionally — pins it in the GPU's fastest memory
-tier so it's never evicted to slower memory by mistake.
 
 ### 🐍 GreenBoost's own model server can now run Mamba-2 models natively
 
@@ -62,12 +15,12 @@ Two fixes above closed the accounting gap for models that mix regular
 attention with the newer "linear attention" style. This entry is about
 the other end of that spectrum: models built ENTIRELY out of the newer
 style, with no regular attention at all. GreenBoost's built-in model
-server didn't know how to run one at all before now — it does today.
+server didn't know how to run one at all before now , it does today.
 
 The model math itself was borrowed from, and checked against, the same
 well-tested open-source code other serving engines use (not hand-written
 from scratch), because getting this kind of model's internal math even
-slightly wrong doesn't crash — it just quietly produces fluent-looking
+slightly wrong doesn't crash , it just quietly produces fluent-looking
 nonsense, which is a much easier mistake to ship by accident. That
 caution paid off during testing: the very first attempt DID produce
 fluent-looking nonsense, traced back to two internal steps that were
@@ -75,25 +28,25 @@ wired up in the wrong order, fixed, and re-verified word-for-word against
 a trusted reference implementation before being called done. Along the
 way, four separate scheduling assumptions that had never been tested
 against a model with no regular attention memory at all were found and
-fixed too — one of which caused every request to simply hang forever
+fixed too , one of which caused every request to simply hang forever
 with no error, rather than fail loudly.
 
 ### 💬 The `gb` terminal assistant got a cleanup pass
 
 - The chat window used to flash raw internal text (things like
-  `<tool_call><function=...>`) whenever the model decided to use a tool —
+  `<tool_call><function=...>`) whenever the model decided to use a tool ,
   now that's filtered out live, so you only ever see the clean "running
   tool…" card.
 - Tools provided by connected MCP servers (used for things like searching
   project memory) sometimes came back as `Unknown instrument` even though
-  they were perfectly available — a naming mismatch, now fixed.
+  they were perfectly available , a naming mismatch, now fixed.
 - The little memory readout in the bottom-right corner (GPU VRAM / system
-  RAM / disk usage) was showing wrong numbers, mostly stuck at zero — it's
+  RAM / disk usage) was showing wrong numbers, mostly stuck at zero , it's
   now pulled from GreenBoost's own live monitoring feed, and it visibly dims
   instead of silently freezing if that feed goes stale.
 - Fixed a cosmetic glitch where the animated "thinking…" line could leave a
   stray character or two behind on screen.
-- `ctrl+o` ("expand the full result") now actually does something — the
+- `ctrl+o` ("expand the full result") now actually does something , the
   hint had been on screen for a while promising this with no button behind
   it.
 - The permission-approval popup box now closes cleanly on the right side
@@ -109,7 +62,7 @@ every single time regardless of what that decision actually was. Both
 fixed.
 
 Decision for this specific model: splitting it across two machines over a
-plain network connection currently makes it *slower*, not faster — the
+plain network connection currently makes it *slower*, not faster , the
 per-token chatter between machines outweighs the benefit for this model's
 architecture. So it stays on a single machine for now; the fixes are in and
 ready for whichever future model the split genuinely helps. And if a
@@ -120,7 +73,7 @@ falls back to running on the local machine alone instead of just giving up.
 
 - The vLLM backend has been retired. GreenBoost's own built-in engine
   (previously an alternate path) is now the only one used for this class of
-  model — one engine to maintain instead of two, and nothing changes for
+  model , one engine to maintain instead of two, and nothing changes for
   anyone already using it.
 - Continuous batching (serving more than one request to the same model at
   once) is back on by default. It had been silently switched off.
@@ -128,17 +81,17 @@ falls back to running on the local machine alone instead of just giving up.
   collided with Ollama, if you also run that) to 11435, so both can run
   side by side without a fight.
 
-### 🧭 GB-Semantics — one governed answer, not a guess
+### 🧭 GB-Semantics , one governed answer, not a guess
 
 A new subsystem, GB-Semantics, gives GreenBoost's own AI assistants (and any
-MCP client) ONE correct answer per question about GreenBoost's current state
-— "is Rule #1 satisfied", "why is it slow", "is the quality floor met" — the
-same way a data team builds a semantic layer so an analytics AI stops
-guessing which table means "revenue". Several internal signals in GreenBoost
-mean two different things depending on where they're read from (a
+MCP client) ONE correct answer per question about GreenBoost's current state,
+things like "is Rule #1 satisfied", "why is it slow", or "is the quality
+floor met", the same way a data team builds a semantic layer so an analytics
+AI stops guessing which table means "revenue". Several internal signals in
+GreenBoost mean two different things depending on where they're read from (a
 shim-inflated "how full does VRAM *look*" number vs. the real physical one;
 a pressure reading that's sometimes a 0/1/2 severity level and sometimes a
-0.0-1.0 fraction under the same name) — GB-Semantics defines each concept
+0.0-1.0 fraction under the same name), GB-Semantics defines each concept
 once, resolves it deterministically, and explicitly flags the field an
 assistant should NOT read instead. Reachable over MCP
 (`semantic_resolve`/`semantic_answer`/`semantic_segments`/`semantic_metrics`
@@ -151,7 +104,7 @@ its resolver.
 
 `gb-synapse`'s serving engine now sizes and enables its host-memory prompt
 cache (previously left at the engine's own default), so a long, unchanging
-system prompt — exactly what `gb`'s terminal assistant resends every turn —
+system prompt, exactly what `gb`'s terminal assistant resends every turn,
 can be reused instead of reprocessed from scratch. Sized automatically from
 whatever RAM is actually free on the machine, never a fixed number. Every
 request's cache-hit rate and response latency now show up in GreenBoost's
@@ -159,18 +112,40 @@ telemetry feed, so the effect is measurable, not just assumed.
 
 **Verified against a real, running instance of the reference model**: a
 repeated prompt went from taking about 1.9-2.1 seconds to process to about
-0.35 seconds — roughly 5-6x faster on the part of the request that reuses
+0.35 seconds , roughly 5-6x faster on the part of the request that reuses
 the cache, with 9 out of every 10 prompt tokens pulled from the cache
 instead of recomputed. That same check also caught the measurement itself
 undercounting the cache-hit rate for real usage of the terminal assistant
-(it was reading the right idea from the wrong place in the response) — now
+(it was reading the right idea from the wrong place in the response), now
 fixed, and covered by a permanent automated test so it can't quietly regress.
+
+
+### ⚡ GreenBoost now measures the conversation cache instead of guessing its size
+
+The formula for estimating how much GPU memory a model's conversation cache
+needs was running about 2.9x too generous for this release's hybrid
+architecture, so GreenBoost was reserving nearly three times the memory it
+actually needed and leaving that much less for everything else. Rather than
+chase the formula through this architecture's internal memory layout,
+GreenBoost now measures the real, shim-observed figure from one server run
+and reuses it on the next, keyed to the exact model, context size, and cache
+precision (`/var/lib/greenboost/synapse/kv_measurements.json`).
+
+
+### 🧹 `greenboost clear memory-pool` stopped guessing which processes to kill
+
+It used to decide what counted as "leftover AI inference" by matching process
+names against a list of known patterns, an approach that's always one unusual
+process name away from either missing something or killing something it
+shouldn't. It now reads GB-Dataflux's own record of what GreenBoost actually
+started, and only reclaims what's genuinely idle and unprotected. The same
+logic backs both the shell command and `gb clear-memory-pool`.
 
 ### 🐛 Installer & stability fixes
 
 - Fixed an installer bug where a few third-party libraries (used for model
   compression) could silently fail to copy into place on a machine that
-  didn't already have the destination folder — an easy way to end up with
+  didn't already have the destination folder , an easy way to end up with
   a working install that was quietly missing a feature.
 - Fixed a real regression from this same release's own port change above:
   the terminal assistant's list of known backends still pointed at the OLD
@@ -178,11 +153,11 @@ fixed, and covered by a permanent automated test so it can't quietly regress.
   that was never running and reported a confusing, unrelated error instead
   of the real one.
 - Fixed the installed `gb` command ignoring an explicit override of where
-  it should look for GreenBoost's own files — useful when testing a
+  it should look for GreenBoost's own files , useful when testing a
   development build instead of the installed one, previously had no effect
   at all.
 - A machine acting as a "feeder" (lending its spare GPU/RAM to another
-  machine) could grow an internal log file past 1 GB with no cleanup — it
+  machine) could grow an internal log file past 1 GB with no cleanup , it
   now rotates automatically like every other GreenBoost log.
 - A couple of crash-prevention fixes for loading models on GPUs with a
   tighter memory budget.
@@ -191,7 +166,7 @@ fixed, and covered by a permanent automated test so it can't quietly regress.
 <details>
 <summary><strong>Jump to a version</strong></summary>
 
-- [v3.3 , 2026-07-28 (in development)](#v33--2026-07-28-in-development)
+- [v3.3 , 2026-08-02](#v33--2026-08-02)
 - [v3.2 , 2026-07-12](#v32--2026-07-12)
 - [v3.1 , 2026-06-16](#v31--2026-06-16)
 - [v3.0 , 2026-06-13](#v30--2026-06-13)

@@ -1,4 +1,4 @@
-# 📘 GreenBoost v3.2 , integration guide for inference tools
+# 📘 GreenBoost v3.3 , integration guide for inference tools
 
 > **GreenBoost** is a CUDA Memory & Compute Orchestrator for NVIDIA GPUs: it
 > tiers system RAM/NVMe into VRAM, quantizes models to fit (gb-quant), and pools
@@ -13,6 +13,7 @@ Check [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
 
 **Getting oriented**
 - [Reading this document](#reading-this-document)
+- [What's new in v3.3](#whats-new-in-v33)
 - [What's new in v3.2](#whats-new-in-v32)
 - [What's new in v3.1](#whats-new-in-v31)
 - [What's new in v3.0](#whats-new-in-v30)
@@ -85,7 +86,7 @@ existing Python script does not change.
 
 ---
 
-## What's new in v3.3 (in development)
+## What's new in v3.3
 
 - **Selective-SSM (Mamba/Mamba-2) support, both phases.** GreenBoost's
   memory model, telemetry, and semantics layer now understand recurrent
@@ -126,6 +127,32 @@ existing Python script does not change.
   (`:MTP-IQ4_XS` matched three different files in one real repo). Pass
   the exact, full quant token for any repo shipping multiple
   `-XXX-<quant>` suffixed files of the same base quant.
+- **Fixed a wrong CUDA attribute constant that was silently degrading
+  serving to partial CPU offload.** `greenboost_cuda_shim.c` and
+  `greenboost_vmm_override.c` hardcoded
+  `CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED` as `193`
+  instead of the real value, `102` (`GB_ATTR_VMM_SUPPORTED` in
+  `greenboost_vmm_override.c`). A new `_gate_cpu_offload()` check
+  (`gb_synapse_backends.py`) now refuses any capacity-driven GPU-layer
+  reduction by default, emits a `cpu_spillover` dataflux event either
+  way, and only serves degraded under an explicit
+  `GB_SYNAPSE_ALLOW_CPU_OFFLOAD=1` override.
+- **KV cache VRAM reservation is now measurement-backed, not
+  formula-only.** `estimate_kv_gb()` ran ~2.9x too generous for this
+  release's reference hybrid architecture even with the `n_kv_layers`
+  fix applied. `_persist_kv_measurement()`/`_load_kv_measurement()`
+  (`gb_synapse.py`) cache the real shim-observed KV size per
+  `(model, ctx, kv_type)` in
+  `/var/lib/greenboost/synapse/kv_measurements.json` and feed it into
+  the next serve's reservation. Live-verified at ctx=65536: VRAM fill
+  67-73% to 85.1%, decode 2.6-4.3 to 5.27 tok/s, T2 overflow ~12.1-12.3GB
+  to 10.3GB.
+- **`greenboost clear memory-pool` / `gb clear-memory-pool` now identify
+  leftover inference processes from GB-Dataflux's own record of what
+  GreenBoost started**, instead of matching process names against a
+  fixed pattern list. Shared implementation: `gb_reclaim.py`
+  (`classify_processes`, `plan_reclaim`, `run_reclaim`,
+  `_recent_dataflux_pids`).
 
 ---
 
@@ -351,36 +378,36 @@ workflows, but plenty of fixes you'll notice in production:
 
 ---
 
-## MCP & A2A surface (current — supersedes tool counts quoted in per-version notes above)
+## MCP & A2A surface (current , supersedes tool counts quoted in per-version notes above)
 
 GreenBoost exposes five MCP servers (each registered in `.mcp.json` for a
 fresh clone, or via `greenboost register-mcp` for the installed path) plus
 one A2A gateway. Per-version bullets above (e.g. "grown from 3 tools to 8")
-describe that release's delta only — this section is the live count.
+describe that release's delta only , this section is the live count.
 
 | Server | Entry file | Tools |
 |---|---|---|
-| `greenboost-dataflux` | `gb_dataflux_mcp.py` | 19 — event-log queries (`dataflux_*`), plus mirrored `greenboost_status`/`greenboost_capabilities`/`greenboost_pilot`/`synapse_status`/`tiering_status` |
-| `greenboost-orchestrator` | `gb_mcp.py` | 20 — `greenboost_overview`, `optimize_inference`, `quant_advisor`, `gb_plan` (CB-3 tier-plan), gated actuation (`tier_actuate`, `set_quant_policy`, `run_under_greenboost`, `a2a_gateway`), `shim_env`, the GB-Semantics governed layer (`semantic_metrics`/`semantic_resolve`/`semantic_segments`/`semantic_answer`, backed by `gb_semantics.py`), plus mirrors of the status/capabilities/pilot/synapse_status/cluster_status/dataflux_summary tools (shared impl in `gb_mcp_common.py`) for "one server suffices" |
-| `greenboost-cluster` | `gb_cluster_mcp.py` | 7 — live feeder/VRAM/T2/T3 state, gated `cluster_dispatch`/`cluster_ensure_feeder_ready` |
-| `greenboost-synapse` | `gb_synapse_mcp.py` | 10 — serving control, `synapse_recommend`, gated `serve_and_repoint`, CLI bridge |
-| `greenboost` (CLI) | `greenboost-cli/greenboost_cli/mcp/server.py` | 16 — RAG/goals/history/factory |
+| `greenboost-dataflux` | `gb_dataflux_mcp.py` | 19 , event-log queries (`dataflux_*`), plus mirrored `greenboost_status`/`greenboost_capabilities`/`greenboost_pilot`/`synapse_status`/`tiering_status` |
+| `greenboost-orchestrator` | `gb_mcp.py` | 20 , `greenboost_overview`, `optimize_inference`, `quant_advisor`, `gb_plan` (CB-3 tier-plan), gated actuation (`tier_actuate`, `set_quant_policy`, `run_under_greenboost`, `a2a_gateway`), `shim_env`, the GB-Semantics governed layer (`semantic_metrics`/`semantic_resolve`/`semantic_segments`/`semantic_answer`, backed by `gb_semantics.py`), plus mirrors of the status/capabilities/pilot/synapse_status/cluster_status/dataflux_summary tools (shared impl in `gb_mcp_common.py`) for "one server suffices" |
+| `greenboost-cluster` | `gb_cluster_mcp.py` | 7 , live feeder/VRAM/T2/T3 state, gated `cluster_dispatch`/`cluster_ensure_feeder_ready` |
+| `greenboost-synapse` | `gb_synapse_mcp.py` | 10 , serving control, `synapse_recommend`, gated `serve_and_repoint`, CLI bridge |
+| `greenboost` (CLI) | `greenboost-cli/greenboost_cli/mcp/server.py` | 16 , RAG/goals/history/factory |
 
 **A2A gateway** (`gb_a2a.py`, installed + enabled by Full Install as the
-`greenboost-a2a.service` systemd unit — loopback-only, actuation gate off,
+`greenboost-a2a.service` systemd unit , loopback-only, actuation gate off,
 until an operator opts in): JSON-RPC 2.0 over HTTP, `GET
 /.well-known/agent.json` (legacy AgentCard shape) AND `GET
-/.well-known/agent-card.json` (A2A protocol v0.3 shape — interop with
+/.well-known/agent-card.json` (A2A protocol v0.3 shape , interop with
 ai-forge's `studio/server/a2a_gateway.py`, which serves the same path; see
 `docs/a2a-interop.md`). Loopback-bound by default (`GB_A2A_TOKEN` required
 for a LAN bind). Verbs map 1:1 to `gb_actuation.VERBS` (now including
 `run_under_greenboost`) so MCP and A2A share the same double-gated
-(`confirm=True` + `GB_ORCH_ACTUATE=1`) dispatch — A2A can never actuate
+(`confirm=True` + `GB_ORCH_ACTUATE=1`) dispatch , A2A can never actuate
 anything an MCP tool couldn't. Liveness + recent requests queryable via the
 `a2a_status` tool on `greenboost-dataflux`; unit-level status/restart via
 `a2a_gateway` on `greenboost-orchestrator`.
 
-Keep this table current when a server's tool count changes — see
+Keep this table current when a server's tool count changes , see
 `checks/check_mcp_parity.py` (once landed) for the mechanical version of this
 check.
 
@@ -1609,7 +1636,7 @@ gb_quant.maybe_quantize_from_env(model)
 
 LLMs go through `gb_synapse_fallback.py` (`load_causal_lm` for transformers)
 or, for continuous-batching throughput, gb-synapse's own torch-core engine
-(vendored gLLM — native bf16/GPTQ/AWQ/FP8 quantization at load time, see
+(vendored gLLM , native bf16/GPTQ/AWQ/FP8 quantization at load time, see
 `workflow/gb-synapse.md`). Ollama runs pre-quantized GGUF - there the lever
 is the shim plus the quant level you pull.
 
@@ -1953,12 +1980,12 @@ sudo greenboost debug vitals off
 ### In scripts
 
 Your own generation scripts and wizards can show the extended vitals panel
-when the flag file exists — check for `/etc/greenboost/debug_vitals.enabled`
+when the flag file exists , check for `/etc/greenboost/debug_vitals.enabled`
 and, if present, render an extra panel (e.g. after your normal T1/T2/T3
 progress bars) by reading `/run/greenboost/shim_stats` or
 `/run/greenboost/metrics.json` at your own checkpoints (before/after each
 generation stage is a common choice). This is a convention personalized
-pipelines can opt into — GreenBoost itself doesn't require any particular
+pipelines can opt into , GreenBoost itself doesn't require any particular
 script structure.
 
 ### Typical use cases
