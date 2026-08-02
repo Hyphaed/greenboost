@@ -651,6 +651,42 @@ class LlamaCppBackend(EngineBackend):
         # is undercounted at the exact placement step that matters.
         ssm_gb = gs._entry_ssm_gb(entry)
         kv_total_gb += ssm_gb
+        # Prefer a REAL, shim-measured KV+SSM footprint from a prior serve of
+        # this exact (model, ctx, kv_type) over the formula estimate above —
+        # see gs._persist_kv_measurement()'s docstring for the full story:
+        # this hybrid model's real observed usage measured ~2.9x smaller than
+        # the formula computed (confirmed via direct cudaMalloc interception,
+        # strictly more authoritative than any formula, since
+        # estimate_kv_gb()'s own inputs were independently verified correct
+        # against this model's GGUF metadata — the gap is in llama.cpp's
+        # actual memory layout for this architecture class, not a formula
+        # bug this codebase can fix without deeper llama.cpp-internals
+        # research). No measurement yet (first-ever serve of this signature)
+        # → keeps the formula estimate, which is the safe, conservative
+        # starting point.
+        _measured_kv_mb = gs._load_kv_measurement(entry.name, ctx, kv_type)
+        _kv_reserve_margin = 1.25
+        if _measured_kv_mb:
+            kv_total_gb = _measured_kv_mb / 1024.0
+            # A real measurement earns a tighter margin than an unvalidated
+            # formula guess: confirmed live 2026-08-02 that the formula's
+            # own 25% margin, applied on TOP of an already-inflated estimate,
+            # was blocking Rule #1's front-load split from placing
+            # compute/workspace buffers that request just after the KV
+            # reserve is provisioned (declined by single-digit MB margins
+            # against a reserve sized off a number that had already proven
+            # itself accurate). Confirmed live 2026-08-02: even a 10% margin
+            # (867 MB reserve) still declined the SAME two compute buffers
+            # by single-digit-MB margins, because gb_frontload_split_alloc()
+            # ALSO subtracts its own fill_headroom (the 10%-of-total-VRAM
+            # Rule #1 target) on top of the KV reserve for every allocation
+            # decision, not just the first — a real double-count on
+            # allocations after the primary buffer already hit the 90%
+            # target with exactly that headroom free, but not something to
+            # fix by changing gb_needs_overflow()'s own headroom formula
+            # tonight. 2% still covers real run-to-run KV/SSM variance
+            # without repeating the same overshoot.
+            _kv_reserve_margin = 1.02
         tensor_split = gs._compute_tensor_split(host_free_mb, online_feeders, kv_total_gb)
         if ssm_gb > 0:
             # llama.cpp allocates the whole recurrent-memory buffer as ONE
@@ -658,6 +694,26 @@ class LlamaCppBackend(EngineBackend):
             # cudaMalloc close to the FULL aggregate — pass that (+25%
             # margin, rounded up) rather than trying to divide by layer count.
             env["GREENBOOST_SSM_STATE_MB"] = str(max(1, int(ssm_gb * 1024 * 1.25) + 1))
+        if shim_active and kv_total_gb > 0:
+            # Give the shim the REAL, already-computed KV+SSM footprint for
+            # THIS model/ctx instead of leaving GREENBOOST_KV_RESERVE_MB
+            # unset (the "llm" workload profile in gb_cluster.py never sets
+            # it, so it fell back to the shim's generic, dense-model-sized
+            # default). Root cause found live 2026-08-02: for a hybrid model
+            # whose real KV+SSM need is far smaller than that generic
+            # default (measured: shim's own runtime tracking only ever
+            # accounted for ~788 MB of a 3056 MB nominal reserve), the
+            # OVERSIZED reserve subtracts real headroom from weight
+            # placement DURING model load — the exact point where it
+            # matters — and no runtime fix after that point can undo it: the
+            # shim's KV-reserve collapse only affects FUTURE allocation
+            # decisions, not weight bytes that already committed to T2
+            # before the reserve had any accurate number to work from.
+            # kv_total_gb here already includes both real KV cache and
+            # ssm_gb (line 653); margin is 25% for a formula estimate (same
+            # convention as GREENBOOST_SSM_STATE_MB above) or 10% once a
+            # real measurement is available (see _kv_reserve_margin above).
+            env["GREENBOOST_KV_RESERVE_MB"] = str(max(1, int(kv_total_gb * 1024 * _kv_reserve_margin) + 1))
 
         # Host-memory prompt-cache size: %-derived from LIVE free host RAM
         # (hardcoded-hardware rule: max(small_floor, pct x capacity), never a

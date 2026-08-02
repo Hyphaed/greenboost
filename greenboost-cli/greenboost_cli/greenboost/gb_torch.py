@@ -29,17 +29,32 @@ _GB_SRC_CANDIDATES = [
 def apply_gb_torch_env(diffusion: bool = False) -> None:
     """Set PYTORCH_CUDA_ALLOC_CONF and GreenBoost env vars before CUDA initialises.
 
-    diffusion=True: also zero out GREENBOOST_KV_RESERVE_MB — diffusion models
-    have no LLM-style KV cache so reserving T1 VRAM for it is wasteful.
+    diffusion=True: also disable phase detection and zero out
+    GREENBOOST_KV_RESERVE_MB — diffusion models have no LLM-style KV cache, so
+    GB's phase detector misclassifies their activation buffers as KV cache, and
+    reserving T1 VRAM for a KV cache that will never exist is wasteful.
+
+    Both env vars are diffusion-scoped ONLY. Incident 2026-08-02: this function
+    used to set GREENBOOST_PHASE_DETECT=0 unconditionally (`setdefault`, not
+    gated on `diffusion`), called at CLI import time (`__main__.py`), so it
+    leaked into every subprocess the CLI's os.environ propagated to — including
+    gb-synapse's `llama-server` LLM serves. With phase detection off, the shim
+    never advances past GB_PHASE_INIT (greenboost_cuda_shim.c:2933), so the KV
+    reserve never collapses (:5975/:6019) and KV is never pinned in T1 (:6105):
+    measured live, 3.4 GB of VRAM stranded by a dead reserve, 10.2 GB of
+    weights spilled to T2 DDR that Rule #1 says belongs in VRAM, VRAM fill
+    72.9% instead of ~90%, decode dropping to 2.6-4.3 tok/s. LLM serving
+    NEEDS phase detection on — do not widen this gate again without re-reading
+    that incident.
     """
     # Force plain cudaMalloc so GreenBoost can intercept T1→T2 overflow.
     # garbage_collection_threshold:0.8 reclaims cached memory at 80% capacity.
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
         "expandable_segments:False,garbage_collection_threshold:0.8"
     )
-    # GB's phase detector misclassifies diffusion activation buffers as KV cache.
-    os.environ.setdefault("GREENBOOST_PHASE_DETECT", "0")
     if diffusion:
+        # GB's phase detector misclassifies diffusion activation buffers as KV cache.
+        os.environ.setdefault("GREENBOOST_PHASE_DETECT", "0")
         os.environ.setdefault("GREENBOOST_KV_RESERVE_MB", "0")
 
 

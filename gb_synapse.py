@@ -3206,6 +3206,111 @@ def _verify_placement(entry: ModelEntry, common: dict) -> None:
         pass
 
 
+_KV_MEASUREMENT_PATH = Path(
+    os.environ.get("GB_KV_MEASUREMENT_CACHE",
+                    "/var/lib/greenboost/synapse/kv_measurements.json"))
+
+
+def _kv_measurement_key(model: str, ctx: int, kv_type: str) -> str:
+    return f"{model}::{ctx}::{kv_type}"
+
+
+def _load_kv_measurement(model: str, ctx: int, kv_type: str) -> "float | None":
+    """Real, shim-measured kv_t1_tracked_mb from a PRIOR serve of this exact
+    (model, ctx, kv_type) signature, or None if never measured. See
+    _persist_kv_measurement()'s docstring for why this exists (a formula
+    estimate confirmed ~2.9x too high for a hybrid Gated-DeltaNet
+    architecture, live 2026-08-02) — callers should prefer this over
+    estimate_kv_gb() whenever it's available; a formula estimate is a
+    starting guess for the FIRST-ever serve, real measurement is ground
+    truth for every one after that."""
+    try:
+        data = json.loads(_KV_MEASUREMENT_PATH.read_text())
+    except Exception:
+        return None
+    rec = data.get(_kv_measurement_key(model, ctx, kv_type))
+    if not rec:
+        return None
+    mb = float(rec.get("kv_t1_tracked_mb", 0) or 0)
+    return mb if mb > 0 else None
+
+
+def _save_kv_measurement(model: str, ctx: int, kv_type: str, kv_t1_tracked_mb: float) -> None:
+    try:
+        try:
+            data = json.loads(_KV_MEASUREMENT_PATH.read_text())
+        except Exception:
+            data = {}
+        data[_kv_measurement_key(model, ctx, kv_type)] = {
+            "kv_t1_tracked_mb": kv_t1_tracked_mb,
+            "ts": time.time(),
+        }
+        _KV_MEASUREMENT_PATH.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
+
+
+def _persist_kv_measurement(entry: ModelEntry, common: dict) -> None:
+    """Persist the REAL, shim-measured KV+SSM footprint (kv_t1_tracked_mb)
+    for this exact (model, ctx, kv_type) so future serves can size
+    GREENBOOST_KV_RESERVE_MB — and the tensor-split budget — from
+    measurement instead of estimate_kv_gb()'s formula.
+
+    Why this exists instead of a formula fix: estimate_kv_gb()'s inputs
+    (n_kv_heads, head_dim, n_kv_layers) were independently verified correct
+    against this model's own GGUF metadata (2026-08-02) — key_length=256,
+    value_length=256, head_count_kv=4 all match what the formula used — yet
+    the shim's own cudaMalloc interception (strictly more authoritative than
+    any formula: it sees the real allocation calls) measured a real total
+    kv_t1_tracked_mb of ~788 MB against a formula estimate of ~2270 MB
+    (2.9x), for this hybrid Gated-DeltaNet architecture served with
+    kv_unified=true. Whatever llama.cpp's exact internal memory layout is
+    for this architecture class was not reverse-engineered here — that
+    would need deeper llama.cpp-internals research than is proportionate
+    given a direct, authoritative measurement is already available every
+    time this model is served.
+
+    This isn't just about reserve accuracy in the abstract: an oversized
+    reserve directly blocks Rule #1's front-load VRAM split
+    (gb_frontload_split_alloc() in greenboost_cuda_shim.c) from filling
+    physical VRAM with compute/workspace buffers that request headroom
+    AFTER the KV reserve is provisioned but BEFORE the real KV allocation
+    lands. Confirmed live 2026-08-02 with temporary shim-side diagnostics:
+    a 2176 MB compute buffer was declined front-load treatment (dumped
+    wholesale to T2) because free_vram (4315 MB) fell just 12 MB short of
+    reserved_total (4327 MB) — and kv_reserve alone accounted for 2908 MB
+    of that reservation, for a KV need that turned out to be ~920 MB.
+
+    First-ever serve of a model+ctx+kv_type combination has no measurement
+    yet and keeps using the formula (conservative — matches this codebase's
+    own "overshooting only costs a layer" principle elsewhere); this only
+    takes over from the SECOND serve of the same signature onward."""
+    try:
+        import gb_monitor
+        snap = gb_monitor.snapshot(probe_gpu=False)
+        if not snap.loaded or snap.shim_stale:
+            return
+        shim = snap.shim or {}
+        kv_t1_mb = float(shim.get("kv_t1_tracked_mb", 0) or 0)
+        if kv_t1_mb <= 0:
+            return
+        ctx = int(common.get("ctx") or 0)
+        kv_type = str(common.get("kv_type") or "")
+        if ctx <= 0 or not kv_type:
+            return
+        _save_kv_measurement(entry.name, ctx, kv_type, kv_t1_mb)
+        import gb_dataflux
+        gb_dataflux.emit({
+            "node": "host", "label": "shim", "kind": "shim_transition",
+            "stage": "kv_measurement", "from": "estimate", "to": "measured",
+            "n_items": 0, "items": [], "duration_s": 0.0, "status": "ok",
+            "model": entry.name, "ctx": ctx, "kv_type": kv_type,
+            "kv_t1_tracked_mb": round(kv_t1_mb, 1),
+        })
+    except Exception:
+        pass
+
+
 def _launch_proxy_and_record(entry: ModelEntry, upstream: subprocess.Popen, port: int,
                               internal_port: int, tensor_split: str = "",
                               feeders: list | None = None, engine: str = "",
@@ -3239,6 +3344,7 @@ def _launch_proxy_and_record(entry: ModelEntry, upstream: subprocess.Popen, port
         _check_cache_reuse_support(entry, common)
         if not (feeders or []):
             _verify_placement(entry, common)
+            _persist_kv_measurement(entry, common)
 
     proxy_proc, proxy_error = _start_proxy(entry, port, internal_port, engine)
 
