@@ -266,21 +266,74 @@ def _nvfp4_allowed() -> bool:
     return os.environ.get("GB_ALLOW_NVFP4", "0") == "1"
 
 
+def _triton_version_ok(min_version: "tuple[int, int]" = (3, 8)) -> bool:
+    """True when the installed Triton carries the sm_120 mixed-prec
+    scaled-dot lowering fix (upstream commit d65880ebf2 , "[NVIDIA] Fixed
+    mixed-prec scaled-dot lowering for sm120"). Confirmed present in
+    release/3.8.x and absent from 3.6.x/3.7.x by missing_features.md item
+    (a)'s live experiment this session. Best-effort: any import/parse
+    failure -> False (fail closed, same posture as the crash this guards
+    against)."""
+    try:
+        import triton
+        parts = tuple(int(p) for p in str(triton.__version__).split(".")[:2])
+        return parts >= min_version
+    except Exception:
+        return False
+
+
+def _nvfp4_compileable() -> bool:
+    """Whether the nvfp4 GEMM is safe to even LIST as usable (won't crash the
+    Triton compiler) , NOT whether it should become the automatic default.
+    GB_ALLOW_NVFP4=1 (explicit opt-in) or a fixed Triton (>=3.8) both answer
+    yes here; see _gate_nvfp4 for why "compiles cleanly" and "should be
+    default" are answered independently."""
+    return _nvfp4_allowed() or _triton_version_ok()
+
+
 def _gate_nvfp4(profile: "GpuProfile") -> "GpuProfile":
     """Blackwell's nvfp4 precision routes straight into a documented Triton
-    sm_120 compiler crash (workflow/known-issues.md). gpu_profile()'s own
-    `quality_default`/tiered-mode floor steer new quantize calls into it by
-    default, so this must be filtered in the planner itself, not left as a
-    CLI-only workaround — a fresh Blackwell install must not crash on its
-    first quantize call. Opt back in with GB_ALLOW_NVFP4=1 once a fixed
-    Triton ships."""
-    if "nvfp4" not in profile.precisions or _nvfp4_allowed():
+    sm_120 compiler crash on Triton <3.8 (workflow/known-issues.md).
+    gpu_profile()'s own `quality_default`/tiered-mode floor steer new
+    quantize calls into it by default, so this must be filtered in the
+    planner itself, not left as a CLI-only workaround , a fresh Blackwell
+    install must not crash on its first quantize call.
+
+    Two independent questions, answered separately (missing_features.md item
+    (a), re-verified live this session):
+    1. Is nvfp4 safe to LIST as usable at all? GB_ALLOW_NVFP4=1 or a fixed
+       Triton (>=3.8) both answer yes , stays reachable via an explicit
+       scalar `bits="nvfp4"` call without an unconditional strip.
+    2. Should nvfp4 become the AUTOMATIC default (floor_default /
+       quality_default)? Only GB_ALLOW_NVFP4=1 (explicit user opt-in)
+       answers yes. A merely-fixed Triton does NOT flip the default , the
+       (a) experiment measured fp8 ~9% faster AND higher-fidelity
+       (cosine 0.99967 vs 0.99489) than nvfp4 even with the Triton 3.8 fix
+       applied, so the owner's fp8-default quant-precision policy holds
+       regardless of whether nvfp4 compiles cleanly. Compiling is not
+       winning."""
+    if "nvfp4" not in profile.precisions or not _nvfp4_compileable():
+        if "nvfp4" not in profile.precisions:
+            return profile
+        precisions = tuple(p for p in profile.precisions if p != "nvfp4")
+        floor_default = 4 if profile.floor_default == "nvfp4" else profile.floor_default
+        quality_default = "fp8" if profile.quality_default == "nvfp4" else profile.quality_default
+        return GpuProfile(
+            family=profile.family, cc=profile.cc, precisions=precisions,
+            floor_default=floor_default, quality_default=quality_default,
+            t2_tolerance_gb=profile.t2_tolerance_gb,
+        )
+    if _nvfp4_allowed():
+        # Explicit full opt-in , nvfp4 stays the default too.
         return profile
-    precisions = tuple(p for p in profile.precisions if p != "nvfp4")
+    # Triton is new enough to compile nvfp4 safely, but the (a) policy
+    # verdict keeps fp8 as the AUTOMATIC default , demote floor/quality
+    # only, keep nvfp4 IN precisions (it compiles now, so no need to hide it
+    # from an explicit scalar call).
     floor_default = 4 if profile.floor_default == "nvfp4" else profile.floor_default
     quality_default = "fp8" if profile.quality_default == "nvfp4" else profile.quality_default
     return GpuProfile(
-        family=profile.family, cc=profile.cc, precisions=precisions,
+        family=profile.family, cc=profile.cc, precisions=profile.precisions,
         floor_default=floor_default, quality_default=quality_default,
         t2_tolerance_gb=profile.t2_tolerance_gb,
     )
@@ -517,6 +570,9 @@ class QualityFitReport:
     max_rel_err: float                     # worst-case calibrated error
     # breakdown: {bits: count_of_layers}
     precision_histogram: Dict[str, int] = field(default_factory=dict)
+    # "greedy" (default per-layer ladder walk) or "dp" (GB_QUANT_DP_PLAN=1 ,
+    # global budget-constrained knapsack, see gb_quant_dp.plan_bits_dp).
+    planner: str = "greedy"
 
     def __str__(self) -> str:
         hist_str = "  ".join(
@@ -976,6 +1032,76 @@ def plan_fit(obj, budget_gb: float,
     return report
 
 
+def preflight_fit(obj, budget_gb: "float | None" = None,
+                  components: "tuple[str, ...] | None" = None,
+                  skip_components=_DEFAULT_SKIP_COMPONENTS,
+                  prefer_bits: "int | str" = 4,
+                  tiered: "Optional[bool]" = None,
+                  verbose: bool = False, emit: bool = True) -> Dict[str, object]:
+    """Preflight, side-effect-free byte-count query , "how much T1/T2 will
+    THIS quantization plan actually need", answered BEFORE any GPU allocation
+    happens (missing_features.md item (h); modelled on DLSS's
+    NVSDK_NGX_*_GetScratchBufferSize pattern: ask for the exact size first,
+    don't allocate heuristically and correct after the fact).
+
+    Pure wrapper around `plan_fit` , no new estimation math. `plan_fit` was
+    already side-effect-free (it never touches a GPU tensor), so this is
+    purely a named surface + a dict shape callers can act on without
+    constructing a FitReport themselves. budget_gb=None derives the budget
+    from THIS node's VROM via `_auto_budgets()`, same as `quantize_to_fit`.
+
+    Returns:
+      {"budget_gb", "total_bf16_gb", "total_quant_gb", "fits",
+       "t1_gb", "t2_overflow_gb", "headroom_gb", "per_component": [...]}
+    per_component entries are {"name", "params", "bf16_gb", "bits", "quant_gb"}.
+    """
+    if budget_gb is None:
+        budget_gb = _auto_budgets()[0]
+        if verbose:
+            print(f"[gb_quant] preflight_fit: auto budget T1={budget_gb:.1f} GiB",
+                 flush=True)
+    report = plan_fit(obj, budget_gb, components=components,
+                      skip_components=skip_components, prefer_bits=prefer_bits,
+                      tiered=tiered)
+    t1_gb = min(report.total_quant_gb, budget_gb)
+    result = {
+        "budget_gb": round(budget_gb, 2),
+        "total_bf16_gb": report.total_bf16_gb,
+        "total_quant_gb": report.total_quant_gb,
+        "fits": report.fits_vram,
+        "t1_gb": round(t1_gb, 2),
+        "t2_overflow_gb": round(report.needs_t2_overflow_gb, 2),
+        "headroom_gb": round(max(0.0, budget_gb - report.total_quant_gb), 2),
+        "per_component": [
+            {"name": c.name, "params": c.params, "bf16_gb": c.bf16_gb,
+             "bits": _bits_tag(c.bits), "quant_gb": c.quant_gb}
+            for c in report.components
+        ],
+    }
+    if verbose:
+        print(str(report), flush=True)
+    if not emit:
+        return result
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({
+            "node": "host", "label": "gb_quant", "kind": "quant_plan",
+            "n_items": len(report.components),
+            "items": [c.name for c in report.components],
+            "duration_s": 0.0, "status": "ok", "dry_run": True,
+            "target": None, "error_ceiling": None,
+            "precision_histogram": {}, "bf16_kept": 0,
+            "mean_rel_err": 0.0, "max_rel_err": 0.0,
+            "budget_gb": result["budget_gb"],
+            "total_quant_gb": result["total_quant_gb"],
+            "total_bf16_gb": result["total_bf16_gb"],
+            "fits": result["fits"],
+        })
+    except Exception:
+        pass
+    return result
+
+
 def quantize_to_fit(obj, budget_gb: "float | None" = None, device: str = "cuda",
                     dtype=None, components: "tuple[str, ...] | None" = None,
                     group_size: int = 64, allow_t3: bool = False,
@@ -1048,6 +1174,12 @@ def quantize_to_fit(obj, budget_gb: "float | None" = None, device: str = "cuda",
             if verbose:
                 print(f"[gb_quant] placement skipped ({e!r})", flush=True)
 
+    if verbose:
+        _pf = preflight_fit(obj, budget_gb, components=components,
+                            prefer_bits=prefer_bits, verbose=False, emit=False)
+        print(f"[gb_quant] preflight: fits={_pf['fits']} "
+             f"t2_overflow={_pf['t2_overflow_gb']:.1f} GiB "
+             f"headroom={_pf['headroom_gb']:.1f} GiB", flush=True)
     report = plan_fit(obj, budget_gb, components=components,
                       prefer_bits=prefer_bits)
     report.placement = _placement
@@ -1156,6 +1288,7 @@ def plan_quality(module: "torch.nn.Module",
     per_layer_bits: Dict[str, object] = {}
     layer_sizes: Dict[str, int] = {}
     layer_errs_used: List[float] = []
+    layer_in_features: Dict[str, int] = {}
 
     for name, layer in module.named_modules():
         if not isinstance(layer, nn.Linear):
@@ -1170,6 +1303,7 @@ def plan_quality(module: "torch.nn.Module",
 
         n_params = layer.weight.numel()
         layer_sizes[name] = n_params
+        layer_in_features[name] = in_f
 
         if target == "compact":
             bits = profile.floor_default
@@ -1217,6 +1351,42 @@ def plan_quality(module: "torch.nn.Module",
         if bits != 16 and name in sensitivity and bits in sensitivity[name]:
             layer_errs_used.append(sensitivity[name][bits])
 
+    # Opt-in DP planner (missing_features.md item (c), GB_QUANT_DP_PLAN=1):
+    # replace the greedy per-layer ladder walk above with a global,
+    # budget-constrained knapsack over the SAME (layer_sizes, sensitivity)
+    # inputs , lets a low-sensitivity layer trade down to buy a
+    # high-sensitivity layer more precision within one fixed total budget,
+    # which the greedy walk (each layer decided independently against its
+    # own error ceiling) cannot do. "compact" has no error budget to trade
+    # against (every layer already goes to the floor), so DP is skipped
+    # there regardless of the env var , nothing to optimize.
+    planner_used = "greedy"
+    if target != "compact" and os.environ.get("GB_QUANT_DP_PLAN") == "1" and per_layer_bits:
+        try:
+            import gb_quant_dp
+            candidates = tuple(
+                b for b in profile.calibrated_precisions if b != 16) + (16,)
+            excluded = {n: (4,) for n, in_f in layer_in_features.items()
+                       if in_f % group_size != 0}
+            dp_result = gb_quant_dp.plan_bits_dp(
+                sensitivity, {n: layer_sizes[n] for n in per_layer_bits},
+                _BYTES_PER_PARAM, budget_gb=t1_budget_gb + t2_budget_gb,
+                candidates=candidates, excluded=excluded)
+            if dp_result["feasible"]:
+                per_layer_bits = dp_result["per_layer_bits"]
+                layer_errs_used = [
+                    sensitivity[n][b] for n, b in per_layer_bits.items()
+                    if b != 16 and n in sensitivity and b in sensitivity[n]
+                ]
+                planner_used = "dp"
+            elif verbose:
+                print("[gb_quant] GB_QUANT_DP_PLAN=1: no combination fits "
+                     f"budget {t1_budget_gb + t2_budget_gb:.1f} GiB , "
+                     "falling back to the greedy ladder walk", flush=True)
+        except Exception as e:  # never let an opt-in planner break plan_quality
+            if verbose:
+                print(f"[gb_quant] GB_QUANT_DP_PLAN=1 skipped ({e!r})", flush=True)
+
     # T1 / T2 split estimate.
     # Priority: smallest quantized layers first → fill T1; BF16 + overflow → T2.
     t1_run = 0.0
@@ -1253,6 +1423,7 @@ def plan_quality(module: "torch.nn.Module",
         mean_rel_err=round(mean_err, 5),
         max_rel_err=round(max_err, 5),
         precision_histogram=hist,
+        planner=planner_used,
     )
     if verbose:
         print(str(report), flush=True)
@@ -1266,6 +1437,7 @@ def plan_quality(module: "torch.nn.Module",
             "precision_histogram": hist,
             "bf16_kept": hist.get("bf16", 0),
             "mean_rel_err": round(mean_err, 5), "max_rel_err": round(max_err, 5),
+            "planner": planner_used,
         })
     except Exception:
         pass

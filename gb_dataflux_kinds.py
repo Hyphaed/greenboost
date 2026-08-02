@@ -88,8 +88,8 @@ KINDS: dict[str, KindSpec] = {
         group="quant", doc="Whole-pipeline quantize-to-fit decision.",
         numeric_fields=("budget_gb", "actual_gb")),
     "quant_plan": KindSpec(
-        group="quant", doc="gb_quant.plan_quality()'s per-layer bit-assignment plan (tier, ceiling, precision histogram, bf16-kept count).",
-        fields=("target", "error_ceiling", "precision_histogram", "bf16_kept"),
+        group="quant", doc="gb_quant.plan_quality()'s per-layer bit-assignment plan (tier, ceiling, precision histogram, bf16-kept count), or gb_quant.preflight_fit()'s side-effect-free component-level byte-count query (dry_run=True, no GPU allocation).",
+        fields=("target", "error_ceiling", "precision_histogram", "bf16_kept", "dry_run", "planner"),
         numeric_fields=("mean_rel_err", "max_rel_err")),
     "turboquant_activate": KindSpec(
         group="quant", doc="TurboQuant K/V attention compression activated (bits, mode, device).",
