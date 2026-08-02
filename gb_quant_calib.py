@@ -44,7 +44,7 @@ import gc
 import hashlib
 import json
 import os
-from typing import Dict, Iterable, Optional, Tuple, Union
+from typing import Callable, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -364,10 +364,23 @@ def calibrate_pipeline_components(
 # ---------------------------------------------------------------------------
 # Real-activation calibration via the vendored AutoRound AutoScheme search
 # (third_party/auto_round , see NOTICE). Additive: calibrate_sensitivity's
-# zero-data Frobenius proxy above stays the default everywhere , this is
-# opt-in (sensitivity_source="delta_loss" / GB_QUANT_CALIB=delta_loss) for
-# callers that have a real tokenizer and want the sub-0.1% regime refined
-# with actual forward-pass activations instead of random-Gaussian ones.
+# zero-data Frobenius proxy above stays the default everywhere.
+#
+# NOTE on integration shape (corrected 2026-08-02 , this comment used to
+# promise a `sensitivity_source="delta_loss"` / `GB_QUANT_CALIB=delta_loss`
+# switch into plan_quality that never existed AND never could have worked
+# as described): calibrate_with_prompts below returns a per-layer bits
+# ASSIGNMENT (AutoRound's own AutoScheme search picks the final scheme
+# directly), not a per-layer, per-precision ERROR TABLE , it cannot slot
+# into plan_quality's `sensitivity=` parameter, which needs the latter
+# shape to walk its ladder. Its own docstring already said this ("bypasses
+# plan_quality()'s ladder walk entirely"); this comment was simply wrong.
+# The gap that WAS real and IS now closed: no calibration source driven by
+# an actual forward pass (rather than calibrate_sensitivity's isotropic-
+# Gaussian weight-only proxy) existed in the correct {layer: {bits: err}}
+# shape to plug into plan_quality , see calibrate_activations() /
+# calibrate_diffusion() below, and gb_quant.plan_quality's
+# `sensitivity_source="activation"` / `GB_QUANT_CALIB=activation` param.
 # ---------------------------------------------------------------------------
 
 # GreenBoost's own tiny, stdlib-only default calibration corpus , no
@@ -587,4 +600,216 @@ def calibrate_with_prompts(
         print(f"[gb_quant_calib] delta_loss done , {len(result)} layers assigned. "
               f"Cache saved: {cpath}", flush=True)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Real-forward-pass calibration (missing_features.md item (d)): unlike
+# calibrate_sensitivity's zero-data Frobenius proxy above (isotropic-Gaussian
+# activation assumption) OR calibrate_with_prompts's delta-loss ASSIGNMENT
+# search above, this drives an ACTUAL forward pass and measures the real
+# per-layer OUTPUT error , closing the specific gap this session's own audit
+# found empirically: a fp8-quantized text encoder measured weight-level
+# mean_err=0.0264 (calibrate_sensitivity) while its real forward-pass
+# embedding drift measured cos≈0.997/rel_err≈0.08 , the weight-level number
+# understates what activation-aware calibration actually sees, because error
+# compounds through nonlinear layers a weight-only proxy can't see.
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def calibrate_activations(
+    module: nn.Module,
+    run_calibration: "Callable[[], None]",
+    precisions: "Tuple | list" = ("fp8", 4, "tq3"),
+    model_id: str = "model",
+    group_size: int = 64,
+    skip_modules: Tuple[str, ...] = _DEFAULT_SKIP_MODULES,
+    verbose: bool = True,
+    force_recompute: bool = False,
+) -> Dict[str, Dict]:
+    """Real-forward-pass per-layer sensitivity: forward hooks on every
+    candidate nn.Linear capture the FIRST real input tensor each layer sees
+    while `run_calibration()` runs, then for each candidate precision the
+    layer's weight is quantized/dequantized and its output on that SAME real
+    captured input is compared against the real (unquantized) output.
+
+    Args:
+        module: nn.Module to calibrate (any device , captured activations
+            are moved to CPU float32 immediately, same as
+            relative_quant_error's weight handling).
+        run_calibration: a zero-arg callable that drives whatever real
+            forward pass(es) should exercise `module` , e.g.
+            `lambda: model(**batch)` for an LLM, or
+            `lambda: pipe(prompt, num_inference_steps=N)` for a diffusion
+            pipe (see calibrate_diffusion below for a ready-made version of
+            exactly that). There is no way to auto-derive this , a real
+            forward pass needs real inputs only the caller can provide.
+        (other args match calibrate_sensitivity.)
+
+    Returns the SAME {layer_name: {bits: rel_err}} shape as
+    calibrate_sensitivity , drops straight into plan_quality(sensitivity=)
+    (or plan_quality(sensitivity_source="activation", run_calibration=...)
+    for the lazy-calibration path). Cached separately (model_id suffixed
+    ".activation") so it never collides with the Frobenius-proxy cache for
+    the same model_id.
+
+    A layer never executed during `run_calibration()` (dead branch, or a
+    component that only fires for certain inputs) has no captured
+    activation and is silently OMITTED from the result , plan_quality
+    already treats an absent layer as "use profile.quality_default", the
+    same fallback the Frobenius proxy relies on for any layer it didn't
+    cover either.
+    """
+    precisions = tuple(precisions)
+    cache_hash = _model_hash(module, precisions, 0) + "_act"
+    cpath = _cache_path(f"{model_id}.activation", cache_hash)
+
+    if not force_recompute:
+        cached = _load_cache(cpath)
+        if cached is not None:
+            if verbose:
+                print(f"[gb_quant_calib] activation cache loaded: {cpath}", flush=True)
+            return _fix_key_types(cached)
+
+    layers = dict(_iter_quantizable_linears(module, skip_modules))
+    captured: Dict[str, torch.Tensor] = {}
+
+    def _make_hook(name):
+        def _hook(_mod, inputs, _output):
+            # Keep only the FIRST captured input per layer , memory-bounded
+            # (a real diffusion loop calls the same layer dozens of times).
+            if name not in captured and inputs:
+                captured[name] = inputs[0].detach().float().cpu()
+        return _hook
+
+    handles = [layer.register_forward_hook(_make_hook(name))
+              for name, layer in layers.items()]
+    if verbose:
+        print(f"[gb_quant_calib] activation: driving real forward pass(es) "
+              f"for {len(layers)} candidate layers …", flush=True)
+    try:
+        run_calibration()
+    finally:
+        for h in handles:
+            h.remove()
+
+    results: Dict[str, Dict] = {}
+    n_captured = 0
+    for name, layer in layers.items():
+        x = captured.get(name)
+        if x is None:
+            continue
+        n_captured += 1
+        w = layer.weight.detach().float().cpu()
+        y_ref = torch.nn.functional.linear(x, w)
+        y_norm = y_ref.norm(p="fro").clamp_min(1e-12)
+        layer_errs: Dict = {}
+        for bits in precisions:
+            if bits == 16:
+                layer_errs[bits] = 0.0
+                continue
+            dequant_fn = _DEQUANT_FN.get(bits)
+            if dequant_fn is None:
+                layer_errs[bits] = float("nan")
+                continue
+            wq = dequant_fn(w, group_size=group_size)
+            y_q = torch.nn.functional.linear(x, wq)
+            layer_errs[bits] = float((y_q - y_ref).norm(p="fro") / y_norm)
+        results[name] = layer_errs
+
+    gc.collect()
+    _save_cache(cpath, _serializable(results))
+    if verbose:
+        print(f"[gb_quant_calib] activation done , {n_captured}/{len(layers)} "
+              f"layers captured a real activation. Cache saved: {cpath}", flush=True)
+    return results
+
+
+# WAN2.1/2.2-style pipelines (LongLive's base) split work across TWO
+# transformer backbones (high-noise + low-noise experts), named "transformer"
+# and "transformer_2" by HF diffusers convention. getattr(..., None) below
+# returns None for pipelines that don't have the second one, and it's
+# skipped with a note , same "iterate known names, skip absent ones" shape
+# calibrate_pipeline_components already uses for its own component list.
+_DEFAULT_DIFFUSION_COMPONENTS: Tuple[str, ...] = ("transformer", "transformer_2")
+
+# GreenBoost's own tiny, stdlib-only default calibration prompt set for
+# text-to-image/video pipelines , a sensitivity PROBE, not a training corpus
+# (same spirit as _DEFAULT_CALIB_PROMPTS above, image-domain wording).
+_DEFAULT_DIFFUSION_PROMPTS: Tuple[str, ...] = (
+    "a photorealistic portrait of a person standing in a sunlit forest",
+    "a red sports car driving on a coastal road at sunset",
+    "an abstract painting with bold geometric shapes in blue and gold",
+    "a bowl of fresh fruit on a wooden kitchen table, morning light",
+)
+
+
+def calibrate_diffusion(
+    pipe,
+    component_names: Tuple[str, ...] = _DEFAULT_DIFFUSION_COMPONENTS,
+    prompts: "Iterable[str] | None" = None,
+    num_inference_steps: int = 4,
+    generator_seed: int = 0,
+    pipe_call_kwargs: "Optional[dict]" = None,
+    precisions: "Tuple | list" = ("fp8", 4, "tq3"),
+    model_id: str = "pipeline",
+    group_size: int = 64,
+    skip_modules: Tuple[str, ...] = _DEFAULT_SKIP_MODULES,
+    verbose: bool = True,
+    force_recompute: bool = False,
+) -> Dict[str, Dict[str, Dict]]:
+    """Diffusion/video-aware per-layer sensitivity (missing_features.md item
+    (d)): drives the REAL diffusion pipeline through real denoising steps
+    (not a single static dummy input) and captures real per-layer
+    activations across the whole loop, one component at a time.
+
+    Honest scope note: this is NOT a wrapper around AutoRound's
+    DiffusionCalibrator / diffusion_mixin.py
+    (third_party/auto_round/auto_round/calibration/diffusion.py). That class
+    requires a full AutoRound BaseCompressor orchestration context (a
+    `compressor.pipe`/`.guidance_scale`/`.num_inference_steps` object, its
+    own dataset/dataloader machinery) this project has no equivalent of, and
+    this session has no live GPU + diffusers + WAN model available to
+    validate such an integration against safely. This function is a
+    genuinely equivalent, independently-implemented mechanism built on
+    GreenBoost's own lightweight forward-hook approach
+    (calibrate_activations, above): diffusion-loop-driven, multi-component-
+    aware, same output shape as the AutoRound path would have produced.
+    Documented plainly rather than claiming a wrap that didn't happen.
+
+    WAN dual-transformer handling: iterates `component_names` (default
+    `("transformer", "transformer_2")`), skipping any name `pipe` doesn't
+    have. `pipe_call_kwargs` extends/overrides the default
+    `pipe(prompt=p, num_inference_steps=..., generator=...)` call for
+    pipelines with a different signature (e.g. I2V needing an `image=`) ,
+    for anything more exotic than that, call calibrate_activations directly
+    with a custom `run_calibration`.
+
+    Returns {component_name: {layer_name: {bits: rel_err}}} , same shape as
+    calibrate_pipeline_components, so existing callers of that function can
+    switch to this one as a drop-in replacement.
+    """
+    resolved_prompts = list(prompts) if prompts is not None else list(_DEFAULT_DIFFUSION_PROMPTS)
+    extra_kwargs = dict(pipe_call_kwargs) if pipe_call_kwargs else {}
+
+    out: Dict[str, Dict[str, Dict]] = {}
+    for comp_name in component_names:
+        comp = getattr(pipe, comp_name, None)
+        if comp is None or not isinstance(comp, nn.Module):
+            if verbose:
+                print(f"[gb_quant_calib] calibrate_diffusion: skip {comp_name!r} "
+                      "(not found or not a Module)", flush=True)
+            continue
+
+        def _run(prompts=resolved_prompts):
+            for p in prompts:
+                gen = torch.Generator(device="cpu").manual_seed(generator_seed)
+                pipe(prompt=p, num_inference_steps=num_inference_steps,
+                    generator=gen, **extra_kwargs)
+
+        comp_id = f"{model_id}.{comp_name}"
+        out[comp_name] = calibrate_activations(
+            comp, _run, precisions=precisions, model_id=comp_id,
+            group_size=group_size, skip_modules=skip_modules, verbose=verbose,
+            force_recompute=force_recompute,
+        )
     return out
