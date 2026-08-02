@@ -28,7 +28,7 @@ from greenboost_cli.inference.router import generate, StreamFragment, ReasoningF
 _DEFAULT_MAX_TURNS   = 50
 _REPEAT_LIMIT        = 3   # same tool+args repeated this many times → stop
 _CONSEC_ERROR_LIMIT  = 4   # this many consecutive Denied/ERROR results → stop
-_INTENT_NUDGE_CAP    = 1   # at most this many "you said you would, now do it" nudges
+_INTENT_NUDGE_CAP    = 2   # at most this many "you said you would, now do it" nudges
 
 # Matches a model announcing a build/task ("I'll build X", "Let me create Y")
 # without having called any tool yet. Narrow on purpose: two-part match
@@ -38,12 +38,31 @@ _INTENT_NUDGE_CAP    = 1   # at most this many "you said you would, now do it" n
 # whose entire output was an intent paragraph ("I'll build a complete Snake
 # game in Godot 4...") with zero tool calls — the loop treated it as a
 # finished answer and stopped, having written nothing.
+#
+# Widened 2026-08-02: the verb list originally only covered *productive*
+# verbs (build/create/write/...), so it missed the investigative hand-off
+# that actually caused the next incident — turn 3 of a Godot Snake-game
+# session ended on "I'll check what's in the godot directory and find how
+# to run Godot on this machine." (30 tokens, clean EOS per llama-server's
+# own log, no tool call) and the loop accepted it as a finished answer. Added
+# check/find/look/inspect/examine/explore/read/see/verify/search. The gate
+# below was also widened from turn_count==1-only to any turn (bounded by a
+# short-reply length check + the nudge cap above), since this incident fired
+# on turn 3, not turn 1.
 _INTENT_RE = re.compile(
     r"\b(I'?ll|I will|Let me|I'?m going to|I am going to)\b"
     r"[^.\n]{0,120}\b(build|create|write|implement|develop|generate|"
-    r"set up|scaffold|start (building|working|coding))\b",
+    r"set up|scaffold|start (building|working|coding)|"
+    r"check|find|look|inspect|examine|explore|read|see|verify|search)\b",
     re.IGNORECASE,
 )
+
+# A terse forward-looking sentence ("I'll check X.") is a hand-off with
+# nothing done yet; a long reply that happens to contain "I'll check" partway
+# through is very likely a real, substantive answer. Gates the any-turn
+# intent-nudge below so it can't misfire on legitimate long-form answers now
+# that the verb list includes common narrative words like "check"/"look".
+_INTENT_NUDGE_MAX_LEN = 400
 
 
 def _capped_mcp_schemas(mcp_schemas: list, settings: dict) -> list:
@@ -415,14 +434,17 @@ def execute_turn(
                 break
 
             # ── Intent without action ────────────────────────────────────
-            # First model turn this invocation (turn_count == 1, i.e. no
-            # tool has been called yet at all) reads as "I'll build/create/
-            # write X" but called no tool. Narrow and bounded (see
-            # _INTENT_RE / _INTENT_NUDGE_CAP above) so ordinary short Q&A
-            # answers ("What's 2+2?" -> "4") are never touched — those don't
-            # match the intent phrasing, and a turn past the first no longer
-            # qualifies (the model has had its chance to act).
-            if (turn_count == 1 and _intent_nudges < _INTENT_NUDGE_CAP
+            # A model turn reads as "I'll build/create/check/find X" but
+            # called no tool. Bounded by three independent guards (see
+            # _INTENT_RE / _INTENT_NUDGE_CAP / _INTENT_NUDGE_MAX_LEN above)
+            # so ordinary answers are never touched: the phrasing must match,
+            # the reply must be short (a genuine long-form answer that happens
+            # to contain "I'll check" isn't a stalled hand-off), and this can
+            # fire at most _INTENT_NUDGE_CAP times per invocation. Originally
+            # gated to turn_count == 1 only — widened 2026-08-02 after a real
+            # stall on turn 3 (see _INTENT_RE's comment).
+            if (_intent_nudges < _INTENT_NUDGE_CAP
+                    and len(completed.text.strip()) < _INTENT_NUDGE_MAX_LEN
                     and _INTENT_RE.search(completed.text)):
                 _intent_nudges += 1
                 session.messages.append({

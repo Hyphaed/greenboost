@@ -937,6 +937,15 @@ def shim_env(workload: str = "diffusion", enabled: bool = True,
                              f"one of {sorted(_WORKLOAD_PROFILES)}")
         for k, v in profile.items():
             env.setdefault(k, v)
+        if workload in ("llm", "ggml"):
+            # Hard override, not setdefault: phase detection is what collapses
+            # the KV reserve (greenboost_cuda_shim.c:5975/:6019) and pins KV in
+            # T1 (:6105) — see gb_torch.py's apply_gb_torch_env() docstring.
+            # A parent process that exported PHASE_DETECT=0 for an earlier
+            # diffusion workload in the same shell must not silently strand
+            # ~3 GB of VRAM in an LLM serve (incident 2026-08-02, measured:
+            # 72.9% VRAM fill instead of ~90%, 2.6-4.3 tok/s decode).
+            env["GREENBOOST_PHASE_DETECT"] = "1"
         if workload in _T2_POOL_WORKLOADS:
             # %-of-MemTotal, computed per call on the executing node (rule).
             env.setdefault("GREENBOOST_HOST_RAM_SAFETY_MB",

@@ -182,6 +182,10 @@ class SnapshotRecorder:
         self._prev_t3_active = None
         self._prev_t2_bucket = None
         self._prev_rule1_underfill = None
+        # rule1_underfill re-emit throttle (see _detect_transitions) , a
+        # persistent violation must stay visible in a dataflux time window,
+        # not just fire once on the edge and scroll away.
+        self._rule1_underfill_last_emit_ts = 0.0
         # Per-tier decision tracking , the shim already exports monotonic
         # per-tier alloc counts + lifetime bytes to /run/greenboost/shim_stats.
         # We diff them each poll and emit one `shim_decision` event per tier
@@ -258,6 +262,19 @@ class SnapshotRecorder:
         rule1_underfill = (
             (getattr(m, "fb_phys_used_pct", 0.0) < 85.0 and _overflow_active)
             if _phys_total else None)
+
+        def _emit_shim_transition(field: str, frm, to, status: str) -> None:
+            emit({
+                "node": node, "label": "shim", "kind": "shim_transition",
+                "stage": field, "from": frm, "to": to,
+                "n_items": 0, "items": [], "duration_s": 0.0,
+                "status": status,
+                "t2_pressure": (gb.t2_pressure if gb else 0),
+                "t3_used_mb": (gb.t3_used_mb if gb else 0),
+                "fb_used_pct": round(getattr(m, "fb_used_pct", 0.0), 1),
+                "fb_phys_used_pct": round(getattr(m, "fb_phys_used_pct", 0.0), 1),
+            })
+
         for field, prev_attr, frm, to, status in (
             ("shim_phase", "_prev_phase", self._prev_phase, phase, "ok"),
             ("t3_spill", "_prev_t3_active",
@@ -266,9 +283,6 @@ class SnapshotRecorder:
             ("t2_pressure", "_prev_t2_bucket", self._prev_t2_bucket, t2_bucket,
              "error" if t2_bucket == "critical" else
              "warn" if t2_bucket == "warn" else "ok"),
-            ("rule1_underfill", "_prev_rule1_underfill",
-             self._prev_rule1_underfill, rule1_underfill,
-             "warn" if rule1_underfill else "ok"),
         ):
             if to == "" or to is None:
                 continue
@@ -277,16 +291,36 @@ class SnapshotRecorder:
                 continue
             if to != frm:
                 setattr(self, prev_attr, to)
-                emit({
-                    "node": node, "label": "shim", "kind": "shim_transition",
-                    "stage": field, "from": frm, "to": to,
-                    "n_items": 0, "items": [], "duration_s": 0.0,
-                    "status": status,
-                    "t2_pressure": (gb.t2_pressure if gb else 0),
-                    "t3_used_mb": (gb.t3_used_mb if gb else 0),
-                    "fb_used_pct": round(getattr(m, "fb_used_pct", 0.0), 1),
-                    "fb_phys_used_pct": round(getattr(m, "fb_phys_used_pct", 0.0), 1),
-                })
+                _emit_shim_transition(field, frm, to, status)
+
+        # rule1_underfill , handled separately from the generic loop above:
+        # unlike the other three fields, a first observation of True is not
+        # benign , it means the recorder started (or a serve began) already
+        # in violation, and the generic seed-suppress would hide exactly that.
+        # Real incident 2026-08-02: this tripwire exists specifically to catch
+        # a stuck-in-GB_PHASE_INIT shim underfilling VRAM (see gb_torch.py's
+        # apply_gb_torch_env), and because the recorder had already seeded
+        # True before this fix, it emitted ZERO shim_transition events across
+        # a full day while the violation ran the whole time. Also re-emits on
+        # a throttle while the violation persists (not just on the edges), so
+        # it stays visible in a dataflux time window instead of being a single
+        # event that ages out.
+        if rule1_underfill is not None:
+            _RULE1_REEMIT_S = 300.0
+            now = time.time()
+            if self._prev_rule1_underfill is None:
+                self._prev_rule1_underfill = rule1_underfill
+                if rule1_underfill:
+                    _emit_shim_transition("rule1_underfill", False, True, "warn")
+                    self._rule1_underfill_last_emit_ts = now
+            elif rule1_underfill != self._prev_rule1_underfill:
+                _emit_shim_transition("rule1_underfill", self._prev_rule1_underfill,
+                                       rule1_underfill, "warn" if rule1_underfill else "ok")
+                self._prev_rule1_underfill = rule1_underfill
+                self._rule1_underfill_last_emit_ts = now
+            elif rule1_underfill and (now - self._rule1_underfill_last_emit_ts) >= _RULE1_REEMIT_S:
+                _emit_shim_transition("rule1_underfill", True, True, "warn")
+                self._rule1_underfill_last_emit_ts = now
 
     # Tier key → (event tier label, reason, status). t1_local (the desired
     # in-VRAM case) is intentionally excluded , we only trace the spill/overflow

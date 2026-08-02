@@ -2576,6 +2576,50 @@ private:
                     slot->prompt.clear();
                     slot->prompt.tokens.insert(tokens);
 
+                    // GreenBoost patch 2026-08-02: seed a checkpoint covering the
+                    // full restored range. Without this, a restored slot can never
+                    // produce a cache hit on the very next request for
+                    // hybrid/recurrent-memory or SWA models: the prefix-reuse
+                    // decision below (search for "forcing full prompt
+                    // re-processing due to lack of cache data") requires a
+                    // checkpoint whose [pos_min, pos_max] covers the resume point,
+                    // and SLOT_SAVE never persists slot->prompt.checkpoints while
+                    // SLOT_RESTORE's slot->prompt.clear() above discards whatever
+                    // was there — so a freshly restored slot always has zero
+                    // checkpoints and always forces a full reprocess, even though
+                    // llama_state_seq_load_file above genuinely already restored
+                    // the real KV/recurrent memory. Confirmed live: save → full
+                    // process restart → restore → byte-identical request →
+                    // cache_n: 0, prompt_ms unchanged from cold. This mirrors
+                    // create_checkpoint()'s own construction (same
+                    // llama_memory_seq_pos_min/max query it uses, so the range is
+                    // measured from the real just-restored memory, not guessed),
+                    // but is NOT a call to create_checkpoint() itself — that
+                    // function unconditionally dereferences slot.task->id, valid
+                    // only mid-generation; a slot being restored is required to be
+                    // idle (see the is_processing() check above), so slot->task is
+                    // not a live task here. data_dft/data_spec are deliberately
+                    // left empty: only ctx_tgt's per-sequence state was restored
+                    // by llama_state_seq_load_file above (the slot save/restore
+                    // file format does not cover the draft/MTP model's context at
+                    // all), so capturing ctx_dft's current state here would stash
+                    // stale, unrelated data under this checkpoint. load_dft() is a
+                    // documented no-op on an empty data_dft, so this is exactly as
+                    // safe as "no draft state to reuse yet" — the same state any
+                    // slot has before its first checkpoint of a new conversation.
+                    if (token_count > 0) {
+                        const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot->id);
+                        const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
+                        if (pos_min >= 0) {
+                            auto & cp = slot->prompt.checkpoints.emplace_back();
+                            cp.id_task = -1;
+                            cp.update_pos((int64_t) token_count, pos_min, pos_max);
+                            cp.update_tgt(ctx_tgt, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            SLT_TRC(*slot, "seeded restore checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                                    cp.pos_min, cp.pos_max, cp.n_tokens, (float) cp.size() / 1024 / 1024);
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
 

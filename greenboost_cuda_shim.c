@@ -2994,8 +2994,26 @@ static uint32_t gb_phase_classify(size_t bytesize)
         atomic_store_explicit(&g_last_overflow_ms, now_ms, memory_order_relaxed);
 
         /* A new large quiet-gap alloc in INFERENCE could be a model reload;
-         * reset to MODEL_LOAD if we see a burst after a long gap. */
-        if (gap_ms >= 5000ULL && bytesize < g_kv_size_threshold_bytes / 4) {
+         * reset to MODEL_LOAD if we see a burst after a long gap.
+         *
+         * Gated on g_kv_allocated_t1_bytes == 0 (real, already-tracked state,
+         * not a new heuristic threshold): a genuine model reload frees the
+         * previous model's KV before the new one loads (cudaFree →
+         * gb_release_kv_t1_bytes decrements this back toward 0), so live,
+         * still-tracked KV is real evidence generation is ongoing, not that a
+         * reload started. Without this, the gap+size check alone false-
+         * positives on ordinary decode-time activation-buffer overflows: at
+         * a model's real, possibly slow tok/s, gaps between decode-time
+         * overflow allocs routinely exceed 5s, and each one flips phase back
+         * to MODEL_LOAD (undoing the KV-reserve collapse and re-arming this
+         * same reset for the NEXT such alloc) even though nothing was ever
+         * reloaded. Confirmed live 2026-08-02 against the Qwen3.6 hybrid
+         * reference model at ~4 tok/s: kv_t1_tracked_mb reached 788 MB then
+         * stalled, kv_reserve_effective_mb partially collapsed (3056→2267 MB)
+         * then stopped, phase read MODEL_LOAD again after a full 500-token
+         * generation - this reset firing mid-decode is exactly why. */
+        if (gap_ms >= 5000ULL && bytesize < g_kv_size_threshold_bytes / 4 &&
+            atomic_load_explicit(&g_kv_allocated_t1_bytes, memory_order_relaxed) == 0) {
             atomic_store_explicit(&g_alloc_phase, GB_PHASE_MODEL_LOAD, memory_order_relaxed);
             atomic_store_explicit(&g_overflow_load_count, 1u, memory_order_relaxed);
             atomic_store_explicit(&g_overflow_avg_bytes, bytesize, memory_order_relaxed);
@@ -6091,16 +6109,15 @@ static void gb_release_kv_t1_bytes(uint32_t flags, size_t sz,
 static void gb_maybe_track_kv_t1(CUdeviceptr dptr, size_t bytesize)
 {
     uint64_t now_ms, gap_ms;
+    int      phase;
 
-    /* Never tag T1 allocs as KV during INIT or MODEL_LOAD - those are weight
-     * tensors.  Tagging them inflates g_kv_allocated_t1_bytes and collapses
-     * the effective KV reserve to zero before inference even starts, causing
-     * real KV cache to spill to T2 at ~32 GB/s instead of staying in T1. */
-    {
-        int phase = atomic_load_explicit(&g_alloc_phase, memory_order_relaxed);
-        if (phase <= (int)GB_PHASE_MODEL_LOAD)
-            return;
-    }
+    /* Never tag T1 allocs as KV during INIT - g_last_overflow_ms is still
+     * unset (gap_ms would read as "infinite" below) so there is no real
+     * weight-loading signal yet to measure a quiet gap against; any large
+     * T1 alloc this early is a weight tensor, not KV. */
+    phase = atomic_load_explicit(&g_alloc_phase, memory_order_relaxed);
+    if (phase == (int)GB_PHASE_INIT)
+        return;
 
     if (!g_phase_detect || bytesize < g_kv_size_threshold_bytes)
         return;
@@ -6114,7 +6131,44 @@ static void gb_maybe_track_kv_t1(CUdeviceptr dptr, size_t bytesize)
         gap_ms = last ? (now_ms - last) : (uint64_t)-1;
     }
 
-    if (gap_ms >= (uint64_t)GB_PHASE_QUIET_GAP_MS) {
+    if (gap_ms < (uint64_t)GB_PHASE_QUIET_GAP_MS)
+        return;
+
+    /* Real signal, not a new heuristic: the SAME quiet-gap evidence
+     * gb_phase_classify()'s own MODEL_LOAD→INFERENCE transition (condition
+     * (a), above) trusts - reused here because a model whose KV/SSM-state
+     * buffer fits directly in leftover physical VRAM never triggers an
+     * overflow allocation at all, so gb_phase_classify() (only ever invoked
+     * from the overflow-decision path) never runs again after weight
+     * loading and g_alloc_phase would otherwise be stuck at MODEL_LOAD
+     * forever - stranding the KV reserve for the lifetime of the process.
+     * Confirmed live 2026-08-02 against the Qwen3.6 hybrid Gated-DeltaNet
+     * reference model: phase stuck at MODEL_LOAD through 500 real decoded
+     * tokens, kv_reserve_effective_mb never collapsed, VRAM fill stuck at
+     * ~67%.
+     *
+     * NOT reusing gb_phase_classify()'s load_count>=8 bar here - confirmed
+     * live (GREENBOOST_DEBUG=1, real log) that bar never transfers to this
+     * call site: this model's weight loading was ONE overflow allocation
+     * ("first overflow alloc, 2176 MB"), not the many-small-tensor-allocs
+     * pattern that bar was calibrated against, so g_overflow_load_count
+     * never came close to 8 and the phase-advance below silently never
+     * fired at all (0 "Phase → INFERENCE" log lines across a full 500-token
+     * generation, despite 4 real "KV T1 track" events). The quiet-gap check
+     * above already establishes "weight loading has genuinely settled" on
+     * its own - a LARGE (>= g_kv_size_threshold_bytes, already checked
+     * above) direct-T1 alloc arriving after that gap needs no further count
+     * bar to be a credible KV/SSM buffer, not a stray weight tensor. */
+    if (phase == (int)GB_PHASE_MODEL_LOAD) {
+        atomic_store_explicit(&g_alloc_phase, GB_PHASE_INFERENCE, memory_order_relaxed);
+        gb_log("Phase → INFERENCE (direct T1 KV alloc %zu MB after %llu ms quiet gap, "
+               "no overflow needed - model's KV/SSM footprint fits in free VRAM)",
+               bytesize >> 20, (unsigned long long)gap_ms);
+        GB_NVTX_EVENT("PHASE_INFERENCE", "PHASE", bytesize >> 20, 0,
+                      "direct_t1_kv_no_overflow");
+    }
+
+    {
         size_t kv_rsv, kv_in;
         atomic_fetch_add_explicit(&g_kv_allocated_t1_bytes, bytesize, memory_order_relaxed);
         ht_set_flags(dptr, GB_ALLOC_KV_CACHE | GB_ALLOC_T1_PRIORITY);
@@ -7254,14 +7308,22 @@ static CUresult gb_frontload_split_alloc(CUdeviceptr *dptr, size_t bytesize)
         ws_reserve = atomic_load_explicit(&g_workspace_reserve_bytes, memory_order_relaxed);
 
     size_t reserved_total = fill_headroom + vram_headroom_bytes + kv_reserve + ws_reserve;
-    if (free_vram <= reserved_total)
+    if (free_vram <= reserved_total) {
+        gb_log("frontload DIAG decline: req=%zu MB free_vram=%zu MB reserved_total=%zu MB "
+               "(fill_headroom=%zu vram_headroom=%zu kv_reserve=%zu ws_reserve=%zu)",
+               bytesize >> 20, free_vram >> 20, reserved_total >> 20,
+               fill_headroom >> 20, vram_headroom_bytes >> 20, kv_reserve >> 20, ws_reserve >> 20);
         return CUDA_ERROR_NOT_SUPPORTED;              /* no VRAM to front-load */
+    }
     size_t target_free = free_vram - reserved_total;
 
     size_t device_portion = (bytesize < target_free) ? bytesize : target_free;
     device_portion &= ~(gran - 1);                    /* round DOWN to gran */
-    if (device_portion == 0)
+    if (device_portion == 0) {
+        gb_log("frontload DIAG decline: req=%zu MB target_free=%zu MB rounds to 0 device_portion",
+               bytesize >> 20, target_free >> 20);
         return CUDA_ERROR_NOT_SUPPORTED;
+    }
 
     /* Reserve one VA for the whole logical buffer. */
     CUdeviceptr va = 0;

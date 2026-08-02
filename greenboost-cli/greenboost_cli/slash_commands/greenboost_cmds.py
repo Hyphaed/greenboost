@@ -89,15 +89,35 @@ def cmd_llamacache(args: str, _session, settings: dict) -> bool:
 
     This command's save/restore calls a real llama-server API
     (`/slots/{id}?action=save|restore`) and round-trips the right token
-    count — but **end-to-end testing across a real server restart did not
+    count — but **end-to-end testing across a real server restart does not
     show a cache hit on the next request**, even with the exact same prompt
-    and even when explicitly targeting the restored slot via `id_slot`. The
-    server's own idle-slot housekeeping appears to clear the restored
-    slot's content before the automatic prefix-matching system that routes
-    new requests can use it — the raw KV restore and the auto-routing
-    cache-pool seem to be two separate, not-yet-bridged mechanisms in this
-    build. Treat `save`/`restore` as not proven to deliver a real speedup
-    until investigated further; only the in-memory reuse above is verified.
+    and even when explicitly targeting the restored slot via `id_slot`.
+
+    Root cause, confirmed live 2026-08-02 (save → full process restart →
+    restore → identical request → `cache_n: 0`, `prompt_ms` unchanged) and
+    traced in the vendored `third_party/llama.cpp` source
+    (`tools/server/server-context.cpp`, the prompt-reuse block around
+    "forcing full prompt re-processing due to lack of cache data"): reusing
+    a cached prefix for hybrid/recurrent-memory or SWA models requires an
+    in-memory "checkpoint" entry (`slot.prompt.checkpoints`) covering the
+    resume position — these checkpoints are built up incrementally DURING
+    live generation and are never written by `SLOT_SAVE` or reconstructed by
+    `SLOT_RESTORE` (`slot->prompt.clear()` discards them). So even when
+    `get_common_prefix()` finds a full token match and the real KV/recurrent
+    memory was genuinely restored via `llama_state_seq_load_file`, the empty
+    checkpoint list forces `do_reset = true` → full reprocessing, every
+    time. This is a known upstream limitation for exactly this class of
+    model (the code comments its own reasoning against
+    ggml-org/llama.cpp#13194) — it is NOT a greenboost/gb-synapse
+    misconfiguration, and the reference workload
+    (Qwen3.6-27B-Fable-Fusion, hybrid Gated-DeltaNet architecture) is
+    squarely in the affected class. Whether a plain dense-attention model is
+    equally affected on this vendored commit is untested. Fixing this for
+    real would mean patching the vendored llama.cpp to seed a synthetic
+    initial checkpoint on restore — not attempted here. Treat `save`/
+    `restore` as not delivering a real speedup for this reference model
+    until that upstream gap is closed; only the in-memory reuse above is
+    verified to work.
 
     Usage:
       /llamacache status           — show llama-server cache state
