@@ -4444,7 +4444,7 @@ cmd_install_python_files() {
         gb_synapse.py
         gb_synapse_api.py
         gb_synapse_backends.py
-        gb_diffusion_server.py
+        gb_diffusion_server.py gb_longlive_server.py
         gb_aviary.py
         gb_cluster.py
         gb_mcp.py

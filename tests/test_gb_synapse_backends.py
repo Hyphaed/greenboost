@@ -112,6 +112,11 @@ def test_select_backend_diffusers_explicit():
     assert isinstance(backend, gsb.DiffusersBackend)
 
 
+def test_select_backend_video_explicit():
+    backend = gsb.select_backend(_FakeEntry("video"))
+    assert isinstance(backend, gsb.VideoBackend)
+
+
 @pytest.mark.parametrize("engine", ["torch", "vllm", "gbquant", "transformers"])
 def test_select_backend_routes_to_torch_when_engine_available(monkeypatch, engine):
     """"torch"/"vllm"/"gbquant"/"transformers" all route to
@@ -746,3 +751,95 @@ def test_synapse_torch_backend_serve_cluster_pp_retries_host_only_on_rendezvous_
     assert "--launch-mode" in cluster_cmd
     assert "--launch-mode" not in retry_cmd
     assert captured["facts"]["feeders"] == []   # final recorded state is the retry's
+
+
+# ── VideoBackend: persistent video-serving engine (missing_features.md f) ──
+
+def test_video_backend_available_when_diffusers_importable():
+    assert gsb.VideoBackend().available() is True
+
+
+def test_video_backend_can_serve_only_video_engine():
+    backend = gsb.VideoBackend()
+    assert backend.can_serve(_FakeEntry("video")) is True
+    assert backend.can_serve(_FakeEntry("diffusers")) is False
+    assert backend.can_serve(_FakeEntry("llama.cpp")) is False
+
+
+def test_video_backend_serve_launches_gb_longlive_server(tmp_path, monkeypatch):
+    import gb_synapse as gs
+    import gb_cluster
+
+    monkeypatch.setattr(gs, "hf_token", lambda: None)
+    monkeypatch.setattr(gs, "_run_log_path", lambda name: tmp_path / f"{name}.log")
+
+    captured = {}
+
+    def _fake_launch(entry, proc, port, internal_port, engine="", **facts):
+        captured.update(entry=entry, proc=proc, port=port,
+                        internal_port=internal_port, engine=engine, facts=facts)
+        return "sentinel-state"
+
+    monkeypatch.setattr(gs, "_launch_proxy_and_record", _fake_launch)
+    monkeypatch.setattr(gb_cluster, "shim_env",
+                        lambda workload, enabled, base_env=None, cudart_path=None:
+                        {"GREENBOOST_ACTIVE": "1"} if enabled else {})
+
+    popen_calls = []
+
+    class _FakeProc:
+        def kill(self):
+            pass
+
+    def _fake_popen(cmd, env=None, stdout=None, stderr=None, start_new_session=None):
+        popen_calls.append({"cmd": cmd, "env": env})
+        return _FakeProc()
+
+    monkeypatch.setattr(gsb.subprocess, "Popen", _fake_popen)
+
+    entry = _FakeSynapseEntry(name="longlive-clip", engine="video")
+    result = gsb.VideoBackend().serve(entry, port=12345)
+
+    assert result == "sentinel-state"
+    assert len(popen_calls) == 1
+    cmd = popen_calls[0]["cmd"]
+    assert cmd[0] == gsb.sys.executable
+    assert cmd[1] == str(gsb._REPO_DIR / "gb_longlive_server.py")
+    assert "--model" in cmd
+    assert "--served-model-name" in cmd
+    assert entry.name in cmd
+    assert "--port" in cmd
+    assert str(12345 + 1000) in cmd   # internal_port = port + 1000
+    assert popen_calls[0]["env"]["GREENBOOST_ACTIVE"] == "1"
+    assert captured["engine"] == "video"
+    assert captured["internal_port"] == 12345 + 1000
+
+
+def test_video_backend_serve_uses_entry_quant_or_fp8_default(tmp_path, monkeypatch):
+    import gb_synapse as gs
+    import gb_cluster
+
+    monkeypatch.setattr(gs, "hf_token", lambda: None)
+    monkeypatch.setattr(gs, "_run_log_path", lambda name: tmp_path / f"{name}.log")
+    monkeypatch.setattr(gs, "_launch_proxy_and_record",
+                        lambda entry, proc, port, internal_port, engine="", **f: "sentinel")
+    monkeypatch.setattr(gb_cluster, "shim_env",
+                        lambda workload, enabled, base_env=None, cudart_path=None: {})
+
+    popen_calls = []
+
+    class _FakeProc:
+        def kill(self):
+            pass
+
+    def _fake_popen(cmd, env=None, stdout=None, stderr=None, start_new_session=None):
+        popen_calls.append(cmd)
+        return _FakeProc()
+
+    monkeypatch.setattr(gsb.subprocess, "Popen", _fake_popen)
+
+    entry = _FakeSynapseEntry(engine="video", quant="")   # falsy -> fp8 default
+    gsb.VideoBackend().serve(entry, port=1000)
+    cmd = popen_calls[0]
+    q_idx = cmd.index("--quant")
+    assert cmd[q_idx + 1] == "fp8"

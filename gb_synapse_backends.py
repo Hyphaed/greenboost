@@ -1386,6 +1386,50 @@ class DiffusersBackend(EngineBackend):
         return gs._launch_proxy_and_record(entry, proc, port, internal_port, engine=self.name)
 
 
+class VideoBackend(EngineBackend):
+    """Persistent video-serving engine (missing_features.md item (f)),
+    served through gb_longlive_server.py behind the same :11434 proxy.
+    Mirrors DiffusersBackend's shape exactly (same shim posture, same
+    resident-process launch pattern) , the difference is entirely in the
+    upstream server script, which speaks /v1/video/generations (a shot list
+    + optional i2v anchor image) instead of /v1/images/generations.
+
+    Read gb_longlive_server.py's own module docstring before pointing this
+    at LongLive specifically , ai-forge's own prior attempt at a warm
+    server for that exact model is documented there as broken under
+    GreenBoost for a real, diagnosed reason (cross-process VRAM release),
+    not merely untested. This backend is not gated on that; it is a
+    reusable mechanism, and the caller decides which model to point it at."""
+    name = "video"
+
+    def available(self) -> bool:
+        try:
+            import diffusers  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def can_serve(self, entry) -> bool:
+        return entry.engine == "video"
+
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None):
+        import gb_synapse as gs
+        import gb_cluster
+
+        internal_port = port + 1000
+        env = gb_cluster.shim_env(workload="torch", enabled=True)
+        if gs.hf_token():
+            env["HF_TOKEN"] = gs.hf_token()
+        cmd = [sys.executable, str(_REPO_DIR / "gb_longlive_server.py"),
+               "--model", _gbquant_model_source(entry), "--served-model-name", entry.name,
+               "--quant", entry.quant or "fp8",
+               "--host", "127.0.0.1", "--port", str(internal_port)]
+        log = open(gs._run_log_path(entry.name), "ab")
+        proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                 start_new_session=True)
+        return gs._launch_proxy_and_record(entry, proc, port, internal_port, engine=self.name)
+
+
 # ---------------------------------------------------------------------------
 # Selection
 # ---------------------------------------------------------------------------
@@ -1398,12 +1442,14 @@ def select_backend(entry) -> EngineBackend:
     P3.9 bring-up, 2026-07-16: the vendored gLLM engine, with its local
     SDPA-fallback patch, serves bf16 safetensors checkpoints correctly on
     this hardware). Falls back to TransformersBackend only if the torch
-    engine isn't installed (VllmBackend retired — Phase 6). "diffusers" is
-    explicit — no silent fallback. Anything else (including the "llama.cpp"
-    default) gets the llama.cpp engine."""
+    engine isn't installed (VllmBackend retired — Phase 6). "diffusers" and
+    "video" are both explicit — no silent fallback. Anything else (including
+    the "llama.cpp" default) gets the llama.cpp engine."""
     if entry.engine in ("torch", "vllm", "gbquant", "transformers"):
         t = SynapseTorchBackend()
         return t if t.available() else TransformersBackend()
     if entry.engine == "diffusers":
         return DiffusersBackend()
+    if entry.engine == "video":
+        return VideoBackend()
     return LlamaCppBackend()

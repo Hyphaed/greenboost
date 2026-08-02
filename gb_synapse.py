@@ -428,7 +428,7 @@ class ModelEntry:
                                 # never a routing token guess.
     quant_bits: int = 0
     arch: str = ""
-    engine: str = "llama.cpp"   # "llama.cpp" | "torch" | "diffusers"
+    engine: str = "llama.cpp"   # "llama.cpp" | "torch" | "diffusers" | "video"
                                 # (legacy on disk: "gbquant"/"vllm"/
                                 # "transformers" values are all normalized to
                                 # "torch" on manifest load — see _load_manifest)
