@@ -301,10 +301,25 @@ def effective_vram_budget_mb() -> "tuple[float, float, dict]":
 _SHIM_STATS_PATH = Path("/run/greenboost/shim_stats")
 
 
-def _read_shim_stats() -> dict:
+def _read_shim_stats(pid: "int | None" = None) -> dict:
+    """pid=None (default): the global shim_stats file, unchanged behavior.
+    pid=<int>: that process's own per-PID snapshot when available (via
+    gb_monitor.shim_stats_path_for), falling back to this hand-rolled
+    global-file parse otherwise — this reader predates gb_monitor.py and
+    keeps its own minimal parser rather than adding a hard import, but
+    per-PID resolution is delegated so both readers agree on path logic."""
+    path = _SHIM_STATS_PATH
+    if pid is not None:
+        try:
+            import gb_monitor
+            per_pid = gb_monitor.shim_stats_path_for(pid)
+            if per_pid is not None:
+                path = per_pid
+        except Exception:
+            pass
     stats: dict[str, str] = {}
     try:
-        for line in _SHIM_STATS_PATH.read_text().splitlines():
+        for line in path.read_text().splitlines():
             k, _, v = line.partition("=")
             if k:
                 stats[k] = v
@@ -313,7 +328,8 @@ def _read_shim_stats() -> dict:
     return stats
 
 
-def _validate_placement(entry, util: float, budget_facts: dict, engine: str) -> None:
+def _validate_placement(entry, util: float, budget_facts: dict, engine: str,
+                        pid: "int | None" = None) -> None:
     """After a synapse-torch-engine serve, confirm the weights genuinely
     landed partly in T2 rather than the whole overflow silently sitting in
     T2 while T1 stayed under-filled (Rule #1). Reads
@@ -322,13 +338,24 @@ def _validate_placement(entry, util: float, budget_facts: dict, engine: str) -> 
     `rule1_warning=true` when t2_bytes>0 while vram_used_pct is below
     GB_SYNAPSE_RULE1_PCT (default 85). Best-effort, never raises.
 
+    `pid`: the just-launched engine's own PID (missing_features.md item (g))
+    — this function is READING the CHILD process's placement decisions from
+    a PARENT (this orchestrator) process, so the global shim_stats file is
+    exactly the "whose snapshot is this?" ambiguity per-PID telemetry
+    exists to close; pass the child's pid so this reads ITS snapshot, not
+    whatever GreenBoost-linked process wrote the global file most recently.
+    None (default, e.g. no proc handle available at a call site) falls back
+    to the prior global-file behavior, unchanged.
+
     Renamed from `_validate_genuine_t2` / event kind renamed from
     `synapse_vllm_placement` (2026-07-16, Phase 4 backend wiring) — this
     validation is engine-agnostic; `engine` says which backend actually
     served (the vLLM backend this originally validated was retired in
     Phase 6)."""
     try:
-        stats = _read_shim_stats()
+        # Call with no args when pid is unset — preserves compatibility with
+        # any caller/test that stubs _read_shim_stats as a zero-arg callable.
+        stats = _read_shim_stats(pid=pid) if pid is not None else _read_shim_stats()
         t2_bytes = (int(stats.get("tier_t2_local_cur_mb", "0") or 0)
                     + int(stats.get("tier_t2_feeder_cur_mb", "0") or 0)) * 1024 * 1024
 
@@ -1303,7 +1330,8 @@ class SynapseTorchBackend(EngineBackend):
                                             feeders=[f.ip for f in online_feeders],
                                             engine=self.name, **facts)
         _, _, budget_facts = effective_vram_budget_mb()
-        _validate_placement(entry, util if mode == "gllm" else 0.0, budget_facts, self.name)
+        _validate_placement(entry, util if mode == "gllm" else 0.0, budget_facts, self.name,
+                            pid=proc.pid)
         return state
 
 

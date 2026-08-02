@@ -714,7 +714,12 @@ parse_pool_info() {
 # Fallback location: /tmp/greenboost_shim_stats (used when Ollama can't write to /run/greenboost/)
 # SS_ACTIVE_PATH: A | B | none | unknown
 # SS_STALE: 1 if the file is older than 30 s (shim not running or crashed)
+# $1 (optional): a PID — read that process's own shim_stats.<pid> snapshot
+# instead of the global file (missing_features.md item (g)). Falls back to
+# the global file if no per-PID file exists for that PID (older shim build,
+# or the process hasn't written one yet) — the no-arg call is unchanged.
 parse_shim_stats() {
+    local _want_pid="${1:-}"
     SS_ACTIVE_PATH="unknown"; SS_STALE=1
     SS_PATH_A=0; SS_PATH_B=0
     SS_PHASE=""; SS_KV_RSV_NOM=0; SS_KV_RSV_EFF=0; SS_KV_T1_MB=0; SS_HEADROOM_MB=0
@@ -722,6 +727,9 @@ parse_shim_stats() {
     SS_H2D_MB=0; SS_D2H_MB=0; SS_KERNEL_DISPATCH=0
     local stats_f="/run/greenboost/shim_stats"
     [[ -r "$stats_f" ]] || stats_f="/tmp/greenboost_shim_stats"
+    if [[ -n "$_want_pid" && -r "${stats_f}.${_want_pid}" ]]; then
+        stats_f="${stats_f}.${_want_pid}"
+    fi
     [[ -r "$stats_f" ]] || return 1
     local content; content=$(cat "$stats_f" 2>/dev/null) || return 1
     local ts; ts=$(echo "$content" | grep -oP 'timestamp=\K[0-9]+' | head -1 || echo 0)
