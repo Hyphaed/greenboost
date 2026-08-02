@@ -2,36 +2,11 @@
 
 ## v3.3 : 2026-08-02
 
-### 🧠 The context window kept shrinking for the wrong reasons , now fixed, three times over
-
 GreenBoost's reference coding model changed to
 [`Qwen3.6-27B-Fable-Fusion`](https://huggingface.co/DavidAU) (a dense 27B
 model, replacing the older 35B mixture-of-experts one). 
 
-
-### 🐍 GreenBoost's own model server can now run Mamba-2 models natively
-
-Two fixes above closed the accounting gap for models that mix regular
-attention with the newer "linear attention" style. This entry is about
-the other end of that spectrum: models built ENTIRELY out of the newer
-style, with no regular attention at all. GreenBoost's built-in model
-server didn't know how to run one at all before now , it does today.
-
-The model math itself was borrowed from, and checked against, the same
-well-tested open-source code other serving engines use (not hand-written
-from scratch), because getting this kind of model's internal math even
-slightly wrong doesn't crash , it just quietly produces fluent-looking
-nonsense, which is a much easier mistake to ship by accident. That
-caution paid off during testing: the very first attempt DID produce
-fluent-looking nonsense, traced back to two internal steps that were
-wired up in the wrong order, fixed, and re-verified word-for-word against
-a trusted reference implementation before being called done. Along the
-way, four separate scheduling assumptions that had never been tested
-against a model with no regular attention memory at all were found and
-fixed too , one of which caused every request to simply hang forever
-with no error, rather than fail loudly.
-
-### 💬 The `gb` terminal assistant got a cleanup pass
+### 💬 The `greenboost-cli` terminal assistant got a cleanup pass
 
 - The chat window used to flash raw internal text (things like
   `<tool_call><function=...>`) whenever the model decided to use a tool ,
@@ -52,31 +27,12 @@ with no error, rather than fail loudly.
 - The permission-approval popup box now closes cleanly on the right side
   instead of trailing off mid-line.
 
-### 🌐 Cluster / multi-machine serving
-
-Chasing a stubborn "this model refuses to load across two machines, no
-matter how I split it" error turned up two real, independent bugs: one
-machine was running an outdated build of the sharing engine, and a
-built-in safety check was rejecting GreenBoost's own placement decision
-every single time regardless of what that decision actually was. Both
-fixed.
-
-Decision for this specific model: splitting it across two machines over a
-plain network connection currently makes it *slower*, not faster , the
-per-token chatter between machines outweighs the benefit for this model's
-architecture. So it stays on a single machine for now; the fixes are in and
-ready for whichever future model the split genuinely helps. And if a
-multi-machine load ever fails for any reason, GreenBoost now automatically
-falls back to running on the local machine alone instead of just giving up.
-
 ### 🗜️ Serving engine, consolidated
 
 - The vLLM backend has been retired. GreenBoost's own built-in engine
   (previously an alternate path) is now the only one used for this class of
   model , one engine to maintain instead of two, and nothing changes for
   anyone already using it.
-- Continuous batching (serving more than one request to the same model at
-  once) is back on by default. It had been silently switched off.
 - The built-in model server's default network port moved from 11434 (which
   collided with Ollama, if you also run that) to 11435, so both can run
   side by side without a fight.
@@ -98,26 +54,6 @@ assistant should NOT read instead. Reachable over MCP
 on `greenboost-orchestrator`) and via a plain `gb_semantics.py` CLI for
 anything without MCP. 
 
-### ⚡ Faster repeated prompts (host-memory prompt cache)
-
-`gb-synapse`'s serving engine now sizes and enables its host-memory prompt
-cache (previously left at the engine's own default), so a long, unchanging
-system prompt, exactly what `gb`'s terminal assistant resends every turn,
-can be reused instead of reprocessed from scratch. Sized automatically from
-whatever RAM is actually free on the machine, never a fixed number. Every
-request's cache-hit rate and response latency now show up in GreenBoost's
-telemetry feed, so the effect is measurable, not just assumed.
-
-**Verified against a real, running instance of the reference model**: a
-repeated prompt went from taking about 1.9-2.1 seconds to process to about
-0.35 seconds , roughly 5-6x faster on the part of the request that reuses
-the cache, with 9 out of every 10 prompt tokens pulled from the cache
-instead of recomputed. That same check also caught the measurement itself
-undercounting the cache-hit rate for real usage of the terminal assistant
-(it was reading the right idea from the wrong place in the response), now
-fixed, and covered by a permanent automated test so it can't quietly regress.
-
-
 ### ⚡ GreenBoost now measures the conversation cache instead of guessing its size
 
 The formula for estimating how much GPU memory a model's conversation cache
@@ -136,8 +72,8 @@ It used to decide what counted as "leftover AI inference" by matching process
 names against a list of known patterns, an approach that's always one unusual
 process name away from either missing something or killing something it
 shouldn't. It now reads GB-Dataflux's own record of what GreenBoost actually
-started, and only reclaims what's genuinely idle and unprotected. The same
-logic backs both the shell command and `gb clear-memory-pool`.
+started, and only reclaims what's genuinely idle and unprotected.
+
 
 ### 🐛 Installer & stability fixes
 
@@ -154,9 +90,6 @@ logic backs both the shell command and `gb clear-memory-pool`.
   it should look for GreenBoost's own files , useful when testing a
   development build instead of the installed one, previously had no effect
   at all.
-- A machine acting as a "feeder" (lending its spare GPU/RAM to another
-  machine) could grow an internal log file past 1 GB with no cleanup , it
-  now rotates automatically like every other GreenBoost log.
 - A couple of crash-prevention fixes for loading models on GPUs with a
   tighter memory budget.
 
