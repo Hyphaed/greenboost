@@ -74,11 +74,27 @@ def _rules_and_taxonomy() -> tuple[dict, dict]:
 
 
 
-def _read_shim_stats() -> dict:
-    """Parsed KEY=VALUE map from the shim's live stats file + freshness."""
+def _read_shim_stats(pid: "int | None" = None) -> dict:
+    """Parsed KEY=VALUE map from the shim's live stats file + freshness.
+    pid=None (default): the global file, unchanged behavior , every
+    existing caller (greenboost_overview, flux_health, whole-system tools)
+    wants that view. pid=<int>: that process's own per-PID snapshot
+    (missing_features.md item (g)) when available, via
+    gb_monitor.shim_stats_path_for , falls back to the global file's path
+    otherwise (not its content; a mismatched pid= is the caller's problem
+    to notice via the returned stats' own `pid=` field, same as
+    gb_monitor.read_shim_stats(pid=)'s stricter contract elsewhere)."""
     out: dict = {"present": False, "fresh": False, "age_s": None}
     try:
         p = Path(SHIM_STATS)
+        if pid is not None:
+            try:
+                import gb_monitor
+                per_pid = gb_monitor.shim_stats_path_for(pid)
+                if per_pid is not None:
+                    p = per_pid
+            except Exception:
+                pass
         text = p.read_text()
         out["present"] = True
         kv = {}

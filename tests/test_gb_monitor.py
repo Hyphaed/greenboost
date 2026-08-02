@@ -209,3 +209,152 @@ def test_reset_stale_tracker_dead_pid(tmp_path, monkeypatch):
 def test_reset_stale_tracker_absent(tmp_path, monkeypatch):
     monkeypatch.setattr(gm, "SHIM_STATS_PATH", tmp_path / "gone")
     assert gm.reset_stale_tracker() is False
+
+
+# ── per-PID shim telemetry (missing_features.md item (g)) ─────────────────
+#
+# The C side (greenboost_cuda_shim.c) is expected to hardlink each write to
+# "<dir>/shim_stats.<pid>" alongside the existing global file. These tests
+# write that fixture layout directly (no C build/deploy needed) and verify
+# gb_monitor's Python-side reader/lister/cleanup logic against it.
+
+_DEAD_PID = 999999   # matches the existing reset_stale_tracker convention
+
+
+def _write_pid_stats(tmp_path, monkeypatch, pid, ts=None, extra_dir=None):
+    import time
+    if ts is None:
+        ts = int(time.time())
+    base_dir = extra_dir or tmp_path
+    p = base_dir / f"shim_stats.{pid}"
+    p.write_text(_SHIM_STATS.format(pid=pid, ts=ts))
+    monkeypatch.setattr(gm, "SHIM_STATS_PATH", base_dir / "shim_stats")
+    monkeypatch.setattr(gm, "SHIM_STATS_ALT", tmp_path / "nonexistent_alt")
+    return p
+
+
+def test_shim_stats_path_for_found(tmp_path, monkeypatch):
+    p = _write_pid_stats(tmp_path, monkeypatch, pid=os.getpid())
+    assert gm.shim_stats_path_for(os.getpid()) == p
+
+
+def test_shim_stats_path_for_absent(tmp_path, monkeypatch):
+    monkeypatch.setattr(gm, "SHIM_STATS_PATH", tmp_path / "shim_stats")
+    monkeypatch.setattr(gm, "SHIM_STATS_ALT", tmp_path / "nonexistent_alt")
+    assert gm.shim_stats_path_for(12345) is None
+
+
+def test_shim_stats_path_for_tmp_fallback(tmp_path, monkeypatch):
+    alt_dir = tmp_path / "alt"
+    alt_dir.mkdir()
+    p = alt_dir / f"greenboost_shim_stats.{os.getpid()}"
+    p.write_text(_SHIM_STATS.format(pid=os.getpid(), ts=1))
+    monkeypatch.setattr(gm, "SHIM_STATS_PATH", tmp_path / "primary_missing")
+    monkeypatch.setattr(gm, "SHIM_STATS_ALT", alt_dir / "greenboost_shim_stats")
+    assert gm.shim_stats_path_for(os.getpid()) == p
+
+
+def test_list_shim_pids_includes_only_alive(tmp_path, monkeypatch):
+    _write_pid_stats(tmp_path, monkeypatch, pid=os.getpid())
+    (tmp_path / f"shim_stats.{_DEAD_PID}").write_text(
+        _SHIM_STATS.format(pid=_DEAD_PID, ts=1))
+    pids = gm.list_shim_pids()
+    assert os.getpid() in pids
+    assert _DEAD_PID not in pids
+
+
+def test_list_shim_pids_ignores_non_digit_suffix(tmp_path, monkeypatch):
+    monkeypatch.setattr(gm, "SHIM_STATS_PATH", tmp_path / "shim_stats")
+    monkeypatch.setattr(gm, "SHIM_STATS_ALT", tmp_path / "nonexistent_alt")
+    (tmp_path / "shim_stats.tmp.1234").write_text("junk")   # the C shim's own tmp-write name
+    assert gm.list_shim_pids() == []
+
+
+def test_list_shim_pids_empty_when_dir_absent(tmp_path, monkeypatch):
+    monkeypatch.setattr(gm, "SHIM_STATS_PATH", tmp_path / "nodir" / "shim_stats")
+    monkeypatch.setattr(gm, "SHIM_STATS_ALT", tmp_path / "nodir2" / "shim_stats")
+    assert gm.list_shim_pids() == []
+
+
+# ── read_shim_stats(pid=) ───────────────────────────────────────────────────
+
+def test_read_shim_stats_pid_reads_own_file(tmp_path, monkeypatch):
+    _write_pid_stats(tmp_path, monkeypatch, pid=os.getpid())
+    d = gm.read_shim_stats(pid=os.getpid())
+    assert d["_pid"] == os.getpid()
+    assert d["phase"] == "INFERENCE"
+
+
+def test_read_shim_stats_pid_missing_file_falls_back_to_matching_global(tmp_path, monkeypatch):
+    """No per-PID file exists, but the global file's own pid= matches the
+    request -> return it (older shim / not-yet-written-per-pid case)."""
+    _write_stats(tmp_path, monkeypatch, pid=os.getpid())   # writes the GLOBAL file only
+    d = gm.read_shim_stats(pid=os.getpid())
+    assert d["_pid"] == os.getpid()
+
+
+def test_read_shim_stats_pid_never_returns_another_process_snapshot(tmp_path, monkeypatch):
+    """The core bug this feature closes: a global file belonging to a
+    DIFFERENT pid must never be returned for an unrelated pid= request."""
+    other_pid = os.getpid() + 1
+    _write_stats(tmp_path, monkeypatch, pid=other_pid)   # global file is PID other_pid's
+    d = gm.read_shim_stats(pid=os.getpid())               # asking for OUR pid
+    assert d == {}
+
+
+def test_read_shim_stats_pid_absent_everywhere_returns_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(gm, "SHIM_STATS_PATH", tmp_path / "nope")
+    monkeypatch.setattr(gm, "SHIM_STATS_ALT", tmp_path / "nope2")
+    assert gm.read_shim_stats(pid=12345) == {}
+
+
+def test_read_shim_stats_explicit_path_wins_over_pid(tmp_path, monkeypatch):
+    """path= is still honored unchanged even if pid= is also passed , path
+    always wins, matching the documented precedence."""
+    explicit = tmp_path / "explicit_stats"
+    explicit.write_text(_SHIM_STATS.format(pid=999, ts=1))
+    d = gm.read_shim_stats(path=explicit, pid=os.getpid())
+    assert d["_pid"] == 999
+
+
+def test_read_shim_stats_default_unaffected_by_new_kwarg(tmp_path, monkeypatch):
+    """No path, no pid , byte-for-byte the original global-file behavior."""
+    _write_stats(tmp_path, monkeypatch)
+    d = gm.read_shim_stats()
+    assert d["phase"] == "INFERENCE"
+    assert d["_pid"] == os.getpid()
+
+
+# ── reset_stale_shim_pids ───────────────────────────────────────────────────
+
+def test_reset_stale_shim_pids_removes_only_dead(tmp_path, monkeypatch):
+    monkeypatch.setattr(gm, "SHIM_STATS_PATH", tmp_path / "shim_stats")
+    monkeypatch.setattr(gm, "SHIM_STATS_ALT", tmp_path / "nonexistent_alt")
+    alive_p = tmp_path / f"shim_stats.{os.getpid()}"
+    alive_p.write_text(_SHIM_STATS.format(pid=os.getpid(), ts=1))
+    dead_p = tmp_path / f"shim_stats.{_DEAD_PID}"
+    dead_p.write_text(_SHIM_STATS.format(pid=_DEAD_PID, ts=1))
+    dead_metrics = tmp_path / f"metrics.{_DEAD_PID}.json"
+    dead_metrics.write_text("{}")
+
+    cleaned = gm.reset_stale_shim_pids()
+
+    assert cleaned == 1
+    assert alive_p.exists()
+    assert not dead_p.exists()
+    assert not dead_metrics.exists()
+
+
+def test_reset_stale_shim_pids_no_dead_files_returns_zero(tmp_path, monkeypatch):
+    monkeypatch.setattr(gm, "SHIM_STATS_PATH", tmp_path / "shim_stats")
+    monkeypatch.setattr(gm, "SHIM_STATS_ALT", tmp_path / "nonexistent_alt")
+    alive_p = tmp_path / f"shim_stats.{os.getpid()}"
+    alive_p.write_text(_SHIM_STATS.format(pid=os.getpid(), ts=1))
+    assert gm.reset_stale_shim_pids() == 0
+    assert alive_p.exists()
+
+
+def test_reset_stale_shim_pids_no_files_never_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(gm, "SHIM_STATS_PATH", tmp_path / "nodir" / "shim_stats")
+    monkeypatch.setattr(gm, "SHIM_STATS_ALT", tmp_path / "nodir2" / "shim_stats")
+    assert gm.reset_stale_shim_pids() == 0

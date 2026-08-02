@@ -744,6 +744,33 @@ def test_local() -> bool:
         _warn("Shim stats not found - no active inference process using LD_PRELOAD shim")
         _info("Start with:  GREENBOOST_ACTIVE=1 LD_PRELOAD=/usr/local/lib/libgreenboost_cuda.so <app>")
 
+    # Per-PID shim stats (missing_features.md item (g)): a diagnostic tool
+    # wants to see EVERY GreenBoost-linked process's own snapshot, not just
+    # whichever one most recently wrote the global file — showing all of
+    # them is strictly more informative here, unlike a whole-system MCP
+    # tool where "one number" is the right answer.
+    _head("Per-PID shim stats  (shim_stats.<pid>)")
+    try:
+        import gb_monitor
+        pids = gb_monitor.list_shim_pids()
+    except Exception as e:
+        pids = []
+        _warn(f"gb_monitor unavailable for per-PID listing: {e}")
+    if not pids:
+        _warn("No per-PID shim_stats.<pid> files found (older shim build, or no "
+             "GreenBoost-linked process has written stats since this feature landed)")
+    else:
+        for pid in pids:
+            _info(f"--- pid {pid} ---")
+            d = gb_monitor.read_shim_stats(pid=pid)
+            if not d:
+                _warn(f"pid {pid}: listed but unreadable (race with the C reaper?)")
+                continue
+            for k, v in sorted(d.items()):
+                if k.startswith("_"):
+                    continue
+                _info(f"{k}={v}")
+
     # Check NVTX log
     _head("Recent NVTX events  (/run/greenboost/nvtx_events.log)")
     nvtx = "/run/greenboost/nvtx_events.log"

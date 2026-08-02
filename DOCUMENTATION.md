@@ -1664,6 +1664,13 @@ All default-safe (off, or the previous behavior, unless set):
 | `GREENBOOST_T1_WORKSPACE_MB` | unset (off) | Reserve T1 VRAM for per-step compute workspace during model load, released at inference. |
 | `GREENBOOST_KV_PREFETCH` | `0` | Enable phase-aware KV prefetch stats mode, exposing `kv_prefetch_*` telemetry counters. |
 | `GB_CUTLASS_ENABLE` | `0` | Build/enable the CUTLASS sm_120a NVFP4 GEMM scaffold (`third_party/gb_cutlass`). Groundwork only. |
+| `GB_QUANT_DP_PLAN` | `0` | Opt-in DP budget-optimal per-layer planner (`gb_quant_dp.py`) inside `plan_quality`, replacing the default greedy ladder walk. Skipped for `target="compact"`. |
+| `GB_QUANT_DP_MAX_STATES` | auto (scales with layer count) | Beam-width cap for the DP planner above. |
+| `GB_QUANT_CALIB` | `frobenius` | `plan_quality`'s lazy-calibration source when `sensitivity=` is unset: `frobenius` (zero-data weight proxy, default) or `activation` (real-forward-pass, needs `run_calibration=`). |
+| `GB_TIER_KV_COMPRESS` | `1` | Kill switch for KV-cache tier-serde compression (`gb_tier_kv.py`) on T3 spill. Mirrors `GB_T3_COMPRESS`; only affects components registered with `kv_bits=`. |
+| `GB_TIER_KV_PRESET` | `polar4` | KV tier-serde codec family: `polar4`/`polar8` → PolarQuant, `turbo_k8v4` → TurboQuant (K/V asymmetric split needs matching `kv_keys=`), `off` → disabled. Bit width always comes from the caller's explicit `kv_bits`. |
+| `GB_TIER_KV_MIN_ELEMS` | `65536` | Minimum tensor element count for KV tier-serde eligibility (below this, overhead exceeds the saving). |
+| `GB_STATS_DIR` | unset (uses `/run/greenboost`, falling back to `/tmp`) | Override the shim's stats directory (`shim_stats`/`metrics.json` + their per-PID variants). Test-only — lets a locally-rebuilt shim be exercised under `LD_PRELOAD` without writing into a live system's `/run/greenboost`. |
 
 ---
 

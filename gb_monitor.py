@@ -106,11 +106,9 @@ def parse_shim_stats(text: str) -> dict:
     return out
 
 
-def read_shim_stats(path: "str | os.PathLike | None" = None) -> dict:
-    """Read + parse the shim_stats file (with the /tmp fallback), adding two
-    derived keys: `_stale` (bool) and `_pid` (int|None). Empty dict if absent."""
-    p = Path(path) if path is not None else (
-        SHIM_STATS_PATH if SHIM_STATS_PATH.exists() else SHIM_STATS_ALT)
+def _read_and_parse_shim_stats(p: "str | os.PathLike") -> dict:
+    """Shared tail of read_shim_stats: read + parse one file, add the
+    derived `_stale`/`_pid` keys. Empty dict if the file is absent/unreadable."""
     try:
         text = Path(p).read_text(errors="replace")
     except OSError:
@@ -129,6 +127,98 @@ def read_shim_stats(path: "str | os.PathLike | None" = None) -> dict:
     except (ValueError, TypeError):
         d["_pid"] = None
     return d
+
+
+def shim_stats_path_for(pid: int) -> "Path | None":
+    """Per-PID shim_stats snapshot path for `pid` (checking the /run
+    location then the /tmp fallback, matching the shim's own
+    gb_stats_resolve_path() dir selection), or None if neither exists.
+
+    Per-PID telemetry (missing_features.md item (g)): the shim additionally
+    hardlinks each write to `<dir>/shim_stats.<pid>` alongside the existing
+    global `<dir>/shim_stats` file — same content, same atomicity, zero
+    extra bytes written (the payload is written once; see
+    greenboost_cuda_shim.c's gb_write_stats()). This resolves the "whose
+    snapshot is this?" ambiguity a read of the global file always carried
+    when multiple GreenBoost-linked processes are running."""
+    for base in (SHIM_STATS_PATH, SHIM_STATS_ALT):
+        p = base.parent / f"{base.name}.{pid}"
+        if p.exists():
+            return p
+    return None
+
+
+def _iter_shim_pid_files() -> "list[tuple[int, Path]]":
+    """(pid, path) for every per-PID shim_stats.<pid> file found under
+    either the /run or /tmp stats directory, regardless of whether that pid
+    is still alive , the liveness decision belongs to the caller
+    (list_shim_pids filters to alive, reset_stale_shim_pids to dead)."""
+    out: "list[tuple[int, Path]]" = []
+    seen: "set[tuple[int, str]]" = set()
+    for base in (SHIM_STATS_PATH, SHIM_STATS_ALT):
+        d = base.parent
+        prefix = base.name + "."
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
+            if not name.startswith(prefix):
+                continue
+            suffix = name[len(prefix):]
+            if not suffix.isdigit():
+                continue
+            pid = int(suffix)
+            key = (pid, str(d))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((pid, d / name))
+    return out
+
+
+def list_shim_pids() -> "list[int]":
+    """PIDs with a per-PID shim_stats file whose process is still alive
+    (checked via kill(pid, 0)). Dead-PID files are skipped here , they're
+    left for reset_stale_shim_pids()/the shim's own reaper to remove, since
+    this is a read, not a mutation."""
+    pids: "set[int]" = set()
+    for pid, _path in _iter_shim_pid_files():
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            continue   # dead (or unqueryable) — not included
+        pids.add(pid)
+    return sorted(pids)
+
+
+def read_shim_stats(path: "str | os.PathLike | None" = None, *,
+                    pid: "int | None" = None) -> dict:
+    """Read + parse a shim_stats file, adding two derived keys: `_stale`
+    (bool) and `_pid` (int|None). Empty dict if absent.
+
+    path=None, pid=None (default): today's behavior, byte-for-byte , the
+        global file, /run then /tmp fallback. All existing callers pass
+        neither and are unaffected by the parameters below.
+    path=<given>: that exact file (unchanged existing behavior; still wins
+        over `pid` if both are somehow passed).
+    pid=<int>: the per-PID snapshot for that process (shim_stats_path_for).
+        When no per-PID file exists yet (older shim, or the process hasn't
+        written one), falls back to the global file ONLY if the global
+        file's own `pid=` field matches the request , this NEVER silently
+        returns a different process's snapshot, which is the exact
+        ambiguity this parameter exists to close. No match -> {}."""
+    if path is not None:
+        return _read_and_parse_shim_stats(Path(path))
+    if pid is not None:
+        p = shim_stats_path_for(pid)
+        if p is not None:
+            return _read_and_parse_shim_stats(p)
+        global_p = SHIM_STATS_PATH if SHIM_STATS_PATH.exists() else SHIM_STATS_ALT
+        d = _read_and_parse_shim_stats(global_p)
+        return d if d.get("_pid") == pid else {}
+    p = SHIM_STATS_PATH if SHIM_STATS_PATH.exists() else SHIM_STATS_ALT
+    return _read_and_parse_shim_stats(p)
 
 
 def _to_int(v) -> int:
@@ -467,6 +557,41 @@ def reset_stale_tracker() -> bool:
         except OSError:
             pass
     return removed
+
+
+def reset_stale_shim_pids() -> int:
+    """Per-PID complement to reset_stale_tracker(): delete every
+    shim_stats.<pid> (and matching metrics.<pid>.json) file whose PID is no
+    longer alive. Python-side cleanup for crashed processes that never ran
+    the C shim's own destructor-time unlink (SIGKILL) OR the shim's
+    opportunistic per-process reaper in gb_stats_resolve_path() (which only
+    runs once per NEW process's own resolve call , if nothing GreenBoost-
+    linked launches again for a while, dead-PID files sit until this runs).
+    Returns the count of PIDs cleaned up. Never raises."""
+    cleaned = 0
+    for pid, path in _iter_shim_pid_files():
+        try:
+            os.kill(pid, 0)
+            continue   # alive — not stale
+        except ProcessLookupError:
+            pass
+        except OSError:
+            continue
+        removed_this_pid = False
+        try:
+            path.unlink()
+            removed_this_pid = True
+        except OSError:
+            pass
+        metrics_path = path.parent / f"metrics.{pid}.json"
+        try:
+            metrics_path.unlink()
+            removed_this_pid = True
+        except OSError:
+            pass
+        if removed_this_pid:
+            cleaned += 1
+    return cleaned
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

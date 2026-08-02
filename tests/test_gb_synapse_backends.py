@@ -329,6 +329,7 @@ def _patch_torch_serve_common(monkeypatch, tmp_path, mode="gllm", reason=""):
     popen_calls = []
 
     class _FakeProc:
+        pid = 424242
         def kill(self):
             pass
 
@@ -843,3 +844,54 @@ def test_video_backend_serve_uses_entry_quant_or_fp8_default(tmp_path, monkeypat
     cmd = popen_calls[0]
     q_idx = cmd.index("--quant")
     assert cmd[q_idx + 1] == "fp8"
+
+
+# ── _read_shim_stats(pid=) / _validate_placement(pid=) (missing_features.md g) ──
+
+def test_read_shim_stats_default_reads_global_file(tmp_path, monkeypatch):
+    p = tmp_path / "shim_stats"
+    p.write_text("tier_t2_local_cur_mb=5\ndefer_init=1\n")
+    monkeypatch.setattr(gsb, "_SHIM_STATS_PATH", p)
+    stats = gsb._read_shim_stats()
+    assert stats["tier_t2_local_cur_mb"] == "5"
+
+
+def test_read_shim_stats_pid_routes_through_gb_monitor(tmp_path, monkeypatch):
+    global_p = tmp_path / "shim_stats"
+    global_p.write_text("tier_t2_local_cur_mb=999\n")   # decoy — must NOT be read
+    per_pid_p = tmp_path / "shim_stats.4242"
+    per_pid_p.write_text("tier_t2_local_cur_mb=7\n")
+
+    monkeypatch.setattr(gsb, "_SHIM_STATS_PATH", global_p)
+
+    import gb_monitor
+    monkeypatch.setattr(gb_monitor, "shim_stats_path_for",
+                        lambda pid: per_pid_p if pid == 4242 else None)
+
+    stats = gsb._read_shim_stats(pid=4242)
+    assert stats["tier_t2_local_cur_mb"] == "7"
+
+
+def test_read_shim_stats_pid_falls_back_to_global_when_no_per_pid_file(tmp_path, monkeypatch):
+    global_p = tmp_path / "shim_stats"
+    global_p.write_text("tier_t2_local_cur_mb=3\n")
+    monkeypatch.setattr(gsb, "_SHIM_STATS_PATH", global_p)
+
+    import gb_monitor
+    monkeypatch.setattr(gb_monitor, "shim_stats_path_for", lambda pid: None)
+
+    stats = gsb._read_shim_stats(pid=999)
+    assert stats["tier_t2_local_cur_mb"] == "3"
+
+
+def test_synapse_torch_backend_serve_passes_child_pid_to_validate_placement(tmp_path, monkeypatch):
+    popen_calls, captured, venv = _patch_torch_serve_common(monkeypatch, tmp_path)
+    validate_calls = []
+    monkeypatch.setattr(gsb, "_validate_placement",
+                        lambda entry, util, budget_facts, engine, pid=None:
+                        validate_calls.append(pid))
+
+    entry = _FakeSynapseEntry()
+    gsb.SynapseTorchBackend().serve(entry, port=11435)
+
+    assert validate_calls == [424242]   # the _FakeProc.pid from _patch_torch_serve_common

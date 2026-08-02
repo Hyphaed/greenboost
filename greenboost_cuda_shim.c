@@ -131,6 +131,8 @@
 #include <sys/sysinfo.h>
 #include <time.h>
 #include <errno.h>
+#include <dirent.h>   /* gb_stats_reap_dead_pids() - missing_features.md item (g) */
+#include <signal.h>   /* kill(pid, 0) liveness check - same */
 #include "greenboost_ioctl.h"     /* gb_alloc_req, GB_IOCTL_ALLOC - userspace-safe */
 #include "greenboost_netc.h"      /* remote cluster GPU client */
 #include "features/net_fabric.h"  /* GB_ALLOC_TIER_* constants */
@@ -3239,23 +3241,77 @@ static volatile int gb_disable_t2_on_blackwell = 0;
 static const char *gb_stats_dir  = NULL;
 static const char *gb_stats_file = NULL;
 
+/* Per-PID stats reaper (missing_features.md item (g)): opportunistically
+ * unlink shim_stats.<pid>/metrics.<pid>.json files whose owning process is
+ * dead. Runs once per NEW process's own gb_stats_resolve_path() call (not
+ * per interval - the caller already guards this function with the
+ * gb_stats_file NULL check), so cost is bounded to process-start frequency,
+ * not the 250ms stats-write cadence. Python-side gb_monitor.reset_stale_
+ * shim_pids() covers the case where no new GreenBoost-linked process starts
+ * for a while after a crash. */
+static void gb_stats_reap_dead_pids(const char *dir)
+{
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *ent;
+    pid_t self = getpid();
+    while ((ent = readdir(d)) != NULL) {
+        const char *prefix = "shim_stats.";
+        size_t plen = strlen(prefix);
+        if (strncmp(ent->d_name, prefix, plen) != 0) continue;
+        const char *suffix = ent->d_name + plen;
+        if (!suffix[0]) continue;
+        char *endp;
+        long pid = strtol(suffix, &endp, 10);
+        if (*endp != '\0' || pid <= 0) continue;   /* not a pure digit suffix */
+        if ((pid_t)pid == self) continue;
+        if (kill((pid_t)pid, 0) == 0 || errno != ESRCH) continue;  /* alive or unqueryable */
+        char stale_path[192], stale_metrics[192];
+        snprintf(stale_path, sizeof(stale_path), "%s/%s", dir, ent->d_name);
+        unlink(stale_path);
+        snprintf(stale_metrics, sizeof(stale_metrics), "%s/metrics.%ld.json", dir, pid);
+        unlink(stale_metrics);
+    }
+    closedir(d);
+}
+
 static void gb_stats_resolve_path(void)
 {
+    static char stats_file_buf[160];
     if (gb_stats_file) return;  /* already resolved */
 
-    /* Try /run/greenboost first (preferred - readable by status script) */
-    if (mkdir(GB_STATS_DIR, 0777) == 0 || errno == EEXIST) {
+    /* GB_STATS_DIR env override (missing_features.md item (g)): lets a
+     * locally-rebuilt shim be exercised under LD_PRELOAD without writing
+     * into a LIVE system's /run/greenboost - there was previously no way
+     * to safely test this file's own path-resolution/write/reaper logic
+     * without clobbering a real install's global shim_stats. Unset in
+     * production; the default path below is unchanged. */
+    const char *preferred_dir = getenv("GB_STATS_DIR");
+    if (!preferred_dir || !preferred_dir[0]) preferred_dir = GB_STATS_DIR;
+
+    /* Try the preferred dir first (readable by status script when it's the
+     * real /run/greenboost) */
+    if (mkdir(preferred_dir, 0777) == 0 || errno == EEXIST) {
         /* chmod in case directory already existed with wrong perms */
-        chmod(GB_STATS_DIR, 0777);
+        chmod(preferred_dir, 0777);
         /* Test writeability */
         char probe[128];
-        snprintf(probe, sizeof(probe), "%s/.probe.%d", GB_STATS_DIR, (int)getpid());
+        snprintf(probe, sizeof(probe), "%s/.probe.%d", preferred_dir, (int)getpid());
         FILE *fp = fopen(probe, "w");
-        if (fp) { fclose(fp); unlink(probe); gb_stats_dir = GB_STATS_DIR; gb_stats_file = GB_STATS_FILE; return; }
+        if (fp) {
+            fclose(fp);
+            unlink(probe);
+            gb_stats_dir = preferred_dir;
+            snprintf(stats_file_buf, sizeof(stats_file_buf), "%s/shim_stats", preferred_dir);
+            gb_stats_file = stats_file_buf;
+            gb_stats_reap_dead_pids(gb_stats_dir);
+            return;
+        }
     }
     /* Fall back to /tmp - always writable */
     gb_stats_dir  = "/tmp";
     gb_stats_file = GB_STATS_FILE_TMP;
+    gb_stats_reap_dead_pids(gb_stats_dir);
 }
 
 /* ================================================================== */
@@ -3740,6 +3796,21 @@ static void gb_write_stats(void)
         fprintf(f, "pinned_pool_bufs_free=%d\n", gb_netc_pinned_free_count());
     fprintf(f, "timestamp=%ld\n",             (long)time(NULL));
     fclose(f);
+
+    /* Per-PID snapshot (missing_features.md item (g)): hardlink the SAME
+     * inode the payload was just written to under shim_stats.<pid>, before
+     * the tmp name is handed to the global file below. The payload is
+     * written ONCE - this is a metadata-only syscall, not an extra
+     * fprintf pass. Best-effort: link() failure (EMLINK, exotic fs, a race)
+     * must never affect the global write that follows. unlink() first
+     * since link() fails EEXIST otherwise (this same PID's own prior
+     * snapshot, from the last write_stats tick). */
+    {
+        char pid_path[192];
+        snprintf(pid_path, sizeof(pid_path), "%s/shim_stats.%d", gb_stats_dir, (int)getpid());
+        unlink(pid_path);
+        if (link(tmp_path, pid_path) != 0) { /* best-effort; never affects the global write below */ }
+    }
     rename(tmp_path, gb_stats_file);
 
     /* D5: also write JSON metrics for Prometheus exporter */
@@ -3847,6 +3918,17 @@ static void gb_write_stats(void)
                 fprintf(jf, "  \"feeders\": []\n}\n");
             }
             fclose(jf);
+            /* Per-PID metrics.<pid>.json, same pattern as shim_stats.<pid>
+             * above - one hardlink, best-effort, never affects the global
+             * write. Naming keeps "*.json" glob matching intact for any
+             * reader that scans gb_stats_dir. */
+            {
+                char pid_json_path[192];
+                snprintf(pid_json_path, sizeof(pid_json_path), "%s/metrics.%d.json",
+                        gb_stats_dir, (int)getpid());
+                unlink(pid_json_path);
+                if (link(json_tmp, pid_json_path) != 0) { /* best-effort; never affects the global write below */ }
+            }
             rename(json_tmp, json_path);
         }
     }
@@ -5825,8 +5907,22 @@ static void gb_resume_init_locked(void) { gb_shim_init(); }
 __attribute__((destructor))
 static void gb_shim_fini(void)
 {
-    if (initialized)
+    if (initialized) {
         gb_write_stats();  /* final snapshot before unload */
+        /* Clean exit (SIGTERM/normal exit): remove this process's own
+         * per-PID snapshot files (missing_features.md item (g)). SIGKILL
+         * skips this destructor entirely - those are cleaned up by
+         * gb_stats_reap_dead_pids() on the next process's own
+         * gb_stats_resolve_path() call, or by gb_monitor.
+         * reset_stale_shim_pids() Python-side. */
+        if (gb_stats_dir) {
+            char pid_path[192], pid_metrics[192];
+            snprintf(pid_path, sizeof(pid_path), "%s/shim_stats.%d", gb_stats_dir, (int)getpid());
+            unlink(pid_path);
+            snprintf(pid_metrics, sizeof(pid_metrics), "%s/metrics.%d.json", gb_stats_dir, (int)getpid());
+            unlink(pid_metrics);
+        }
+    }
     /* CRIT-06: Join on prefetch_initialized (not initialized) so the thread is
      * always reaped regardless of whether symbol resolution succeeded. */
     if (prefetch_initialized) {
