@@ -26,7 +26,7 @@
 | 🗜️ **GB-Quant** | Compress model weights and the KV cache so larger models fit into available VRAM. |
 | 📡 **GB-Dataflux** | Live telemetry exposed through the GreenBoost Dataflux MCP server and a web dashboard. Launch the UI with `greenboost dataflux-ui`. |
 | 🌐 **GB-Cluster** | Borrow idle GPU and RAM resources from other machines on your local network. |
-| 🔗 **GB-Synapse** | Translation proxy exposing Ollama-compatible endpoints (`/api/generate`, `/api/chat`, `/api/tags`, `/api/ps`) and the OpenAI-compatible `/v1/*` API on port `11435`. It sits in front of `gb-synapse` (`llama-server --rpc`), enabling cross-GPU RPC execution, GB-Quant, proxy-side Dataflux telemetry (including tokens/sec), HuggingFace models model serving. A genuine full featured backend, drop-in replacement for Ollama  :: Do not use Ollama point directly to GB-Synapse for orchestrated ai inference |
+| 🔗 **GB-Synapse** | Translation proxy exposing Ollama-compatible endpoints (`/api/generate`, `/api/chat`, `/api/tags`, `/api/ps`) and the OpenAI-compatible `/v1/*` API on port `11435`. It sits in front of `gb-synapse` (`llama-server --rpc`), enabling cross-GPU RPC execution, GB-Quant, proxy-side Dataflux telemetry (including tokens/sec), HuggingFace models model serving. A genuine full featured backend, drop-in replacement for Ollama  :: Do not use Ollama, point directly to GB-Synapse for orchestrated ai inference |
 | 🖥️ **GB-CLI** | Agentic terminal client, installed by Full Install , no separate setup. Open it with `gb` or `greenboost-cli`; one-shot prompts with `gb -p "…"`; headless JSON subcommands for scripts (`gb rag-search …`). Always talks to GB-Synapse on `:11435` (Ollama **and** HuggingFace models via `greenboost synapse pull` / `index-ollama`). |
 | 🧭 **GB-Semantics** | Standardized metrics layer that gives every important system concept, such as VRAM usage, throughput (tokens per second), cache hit rate, cluster health, or quality level, a single, well-defined name and source. |
 </div>
@@ -556,7 +556,7 @@ next serve, instead of re-estimating from a formula every time.
 **Agentic terminal client, installed by Full Install , no separate setup.**
 
 ```bash
-gb                        # interactive agent in your terminal
+gb or greenboost-cli                        # interactive agent in your terminal
 gb -p "summarize this repo"   # one-shot prompt
 gb rag-search "kv cache"      # headless JSON subcommand, for scripts
 ```
