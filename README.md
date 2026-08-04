@@ -338,6 +338,16 @@ report = gb_quant.quantize_to_fit(pipe_or_model, budget_gb=11.0)
 - Measured on an RTX 5070 12 GB: a 9 B image model that needed ~7 min/image
   through DDR overflow runs at ~5 s/image quantized into VRAM, with no
   visible quality loss; a 12 B LLM (22.7 GiB bf16) fits in 6.2 GiB.
+- **Component-sensitivity-aware, not just budget-aware** (`gb_quant_roles.py`,
+  `gb_gguf_plan.py`): recurrent/state-tracking tensors (a small minority of
+  bytes, but disproportionately sensitive to compression) get protected at a
+  quality floor regardless of what a flat per-layer error proxy alone would
+  suggest, while the ordinary feed-forward majority takes the aggressive
+  compression instead — for GGUF models served through gb-synapse, this
+  wires directly into `llama-quantize`'s own per-tensor type override; for
+  torch checkpoints, into the same DP planner above. Mechanism is built and
+  tested; the live before/after measurement on the reference workload is
+  still pending — see `missing_features.md` item (j).
 
 The low-bit GEMM kernel underneath (GemLite, `scaled_mm` fp8, bf16
 passthrough) is itself pluggable via `gb_kernel_backends.py` and
@@ -611,6 +621,8 @@ set against a frozen fixture on every run.
 ## 🔗 Non direct contributors
 
 - **Mobius Labs** thanks to https://github.com/dropbox/gemlite, big part of gb-quant is based on it
+
+GemLite is a collection of Triton kernels designed for efficient low-bit matrix multiplication, emphasizing simplicity and reusability. It provides a practical solution for achieving significant performance gains, delivering up to 7-8x faster prefill and 3-6x faster decoding compared to default Torch AO kernels.  
 
 ---
 
