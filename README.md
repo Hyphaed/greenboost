@@ -26,7 +26,7 @@
 | 🗜️ **GB-Quant** | Compress model weights and the KV cache so larger models fit into available VRAM. |
 | 📡 **GB-Dataflux** | Live telemetry exposed through the GreenBoost Dataflux MCP server and a web dashboard. Launch the UI with `greenboost dataflux-ui`. |
 | 🌐 **GB-Cluster** | Borrow idle GPU and RAM resources from other machines on your local network. |
-| 🔗 **GB-Synapse** | Translation proxy exposing Ollama-compatible endpoints (`/api/generate`, `/api/chat`, `/api/tags`, `/api/ps`) and the OpenAI-compatible `/v1/*` API on port `11434`. It sits in front of `gb-synapse` (`llama-server --rpc`), enabling cross-GPU RPC execution, GB-Quant, and proxy-side Dataflux telemetry (including tokens/sec). A genuine drop-in replacement for Ollama. |
+| 🔗 **GB-Synapse** | Translation proxy exposing Ollama-compatible endpoints (`/api/generate`, `/api/chat`, `/api/tags`, `/api/ps`) and the OpenAI-compatible `/v1/*` API on port `11435`. It sits in front of `gb-synapse` (`llama-server --rpc`), enabling cross-GPU RPC execution, GB-Quant, and proxy-side Dataflux telemetry (including tokens/sec). A genuine drop-in replacement for Ollama. |
 | 🖥️ **GB-CLI** | Agentic terminal client, installed by Full Install , no separate setup. Open it with `gb` (or `greenboost-cli`); one-shot prompts with `gb -p "…"`; headless JSON subcommands for scripts (`gb rag-search …`). Always talks to GB-Synapse on `:11435` (Ollama **and** HuggingFace models via `greenboost synapse pull` / `index-ollama`). |
 | 🧭 **GB-Semantics** | Governed metric/segment layer for GreenBoost's own state (VRAM fill, tier pressure, tok/s, quality floor, cluster health, prompt-cache hit rate…) , one name, one deterministic resolver, per concept, with explicit "never read this raw field instead" traps. The mandatory default path any LLM client resolves through before touching a raw dataflux/telemetry field. |
 </div>
@@ -51,8 +51,6 @@
 [GB-CLI](#-gb-cli) ·
 [GB-Semantics](#-gb-semantics) ·
 [Changelog](CHANGELOG.md)
-
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/greenboost)
 
 </div>
 
