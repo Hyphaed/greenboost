@@ -104,8 +104,14 @@ diffusion pipelines for image and video - not just synthetic benchmarks.
 ### Who is this for?
 
 - **Newcomers to local LLMs:** you have a 12 GB or 16 GB GPU and want to
-  run a 30 B+ model that needs 24 GB. Install GreenBoost, point Ollama at
-  it, done.
+  run a 30 B+ model that needs 24 GB. Install GreenBoost, 
+  use gb-synapse as backend and/or greenboost-cli, 
+  greenboost at first versions was intercepting ollama,
+  on those new latest versions greenboost ships GB-Synapse, 
+  a proper backend serving GGUF (with full compatible ollama endpoints) + 
+  hugging face models while using whole greenboost features.
+  type "greenboost-cli" on terminal, 
+  is a simple cli to manage those models directly from your terminal,
 - **Inference engineers:** you want to push context length or batch size
   past VRAM, without paying a 100× CPU offload penalty. GreenBoost keeps
   compute on the GPU; only memory crosses PCIe.
@@ -116,10 +122,6 @@ diffusion pipelines for image and video - not just synthetic benchmarks.
 - **Cluster operators:** you have a few workstations with idle VRAM.
   GB-Cluster turns them into "feeders" so one host can borrow VRAM and
   compute from them over TCP.
-
-If your workload is small enough to fit entirely in VRAM, GreenBoost adds
-no benefit - and adds no overhead either, since the shim only intercepts
-the allocations that overflow.
 
 ---
 
