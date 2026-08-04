@@ -109,8 +109,7 @@ diffusion pipelines for image and video - not just synthetic benchmarks.
   greenboost at first versions was intercepting ollama,
   on those new latest versions greenboost ships GB-Synapse, 
   a proper backend serving GGUF (with full compatible ollama endpoints) + 
-  hugging face models while using whole greenboost features.
-  type "greenboost-cli" on terminal, 
+  hugging face models while using whole greenboost features. Type "greenboost-cli" on terminal, 
   is a simple cli to manage those models directly from your terminal,
 - **Inference engineers:** you want to push context length or batch size
   past VRAM, without paying a 100× CPU offload penalty. GreenBoost keeps
