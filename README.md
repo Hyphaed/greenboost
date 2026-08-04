@@ -28,7 +28,7 @@
 | 🌐 **GB-Cluster** | Borrow idle GPU and RAM resources from other machines on your local network. |
 | 🔗 **GB-Synapse** | Translation proxy exposing Ollama-compatible endpoints (`/api/generate`, `/api/chat`, `/api/tags`, `/api/ps`) and the OpenAI-compatible `/v1/*` API on port `11435`. It sits in front of `gb-synapse` (`llama-server --rpc`), enabling cross-GPU RPC execution, GB-Quant, and proxy-side Dataflux telemetry (including tokens/sec). A genuine drop-in replacement for Ollama. |
 | 🖥️ **GB-CLI** | Agentic terminal client, installed by Full Install , no separate setup. Open it with `gb` (or `greenboost-cli`); one-shot prompts with `gb -p "…"`; headless JSON subcommands for scripts (`gb rag-search …`). Always talks to GB-Synapse on `:11435` (Ollama **and** HuggingFace models via `greenboost synapse pull` / `index-ollama`). |
-| 🧭 **GB-Semantics** | Governed metric/segment layer for GreenBoost's own state (VRAM fill, tier pressure, tok/s, quality floor, cluster health, prompt-cache hit rate…) , one name, one deterministic resolver, per concept, with explicit "never read this raw field instead" traps. The mandatory default path any LLM client resolves through before touching a raw dataflux/telemetry field. |
+| 🧭 **GB-Semantics** | Standardized metrics layer that gives every important system concept—such as VRAM usage, throughput (tokens per second), cache hit rate, cluster health, or quality level—a single, well-defined name and source. |
 </div>
 
 <div align="center">
@@ -575,17 +575,7 @@ rag/goals/factory surface to other assistants.
 
 ## 🧭 GB-Semantics
 
-**A governed metric/segment layer so an LLM gets one deterministic answer per
-question about GreenBoost's own state , never a guess.**
-
-Several raw fields in this codebase mean two different things depending on
-where they're read from (a shim-inflated "virtual" VRAM figure vs. the real
-physical one; a 0/1/2 pressure enum vs. a 0.0-1.0 pressure fraction under the
-same field name). GB-Semantics defines each governed concept ONCE
-(`semantics/*.yaml`: entities, metrics, segments, question-routing), binds it
-to a resolver that wraps GreenBoost's existing accessors (`gb_semantics.py`),
-and documents every trap explicitly (`never_use`) so an agent that reads the
-raw field anyway at least knows it's the wrong one.
+This is a standardized metrics layer that gives every important system concept—such as VRAM usage, throughput (tokens per second), cache hit rate, cluster health, or quality level—a single, well-defined name and source. Instead of letting applications or LLMs read raw telemetry directly, they must go through this layer, which acts as the authoritative resolver for each metric. It enforces consistency, hides implementation details, and prevents accidental use of low-level fields by explicitly marking them as internal or unsupported. In practice, it becomes the default interface for accessing system state, ensuring that all clients interpret metrics the same way regardless of how the underlying telemetry changes.
 
 ```bash
 python3 gb_semantics.py answer "is rule 1 satisfied?"
@@ -622,7 +612,7 @@ set against a frozen fixture on every run.
 
 - **Mobius Labs** thanks to https://github.com/dropbox/gemlite, big part of gb-quant is based on it
 
-GemLite is a collection of Triton kernels designed for efficient low-bit matrix multiplication, emphasizing simplicity and reusability. It provides a practical solution for achieving significant performance gains, delivering up to 7-8x faster prefill and 3-6x faster decoding compared to default Torch AO kernels.  
+GemLite is a collection of Triton kernels designed for efficient low-bit matrix multiplication, emphasizing simplicity and reusability. It provides a practical solution for achieving significant performance gains, delivering up to 7-8x faster prefill and 3-6x faster decoding compared to default Torch AO kernels.
 
 ---
 
