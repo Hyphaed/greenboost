@@ -2,6 +2,21 @@
 #define GREENBOOST_COMPAT_H
 #include <linux/version.h>
 
+/* dma_buf_set_priority(): out-of-tree RFC hint, not gated by kernel version
+ * (see Kbuild's GB_HAS_DMABUF_PRIORITY probe). Fall back to 0 (absent) for
+ * any build path that doesn't define it. */
+#ifndef GB_HAS_DMABUF_PRIORITY
+# define GB_HAS_DMABUF_PRIORITY 0
+#endif
+
+/* dma_buf_set_compression(): sibling out-of-tree RFC hint (see Kbuild's
+ * GB_HAS_DMABUF_COMPRESSION probe). Fall back to 0 (absent) for any build
+ * path that doesn't define it — same reasoning as GB_HAS_DMABUF_PRIORITY
+ * above. */
+#ifndef GB_HAS_DMABUF_COMPRESSION
+# define GB_HAS_DMABUF_COMPRESSION 0
+#endif
+
 /* kretprobe: entry_handler field added in 5.11 */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0)
 # define GB_KRETPROBE_HAS_ENTRY  0

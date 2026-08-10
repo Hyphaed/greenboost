@@ -13,10 +13,20 @@ forward pass, no extra tensor compute) to:
 
   1. build a per-layer, per-expert frequency histogram (CPU-side bookkeeping
      only , no tensor compute on CPU, per GreenBoost's immutable design rule),
-  2. keep cold experts compressed (gb_quant.quantize_module, int4) and
-     DDR-resident (ModelTierManager, T2) instead of full-precision T1 VRAM,
-  3. statistically prefetch the next layer's historically-hottest experts
-     to T1 on the transfer stream while the current layer computes, so a
+  2. keep cold experts LOSSLESSLY compressed (CPU-side, bit-exact ,
+     _demote_expert_module/_restore_expert_module, see their docstrings)
+     and DDR-resident (ModelTierManager, T2) instead of full-precision T1
+     VRAM. 2026-08-10: replaced the original gb_quant.quantize_module(int4)
+     demote path, which was irreversible , promote() never un-quantized,
+     so an expert that went cold and came back hot returned permanently
+     precision-degraded, contradicting this module's own "T1 = full
+     precision" contract. compress_ratio tracking on this path also feeds
+     entropy-aware placement (item 3 below): a well-compressing expert is a
+     cheaper eviction than an equally-cold peer that doesn't compress, so
+     it's held to a stricter hot-bar , see _entropy_adjusted_threshold.
+  3. statistically (optionally MTP-predictively, see mtp_oracle on
+     GbMoEManager.__init__) prefetch the next layer's likely-hot experts to
+     T1 on the transfer stream while the current layer computes, so a
      demoted expert that becomes hot again isn't promoted synchronously on
      the critical path.
 
@@ -43,6 +53,10 @@ Usage:
 
     mgr = gb_moe.GbMoEManager(model, hot_threshold=0.05,
                                cold_bits=4, prefetch_topn=2)
+    # Optional, for models with native MTP heads (see mtp_oracle's
+    # docstring on GbMoEManager.__init__) , omit entirely for pure-history
+    # prefetch, unchanged from before this parameter existed:
+    #   mgr = gb_moe.GbMoEManager(model, mtp_oracle=my_mtp_router_lookahead)
     mgr.attach()
     ...run inference...
     print(mgr.status())
@@ -203,6 +217,77 @@ def _dequant_int8_slice(
     return (flat_q * flat_s).reshape(q.shape).to(dtype)
 
 
+# ── lossless CPU-side compression for cold-expert demotion ─────────────────
+#
+# 2026-08-10: replaces gb_quant.quantize_module()'s use as the non-batched
+# _rebalance() demote path. That call was IRREVERSIBLE — it replaces a
+# module's Linear layers in place with lower-precision GemLite/TurboQuant
+# kernels, and nothing on the promote side ever undoes it (ModelTierManager.
+# promote() is a plain `module.to("cuda")`; it has no un-quantize). An
+# expert that went cold and later became hot again came back permanently
+# precision-degraded, silently, contradicting this module's own docstring
+# ("T1, hot, full precision"). Confirmed by reading gb_model_tier.py's
+# promote()/demote(): both are bare device-transfer calls, so
+# quantize_module() was doing double duty as BOTH the DDR-footprint
+# reduction AND an (irreversible) precision cut. _demote_expert_module /
+# _restore_expert_module below split those two concerns: ModelTierManager
+# still owns the device transfer (unchanged), and footprint reduction now
+# comes from a genuinely lossless, genuinely reversible compression step
+# instead of a lossy one.
+#
+# zlib (Python stdlib, zero new runtime dependency) is deliberately not
+# nvCOMP/DFloat11-class — those need a real GPU codec runtime that isn't
+# vendored on this box yet (see docs/research/spark-parity-survey.md's
+# empirical codec gate, and patches/custom/0020-dma-buf-compressed-
+# descriptor.patch, in ~/Dev/kernel_inference, which this demote path is
+# the intended first consumer of once a GPU codec lands). zlib buys real,
+# working, bit-exact compression today with no new dependency; swapping the
+# two functions below for a GPU-side codec is a drop-in replacement for
+# every caller once one is vendored and benchmarked — don't do that swap
+# blind, benchmark it first per the survey's step 2.1.
+#
+# `.view(torch.uint8)` is what makes this dtype-agnostic (works for
+# bfloat16 too, which plain `.numpy()` cannot handle — numpy has no native
+# bfloat16 type): it reinterprets the same underlying bytes without
+# copying or converting any value, so compression operates on the exact
+# on-the-wire representation and decompression reconstructs it bit-exact.
+
+def _lossless_compress_tensor(t: torch.Tensor) -> "Tuple[bool, bytes, torch.Size, torch.dtype]":
+    """Bit-exact CPU compression of a tensor's raw bytes. Returns
+    (is_compressed, payload, original_shape, original_dtype).
+
+    Near-random data (e.g. a freshly torch.randn-initialized tensor —
+    confirmed by this module's own tests) can have no exploitable
+    redundancy at all, in which case zlib's own framing overhead makes
+    its output LARGER than the input. Real model weights compress better
+    in practice (see docs/research/spark-parity-survey.md's "LLM weight
+    effective entropy is 2-10x lower than stored bitwidth" finding), but
+    this function must never assume that — is_compressed=False signals
+    the caller to store the raw bytes as-is instead of a "compressed"
+    blob that would waste more DDR than a plain copy."""
+    import zlib
+    cpu_t = t.detach().to("cpu", non_blocking=False).contiguous()
+    byte_view = cpu_t.view(torch.uint8)
+    raw_bytes = byte_view.numpy().tobytes()
+    compressed = zlib.compress(raw_bytes, level=6)
+    if len(compressed) < len(raw_bytes):
+        return True, compressed, cpu_t.shape, cpu_t.dtype
+    return False, raw_bytes, cpu_t.shape, cpu_t.dtype
+
+
+def _lossless_decompress_tensor(
+    is_compressed: bool, payload: bytes, shape: "torch.Size", dtype: torch.dtype
+) -> torch.Tensor:
+    """Inverse of _lossless_compress_tensor — bit-exact, not an
+    approximation. Returns a CPU tensor; caller moves it to the target
+    device (ModelTierManager.promote()'s subsequent `.to("cuda")` does
+    this for the non-batched path)."""
+    import zlib
+    raw = zlib.decompress(payload) if is_compressed else payload
+    byte_tensor = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+    return byte_tensor.view(dtype).reshape(shape).clone()
+
+
 @dataclass
 class _BatchedBlockState:
     """State for one MoE block using the batched-*Experts 3D-param convention.
@@ -243,6 +328,18 @@ class _BlockState:
     gate_handle: object = None
     pre_hook_handles: list = field(default_factory=list)
     calls: int = 0                                # this block's own hook-fire count
+    # {expert_key: {param_name: (compressed_bytes, shape, dtype)}} for cold
+    # experts — see _demote_expert_module/_restore_expert_module. A
+    # parameter's real data is swapped out to here (replaced on-module with
+    # a 1-element placeholder) while cold; restoring pops the entry and
+    # writes the decompressed bytes back, bit-exact.
+    lossless_bufs: dict = field(default_factory=dict)
+    # {expert_key: last observed compressed_size / uncompressed_size} — the
+    # entropy-aware placement signal: an expert that compresses better is a
+    # cheaper eviction (less to re-fetch/recompute on promote) than an
+    # equally-cold peer that doesn't, so demotion order can prefer it. Only
+    # populated after an expert has been demoted at least once.
+    compress_ratio: dict = field(default_factory=dict)
 
 
 _EMA_DECAY = 0.98
@@ -293,14 +390,42 @@ class GbMoEManager:
     tier_manager : ModelTierManager | None
         Reuse an existing one (e.g. the diffusion/LLM orchestrator's), or a
         dedicated instance is created.
+    mtp_oracle : Callable[[str, torch.Tensor], "Iterable[int] | None"] | None
+        Optional predictive-prefetch oracle for models with native
+        multi-token-prediction (MTP) heads (e.g. this workstation's default
+        Qwen3.6 model — see docs/research/spark-parity-survey.md's Track
+        2.2 in ~/Dev/kernel_inference). The module docstring's own
+        limitation note is exactly the gap this closes: "layer i+1's actual
+        routing depends on layer i's output, which doesn't exist until
+        layer i finishes" — true for the MAIN forward pass, but an MTP
+        head predicts several tokens ahead using information already
+        available, so its predicted routing can stand in for the
+        historical-frequency heuristic the prefetch otherwise relies on
+        alone. Called as `mtp_oracle(block_name, gate_logits)` right after
+        each block's gate fires; return an iterable of predicted expert
+        indices for the NEXT block, or None/empty to fall back to pure
+        history for that call. Predictions are UNIONED with the
+        historical top-`prefetch_topn` list, never used to replace it ,
+        this is a hint that can widen the prefetch set, not a correctness
+        dependency (the synchronous pre-hook/gate-hook restore paths
+        remain the actual correctness guarantee regardless of what this
+        oracle predicts). Default None: behavior is then byte-identical to
+        before this parameter existed. Speculative decoding is universally
+        used to amortize compute; using its predictions as a memory-tiering
+        oracle is the actually-new idea here, not a proven technique , no
+        MTP-capable model was available to test this against live in this
+        session, so treat it as a documented, tested-at-the-plumbing-level
+        extension point rather than a validated performance claim.
     """
 
     def __init__(self, model: torch.nn.Module, hot_threshold: float = 0.05,
                  cold_bits: "int | str" = 4, prefetch_topn: int = 2,
-                 hysteresis_margin: float = 0.25, tier_manager=None):
+                 hysteresis_margin: float = 0.25, tier_manager=None,
+                 mtp_oracle=None):
         self.model = model
         self.hot_threshold = hot_threshold
         self.cold_bits = cold_bits
+        self.mtp_oracle = mtp_oracle
         self.prefetch_topn = prefetch_topn
         self.hysteresis_margin = hysteresis_margin
 
@@ -349,7 +474,7 @@ class GbMoEManager:
                 # cold expert back to T1 the instant it's actually about to
                 # run, guaranteeing correctness; the predictive prefetch in
                 # _prefetch_next is what keeps this path cold in practice.
-                handle = mod.register_forward_pre_hook(self._make_pre_hook(entry_name))
+                handle = mod.register_forward_pre_hook(self._make_pre_hook(st, key, mod, entry_name))
                 st.pre_hook_handles.append(handle)
 
             handle = gate.register_forward_hook(self._make_hook(st))
@@ -378,11 +503,18 @@ class GbMoEManager:
         self._attached = True
         return len(self._blocks) + len(self._batched_blocks)
 
-    def _make_pre_hook(self, entry_name: str):
+    def _make_pre_hook(self, st: _BlockState, key: str, mod: torch.nn.Module, entry_name: str):
         def _pre_hook(module, inputs):
             entry = self.tm._entries.get(entry_name)
             if entry is not None and entry.tier != "T1_HBM":
-                self.tm.promote(entry_name)
+                # Real per-token routing can select a cold expert regardless
+                # of its historical frequency (see attach()'s comment on
+                # this hook) — _restore_expert_module decompresses it
+                # bit-exact before promoting, rather than the old bare
+                # self.tm.promote(entry_name), which would have handed the
+                # forward pass a still-1-element placeholder parameter.
+                self._restore_expert_module(st, key, mod, entry_name)
+                st.hot.add(key)
         return _pre_hook
 
     # ── batched-*Experts hooks and slice management ───────────────────────────
@@ -416,7 +548,7 @@ class GbMoEManager:
             bst.calls += 1
             if bst.calls % _REBALANCE_EVERY == 0:
                 self._rebalance_batched(bst)
-            self._prefetch_next_batched(bst)
+            self._prefetch_next_batched(bst, gate_output=logits)
         return _hook
 
     def _restore_expert_slice(self, bst: _BatchedBlockState, expert_idx: int) -> None:
@@ -462,6 +594,20 @@ class GbMoEManager:
 
     def detach(self):
         for st in self._blocks:
+            # Restore any still-cold experts BEFORE removing hooks/clearing
+            # state, so the model is left with real weights, not 1-element
+            # placeholders, after detach. This mirrors the batched path's
+            # existing cpu_bufs restore below — required here because
+            # _demote_expert_module swaps each cold parameter's .data out
+            # to a placeholder; skipping this would silently strand the
+            # model with unusable experts instead of merely stale tier
+            # bookkeeping (a materially worse failure mode than the
+            # pre-existing quantize-in-place behavior this replaced, which
+            # never removed the parameter's real storage).
+            for key, mod in st.experts:
+                if key in st.lossless_bufs:
+                    entry_name = f"moe::{st.block_name}::{key}"
+                    self._restore_expert_module(st, key, mod, entry_name)
             if st.gate_handle is not None:
                 st.gate_handle.remove()
             for h in st.pre_hook_handles:
@@ -500,19 +646,46 @@ class GbMoEManager:
             st.calls += 1
             if st.calls % _REBALANCE_EVERY == 0:
                 self._rebalance(st)
-            self._prefetch_next(st)
+            self._prefetch_next(st, gate_output=logits)
         return _hook
 
     # ── compression / tier rebalance ─────────────────────────────────────────
 
-    def _is_hot(self, freq_norm: float, was_hot: bool) -> bool:
+    def _is_hot(self, freq_norm: float, was_hot: bool, threshold: "float | None" = None) -> bool:
         """Hysteresis-gated hot/cold decision , see hysteresis_margin
         docstring on __init__. Not-yet-classified experts (was_hot=False on
         an expert never seen resident) use the plain threshold, same as a
-        demoted expert would on the cold side."""
+        demoted expert would on the cold side.
+
+        threshold: overrides self.hot_threshold when given — see
+        _entropy_adjusted_threshold, the entropy-aware placement caller."""
+        base = self.hot_threshold if threshold is None else threshold
         if was_hot:
-            return freq_norm >= self.hot_threshold * (1.0 - self.hysteresis_margin)
-        return freq_norm >= self.hot_threshold * (1.0 + self.hysteresis_margin)
+            return freq_norm >= base * (1.0 - self.hysteresis_margin)
+        return freq_norm >= base * (1.0 + self.hysteresis_margin)
+
+    def _entropy_adjusted_threshold(self, st: _BlockState, key: str) -> float:
+        """Entropy-aware placement (spark-parity-survey.md Track 2.2, in
+        ~/Dev/kernel_inference): every tiering scheme in gb_moe.py before
+        this ranked hot/cold purely by access frequency, which is
+        entropy-blind. An expert that compresses well is a CHEAPER
+        eviction than an equally-hot peer that doesn't (less to re-fetch/
+        decompress on promote), so it can be held to a stricter ("more
+        must stay cold") bar , freeing VRAM budget for poorly-compressing,
+        expensive-to-refetch experts to stay resident instead.
+
+        st.compress_ratio[key] defaults to 1.0 (assume worst case,
+        expensive to evict) for any expert never yet demoted, so a fresh
+        model with zero compression history behaves EXACTLY as it did
+        before this feature existed , the adjustment only kicks in once an
+        expert has gone cold at least once and its real ratio is known.
+        Scoped to the non-batched (state_dict-module) path, the only one
+        that currently tracks compress_ratio; the batched 3D-param path's
+        cold_bits>4 branch is lossless-but-currently-uncompressed (stores
+        a raw CPU copy), so it has no ratio signal to adjust with yet.
+        """
+        ratio = st.compress_ratio.get(key, 1.0)
+        return self.hot_threshold * (2.0 - ratio)
 
     def _emit_expert_placement(self, block_name: str, key: str, action: str,
                                freq_norm: float) -> None:
@@ -532,22 +705,69 @@ class GbMoEManager:
         except Exception:
             pass
 
-    def _rebalance(self, st: _BlockState):
-        import gb_quant
+    def _demote_expert_module(self, st: _BlockState, key: str,
+                              mod: torch.nn.Module, entry_name: str) -> None:
+        """Lossless demote: ModelTierManager still owns the actual device
+        transfer (self.tm.demote -> module.to("cpu"), unchanged, already
+        correct), then each parameter's now-CPU-resident bytes are
+        compressed bit-exact and the module's own copy is replaced with a
+        1-element placeholder so its nominal footprint tracks what's
+        actually being kept resident. See the _lossless_compress_tensor
+        module comment for why this replaces gb_quant.quantize_module
+        here specifically."""
+        self.tm.demote(entry_name)
+        buf: dict = {}
+        total_raw = 0
+        total_stored = 0
+        for pname, p in mod.named_parameters():
+            is_compressed, payload, shape, dtype = _lossless_compress_tensor(p.data)
+            buf[pname] = (is_compressed, payload, shape, dtype)
+            total_raw += p.data.numel() * p.data.element_size()
+            total_stored += len(payload)
+            with torch.no_grad():
+                p.data = torch.zeros(1, dtype=p.dtype)
+        st.lossless_bufs[key] = buf
+        if total_raw > 0:
+            # Capped at 1.0: an incompressible tensor stores its raw bytes
+            # (is_compressed=False, see _lossless_compress_tensor), so this
+            # ratio never exceeds "no space saved", by construction — the
+            # entropy-aware placement signal this feeds should never see a
+            # value implying compression made things worse.
+            st.compress_ratio[key] = min(1.0, total_stored / total_raw)
 
+    def _restore_expert_module(self, st: _BlockState, key: str,
+                               mod: torch.nn.Module, entry_name: str) -> None:
+        """Inverse of _demote_expert_module — decompresses each parameter
+        back to its exact original bytes before handing off to
+        self.tm.promote() (which does the actual `.to("cuda")` transfer,
+        unchanged). Safe/idempotent to call on an already-hot expert:
+        lossless_bufs.pop() returns None and only tm.promote() (itself a
+        no-op for an already-T1 entry) runs."""
+        buf = st.lossless_bufs.pop(key, None)
+        if buf is not None:
+            for pname, p in mod.named_parameters():
+                stored = buf.get(pname)
+                if stored is None:
+                    continue
+                is_compressed, payload, shape, dtype = stored
+                with torch.no_grad():
+                    p.data = _lossless_decompress_tensor(is_compressed, payload, shape, dtype)
+        self.tm.promote(entry_name)
+
+    def _rebalance(self, st: _BlockState):
         total = st.freq.sum().clamp_min(1e-8)
         norm = st.freq / total
         for i, (key, mod) in enumerate(st.experts):
             was_hot = key in st.hot
-            is_hot = self._is_hot(float(norm[i]), was_hot)
+            threshold = self._entropy_adjusted_threshold(st, key)
+            is_hot = self._is_hot(float(norm[i]), was_hot, threshold)
             entry_name = f"moe::{st.block_name}::{key}"
             if is_hot and not was_hot:
-                self.tm.promote(entry_name)
+                self._restore_expert_module(st, key, mod, entry_name)
                 st.hot.add(key)
                 self._emit_expert_placement(st.block_name, key, "promote", float(norm[i]))
             elif not is_hot and was_hot:
-                gb_quant.quantize_module(mod, bits=self.cold_bits)
-                self.tm.demote(entry_name)
+                self._demote_expert_module(st, key, mod, entry_name)
                 st.hot.discard(key)
                 self._emit_expert_placement(st.block_name, key, "demote", float(norm[i]))
 
@@ -588,9 +808,14 @@ class GbMoEManager:
                 self._demote_expert_slice(bst, i)
                 self._emit_expert_placement(bst.block_name, str(i), "demote", float(norm[i]))
 
-    def _prefetch_next_batched(self, bst: _BatchedBlockState) -> None:
+    def _prefetch_next_batched(self, bst: _BatchedBlockState, gate_output=None) -> None:
         """Copy the historically-hottest cold expert slices of the NEXT batched
         block back to GPU before that block's GEMM runs.
+
+        gate_output: this block's just-computed gate logits, forwarded to
+        self.mtp_oracle if one is configured (see __init__ docstring) —
+        None (the default) skips the oracle call, matching pre-existing
+        pure-history behavior for any caller that doesn't pass it.
 
         Copy is intentionally blocking (non_blocking=False): we mark the expert
         hot immediately after, so the next block's gate hook sees it as hot and
@@ -623,21 +848,45 @@ class GbMoEManager:
         if not _vram_budget_ok(estimated_mb * self.prefetch_topn):
             return
 
-        top = torch.topk(
+        top = set(torch.topk(
             nxt.freq, k=min(self.prefetch_topn, nxt.num_experts)
-        ).indices.tolist()
+        ).indices.tolist())
+        top |= self._mtp_predicted_indices(nxt.block_name, gate_output, nxt.num_experts)
         for i in top:
             if str(i) in nxt.hot or i not in nxt.cpu_bufs:
                 continue
             self._restore_expert_slice(nxt, i)
 
-    # ── statistical predictive prefetch ──────────────────────────────────────
+    # ── statistical (+ optional MTP-predictive) prefetch ────────────────────
 
-    def _prefetch_next(self, st: _BlockState):
+    def _mtp_predicted_indices(self, block_name: str, gate_output, num_experts: int) -> set:
+        """Best-effort call into self.mtp_oracle (see its __init__
+        docstring) — a predictive hint, never a correctness dependency, so
+        any failure here (wrong return type, an oracle that raises, no
+        oracle configured) degrades silently to "no extra predictions",
+        leaving the historical-frequency prefetch as the sole source,
+        exactly as if this feature didn't exist."""
+        if self.mtp_oracle is None or gate_output is None:
+            return set()
+        try:
+            predicted = self.mtp_oracle(block_name, gate_output)
+            if not predicted:
+                return set()
+            return {int(i) for i in predicted if 0 <= int(i) < num_experts}
+        except Exception:
+            return set()
+
+    def _prefetch_next(self, st: _BlockState, gate_output=None):
         """Prefetch the historically-hottest experts of the *next* MoE block
         on the transfer stream while this block's gate/expert compute runs.
         Heuristic only (see module docstring) , never blocks, never required
-        for correctness (promote() on the critical path is the fallback)."""
+        for correctness (promote() on the critical path is the fallback).
+
+        gate_output: this block's just-computed gate logits, forwarded to
+        self.mtp_oracle if one is configured (see __init__ docstring) —
+        None (the default) skips the oracle call entirely, so any existing
+        caller that doesn't pass it gets pure-history behavior unchanged.
+        """
         if not _vram_budget_ok():
             return
         idx = self._block_order.get(st.block_name)
@@ -646,18 +895,30 @@ class GbMoEManager:
         nxt = self._blocks[idx + 1]
         if nxt.freq.sum() <= 0:
             return
-        top = torch.topk(nxt.freq, k=min(self.prefetch_topn, nxt.freq.numel())).indices.tolist()
+        top = set(torch.topk(nxt.freq, k=min(self.prefetch_topn, nxt.freq.numel())).indices.tolist())
+        top |= self._mtp_predicted_indices(nxt.block_name, gate_output, nxt.freq.numel())
 
-        import gb_stream_sched as gs
         for i in top:
             key, mod = nxt.experts[i]
             entry_name = f"moe::{nxt.block_name}::{key}"
             entry = self.tm._entries.get(entry_name)
             if entry is None or entry.tier == "T1_HBM":
                 continue
-            with gs.on("transfer"):
-                mod.to("cuda", non_blocking=True)
-            entry.tier = "T1_HBM"
+            # Must go through _restore_expert_module, not a bare
+            # mod.to("cuda") + tier flip: if this expert was demoted via
+            # _demote_expert_module its parameters are 1-element
+            # placeholders on CPU, not real weights — moving those to CUDA
+            # and marking the entry T1_HBM directly would leave the model
+            # holding placeholder weights for real compute, AND the
+            # pre-hook safety net (_make_pre_hook) would see tier==T1_HBM
+            # and skip restoring, since it only checks tier, not whether
+            # the data is real. _restore_expert_module decompresses first,
+            # then calls self.tm.promote() — which already has its own
+            # async-transfer handling (gs.on("transfer") + event sync, see
+            # ModelTierManager.promote), so this also drops the need for a
+            # separate manual transfer-stream block here.
+            self._restore_expert_module(nxt, key, mod, entry_name)
+            nxt.hot.add(key)
             entry.last_used = time.time()
 
     # ── introspection ─────────────────────────────────────────────────────────

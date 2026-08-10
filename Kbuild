@@ -11,6 +11,23 @@ ccflags-y += -fprefetch-loop-arrays
 ccflags-y += -Wall
 ccflags-y += -Werror
 
+# dma_buf_set_priority(): out-of-tree RFC hint from the kernel_inference
+# project's dma-buf-priority-hint patch (~/Dev/kernel_inference/upstream-
+# candidates/dma-buf-priority-hint), only present on kernels built with that
+# patch (e.g. this box's "hyphaed" kernel), not on any stock/upstream kernel
+# regardless of version - so it can't be gated by LINUX_VERSION_CODE like the
+# rest of features/compat.h. Probe the target kernel's own dma-buf.h instead.
+GB_HAS_DMABUF_PRIORITY := $(shell grep -q 'dma_buf_set_priority' $(srctree)/include/linux/dma-buf.h 2>/dev/null && echo 1 || echo 0)
+ccflags-y += -DGB_HAS_DMABUF_PRIORITY=$(GB_HAS_DMABUF_PRIORITY)
+
+# dma_buf_set_compression(): sibling out-of-tree RFC hint from the
+# kernel_inference project's dma-buf-compressed-descriptor patch
+# (~/Dev/kernel_inference/upstream-candidates/dma-buf-compressed-descriptor),
+# same probe pattern as GB_HAS_DMABUF_PRIORITY above and the same reasoning
+# for why LINUX_VERSION_CODE gating doesn't apply here either.
+GB_HAS_DMABUF_COMPRESSION := $(shell grep -q 'dma_buf_set_compression' $(srctree)/include/linux/dma-buf.h 2>/dev/null && echo 1 || echo 0)
+ccflags-y += -DGB_HAS_DMABUF_COMPRESSION=$(GB_HAS_DMABUF_COMPRESSION)
+
 # greenboost.ko - NVLink pool logic is included directly in greenboost.c
 # via #include "features/nvlink_pool.c" to avoid the Kbuild circular dependency
 # that arises when greenboost.o is both the target and a listed source.

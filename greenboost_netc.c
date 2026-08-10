@@ -463,6 +463,11 @@ struct netc_feeder {
     int      feat_zstd;
     uint8_t *zbuf;
     size_t   zbuf_cap;
+    /* dma-buf compressed-content descriptor: negotiated at handshake, both
+     * sides advertise GB_NET_FEAT_DMABUF_COMPRESSION unconditionally (see
+     * that flag's comment in features/net_fabric.h for why , distinct
+     * concept from feat_zstd above). */
+    int      feat_dmabuf_compression;
 #ifdef GREENBOOST_USE_NCCL
     ncclComm_t nccl_comm;
 #endif
@@ -950,6 +955,9 @@ static int connect_feeder(struct netc_feeder *f)
     gb_netc_zstd_init();
     if (g_zstd_enabled) req.feature_flags |= GB_NET_FEAT_ZSTD;
 #endif
+    /* Advertised unconditionally, not gated by GB_HAVE_ZSTD like above ,
+     * see GB_NET_FEAT_DMABUF_COMPRESSION's comment in features/net_fabric.h. */
+    req.feature_flags |= GB_NET_FEAT_DMABUF_COMPRESSION;
 
     if (netc_send_msg(f, GB_MSG_HANDSHAKE_REQ, 0, &req, sizeof(req)) < 0) {
         f->fd = -1;
@@ -1033,6 +1041,21 @@ static int connect_feeder(struct netc_feeder *f)
         }
     }
 #endif
+
+    /* dma-buf compressed-content descriptor negotiation , mirrors the
+     * zstd block above structurally but is unconditional (no GB_HAVE_ZSTD
+     * equivalent gate), matching how it was advertised in the request. */
+    f->feat_dmabuf_compression = 0;
+    {
+        size_t need = offsetof(struct gb_net_handshake_resp, feature_flags)
+                      + sizeof(gb_u32);
+        if (resp_hdr.payload_len >= (uint32_t)need &&
+            (resp->feature_flags & GB_NET_FEAT_DMABUF_COMPRESSION)) {
+            f->feat_dmabuf_compression = 1;
+            netc_log("feeder %s: dma-buf compression descriptor support negotiated",
+                     f->addr);
+        }
+    }
 
 #ifdef GREENBOOST_USE_NCCL
     /* Phase 4: Init NCCL for this connection */
@@ -1305,10 +1328,30 @@ int gb_netc_init(void)
     g_remote_gpu_count = 0;
     g_next_fake_ptr    = GB_REMOTE_PTR_BASE;
 
-    /* Read cluster.conf */
-    FILE *f = fopen(GB_CLUSTER_CONF, "r");
+    /* Read cluster.conf (TCB-U1: validate trust before use) */
+    int conf_fd = gb_trusted_root_file_fd(GB_CLUSTER_CONF, 256 * 128);
+    if (conf_fd < 0) {
+        /* Diagnose trust validation failure */
+        struct stat st;
+        if (lstat(GB_CLUSTER_CONF, &st) != 0) {
+            netc_log("No cluster.conf - network fabric inactive");
+        } else if (S_ISLNK(st.st_mode)) {
+            netc_log("SECURITY: cluster.conf is a symbolic link - network fabric disabled (TCB-U1)");
+        } else if (st.st_uid != 0) {
+            netc_log("SECURITY: cluster.conf owner uid=%d (expected 0) - network fabric disabled (TCB-U1)", st.st_uid);
+        } else if ((st.st_mode & 0022) != 0) {
+            netc_log("SECURITY: cluster.conf world/group-writable mode=0%o - network fabric disabled (TCB-U1)", st.st_mode & 07777);
+        } else {
+            netc_log("SECURITY: cluster.conf validation failed - network fabric disabled (TCB-U1)");
+        }
+        g_netc_initialized = 1;
+        pthread_mutex_unlock(&g_netc_lock);
+        return 0;
+    }
+    FILE *f = fdopen(conf_fd, "r");
     if (!f) {
-        netc_log("No cluster.conf - network fabric inactive");
+        netc_log("Failed to fdopen validated cluster.conf");
+        close(conf_fd);
         g_netc_initialized = 1;
         pthread_mutex_unlock(&g_netc_lock);
         return 0;

@@ -574,6 +574,11 @@ struct client {
      * handshake). H2D decompress is per-message, but this records the peer's
      * capability for any compressed response direction. */
     int      feat_zstd;
+    /* Peer understands the dma-buf compressed-content descriptor
+     * (GB_NET_FEAT_DMABUF_COMPRESSION, see features/net_fabric.h). Distinct
+     * from feat_zstd , this is about relaying a per-buffer codec
+     * descriptor, not compressing this protocol's own wire payloads. */
+    int      feat_dmabuf_compression;
 #ifdef GREENBOOST_USE_NCCL
     ncclComm_t nccl_comm;
 #endif
@@ -1052,6 +1057,20 @@ static int handle_handshake(struct client *cli, const void *payload, uint32_t le
 #else
     (void)req_feature_flags;
 #endif
+
+    /* dma-buf compressed-content descriptor: advertised unconditionally
+     * (see the flag's comment in features/net_fabric.h for why this isn't
+     * gated by a build macro like GB_HAVE_ZSTD above) , cli->feat_dmabuf_
+     * compression simply records whether the PEER also understands it, so
+     * a future relay path can decide whether it's safe to forward a
+     * buffer's compression descriptor as-is or must decompress first for
+     * an older peer. */
+    cli->feat_dmabuf_compression = 0;
+    if (req_feature_flags & GB_NET_FEAT_DMABUF_COMPRESSION) {
+        resp.feature_flags |= GB_NET_FEAT_DMABUF_COMPRESSION;
+        cli->feat_dmabuf_compression = 1;
+        netd_log("dma-buf compression descriptor support negotiated with %s", cli->remote_addr);
+    }
 
     /* T1: advertise topology-report support when this node's hardware profile
      * exists on disk (Full Install always writes it). The host then fetches it
@@ -3400,18 +3419,70 @@ static void *gb_kernel_resolve(const char *kname)
  *     256-entry name list can never cover ggml's kernel set (hundreds of
  *     template instantiations) , requiring it made feeder compute
  *     permanently dead.
- *   - neither → reject all (fail-closed, unchanged). */
+ *   - neither → reject all (fail-closed, unchanged).
+ *
+ * TCB-U1 (2026-08-06): now validates kernels.allow ownership/perms before
+ * trusting its contents; reloads if file mtime changes. */
 #define GB_KERNEL_ALLOW_PATH "/etc/greenboost/kernels.allow"
+#define GB_KERNEL_ALLOW_MAX_BYTES (64 * 1024)
 static int gb_kernel_name_allowed(const char *kname)
 {
     static int   g_allow_loaded = 0;
     static int   g_allow_present = 0;
     static char  g_allow_names[256][GB_NET_MAX_KERNEL_NAME];
     static int   g_allow_count = 0;
+    static time_t g_allow_mtime = 0;
+
+    /* Check if file has changed (mtime staleness check). */
+    struct stat st;
+    if (g_allow_loaded && stat(GB_KERNEL_ALLOW_PATH, &st) == 0) {
+        if (st.st_mtime == g_allow_mtime) {
+            /* File unchanged; use cached result. */
+            if (!g_allow_present)
+                return gb_kernel_lib() != NULL;
+            for (int i = 0; i < g_allow_count; i++) {
+                if (strcmp(g_allow_names[i], kname) == 0) return 1;
+            }
+            return 0;
+        }
+        /* File modified; reload. */
+        g_allow_loaded = 0;
+    }
 
     if (!g_allow_loaded) {
         g_allow_loaded = 1;
-        FILE *fp = fopen(GB_KERNEL_ALLOW_PATH, "r");
+        g_allow_present = 0;
+        g_allow_count = 0;
+        memset(g_allow_names, 0, sizeof(g_allow_names));
+
+        int fd = gb_trusted_root_file_fd(GB_KERNEL_ALLOW_PATH, GB_KERNEL_ALLOW_MAX_BYTES);
+        if (fd < 0) {
+            /* gb_trusted_root_file_fd returns -1 silently; diagnose reason here */
+            struct stat st;
+            if (lstat(GB_KERNEL_ALLOW_PATH, &st) != 0) {
+                netd_log("TRACE: %s not present - kernel dispatch scoped to trusted library only "
+                         "(audit F-L3-04)", GB_KERNEL_ALLOW_PATH);
+            } else if (S_ISLNK(st.st_mode)) {
+                netd_log("SECURITY: %s rejected: is a symbolic link - all remote kernel dispatches "
+                         "denied (audit TCB-U1)", GB_KERNEL_ALLOW_PATH);
+            } else if (st.st_uid != 0) {
+                netd_log("SECURITY: %s rejected: owner uid=%d (expected 0) - all remote kernel "
+                         "dispatches denied (audit TCB-U1)", GB_KERNEL_ALLOW_PATH, st.st_uid);
+            } else if ((st.st_mode & 0022) != 0) {
+                netd_log("SECURITY: %s rejected: world/group-writable mode=0%o - all remote kernel "
+                         "dispatches denied (audit TCB-U1)", GB_KERNEL_ALLOW_PATH, st.st_mode & 07777);
+            } else {
+                netd_log("SECURITY: %s validation failed - all remote kernel dispatches denied "
+                         "(audit TCB-U1)", GB_KERNEL_ALLOW_PATH);
+            }
+            return gb_kernel_lib() != NULL;
+        }
+
+        if (fstat(fd, &st) == 0) {
+            g_allow_mtime = st.st_mtime;
+        }
+
+        FILE *fp = fdopen(fd, "r");
         if (fp) {
             g_allow_present = 1;
             char line[GB_NET_MAX_KERNEL_NAME + 32];
@@ -3427,12 +3498,11 @@ static int gb_kernel_name_allowed(const char *kname)
                 g_allow_count++;
             }
             fclose(fp);
-            netd_log("kernel allowlist: %d entries loaded from %s",
+            netd_log("kernel allowlist: %d entries loaded from %s (trusted)",
                      g_allow_count, GB_KERNEL_ALLOW_PATH);
         } else {
-            netd_log("WARN: %s not present - all remote kernel dispatches "
-                     "rejected (fail-closed, audit F-L3-04)",
-                     GB_KERNEL_ALLOW_PATH);
+            close(fd);
+            netd_log("WARN: failed to fdopen validated %s", GB_KERNEL_ALLOW_PATH);
         }
     }
     if (!g_allow_present)
