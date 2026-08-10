@@ -963,11 +963,61 @@ static const struct dma_buf_ops gb_dma_buf_ops = {
  * instead of every GreenBoost dma-buf reporting the generic default
  * (DMA_BUF_PRIORITY_DEFAULT, 128) regardless of how important it actually
  * is. Non-KV buffers are left at the default, dma_buf_export() already sets
- * that, nothing to call here for them. */
+ * that, nothing to call here for them.
+ *
+ * This is an out-of-tree RFC symbol (kernel_inference's dma-buf-priority-hint
+ * patch), not present on stock kernels - GB_HAS_DMABUF_PRIORITY (probed in
+ * Kbuild against the target kernel's own dma-buf.h) gates the call so this
+ * file still builds on kernels without the patch. */
 static void gb_apply_priority_hint(struct dma_buf *dmabuf, u32 alloc_flags)
 {
+#if GB_HAS_DMABUF_PRIORITY
 	if (alloc_flags & (GB_ALLOC_KV_CACHE | GB_ALLOC_T1_PRIORITY))
 		dma_buf_set_priority(dmabuf, 200); /* DEFAULT=128, MAX=255; comfortably "keep longer" */
+#else
+	(void)dmabuf;
+	(void)alloc_flags;
+#endif
+}
+
+/* Sibling consumer for the generic dma-buf compressed-content descriptor
+ * landed by patches/custom/0020-dma-buf-compressed-descriptor.patch
+ * (DMA_BUF_IOCTL_SET_COMPRESSION, dma_buf_set_compression()). Same
+ * feature-probe gating pattern as gb_apply_priority_hint() above
+ * (GB_HAS_DMABUF_COMPRESSION, probed in Kbuild against the target
+ * kernel's own dma-buf.h) and called at the same three dma_buf_export()
+ * sites, for the same reason: one place to touch once there's something
+ * real to describe.
+ *
+ * 2026-08-10: deliberately a structural no-op today. None of this
+ * driver's own kernel-pinned KV-cache/T1-priority buffers are actually
+ * compressed at the C level right now — the earlier embedded-PTX absmax
+ * KV codec (GREENBOOST_KV_COMPRESS) was removed as dead code in the
+ * 2026-07-26 Speed Program audit (see g_kv_compress_enabled's comment
+ * above), and gb_moe.py's newer lossless MoE expert-compression path
+ * (added this same session, see ~/Dev/greenboost_all/greenboost/gb_moe.py)
+ * operates entirely in userspace on plain torch tensors via
+ * ModelTierManager , it never touches a dma_buf object, so there is
+ * nothing for THIS kernel-module-side function to describe on its
+ * behalf either. This function exists so the plumbing is ready , the
+ * probe, the gate, the call site , the moment any future GreenBoost
+ * codec actually compresses a kernel-pinned buffer before pinning it,
+ * setting the descriptor here is a one-line change instead of a new
+ * integration. Publishing a descriptor that always says "uncompressed"
+ * would be strictly worse than not calling the ioctl at all , it is
+ * the correct default already, so this leaves it untouched. */
+static void gb_apply_compression_descriptor(struct dma_buf *dmabuf, u32 alloc_flags)
+{
+#if GB_HAS_DMABUF_COMPRESSION
+	(void)dmabuf;
+	(void)alloc_flags;
+	/* No real compressed buffer to describe yet — see comment above.
+	 * dma_buf_export() already leaves every new dma_buf at
+	 * DMA_BUF_CODEC_NONE, so there is nothing to call here today. */
+#else
+	(void)dmabuf;
+	(void)alloc_flags;
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -1636,6 +1686,7 @@ static long gb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		}
 		buf->dmabuf = dmabuf;
 		gb_apply_priority_hint(dmabuf, buf->alloc_flags);
+		gb_apply_compression_descriptor(dmabuf, buf->alloc_flags);
 
 		/* 3+4. Register in IDR and install fd (REF-01: shared helper) */
 		fd = gb_dmabuf_idr_and_install_fd(buf, dmabuf);
@@ -1737,6 +1788,7 @@ static long gb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		}
 		buf->dmabuf = dmabuf;
 		gb_apply_priority_hint(dmabuf, buf->alloc_flags);
+		gb_apply_compression_descriptor(dmabuf, buf->alloc_flags);
 
 		/* 3+4. Register in IDR and install fd (REF-01: shared helper) */
 		fd = gb_dmabuf_idr_and_install_fd(buf, dmabuf);
@@ -2674,6 +2726,7 @@ static ssize_t alloc_trigger_store(struct device *dev,
 			return err;
 		}
 		gb_apply_priority_hint(gbuf->dmabuf, gbuf->alloc_flags);
+		gb_apply_compression_descriptor(gbuf->dmabuf, gbuf->alloc_flags);
 	}
 
 	fd = dma_buf_fd(gbuf->dmabuf, O_CLOEXEC);

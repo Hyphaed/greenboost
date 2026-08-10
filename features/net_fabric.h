@@ -246,6 +246,20 @@ enum gb_net_status {
  * reads as 0. A feature is used only when BOTH sides advertise its bit. */
 #define GB_NET_FEAT_ZSTD      (1u << 0)  /* transparent zstd payload compression */
 #define GB_NET_FEAT_TOPOLOGY  (1u << 1)  /* feeder can serve GB_MSG_TOPOLOGY      */
+/* 2026-08-10: peer understands the generic dma-buf compressed-content
+ * descriptor (patches/custom/0020-dma-buf-compressed-descriptor.patch in
+ * ~/Dev/kernel_inference — sibling of the existing GB_NET_FEAT_ZSTD wire
+ * codec, a DIFFERENT thing: that's transparent compression of THIS
+ * protocol's own message payloads; this flag is about relaying a
+ * per-buffer codec descriptor a kernel-pinned dma-buf may itself carry.
+ * Advertised unconditionally (like GB_NET_FEAT_TOPOLOGY, not gated by a
+ * build-time macro like GB_NET_FEAT_ZSTD/GB_HAVE_ZSTD) because this is a
+ * wire-protocol capability of THIS proto version, not a fact about
+ * whether the local kernel module happens to have the 0020 patch active
+ * , that is a per-fd runtime fact (GET_COMPRESSION), not something netd
+ * itself needs to gate at compile time. GB_NET_FEAT_ZSTD is NOT removed
+ * or altered by adding this , both negotiate independently. */
+#define GB_NET_FEAT_DMABUF_COMPRESSION (1u << 2)
 
 /* ------------------------------------------------------------------ */
 /*  Wire header - precedes every message                               */
@@ -646,6 +660,11 @@ struct gb_net_topology_resp {
 /* ------------------------------------------------------------------ */
 #ifndef __KERNEL__
 # include <sys/stat.h>
+# include <sys/types.h>
+# include <fcntl.h>
+# include <unistd.h>
+# include <errno.h>
+# include <string.h>
 # include <grp.h>
 
 /* GB_KEYFILE_GRP , group name that may read cluster.key at mode 0640.
@@ -677,6 +696,69 @@ static inline int gb_check_keyfile_mode(const struct stat *st, const char *path)
             return -1;
     }
     return 0;
+}
+
+/* Audit TCB-U1 (2026-08-06): Trusted root-owned config file validation.
+ *
+ * Opens a file that MUST be a regular file, root-owned, and not world/group-
+ * writable. Returns an open fd on success (caller must use fdopen/read and close),
+ * or -1 on failure (caller must log the reason via external netd_log/netc_log).
+ * Uses O_NOFOLLOW + fstat to close TOCTOU window between stat(path) and fopen(path).
+ *
+ * Ported from NemoClaw audit Phase 4 (isTrustedStationReleaseMarker pattern).
+ * Caller is responsible for logging the reason on error; this function returns
+ * -1 silently to avoid repeated log spam in both netc and netd contexts.
+ *
+ * Preconditions:
+ *   - path is a valid C string
+ *   - max_size > 0 (size limit in bytes, typically 64*1024 for configs)
+ *
+ * Returns: open file descriptor on success (caller owns it), -1 on any failure.
+ */
+static inline int gb_trusted_root_file_fd(const char *path, size_t max_size)
+{
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;  /* File not found, is a symlink, or open failed */
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    /* Must be a regular file */
+    if (!S_ISREG(st.st_mode)) {
+        close(fd);
+        return -1;
+    }
+
+    /* Must be owned by root */
+    if (st.st_uid != 0) {
+        close(fd);
+        return -1;
+    }
+
+    /* Must not be writable by group or others */
+    if ((st.st_mode & 0022) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    /* Must be non-empty */
+    if (st.st_size == 0) {
+        close(fd);
+        return -1;
+    }
+
+    /* Must not exceed size limit */
+    if ((size_t)st.st_size > max_size) {
+        close(fd);
+        return -1;
+    }
+
+    return fd;
 }
 #endif /* !__KERNEL__ */
 
