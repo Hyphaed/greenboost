@@ -16,6 +16,8 @@
 
 **No retraining. No code changes.** Just install **GreenBoost** and keep using **Ollama**, **llama.cpp**, **vLLM**, **PyTorch**, and **Diffusers** and/or step further, use directly **GB-Synapse + Greenboost MCP** for your pipelines.
 
+are you looking for Greenboost Gaming Suite instead? https://gitlab.com/IsolatedOctopi/greenboost_gaming_suite
+
 </div>
 
 <div align="center">
