@@ -680,6 +680,8 @@ The gaming side of GreenBoost has been stripped out and moved into its own proje
 still in alpha stage at the moment... 
 Do not know when I will release Greenboost Gaming Suite.
 
+https://gitlab.com/IsolatedOctopi/greenboost_gaming_suite
+
 ![GreenBoost Gaming Suite](greenboost_gaming_suite.png)
 
 ---
