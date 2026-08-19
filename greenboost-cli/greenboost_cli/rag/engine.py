@@ -250,6 +250,85 @@ def _load_store() -> tuple[np.ndarray | None, list[dict]]:
     return None, []
 
 
+#: Tiny sidecar holding only what count-only callers need. Written beside the
+#: store on every save; regenerated on demand if absent or stale.
+STATS_FILE = RAG_DIR / "stats.json"
+
+
+def store_stats() -> dict:
+    """Chunk and file counts, WITHOUT parsing the whole store.
+
+    `_load_store()` is called from ten places, and several of them want nothing
+    but `len(metadata)` — the startup banner, `/doctor`, the MCP status line.
+    On this box that meant parsing a 413 MB JSON (measured: 964 MB peak RSS,
+    ~2 s) to print "272,080 chunks", at every single startup.
+
+    Falls back to the full parse ONLY when the sidecar is missing or older than
+    the store it describes, and writes the sidecar on the way out so the cost is
+    paid once rather than every time.
+
+    Returns {"chunks": int, "files": int} — zeros when there is no store at all,
+    which is a real answer, not a failure.
+    """
+    if not METADATA_FILE.exists():
+        return {"chunks": 0, "files": 0}
+    fp = _store_fingerprint()
+    try:
+        if STATS_FILE.exists():
+            data = json.loads(STATS_FILE.read_text())
+            if (isinstance(data.get("chunks"), int)
+                    and isinstance(data.get("files"), int)
+                    and data.get("fingerprint") == fp):
+                return {"chunks": data["chunks"], "files": data["files"]}
+    except (OSError, ValueError):
+        pass    # unreadable or malformed sidecar — fall through and rebuild it
+    try:
+        with open(METADATA_FILE) as f:
+            metadata = json.load(f)
+    except (OSError, ValueError):
+        return {"chunks": 0, "files": 0}
+    stats = {
+        "chunks": len(metadata),
+        "files": len({m.get("file") for m in metadata if isinstance(m, dict)}),
+    }
+    _write_stats(stats)
+    return stats
+
+
+def _store_fingerprint() -> "str | None":
+    """Identity of the store this sidecar claims to describe: size + mtime.
+
+    Mtime ORDERING alone is not enough, and trusting it produced a real wrong
+    answer: a sidecar written by something else was newer than a 413 MB store
+    it had never read, so the banner confidently reported 3 chunks instead of
+    272,080. "Newer" says nothing about "describes THIS file". A fingerprint
+    that must match makes any foreign or hand-edited sidecar self-invalidating,
+    and costs one stat() to check.
+    """
+    try:
+        st = METADATA_FILE.stat()
+        return f"{st.st_size}:{int(st.st_mtime_ns)}"
+    except OSError:
+        return None
+
+
+def _write_stats(stats: dict) -> None:
+    """Best-effort sidecar write; a failure here only costs a re-parse later.
+
+    Stamps the store's fingerprint so the sidecar can only ever be believed
+    about the exact file it was computed from.
+    """
+    try:
+        RAG_DIR.mkdir(parents=True, exist_ok=True)
+        payload = dict(stats)
+        payload["fingerprint"] = _store_fingerprint()
+        tmp = STATS_FILE.with_name(STATS_FILE.name + ".tmp")
+        tmp.write_text(json.dumps(payload))
+        os.replace(tmp, STATS_FILE)
+    except OSError:
+        pass
+
+
 def _save_store(embeddings: np.ndarray, metadata: list[dict]) -> None:
     RAG_DIR.mkdir(parents=True, exist_ok=True)
     # Atomic writes: a concurrent reader (e.g. standalone `gb web` process) never
@@ -263,6 +342,13 @@ def _save_store(embeddings: np.ndarray, metadata: list[dict]) -> None:
     with open(meta_tmp, "w") as f:
         json.dump(metadata, f, indent=2)
     os.replace(meta_tmp, METADATA_FILE)
+    # Refresh the count sidecar in the same breath, so the cheap path is never
+    # stale after a write. Written AFTER the replace: a sidecar describing a
+    # store that failed to land would be worse than none.
+    _write_stats({
+        "chunks": len(metadata),
+        "files": len({m.get("file") for m in metadata if isinstance(m, dict)}),
+    })
 
 
 def _load_folders() -> list[dict]:

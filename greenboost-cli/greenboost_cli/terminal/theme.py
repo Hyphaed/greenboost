@@ -42,7 +42,45 @@ _THEME = Theme({
     "tool":     f"bold {CYAN}",
 })
 
-console = Console(theme=_THEME, highlight=False)
+class _LockedStdout:
+    """stdout proxy that routes rich's writes through `width.tty_write`.
+
+    rich writes straight to the real stdout, so before this every
+    `console.print()` was invisible to two mechanisms that exist to keep the
+    screen coherent: it did not take TTY_LOCK, and it did not update the
+    cursor-row tracking that live painters consult.
+
+    The visible consequence was the mangled permission card in the 2026-08-18
+    screenshots. `repl.py` halts the TOOL spinner before an approval prompt,
+    but the STATUS LINE runs on its own thread and repaints every 80 ms; while
+    rich drew the card's rows one print at a time, the status thread painted
+    into them, so the box's borders landed at whatever column the cursor
+    happened to be at.
+
+    Delegating every attribute other than write/flush keeps rich's own terminal
+    detection (isatty, encoding, fileno) reading the real stream, so colour and
+    width detection are unchanged.
+    """
+
+    __slots__ = ()
+
+    def write(self, s: str) -> int:
+        from greenboost_cli.terminal.width import tty_write
+        tty_write(s, flush=False)
+        return len(s)
+
+    def flush(self) -> None:
+        import sys as _s
+        from greenboost_cli.terminal.width import TTY_LOCK
+        with TTY_LOCK:
+            _s.stdout.flush()
+
+    def __getattr__(self, name):
+        import sys as _s
+        return getattr(_s.stdout, name)
+
+
+console = Console(theme=_THEME, highlight=False, file=_LockedStdout())
 
 # ── Raw ANSI helpers (for \r overwrite contexts where Rich can't be used) ────
 def _hex_to_ansi_fg(h: str) -> str:
@@ -69,6 +107,21 @@ ANSI_T3 = _hex_to_ansi_fg(CORAL)        # T3 NVMe  — coral
 # ── Spinner frame arrays ──────────────────────────────────────────────────────
 SPINNER_THINK = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 SPINNER_TOOL  = ["◐", "◓", "◑", "◒"]
+
+# Travelling 8-bit wave for the tool line — a serpent of block elements that
+# moves left to right while an action runs.
+#
+# Block Elements (U+2581..U+2588) are chosen over braille here for a reason:
+# they are the one decorative range terminals render at a dependable ONE column,
+# so the wave cannot widen the line on a CJK-capable font. The status line's
+# `·`, `↑` and `↓` are East-Asian-Ambiguous and do exactly that — see
+# terminal/width.py for the wrapping bug that caused.
+WAVE_GLYPHS = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█", "▇", "▆", "▅", "▄", "▃", "▂"]
+WAVE_WIDTH  = 6      # visible cells of wave
+
+# Pulse for the leading marker: bright on the beat, dim between, so the line
+# reads as alive at a glance without the eye-catching cost of a full redraw.
+PULSE_GLYPHS = ["◆", "◇", "◆", "◈"]
 
 # ── Context-fill thresholds ───────────────────────────────────────────────────
 # Single source of truth — referenced by repl.py (emit_warn) and statusline.py (colour).

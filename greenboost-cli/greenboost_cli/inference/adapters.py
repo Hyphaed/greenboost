@@ -26,8 +26,40 @@ class ContextOverflowError(RuntimeError):
     instead of surfacing a dead end — see execute_turn's overflow handling.
     Previously every 400 (this one included) became an identical generic
     RuntimeError with no retry, which is exactly the failure the owner hit
-    live (8324 tokens against a 7680-token window)."""
-    pass
+    live (8324 tokens against a 7680-token window).
+
+    Carries the server's own numbers when it reported them. They matter
+    because compaction CANNOT always fix this: the prompt's fixed overhead
+    (system prompt + every connected MCP server's tool schemas) is paid on
+    every request and no amount of history trimming touches it. Live
+    2026-08-18: ten MCP servers, 238 tools, `n_prompt_tokens: 29507` against
+    `n_ctx: 16384` for a thirty-word message and an essentially empty history
+    , compacting freed a few hundred tokens, the retry failed identically, and
+    the operator got a raw 400. Knowing prompt vs window lets the retry decide
+    whether it is worth attempting at all, and lets the message name the real
+    cause."""
+
+    def __init__(self, message: str = "", *, prompt_tokens: int = 0,
+                 n_ctx: int = 0) -> None:
+        super().__init__(message)
+        self.prompt_tokens = prompt_tokens
+        self.n_ctx = n_ctx
+
+
+def _overflow_numbers(err_str: str) -> "tuple[int, int]":
+    """(prompt_tokens, n_ctx) from llama-server's 400 body, or (0, 0).
+
+    The body carries them as JSON fields AND in the prose; the fields are
+    read first because they are unambiguous.
+    """
+    import re as _re
+    pt = _re.search(r"'n_prompt_tokens'\s*:\s*(\d+)", err_str) or \
+         _re.search(r'"n_prompt_tokens"\s*:\s*(\d+)', err_str) or \
+         _re.search(r"request \((\d+) tokens\)", err_str)
+    nc = _re.search(r"'n_ctx'\s*:\s*(\d+)", err_str) or \
+         _re.search(r'"n_ctx"\s*:\s*(\d+)', err_str) or \
+         _re.search(r"context size \((\d+) tokens\)", err_str)
+    return (int(pt.group(1)) if pt else 0, int(nc.group(1)) if nc else 0)
 
 
 def _is_context_overflow(err_str: str) -> bool:
@@ -279,6 +311,91 @@ def schemas_to_openai_functions(tool_schemas: list) -> list:
 
 # ── Streaming implementations ──────────────────────────────────────────────
 
+
+#: Marker key carrying WHY a tool call's arguments could not be parsed. The
+#: dispatcher turns this into a message the model can act on. Its presence
+#: means `_raw` holds the unparsed argument string.
+TOOL_ARG_PARSE_ERROR_KEY = "_parse_error"
+
+
+def parse_tool_arguments(raw: "str | None") -> "tuple[dict, str | None]":
+    """Parse a tool call's `arguments` string into a dict.
+
+    Returns (input_dict, error_or_None).
+
+    Why this is not just `json.loads`
+    ---------------------------------
+    Local GGUF finetunes are far looser about JSON than a hosted model, and the
+    two ways they get it wrong need OPPOSITE handling:
+
+    1. **Literal control characters inside a string.** A model writing code
+       emits a real newline instead of `\\n`. The arguments are COMPLETE and
+       unambiguous, strict JSON just refuses them. `strict=False` accepts them,
+       so this is repaired silently , there is nothing for the model to fix.
+
+    2. **Truncation.** The response hit its token ceiling mid-argument. The
+       content is INCOMPLETE, and it is tempting to salvage it by closing the
+       open quotes and braces , do NOT. A salvaged `Write` writes half a file
+       and reports success, which is worse than any error. Truncation is
+       reported back so the model can retry with a smaller payload.
+
+    Before 2026-08-19 every failure here collapsed to `{"_raw": ...}`, which
+    reached the instrument as a missing required parameter. A truncated Godot
+    script became `instrument 'Write' called with invalid parameters
+    ('file_path')` , pointing the model at a parameter name that was never the
+    problem, so it would retry the identical oversized call.
+    """
+    if not raw:
+        return {}, None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        try:
+            # Case 1: complete, but with raw newlines/tabs inside strings.
+            parsed = json.loads(raw, strict=False)
+        except json.JSONDecodeError as e:
+            # Case 2 and anything else: do not guess at the missing bytes.
+            if _looks_truncated(raw):
+                msg = (f"the arguments were cut off after {len(raw)} characters "
+                       f"(unterminated JSON). The response most likely hit its "
+                       f"token limit. Retry with a smaller payload , for a file "
+                       f"write, create it in several smaller pieces.")
+            else:
+                msg = (f"the arguments were not valid JSON ({e.msg} at "
+                       f"position {e.pos}).")
+            return {"_raw": raw, TOOL_ARG_PARSE_ERROR_KEY: msg}, msg
+    if not isinstance(parsed, dict):
+        msg = (f"the arguments must be a JSON object, got "
+               f"{type(parsed).__name__}.")
+        return {"_raw": raw, TOOL_ARG_PARSE_ERROR_KEY: msg}, msg
+    return parsed, None
+
+
+def _looks_truncated(raw: str) -> bool:
+    """True when `raw` ends mid-JSON rather than being merely malformed.
+
+    Scans once, tracking string state and escapes, so a brace inside a string
+    literal (very common in generated code) is not counted as structure.
+    """
+    depth = 0
+    in_str = False
+    esc = False
+    for ch in raw:
+        if esc:
+            esc = False
+            continue
+        if ch == "\\" and in_str:
+            esc = True
+        elif ch == '"':
+            in_str = not in_str
+        elif not in_str:
+            if ch in "{[":
+                depth += 1
+            elif ch in "}]":
+                depth -= 1
+    return in_str or depth > 0
+
+
 def _stream_openai_api(
     api_key: str,
     base_url: str,
@@ -380,7 +497,9 @@ def _stream_openai_api(
                 f"  • Switch model:            /model <name>\n"
             ) from _conn_err
         if _is_context_overflow(_e):
-            raise ContextOverflowError(_e) from _conn_err
+            _pt, _nc = _overflow_numbers(str(_e))
+            raise ContextOverflowError(str(_e), prompt_tokens=_pt,
+                                       n_ctx=_nc) from _conn_err
         _status = getattr(_conn_err, "status_code", None)
         if _status is not None or "BadRequestError" in _cls or "InternalServerError" in _cls or "APIStatusError" in _cls:
             raise RuntimeError(
@@ -449,10 +568,7 @@ def _stream_openai_api(
     tool_calls = []
     for idx in sorted(tool_buf):
         v = tool_buf[idx]
-        try:
-            inp = json.loads(v["args"]) if v["args"] else {}
-        except json.JSONDecodeError:
-            inp = {"_raw": v["args"]}
+        inp, _err = parse_tool_arguments(v["args"])
         tool_calls.append({"id": v["id"] or f"call_{idx}", "name": v["name"], "input": inp})
 
     # Fallback: some GGUF finetunes emit tool calls as text (<tool_call>…</tool_call>,
@@ -543,7 +659,9 @@ def _stream_injected(
             # actually goes through. Before this check it had NO 400 handler
             # at all — even the generic one below — so a context-overflow 400
             # here reached the REPL as a raw, unwrapped openai.BadRequestError.
-            raise ContextOverflowError(err_str) from _conn_err
+            _pt, _nc = _overflow_numbers(err_str)
+            raise ContextOverflowError(err_str, prompt_tokens=_pt,
+                                       n_ctx=_nc) from _conn_err
         _is_refused = (
             "Connection refused" in err_str
             or "ConnectError"    in type(_conn_err).__name__
@@ -562,7 +680,7 @@ def _stream_injected(
             or "NotFoundError" in type(_conn_err).__name__
         )
         if _is_refused:
-            _url = base_url or "http://localhost:11435"  # gb-synapse's own default (registry.py)
+            _url = base_url or "http://localhost:11369"  # gb-synapse's own default (registry.py)
             raise RuntimeError(
                 f"\nCannot connect to gb-synapse at {_url}\n\n"
                 f"  • /llamaserve          — start the server\n"

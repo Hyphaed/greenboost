@@ -40,6 +40,7 @@ def test_registry_covers_every_known_group():
     assert set(kinds.GROUPS) == {
         "placement", "quant", "synapse", "cluster", "shim",
         "pipeline", "health", "agent", "eval", "bench", "gaming",
+        "install", "orchestration",
     }
 
 

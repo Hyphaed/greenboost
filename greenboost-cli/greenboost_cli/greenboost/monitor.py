@@ -745,14 +745,3 @@ def get_banner_line(stats: dict | None = None) -> str:
     if gpu:
         line += f"  GPU:{gpu}"
     return line + "\n"
-
-
-def get_statusline_label() -> str:
-    """Return a short label for the statusline, e.g. 'T2:120G'."""
-    stats = get_tier_stats()
-    if not stats:
-        return ""
-    t2_gb = round(stats.get("t2_available_mb", 0) / 1024, 1)
-    pressure = stats.get("t2_pressure", 0)
-    suffix = "!" if pressure >= 1 else ""
-    return f"T2:{t2_gb}G{suffix}"

@@ -58,6 +58,34 @@ _TEMPLATE: list[dict] = [
         "n_items": 1, "items": ["fable-fusion-27b"], "duration_s": 0.0,
         "model": "fable-fusion-27b",
         "ttft_ms": 4200.0, "hit_pct": 3.0, "reused_tokens": 40,  # cold cache
+        # engine_prompt_ms deliberately well below ttft_ms: the gap between the
+        # two is the diagnostic (queueing + contention, not prefill), and a
+        # fixture where they matched would let a resolver confusing the two
+        # pass. prompt_tokens is the depth those figures were measured at.
+        "engine_prompt_ms": 1350.0, "prompt_tokens": 1333,
+    },
+    # GB-1. Two cache_index events, not one, because slot_pin_rate_pct is a
+    # RATE: a single event can only ever produce 0% or 100%, which would let a
+    # resolver that reads the newest event instead of the window pass. The mix
+    # here (one pinned, one reassigned) is the interesting case , a conversation
+    # kept its slot while another was displaced.
+    {
+        "node": NODE, "label": "synapse", "kind": "cache_index", "status": "ok",
+        "n_items": 1, "items": ["fable-fusion-27b"], "duration_s": 0.0,
+        "model": "fable-fusion-27b", "conv": "aaaaaaaaaaaaaaaa", "slot": 0,
+        "decision": "reassigned", "chunks": 6, "chunks_before": 4,
+        "changed_chunk": None, "n_slots": 4, "tracked": 2, "identity": "inferred",
+        "applied": False,
+    },
+    {
+        "node": NODE, "label": "synapse", "kind": "cache_index", "status": "ok",
+        "n_items": 1, "items": ["fable-fusion-27b"], "duration_s": 0.0,
+        "model": "fable-fusion-27b", "conv": "bbbbbbbbbbbbbbbb", "slot": 1,
+        # changed_chunk=2 is the whole point of the field: an edit landed on
+        # the third chunk, so everything after it has to be re-prefilled.
+        "decision": "pinned-edited", "chunks": 6, "chunks_before": 6,
+        "changed_chunk": 2, "n_slots": 4, "tracked": 2, "identity": "explicit",
+        "applied": False,
     },
     {
         "node": "feeder1 (192.0.2.10)", "label": "cluster_dispatch", "kind": "chunk_remote",
@@ -73,9 +101,16 @@ def load(node: str = NODE, t2_pressure: "float | None" = None,
     kmod-missing case, or a healthy-cache case) without a second fixture file."""
     now = time.time()
     out = []
-    for ev in _TEMPLATE:
+    # Stamp in list order, a millisecond apart, so "the latest event of this
+    # kind" is DETERMINISTIC. Stamping every event with the same instant made
+    # that a tie, and `max(key=ts)` breaks a tie by list position — which meant
+    # a resolver reading the newest event of a kind with two fixture entries
+    # silently got the FIRST one. Ordering is part of what these resolvers
+    # depend on, so the fixture has to model it.
+    n = len(_TEMPLATE)
+    for i, ev in enumerate(_TEMPLATE):
         e = dict(ev)
-        e["ts"] = now
+        e["ts"] = now - (n - 1 - i) * 0.001
         if e["kind"] == "snapshot":
             if t2_pressure is not None:
                 e["t2_pressure"] = t2_pressure

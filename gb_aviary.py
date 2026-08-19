@@ -35,7 +35,7 @@ import urllib.request
 from pathlib import Path
 
 def _default_synapse_url() -> str:
-    """gb-synapse's own port (GB_SYNAPSE_PORT, default 11435) , not raw
+    """gb-synapse's own port (GB_SYNAPSE_PORT, default 11369) , not raw
     Ollama's legacy :11434. gb-synapse is THE Ollama replacement (owner
     rule, 2026-07-15); certifying against the wrong port would measure a
     different serving path than the one that actually runs the model."""
@@ -43,7 +43,7 @@ def _default_synapse_url() -> str:
         import gb_synapse
         return f"http://127.0.0.1:{gb_synapse.DEFAULT_PORT}"
     except Exception:
-        return "http://127.0.0.1:11435"
+        return "http://127.0.0.1:11369"
 
 
 # 1M is the default target because it is the certified frontier, not because it

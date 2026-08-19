@@ -11,6 +11,8 @@ Subcommands:
   gb factory-status            [--json]
   gb factory-list              [--state pending|running|completed|all]
                                [--agent NAME] [--limit N] [--json]
+  gb factory-run               [--agent NAME] [--model MODEL] [--workers N]
+                               [--watch] [--timeout SEC] [--json]
   gb factory-pause   <agent>   [--json]
   gb factory-resume  <agent>   [--json]
   gb factory-agents            [--json]
@@ -341,10 +343,91 @@ def cmd_factory_sleep(argv: list[str]) -> int:
 
 # ── Dispatch registration helpers ─────────────────────────────────────────────
 
+def cmd_factory_run(argv: list[str]) -> int:
+    """Start worker threads and actually PROCESS the queue.
+
+    Without this, the headless plane could only ever enqueue work: `submit`
+    persists a task to factory.db, but nothing dequeues it unless a REPL
+    session or a bespoke Python driver calls `AIFactory.start()`. An
+    autonomous run therefore could not be expressed as `gb` commands at all
+    — the exact tool gap CLAUDE.md says to close rather than work around.
+    """
+    p = argparse.ArgumentParser(prog="gb factory-run", add_help=True)
+    p.add_argument("--agent", default="", help="agent to run as (created if absent)")
+    p.add_argument("--model", default="", help="gb-synapse model for a newly created agent")
+    p.add_argument("--workers", type=int, default=1,
+                   help="worker threads; keep at 1 when one local model serves them all")
+    p.add_argument("--watch", action="store_true",
+                   help="keep running after the queue empties (default: exit when drained)")
+    p.add_argument("--timeout", type=float, default=0.0,
+                   help="give up after N seconds (0 = no limit)")
+    p.add_argument("--poll", type=float, default=5.0, help="seconds between drain checks")
+    p.add_argument("--json", action="store_true")
+    a = p.parse_args(argv)
+
+    import time
+
+    factory = _get_factory()
+
+    agent = _safe_agent_name(_cap(a.agent, _MAX_PROJECT_LEN)) if a.agent else ""
+    if agent:
+        model = _cap(a.model, _MAX_QUERY_LEN)
+        # add_agent refreshes model/gpu on an existing agent rather than duplicating.
+        if model:
+            factory.add_agent(agent, model=model)
+        elif agent not in factory.snapshot().get("agents", {}):
+            factory.add_agent(agent)
+    elif not factory.snapshot().get("agents"):
+        _emit_err("no agents configured — pass --agent NAME [--model MODEL]")
+        return 2
+
+    workers = max(1, min(a.workers, 8))
+    factory.start(workers=workers, sleep=False)
+
+    started = time.monotonic()
+    timed_out = False
+    try:
+        while True:
+            time.sleep(max(0.5, a.poll))
+            snap = factory.snapshot()
+            busy = [n for n, s in snap.get("agents", {}).items()
+                    if s.get("current_task") not in ("idle", "", None)]
+            drained = snap.get("queue_depth", 0) == 0 and not busy
+            if drained and not a.watch:
+                break
+            if a.timeout and (time.monotonic() - started) >= a.timeout:
+                timed_out = True
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        factory.stop()
+
+    snap = factory.snapshot()
+    payload = {
+        "ran_for_s": round(time.monotonic() - started, 1),
+        "timed_out": timed_out,
+        "queue_depth": snap.get("queue_depth", 0),
+        "agents": {n: {"total_tasks": s.get("total_tasks"),
+                       "failed_tasks": s.get("failed_tasks")}
+                   for n, s in snap.get("agents", {}).items()},
+    }
+    if a.json:
+        _emit_json(payload)
+    else:
+        state = "timed out" if timed_out else "drained"
+        print(f"factory {state} after {payload['ran_for_s']}s — "
+              f"queue_depth={payload['queue_depth']}")
+        for n, s in payload["agents"].items():
+            print(f"  {n}: {s['total_tasks']} task(s), {s['failed_tasks']} failed")
+    return 1 if timed_out else 0
+
+
 FACTORY_SUBCOMMANDS = {
     "factory-submit":   cmd_factory_submit,
     "factory-status":   cmd_factory_status,
     "factory-list":     cmd_factory_list,
+    "factory-run":      cmd_factory_run,
     "factory-pause":    cmd_factory_pause,
     "factory-resume":   cmd_factory_resume,
     "factory-agents":   cmd_factory_agents,
@@ -358,6 +441,7 @@ __all__ = [
     "cmd_factory_submit",
     "cmd_factory_status",
     "cmd_factory_list",
+    "cmd_factory_run",
     "cmd_factory_pause",
     "cmd_factory_resume",
     "cmd_factory_agents",

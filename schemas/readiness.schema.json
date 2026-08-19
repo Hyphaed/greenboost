@@ -1,0 +1,112 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://greenboost.local/schemas/readiness.schema.json",
+  "title": "GreenBoost readiness report",
+  "description": "NemoClaw audit, Phase 6b. Adopts the SHAPE of NemoClaw's system-readiness.schema.json (five parallel ID'd collections, mutated:false enforced by the schema, status<->exitCode pinned, inconclusive a genuine third state) — re-implemented from scratch for GreenBoost's own signals (gb_readiness.py), not a fork. Produced by `python3 gb_readiness.py doctor --json` and `greenboost doctor --json`.",
+  "type": "object",
+  "required": [
+    "schemaVersion", "status", "exitCode", "mutated", "provenance",
+    "observations", "capabilities", "qualifications", "findings", "evidence"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "type": "string", "const": "1" },
+    "status": {
+      "type": "string",
+      "enum": ["supported", "incompatible", "inconclusive"],
+      "description": "inconclusive is a genuine third state — used when an observation itself could not be determined (e.g. system_status erroring with 'NoneType has no attribute items' because the kernel module isn't loaded IS a finding, not a tool bug), never silently rounded to supported or incompatible."
+    },
+    "exitCode": {
+      "type": "integer",
+      "description": "Pinned to status: supported->0, incompatible->2, inconclusive->3. 1 is reserved for 'the tool itself broke' (a Python exception in the report builder) and is never produced by a well-formed report — the CLI wrapper uses exit 1 only when this JSON was never produced at all."
+    },
+    "mutated": {
+      "type": "boolean",
+      "const": false,
+      "description": "Enforced false by the schema itself — a doctor that writes anything cannot validate. GreenBoost's own precedent: optimize_inference's GB_ORCH_ACTUATE read/write split."
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["tool", "generatedAtEpochS", "node"],
+      "additionalProperties": false,
+      "properties": {
+        "tool": { "type": "string" },
+        "generatedAtEpochS": { "type": "number" },
+        "node": { "type": "string" }
+      }
+    },
+    "observations": {
+      "type": "array", "maxItems": 256,
+      "items": { "$ref": "#/$defs/observation" }
+    },
+    "capabilities": {
+      "type": "array", "maxItems": 256,
+      "items": { "$ref": "#/$defs/capability" }
+    },
+    "qualifications": {
+      "type": "array", "maxItems": 128,
+      "items": { "$ref": "#/$defs/qualification" }
+    },
+    "findings": {
+      "type": "array", "maxItems": 256,
+      "items": { "$ref": "#/$defs/finding" }
+    },
+    "evidence": {
+      "type": "array", "maxItems": 256,
+      "items": { "$ref": "#/$defs/evidence" }
+    }
+  },
+  "$defs": {
+    "observation": {
+      "type": "object",
+      "required": ["id", "value", "determined"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "description": "dotted id, e.g. kmod.greenboost.loaded, netd.port_9740.listening" },
+        "value": { "description": "the observed value — type varies by id" },
+        "determined": { "type": "boolean", "description": "false means the observation could not be made at all (distinct from a false/negative value that WAS determined)" }
+      }
+    },
+    "capability": {
+      "type": "object",
+      "required": ["id", "available"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "description": "e.g. capability.tier_actuate, capability.rpc_split, capability.frontload_split" },
+        "available": { "type": "boolean" },
+        "reason": { "type": "string" }
+      }
+    },
+    "qualification": {
+      "type": "object",
+      "required": ["id", "passed"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "passed": { "type": "boolean" },
+        "detail": { "type": "string" }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "required": ["id", "severity", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "severity": { "type": "string", "enum": ["info", "warning", "blocking"] },
+        "message": { "type": "string" },
+        "relatedObservation": { "type": "string" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["id", "source"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "source": { "type": "string", "description": "what produced this evidence, e.g. 'socket.connect_ex', 'os.path.exists'" },
+        "detail": { "type": "string" }
+      }
+    }
+  }
+}

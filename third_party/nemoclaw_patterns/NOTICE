@@ -1,0 +1,51 @@
+GreenBoost third_party/nemoclaw_patterns — adapted third-party code
+=====================================================================
+
+Upstream project: NVIDIA NemoClaw
+Repository:       https://github.com/NVIDIA/NemoClaw
+Upstream commit:  87fcfe40d ("docs(policy): add N1X platform taxonomy (#8232)", 2026-08-05)
+License:          Apache License 2.0 (see LICENSE at the upstream repo)
+Import date:      2026-08-05
+
+Unlike this repo's other third_party/ entries (whole vendored trees built
+from CMake/source), this is a single-file NEAR-VERBATIM ADAPTATION, not a
+vendor import — the file lives in the main source tree, not here, because
+it is one integrated module of greenboost-cli, not a standalone dependency
+this repo builds against. This NOTICE exists purely to satisfy the
+attribution requirement for that adapted file; the file itself carries its
+own Apache-2.0 SPDX header.
+
+What was adapted
+-----------------
+`greenboost-cli/greenboost_cli/instruments/capture.py` — the stdlib-only
+bounded/redacting-capture core (`_CaptureBudget`, `_bounded_string`,
+`_scrub_secret_values`, `_redact_capture_key`, `_capture_jsonable`, plus the
+standalone/anchored/truncated credential-pattern tuples and the aggregate-
+budget constants) from:
+
+  agents/langchain-deepagents-code/nemoclaw_observability.py
+
+as it existed in the NemoClaw checkout audited on 2026-08-05 (commit
+87fcfe40d, "docs(policy): add N1X platform taxonomy (#8232)").
+
+Ported near-verbatim rather than re-derived because the secret-shaped-value
+redaction is subtle security code (byte-boundary-safe truncation handling,
+unpaired-UTF-16-surrogate replacement, credential-shaped dict-key detection
+across snake_case/camelCase/PascalCase naming) — re-deriving it from
+scratch risked silently missing an edge case the original already handles.
+See the NemoClaw audit plan's Phase 3d for the full port rationale.
+
+What was NOT carried over: NemoClaw's LangGraph checkpoint/interrupt-state
+redaction (`_STATE_CAPTURE_KEYS`), its OTLP export lifecycle/exporter
+classes, and `_bounded_llm_request` — none of that applies to GreenBoost's
+use (bounding a tool call's `params` dict before a dataflux JSONL emit, not
+exporting LLM request payloads over OTLP). Variable and constant names were
+renamed where they referenced NemoClaw-specific concepts ("Relay" → "safe
+JSON", OTLP terminology dropped) without changing the underlying logic.
+
+Local modifications
+--------------------
+Every local patch to this adapted file MUST be appended below, in order.
+
+- 2026-08-05: Initial adaptation, no logic modifications beyond the trim
+  described above.

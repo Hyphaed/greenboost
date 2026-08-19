@@ -1,0 +1,265 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://greenboost.local/serving/recipe.schema.json",
+  "title": "GreenBoost serving recipe",
+  "description": "NemoClaw audit, Phase 5a. GreenBoost-native (YAML instances validated against this JSON Schema) \u2014 a from-scratch schema following the IDEAS in NemoClaw's recipe.schema.json (digest-pinned model revision, a closed kvCache enum, a capabilities block with required keys pinned false until proven true) rather than a fork of its 1288 lines, which carry DGX/OpenShell-specific fields (gpu.count, containerRuntime) GreenBoost has no use for. A recipe turns gb_synapse.py's ctx/-ngl/KV-type heuristics into a validated document for models where the heuristic output has been measured and is worth pinning; a model with no recipe keeps using the heuristics unchanged (see gb_synapse.py's load_recipe()).",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "model",
+    "capabilities",
+    "kvCache",
+    "ctx",
+    "nGpuLayers",
+    "tierIntent",
+    "contentDigest"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "const": "1",
+      "description": "Recipe schema version. Bump when a breaking shape change lands; check_recipes.py rejects a recipe whose schemaVersion this schema doesn't recognize."
+    },
+    "model": {
+      "type": "object",
+      "required": [
+        "name",
+        "revision",
+        "files"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "gb_synapse manifest name this recipe applies to (matches ModelEntry.name)."
+        },
+        "revision": {
+          "type": "string",
+          "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64}|sha256:[0-9a-f]{64})$",
+          "description": "A real content-addressed revision (git SHA-1/SHA-256, or a sha256: digest) \u2014 NEVER a branch name or a mutable tag. Ported directly from NemoClaw's recipe.schema.json:58 pattern; the whole point of pinning a revision is that it can't silently move under the recipe."
+        },
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "path",
+              "sha256"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Hex sha256 of this weight/config file, so a recipe can't silently drift onto a different file with the same path."
+              }
+            }
+          }
+        }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "description": "Every key REQUIRED \u2014 a model can't silently claim a capability nothing checked for. toolCalls/streaming/mtpDraftHead are the ones GreenBoost's own reference workloads have actually exercised; visionProjector/recurrentState default to false (pinned in the schema below) until a recipe author has verified them the same way \u2014 the mechanism that would have caught the documented rope.dimension_sections and missing-mmproj incidents (CLAUDE.md's Reference Workload Rule section) as a validation failure instead of a load crash.",
+      "required": [
+        "toolCalls",
+        "streaming",
+        "mtpDraftHead",
+        "visionProjector",
+        "recurrentState"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "toolCalls": {
+          "type": "boolean"
+        },
+        "streaming": {
+          "type": "boolean"
+        },
+        "mtpDraftHead": {
+          "type": "boolean"
+        },
+        "visionProjector": {
+          "type": "boolean",
+          "const": false,
+          "description": "Pinned false \u2014 no GreenBoost reference workload has verified a vision projector through a recipe yet. Flip to a real boolean (drop the const) the day one is verified end-to-end, per-recipe."
+        },
+        "recurrentState": {
+          "type": "boolean",
+          "const": false,
+          "description": "Pinned false \u2014 same reasoning as visionProjector. A hybrid recurrent/attention model (n_recurrent_layers > 0) is real and supported by gb_synapse.py's estimate_ssm_state_gb(), but no recipe has yet been validated end-to-end claiming this capability; a model that needs it should still work through the heuristic (recipe-less) path today."
+        }
+      }
+    },
+    "kvCache": {
+      "type": "object",
+      "required": [
+        "key",
+        "value"
+      ],
+      "additionalProperties": false,
+      "description": "Closed enum, not a free string \u2014 gb_synapse_backends.py passes these straight to llama.cpp's --cache-type-k/--cache-type-v with no validation today; this is the schema-side fix for that gap.",
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/kvCacheType"
+        },
+        "value": {
+          "$ref": "#/$defs/kvCacheType"
+        }
+      }
+    },
+    "ctx": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Context window this recipe was measured/validated at. Overrides gb_synapse.serve()'s heuristic ctx solve when this recipe is consumed."
+    },
+    "nGpuLayers": {
+      "description": "-ngl. Either \"all\" (llama.cpp's -ngl 999 convention \u2014 every layer on GPU) or a non-negative integer layer count for a partial-offload recipe. Reaches LlamaCppBackend.serve()'s own -ngl decision directly via n_gpu_layers_override (NemoClaw audit, Phase 5/7 follow-up) \u2014 a value below entry.n_layers on a dense (non-MoE) model still clears the same _gate_cpu_offload() T2-spill safety check a live heuristic decision would.",
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "all"
+        },
+        {
+          "type": "integer",
+          "minimum": 0
+        }
+      ]
+    },
+    "mtpDraftN": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "--spec-draft-n-max override for an MTP-carrying model (only meaningful when capabilities.mtpDraftHead is true). Optional \u2014 omit for a model with no MTP head."
+    },
+    "nCpuMoe": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "--n-cpu-moe override \u2014 measured, deliberate MoE-expert CPU placement (CLAUDE.md's 2026-07-26 amendment), never a silent fallback. Optional \u2014 omit for a dense model or a MoE model not using this placement."
+    },
+    "kvReserveMb": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "GREENBOOST_KV_RESERVE_MB override \u2014 a real shim-observed measurement from gb_synapse.py's KV measurement cache (_persist_kv_measurement/_load_kv_measurement), promoted into a pinned recipe field. Optional \u2014 omit to let the measurement cache keep deriving it live."
+    },
+    "tierIntent": {
+      "type": "string",
+      "enum": [
+        "t1Only",
+        "t2Spill",
+        "rpcSplit"
+      ],
+      "description": "Which tier-placement shape this recipe was measured under \u2014 t1Only (fits VRAM alone), t2Spill (host T2 DDR overflow, the shim's front-load split), or rpcSplit (llama.cpp --rpc across host+feeder). Informational + used by the Phase 7 preset resolver's requirements matching; gb_synapse.serve() does not yet branch on it directly (see load_recipe()'s docstring)."
+    },
+    "contentDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "serving/digest.py's digest() of this recipe's own content with this field excluded \u2014 see serving/check_recipes.py. Detects any drift between a recipe's committed digest and its committed content."
+    },
+    "sleepIdleSeconds": {
+      "type": "integer",
+      "minimum": -1,
+      "description": "Seconds of idleness after which llama-server sleeps and releases VRAM (--sleep-idle-seconds). -1 disables. Exists because an idle session was measured holding 10.4 GiB of a 12 GB card at 0% utilization indefinitely."
+    },
+    "specType": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "none",
+          "draft-simple",
+          "draft-eagle3",
+          "draft-mtp",
+          "draft-dflash",
+          "ngram-simple",
+          "ngram-map-k",
+          "ngram-map-k4v",
+          "ngram-mod",
+          "ngram-cache"
+        ]
+      },
+      "description": "Speculative-decoding modes, in priority order, joined into llama.cpp's comma-separated --spec-type. ngram modes need no draft model and no extra VRAM. MEASURED per model, never assumed."
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Local-first enforcement, mirroring NemoClaw's managed-inference policy block. Makes CLAUDE.md's Local-First Must-Rule checkable rather than prose.",
+      "properties": {
+        "egress": {
+          "enum": [
+            "disabled",
+            "allowed"
+          ],
+          "description": "Outbound network from the serving runtime."
+        },
+        "modelSource": {
+          "enum": [
+            "verified-local",
+            "any"
+          ],
+          "description": "verified-local serves only what is already on disk, digest-checked."
+        },
+        "modelDownloads": {
+          "enum": [
+            "disabled",
+            "allowed"
+          ],
+          "description": "Whether a serve may fetch weights."
+        }
+      }
+    },
+    "sampling": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Sampling defaults the MODEL CARD specifies, passed to llama-server at launch. Exists because a model's published sampling values had no way to reach the engine: the recipe could pin ctx and KV type but not temperature, so a model whose card says top_k 20 / min_p 0.0 silently ran on llama.cpp's generic defaults (top_k 40 / min_p 0.05). A client that sends its own values per request still wins over these , these are defaults, not a ceiling.",
+      "properties": {
+        "temperature": {
+          "type": "number",
+          "minimum": 0
+        },
+        "topP": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "topK": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "minP": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "presencePenalty": {
+          "type": "number"
+        },
+        "repeatPenalty": {
+          "type": "number",
+          "minimum": 0
+        },
+        "source": {
+          "type": "string",
+          "description": "Where these came from , a model-card URL, so a reader can check them rather than trust them."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "kvCacheType": {
+      "type": "string",
+      "enum": [
+        "f16",
+        "q8_0",
+        "q4_0"
+      ],
+      "description": "The three KV cache quantizations gb_synapse_backends.py actually passes to llama.cpp's --cache-type-k/-v today."
+    }
+  }
+}

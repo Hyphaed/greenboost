@@ -1,0 +1,69 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://greenboost.local/serving/preset.schema.json",
+  "title": "GreenBoost serving preset",
+  "description": "NemoClaw audit, Phase 7. GreenBoost-native (re-implemented from scratch — no code copied) version of the IDEAS in NemoClaw's preset.schema.json + resolver.ts: a preset names a recipe (serving/recipes/*.yaml) plus a requirements.all[] list of typed, scoped facts that must ALL hold before this preset is eligible. serving/resolver.py evaluates presets against a facts snapshot (from gb_readiness.build_report() plus per-node cluster facts) and picks the highest-priority ELIGIBLE preset — raising ambiguous-selection on a priority tie rather than silently picking one.",
+  "type": "object",
+  "required": ["id", "priority", "recipeRef", "requirements"],
+  "additionalProperties": false,
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "priority": {
+      "type": "integer",
+      "description": "Higher wins. Two ELIGIBLE presets sharing the top priority is an ambiguous-selection error, not a silent pick — see resolver.py."
+    },
+    "recipeRef": {
+      "type": "string",
+      "minLength": 1,
+      "description": "A serving/recipes/*.yaml filename this preset resolves to when selected."
+    },
+    "requirements": {
+      "type": "object",
+      "required": ["all"],
+      "additionalProperties": false,
+      "properties": {
+        "all": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/requirement" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "requirement": {
+      "type": "object",
+      "required": ["scope", "kind", "id"],
+      "additionalProperties": false,
+      "properties": {
+        "scope": {
+          "type": "string",
+          "enum": ["controller", "everyNode", "anyNode"],
+          "description": "controller: checked once against the host's own facts. everyNode: must hold for every node in the cluster fact snapshot (including the host). anyNode: must hold for at least one node."
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["qualification", "observation", "capability", "comparison", "fact"],
+          "description": "qualification/observation/capability default to a truthy check on the named id's value when no operator/value is given; comparison/fact require both."
+        },
+        "id": { "type": "string", "minLength": 1, "description": "dotted fact id, e.g. host.gpu.vram_total_bytes, kmod.greenboost.loaded" },
+        "operator": {
+          "type": "string",
+          "enum": ["eq", "neq", "gt", "gte", "lt", "lte", "version-at-least"]
+        },
+        "value": {
+          "description": "required when operator is given; the comparison target"
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "comparison" } } },
+          "then": { "required": ["operator", "value"] }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "fact" } } },
+          "then": { "required": ["value"] }
+        }
+      ]
+    }
+  }
+}

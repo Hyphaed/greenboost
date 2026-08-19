@@ -157,3 +157,28 @@ def _skip_feeder_ready_gate(monkeypatch):
     tests must never depend on a live feeder. GB_SKIP_FEEDER_READY=1 restores
     the pre-gate dispatch behavior under test."""
     monkeypatch.setenv("GB_SKIP_FEEDER_READY", "1")
+
+
+# ── @pytest.mark.gpu ─────────────────────────────────────────────────────────
+# Declarative gate for tests that must allocate on a real CUDA device. See
+# tests/_gpu_gate.py for why `torch.cuda.is_available()` alone is not enough
+# (a served model holding the card makes every .cuda() call OOM, which the
+# suite would otherwise report as a code failure).
+
+from _gpu_gate import DEFAULT_MIN_FREE_MIB, gpu_skip_reason  # noqa: E402
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        f"gpu(min_free_mib={DEFAULT_MIN_FREE_MIB}): needs a real CUDA device with "
+        "that much PHYSICAL free VRAM; skipped (not failed) when the card is busy",
+    )
+
+
+def pytest_runtest_setup(item):
+    for mark in item.iter_markers(name="gpu"):
+        need = int(mark.kwargs.get("min_free_mib", DEFAULT_MIN_FREE_MIB))
+        reason = gpu_skip_reason(need)
+        if reason:
+            pytest.skip(reason)

@@ -124,6 +124,56 @@ def test_summarize_no_stage_profile_key_absent_events():
     assert s["stages"] == {}
 
 
+# missing_features.md item (k): dataflux_tok_s (via summarize()) must not
+# blend tok_s_measured samples across different quant/ctx/kv_type configs
+# of the same model name — the same class of bug fixed in
+# gb_synapse._measured_tok_s(), independently reproduced here because this
+# function reads the raw event log, not gb_synapse's persisted file.
+
+def test_summarize_tok_s_separates_quant_swaps_of_same_model():
+    events = [
+        {"ts": 100.0, "run_id": "r1", "node": "host", "label": "gb_synapse",
+         "kind": "tok_s_measured", "n_items": 1, "duration_s": 0.0, "status": "ok",
+         "model": "qwen35", "tok_s": 5.0, "quant": "Q4_K_M", "ctx": 65536, "kv_type": "q8_0"},
+        {"ts": 200.0, "run_id": "r2", "node": "host", "label": "gb_synapse",
+         "kind": "tok_s_measured", "n_items": 1, "duration_s": 0.0, "status": "ok",
+         "model": "qwen35", "tok_s": 12.0, "quant": "IQ2_M", "ctx": 32768, "kv_type": "f16"},
+    ]
+    s = gdf.summarize(events)
+
+    assert "qwen35::Q4_K_M::65536::q8_0" in s["tok_s"]
+    assert "qwen35::IQ2_M::32768::f16" in s["tok_s"]
+    assert s["tok_s"]["qwen35::Q4_K_M::65536::q8_0"]["avg"] == 5.0
+    assert s["tok_s"]["qwen35::IQ2_M::32768::f16"]["avg"] == 12.0
+
+
+def test_summarize_tok_s_legacy_events_without_quant_keep_old_key_shape():
+    """Events recorded before this fix (no quant/ctx/kv_type fields) must
+    keep the exact old unprefixed key , backward compatible with existing
+    dashboards and historical rows."""
+    events = [
+        {"ts": 100.0, "run_id": "r1", "node": "host", "label": "gb_synapse",
+         "kind": "tok_s_measured", "n_items": 1, "duration_s": 0.0, "status": "ok",
+         "model": "qwen35", "tok_s": 4.5},
+    ]
+    s = gdf.summarize(events)
+
+    assert "qwen35" in s["tok_s"]
+    assert s["tok_s"]["qwen35"]["avg"] == 4.5
+
+
+def test_summarize_tok_s_source_prefix_still_applies_with_quant_key():
+    events = [
+        {"ts": 100.0, "run_id": "r1", "node": "host", "label": "gb_synapse",
+         "kind": "tok_s_measured", "n_items": 1, "duration_s": 0.0, "status": "ok",
+         "model": "qwen35", "tok_s": 5.0, "source": "proxy",
+         "quant": "Q4_K_M", "ctx": 65536, "kv_type": "q8_0"},
+    ]
+    s = gdf.summarize(events)
+
+    assert "[proxy]qwen35::Q4_K_M::65536::q8_0" in s["tok_s"]
+
+
 def test_render_html_contains_summary_numbers():
     events = [{"ts": time.time(), "run_id": "r1", "node": "host", "label": "x",
               "n_items": 4, "duration_s": 2.0, "status": "ok", "items": ["a", "b"]}]

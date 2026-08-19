@@ -57,7 +57,8 @@ def test_analyze_no_flag_below_min_samples():
 
 
 def test_analyze_flags_tok_s_degradation():
-    evs = [_tok("qwen3-vl:30b", t) for t in [20.0, 21.0, 19.0, 10.0]]
+    evs = [_tok("qwen3-vl:30b", t) for t in
+            [20.0, 21.0, 19.0, 20.0, 21.0, 19.0, 20.0, 10.0]]
     a = gp.analyze(evs)
     m = a["models"]["qwen3-vl:30b"]
     assert m["degraded"] is True
@@ -65,7 +66,7 @@ def test_analyze_flags_tok_s_degradation():
 
 
 def test_analyze_improving_tok_s_not_flagged():
-    evs = [_tok("m", t) for t in [10.0, 12.0, 15.0, 20.0]]
+    evs = [_tok("m", t) for t in [8.0, 9.0, 10.0, 12.0, 14.0, 15.0, 18.0, 20.0]]
     assert gp.analyze(evs)["models"]["m"]["degraded"] is False
 
 
@@ -101,7 +102,7 @@ def test_advise_t2_critical_names_safe_levers():
 
 def test_every_advice_lever_names_a_real_gbcontrol_method():
     import gb_control
-    tok_events = [_tok("m", 100, ts=i) for i in range(4)] + [_tok("m", 40, ts=4)]
+    tok_events = [_tok("m", 100, ts=i) for i in range(8)] + [_tok("m", 40, ts=8)]
     scenarios = [
         [_snap(ts=1, t3_used_mb=4096)],
         [_snap(ts=1, t2_pressure=2)],
@@ -129,7 +130,7 @@ def test_advise_stage_regression_evidence():
 
 
 def test_advise_tok_s_drop():
-    evs = [_tok("m", t) for t in [20.0, 21.0, 19.0, 5.0]]
+    evs = [_tok("m", t) for t in [20.0, 21.0, 19.0, 20.0, 21.0, 19.0, 20.0, 5.0]]
     adv = gp.advise(gp.analyze(evs))
     assert any(x["topic"] == "tok_s_drop" for x in adv)
 
@@ -149,7 +150,7 @@ def _split(nodes, ts=0, v3=False):
 
 def test_rebalance_advisory_fires_on_severe_drop_with_multinode_split():
     evs = [_split(2, ts=0)] + [_tok("m", t, ts=i) for i, t in
-                               enumerate([100.0, 100.0, 100.0, 100.0, 40.0])]
+                               enumerate([100.0] * 8 + [40.0])]
     a = gp.analyze(evs)
     assert a["last_split"]["nodes"] == 2
     adv = gp.advise(a)
@@ -158,16 +159,22 @@ def test_rebalance_advisory_fires_on_severe_drop_with_multinode_split():
 
 def test_rebalance_advisory_silent_on_single_node():
     evs = [_split(1, ts=0)] + [_tok("m", t, ts=i) for i, t in
-                               enumerate([100.0, 100.0, 100.0, 100.0, 40.0])]
+                               enumerate([100.0] * 8 + [40.0])]
     adv = gp.advise(gp.analyze(evs))
     assert not any(x["topic"] == "rebalance_advice" for x in adv)
 
 
 def test_rebalance_advisory_silent_below_threshold():
     # Drop clears the generic tok_s_drop bar (20%) but not the stricter
-    # rebalance bar (25%): avg=(100*4+74)/5=94.8, drop=(94.8-74)/94.8~=21.9%.
+    # rebalance bar (25%). Baseline is the MEDIAN, not the mean (changed
+    # 2026-08-17 — a duration-blind tok/s distribution is too skewed for a mean
+    # to be a usable baseline): median=100, drop=(100-78)/100=22%.
+    # The old fixture's 74.0 was computed against mean=94.8 (21.9%); under
+    # median semantics that same sample is a 26% drop and correctly clears the
+    # rebalance bar too, so the value moved to keep this test asserting the
+    # in-between band it was written to cover.
     evs = [_split(2, ts=0)] + [_tok("m", t, ts=i) for i, t in
-                               enumerate([100.0, 100.0, 100.0, 100.0, 74.0])]
+                               enumerate([100.0] * 8 + [78.0])]
     a = gp.analyze(evs)
     adv = gp.advise(a)
     assert any(x["topic"] == "tok_s_drop" for x in adv)
@@ -175,7 +182,7 @@ def test_rebalance_advisory_silent_below_threshold():
 
 
 def test_rebalance_advisory_silent_without_split_history():
-    evs = [_tok("m", t, ts=i) for i, t in enumerate([100.0, 100.0, 100.0, 100.0, 40.0])]
+    evs = [_tok("m", t, ts=i) for i, t in enumerate([100.0] * 8 + [40.0])]
     a = gp.analyze(evs)
     assert a["last_split"]["nodes"] == 1   # default when no tensor_split event seen
     adv = gp.advise(a)
@@ -191,3 +198,34 @@ def test_snapshot_renders_without_log(monkeypatch):
     assert "image:generate" in text
     assert "ADVICE" in text
     assert "│" not in text          # UI paradigm: no vertical pipes
+
+
+def test_tok_s_drop_needs_a_real_population():
+    """A big drop on a handful of samples must NOT raise an advisory.
+
+    Regression for 2026-08-18: five standing "decode speed degraded" warnings
+    were built on n=3, n=5 and n=9 populations, each carrying a real
+    set_kv_size_threshold_mb retune lever. A tok/s sample is duration-blind and
+    the 24-token sample floor discards much of an agentic session's traffic, so
+    what survives is both few and skewed — a latest-vs-median comparison over
+    three of them is noise, not a finding.
+    """
+    few = [_tok("m", t, ts=i) for i, t in enumerate([100.0, 100.0, 20.0])]
+    a = gp.analyze(few)
+    assert a["models"]["m"]["degraded"] is False
+    assert a["models"]["m"]["insufficient_samples"] is True
+    assert not any(x["topic"] == "tok_s_drop" for x in gp.advise(a))
+
+    # The same drop, once there is a population behind it, still fires.
+    many = [_tok("m", t, ts=i) for i, t in enumerate([100.0] * 8 + [20.0])]
+    a = gp.analyze(many)
+    assert a["models"]["m"]["degraded"] is True
+    assert a["models"]["m"]["insufficient_samples"] is False
+    assert any(x["topic"] == "tok_s_drop" for x in gp.advise(a))
+
+
+def test_stage_regressions_keep_the_smaller_sample_floor():
+    """Only decode rate got the bigger floor; stage wall-times are not rates."""
+    evs = [_stage("image:generate", w, ts=i) for i, w in
+           enumerate([30.0, 31.0, 29.0, 60.0])]
+    assert gp.analyze(evs)["stages"]["image:generate"]["regressed"] is True

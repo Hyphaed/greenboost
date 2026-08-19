@@ -38,7 +38,7 @@ def test_default_synapse_url_falls_back_when_gb_synapse_unimportable(monkeypatch
             raise ImportError("simulated")
         return real_import(name, *a, **kw)
     monkeypatch.setattr(builtins, "__import__", _fake_import)
-    assert gb_aviary._default_synapse_url() == "http://127.0.0.1:11435"
+    assert gb_aviary._default_synapse_url() == "http://127.0.0.1:11369"
 
 
 def test_niah_certify_default_url_param_is_none_not_11434():

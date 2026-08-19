@@ -42,6 +42,9 @@
 #include <cstring>
 #include <chrono>
 #include <vector>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <cerrno>
 
 #define CUDA_CHECK(call)                                                     \
     do {                                                                     \
@@ -216,6 +219,89 @@ int main(int argc, char **argv) {
 
         cudaFree(sink);
         cudaFreeHost(h_buf);
+    }
+
+    // ---- 3b. Does the HOST page size change that number? (GB-K4) ------
+    //
+    // The shim's T2 pool is already 2 MiB-backed (greenboost.c,
+    // use_hugepages=1), and iommu=pt is set on this box, so the two usual
+    // explanations for a zero-copy read running at half the pinned-DMA rate
+    // are already spent. What has never been measured is whether the GPU's
+    // own mapping granularity for host memory costs anything: an SM read of
+    // a cuMemHostRegister'd buffer walks a device-side page table, and 4 KiB
+    // entries mean 512x more of them per 2 MiB than a huge mapping does.
+    //
+    // If 2 MiB and 1 GiB backings read no faster than 4 KiB, the SM-driven
+    // gather is latency-bound by nature and no kernel patch can help, which
+    // closes the question permanently. If they do read faster, the T2 pool
+    // has a reason to want 1 GiB pages and that is a real kmod change.
+    //
+    // Each backing is verified against /proc/self/smaps rather than assumed
+    // from the mmap flags: with transparent_hugepage=always a plain mmap can
+    // silently be 2 MiB-backed, which would make a "4 KiB" row a fiction.
+    {
+        struct Backing { const char *name; int madv; int extra_flags; };
+        const Backing backings[] = {
+            {"4k",  MADV_NOHUGEPAGE, 0},
+            {"2m",  MADV_HUGEPAGE,   0},
+#ifdef MAP_HUGE_1GB
+            {"1g",  0, MAP_HUGETLB | MAP_HUGE_1GB},
+#endif
+        };
+        for (const Backing &b : backings) {
+            int flags = MAP_PRIVATE | MAP_ANONYMOUS | b.extra_flags;
+            void *h = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, flags, -1, 0);
+            if (h == MAP_FAILED) {
+                fprintf(stderr, "[pathbench] host backing %s unavailable: %s\n",
+                        b.name, strerror(errno));
+                continue;
+            }
+            if (b.madv) madvise(h, bytes, b.madv);
+            memset(h, 0x5a, bytes);          // fault every page in before timing
+
+            // What did we actually get? AnonHugePages for this range, in KiB.
+            size_t thp_kb = 0;
+            if (FILE *f = fopen("/proc/self/smaps", "r")) {
+                char line[512];
+                bool in_range = false;
+                unsigned long lo = (unsigned long)h;
+                while (fgets(line, sizeof(line), f)) {
+                    unsigned long a = 0, z = 0;
+                    if (sscanf(line, "%lx-%lx", &a, &z) == 2) in_range = (a == lo);
+                    else if (in_range && !strncmp(line, "AnonHugePages:", 14))
+                        sscanf(line + 14, "%zu", &thp_kb);
+                }
+                fclose(f);
+            }
+
+            if (cudaHostRegister(h, bytes, cudaHostRegisterMapped) != cudaSuccess) {
+                fprintf(stderr, "[pathbench] host backing %s: cudaHostRegister failed\n", b.name);
+                munmap(h, bytes);
+                continue;
+            }
+            void *d_ptr = nullptr;
+            cudaHostGetDevicePointer(&d_ptr, h, 0);
+            unsigned long long *sink2 = nullptr;
+            CUDA_CHECK(cudaMalloc(&sink2, sizeof(unsigned long long)));
+            launch_read_kernel(d_ptr, sink2, bytes, stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            double t0 = gb_now_s();
+            for (int i = 0; i < iters; i++)
+                launch_read_kernel(d_ptr, sink2, bytes, stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            double s_ = (gb_now_s() - t0) / iters;
+
+            static char names[3][64];
+            static int nidx = 0;
+            snprintf(names[nidx], sizeof(names[0]), "zerocopy_sm_read_%s_thp%zuMB",
+                     b.name, thp_kb / 1024);
+            results.push_back({names[nidx], (double)bytes / s_ / 1e9, s_});
+            nidx = (nidx + 1) % 3;
+
+            cudaFree(sink2);
+            cudaHostUnregister(h);
+            munmap(h, bytes);
+        }
     }
 
     // ---- 4. Staged read (bulk DMA into VRAM, then read from VRAM) ----

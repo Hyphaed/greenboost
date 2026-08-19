@@ -15,8 +15,11 @@ import os
 # sibling greenboost/ repo. Was 11434 (collided with raw Ollama) until the
 # 2026-07 migration to 11435; this registry entry was missed at the time,
 # which meant `gb` fell back to querying Ollama's port on any gb-synapse
-# connection failure instead of reporting the real gb-synapse error.
-_GB_SYNAPSE_PORT = int(os.environ.get("GB_SYNAPSE_PORT", "11435"))
+# connection failure instead of reporting the real gb-synapse error. Moved
+# again to 11369 (2026-08-05): 11435 turned out to collide with NemoClaw's
+# own Ollama auth proxy default (OLLAMA_PROXY_PORT) — see
+# docs/nemoclaw-and-greenboost.md.
+_GB_SYNAPSE_PORT = int(os.environ.get("GB_SYNAPSE_PORT", "11369"))
 
 BACKEND_REGISTRY: dict[str, dict] = {
     "gb-synapse": {

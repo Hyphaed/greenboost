@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>   // getenv, for the opt-in M-RoPE K-shift gate
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -1174,7 +1175,31 @@ bool llama_kv_cache::get_can_shift() const {
         return false;
     }
     if (hparams.n_pos_per_embd() > 1) {
-        return false;
+        // M-RoPE / interleaved M-RoPE. The K-shift path ALREADY handles this:
+        // build_rope_shift() maps MROPE/IMROPE to NEOX and rotates the whole
+        // vector (see the @ngxson workaround above, ggml-org/llama.cpp#13870).
+        // This guard nonetheless disables both ctx_shift and cache_reuse for
+        // every M-RoPE model, including text-only ones.
+        //
+        // That matters here: Qwen3.5/3.8 is registered as IMROPE, so
+        // llama-server logs "cache_reuse is not supported by this context" and
+        // every turn re-pays full prompt eval. Measured on GreenBoost's
+        // reference box , a 23,273-token prompt (mostly MCP tool schemas) took
+        // ~760 s of prefill, on EVERY turn, because nothing could be reused.
+        //
+        // For a TEXT-ONLY sequence the extra position dimensions are all equal
+        // to the text position, so the rotation is identical to standard RoPE
+        // and shifting is sound. With image or video tokens present they
+        // diverge and it is NOT.
+        //
+        // Opt-in only, and deliberately so: the failure mode of getting this
+        // wrong is silently wrong attention, not a crash. GreenBoost sets this
+        // exclusively for a text-only model with no vision projector loaded.
+        static const bool allow_mrope_shift =
+            getenv("LLAMA_ALLOW_MROPE_KV_SHIFT") != nullptr;
+        if (!allow_mrope_shift) {
+            return false;
+        }
     }
     return true;
 }

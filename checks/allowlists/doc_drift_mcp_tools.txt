@@ -1,0 +1,26 @@
+# Doc-drift exemptions (MCP tools) — checks/check_doc_drift.py.
+# Pre-existing gap, recorded 2026-08-05 (NemoClaw audit round 2, item 6):
+# these tools are defined with @mcp.tool() but not yet mentioned in
+# DOCUMENTATION.md. Grandfathered so the check doesn't fail on day one
+# over a pre-existing backlog — any tool NOT in this list is a real, new
+# violation. Shrink this list as DOCUMENTATION.md catches up; do not add
+# a newly-introduced tool here instead of documenting it.
+
+cli_prompt
+cli_run
+cluster_available
+cluster_feeders
+cluster_snapshot
+cluster_sync_dataflux
+cluster_topology
+dataflux_actuations
+dataflux_candidates
+dataflux_critic
+dataflux_decisions
+dataflux_group
+dataflux_models
+dataflux_schema
+dataflux_topology
+quality_gate
+synapse_models
+synapse_stop

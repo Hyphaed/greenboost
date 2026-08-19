@@ -74,8 +74,18 @@ def _import_gpu_metrics():
     return GpuMetrics
 
 def _import_meminfo_reader():
-    from gb_telemetry import read_meminfo_mb
-    return read_meminfo_mb
+    # Best-effort, matching _NvmlHandle's gb_nvml fallback (:155-160): the
+    # supervisor's primary duties (VRAM watchdog, boot recovery) must not be
+    # blocked by losing the system-RAM-pressure signal alone. Returns None on
+    # failure; _RamMonitor.poll() treats that as its documented "unknown" state.
+    try:
+        from gb_telemetry import read_meminfo_mb
+        return read_meminfo_mb
+    except Exception as exc:
+        logging.getLogger("gb_supervisor").warning(
+            "gb_telemetry unavailable (%s) , system RAM pressure will read 'unknown'", exc
+        )
+        return None
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -626,6 +636,8 @@ class _RamMonitor:
 
     def poll(self) -> str:
         """Poll /proc/meminfo. Returns state ∈ {'ok', 'warn', 'critical', 'unknown'}."""
+        if self._read_meminfo is None:
+            return "unknown"
         mem_total_mb, mem_avail_mb, swap_total_mb, swap_used_mb = self._read_meminfo()
         if mem_total_mb <= 0:
             return "unknown"
@@ -641,6 +653,7 @@ class _RamMonitor:
             state = "ok"
 
         if state != self._prev_state:
+            prev = self._prev_state
             if state in ("critical", "warn"):
                 log.log(
                     logging.CRITICAL if state == "critical" else logging.WARNING,
@@ -652,6 +665,43 @@ class _RamMonitor:
             else:
                 log.info("OK: system RAM pressure cleared , available %.1f%%, swap used %.1f%%",
                          avail_pct, swap_pct)
+            # Observability Must-Rule: a pressure transition that exists only
+            # in the journal is invisible to dataflux, to GB-Semantics and to
+            # any agent asking "is this box about to fall over". On 2026-08-18
+            # this monitor went critical twice (MemAvailable 4044 MB = 6.6% of
+            # 61 GB, past its own 8% floor) roughly ten minutes before the OOM
+            # killer took the user's terminal, and said so only here.
+            try:
+                import gb_dataflux
+                # emit() takes ONE dict, not kwargs. Getting that wrong raised
+                # TypeError into the best-effort `except` below, so this event
+                # was silently never written — a signal with no reader, which is
+                # the exact defect this emit exists to fix. Regression test:
+                # tests/test_supervisor_host_mem_emit.py.
+                gb_dataflux.emit({
+                    "kind": "host_mem_pressure",
+                    "node": "host",
+                    "label": "gb_supervisor",
+                    "status": ("error" if state == "critical"
+                               else "warn" if state == "warn" else "ok"),
+                    "state": state,
+                    "prev_state": prev,
+                    "mem_available_mib": int(mem_avail_mb),
+                    "mem_available_pct": round(avail_pct, 1),
+                    "mem_total_mib": int(mem_total_mb),
+                    "swap_used_pct": round(swap_pct, 1),
+                    "swap_used_mib": int(swap_used_mb),
+                    # WHO is eating the memory, captured at the moment pressure
+                    # changes rather than after the OOM killer has erased the
+                    # evidence. Overnight 2026-08-19 a python3 reached 39 GB and
+                    # was killed at 01:47; by morning /proc/<pid> was gone and
+                    # the kernel report named only "python3", so the cause could
+                    # not be established at all. gb_memwatch.py exists for this
+                    # but has to be started by hand, and nobody is awake at 01:47.
+                    "top_consumers": _top_memory_consumers(),
+                })
+            except Exception:
+                pass    # emit is best-effort and must never break the tick
             self._prev_state = state
 
         try:
@@ -672,6 +722,40 @@ class _RamMonitor:
 
 
 # ── Main supervisor loop ──────────────────────────────────────────────────────
+
+def _top_memory_consumers(n: int = 5) -> list:
+    """The n largest RSS processes, with cmdline. Best-effort, never raises.
+
+    Deliberately cheap , this runs inside a pressure transition, on a box that
+    is by definition short of memory, so it reads /proc/<pid>/statm and stops.
+    No smaps walk, no sorting of the whole process table twice.
+    """
+    try:
+        page_kb = os.sysconf("SC_PAGE_SIZE") // 1024
+        rows = []
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry.name}/statm") as f:
+                    rss_kb = int(f.read().split()[1]) * page_kb
+            except (OSError, IndexError, ValueError):
+                continue
+            if rss_kb:
+                rows.append((rss_kb, int(entry.name)))
+        rows.sort(reverse=True)
+        out = []
+        for rss_kb, pid in rows[:n]:
+            try:
+                with open(f"/proc/{pid}/cmdline") as f:
+                    cmd = f.read().replace("\0", " ").strip()[:200]
+            except OSError:
+                cmd = ""
+            out.append({"pid": pid, "rss_mb": round(rss_kb / 1024, 1), "cmd": cmd})
+        return out
+    except Exception:
+        return []
+
 
 class GreenBoostSupervisor:
     def __init__(self) -> None:
@@ -777,7 +861,60 @@ class GreenBoostSupervisor:
 
         self._shutdown()
 
+    def _reap_orphaned_serves(self) -> None:
+        """Stop an engine whose proxy has died, so it releases its VRAM.
+
+        The proxy is a stateless passthrough and the engine is the expensive
+        part , but an engine with no proxy is unreachable, and it holds the
+        whole card while being unreachable. Overnight 2026-08-19: the proxy was
+        OOM-killed at 01:47, llama-server survived until 10:26 holding 10.5 GB
+        of a 12 GB card, and every request in between failed with "Cannot
+        connect to :11369". Nothing noticed for eight hours.
+
+        Deliberately conservative: it acts only when gb_synapse itself reports
+        `proxy_error` AND the engine pid is alive, and it only ever STOPS. It
+        does not restart the serve , choosing a model and a context is the
+        operator's decision, and guessing one at 02:00 is how a box ends up
+        serving something nobody asked for.
+        """
+        try:
+            import gb_synapse
+        except Exception:
+            return
+        try:
+            sessions = gb_synapse.ps()
+        except Exception:
+            return
+        for sess in sessions:
+            if not sess.get("proxy_error") or not sess.get("llama_pid"):
+                continue
+            model = sess.get("model") or ""
+            log.warning(
+                "Serve session '%s' has a dead proxy (%s) while its engine "
+                "(pid %s) still holds VRAM , stopping it so the card comes "
+                "back. Re-serve with: greenboost synapse serve %s",
+                model, sess.get("proxy_error"), sess.get("llama_pid"), model,
+            )
+            try:
+                import gb_dataflux
+                gb_dataflux.emit({
+                    "kind": "synapse_serve", "node": "host", "label": "supervisor",
+                    "status": "error", "model": model,
+                    "reason": "orphaned_engine_reaped",
+                    "proxy_error": sess.get("proxy_error"),
+                    "llama_pid": sess.get("llama_pid"),
+                })
+            except Exception:
+                pass
+            try:
+                gb_synapse.stop(model)
+            except Exception as exc:
+                log.warning("could not stop orphaned serve '%s': %s", model, exc)
+
     def _tick(self) -> None:
+        # 3-.  Orphaned serve session , engine alive, proxy dead.
+        self._reap_orphaned_serves()
+
         # 3a. Gaming mode , doubles VRAM reserve thresholds
         gaming = _read_gaming_mode()
 

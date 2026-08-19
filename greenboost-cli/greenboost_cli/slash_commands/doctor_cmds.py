@@ -91,10 +91,9 @@ def _check_sentence_transformers() -> Check:
 
 def _check_rag_index() -> Check:
     try:
-        from greenboost_cli.rag.engine import _load_store, _load_folders
-        _, meta  = _load_store()
+        from greenboost_cli.rag.engine import store_stats, _load_folders
         folders  = _load_folders()
-        n        = len(meta) if meta else 0
+        n        = store_stats()["chunks"]
         if n == 0:
             return Check(
                 name="RAG index",

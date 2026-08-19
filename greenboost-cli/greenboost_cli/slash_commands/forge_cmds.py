@@ -227,6 +227,10 @@ def _forge_connect(args: str, session, settings: dict) -> None:
             emit_ok(f"{ok} server(s) connected · {len(registry.tool_schemas)} tools available")
         if fail:
             emit_warn(f"{fail} server(s) failed to connect")
+        for collision in registry.collisions:
+            emit_warn(collision)
+        for dup in getattr(registry, "duplicate_names", []):
+            emit_info(dup)
 
     # Run synchronously since user explicitly requested connection
     _connect_bg()

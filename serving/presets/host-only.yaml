@@ -1,0 +1,22 @@
+# serving/presets/host-only.yaml — TEMPLATE (NemoClaw audit, Phase 7).
+#
+# The always-eligible fallback preset: requires only that the kernel
+# module is loaded (T1/T2/T3 tiering works at all). No cluster requirement,
+# so this is the preset every box with a working GreenBoost install
+# qualifies for — the resolver falls back to this when a higher-priority,
+# cluster-requiring preset (e.g. rpc-split.yaml) isn't eligible.
+#
+# recipeRef names a serving/recipes/*.yaml file — points at the template
+# example.yaml until a real host-only recipe replaces it (same honesty
+# convention as example.yaml's own placeholder digests: don't invent a
+# real-looking recipe reference for a model that hasn't actually been
+# measured on this specific placement).
+
+id: host-only
+priority: 10
+recipeRef: example.yaml
+requirements:
+  all:
+    - scope: controller
+      kind: observation
+      id: kmod.greenboost.loaded

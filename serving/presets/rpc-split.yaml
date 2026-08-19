@@ -1,0 +1,43 @@
+# serving/presets/rpc-split.yaml — TEMPLATE (NemoClaw audit, Phase 7).
+#
+# Higher priority than host-only.yaml, but only eligible when a feeder is
+# actually reachable AND Blackwell-class (cc >= 12.0, matching this box's
+# real hardware per CLAUDE.md) — the exact "anyNode.gpu.cc >= 12.0" example
+# the plan named. everyNode.synapse.engine_version parity guards against
+# selecting an rpc-split placement when host and feeder are running
+# mismatched llama.cpp builds (a real, documented parity concern — see
+# CLAUDE.md's "gb-synapse is THE Ollama replacement" section's engine
+# parity check).
+#
+# recipeRef: same placeholder-template convention as host-only.yaml.
+
+id: rpc-split
+priority: 20
+recipeRef: example.yaml
+requirements:
+  all:
+    - scope: controller
+      kind: observation
+      id: kmod.greenboost.loaded
+    # A "cluster" of one node (the host counting as its own sole node) is
+    # not a real --rpc split — this fact must come from an ACTUAL feeder
+    # count, not from anyNode/everyNode's own vacuous-on-one-node
+    # semantics (a real gap this comparison caught: without it, a
+    # Blackwell-class host with ZERO feeders configured still satisfied
+    # anyNode.gpu.cc>=12.0 against itself and looked eligible for
+    # rpc-split with no cluster at all).
+    - scope: controller
+      kind: comparison
+      id: cluster.feeder_count
+      operator: gte
+      value: 1
+    - scope: anyNode
+      kind: comparison
+      id: gpu.cc
+      operator: gte
+      value: 12.0
+    - scope: everyNode
+      kind: comparison
+      id: synapse.engine_version
+      operator: version-at-least
+      value: "0"

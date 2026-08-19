@@ -78,13 +78,28 @@ _PROTECTED_EXACT = {
 _PROTECTED_PREFIXES = (
     "gnome-shell-", "gnome-session", "gnome-control-", "gnome-software",
     "gnome-keyring", "tracker-", "gdm-", "Xwayland", "kwin_", "kded",
-    "sddm-", "systemd-", "pipewire-", "nvidia-", "greenboost",
+    "sddm-", "systemd-", "pipewire-", "nvidia-",
     "vmware-usbarbitrator", "qemu-system-",
 )
 
+# GreenBoost's OWN long-lived daemons — protected by exact name, never by a
+# blanket "greenboost" prefix.
+#
+# The prefix used to be in _PROTECTED_PREFIXES, which made EVERY process whose
+# comm starts with "greenboost" unreclaimable — including `greenboost-cli`
+# itself. So `greenboost clear memory-pool` could never release the GPU memory
+# of the very CLI the owner runs inference through, which is the opposite of
+# what that command is for (owner report 2026-08-18). Only the fabric/system
+# daemons genuinely need to survive a reclaim: killing greenboost-netd drops
+# the cluster link to every feeder, and the supervisor owns the pool itself.
+_PROTECTED_GB_DAEMONS = {
+    "greenboost-netd", "greenboost-net", "gb_supervisor", "gb-supervisor",
+    "greenboost-supe", "greenboostd",
+}
+
 
 def _gb_proc_is_protected(comm: str) -> bool:
-    if comm in _PROTECTED_EXACT:
+    if comm in _PROTECTED_EXACT or comm in _PROTECTED_GB_DAEMONS:
         return True
     return any(comm.startswith(p) for p in _PROTECTED_PREFIXES) or comm == "qemu-kvm"
 
@@ -207,6 +222,34 @@ def _recent_dataflux_pids(minutes: float = DEFAULT_RECENCY_MINUTES) -> "set[int]
     return {int(e["pid"]) for e in events if e.get("pid")}
 
 
+def _ancestor_pids() -> "set[int]":
+    """Every PID from this process up to init.
+
+    Reclaim must never kill the thing that invoked it. `{getpid(), getppid()}`
+    was enough while greenboost-cli was protected by name, but it is not any
+    more: `/clear-memory` inside gb shells out to `sudo greenboost clear
+    memory-pool`, so the live gb process is the caller's GRANDparent (gb ->
+    sudo -> bash -> python), sits several levels up, and is now a legitimate
+    reclaim candidate. Without the full walk, running the command from inside
+    gb would kill gb — while it was running the command.
+    """
+    out: set[int] = set()
+    pid = os.getpid()
+    for _ in range(64):          # bounded: never spin on a malformed /proc
+        if pid <= 1 or pid in out:
+            break
+        out.add(pid)
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                data = f.read().decode("utf-8", "replace")
+            # comm can contain spaces and parentheses — parse after the LAST ')'
+            ppid = int(data[data.rindex(")") + 2:].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+        pid = ppid
+    return out
+
+
 def classify_processes(kill_min_mb: int = DEFAULT_KILL_MIN_MB) -> dict:
     """{"live": [...], "ambiguous": [...], "residue": [...]} of
     {"pid", "comm", "gpu_mb", "gb_dev"} dicts — every reclaim-candidate
@@ -219,7 +262,7 @@ def classify_processes(kill_min_mb: int = DEFAULT_KILL_MIN_MB) -> dict:
 
     live_tracked = _live_pids()
     recent = _recent_dataflux_pids()
-    self_pids = {os.getpid(), os.getppid()}
+    self_pids = _ancestor_pids()
 
     out: dict = {"live": [], "ambiguous": [], "residue": []}
     for pid in candidates:
@@ -243,7 +286,46 @@ def classify_processes(kill_min_mb: int = DEFAULT_KILL_MIN_MB) -> dict:
 # Plan / run
 # ---------------------------------------------------------------------------
 
-_SCOPES = ("residue", "ambiguous", "all")
+_SCOPES = ("residue", "ambiguous", "inference", "all")
+
+# comm names of local AI-inference workers. Matching is substring-based on the
+# full command line as well as comm, because the ai-forge pipelines all run as
+# a bare `python3` — comm alone cannot tell a ComfyUI worker apart from an
+# unrelated script, and the owner's requirement is explicitly that a session
+# started through ~/Dev/ai-forge (art_wizard.sh, a character generation, a
+# LongLive render) is cleaned by `greenboost clear memory-pool` like any other.
+_INFERENCE_COMMS = {
+    "llama-server", "rpc-server", "ollama", "ollama_llama_se",
+    "greenboost-cli", "vllm", "sglang",
+}
+_INFERENCE_CMDLINE_HINTS = (
+    "ai-forge", "comfyui", "gb_diffusion_server", "gb_longlive_server",
+    "gb_synapse", "greenboost_cli", "diffusers", "longlive",
+    "art_wizard", "run_character_pipeline", "run_spherical_pipeline",
+)
+
+
+def _proc_cmdline(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().replace(b"\0", b" ").decode("utf-8", "replace").lower()
+    except OSError:
+        return ""
+
+
+def is_inference_process(pid: int, comm: str) -> bool:
+    """True when this PID is a local AI-inference worker.
+
+    Deliberately looks at the full command line, not just comm: every ai-forge
+    pipeline runs as `python3`, so comm is useless for telling a character
+    render apart from an unrelated script. A false positive here kills a
+    user's own python job, so the hints are specific paths/modules rather than
+    anything as broad as "python".
+    """
+    if comm in _INFERENCE_COMMS:
+        return True
+    cl = _proc_cmdline(pid)
+    return any(h in cl for h in _INFERENCE_CMDLINE_HINTS)
 
 
 def plan_reclaim(scope: str = "residue", kill_min_mb: int = DEFAULT_KILL_MIN_MB) -> dict:
@@ -253,6 +335,12 @@ def plan_reclaim(scope: str = "residue", kill_min_mb: int = DEFAULT_KILL_MIN_MB)
     that never touches gb-synapse's own tracked servers or anything with
     recent activity.
     scope="ambiguous": residue + ambiguous (recently active but untracked).
+    scope="inference": every LOCAL AI-INFERENCE session, tracked or not —
+    gb-synapse servers, ollama, greenboost-cli, and the ai-forge workers
+    (ComfyUI, diffusers, LongLive, art_wizard). Desktop, GNOME, VM and
+    GreenBoost's own fabric daemons stay protected. This is what "clear
+    memory-pool" means to its owner: give me the whole card and the T2 DDR
+    back from AI inference, without logging me out of my desktop.
     scope="all": every non-protected candidate including gb-synapse's own
     live-tracked servers — reproduces the old bash nuke's full blast radius.
     Never the default; only ever explicit (--all)."""
@@ -263,6 +351,13 @@ def plan_reclaim(scope: str = "residue", kill_min_mb: int = DEFAULT_KILL_MIN_MB)
         targets = list(classes["residue"])
     elif scope == "ambiguous":
         targets = list(classes["residue"]) + list(classes["ambiguous"])
+    elif scope == "inference":
+        # Every class, filtered to actual inference workers. A live-tracked
+        # gb-synapse server IS in scope here — sparing it is the whole reason
+        # the command kept reporting success while 10 GB stayed held.
+        targets = [e for e in (list(classes["residue"]) + list(classes["ambiguous"])
+                               + list(classes["live"]))
+                   if is_inference_process(e["pid"], e["comm"])]
     else:
         targets = list(classes["residue"]) + list(classes["ambiguous"]) + list(classes["live"])
     return {"scope": scope, "targets": targets, "classes": classes}
@@ -283,6 +378,28 @@ def run_reclaim(scope: str = "residue", kill_min_mb: int = DEFAULT_KILL_MIN_MB,
             name = m.get("name", "")
             if name and _ollama_unload(name, silent=True):
                 unloaded.append(name)
+
+    # Graceful gb-synapse shutdown BEFORE the SIGTERM sweep.
+    #
+    # stop() is not just a nicer kill: it captures the real KV footprint at the
+    # one moment it is knowable (see gb_synapse.stop's own comment on
+    # _persist_kv_measurement), tears down feeder state, and removes the
+    # run-state file. SIGKILLing the process instead loses the measurement and
+    # strands a run-state JSON describing a server that no longer exists, so
+    # the next `ps` reports a phantom.
+    stopped_servers: list[str] = []
+    target_pids = {t["pid"] for t in targets}
+    try:
+        import gb_synapse
+        for st in gb_synapse.ps():
+            if st.get("llama_pid") in target_pids or st.get("proxy_pid") in target_pids:
+                try:
+                    if gb_synapse.stop(st["model"]):
+                        stopped_servers.append(st["model"])
+                except Exception:
+                    pass   # fall through to the signal sweep below
+    except Exception:
+        pass
 
     killed: list[dict] = []
     failed: list[dict] = []
@@ -320,11 +437,21 @@ def run_reclaim(scope: str = "residue", kill_min_mb: int = DEFAULT_KILL_MIN_MB,
     # holding 7GB VRAM + 6.7GB RAM, but the command's own output ("No
     # killable GPU inference processes found") read as if nothing was using
     # that memory at all.
+    # Derived from the ACTUAL target set, never from a per-scope guess.
+    #
+    # This used to be `list(classes["live"])` plus ambiguous at scope=residue,
+    # which silently assumed live entries are never targeted. scope="inference"
+    # (and "all") DO target them, so the first real run printed PID 44218 under
+    # "Terminated GPU inference processes" AND under "Still held (spared)" in
+    # the same output — an outright contradiction the operator had to resolve
+    # by reading the VRAM numbers (owner report 2026-08-18). Computing the
+    # complement of `targets` cannot drift from the scope again, because it
+    # does not know or care what the scope was.
     classes = plan["classes"]
-    spared = list(classes["live"])
-    if scope == "residue":
-        spared += list(classes["ambiguous"])
-    result = {"scope": scope, "killed": killed, "unloaded": unloaded, "failed": failed,
+    target_pids = {t["pid"] for t in targets}
+    spared = [e for v in classes.values() for e in v
+              if e["pid"] not in target_pids]
+    result = {"scope": scope, "killed": killed, "unloaded": unloaded, "stopped_servers": stopped_servers, "failed": failed,
               "spared": spared}
     try:
         import gb_dataflux

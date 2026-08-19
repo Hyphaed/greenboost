@@ -5108,7 +5108,7 @@ enum {
 	ATA_EH_PMP_TRIES = 5,
 	ATA_EH_PMP_LINK_TRIES = 3,
 	SATA_PMP_RW_TIMEOUT = 3000,
-	ATA_EH_CMD_TIMEOUT_TABLE_SIZE = 8,
+	ATA_EH_CMD_TIMEOUT_TABLE_SIZE = 9,
 	ATA_DMA_MASK_ATA = 1,
 	ATA_DMA_MASK_ATAPI = 2,
 	ATA_DMA_MASK_CFA = 4,
@@ -8480,67 +8480,6 @@ enum {
 };
 
 enum {
-	SEV_RET_NO_FW_CALL = -1,
-	SEV_RET_SUCCESS = 0,
-	SEV_RET_INVALID_PLATFORM_STATE = 1,
-	SEV_RET_INVALID_GUEST_STATE = 2,
-	SEV_RET_INAVLID_CONFIG = 3,
-	SEV_RET_INVALID_CONFIG = 3,
-	SEV_RET_INVALID_LEN = 4,
-	SEV_RET_ALREADY_OWNED = 5,
-	SEV_RET_INVALID_CERTIFICATE = 6,
-	SEV_RET_POLICY_FAILURE = 7,
-	SEV_RET_INACTIVE = 8,
-	SEV_RET_INVALID_ADDRESS = 9,
-	SEV_RET_BAD_SIGNATURE = 10,
-	SEV_RET_BAD_MEASUREMENT = 11,
-	SEV_RET_ASID_OWNED = 12,
-	SEV_RET_INVALID_ASID = 13,
-	SEV_RET_WBINVD_REQUIRED = 14,
-	SEV_RET_DFFLUSH_REQUIRED = 15,
-	SEV_RET_INVALID_GUEST = 16,
-	SEV_RET_INVALID_COMMAND = 17,
-	SEV_RET_ACTIVE = 18,
-	SEV_RET_HWSEV_RET_PLATFORM = 19,
-	SEV_RET_HWSEV_RET_UNSAFE = 20,
-	SEV_RET_UNSUPPORTED = 21,
-	SEV_RET_INVALID_PARAM = 22,
-	SEV_RET_RESOURCE_LIMIT = 23,
-	SEV_RET_SECURE_DATA_INVALID = 24,
-	SEV_RET_INVALID_PAGE_SIZE = 25,
-	SEV_RET_INVALID_PAGE_STATE = 26,
-	SEV_RET_INVALID_MDATA_ENTRY = 27,
-	SEV_RET_INVALID_PAGE_OWNER = 28,
-	SEV_RET_AEAD_OFLOW = 29,
-	SEV_RET_EXIT_RING_BUFFER = 31,
-	SEV_RET_RMP_INIT_REQUIRED = 32,
-	SEV_RET_BAD_SVN = 33,
-	SEV_RET_BAD_VERSION = 34,
-	SEV_RET_SHUTDOWN_REQUIRED = 35,
-	SEV_RET_UPDATE_FAILED = 36,
-	SEV_RET_RESTORE_REQUIRED = 37,
-	SEV_RET_RMP_INITIALIZATION_FAILED = 38,
-	SEV_RET_INVALID_KEY = 39,
-	SEV_RET_SHUTDOWN_INCOMPLETE = 40,
-	SEV_RET_INCORRECT_BUFFER_LENGTH = 48,
-	SEV_RET_EXPAND_BUFFER_LENGTH_REQUEST = 49,
-	SEV_RET_SPDM_REQUEST = 50,
-	SEV_RET_SPDM_ERROR = 51,
-	SEV_RET_SEV_STATUS_ERR_IN_DEV_CONN = 53,
-	SEV_RET_SEV_STATUS_INVALID_DEV_CTX = 54,
-	SEV_RET_SEV_STATUS_INVALID_TDI_CTX = 55,
-	SEV_RET_SEV_STATUS_INVALID_TDI = 56,
-	SEV_RET_SEV_STATUS_RECLAIM_REQUIRED = 57,
-	SEV_RET_IN_USE = 58,
-	SEV_RET_SEV_STATUS_INVALID_DEV_STATE = 59,
-	SEV_RET_SEV_STATUS_INVALID_TDI_STATE = 60,
-	SEV_RET_SEV_STATUS_DEV_CERT_CHANGED = 61,
-	SEV_RET_SEV_STATUS_RESYNC_REQ = 62,
-	SEV_RET_SEV_STATUS_RESPONSE_TOO_LARGE = 63,
-	SEV_RET_MAX = 64,
-};
-
-enum {
 	SFF8024_ID_UNK = 0,
 	SFF8024_ID_SFF_8472 = 2,
 	SFF8024_ID_SFP = 3,
@@ -11491,7 +11430,8 @@ enum _slab_flag_bits {
 	_SLAB_CMPXCHG_DOUBLE = 18,
 	_SLAB_NO_OBJ_EXT = 19,
 	_SLAB_OBJ_EXT_IN_OBJ = 20,
-	_SLAB_FLAGS_LAST_BIT = 21,
+	_SLAB_NO_SHEAVES = 21,
+	_SLAB_FLAGS_LAST_BIT = 22,
 };
 
 enum _tlb_table_type {
@@ -12004,11 +11944,6 @@ enum address_markers_idx {
 	MODULES_END_NR = 11,
 	FIXADDR_START_NR = 12,
 	END_OF_SPACE_NR = 13,
-};
-
-enum aead_algo {
-	SNP_AEAD_INVALID = 0,
-	SNP_AEAD_AES_256_GCM = 1,
 };
 
 enum alarmtimer_type {
@@ -12637,15 +12572,6 @@ enum amd_pref_core {
 	AMD_PREF_CORE_UNKNOWN = 0,
 	AMD_PREF_CORE_SUPPORTED = 1,
 	AMD_PREF_CORE_UNSUPPORTED = 2,
-};
-
-enum amd_pstate_mode {
-	AMD_PSTATE_UNDEFINED = 0,
-	AMD_PSTATE_DISABLE = 1,
-	AMD_PSTATE_PASSIVE = 2,
-	AMD_PSTATE_ACTIVE = 3,
-	AMD_PSTATE_GUIDED = 4,
-	AMD_PSTATE_MAX = 5,
 };
 
 enum anon_enabled_mode {
@@ -17566,16 +17492,6 @@ enum enable_type {
 };
 
 enum energy_perf_value_index {
-	EPP_INDEX_DEFAULT = 0,
-	EPP_INDEX_PERFORMANCE = 1,
-	EPP_INDEX_BALANCE_PERFORMANCE = 2,
-	EPP_INDEX_BALANCE_POWERSAVE = 3,
-	EPP_INDEX_POWERSAVE = 4,
-	EPP_INDEX_CUSTOM = 5,
-	EPP_INDEX_MAX = 6,
-};
-
-enum energy_perf_value_index___2 {
 	EPB_INDEX_PERFORMANCE = 0,
 	EPB_INDEX_BALANCE_PERFORMANCE = 1,
 	EPB_INDEX_NORMAL = 2,
@@ -17583,12 +17499,12 @@ enum energy_perf_value_index___2 {
 	EPB_INDEX_POWERSAVE = 4,
 };
 
-enum energy_perf_value_index___3 {
-	EPP_INDEX_DEFAULT___2 = 0,
-	EPP_INDEX_PERFORMANCE___2 = 1,
-	EPP_INDEX_BALANCE_PERFORMANCE___2 = 2,
-	EPP_INDEX_BALANCE_POWERSAVE___2 = 3,
-	EPP_INDEX_POWERSAVE___2 = 4,
+enum energy_perf_value_index___2 {
+	EPP_INDEX_DEFAULT = 0,
+	EPP_INDEX_PERFORMANCE = 1,
+	EPP_INDEX_BALANCE_PERFORMANCE = 2,
+	EPP_INDEX_BALANCE_POWERSAVE = 3,
+	EPP_INDEX_POWERSAVE = 4,
 };
 
 enum environment_cap {
@@ -17631,15 +17547,6 @@ enum error_detector {
 	ERROR_DETECTOR_KFENCE = 0,
 	ERROR_DETECTOR_KASAN = 1,
 	ERROR_DETECTOR_WARN = 2,
-};
-
-enum es_result {
-	ES_OK = 0,
-	ES_UNSUPPORTED = 1,
-	ES_VMM_ERROR = 2,
-	ES_DECODE_FAILED = 3,
-	ES_EXCEPTION = 4,
-	ES_RETRY = 5,
 };
 
 enum ethnl_sock_type {
@@ -20500,14 +20407,6 @@ enum ib_wr_opcode {
 	IB_WR_RESERVED10 = 249,
 };
 
-enum ibs_states {
-	IBS_ENABLED = 0,
-	IBS_STARTED = 1,
-	IBS_STOPPING = 2,
-	IBS_STOPPED = 3,
-	IBS_MAX_STATES = 4,
-};
-
 enum id_action {
 	ID_REMOVE = 0,
 	ID_ADD = 1,
@@ -21615,7 +21514,8 @@ enum kmalloc_cache_type {
 	KMALLOC_RECLAIM = 16,
 	KMALLOC_DMA = 17,
 	KMALLOC_CGROUP = 18,
-	NR_KMALLOC_TYPES = 19,
+	KMALLOC_NO_OBJ_EXT = 19,
+	NR_KMALLOC_TYPES = 20,
 };
 
 enum kmsg_dump_reason {
@@ -23145,10 +23045,8 @@ enum mipi_dsi_pixel_format {
 };
 
 enum misc_res_type {
-	MISC_CG_RES_SEV = 0,
-	MISC_CG_RES_SEV_ES = 1,
-	MISC_CG_RES_TDX = 2,
-	MISC_CG_RES_TYPES = 3,
+	MISC_CG_RES_TDX = 0,
+	MISC_CG_RES_TYPES = 1,
 };
 
 enum mm_io_opcode {
@@ -23435,27 +23333,6 @@ enum msdos_sys_ind {
 	BSDI_PARTITION = 183,
 	MINIX_PARTITION = 129,
 	UNIXWARE_PARTITION = 99,
-};
-
-enum msg_type {
-	SNP_MSG_TYPE_INVALID = 0,
-	SNP_MSG_CPUID_REQ = 1,
-	SNP_MSG_CPUID_RSP = 2,
-	SNP_MSG_KEY_REQ = 3,
-	SNP_MSG_KEY_RSP = 4,
-	SNP_MSG_REPORT_REQ = 5,
-	SNP_MSG_REPORT_RSP = 6,
-	SNP_MSG_EXPORT_REQ = 7,
-	SNP_MSG_EXPORT_RSP = 8,
-	SNP_MSG_IMPORT_REQ = 9,
-	SNP_MSG_IMPORT_RSP = 10,
-	SNP_MSG_ABSORB_REQ = 11,
-	SNP_MSG_ABSORB_RSP = 12,
-	SNP_MSG_VMRK_REQ = 13,
-	SNP_MSG_VMRK_RSP = 14,
-	SNP_MSG_TSC_INFO_REQ = 17,
-	SNP_MSG_TSC_INFO_RSP = 18,
-	SNP_MSG_TYPE_MAX = 19,
 };
 
 enum msi_desc_filter {
@@ -26223,18 +26100,6 @@ enum pkt_hash_types {
 	PKT_HASH_TYPE_L4 = 3,
 };
 
-enum platform_profile_option {
-	PLATFORM_PROFILE_LOW_POWER = 0,
-	PLATFORM_PROFILE_COOL = 1,
-	PLATFORM_PROFILE_QUIET = 2,
-	PLATFORM_PROFILE_BALANCED = 3,
-	PLATFORM_PROFILE_BALANCED_PERFORMANCE = 4,
-	PLATFORM_PROFILE_PERFORMANCE = 5,
-	PLATFORM_PROFILE_MAX_POWER = 6,
-	PLATFORM_PROFILE_CUSTOM = 7,
-	PLATFORM_PROFILE_LAST = 8,
-};
-
 enum pldmfw_update_mode {
 	PLDMFW_UPDATE_MODE_FULL = 0,
 	PLDMFW_UPDATE_MODE_SINGLE_COMPONENT = 1,
@@ -26689,11 +26554,6 @@ enum ps2_disposition {
 	PS2_PROCESS = 0,
 	PS2_IGNORE = 1,
 	PS2_ERROR = 2,
-};
-
-enum psc_op {
-	SNP_PAGE_STATE_PRIVATE = 1,
-	SNP_PAGE_STATE_SHARED = 2,
 };
 
 enum pse_budget_eval_strategies {
@@ -32193,7 +32053,7 @@ enum wq_internal_consts {
 
 enum wq_misc_consts {
 	WORK_NR_COLORS = 16,
-	WORK_CPU_UNBOUND = 8192,
+	WORK_CPU_UNBOUND = 64,
 	WORK_BUSY_PENDING = 1,
 	WORK_BUSY_RUNNING = 2,
 	WORKER_DESC_LEN = 32,
@@ -34931,8 +34791,6 @@ typedef struct {
 	atomic_t perf_rdpmc_allowed;
 	u16 pkey_allocation_map;
 	s16 execute_only_pkey;
-	u16 global_asid;
-	bool asid_transition;
 } mm_context_t;
 
 typedef struct {
@@ -35869,6 +35727,7 @@ struct Scsi_Host {
 	struct scsi_device *pseudo_sdev;
 	void *shost_data;
 	struct device *dma_dev;
+	struct work_struct eh_work;
 	int rpm_autosuspend_delay;
 	long unsigned int hostdata[0];
 };
@@ -37955,7 +37814,11 @@ struct acpi_control_state {
 	u64 loop_timeout;
 };
 
-typedef struct cpumask *cpumask_var_t;
+struct cpumask {
+	long unsigned int bits[1];
+};
+
+typedef struct cpumask cpumask_var_t[1];
 
 struct acpi_pct_register;
 
@@ -40418,32 +40281,6 @@ struct acpi_pcct_ext_pcc_shared_memory {
 	u32 command;
 };
 
-struct acpi_pcct_ext_pcc_slave {
-	struct acpi_subtable_header header;
-	u32 platform_interrupt;
-	u8 flags;
-	u8 reserved1;
-	u64 base_address;
-	u32 length;
-	struct acpi_generic_address doorbell_register;
-	u64 preserve_mask;
-	u64 write_mask;
-	u32 latency;
-	u32 max_access_rate;
-	u32 min_turnaround_time;
-	struct acpi_generic_address platform_ack_register;
-	u64 ack_preserve_mask;
-	u64 ack_set_mask;
-	u64 reserved2;
-	struct acpi_generic_address cmd_complete_register;
-	u64 cmd_complete_mask;
-	struct acpi_generic_address cmd_update_register;
-	u64 cmd_update_preserve_mask;
-	u64 cmd_update_set_mask;
-	struct acpi_generic_address error_status_register;
-	u64 error_status_mask;
-} __attribute__((packed));
-
 struct acpi_pcct_hw_reduced {
 	struct acpi_subtable_header header;
 	u32 platform_interrupt;
@@ -42526,35 +42363,10 @@ struct aes_key {
 	union aes_invkey_arch inv_k;
 };
 
-struct polyval_elem {
-	union {
-		u8 bytes[16];
-		struct {
-			__le64 lo;
-			__le64 hi;
-		};
-	};
-};
-
-struct ghash_key {
-	struct polyval_elem h;
-};
-
-struct aesgcm_ctx {
-	struct ghash_key ghash_key;
-	struct aes_enckey aes_key;
-	unsigned int authsize;
-};
-
 struct affinity_context {
 	const struct cpumask *new_mask;
 	struct cpumask *user_mask;
 	unsigned int flags;
-};
-
-struct aggregate_choices_data {
-	long unsigned int aggregate[1];
-	int count;
 };
 
 struct aggregate_control {
@@ -43093,12 +42905,6 @@ struct alt_instr {
 	u8 replacementlen;
 } __attribute__((packed));
 
-struct amd_aperf_mperf {
-	u64 aperf;
-	u64 mperf;
-	u64 tsc;
-};
-
 struct amd_chipset_type {
 	enum amd_chipset_gen gen;
 	u8 rev;
@@ -43112,66 +42918,6 @@ struct amd_chipset_info {
 	int isoc_reqs;
 	int probe_count;
 	bool need_pll_quirk;
-};
-
-union perf_cached {
-	struct {
-		u8 highest_perf;
-		u8 nominal_perf;
-		u8 lowest_nonlinear_perf;
-		u8 lowest_perf;
-		u8 min_limit_perf;
-		u8 max_limit_perf;
-		u8 bios_min_perf;
-	};
-	u64 val;
-};
-
-struct amd_cpudata {
-	int cpu;
-	struct freq_qos_request req[2];
-	u64 cppc_req_cached;
-	u64 cppc_req2_cached;
-	union perf_cached perf;
-	u8 prefcore_ranking;
-	u8 floor_perf_cnt;
-	u8 bios_floor_perf;
-	u32 min_limit_freq;
-	u32 max_limit_freq;
-	u32 nominal_freq;
-	u32 max_freq;
-	u32 lowest_nonlinear_freq;
-	u32 floor_freq;
-	struct amd_aperf_mperf cur;
-	struct amd_aperf_mperf prev;
-	u64 freq;
-	bool boost_supported;
-	bool hw_prefcore;
-	u32 policy;
-	bool suspended;
-	u8 epp_default_ac;
-	u8 epp_default_dc;
-	bool dynamic_epp;
-	bool raw_epp;
-	struct notifier_block power_nb;
-	enum platform_profile_option current_profile;
-	struct device *ppdev;
-	char *profile_name;
-};
-
-union amd_debug_extn_cfg {
-	__u64 val;
-	struct {
-		__u64 rsvd0: 2;
-		__u64 brsmen: 1;
-		__u64 rsvd4_3: 2;
-		__u64 vb: 1;
-		__u64 rsvd2: 10;
-		__u64 msroff: 4;
-		__u64 rsvd3: 4;
-		__u64 pmc: 3;
-		__u64 rsvd4: 37;
-	};
 };
 
 struct amd_function {
@@ -43297,40 +43043,6 @@ struct amd_gpio {
 	int irq;
 };
 
-struct amd_hfi_classes {
-	u32 perf;
-	u32 eff;
-};
-
-struct amd_hfi_cpuinfo {
-	int cpu;
-	u32 apic_id;
-	s16 class_index;
-	u8 nr_class;
-	int *ipcc_scores;
-	struct amd_hfi_classes *amd_hfi_classes;
-};
-
-struct pcc_mbox_chan;
-
-struct amd_shmem_info;
-
-struct amd_hfi_data {
-	const char *name;
-	struct device *dev;
-	struct pcc_mbox_chan *pcc_chan;
-	void *pcc_comm_addr;
-	struct acpi_subtable_header *pcct_entry;
-	struct amd_shmem_info *shmem;
-	struct dentry *dbgfs_dir;
-};
-
-struct amd_hostbridge {
-	u32 bus;
-	u32 slot;
-	u32 device;
-};
-
 struct iommu_ops;
 
 struct iommu_device {
@@ -43395,11 +43107,6 @@ struct amd_iommu {
 	u64 cmd_sem_paddr;
 	struct iopf_queue *iopf_queue;
 	unsigned char iopfq_name[32];
-};
-
-struct amd_iommu_event_desc {
-	struct device_attribute attr;
-	const char *event;
 };
 
 struct dev_table_entry;
@@ -43586,33 +43293,10 @@ struct amd_nb {
 	struct event_constraint event_constraints[64];
 };
 
-struct amd_nb_bus_dev_range {
-	u8 bus;
-	u8 dev_base;
-	u8 dev_limit;
-};
-
 struct amd_northbridge {
 	struct pci_dev *misc;
 	struct pci_dev *link;
 	struct amd_l3_cache l3_cache;
-};
-
-struct amd_northbridge_info {
-	u16 num;
-	u64 flags;
-	struct amd_northbridge *nb;
-};
-
-struct amd_shmem_info {
-	struct acpi_pcct_ext_pcc_shared_memory header;
-	u32 version_number: 8;
-	u32 n_logical_processors: 8;
-	u32 n_capabilities: 8;
-	u32 table_update_context: 8;
-	u32 n_bitmaps: 8;
-	u32 reserved: 24;
-	u32 table_data[0];
 };
 
 struct amd_vsdb_v3_payload {
@@ -44651,10 +44335,6 @@ struct arch_specific_insn {
 	int tp_len;
 };
 
-struct cpumask {
-	long unsigned int bits[128];
-};
-
 struct arch_tlbflush_unmap_batch {
 	struct cpumask cpumask;
 	bool unmapped_pages;
@@ -45143,7 +44823,7 @@ struct ata_eh_info {
 struct ata_eh_context {
 	struct ata_eh_info i;
 	int tries[2];
-	int cmd_timeout_idx[16];
+	int cmd_timeout_idx[18];
 	unsigned int classes[2];
 	unsigned int did_probe_mask;
 	unsigned int unloaded_mask;
@@ -45225,7 +44905,6 @@ struct ata_link {
 	struct ata_queued_cmd *deferred_qc;
 	struct ata_eh_info eh_info;
 	struct ata_eh_context eh_context;
-	long: 64;
 	long: 64;
 	long: 64;
 	long: 64;
@@ -45511,12 +45190,6 @@ struct atkbd {
 	long unsigned int event_mask;
 	struct mutex mutex;
 	struct vivaldi_data vdata;
-};
-
-struct atl_err {
-	u64 addr;
-	u64 ipid;
-	u32 cpu;
 };
 
 struct atomic_notifier_head {
@@ -45965,6 +45638,11 @@ struct audit_watch {
 	struct audit_parent *parent;
 	struct list_head wlist;
 	struct list_head rules;
+};
+
+struct audit_watch_ctx {
+	struct inode *dir;
+	struct inode *child;
 };
 
 struct auditd_connection {
@@ -54852,27 +54530,6 @@ struct br_tunnel_info {
 	struct metadata_dst *tunnel_dst;
 };
 
-struct branch_entry {
-	union {
-		struct {
-			u64 ip: 58;
-			u64 ip_sign_ext: 5;
-			u64 mispredict: 1;
-		} split;
-		u64 full;
-	} from;
-	union {
-		struct {
-			u64 ip: 58;
-			u64 ip_sign_ext: 3;
-			u64 reserved: 1;
-			u64 spec: 1;
-			u64 valid: 1;
-		} split;
-		u64 full;
-	} to;
-};
-
 struct bridge_id {
 	unsigned char prio[2];
 	unsigned char addr[6];
@@ -57345,30 +57002,6 @@ struct cc_attr_flags {
 	__u64 __resv: 63;
 };
 
-struct cc_blob_sev_info {
-	u32 magic;
-	u16 version;
-	u16 reserved;
-	u64 secrets_phys;
-	u32 secrets_len;
-	u32 rsvd1;
-	u64 cpuid_phys;
-	u32 cpuid_len;
-	u32 rsvd2;
-};
-
-struct setup_data {
-	__u64 next;
-	__u32 type;
-	__u32 len;
-	__u8 data[0];
-};
-
-struct cc_setup_data {
-	struct setup_data header;
-	u32 cc_blob_address;
-};
-
 struct request_sense;
 
 struct cdrom_generic_command {
@@ -58318,6 +57951,7 @@ struct channel {
 	struct list_head clist;
 	spinlock_t upl;
 	struct channel *bridge;
+	struct callback_head rcu;
 	u8 avail;
 	u8 had_frag;
 	u32 lastseq;
@@ -58865,7 +58499,7 @@ struct srcu_node;
 
 struct srcu_usage {
 	struct srcu_node *node;
-	struct srcu_node *level[4];
+	struct srcu_node *level[3];
 	int srcu_size_state;
 	struct mutex srcu_cb_mutex;
 	raw_spinlock_t lock;
@@ -60977,15 +60611,6 @@ struct consw {
 	void (*con_invert_region)(struct vc_data *, u16 *, int);
 };
 
-struct microcode_amd;
-
-struct cont_desc {
-	struct microcode_amd *mc;
-	u32 psize;
-	u8 *data;
-	size_t size;
-};
-
 struct container_dev {
 	struct device dev;
 	int (*offline)(struct container_dev *);
@@ -61562,6 +61187,8 @@ struct cppc_cpudata {
 	unsigned int shared_type;
 	cpumask_var_t shared_cpu_map;
 };
+
+struct pcc_mbox_chan;
 
 struct cppc_pcc_data {
 	struct pcc_mbox_chan *pcc_channel;
@@ -62313,11 +61940,6 @@ struct cpu_model {
 	struct cpufreq_frequency_table *op_points;
 };
 
-struct cpu_perf_ibs {
-	struct perf_event *event;
-	long unsigned int state[1];
-};
-
 struct cpu_rmap {
 	struct kref refcount;
 	u16 size;
@@ -62871,44 +62493,12 @@ union cpuid_0x10_x_edx {
 	unsigned int full;
 };
 
-union cpuid_0x80000022_ebx {
-	struct {
-		unsigned int num_core_pmc: 4;
-		unsigned int lbr_v2_stack_sz: 6;
-		unsigned int num_df_pmc: 6;
-		unsigned int num_umc_pmc: 6;
-	} split;
-	unsigned int full;
-};
-
-union cpuid_1_eax {
-	struct {
-		__u32 stepping: 4;
-		__u32 model: 4;
-		__u32 family: 4;
-		__u32 __reserved0: 4;
-		__u32 ext_model: 4;
-		__u32 ext_fam: 8;
-		__u32 __reserved1: 4;
-	};
-	__u32 full;
-};
-
 struct cpuid_bit {
 	u16 feature;
 	u8 reg;
 	u8 bit;
 	u32 level;
 	u32 sub_leaf;
-};
-
-struct ghcb;
-
-struct es_em_ctxt;
-
-struct cpuid_ctx {
-	struct ghcb *ghcb;
-	struct es_em_ctxt *ctxt;
 };
 
 struct cpuid_dep {
@@ -62919,15 +62509,6 @@ struct cpuid_dep {
 struct cpuid_dependent_feature {
 	u32 feature;
 	u32 level;
-};
-
-struct cpuid_leaf {
-	u32 fn;
-	u32 subfn;
-	u32 eax;
-	u32 ebx;
-	u32 ecx;
-	u32 edx;
 };
 
 struct cpuidle_device;
@@ -63446,6 +63027,20 @@ struct crypto_cts_reqctx {
 	struct scatterlist sg[2];
 	unsigned int offset;
 	struct skcipher_request subreq;
+};
+
+struct polyval_elem {
+	union {
+		u8 bytes[16];
+		struct {
+			__le64 lo;
+			__le64 hi;
+		};
+	};
+};
+
+struct ghash_key {
+	struct polyval_elem h;
 };
 
 struct crypto_gcm_ctx {
@@ -67744,7 +67339,7 @@ struct displayid_tiled_block {
 	u8 topo[3];
 	u8 tile_size[4];
 	u8 tile_pixel_bezel[5];
-	u8 topology_id[8];
+	u8 topology_id[9];
 };
 
 struct displayid_vesa_vendor_specific_block {
@@ -68109,7 +67704,7 @@ struct dm_stat {
 	size_t shared_alloc_size;
 	size_t percpu_alloc_size;
 	size_t histogram_alloc_size;
-	struct dm_stat_percpu *stat_percpu[8192];
+	struct dm_stat_percpu *stat_percpu[64];
 	struct dm_stat_shared stat_shared[0];
 };
 
@@ -68301,6 +67896,12 @@ struct iosys_map {
 	bool is_iomem;
 };
 
+struct dma_buf_compression_hint {
+	u32 codec;
+	u32 block_size;
+	u64 uncompressed_size;
+};
+
 struct dma_buf_poll_cb_t {
 	struct dma_fence_cb cb;
 	wait_queue_head_t *poll;
@@ -68322,6 +67923,8 @@ struct dma_buf {
 	const char *name;
 	spinlock_t name_lock;
 	atomic_t priority;
+	struct dma_buf_compression_hint compression;
+	spinlock_t compression_lock;
 	struct module *owner;
 	struct list_head list_node;
 	void *priv;
@@ -68346,6 +67949,12 @@ struct dma_buf_attachment {
 	const struct dma_buf_attach_ops *importer_ops;
 	void *importer_priv;
 	void *priv;
+};
+
+struct dma_buf_compression {
+	__u32 codec;
+	__u32 block_size;
+	__u64 uncompressed_size;
 };
 
 struct sg_table {
@@ -69141,25 +68750,6 @@ struct dmemcg_state {
 	struct list_head pools;
 };
 
-struct dmi_header {
-	u8 type;
-	u8 length;
-	u16 handle;
-};
-
-struct dmi_a_info {
-	struct dmi_header header;
-	u8 count;
-} __attribute__((packed));
-
-struct dmi_a_info_entry {
-	u8 length;
-	u16 handle;
-	u8 offset;
-	u8 str_num;
-	u8 value[0];
-} __attribute__((packed));
-
 struct dmi_device {
 	struct list_head list;
 	int type;
@@ -69178,6 +68768,12 @@ struct dmi_dev_onboard {
 struct dmi_device_attribute {
 	struct device_attribute dev_attr;
 	int field;
+};
+
+struct dmi_header {
+	u8 type;
+	u8 length;
+	u16 handle;
 };
 
 struct dmi_memdev_info {
@@ -72484,7 +72080,7 @@ struct drm_tile_group {
 	struct kref refcount;
 	struct drm_device *dev;
 	int id;
-	u8 group_data[8];
+	u8 group_data[9];
 };
 
 struct drm_unique {
@@ -76093,19 +75689,6 @@ struct eprobe_trace_entry_head {
 	struct trace_entry ent;
 };
 
-struct equiv_cpu_entry {
-	u32 installed_cpu;
-	u32 fixed_errata_mask;
-	u32 fixed_errata_compare;
-	u16 equiv_cpu;
-	u16 res;
-};
-
-struct equiv_cpu_table {
-	unsigned int num_entries;
-	struct equiv_cpu_entry *entry;
-};
-
 struct er_account {
 	raw_spinlock_t lock;
 	u64 config;
@@ -76172,58 +75755,6 @@ struct erst_record_id_cache {
 	int len;
 	int size;
 	int refcount;
-};
-
-struct insn_field {
-	union {
-		insn_value_t value;
-		insn_byte_t bytes[4];
-	};
-	unsigned char got;
-	unsigned char nbytes;
-};
-
-struct insn {
-	struct insn_field prefixes;
-	struct insn_field rex_prefix;
-	union {
-		struct insn_field vex_prefix;
-		struct insn_field xop_prefix;
-	};
-	struct insn_field opcode;
-	struct insn_field modrm;
-	struct insn_field sib;
-	struct insn_field displacement;
-	union {
-		struct insn_field immediate;
-		struct insn_field moffset1;
-		struct insn_field immediate1;
-	};
-	union {
-		struct insn_field moffset2;
-		struct insn_field immediate2;
-	};
-	int emulate_prefix_size;
-	insn_attr_t attr;
-	unsigned char opnd_bytes;
-	unsigned char addr_bytes;
-	unsigned char length;
-	unsigned char x86_64;
-	const insn_byte_t *kaddr;
-	const insn_byte_t *end_kaddr;
-	const insn_byte_t *next_byte;
-};
-
-struct es_fault_info {
-	long unsigned int vector;
-	long unsigned int error_code;
-	long unsigned int cr2;
-};
-
-struct es_em_ctxt {
-	struct pt_regs *regs;
-	struct insn insn;
-	struct es_fault_info fi;
 };
 
 struct strp_stats {
@@ -76612,16 +76143,15 @@ struct ethtool_fec_hist_value {
 	u64 per_lane[8];
 };
 
-struct ethtool_fec_hist_range;
+struct ethtool_fec_hist_range {
+	u16 low;
+	u16 high;
+};
 
 struct ethtool_fec_hist {
 	struct ethtool_fec_hist_value values[17];
 	const struct ethtool_fec_hist_range *ranges;
-};
-
-struct ethtool_fec_hist_range {
-	u16 low;
-	u16 high;
+	struct ethtool_fec_hist_range ranges_buf[17];
 };
 
 struct ethtool_fec_stat {
@@ -77415,6 +76945,7 @@ struct event_trigger_data {
 	struct list_head named_list;
 	struct event_trigger_data *named_data;
 	struct llist_node llist;
+	void (*private_data_free)(struct event_trigger_data *);
 };
 
 struct eventfd_ctx {
@@ -77667,9 +77198,9 @@ struct exception_stacks {
 	char MCE_stack_guard[0];
 	char MCE_stack[8192];
 	char VC_stack_guard[0];
-	char VC_stack[8192];
+	char VC_stack[0];
 	char VC2_stack_guard[0];
-	char VC2_stack[8192];
+	char VC2_stack[0];
 	char IST_top_guard[0];
 };
 
@@ -82790,11 +82321,6 @@ struct freq_attr {
 	ssize_t (*store)(struct cpufreq_policy *, const char *, size_t);
 };
 
-struct freq_attr_visibility {
-	struct freq_attr *attr;
-	bool (*visibility_fn)(void);
-};
-
 struct muldiv {
 	u32 multiplier;
 	u32 divider;
@@ -83211,7 +82737,7 @@ struct fscrypt_operations {
 	const union fscrypt_policy * (*get_dummy_policy)(struct super_block *);
 	bool (*empty_dir)(struct inode *);
 	bool (*has_stable_inodes)(struct super_block *);
-	struct block_device ** (*get_devices)(struct super_block *, unsigned int *);
+	unsigned int (*get_devices)(struct super_block *, struct block_device **);
 };
 
 struct fscrypt_provisioning_key_payload {
@@ -86136,10 +85662,6 @@ struct ghcb {
 	u32 ghcb_usage;
 };
 
-struct ghcb_state {
-	struct ghcb *ghcb;
-};
-
 struct ghes {
 	union {
 		struct acpi_hest_generic *generic;
@@ -88704,71 +88226,6 @@ union hv_dispatch_suspend_register {
 	};
 };
 
-union hv_input_vtl {
-	u8 as_uint8;
-	struct {
-		u8 target_vtl: 4;
-		u8 use_target_vtl: 1;
-		u8 reserved_z: 3;
-	};
-};
-
-struct hv_x64_segment_register {
-	u64 base;
-	u32 limit;
-	u16 selector;
-	union {
-		struct {
-			u16 segment_type: 4;
-			u16 non_system_segment: 1;
-			u16 descriptor_privilege_level: 2;
-			u16 present: 1;
-			u16 reserved: 4;
-			u16 available: 1;
-			u16 _long: 1;
-			u16 _default: 1;
-			u16 granularity: 1;
-		};
-		u16 attributes;
-	};
-};
-
-struct hv_x64_table_register {
-	u16 pad[3];
-	u16 limit;
-	u64 base;
-};
-
-struct hv_init_vp_context {
-	u64 rip;
-	u64 rsp;
-	u64 rflags;
-	struct hv_x64_segment_register cs;
-	struct hv_x64_segment_register ds;
-	struct hv_x64_segment_register es;
-	struct hv_x64_segment_register fs;
-	struct hv_x64_segment_register gs;
-	struct hv_x64_segment_register ss;
-	struct hv_x64_segment_register tr;
-	struct hv_x64_segment_register ldtr;
-	struct hv_x64_table_register idtr;
-	struct hv_x64_table_register gdtr;
-	u64 efer;
-	u64 cr0;
-	u64 cr3;
-	u64 cr4;
-	u64 msr_cr_pat;
-};
-
-struct hv_enable_vp_vtl {
-	u64 partition_id;
-	u32 vp_index;
-	union hv_input_vtl target_vtl;
-	u8 mbz0;
-	u16 mbz1;
-	struct hv_init_vp_context vp_context;
-};
-
 struct hv_enc_pfn_region {
 	struct list_head list;
 	u64 pfn;
@@ -88783,44 +88240,20 @@ union hv_explicit_suspend_register {
 	};
 };
 
+union hv_input_vtl {
+	u8 as_uint8;
+	struct {
+		u8 target_vtl: 4;
+		u8 use_target_vtl: 1;
+		u8 reserved_z: 3;
+	};
+};
+
 struct hv_get_vp_from_apic_id_in {
 	u64 partition_id;
 	union hv_input_vtl target_vtl;
 	u8 res[7];
 	u32 apic_ids[0];
-};
-
-union hv_ghcb {
-	struct ghcb ghcb;
-	struct {
-		u64 hypercalldata[509];
-		u64 outputgpa;
-		union {
-			union {
-				struct {
-					u32 callcode: 16;
-					u32 isfast: 1;
-					u32 reserved1: 14;
-					u32 isnested: 1;
-					u32 countofelements: 12;
-					u32 reserved2: 4;
-					u32 repstartindex: 12;
-					u32 reserved3: 4;
-				};
-				u64 asuint64;
-			} hypercallinput;
-			union {
-				struct {
-					u16 callstatus;
-					u16 reserved1;
-					u32 elementsprocessed: 12;
-					u32 reserved2: 20;
-				};
-				u64 asunit64;
-			} hypercalloutput;
-		};
-		u64 reserved2;
-	} hypercall;
 };
 
 union hv_gpa_page_range {
@@ -88901,8 +88334,9 @@ struct hv_input_get_partition_property {
 
 struct hv_input_get_system_property {
 	u32 property_id;
+	u32 reserved;
 	union {
-		u32 as_uint32;
+		u64 as_uint64;
 		u32 hv_processor_feature;
 	};
 };
@@ -89018,6 +88452,32 @@ struct hv_input_set_system_property {
 struct hv_u128 {
 	u64 low_part;
 	u64 high_part;
+};
+
+struct hv_x64_segment_register {
+	u64 base;
+	u32 limit;
+	u16 selector;
+	union {
+		struct {
+			u16 segment_type: 4;
+			u16 non_system_segment: 1;
+			u16 descriptor_privilege_level: 2;
+			u16 present: 1;
+			u16 reserved: 4;
+			u16 available: 1;
+			u16 _long: 1;
+			u16 _default: 1;
+			u16 granularity: 1;
+		};
+		u16 attributes;
+	};
+};
+
+struct hv_x64_table_register {
+	u16 pad[3];
+	u16 limit;
+	u64 base;
 };
 
 union hv_intercept_suspend_register {
@@ -91216,105 +90676,6 @@ struct ib_xrcd {
 	struct inode *inode;
 	struct rw_semaphore tgt_qps_rwsem;
 	struct xarray tgt_qps;
-};
-
-union ibs_fetch_ctl {
-	__u64 val;
-	struct {
-		__u64 fetch_maxcnt: 16;
-		__u64 fetch_cnt: 16;
-		__u64 fetch_lat: 16;
-		__u64 fetch_en: 1;
-		__u64 fetch_val: 1;
-		__u64 fetch_comp: 1;
-		__u64 ic_miss: 1;
-		__u64 phy_addr_valid: 1;
-		__u64 l1tlb_pgsz: 2;
-		__u64 l1tlb_miss: 1;
-		__u64 l2tlb_miss: 1;
-		__u64 rand_en: 1;
-		__u64 fetch_l2_miss: 1;
-		__u64 l3_miss_only: 1;
-		__u64 fetch_oc_miss: 1;
-		__u64 fetch_l3_miss: 1;
-		__u64 reserved: 2;
-	};
-};
-
-union ibs_op_ctl {
-	__u64 val;
-	struct {
-		__u64 opmaxcnt: 16;
-		__u64 l3_miss_only: 1;
-		__u64 op_en: 1;
-		__u64 op_val: 1;
-		__u64 cnt_ctl: 1;
-		__u64 opmaxcnt_ext: 7;
-		__u64 reserved0: 5;
-		__u64 opcurcnt: 27;
-		__u64 ldlat_thrsh: 4;
-		__u64 ldlat_en: 1;
-	};
-};
-
-union ibs_op_data {
-	__u64 val;
-	struct {
-		__u64 comp_to_ret_ctr: 16;
-		__u64 tag_to_ret_ctr: 16;
-		__u64 reserved1: 2;
-		__u64 op_return: 1;
-		__u64 op_brn_taken: 1;
-		__u64 op_brn_misp: 1;
-		__u64 op_brn_ret: 1;
-		__u64 op_rip_invalid: 1;
-		__u64 op_brn_fuse: 1;
-		__u64 op_microcode: 1;
-		__u64 reserved2: 23;
-	};
-};
-
-union ibs_op_data2 {
-	__u64 val;
-	struct {
-		__u64 data_src_lo: 3;
-		__u64 reserved0: 1;
-		__u64 rmt_node: 1;
-		__u64 cache_hit_st: 1;
-		__u64 data_src_hi: 2;
-		__u64 strm_st: 1;
-		__u64 rmt_socket: 1;
-		__u64 reserved1: 54;
-	};
-};
-
-union ibs_op_data3 {
-	__u64 val;
-	struct {
-		__u64 ld_op: 1;
-		__u64 st_op: 1;
-		__u64 dc_l1tlb_miss: 1;
-		__u64 dc_l2tlb_miss: 1;
-		__u64 dc_l1tlb_hit_2m: 1;
-		__u64 dc_l1tlb_hit_1g: 1;
-		__u64 dc_l2tlb_hit_2m: 1;
-		__u64 dc_miss: 1;
-		__u64 dc_mis_acc: 1;
-		__u64 reserved: 4;
-		__u64 dc_wc_mem_acc: 1;
-		__u64 dc_uc_mem_acc: 1;
-		__u64 dc_locked_op: 1;
-		__u64 dc_miss_no_mab_alloc: 1;
-		__u64 dc_lin_addr_valid: 1;
-		__u64 dc_phy_addr_valid: 1;
-		__u64 dc_l2_tlb_hit_1g: 1;
-		__u64 l2_miss: 1;
-		__u64 sw_pf: 1;
-		__u64 op_mem_width: 4;
-		__u64 op_dc_miss_open_mem_reqs: 6;
-		__u64 dc_miss_lat: 16;
-		__u64 tlb_refill_lat: 16;
-	};
 };
 
 struct icc_path;
@@ -93530,6 +92891,46 @@ struct input_value {
 	__u16 type;
 	__u16 code;
 	__s32 value;
+};
+
+struct insn_field {
+	union {
+		insn_value_t value;
+		insn_byte_t bytes[4];
+	};
+	unsigned char got;
+	unsigned char nbytes;
+};
+
+struct insn {
+	struct insn_field prefixes;
+	struct insn_field rex_prefix;
+	union {
+		struct insn_field vex_prefix;
+		struct insn_field xop_prefix;
+	};
+	struct insn_field opcode;
+	struct insn_field modrm;
+	struct insn_field sib;
+	struct insn_field displacement;
+	union {
+		struct insn_field immediate;
+		struct insn_field moffset1;
+		struct insn_field immediate1;
+	};
+	union {
+		struct insn_field moffset2;
+		struct insn_field immediate2;
+	};
+	int emulate_prefix_size;
+	insn_attr_t attr;
+	unsigned char opnd_bytes;
+	unsigned char addr_bytes;
+	unsigned char length;
+	unsigned char x86_64;
+	const insn_byte_t *kaddr;
+	const insn_byte_t *end_kaddr;
+	const insn_byte_t *next_byte;
 };
 
 struct insn_live_regs {
@@ -100412,7 +99813,7 @@ struct km_event {
 };
 
 struct kmalloc_info_struct {
-	const char *name[19];
+	const char *name[20];
 	unsigned int size;
 };
 
@@ -103722,7 +103123,7 @@ struct location {
 	long int max_time;
 	long int min_pid;
 	long int max_pid;
-	long unsigned int cpus[128];
+	long unsigned int cpus[1];
 	nodemask_t nodes;
 };
 
@@ -107249,28 +106650,6 @@ struct mhp_params {
 	struct dev_pagemap *pgmap;
 };
 
-struct microcode_header_amd {
-	u32 data_code;
-	u32 patch_id;
-	u16 mc_patch_data_id;
-	u8 mc_patch_data_len;
-	u8 init_flag;
-	u32 mc_patch_data_checksum;
-	u32 nb_dev_id;
-	u32 sb_dev_id;
-	u16 processor_rev_id;
-	u8 nb_rev_id;
-	u8 sb_rev_id;
-	u8 bios_api_rev;
-	u8 reserved1[3];
-	u32 match_reg[8];
-};
-
-struct microcode_amd {
-	struct microcode_header_amd hdr;
-	unsigned int mpb[0];
-};
-
 struct microcode_header_intel {
 	unsigned int hdrver;
 	unsigned int rev;
@@ -107562,7 +106941,7 @@ struct misc_cg {
 	struct cgroup_subsys_state css;
 	struct cgroup_file events_file;
 	struct cgroup_file events_local_file;
-	struct misc_res res[3];
+	struct misc_res res[1];
 };
 
 struct mld2_grec {
@@ -107746,13 +107125,6 @@ struct mm_struct {
 			struct mem_cgroup *memcg;
 		} lru_gen;
 		mm_id_t mm_id;
-		long: 64;
-		long: 64;
-		long: 64;
-		long: 64;
-		long: 64;
-		long: 64;
-		long: 64;
 	};
 	char flexible_array[0];
 };
@@ -118822,11 +118194,6 @@ struct pasid_table {
 	u32 max_pasid;
 };
 
-struct patch_digest {
-	u32 patch_id;
-	u8 sha256[32];
-};
-
 struct patch_site {
 	u8 *instr;
 	struct alt_instr *alt;
@@ -119836,6 +119203,13 @@ struct pci_serial_quirk {
 	void (*exit)(struct pci_dev *);
 };
 
+struct setup_data {
+	__u64 next;
+	__u32 type;
+	__u32 len;
+	__u8 data[0];
+};
+
 struct pci_setup_rom {
 	struct setup_data data;
 	uint16_t vendor;
@@ -120510,17 +119884,6 @@ struct perf_addr_filters_head {
 	unsigned int nr_file_filters;
 };
 
-struct perf_amd_iommu {
-	struct list_head list;
-	struct pmu pmu;
-	struct amd_iommu *iommu;
-	char name[24];
-	u8 max_banks;
-	u8 max_counters;
-	u64 cntr_assign_mask;
-	raw_spinlock_t lock;
-};
-
 struct perf_event_header {
 	__u32 type;
 	__u16 misc;
@@ -120998,34 +120361,6 @@ struct perf_guest_info_callbacks {
 	long unsigned int (*get_ip)(void);
 	unsigned int (*handle_intel_pt_intr)(void);
 	void (*handle_mediated_pmi)(void);
-};
-
-struct perf_ibs {
-	struct pmu pmu;
-	unsigned int msr;
-	unsigned int msr2;
-	u64 config_mask;
-	u64 cnt_mask;
-	u64 enable_mask;
-	u64 disable_mask;
-	u64 valid_mask;
-	u16 min_period;
-	u64 max_period;
-	long unsigned int offset_mask[1];
-	int offset_max;
-	unsigned int fetch_count_reset_broken: 1;
-	unsigned int fetch_ignore_if_zero_rip: 1;
-	struct cpu_perf_ibs *pcpu;
-	u64 (*get_count)(u64);
-};
-
-struct perf_ibs_data {
-	u32 size;
-	union {
-		u32 data[0];
-		u32 caps;
-	};
-	u64 regs[8];
 };
 
 struct perf_ksymbol_event {
@@ -122555,24 +121890,6 @@ struct platform_hibernation_ops {
 struct platform_object {
 	struct platform_device pdev;
 	char name[0];
-};
-
-struct platform_profile_ops;
-
-struct platform_profile_handler {
-	const char *name;
-	struct device dev;
-	int minor;
-	long unsigned int choices[1];
-	long unsigned int hidden_choices[1];
-	const struct platform_profile_ops *ops;
-};
-
-struct platform_profile_ops {
-	int (*probe)(void *, long unsigned int *);
-	int (*hidden_choices)(void *, long unsigned int *);
-	int (*profile_get)(struct device *, enum platform_profile_option *);
-	int (*profile_set)(struct device *, enum platform_profile_option);
 };
 
 struct platform_s2idle_ops {
@@ -124720,28 +124037,6 @@ struct psb_s {
 	u8 numps;
 };
 
-struct svsm_ca;
-
-struct psc_desc {
-	enum psc_op op;
-	struct svsm_ca *ca;
-	u64 caa_pa;
-};
-
-struct psc_entry {
-	u64 cur_page: 12;
-	u64 gfn: 40;
-	u64 operation: 4;
-	u64 pagesize: 1;
-	u64 reserved: 7;
-};
-
-struct psc_hdr {
-	u16 cur_entry;
-	u16 end_entry;
-	u32 reserved;
-};
-
 struct psched_pktrate {
 	u64 rate_pkts_ps;
 	u32 mult;
@@ -125420,17 +124715,6 @@ struct ptdesc {
 struct ptdump_range {
 	long unsigned int start;
 	long unsigned int end;
-};
-
-struct pte_enc_desc {
-	pte_t *kpte;
-	int pte_level;
-	bool encrypt;
-	long unsigned int pfn;
-	long unsigned int pa;
-	void *va;
-	long unsigned int size;
-	pgprot_t new_pgprot;
 };
 
 struct ptp_clock_info;
@@ -126122,11 +125406,6 @@ struct quirk_entry {
 	u32 flags;
 };
 
-struct quirk_entry___2 {
-	u32 nominal_freq;
-	u32 lowest_freq;
-};
-
 struct quirks_list_struct {
 	struct hid_device_id hid_bl_item;
 	struct list_head node;
@@ -126721,10 +126000,11 @@ struct sr_wait_node {
 };
 
 struct rcu_state {
-	struct rcu_node node[521];
-	struct rcu_node *level[4];
+	struct rcu_node node[5];
+	struct rcu_node *level[3];
 	int ncpus;
 	int n_online_cpus;
+	long: 64;
 	long: 64;
 	long: 64;
 	long: 64;
@@ -127117,7 +126397,6 @@ struct real_mode_header {
 	u32 ro_end;
 	u32 trampoline_start;
 	u32 trampoline_header;
-	u32 sev_es_trampoline_start;
 	u32 trampoline_start64;
 	u32 trampoline_pgd;
 	u32 wakeup_start;
@@ -128962,54 +128241,6 @@ struct rmid_read {
 	void *arch_mon_ctx;
 };
 
-struct rmpentry_raw;
-
-struct rmp_segment_desc {
-	struct rmpentry_raw *rmp_entry;
-	u64 max_index;
-	u64 size;
-};
-
-struct rmp_state {
-	u64 gpa;
-	u8 assigned;
-	u8 pagesize;
-	u8 immutable;
-	u8 rsvd;
-	u32 asid;
-};
-
-struct rmpentry {
-	u64 gpa;
-	u8 assigned: 1;
-	u8 rsvd1: 7;
-	u8 pagesize: 1;
-	u8 hpage_region_status: 1;
-	u8 rsvd2: 6;
-	u8 immutable: 1;
-	u8 rsvd3: 7;
-	u8 rsvd4;
-	u32 asid;
-};
-
-struct rmpentry_raw {
-	union {
-		struct {
-			u64 assigned: 1;
-			u64 pagesize: 1;
-			u64 immutable: 1;
-			u64 rsvd1: 9;
-			u64 gpa: 39;
-			u64 asid: 10;
-			u64 vmsa: 1;
-			u64 validated: 1;
-			u64 rsvd2: 1;
-		};
-		u64 lo;
-	};
-	u64 hi;
-};
-
 struct rnd_state {
 	__u32 s1;
 	__u32 s2;
@@ -129710,12 +128941,6 @@ struct rt_rq {
 	bool overloaded;
 	struct plist_head pushable_tasks;
 	int rt_queued;
-	int rt_throttled;
-	u64 rt_time;
-	u64 rt_runtime;
-	raw_spinlock_t rt_runtime_lock;
-	unsigned int rt_nr_boosted;
-	struct rq *rq;
 	struct task_group *tg;
 };
 
@@ -129849,10 +129074,6 @@ struct rq {
 	const struct sched_class *next_class;
 	long unsigned int next_balance;
 	struct mm_struct *prev_mm;
-	long: 64;
-	long: 64;
-	long: 64;
-	long: 64;
 	long: 64;
 	long: 64;
 	long: 64;
@@ -130212,14 +129433,6 @@ struct rt6_statistics {
 	atomic_t fib_rt_alloc;
 };
 
-struct rt_bandwidth {
-	raw_spinlock_t rt_runtime_lock;
-	ktime_t rt_period;
-	u64 rt_runtime;
-	struct hrtimer rt_period_timer;
-	unsigned int rt_period_active;
-};
-
 struct rt_cache_stat {
 	unsigned int in_slow_tot;
 	unsigned int in_slow_mc;
@@ -130246,11 +129459,7 @@ struct rt_mutex_waiter {
 	struct ww_acquire_ctx *ww_ctx;
 };
 
-struct rt_schedulable_data {
-	struct task_group *tg;
-	u64 rt_period;
-	u64 rt_runtime;
-};
+typedef struct rt_rq *rt_rq_iter_t;
 
 struct sigaltstack {
 	void *ss_sp;
@@ -131263,9 +130472,6 @@ struct sched_rt_entity {
 	short unsigned int on_rq;
 	short unsigned int on_list;
 	struct sched_rt_entity *back;
-	struct sched_rt_entity *parent;
-	struct rt_rq *rt_rq;
-	struct rt_rq *my_q;
 };
 
 struct sched_shutdown {
@@ -132013,7 +131219,7 @@ struct sctp_cookie {
 	__u8 padding;
 	__u32 adaptation_ind;
 	__u8 auth_random[36];
-	__u8 auth_hmacs[10];
+	__u8 auth_hmacs[12];
 	__u8 auth_chunks[20];
 	__u32 raw_addr_list_len;
 };
@@ -133308,16 +132514,6 @@ struct seccomp_notif_sizes {
 	__u16 seccomp_data;
 };
 
-struct secrets_os_area {
-	u32 msg_seqno_0;
-	u32 msg_seqno_1;
-	u32 msg_seqno_2;
-	u32 msg_seqno_3;
-	u64 ap_jump_table_pa;
-	u8 rsvd[40];
-	u8 guest_usage[32];
-};
-
 struct section_header {
 	char name[8];
 	uint32_t virtual_size;
@@ -133329,10 +132525,6 @@ struct section_header {
 	uint16_t num_relocs;
 	uint16_t num_lin_numbers;
 	uint32_t flags;
-};
-
-struct secure_avic_page {
-	u8 regs[4096];
 };
 
 struct security_class_mapping {
@@ -134314,137 +133506,6 @@ struct setup_rw_req {
 	char *bvec_data;
 	bool require_extra_req;
 	struct blkif_request *extra_ring_req;
-};
-
-struct sev_config {
-	__u64 debug: 1;
-	__u64 ghcbs_initialized: 1;
-	__u64 use_cas: 1;
-	__u64 __reserved: 61;
-};
-
-struct sev_es_runtime_data {
-	struct ghcb ghcb_page;
-	struct ghcb backup_ghcb;
-	bool ghcb_active;
-	bool backup_ghcb_active;
-	long unsigned int dr7;
-};
-
-struct vmcb_seg {
-	u16 selector;
-	u16 attrib;
-	u32 limit;
-	u64 base;
-};
-
-struct sev_es_save_area {
-	struct vmcb_seg es;
-	struct vmcb_seg cs;
-	struct vmcb_seg ss;
-	struct vmcb_seg ds;
-	struct vmcb_seg fs;
-	struct vmcb_seg gs;
-	struct vmcb_seg gdtr;
-	struct vmcb_seg ldtr;
-	struct vmcb_seg idtr;
-	struct vmcb_seg tr;
-	u64 pl0_ssp;
-	u64 pl1_ssp;
-	u64 pl2_ssp;
-	u64 pl3_ssp;
-	u64 u_cet;
-	u8 reserved_0xc8[2];
-	u8 vmpl;
-	u8 cpl;
-	u8 reserved_0xcc[4];
-	u64 efer;
-	u8 reserved_0xd8[104];
-	u64 xss;
-	u64 cr4;
-	u64 cr3;
-	u64 cr0;
-	u64 dr7;
-	u64 dr6;
-	u64 rflags;
-	u64 rip;
-	u64 dr0;
-	u64 dr1;
-	u64 dr2;
-	u64 dr3;
-	u64 dr0_addr_mask;
-	u64 dr1_addr_mask;
-	u64 dr2_addr_mask;
-	u64 dr3_addr_mask;
-	u8 reserved_0x1c0[24];
-	u64 rsp;
-	u64 s_cet;
-	u64 ssp;
-	u64 isst_addr;
-	u64 rax;
-	u64 star;
-	u64 lstar;
-	u64 cstar;
-	u64 sfmask;
-	u64 kernel_gs_base;
-	u64 sysenter_cs;
-	u64 sysenter_esp;
-	u64 sysenter_eip;
-	u64 cr2;
-	u8 reserved_0x248[32];
-	u64 g_pat;
-	u64 dbgctl;
-	u64 br_from;
-	u64 br_to;
-	u64 last_excp_from;
-	u64 last_excp_to;
-	u8 reserved_0x298[80];
-	u32 pkru;
-	u32 tsc_aux;
-	u64 tsc_scale;
-	u64 tsc_offset;
-	u8 reserved_0x300[8];
-	u64 rcx;
-	u64 rdx;
-	u64 rbx;
-	u64 reserved_0x320;
-	u64 rbp;
-	u64 rsi;
-	u64 rdi;
-	u64 r8;
-	u64 r9;
-	u64 r10;
-	u64 r11;
-	u64 r12;
-	u64 r13;
-	u64 r14;
-	u64 r15;
-	u8 reserved_0x380[16];
-	u64 guest_exit_info_1;
-	u64 guest_exit_info_2;
-	u64 guest_exit_int_info;
-	u64 guest_nrip;
-	u64 sev_features;
-	u64 vintr_ctrl;
-	u64 guest_exit_code;
-	u64 virtual_tom;
-	u64 tlb_id;
-	u64 pcpu_id;
-	u64 event_inj;
-	u64 xcr0;
-	u8 reserved_0x3f0[16];
-	u64 x87_dp;
-	u32 mxcsr;
-	u16 x87_ftw;
-	u16 x87_fsw;
-	u16 x87_fcw;
-	u16 x87_fop;
-	u16 x87_ds;
-	u16 x87_cs;
-	u64 x87_rip;
-	u8 fpreg_x87[80];
-	u8 fpreg_xmm[256];
-	u8 fpreg_ymm[256];
 };
 
 struct severity {
@@ -136273,16 +135334,6 @@ struct smca_hwid {
 	u32 hwid_mcatype;
 };
 
-struct sme_populate_pgd_data {
-	void *pgtable_area;
-	pgd_t *pgd;
-	pmdval_t pmd_flags;
-	pteval_t pte_flags;
-	long unsigned int paddr;
-	long unsigned int vaddr;
-	long unsigned int vaddr_end;
-};
-
 struct smk_audit_info {
 	struct common_audit_data a;
 	struct smack_audit_data sad;
@@ -136400,121 +135451,6 @@ struct snapshot_data {
 struct snmp_mib {
 	const char *name;
 	int entry;
-};
-
-struct snp_cpuid_fn {
-	u32 eax_in;
-	u32 ecx_in;
-	u64 xcr0_in;
-	u64 xss_in;
-	u32 eax;
-	u32 ebx;
-	u32 ecx;
-	u32 edx;
-	u64 __reserved;
-};
-
-struct snp_cpuid_table {
-	u32 count;
-	u32 __reserved1;
-	u64 __reserved2;
-	struct snp_cpuid_fn fn[64];
-};
-
-struct snp_guest_msg_hdr {
-	u8 authtag[32];
-	u64 msg_seqno;
-	u8 rsvd1[8];
-	u8 algo;
-	u8 hdr_version;
-	u16 hdr_sz;
-	u8 msg_type;
-	u8 msg_version;
-	u16 msg_sz;
-	u32 rsvd2;
-	u8 msg_vmpck;
-	u8 rsvd3[35];
-};
-
-struct snp_guest_msg {
-	struct snp_guest_msg_hdr hdr;
-	u8 payload[4000];
-};
-
-struct snp_req_data {
-	long unsigned int req_gpa;
-	long unsigned int resp_gpa;
-	long unsigned int data_gpa;
-	unsigned int data_npages;
-};
-
-struct snp_guest_req {
-	void *req_buf;
-	size_t req_sz;
-	void *resp_buf;
-	size_t resp_sz;
-	u64 exit_code;
-	u64 exitinfo2;
-	unsigned int vmpck_id;
-	u8 msg_version;
-	u8 msg_type;
-	struct snp_req_data input;
-	void *certs_data;
-};
-
-struct snp_secrets_page;
-
-struct snp_msg_desc {
-	struct snp_guest_msg *request;
-	struct snp_guest_msg *response;
-	struct snp_guest_msg secret_request;
-	struct snp_guest_msg secret_response;
-	struct snp_secrets_page *secrets;
-	struct aesgcm_ctx *ctx;
-	u32 *os_area_msg_seqno;
-	u8 *vmpck;
-	int vmpck_id;
-};
-
-struct snp_psc_desc {
-	struct psc_hdr hdr;
-	struct psc_entry entries[64];
-};
-
-struct snp_secrets_page {
-	u32 version;
-	u32 imien: 1;
-	u32 rsvd1: 31;
-	u32 fms;
-	u32 rsvd2;
-	u8 gosvw[16];
-	u8 vmpck0[32];
-	u8 vmpck1[32];
-	u8 vmpck2[32];
-	u8 vmpck3[32];
-	struct secrets_os_area os_area;
-	u8 vmsa_tweak_bitmap[64];
-	u64 svsm_base;
-	u64 svsm_size;
-	u64 svsm_caa;
-	u32 svsm_max_version;
-	u8 svsm_guest_vmpl;
-	u8 rsvd3[3];
-	u32 tsc_factor;
-	u8 rsvd4[3740];
-};
-
-struct snp_tsc_info_req {
-	u8 rsvd[128];
-};
-
-struct snp_tsc_info_resp {
-	u32 status;
-	u32 rsvd1;
-	u64 tsc_scale;
-	u64 tsc_offset;
-	u32 tsc_factor;
-	u8 rsvd2[100];
 };
 
 struct so_timestamping {
@@ -138581,58 +137517,6 @@ struct svc_version {
 	int (*vs_dispatch)(struct svc_rqst *);
 };
 
-struct svsm_loc_entry {
-	u64 pa;
-	u32 len;
-	u8 rsvd[4];
-};
-
-struct svsm_attest_call {
-	struct svsm_loc_entry report_buf;
-	struct svsm_loc_entry nonce;
-	struct svsm_loc_entry manifest_buf;
-	struct svsm_loc_entry certificates_buf;
-	u8 service_guid[16];
-	u32 service_manifest_ver;
-	u8 rsvd[4];
-};
-
-struct svsm_ca {
-	u8 call_pending;
-	u8 mem_available;
-	u8 rsvd1[6];
-	u8 svsm_buffer[4088];
-};
-
-struct svsm_call {
-	struct svsm_ca *caa;
-	u64 rax;
-	u64 rcx;
-	u64 rdx;
-	u64 r8;
-	u64 r9;
-	u64 rax_out;
-	u64 rcx_out;
-	u64 rdx_out;
-	u64 r8_out;
-	u64 r9_out;
-};
-
-struct svsm_pvalidate_entry {
-	u64 page_size: 2;
-	u64 action: 1;
-	u64 ignore_cf: 1;
-	u64 rsvd: 8;
-	u64 pfn: 52;
-};
-
-struct svsm_pvalidate_call {
-	u16 num_entries;
-	u16 cur_index;
-	u8 rsvd1[4];
-	struct svsm_pvalidate_entry entry[0];
-};
-
 struct sw_sync_create_fence_data {
 	__u32 value;
 	char name[32];
@@ -140053,8 +138937,6 @@ struct task_delay_info {
 	struct timespec64 irq_delay_max_ts;
 };
 
-typedef struct task_group *rt_rq_iter_t;
-
 struct uclamp_se {
 	unsigned int value: 11;
 	unsigned int bucket_id: 3;
@@ -140071,9 +138953,6 @@ struct task_group {
 	long: 64;
 	long: 64;
 	atomic_long_t load_avg;
-	struct sched_rt_entity **rt_se;
-	struct rt_rq **rt_rq;
-	struct rt_bandwidth rt_bandwidth;
 	struct scx_task_group scx;
 	struct callback_head rcu;
 	struct list_head list;
@@ -140240,11 +139119,6 @@ struct task_struct {
 	bool throttled;
 	struct uclamp_se uclamp_req[2];
 	struct uclamp_se uclamp[2];
-	long: 64;
-	long: 64;
-	long: 64;
-	long: 64;
-	long: 64;
 	long: 64;
 	long: 64;
 	struct sched_statistics stats;
@@ -140486,8 +139360,6 @@ struct task_struct {
 	struct user_event_mm *user_event_mm;
 	struct unwind_task_info unwind_info;
 	struct thread_struct thread;
-	long: 64;
-	long: 64;
 };
 
 struct task_struct__safe_rcu {
@@ -144274,12 +143146,6 @@ struct trace_event_data_offsets_alarmtimer_suspend {};
 
 struct trace_event_data_offsets_alloc_vmap_area {};
 
-struct trace_event_data_offsets_amd_pstate_cppc_req2 {};
-
-struct trace_event_data_offsets_amd_pstate_epp_perf {};
-
-struct trace_event_data_offsets_amd_pstate_perf {};
-
 struct trace_event_data_offsets_arm_event {
 	u32 pei_buf;
 	const void *pei_buf_ptr_;
@@ -146451,41 +145317,6 @@ struct trace_event_raw_alloc_vmap_area {
 	long unsigned int vstart;
 	long unsigned int vend;
 	int failed;
-	char __data[0];
-};
-
-struct trace_event_raw_amd_pstate_cppc_req2 {
-	struct trace_entry ent;
-	unsigned int cpu_id;
-	u8 floor_perf;
-	bool changed;
-	int err_code;
-	char __data[0];
-};
-
-struct trace_event_raw_amd_pstate_epp_perf {
-	struct trace_entry ent;
-	unsigned int cpu_id;
-	u8 highest_perf;
-	u8 epp;
-	u8 min_perf;
-	u8 max_perf;
-	bool boost;
-	bool changed;
-	char __data[0];
-};
-
-struct trace_event_raw_amd_pstate_perf {
-	struct trace_entry ent;
-	u8 min_perf;
-	u8 target_perf;
-	u8 capacity;
-	long long unsigned int freq;
-	long long unsigned int mperf;
-	long long unsigned int aperf;
-	long long unsigned int tsc;
-	unsigned int cpu_id;
-	bool fast_switch;
 	char __data[0];
 };
 
@@ -154639,14 +153470,6 @@ struct ucode_cpu_info {
 	void *mc;
 };
 
-struct ucode_patch {
-	struct list_head plist;
-	void *data;
-	unsigned int size;
-	u32 patch_id;
-	u16 equiv_cpu;
-};
-
 struct ucounts {
 	struct hlist_nulls_node node;
 	struct user_namespace *ns;
@@ -160330,7 +159153,7 @@ struct vmap_block {
 	struct vmap_area *va;
 	long unsigned int free;
 	long unsigned int dirty;
-	long unsigned int used_map[4];
+	long unsigned int used_map[16];
 	long unsigned int dirty_min;
 	long unsigned int dirty_max;
 	struct list_head free_list;
@@ -161368,7 +160191,7 @@ struct wireless_dev {
 	struct cfg80211_cached_keys *connect_keys;
 	enum ieee80211_bss_type conn_bss_type;
 	u32 conn_owner_nlportid;
-	struct work_struct disconnect_wk;
+	struct wiphy_work disconnect_wk;
 	u8 disconnect_bssid[6];
 	struct list_head event_list;
 	spinlock_t event_lock;
@@ -161395,7 +160218,7 @@ struct wireless_dev {
 	struct cfg80211_cqm_config *cqm_config;
 	struct list_head pmsr_list;
 	spinlock_t pmsr_lock;
-	struct work_struct pmsr_free_wk;
+	struct wiphy_work pmsr_free_wk;
 	long unsigned int unprot_beacon_reported;
 	union {
 		struct {
@@ -162958,13 +161781,13 @@ struct xdp_sock {
 	u64 rx_dropped;
 	u64 rx_queue_full;
 	struct sk_buff *skb;
+	bool drain_cont;
 	struct list_head map_list;
 	spinlock_t map_list_lock;
 	u32 max_tx_budget;
 	struct mutex mutex;
 	struct xsk_queue *fq_tmp;
 	struct xsk_queue *cq_tmp;
-	long: 64;
 };
 
 struct xdp_statistics {
@@ -164675,6 +163498,7 @@ struct xhci_hcd {
 	u8 max_ports;
 	u32 imod_interval;
 	u32 page_size;
+	unsigned int dma_mask_bits;
 	int nvecs;
 	struct clk *clk;
 	struct clk *reg_clk;
@@ -165085,6 +163909,9 @@ struct xsk_buff_pool {
 	u32 chunk_size;
 	u32 chunk_shift;
 	u32 frame_len;
+	u32 tx_descs_nentries;
+	u32 reclaim_descs;
+	u32 tx_zc_pending_descs;
 	u32 xdp_zc_max_segs;
 	u8 tx_metadata_len;
 	u8 cached_need_wakeup;
@@ -165094,8 +163921,6 @@ struct xsk_buff_pool {
 	void *addrs;
 	spinlock_t cq_prod_lock;
 	struct xdp_buff_xsk *free_heads[0];
-	long: 64;
-	long: 64;
 };
 
 struct xsk_cb_desc {
@@ -165136,6 +163961,12 @@ struct xsk_queue {
 	u64 queue_empty_descs;
 	size_t ring_vmalloc_size;
 	spinlock_t cq_cached_prod_lock;
+};
+
+struct xsk_tx_batch {
+	u32 tx_descs;
+	u32 reclaim_descs;
+	bool budget_limited;
 };
 
 struct xsk_tx_metadata {
@@ -165304,18 +164135,6 @@ struct zcrx_ctrl {
 	};
 };
 
-union zen_patch_rev {
-	struct {
-		__u32 rev: 8;
-		__u32 stepping: 4;
-		__u32 model: 4;
-		__u32 __reserved: 4;
-		__u32 ext_model: 4;
-		__u32 ext_fam: 8;
-	};
-	__u32 ucode_rev;
-};
-
 struct zone_report_args {
 	struct blk_zone *zones;
 };
@@ -165447,8 +164266,6 @@ typedef acpi_status (*acpi_table_handler)(u32, void *, void *);
 typedef acpi_status (*acpi_walk_aml_callback)(u8 *, u32, u32, u8, void **);
 
 typedef acpi_status (*acpi_walk_resource_callback)(struct acpi_resource *, void *);
-
-typedef void amd_pmu_branch_reset_t(void);
 
 typedef int (*apei_exec_entry_func_t)(struct apei_exec_context *, struct acpi_whea_header *, void *);
 
@@ -166051,12 +164868,6 @@ typedef void (*btf_trace_alarmtimer_start)(void *, struct alarm *, ktime_t);
 typedef void (*btf_trace_alarmtimer_suspend)(void *, ktime_t, int);
 
 typedef void (*btf_trace_alloc_vmap_area)(void *, long unsigned int, long unsigned int, long unsigned int, long unsigned int, long unsigned int, int);
-
-typedef void (*btf_trace_amd_pstate_cppc_req2)(void *, unsigned int, u8, bool, int);
-
-typedef void (*btf_trace_amd_pstate_epp_perf)(void *, unsigned int, u8, u8, u8, u8, bool, bool);
-
-typedef void (*btf_trace_amd_pstate_perf)(void *, u8, u8, u8, u64, u64, u64, u64, unsigned int, bool);
 
 typedef void (*btf_trace_arm_event)(void *, const struct cper_sec_proc_arm *, const u8 *, const u32, const u8 *, const u32, const u8 *, const u32, u8, int);
 
@@ -168222,8 +167033,6 @@ typedef int cont_fn(struct opal_dev *);
 
 typedef int (*copy_fn_t)(void *, const void *, u32, struct task_struct *);
 
-typedef int (*cppc_mode_transition_fn)(int);
-
 typedef int ctrlval_parser_t(struct rdt_parse_data *, struct resctrl_schema *, struct rdt_ctrl_domain *);
 
 typedef void detailed_cb(const struct detailed_timing *, void *);
@@ -168477,6 +167286,8 @@ struct nf_bridge_frag_data;
 struct kunit;
 
 struct bpf_iter;
+
+union hv_ghcb;
 
 
 /* BPF kfuncs */

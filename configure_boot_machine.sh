@@ -19,7 +19,7 @@
 set -uo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GB_VERSION="3.2"
+GB_VERSION="3.4"
 DRIVER_NAME="greenboost"
 
 C_LIME='\033[0;32m'; C_RED='\033[0;31m'; C_AMBER='\033[1;33m'; C_CYAN='\033[0;36m'; C_RESET='\033[0m'

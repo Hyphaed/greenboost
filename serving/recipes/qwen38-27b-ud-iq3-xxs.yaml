@@ -1,0 +1,66 @@
+# Qwen3.8-27B-UD-IQ3_XXS on a 12 GB card.
+#
+# Why ctx is 40960 and not something rounder
+# ------------------------------------------
+# This box connects ten MCP servers exposing 238 tools. Their schemas plus the
+# system prompt are re-sent in full on EVERY request and measured, live, at
+# 29,507 prompt tokens for a thirty-word message with an empty history. That
+# is a floor no compaction can reach , compaction shrinks history, and history
+# was not the problem.
+#
+# Sizing against that floor (weights 11.10 GiB, physical VRAM 11.94 GiB):
+#
+#     ctx 16384   reserve 1547 MB   spill 0.67 GiB   conversation room -13,123
+#     ctx 32768   reserve 2907 MB   spill 1.99 GiB   conversation room  +3,261
+#     ctx 40960   reserve 3587 MB   spill 2.66 GiB   conversation room +11,453
+#     ctx 49152   reserve 4267 MB   spill 3.32 GiB   conversation room +19,645
+#
+# 16384 is not "tight", it is unusable , the overhead alone overflows it, which
+# is exactly the 400 seen on 2026-08-18. 32768 fits but leaves ~3k for the
+# actual conversation, less than one file read. 40960 is the first value with
+# real working room.
+#
+# The cost is stated rather than hidden: 2.66 GiB no longer fits VRAM and
+# crosses PCIe on every token, so decode is slower than the 8.37 tok/s measured
+# when the whole working set was resident. tierIntent is therefore t2Spill, not
+# t1Only , the recipe should not claim a placement it does not achieve.
+#
+# The higher-leverage fix is not here: ~24k of those 29.5k tokens are tool
+# schemas. Disconnecting MCP servers you are not using buys back context AND
+# decode speed at once, and costs no VRAM.
+#
+# `sampling` carries the model card's THINKING-mode values (on by default).
+# Non-thinking would be temperature 0.7 / topP 0.80 / presencePenalty 1.5 ,
+# send those per request, which still wins over these launch defaults.
+# Source: https://huggingface.co/unsloth/Qwen3.8-27B-GGUF
+#
+# NOTE: `check_recipes.py --fix` rewrites this file with yaml.safe_dump and
+# does NOT preserve comments. Re-add this header after any --fix run.
+
+schemaVersion: '1'
+model:
+  name: Qwen3.8-27B-UD-IQ3_XXS
+  revision: f1bfb127c64f7072bdd2cad55f258b9c8b2910fe
+  files:
+  - path: Qwen3.8-27B-UD-IQ3_XXS.gguf
+    sha256: 0a6129dcbbbe72f423dc67e0e3bbfbbdf3e923981a3637687ebb96a46c59d6be
+capabilities:
+  toolCalls: true
+  streaming: true
+  mtpDraftHead: false
+  visionProjector: false
+  recurrentState: false
+kvCache:
+  key: f16
+  value: f16
+sampling:
+  temperature: 1.0
+  topP: 0.95
+  topK: 20
+  minP: 0.0
+  presencePenalty: 0.0
+  source: https://huggingface.co/unsloth/Qwen3.8-27B-GGUF
+ctx: 40960
+nGpuLayers: all
+tierIntent: t2Spill
+contentDigest: sha256:2618dec2c69815b88c408ba1e129324c268867df8a4bf34c639869823cfc5ff6

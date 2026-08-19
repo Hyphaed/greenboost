@@ -118,21 +118,65 @@ new files use: CREATE [path] with full content.
 - Match the surrounding code's style: comment density, naming, indentation.
 - Ask a single, specific clarifying question when the task is genuinely ambiguous.
 - Before marking a task complete, verify the change works (run tests, check output).
-{project_notes}{goals_context}{rag_summary}{ui_guidelines}{plan_session}
-# Current Session
-- Date: {date}
+
+# Gathering information (this matters more here than on a hosted model)
+
+- **Ask for everything you need at once.** When several lookups do not depend
+  on each other , reading three files, a read plus a search, several
+  GreenBoost status questions , request them in ONE reply rather than one per
+  turn. Independent read-only calls are executed in parallel; issued one at a
+  time they are executed one at a time, and each extra turn costs a full
+  round-trip on local hardware.
+- Only batch calls that are genuinely independent. If call B's arguments
+  depend on call A's result, they are two turns and that is correct.
+- **Prefer GreenBoost's own tools over shell commands for GreenBoost state.**
+  `semantic_answer`/`greenboost_status`/`dataflux_*` return governed,
+  unambiguous answers; `lsmod`, `nvidia-smi` and log-greps return fields whose
+  meaning changes with where they were read from.
+- Call tools by the exact names you were given. If you are unsure a tool
+  exists, look it up rather than guessing a plausible name.
+- **Do not sit and watch slow commands.** Builds, test suites, installs,
+  downloads and model pulls go in the background:
+  `Bash(command=..., run_in_background=true)` returns a task id immediately.
+  Keep working, then collect the result with `TaskOutput(task_id=...)`. Run it
+  in the foreground only when the very next thing you do depends on its
+  output.
+
+# Project Context
 - Directory: {cwd}
 - Platform: {platform}
-{git_context}{gb_context}"""
+{git_branch}{project_notes}{goals_context}{rag_summary}{ui_guidelines}{mcp_context}
+# Current Session
+- Date: {date}
+{git_status_log}{gb_context}{plan_session}"""
 
 
-def _gather_git_context() -> str:
-    """Return git branch/status/log summary if inside a git repository."""
+def _gather_git_branch() -> str:
+    """Return just the current git branch — stable across repeated invocations
+    from the same project directory (unlike status/log, which change with
+    every commit or uncommitted edit). Split out from the combined git
+    context so the system prompt's prefix-cacheable portion (branch, part of
+    "Project Context") doesn't get invalidated by the volatile portion
+    (status/log, part of "Current Session") — see slot_prompt_similarity's
+    2026-08-05 fix in gb_synapse_backends.py for why prefix stability here
+    matters: llama-server reuses a slot's cached KV state for the longest
+    matching prefix, so anything that changes turn-to-turn should sit AFTER
+    everything that doesn't, not interleaved with it."""
     try:
         branch = subprocess.check_output(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
             stderr=subprocess.DEVNULL, text=True,
         ).strip()
+        return f"- Git branch: {branch}\n" if branch else ""
+    except Exception:
+        return ""
+
+
+def _gather_git_status_log() -> str:
+    """Return git status/recent-commits — changes with every commit or
+    uncommitted edit, unlike the branch name. See _gather_git_branch()'s
+    docstring for why this is split out and placed later in the prompt."""
+    try:
         status = subprocess.check_output(
             ["git", "status", "--short"],
             stderr=subprocess.DEVNULL, text=True,
@@ -141,13 +185,13 @@ def _gather_git_context() -> str:
             ["git", "log", "--oneline", "-5"],
             stderr=subprocess.DEVNULL, text=True,
         ).strip()
-        parts = [f"- Git branch: {branch}"]
+        parts = []
         if status:
             lines = status.split("\n")[:10]
             parts.append("- Git status:\n" + "\n".join(f"  {l}" for l in lines))
         if log:
             parts.append("- Recent commits:\n" + "\n".join(f"  {l}" for l in log.split("\n")))
-        return "\n".join(parts) + "\n"
+        return "\n".join(parts) + "\n" if parts else ""
     except Exception:
         return ""
 
@@ -413,12 +457,14 @@ def assemble_system_context(model: str = "") -> str:
         date=datetime.now().strftime("%Y-%m-%d %A"),
         cwd=str(Path.cwd()),
         platform=platform.system(),
-        git_context=_gather_git_context(),
+        git_branch=_gather_git_branch(),
         project_notes=_gather_project_notes(),
         goals_context=_gather_goals_context(),
         rag_summary=_gather_rag_context(),
         ui_guidelines=_gather_ui_guidelines_context(),
-        gb_context=_greenboost_context() + _gather_mcp_context(),
+        mcp_context=_gather_mcp_context(),
+        git_status_log=_gather_git_status_log(),
+        gb_context=_greenboost_context(),
         plan_session=_gather_plan_session(),
     )
     ollama_system = _gather_ollama_system_prompt(model)

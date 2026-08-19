@@ -15,6 +15,7 @@ from pathlib import Path
 from greenboost_cli.terminal.theme import (
     emit_ok, emit_err, emit_warn, emit_info, emit_section, VIOLET, GRAY, LIME, AMBER, CYAN, TEAL, DIM
 )
+from greenboost_cli.terminal.width import suspend_live
 from greenboost_cli.terminal.theme import console
 
 
@@ -771,17 +772,17 @@ def cmd_compact(_args: str, session, settings) -> bool:
         return True
     try:
         from greenboost_cli.workflow.intelligence import _compress_context, _estimate_tokens
+        from greenboost_cli.terminal.renderer import compaction_progress
         before_msgs = len(session.messages)
         before_tok  = _estimate_tokens(session)
-        _compress_context(session, settings, force=True)
-        after_msgs = len(session.messages)
-        after_tok  = _estimate_tokens(session)
-        saved = before_tok - after_tok
-        emit_ok(
-            f"Compacted: {before_msgs} → {after_msgs} messages  "
-            f"·  ~{saved:,} tokens freed  "
-            f"·  ~{after_tok:,} tokens remain"
-        )
+        # Compaction is a real model call on local hardware — tens of seconds.
+        # Run the live indicator around the work, not after it.
+        with compaction_progress(before_tok, before_msgs) as done:
+            _compress_context(session, settings, force=True)
+            after_msgs = len(session.messages)
+            after_tok  = _estimate_tokens(session)
+            done(after_msgs, after_tok)
+        emit_info(f"~{after_tok:,} tokens remain in context.")
     except Exception as e:
         emit_err(f"Compression failed: {e}")
     return True
@@ -981,9 +982,24 @@ def cmd_todo(_args: str, _session, _settings) -> bool:
 
 
 def cmd_exit(_args: str, _session, _settings) -> bool:
-    from greenboost_cli.terminal.repl import request_shutdown
+    from greenboost_cli.terminal.repl import request_shutdown, release_memory_pool
     emit_ok("Goodbye.")
+    # MCP autoconnect (repl.py's _mcp_autoconnect) starts a stdio subprocess
+    # per configured server and never closed it on exit before this — each
+    # /exit left every connected server (gb_synapse_mcp.py, gb_mcp.py, ...)
+    # running as an orphan, accumulating one set per session. close_all()
+    # already exists for the config-reload path (forge_cmds.py); this is
+    # the same call on the normal shutdown path.
+    registry = getattr(_session, "mcp_registry", None)
+    if registry is not None:
+        try:
+            registry.close_all()
+        except Exception:
+            pass
     request_shutdown()
+    # After request_shutdown(), so restore_terminal() has already cleared the
+    # screen and this one confirmation line lands on a clean terminal.
+    release_memory_pool("/exit")
     sys.exit(0)
 
 
@@ -1053,8 +1069,24 @@ def dispatch_command(line: str, session, settings) -> bool:
     cmd  = parts[0].lower()
     args = parts[1] if len(parts) > 1 else ""
     handler = COMMAND_TABLE.get(cmd)
-    if handler:
-        handler(args, session, settings)
-    else:
-        emit_err(f"Unknown command: /{cmd}  (type /help for commands)")
+    # Suspend the live painters for the whole command, at this ONE chokepoint
+    # rather than inside each handler. Slash commands print multi-row blocks —
+    # /gb-status alone makes 50 console.print calls — and a status frame landing
+    # between two of those rows corrupts the block exactly the way it corrupted
+    # the permission card. Wrapping ~18 handlers individually would also leave
+    # every future handler exposed by default; wrapping the dispatcher does not.
+    with suspend_live():
+        if handler:
+            handler(args, session, settings)
+        else:
+            emit_err(f"Unknown command: /{cmd}  (type /help for commands)")
     return True
+
+
+# Per-session MCP server control (/mcp-servers, /mcp-off, /mcp-on, ...).
+# Imported at the END of this module on purpose: it calls register_command()
+# at import time, so the function must already exist.
+from greenboost_cli.slash_commands import mcp_session_cmds as _mcp_session  # noqa: E402,F401
+from greenboost_cli.slash_commands import autonomy_cmds as _autonomy  # noqa: E402,F401
+from greenboost_cli.slash_commands import memory_store_cmds as _memstore  # noqa: E402,F401
+from greenboost_cli.slash_commands import history_cmds as _histcmds  # noqa: E402,F401

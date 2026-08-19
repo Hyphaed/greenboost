@@ -28,6 +28,7 @@ def rag(tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "METADATA_FILE", rag_dir / "metadata.json")
     monkeypatch.setattr(engine, "FOLDERS_FILE", rag_dir / "indexed_folders.yaml")
     monkeypatch.setattr(engine, "WEB_SOURCES_FILE", rag_dir / "web_sources.json")
+    monkeypatch.setattr(engine, "STATS_FILE", rag_dir / "stats.json")
     monkeypatch.setattr(engine, "_embed",
                         lambda texts: np.ones((len(texts), DIM), dtype=np.float32))
     return rag_dir

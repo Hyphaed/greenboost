@@ -338,6 +338,13 @@ struct gb_device {
 	struct eventfd_ctx *pressure_efd; /* signaled on pressure change   */
 	atomic_t            teardown_done; /* prevents double-teardown: reboot notifier + gb_exit */
 	atomic_t            shutting_down; /* 1 when exit/reboot started - evict work aborts early */
+	/* Count of eviction candidates skipped on the threshold sweep because
+	 * their dma-buf priority was above default (2026-08-18). Exposed in
+	 * sysfs `status` so the hint's effect is followable instead of
+	 * invisible - Observability Must-Rule. A permanently-zero counter here
+	 * means nothing is setting DMA_BUF_IOCTL_SET_PRIORITY and the reader is
+	 * dead weight; that is worth being able to see. */
+	atomic64_t          prio_spared;
 	/* Async T3 eviction workqueue - prevents ioctl threads from blocking on NVMe I/O */
 	struct workqueue_struct *evict_wq;
 
@@ -978,6 +985,82 @@ static void gb_apply_priority_hint(struct dma_buf *dmabuf, u32 alloc_flags)
 	(void)dmabuf;
 	(void)alloc_flags;
 #endif
+}
+
+/* Republish the hint when heat changes, 2026-08-19 (GB-K2).
+ *
+ * gb_apply_priority_hint() above runs once, at dma_buf_export(), off
+ * alloc_flags - which are fixed for the buffer's whole life. Access frequency
+ * is not: the shim pushes it continuously via GB_IOCTL_SET_HEAT, and the
+ * watchdog halves it every 2s, so a buffer that was cold at allocation and is
+ * now the hottest thing in T2 still published DMA_BUF_PRIORITY_DEFAULT to
+ * anyone reading fdinfo or GET_PRIORITY. An external reader was therefore
+ * getting a value that was correct once and stale since.
+ *
+ * Mapping: KV-cache/T1-priority buffers keep their fixed 200 - those are hard
+ * skips in the evictor, and letting a heat score pull them DOWN would let a
+ * quiet period misrepresent a buffer this driver will never evict anyway.
+ * Everything else maps onto the band above the default, so the hint orders
+ * ordinary T2 buffers among themselves without ever claiming to outrank the
+ * KV cache: default (128) when cold, rising to 190 as heat accumulates.
+ *
+ * Deliberately no new locking: dma_buf_set_priority() takes an atomic_t hint,
+ * and buf->heat is read under lru_lock by the caller. A torn read here would
+ * publish a slightly stale advisory number, which is what the field is.
+ */
+#define GB_PRIO_HEAT_BASE   128u   /* DMA_BUF_PRIORITY_DEFAULT */
+#define GB_PRIO_HEAT_SPAN    62u   /* tops out at 190, below the KV band (200) */
+#define GB_PRIO_HEAT_FULL     8u   /* heat at which the band saturates */
+
+static void gb_publish_heat_priority(struct gb_buf *buf)
+{
+#if GB_HAS_DMABUF_PRIORITY
+	u32 h, prio;
+
+	if (!buf || !buf->dmabuf)
+		return;
+	if (buf->alloc_flags & (GB_ALLOC_KV_CACHE | GB_ALLOC_T1_PRIORITY))
+		return;                 /* fixed at 200 by gb_apply_priority_hint() */
+
+	h = buf->heat;
+	if (h > GB_PRIO_HEAT_FULL)
+		h = GB_PRIO_HEAT_FULL;
+	prio = GB_PRIO_HEAT_BASE + (GB_PRIO_HEAT_SPAN * h) / GB_PRIO_HEAT_FULL;
+	dma_buf_set_priority(buf->dmabuf, prio);
+#else
+	(void)buf;
+#endif
+}
+
+/* Reader for the same hint, 2026-08-18. Until now this driver only ever WROTE
+ * the priority (above) and never read it back, so the value influenced nothing
+ * and the comment above was right to say the call changes no behavior.
+ *
+ * What makes reading it non-redundant: alloc_flags is fixed at allocation
+ * time, and GB_IOCTL_SET_HEAT is a GreenBoost-private ioctl the shim uses.
+ * The dma-buf priority is a *standard* UAPI settable on any exported fd by
+ * any process, so a tool that knows nothing about GreenBoost's private ioctls
+ * can still say "this buffer matters" and have T2 eviction honour it. That is
+ * the whole point of the hint being in dma-buf core rather than here.
+ *
+ * Deliberately NOT a replacement for the hard skip rules. KV cache, frozen
+ * and t1_priority buffers are checked before this and stay unconditional: a
+ * foreign process must not be able to talk GreenBoost into evicting the KV
+ * cache by writing a low priority, which is exactly what folding those rules
+ * into a numeric score would allow. Priority only re-orders buffers that were
+ * already eligible.
+ *
+ * Returns DMA_BUF_PRIORITY_DEFAULT when the hint is unavailable, so every
+ * comparison below degrades to "all candidates equal" on a stock kernel. */
+static u32 gb_read_priority_hint(struct dma_buf *dmabuf)
+{
+#if GB_HAS_DMABUF_PRIORITY
+	if (dmabuf)
+		return dma_buf_get_priority(dmabuf);
+#else
+	(void)dmabuf;
+#endif
+	return 128;   /* DMA_BUF_PRIORITY_DEFAULT */
 }
 
 /* Sibling consumer for the generic dma-buf compressed-content descriptor
@@ -2385,6 +2468,12 @@ static long gb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			 * to a stale/out-of-order batch entry. */
 			buf->heat |= req.ent[i].heat;
 			spin_unlock(&gb_dev.lru_lock);
+			/* GB-K2: the published hint follows the heat it is
+			 * supposed to represent. Outside the spinlock - this
+			 * is an advisory atomic_t store, not part of the LRU
+			 * invariant, and dma_buf_set_priority() must not be
+			 * called with a spinlock held. */
+			gb_publish_heat_priority(buf);
 			dma_buf_put(buf->dmabuf);
 		}
 		return 0;
@@ -2457,6 +2546,7 @@ static ssize_t status_show(struct device *dev,
 		"  Active DMA-BUF objects   : %d\n"
 		"  OOM guard                : %s\n"
 		"  Page mode                : %s\n"
+		"  Evict spared by dma-buf priority : %llu\n"
 		"\n"
 		"── KV Cache ────────────────────────────────\n"
 		"  KV in T1 (native VRAM)   : managed by CUDA (reserve: %d MB)\n"
@@ -2483,6 +2573,7 @@ static ssize_t status_show(struct device *dev,
 		atomic_read(&gb_dev.oom_active) ? "YES" : "no",
 		use_hugepages ? "2 MB hugepages (T2) / 4K direct (T3)"
 			      : "4 KB pages",
+		(u64)atomic64_read(&gb_dev.prio_spared),
 		kv_reserve_mb, kv_t2_mb, (kv_used_mb > kv_t2_mb) ? (kv_used_mb - kv_t2_mb) : 0ULL, kv_used_mb,
 		gb_dev.t3_file ? t3_file_path : "disabled",
 		t3_max_mb > 0 ? "capped" : (gb_dev.t3_file ? "disk-limited" : "T3 disabled"),
@@ -2950,6 +3041,16 @@ static int gb_auto_evict_cold(u64 target_free_bytes)
 				/* Skip session-protected buffers on first pass (evict unprotected first) */
 				if (buf->session_priority >= 1)
 					continue;
+				/* Above-default dma-buf priority: someone asked for this
+				 * buffer to be kept. Honoured on the threshold sweep only,
+				 * so it re-orders rather than exempts - the second pass
+				 * below will still take it if the target is not met, the
+				 * same way session_priority already behaves. See
+				 * gb_read_priority_hint(). */
+				if (gb_read_priority_hint(buf->dmabuf) > 128) {
+					atomic64_inc(&gb_dev.prio_spared);
+					continue;
+				}
 				/* Only evict T2 4K-page buffers (hugepages are pinned) */
 				if (buf->tier != GB_TIER2_SDDR || buf->hugepages)
 					continue;

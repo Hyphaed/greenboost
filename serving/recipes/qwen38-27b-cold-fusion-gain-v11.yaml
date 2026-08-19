@@ -1,0 +1,74 @@
+# Qwen3.8-27B-Cold-Fusion-GAIN-V1.1 (NEO-MAX, MTP-IQ4_XS) , the default again.
+#
+# Why this and not the quant that FITS
+# ------------------------------------
+# Qwen3.8-27B-UD-IQ3_XXS is 11.10 GiB and fits this 11.94 GiB card with nothing
+# streaming; this one is 15.85 GiB and spills ~6 GiB over PCIe every token. On
+# raw decode the small one wins (8.37 vs ~5 tok/s), and that is the reason it
+# was made default earlier the same day.
+#
+# That was the wrong metric, and the owner caught it. What a person waits for
+# is a finished ANSWER, not a token. Two things make this model finish sooner
+# despite being slower per token:
+#
+#   1. It carries an MTP draft head. UD-IQ3_XXS has none, so it forfeits
+#      speculative decoding entirely , worth ~2x on this box when it engages.
+#   2. Its whole training goal is fewer thinking tokens. The model card claims
+#      1/10 to 1/2 of stock Qwen, and this repo already recorded the same
+#      effect for the 3.6 Cold-Fusion generation: "the reduced-thinking-block
+#      claim held in the direction that matters for agentic work: tokens per
+#      TASK, not tok/s."
+#
+# Halve the tokens a task needs and 5 tok/s beats 8.37 outright. That is the
+# bet this recipe makes, and it is a bet , see "not yet measured" below.
+#
+# ctx 24576, chosen against the real prompt floor
+# -----------------------------------------------
+# This box's system prompt plus MCP tool schemas measure ~13,000 tokens per
+# request even after the schema degradation and count cap. Sized against that:
+#
+#     ctx 16384   reserve 1547 MB   spill 5.42 GiB   room  +3,384  (under one file read)
+#     ctx 24576   reserve 2227 MB   spill 6.09 GiB   room +11,576
+#
+# The extra 8k of context costs only 0.67 GiB more spill, because with 15.85 GiB
+# of weights the overflow is dominated by weights, not KV. Room wins.
+#
+# NOT YET MEASURED , do this before quoting a speed-per-task number:
+#   a like-for-like A/B against Qwen3.8-27B-UD-IQ3_XXS on ONE identical agentic
+#   prompt, comparing wall-clock to a COMPLETE answer and total completion
+#   tokens. Comparing tok/s between these two models is exactly the mistake
+#   this file exists to correct.
+#
+# Sampling is the model card's Qwen3.8 thinking-mode set.
+# mtpDraftN 4 is this repo's own swept optimum (2->5.15, 3->5.58, 4->6.5, 6->4.40).
+#
+# NOTE: `check_recipes.py --fix` does not preserve comments. Re-add after --fix.
+
+schemaVersion: '1'
+model:
+  name: Qwen3.8-27B-Cold-Fusion-MTP-IQ4_XS
+  revision: 21b1de837ee2d68cc326fea49bc81d2b92f7d713
+  files:
+  - path: Qwen3.8-27B-Cold-Fusion-GAIN-V1.1-NM-DAU-NEO-MAX-NEO-MTP-IQ4_XS.gguf
+    sha256: 523bf4fbe2a2e0ce7aa54f812d85746294483b579443dd6e50e8ab684d7852f9
+capabilities:
+  toolCalls: true
+  streaming: true
+  mtpDraftHead: true
+  visionProjector: false
+  recurrentState: false
+kvCache:
+  key: f16
+  value: f16
+sampling:
+  temperature: 1.0
+  topP: 0.95
+  topK: 20
+  minP: 0.0
+  presencePenalty: 0.0
+  source: https://huggingface.co/DavidAU/Qwen3.8-27B-Cold-Fusion-GAIN-V1.1-NM-DAU-NEO-MAX-MTP-GGUF
+ctx: 24576
+nGpuLayers: all
+tierIntent: t2Spill
+mtpDraftN: 4
+contentDigest: sha256:4ee133ac172c0e7b1da140987b168cd726070a5cc9c84d51376f4b4f4b8fd999

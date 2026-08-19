@@ -22,7 +22,7 @@ _OLLAMA_BASE = "http://localhost:11434"
 
 # ── Ollama service coexistence ──────────────────────────────────────────────
 #
-# gb-synapse binds its own port (11435 by default, registry.py's "gb-synapse"
+# gb-synapse binds its own port (11369 by default, registry.py's "gb-synapse"
 # entry — separate from Ollama's 11434 since the 2026-07 port migration), but
 # both still compete for the same GPU VRAM. These manage the actual Ollama
 # SYSTEMD SERVICE so it steps aside before gb-synapse (or any other GPU-heavy

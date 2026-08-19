@@ -26,6 +26,11 @@ import time
 import argparse
 import statistics
 import concurrent.futures
+from pathlib import Path
+
+_REPO_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_REPO_DIR))
+import gb_ports  # noqa: E402
 
 # ── Protocol constants (must match features/net_fabric.h) ─────────────────────
 GB_NET_MAGIC          = 0x47424E46  # "GBNF"
@@ -670,21 +675,21 @@ def read_all_cluster_conf():
                 # Audit F-L5-31: validate the port is numeric AND in range.
                 # Falling back silently to 9740 on garbage hid malformed conf.
                 if not port_str:
-                    port = 9740
+                    port = gb_ports.NETD_PORT
                 elif port_str.isdigit():
                     port = int(port_str)
                     if not 1 <= port <= 65535:
                         sys.stderr.write(
                             f"[gb_feeder_diag] WARN: port {port} out of range "
-                            f"for {ip}; using 9740\n"
+                            f"for {ip}; using {gb_ports.NETD_PORT}\n"
                         )
-                        port = 9740
+                        port = gb_ports.NETD_PORT
                 else:
                     sys.stderr.write(
                         f"[gb_feeder_diag] WARN: non-numeric port {port_str!r} "
-                        f"for {ip}; using 9740\n"
+                        f"for {ip}; using {gb_ports.NETD_PORT}\n"
                     )
-                    port = 9740
+                    port = gb_ports.NETD_PORT
                 entries.append((ip, port))
     return entries
 
@@ -798,7 +803,7 @@ def main():
                         choices=["t1", "t2", "t3", "compute", "telemetry", "topology", "all", "info"],
                         help="Which test to run (default: all)")
     parser.add_argument("--ip",   default=None, help="Feeder IP (overrides cluster.conf)")
-    parser.add_argument("--port", type=int, default=None, help="Feeder port (default: 9740)")
+    parser.add_argument("--port", type=int, default=None, help=f"Feeder port (default: {gb_ports.NETD_PORT})")
     # N10: new diagnostic modes
     parser.add_argument("--heartbeat-latency", action="store_true",
                         help="N10: Send 100 heartbeat pings and report p50/p95/p99 RTT")
@@ -831,7 +836,7 @@ def main():
         print(f"{C_RED}No feeder configured.{C_RESET}  Run: sudo greenboost connect <IP>")
         sys.exit(1)
     if not port:
-        port = 9740
+        port = gb_ports.NETD_PORT
 
     print(f"\n{C_BOLD}GreenBoost Feeder Diagnostic{C_RESET}  →  {ip}:{port}")
     print(f"{C_DIM}{'─' * 50}{C_RESET}")

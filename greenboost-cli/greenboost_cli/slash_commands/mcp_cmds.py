@@ -136,10 +136,9 @@ def _check_status() -> None:
         print("     pip install greenboost-cli[convert]")
 
     try:
-        from greenboost_cli.rag.engine import _load_store, _load_folders
-        _, meta  = _load_store()
+        from greenboost_cli.rag.engine import store_stats, _load_folders
         folders  = _load_folders()
-        n_chunks = len(meta) if meta else 0
+        n_chunks = store_stats()["chunks"]
         print(f"  ✓  RAG: {n_chunks:,} chunks · {len(folders)} source(s)")
     except Exception as e:
         print(f"  ⚠  RAG unavailable: {e}")

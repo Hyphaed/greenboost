@@ -431,23 +431,156 @@ def _gate_cpu_offload(*, entry, engine: str, event_status: str,
         pass
     if allowed:
         return
-    raise RuntimeError(
-        f"'{entry.name}' would fall back to CPU offload ({event_status}) — "
-        f"CLAUDE.md's T2-spill rule forbids this by default (owner directive, "
-        f"2026-08-01: GreenBoost must always spill through the shim to T2, "
-        f"never to CPU). shim={'on' if shim_active else 'off'} ({shim_reason}), "
-        f"t2_free={t2_free_mb:.0f} MB. Fix the shim (gb_shim_probe.py) or free "
-        f"more T2 before retrying; as a deliberate debugging override only, "
-        f"set GB_SYNAPSE_ALLOW_CPU_OFFLOAD=1."
-    )
+
+    # Classify the failure for a structured error message with confidence
+    # signal (ported from NemoClaw's failure-classifier pattern).
+    try:
+        import gb_failures
+        shim_status = (shim_active, shim_reason)
+        classification = gb_failures.classify_serve_failure(
+            kind_hint=gb_failures.FailureKind.CAPACITY_EXCEEDED,
+            model_name=entry.name,
+            shim_status=shim_status,
+            t2_facts={"t2_free_mb": t2_free_mb},
+            # effective_vram_budget_mb() was just called above, at the top of
+            # this function — t2_free_mb is a live read, not a cached one.
+            t2_freshly_read=True,
+        )
+        # Preserve the shim_reason in the error message for observability
+        # (it carries diagnostic details like "reproduced known failure")
+        error_msg = (
+            f"{classification.reason}\n"
+            f"Shim status: {'on' if shim_active else 'off'} ({shim_reason})\n"
+            f"Event: {event_status}\n"
+            f"Next step: {classification.next_step}"
+        )
+    except Exception:
+        # Fallback to the original prose message if classification fails
+        error_msg = (
+            f"'{entry.name}' would fall back to CPU offload ({event_status}) — "
+            f"CLAUDE.md's T2-spill rule forbids this by default (owner directive, "
+            f"2026-08-01: GreenBoost must always spill through the shim to T2, "
+            f"never to CPU). shim={'on' if shim_active else 'off'} ({shim_reason}), "
+            f"t2_free={t2_free_mb:.0f} MB. Fix the shim (gb_shim_probe.py) or free "
+            f"more T2 before retrying; as a deliberate debugging override only, "
+            f"set GB_SYNAPSE_ALLOW_CPU_OFFLOAD=1."
+        )
+    raise RuntimeError(error_msg)
+
+
+# Valued CLI flags this module itself emits as adjacent `--flag value` pairs
+# (never boolean switches like --jinja/--no-mmap, which take no following
+# token — stripping those from cmd on an extra_args match would misidentify
+# the NEXT unrelated argument as their "value" and corrupt the command line).
+_KNOWN_VALUED_FLAGS = {
+    "--host", "--port", "--ctx-size", "--slot-save-path", "--flash-attn",
+    "--cache-reuse", "--cache-ram", "--slot-prompt-similarity", "--threads",
+    "-np", "--cache-type-k", "--cache-type-v", "-fit", "--mmproj",
+    "--spec-type", "--spec-draft-n-max", "--spec-draft-p-min", "--rpc",
+    "--tensor-split", "-ngl", "--n-cpu-moe", "--maxp",
+}
+
+
+def _dedupe_extra_args_overrides(cmd: "list[str]", extra_args: str) -> "list[str]":
+    """Strip any known valued flag from cmd that extra_args also supplies, so
+    an explicit caller override wins instead of being silently ignored.
+
+    Found live during the 2026-08-03 M1 measurement pass: llama.cpp's CLI
+    parser keeps the FIRST occurrence of a duplicate flag, not the last, so
+    appending extra_args after cmd's own `--cache-type-k/-v <kv_type>` never
+    let a caller force a different KV type via extra_args — the override was
+    silently ignored. Restricted to _KNOWN_VALUED_FLAGS (not a generic
+    "next token is the value" parser) because at least one of this module's
+    own values looks flag-shaped (`-np` defaults to `str(-1)` = "-1"), which
+    would defeat a heuristic based on the following token's leading '-'.
+    """
+    if not extra_args:
+        return cmd
+    override_flags = {tok for tok in shlex.split(extra_args) if tok in _KNOWN_VALUED_FLAGS}
+    if not override_flags:
+        return cmd
+    out: "list[str]" = []
+    skip_next = False
+    for tok in cmd:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in override_flags:
+            skip_next = True  # also drop the value that follows it
+            continue
+        out.append(tok)
+    return out
 
 
 # ---------------------------------------------------------------------------
 # EngineBackend
 # ---------------------------------------------------------------------------
 
+_ADAPTERS: dict[str, "type[EngineBackend]"] = {}
+_ADAPTER_REF_RE = re.compile(r"[a-z0-9][a-z0-9.-]*/v[1-9][0-9]*")
+
+
+def register(ref: str):
+    """Class decorator: register a concrete EngineBackend under a versioned
+    adapter ref (NemoClaw audit, Phase 1). `ref` must match
+    `[a-z0-9][a-z0-9.-]*/vN` — enforced so a ref always carries an explicit
+    version rather than an implicit, unversioned name. Raises on a
+    malformed ref or a duplicate registration; sets `cls.ADAPTER_REF = ref`
+    on success."""
+    if not _ADAPTER_REF_RE.fullmatch(ref):
+        raise ValueError(
+            f"adapter ref {ref!r} must match {_ADAPTER_REF_RE.pattern!r} "
+            f"(e.g. 'llama-cpp.host-local/v1')")
+
+    def _decorate(cls):
+        if ref in _ADAPTERS:
+            raise ValueError(
+                f"adapter ref {ref!r} already registered (by "
+                f"{_ADAPTERS[ref].__name__})")
+        cls.ADAPTER_REF = ref
+        _ADAPTERS[ref] = cls
+        return cls
+
+    return _decorate
+
+
+def resolve_adapter(ref: str) -> "type[EngineBackend]":
+    """Look up a registered EngineBackend class by its adapter ref. Raises
+    ValueError naming every known ref when `ref` isn't registered, rather
+    than silently falling through to a default — a typo in a ref string
+    must surface immediately, not resolve to the wrong engine."""
+    try:
+        return _ADAPTERS[ref]
+    except KeyError:
+        raise ValueError(
+            f"unknown adapter ref {ref!r}; known refs: {sorted(_ADAPTERS)}"
+        ) from None
+
+
+def _sampling_args(sampling: "dict | None") -> "list[str]":
+    """llama-server flags for a recipe's model-card sampling defaults.
+
+    Returns [] when a recipe carries no `sampling` block, so a model without
+    published values keeps llama.cpp's own defaults rather than inheriting
+    another model's. Only keys actually present are emitted , a partial block
+    pins what the card states and leaves the rest alone.
+    """
+    if not sampling:
+        return []
+    flags: list[str] = []
+    for key, flag in (("temperature", "--temp"), ("topP", "--top-p"),
+                      ("topK", "--top-k"), ("minP", "--min-p"),
+                      ("presencePenalty", "--presence-penalty"),
+                      ("repeatPenalty", "--repeat-penalty")):
+        v = sampling.get(key)
+        if v is not None:
+            flags += [flag, str(v)]
+    return flags
+
+
 class EngineBackend:
     name = "base"
+    ADAPTER_REF: "str | None" = None
 
     def available(self) -> bool:
         raise NotImplementedError
@@ -455,7 +588,10 @@ class EngineBackend:
     def can_serve(self, entry) -> bool:
         raise NotImplementedError
 
-    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None):
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None,
+              mtp_draft_n=None, spec_draft_p_min=None, slot_prompt_similarity=None,
+              n_gpu_layers_override=None, kv_type_override=None, n_cpu_moe_override=None,
+              sampling_override=None):
         """n_slots=-1 (default) means "let the engine decide" — for
         LlamaCppBackend this passes straight through to llama.cpp's own
         `-np -1` auto mode (n_parallel=4, kv_unified=true, a single shared
@@ -482,7 +618,27 @@ class EngineBackend:
         sizing; the hardcoded-hardware-values rule forbids a literal MiB
         figure here). Pass an explicit MiB value to override the derivation
         for one serve call. Backends without llama.cpp's host-memory
-        prompt-cache concept ignore this parameter regardless of its value."""
+        prompt-cache concept ignore this parameter regardless of its value.
+
+        mtp_draft_n/spec_draft_p_min=None (default) means "use the
+        GB_SYNAPSE_MTP_DRAFT_N/GB_SYNAPSE_MTP_P_MIN env vars" (LlamaCppBackend
+        only — --spec-draft-n-max/--spec-draft-p-min on an MTP-carrying model;
+        see that backend's serve() for the full rationale). Backends without
+        an MTP speculative-decode path ignore these regardless of value.
+
+        slot_prompt_similarity=None (default) means "use the
+        GB_SYNAPSE_SLOT_PROMPT_SIMILARITY env var" (LlamaCppBackend only —
+        --slot-prompt-similarity, how much a new request's prompt must
+        overlap an idle slot's cached prompt before it's reused instead of
+        falling back to LRU). Backends without llama.cpp's slot concept
+        ignore this regardless of value.
+
+        n_gpu_layers_override/kv_type_override/n_cpu_moe_override=None
+        (default) means "use the live heuristic solve" (LlamaCppBackend
+        only — a serving/ recipe's pinned nGpuLayers/kvCache/nCpuMoe; see
+        that backend's serve() for the full rationale). Backends without
+        llama.cpp's layer-placement concept ignore these regardless of
+        value."""
         raise NotImplementedError
 
     def serve_facts(self, entry) -> dict:
@@ -490,6 +646,7 @@ class EngineBackend:
         return {}
 
 
+@register("llama-cpp.host-local/v1")
 class LlamaCppBackend(EngineBackend):
     """The default, cluster-aware engine — llama.cpp with an explicit
     --rpc/--tensor-split across online feeders, and the shim's local T2/T3
@@ -504,7 +661,23 @@ class LlamaCppBackend(EngineBackend):
     def can_serve(self, entry) -> bool:
         return entry.engine == "llama.cpp"
 
-    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None):
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None,
+              mtp_draft_n=None, spec_draft_p_min=None, slot_prompt_similarity=None,
+              n_gpu_layers_override=None, kv_type_override=None, n_cpu_moe_override=None,
+              sampling_override=None):
+        """n_gpu_layers_override/kv_type_override/n_cpu_moe_override (NemoClaw
+        audit, Phase 5/7 follow-up): a serving/ recipe's nGpuLayers/kvCache/
+        nCpuMoe fields, threaded through to skip the heuristic -ngl/KV-type/
+        --n-cpu-moe derivation entirely once a recipe has PINNED a measured
+        value — see gb_synapse.serve()'s recipe-lookup call site. cpu_quirk
+        (a confirmed upstream CUDA regression for this arch) still wins
+        unconditionally: a recipe can never re-enable a placement that
+        crashes. An n_gpu_layers_override on a DENSE (non-MoE) model asking
+        for fewer than all layers is still a capacity decision — it goes
+        through _gate_cpu_offload() exactly as the heuristic partial-offload
+        path would, so a pinned recipe can't silently bypass the T2-spill
+        safety rule. A MoE model's --n-cpu-moe placement stays exempt from
+        that gate either way, matching the un-overridden path."""
         import gb_synapse as gs
         import gb_cluster
         from gb_nvml import get_nvml
@@ -585,6 +758,32 @@ class LlamaCppBackend(EngineBackend):
         # so we say plainly which one we got.
         weights_gb = entry.n_bytes / (1024 ** 3)
         fits_vram = weights_gb <= budget_gb or "LD_PRELOAD" in env
+
+        # MoE placement is decided against PHYSICAL VRAM, never the shim-backed
+        # budget, and the `or "LD_PRELOAD" in env` above is exactly why this
+        # exists. With the shim preloaded — which is always, under GreenBoost —
+        # fits_vram is unconditionally True at any model size, so the
+        # `elif fits_vram:` branch below sends every layer to the GPU with
+        # -ngl 999 and lets the shim spill the remainder across PCIe.
+        #
+        # For a DENSE model that is correct and deliberate: Rule #1 says fill
+        # VRAM and spill the rest through the shim, because every parameter is
+        # read every token and there is nothing cheaper to move.
+        #
+        # For an MoE it is precisely backwards. Experts are ~92% of the bytes
+        # and only 8 of 256 fire per token, so streaming them over PCIe is the
+        # most expensive possible place to put them. This box measured the
+        # comparison on 2026-07-26 for this exact architecture class: CPU expert
+        # GEMM out of DDR5 costs ~8 ms/token against ~19 ms/token to stream the
+        # same bytes to the GPU — one of the two sanctioned CPU placements in
+        # CLAUDE.md's Immutable Design Rule, chosen on measurement rather than
+        # fallen back to.
+        #
+        # Measured live 2026-08-18, Qwen3.6-35B-A3B UD-Q4_K_XL (21.27 GiB on an
+        # 11.94 GiB card): served with -ngl 999 and no --n-cpu-moe at all, the
+        # fit check reported 13,850 MB spilling to T2 — three times the dense
+        # reference model's overflow. The expert-offload machinery existed and
+        # simply never ran.
         cpu_quirk = (not fits_vram and entry.arch in gs.ARCH_CPU_SPLIT_BROKEN
                      and os.environ.get("GB_SYNAPSE_FORCE_SPLIT") != "1")
 
@@ -661,7 +860,15 @@ class LlamaCppBackend(EngineBackend):
         # the budget rather than hardcoded: f16 is certification grade, q8_0 is a
         # budget config. Take f16 whenever it fits; drop to q8_0 only to make the
         # context reachable at all.
-        if _model_default and not os.environ.get("GB_SYNAPSE_KV"):
+        # Model-card sampling defaults, when a serving recipe carries them.
+        # llama-server's own defaults (top_k 40, min_p 0.05, temp 0.8) are
+        # generic; a card publishing different values is stating what the model
+        # was actually tuned for. These are DEFAULTS , a client sending its own
+        # values per request still overrides them.
+        _sampling_flags = _sampling_args(sampling_override)
+        if kv_type_override is not None:
+            kv_type = kv_type_override
+        elif _model_default and not os.environ.get("GB_SYNAPSE_KV"):
             kv_type = _model_default[1]
         else:
             kv_type = gs._pick_kv_type(ctx, entry, ctx_kv_budget_gb + t2_kv_extra_gb)
@@ -702,17 +909,15 @@ class LlamaCppBackend(EngineBackend):
             # compute/workspace buffers that request just after the KV
             # reserve is provisioned (declined by single-digit MB margins
             # against a reserve sized off a number that had already proven
-            # itself accurate). Confirmed live 2026-08-02: even a 10% margin
-            # (867 MB reserve) still declined the SAME two compute buffers
-            # by single-digit-MB margins, because gb_frontload_split_alloc()
-            # ALSO subtracts its own fill_headroom (the 10%-of-total-VRAM
-            # Rule #1 target) on top of the KV reserve for every allocation
-            # decision, not just the first — a real double-count on
-            # allocations after the primary buffer already hit the 90%
-            # target with exactly that headroom free, but not something to
-            # fix by changing gb_needs_overflow()'s own headroom formula
-            # tonight. 2% still covers real run-to-run KV/SSM variance
-            # without repeating the same overshoot.
+            # itself accurate). A same-session "gb_frontload_split_alloc()
+            # double-counts fill_headroom against every allocation decision"
+            # theory did NOT survive closer inspection (see CLAUDE.md's
+            # 2026-08-02 correction) — the remaining ~5% gap to the 90%
+            # target is two legitimate, independent safety margins (the
+            # Rule #1 fill headroom and the KV reserve), not a shim bug.
+            # 2% still covers real run-to-run KV/SSM variance on top of an
+            # already-accurate measurement without repeating the old
+            # formula's overshoot.
             _kv_reserve_margin = 1.02
         tensor_split = gs._compute_tensor_split(host_free_mb, online_feeders, kv_total_gb)
         if ssm_gb > 0:
@@ -774,6 +979,12 @@ class LlamaCppBackend(EngineBackend):
                "--flash-attn", "auto",
                "--cache-reuse", "256",
                "--cache-ram", str(cache_ram_mb),
+               # --slot-prompt-similarity: raised from the engine's own compiled
+               # default of 0.10 (GB_SLOT_PROMPT_SIMILARITY's module-level comment
+               # in gb_synapse.py) — governs slot reuse for every serve, not just
+               # MTP ones.
+               "--slot-prompt-similarity",
+               str(slot_prompt_similarity if slot_prompt_similarity is not None else gs.GB_SLOT_PROMPT_SIMILARITY),
                "--no-mmap",  # DMA-BUF pinning (Path A) is incompatible with mmap-backed pages
                # n_slots defaults to -1 (EngineBackend.serve's docstring):
                # passed straight through, llama.cpp's own arg parser treats
@@ -797,20 +1008,98 @@ class LlamaCppBackend(EngineBackend):
                # llama.cpp's own redundant veto is disabled rather than raced.
                "-fit", "off",
                "--jinja"]
+        # A recipe's model-card sampling values, if it carries any. Appended
+        # here so llama.cpp's arg parser takes them as the launch defaults; a
+        # client's per-request values still win over them.
+        cmd += _sampling_flags
 
         n_cpu_moe = 0
         n_gpu = None
         n_gpu_layers_reported = 0
-        if fits_vram:
-            cmd += ["-ngl", "999"]        # all layers on GPU — the fast path
-            n_gpu_layers_reported = entry.n_layers or 999
-        elif cpu_quirk:
+
+        # How many layers should keep their EXPERTS off the GPU, decided against
+        # PHYSICAL VRAM (`budget_gb` is NVML free VRAM + feeder T1) rather than
+        # the shim-backed virtual device.
+        #
+        # This has to be computed independently of `fits_vram`, because
+        # fits_vram carries `or "LD_PRELOAD" in env` — with the shim preloaded,
+        # which is always under GreenBoost, it is unconditionally True at any
+        # model size. The `elif fits_vram:` branch below then sends every layer
+        # to the GPU with -ngl 999 and lets the shim spill the remainder over
+        # PCIe.
+        #
+        # For a DENSE model that is correct and deliberate: Rule #1 says fill
+        # VRAM and spill the rest through the shim, because every parameter is
+        # read on every token and nothing is cheaper to move.
+        #
+        # For an MoE it is backwards. Experts are ~92% of the bytes but only 8
+        # of 256 fire per token, so PCIe is the most expensive place to put
+        # them. This box measured the comparison on 2026-07-26 for this exact
+        # architecture class: CPU expert GEMM out of DDR5 ~8 ms/token against
+        # ~19 ms/token to stream the same bytes to the GPU. That makes it one of
+        # the two sanctioned CPU placements in CLAUDE.md's Immutable Design Rule
+        # — chosen on measurement, not fallen back to — so it does not go
+        # through _gate_cpu_offload().
+        #
+        # Measured live 2026-08-18: Qwen3.6-35B-A3B UD-Q4_K_XL (21.27 GiB on an
+        # 11.94 GiB card) served with -ngl 999 and no --n-cpu-moe at all, and
+        # the fit check reported 13,850 MB spilling to T2 — three times the
+        # dense reference model's overflow. The machinery existed and never ran.
+        moe_offload_layers = 0
+        if entry.is_moe and not cpu_quirk:
+            try:
+                moe_offload_layers = gs._fit_cpu_moe_layers(
+                    entry, budget_gb, kv_total_gb,
+                    n_devices=max(1, 1 + len(online_feeders)))
+            except Exception:
+                moe_offload_layers = 0
+        # An override's placement decision was already gated (below, in this
+        # same branch) when it needed to be — the diagnostic print/gate block
+        # further down is for the un-overridden heuristic path only.
+        override_handled = False
+        if cpu_quirk:
             # Upstream llama.cpp CUDA regression: for this arch ANY CPU/GPU split
             # aborts at the first batched prompt. -ngl 0 alone is NOT CPU-only:
             # llama.cpp still op-offloads batched matmuls above ~32 tokens, so hide
-            # the GPU entirely. See workflow/known-issues.md.
+            # the GPU entirely. See workflow/known-issues.md. Wins over an
+            # override unconditionally — a recipe can never re-enable a
+            # placement that's a confirmed crash.
             cmd += ["-ngl", "0", "--no-op-offload"]
             env["CUDA_VISIBLE_DEVICES"] = ""
+        elif n_gpu_layers_override is not None:
+            override_handled = True
+            if n_gpu_layers_override == "all":
+                cmd += ["-ngl", "999"]
+                n_gpu_layers_reported = entry.n_layers or 999
+                if entry.is_moe and n_cpu_moe_override is not None:
+                    n_cpu_moe = n_cpu_moe_override
+                    cmd += ["--n-cpu-moe", str(n_cpu_moe)]
+            else:
+                cmd += ["-ngl", str(n_gpu_layers_override)]
+                n_gpu_layers_reported = n_gpu_layers_override
+                if entry.is_moe and n_cpu_moe_override is not None:
+                    n_cpu_moe = n_cpu_moe_override
+                    cmd += ["--n-cpu-moe", str(n_cpu_moe)]
+                elif not entry.is_moe:
+                    # Fewer than all layers on a DENSE model is a capacity
+                    # decision — same T2-spill safety rule the heuristic
+                    # partial-offload path enforces, applied here directly
+                    # since the heuristic branch below is skipped entirely.
+                    _gate_cpu_offload(
+                        entry=entry, engine=self.name,
+                        event_status="dense_partial_offload_override",
+                        shim_active=shim_active, shim_reason=shim_reason,
+                        extra={"weights_gb": round(weights_gb, 2), "budget_gb": round(budget_gb, 2),
+                               "n_gpu_layers": n_gpu_layers_override, "n_layers": entry.n_layers, "ctx": ctx})
+        elif fits_vram:
+            cmd += ["-ngl", "999"]        # all layers on GPU — the fast path
+            n_gpu_layers_reported = entry.n_layers or 999
+            if moe_offload_layers > 0:
+                # Every layer's ATTENTION and KV stay on the GPU (they are read
+                # every token); only the cold experts move. That is the split
+                # _fit_cpu_moe_layers exists to compute.
+                n_cpu_moe = moe_offload_layers
+                cmd += ["--n-cpu-moe", str(n_cpu_moe)]
         elif entry.is_moe:
             # Every layer still runs on the GPU; only the experts of the first
             # n_cpu_moe layers live in host DDR.
@@ -858,19 +1147,46 @@ class LlamaCppBackend(EngineBackend):
         # today (-ngl 65/65, mtp=true) is unaffected — confirmed live via a
         # direct benchmark request (100% SM util, 4.86 tok/s, no crash).
         mtp_active = gs._has_mtp(entry) and (fits_vram or entry.is_moe)
-        if mtp_active:
-            cmd += ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(gs.MTP_DRAFT_N)]
+        # Speculation is stackable: --spec-type takes a comma-separated list, and
+        # the ngram modes need no draft model and no extra VRAM (they predict
+        # from text already in the context). On a bandwidth-bound decode a
+        # forward pass costs the same whether it emits one token or five, so an
+        # extra accepted draft token is close to free.
+        #
+        # Deliberately opt-in (GB_SYNAPSE_SPEC_EXTRA) rather than defaulted: it
+        # is a lever to MEASURE with gb_bench_turn.py per model, not an
+        # assumption. A model with no MTP head can still use it, which is why
+        # this is computed outside the mtp_active branch.
+        # Release VRAM after a configured idle period (native engine flag).
+        # Only emitted when enabled, so the default command line is unchanged.
+        if gs.SLEEP_IDLE_SECONDS and gs.SLEEP_IDLE_SECONDS > 0:
+            cmd += ["--sleep-idle-seconds", str(gs.SLEEP_IDLE_SECONDS)]
+
+        _draft_n, _p_min = 0, 0.0
+        _spec_base = ["draft-mtp"] if mtp_active else []
+        _spec_value = gs.spec_type_list(_spec_base, gs.SPEC_EXTRA_TYPES)
+        if _spec_value:
+            cmd += ["--spec-type", _spec_value]
+            if mtp_active:
+                _draft_n = mtp_draft_n if mtp_draft_n is not None else gs.MTP_DRAFT_N
+                _p_min = spec_draft_p_min if spec_draft_p_min is not None else gs.MTP_P_MIN
+                cmd += ["--spec-draft-n-max", str(_draft_n),
+                        "--spec-draft-p-min", str(_p_min)]
 
         if rpc_args:
             cmd += ["--rpc", ",".join(rpc_args), "--tensor-split", tensor_split]
         if extra_args:
+            cmd = _dedupe_extra_args_overrides(cmd, extra_args)
             cmd += shlex.split(extra_args)
 
         kv_grade = "certification-grade" if kv_type == "f16" else "budget"
-        if fits_vram:
-            placement = "all-GPU"
-        elif cpu_quirk:
+        if cpu_quirk:
             placement = "CPU-ONLY (arch CUDA-split quirk — see known-issues.md)"
+        elif override_handled:
+            placement = ("all-GPU (override)" if n_gpu_layers_override == "all"
+                        else "PARTIAL CPU OFFLOAD (override)")
+        elif fits_vram:
+            placement = "all-GPU"
         else:
             placement = "PARTIAL CPU OFFLOAD (slow)"
         print(f"  [gb-synapse] {entry.name}: ctx={ctx} kv={kv_type} ({kv_grade}) "
@@ -884,6 +1200,10 @@ class LlamaCppBackend(EngineBackend):
                   f"build (upstream CUDA regression) — serving CPU-ONLY. Measured 11.2 tok/s "
                   f"decode (3B-active MoE). Re-test the split with GB_SYNAPSE_FORCE_SPLIT=1 "
                   f"after an engine upgrade.", flush=True)
+        elif override_handled:
+            pass  # the override branch above already printed nothing extra
+                  # and already ran _gate_cpu_offload() itself when needed —
+                  # this block's heuristic diagnostics/gate don't apply.
         elif not fits_vram and n_cpu_moe:
             print(f"  [gb-synapse] {weights_gb:.1f} GB of weights vs {budget_gb:.1f} GB VRAM: "
                   f"ALL {entry.n_layers} layers stay on GPU (attention + KV); experts of "
@@ -916,7 +1236,16 @@ class LlamaCppBackend(EngineBackend):
                                                n_gpu_layers=n_gpu_layers_reported,
                                                mtp=mtp_active, vision=bool(mmproj),
                                                ssm_state_gb=round(ssm_gb, 3),
-                                               n_recurrent_layers=entry.n_recurrent_layers)
+                                               n_recurrent_layers=entry.n_recurrent_layers,
+                                               # GB-6: the speculative-decode
+                                               # depth this server was actually
+                                               # launched with. Without it a
+                                               # tok/s measurement cannot say
+                                               # which draft depth produced it,
+                                               # which is the whole point of
+                                               # sweeping the depth.
+                                               mtp_draft_n=(_draft_n if mtp_active else 0),
+                                               spec_draft_p_min=(_p_min if mtp_active else 0.0))
         except RuntimeError as e:
             err_lower = str(e).lower()
             is_oom = "out of memory" in err_lower
@@ -1041,6 +1370,7 @@ class LlamaCppBackend(EngineBackend):
         return proc, internal_port
 
 
+@register("torch.gllm-local/v1")
 class SynapseTorchBackend(EngineBackend):
     """GreenBoost's own torch-core inference engine (vendored gLLM, see
     synapse_engine/NOTICE) — the safetensors-checkpoint backend the
@@ -1092,7 +1422,10 @@ class SynapseTorchBackend(EngineBackend):
         facts["n_recurrent_layers"] = entry.n_recurrent_layers
         return facts
 
-    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None):
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None,
+              mtp_draft_n=None, spec_draft_p_min=None, slot_prompt_similarity=None,
+              n_gpu_layers_override=None, kv_type_override=None, n_cpu_moe_override=None,
+              sampling_override=None):
         import gb_synapse as gs
         import gb_cluster
 
@@ -1296,6 +1629,7 @@ class SynapseTorchBackend(EngineBackend):
                                 gs.kill_feeder_gllm_slave(f)
 
         if extra_args:
+            cmd = _dedupe_extra_args_overrides(cmd, extra_args)
             cmd += shlex.split(extra_args)
 
         log = open(gs._run_log_path(entry.name), "ab")
@@ -1335,6 +1669,7 @@ class SynapseTorchBackend(EngineBackend):
         return state
 
 
+@register("transformers.single-request/v1")
 class TransformersBackend(EngineBackend):
     """Fallback when the synapse torch engine isn't installed at all (no
     torch venv found — see `_torch_env_dir()`): runs `gb_synapse_fallback.py`
@@ -1358,7 +1693,10 @@ class TransformersBackend(EngineBackend):
     def can_serve(self, entry) -> bool:
         return entry.engine in ("transformers", "gbquant")
 
-    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None):
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None,
+              mtp_draft_n=None, spec_draft_p_min=None, slot_prompt_similarity=None,
+              n_gpu_layers_override=None, kv_type_override=None, n_cpu_moe_override=None,
+              sampling_override=None):
         import gb_synapse as gs
 
         internal_port = port + 1000
@@ -1376,6 +1714,7 @@ class TransformersBackend(EngineBackend):
         return gs._launch_proxy_and_record(entry, proc, port, internal_port, engine=self.name)
 
 
+@register("diffusers.host-local/v1")
 class DiffusersBackend(EngineBackend):
     """HF diffusers image-generation pipelines (FLUX, SDXL, LTX, ...), served
     through gb_diffusion_server.py behind the same :11434 proxy — the proxy's
@@ -1394,7 +1733,10 @@ class DiffusersBackend(EngineBackend):
     def can_serve(self, entry) -> bool:
         return entry.engine == "diffusers"
 
-    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None):
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None,
+              mtp_draft_n=None, spec_draft_p_min=None, slot_prompt_similarity=None,
+              n_gpu_layers_override=None, kv_type_override=None, n_cpu_moe_override=None,
+              sampling_override=None):
         import gb_synapse as gs
         import gb_cluster
 
@@ -1414,6 +1756,7 @@ class DiffusersBackend(EngineBackend):
         return gs._launch_proxy_and_record(entry, proc, port, internal_port, engine=self.name)
 
 
+@register("video.host-local/v1")
 class VideoBackend(EngineBackend):
     """Persistent video-serving engine (missing_features.md item (f)),
     served through gb_longlive_server.py behind the same :11434 proxy.
@@ -1440,7 +1783,10 @@ class VideoBackend(EngineBackend):
     def can_serve(self, entry) -> bool:
         return entry.engine == "video"
 
-    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None):
+    def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None,
+              mtp_draft_n=None, spec_draft_p_min=None, slot_prompt_similarity=None,
+              n_gpu_layers_override=None, kv_type_override=None, n_cpu_moe_override=None,
+              sampling_override=None):
         import gb_synapse as gs
         import gb_cluster
 
@@ -1474,10 +1820,10 @@ def select_backend(entry) -> EngineBackend:
     "video" are both explicit — no silent fallback. Anything else (including
     the "llama.cpp" default) gets the llama.cpp engine."""
     if entry.engine in ("torch", "vllm", "gbquant", "transformers"):
-        t = SynapseTorchBackend()
-        return t if t.available() else TransformersBackend()
+        t = resolve_adapter("torch.gllm-local/v1")()
+        return t if t.available() else resolve_adapter("transformers.single-request/v1")()
     if entry.engine == "diffusers":
-        return DiffusersBackend()
+        return resolve_adapter("diffusers.host-local/v1")()
     if entry.engine == "video":
-        return VideoBackend()
-    return LlamaCppBackend()
+        return resolve_adapter("video.host-local/v1")()
+    return resolve_adapter("llama-cpp.host-local/v1")()

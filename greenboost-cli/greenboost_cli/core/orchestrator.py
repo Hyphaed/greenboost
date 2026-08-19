@@ -28,6 +28,11 @@ from greenboost_cli.inference.router import generate, StreamFragment, ReasoningF
 _DEFAULT_MAX_TURNS   = 50
 _REPEAT_LIMIT        = 3   # same tool+args repeated this many times → stop
 _CONSEC_ERROR_LIMIT  = 4   # this many consecutive Denied/ERROR results → stop
+#: How many TRANSIENT tool failures (timeout, device busy, connection reset)
+#: one turn may absorb before they start counting toward the guard above.
+#: Small on purpose: a genuinely wedged resource should still stop the turn,
+#: but a couple of hiccups should not end a long agentic run.
+_TRANSIENT_ERROR_LIMIT = 2
 _INTENT_NUDGE_CAP    = 2   # at most this many "you said you would, now do it" nudges
 
 # Matches a model announcing a build/task ("I'll build X", "Let me create Y")
@@ -65,6 +70,52 @@ _INTENT_RE = re.compile(
 _INTENT_NUDGE_MAX_LEN = 400
 
 
+# Hard byte ceilings, independent of the live context window — NemoClaw
+# audit, Phase 3e. The fraction-of-context budget below (`budget_chars`)
+# already shrinks for a small window, but had no UPPER bound at all: on a
+# huge served ctx, `int(ctx * 0.15 * 4)` could still let an enormous MCP
+# schema block through uncapped. These two constants close that, matching
+# NemoClaw's progressive_tool_disclosure.py's own byte-budget shape
+# (design re-implemented from scratch — no NemoClaw code copied here,
+# unlike instruments/capture.py). MAX_SINGLE_TOOL_SCHEMA_BYTES additionally
+# protects against ONE pathological MCP server's oversized schema forcing
+# every OTHER server's tools to degrade too, even when the aggregate would
+# otherwise fit.
+MAX_VISIBLE_DISCOVERED_SCHEMA_BYTES = 128 * 1024
+MAX_SINGLE_TOOL_SCHEMA_BYTES = 16 * 1024
+MAX_SEARCH_QUERY_LENGTH = 256
+MAX_SEARCH_OUTPUT_BYTES = 8 * 1024
+
+
+def _light_schema(schema: dict) -> dict:
+    """Name + one sentence, no parameters , the degraded form.
+
+    Deliberately carries NO "call ToolSearch for the real schema" sentence.
+    That instruction is identical for every tool and is already stated once, in
+    the ToolSearch builtin's own description ("most MCP tools are advertised to
+    you with only a name and short description ... call ToolSearch first").
+    Repeating it per tool bought nothing and cost a great deal: measured on a
+    live 238-tool session, 116 chars x 238 = 27,608 chars of byte-identical
+    text, about 6,900 prompt tokens re-sent on EVERY request.
+
+    That is not a rounding error on this hardware. The reference architecture
+    rejects `--cache-reuse`. That does NOT mean every turn re-pays prefill ,
+    same-slot prefix reuse still works and measured 99.7% hit on this model.
+    It does mean the FIRST turn after any restart pays in full, and that turn
+    was measured at 30-46 tok/s while weights spill to T2 , roughly 197 seconds
+    of it spent re-reading the same sentence 238 times. An empty
+    `properties` is already the per-tool signal that the schema was withheld.
+    """
+    name = schema.get("name", "")
+    desc = (schema.get("description") or "").strip()
+    first_sentence = desc.split(". ")[0][:160]
+    return {
+        "name": name,
+        "description": first_sentence,
+        "input_schema": {"type": "object", "properties": {}},
+    }
+
+
 def _capped_mcp_schemas(mcp_schemas: list, settings: dict) -> list:
     """Cap the MCP portion of the tool-schema block to a fraction of the
     LIVE served context window, instead of sending every connected server's
@@ -85,14 +136,21 @@ def _capped_mcp_schemas(mcp_schemas: list, settings: dict) -> list:
     shrink for a session that can afford them, same convention as
     instruments/handlers.py's `_ctx_char_budget`. Only once the full set
     would exceed ~15% of the live window (that fraction chosen to match
-    `_ctx_char_budget`'s existing precedent) do entries degrade to name +
-    first-sentence description, no input_schema — the model must call the
-    ToolSearch builtin to fetch the real parameters before calling an
-    unfamiliar mcp__ tool with arguments, the same deferred-schema pattern
-    Claude Code's own harness uses for its MCP tool surface. This never
-    changes what a tool call actually DOES — the real MCP server still gets
-    whatever arguments the model sends regardless of the schema shown to it,
-    so a model that guesses right on an obvious tool still works fine."""
+    `_ctx_char_budget`'s existing precedent), OR the hard
+    MAX_VISIBLE_DISCOVERED_SCHEMA_BYTES ceiling above, do entries degrade to
+    name + first-sentence description, no input_schema — the model must
+    call the ToolSearch builtin to fetch the real parameters before calling
+    an unfamiliar mcp__ tool with arguments, the same deferred-schema
+    pattern Claude Code's own harness uses for its MCP tool surface. This
+    never changes what a tool call actually DOES — the real MCP server
+    still gets whatever arguments the model sends regardless of the schema
+    shown to it, so a model that guesses right on an obvious tool still
+    works fine.
+
+    Independently of the aggregate budget, any SINGLE schema over
+    MAX_SINGLE_TOOL_SCHEMA_BYTES degrades on its own — one pathological MCP
+    server's giant schema must not force every other server's tools to
+    degrade too."""
     if not mcp_schemas:
         return []
     try:
@@ -101,34 +159,89 @@ def _capped_mcp_schemas(mcp_schemas: list, settings: dict) -> list:
     except Exception:
         ctx = 0
     budget_chars = max(4_000, int(ctx * 0.15 * 4)) if ctx else 30_000
+    budget_chars = min(budget_chars, MAX_VISIBLE_DISCOVERED_SCHEMA_BYTES)
 
     full_chars = sum(len(json.dumps(s)) for s in mcp_schemas)
     if full_chars <= budget_chars:
-        return mcp_schemas
+        # Aggregate fits — still enforce the per-tool ceiling individually.
+        return [
+            schema if len(json.dumps(schema)) <= MAX_SINGLE_TOOL_SCHEMA_BYTES
+            else _light_schema(schema)
+            for schema in mcp_schemas
+        ]
 
-    light = []
-    for schema in mcp_schemas:
-        name = schema.get("name", "")
-        desc = (schema.get("description") or "").strip()
-        first_sentence = desc.split(". ")[0][:160]
-        light.append({
-            "name": name,
+    light = [_light_schema(schema) for schema in mcp_schemas]
+    light_chars = sum(len(json.dumps(x)) for x in light)
+    if light_chars <= budget_chars:
+        return light
+
+    # Degrading every schema was not enough: the NAMES alone still overflow.
+    # Measured live 2026-08-18 , ten MCP servers, 238 tools , degraded schemas
+    # still carried ~17k prompt tokens, and this architecture rejects
+    # --cache-reuse, so the first turn after a restart pays full prefill
+    # (later turns reuse the prefix via slots , measured 99.7% hit). Worse,
+    # on that first turn prefill
+    # cost is super-linear in prompt length (attention is quadratic): the
+    # observed per-2048-token chunk time grew by a steady +9.1 s, so a 23,273
+    # token prompt took a projected 837 s BEFORE the first output token.
+    #
+    # So cap the COUNT too, not just the bytes. This is exactly what ToolSearch
+    # exists for , every withheld tool stays reachable by name or keyword, and
+    # its own description already tells the model to use it.
+    #
+    # Round-robin across servers rather than truncating the list: a plain
+    # head-slice would let whichever server sorts first consume the entire
+    # budget and leave whole servers invisible, which is a far worse failure
+    # than showing fewer tools from each.
+    by_server: "dict[str, list]" = {}
+    for x in light:
+        name = x.get("name", "")
+        server = name.split("__")[1] if name.startswith("mcp__") and "__" in name[5:] else ""
+        by_server.setdefault(server, []).append(x)
+
+    kept, used, queues = [], 0, list(by_server.values())
+    while queues:
+        for q in list(queues):
+            if not q:
+                queues.remove(q)
+                continue
+            cand = q.pop(0)
+            cost = len(json.dumps(cand)) + 1
+            if used + cost > budget_chars:
+                queues.clear()
+                break
+            kept.append(cand)
+            used += cost
+    withheld = len(light) - len(kept)
+    if withheld:
+        kept.append({
+            "name": "_mcp_tools_withheld",
             "description": (
-                f"{first_sentence}. Call ToolSearch(query=\"{name}\") for its "
-                "full parameter schema before calling it with arguments."
+                f"{withheld} more MCP tools are connected but not listed here, to "
+                f"keep the prompt small. Call ToolSearch with a keyword or an "
+                f"exact mcp__server__tool name to fetch any of them."
             ),
             "input_schema": {"type": "object", "properties": {}},
         })
-    return light
+    return kept
 
 
 def _tool_search(mcp_registry, query: str, max_results: int = 6) -> str:
     """Handler for the ToolSearch builtin: look up full MCP tool schemas
     (from the registry's uncapped list, unaffected by _capped_mcp_schemas)
-    by name or description keyword."""
+    by name or description keyword.
+
+    This is a CONTEXT OPTIMIZATION, not an authorization boundary (repeating
+    NemoClaw's own caveat on progressive_tool_disclosure.py verbatim, since
+    the failure mode it warns against is real here too): a model that
+    guesses a withheld tool's exact name and calls it directly, without ever
+    going through ToolSearch, still has that call evaluated by
+    dispatcher.py's policy gate like any other tool call. Narrowing what's
+    VISIBLE in the schema block never narrows what's PERMITTED — those are
+    two independent layers, and this function only ever touches the first."""
     if mcp_registry is None:
         return "No MCP servers connected."
-    q = (query or "").lower().strip()
+    q = (query or "").lower().strip()[:MAX_SEARCH_QUERY_LENGTH]
     if not q:
         return "ToolSearch needs a non-empty query (a tool name or keyword)."
     scored = []
@@ -140,13 +253,33 @@ def _tool_search(mcp_registry, query: str, max_results: int = 6) -> str:
         elif q in desc.lower():
             scored.append((1, schema))
     scored.sort(key=lambda pair: pair[0])
+    total_matched = len(scored)
     matches = [s for _, s in scored[:max_results]]
     if not matches:
         return (
             f"No tools matched '{query}'. Try a shorter or different keyword "
             "(e.g. part of the server name, like 'forge3d' or 'greenboost')."
         )
-    return json.dumps(matches, indent=2)
+    # Tell the model when results were withheld and why (NemoClaw audit,
+    # Phase 3e) — a silent top-N truncation looks identical to "these are
+    # all the matches", which can lead the model to conclude a tool doesn't
+    # exist when it was simply outside the shown slice.
+    withheld = total_matched - len(matches)
+    encoded = json.dumps(matches, indent=2)
+    if len(encoded) > MAX_SEARCH_OUTPUT_BYTES:
+        # Re-encode compactly first; only fall back to a hard truncation
+        # (rare — one match's schema would have to be enormous) if even
+        # that doesn't fit.
+        encoded = json.dumps(matches)
+        if len(encoded) > MAX_SEARCH_OUTPUT_BYTES:
+            encoded = encoded[:MAX_SEARCH_OUTPUT_BYTES] + \
+                "...[truncated — narrow your query for a smaller result set]"
+    if withheld > 0:
+        encoded += (
+            f"\n\n({withheld} more match(es) not shown — refine your query "
+            "to see them.)"
+        )
+    return encoded
 
 
 # ── Event types yielded to the caller ─────────────────────────────────────
@@ -205,6 +338,159 @@ class LoopGuardTriggered:
 
 # ── Main loop ──────────────────────────────────────────────────────────────
 
+
+#: Upper bound on tools run at once. Matches Claude Code's default; the work is
+#: I/O-bound (file reads, greps, fetches), so this is about not drowning the
+#: filesystem, not about CPU.
+_MAX_TOOL_CONCURRENCY = 10
+
+
+def _prefetch_safe_batches(tool_calls, session, settings):
+    """Run consecutive concurrency-safe tool calls ahead of the event loop.
+
+    Returns {index_in_tool_calls: result_string} for calls that were executed
+    here; the main loop yields their events in the original order and picks the
+    result up instead of dispatching again.
+
+    A call is only eligible when it would have run unattended anyway , not an
+    intercept, not blocked by plan mode, and already auto-approved. Anything
+    that would have shown the user an approval card is left to the serial path,
+    so this can never execute something the user has not agreed to, and can
+    never reorder a prompt.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from greenboost_cli.instruments.concurrency import partition_tool_calls
+
+    _INTERCEPTS = ("AskUserQuestion", "ToolSearch")
+    out: dict[int, str] = {}
+    index = {id(tc): i for i, tc in enumerate(tool_calls)}
+
+    def _eligible(tc):
+        if tc["name"] in _INTERCEPTS:
+            return False
+        if _plan_mode_block(tc, session) is not None:
+            return False
+        try:
+            _is_mcp = bool(session.mcp_registry
+                           and session.mcp_registry.has_tool(tc["name"]))
+            return bool(_is_auto_approved(tc, settings, is_mcp=_is_mcp))
+        except Exception:
+            return False
+
+    for safe, batch in partition_tool_calls(
+            tool_calls, mcp_registry=getattr(session, "mcp_registry", None)):
+        if not safe or len(batch) < 2:
+            continue                      # one call gains nothing from a thread
+        runnable = [tc for tc in batch if _eligible(tc)]
+        if len(runnable) < 2:
+            continue
+
+        def _run(tc):
+            return dispatch(
+                tc["name"], tc["input"],
+                approval_mode="accept-all",     # eligibility checked above
+                policy=settings.get("_tool_policy"),
+                agent=settings.get("_agent_label", "main"),
+            )
+
+        with ThreadPoolExecutor(max_workers=min(len(runnable),
+                                                _MAX_TOOL_CONCURRENCY)) as pool:
+            for tc, res in zip(runnable, pool.map(_run, runnable)):
+                out[index[id(tc)]] = res
+    return out
+
+
+def _touched_paths(messages: list) -> list:
+    """Files this session has actually worked on, newest first.
+
+    Drives scope-matched memory recall (AE-10): a memory about the CUDA shim
+    should arrive when the shim is being edited and stay silent otherwise.
+    """
+    out: list = []
+    for m in reversed(messages[-40:]):
+        for tc in (m.get("tool_calls") or ()):
+            fp = (tc.get("input") or {}).get("file_path")
+            if fp and fp not in out:
+                out.append(fp)
+        if m.get("role") == "tool" and m.get("name") in ("Read", "Write", "Edit"):
+            c = str(m.get("content", ""))[:200]
+            for tok in c.split():
+                if "/" in tok and tok not in out:
+                    out.append(tok)
+                    break
+    return out[:20]
+
+
+def _with_recalled_memory(messages: list, user_text: str) -> list:
+    """Append memories that apply to this turn , same placement rule as the
+    pinned plan: at the END, where changing content costs no cache reuse."""
+    try:
+        from greenboost_cli.memory.store import recall, render_block
+        mems = recall(user_text, touched_paths=_touched_paths(messages))
+        block = render_block(mems)
+    except Exception:
+        return messages
+    if not block:
+        return messages
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({
+            "kind": "agent_memory_recall", "status": "ok",
+            "n_items": len(mems), "chars": len(block),
+            "rules": sum(1 for m in mems if m.type == "rule"),
+            "scoped": sum(1 for m in mems if m.scope),
+        })
+    except Exception:
+        pass
+    return list(messages) + [{"role": "user", "content": block}]
+
+
+def _with_pinned_todos(messages: list) -> list:
+    """Append the live todo list as the last thing the model sees.
+
+    A plan is a context-time object, not something the model retains. Measured
+    externally (arXiv 2606.22953), an agent's plan decays several-fold out of
+    hidden state within ONE action-observation cycle, and evicting it cost
+    34.7 percentage points of task success , which re-surfacing it later did
+    not recover. So the todo list has to be IN the request, every request, or
+    it is not in the run at all.
+
+    Two placement rules, and the second is the one that is easy to get wrong:
+
+    1. It goes at the END, not the front. Pinning does not mean "put it first".
+       This block changes whenever a todo changes, and the engine's KV cache is
+       only reusable up to the first token that differs , at the front it would
+       invalidate the entire conversation on every status flip. At the end it
+       invalidates nothing before it.
+    2. It is never written into `session.messages`. It is rendered fresh per
+       request from the live store, so it cannot go stale, be compacted away,
+       or accumulate copies of itself in history.
+
+    Returns `messages` unchanged when there are no todos , an empty pinned
+    block is pure prefix churn for no information.
+    """
+    try:
+        from greenboost_cli.instruments.handlers import _session_todos
+    except Exception:
+        return messages
+    todos = [t for t in (_session_todos or []) if isinstance(t, dict)]
+    if not todos:
+        return messages
+    lines = []
+    for t in todos:
+        status = str(t.get("status", "pending")).lower()
+        mark = {"completed": "x", "in_progress": ">", "in-progress": ">"}.get(status, " ")
+        lines.append(f"- [{mark}] {t.get('content') or t.get('task') or ''}".rstrip())
+    open_n = sum(1 for t in todos
+                 if str(t.get("status", "pending")).lower() not in ("completed", "cancelled"))
+    block = ("<pinned-plan>\n"
+             "Your current todo list (live, re-rendered every turn , not history):\n"
+             + "\n".join(lines)
+             + f"\n{open_n} item(s) still open. Continue with the next open item.\n"
+               "</pinned-plan>")
+    return list(messages) + [{"role": "user", "content": block}]
+
+
 def execute_turn(
     user_message: str,
     session: ConversationSession,
@@ -240,17 +526,56 @@ def execute_turn(
         session.turn_count += 1
         completed: CompletedResponse | None = None
 
+        # A long idle gap means the engine's cache for this conversation is
+        # gone regardless, so this is the one moment when clearing stale tool
+        # output costs nothing. Doing it here means the next active stretch
+        # starts small rather than compacting under pressure mid-task.
+        try:
+            from greenboost_cli.workflow.intelligence import microcompact_if_cold
+            microcompact_if_cold(session, getattr(session, "_last_turn_ts", 0.0))
+        except Exception:
+            pass
+        session._last_turn_ts = time.time()
+
         tool_schemas = list(INSTRUMENT_DEFINITIONS)
         if session.mcp_registry is not None:
-            tool_schemas.extend(_capped_mcp_schemas(session.mcp_registry.tool_schemas, settings))
+            # active_tool_schemas(), not tool_schemas: a server made dormant
+            # for this session keeps running and stays reachable via
+            # ToolSearch, but its schemas are kept OUT of the prompt , which is
+            # where the cost actually is.
+            _adv = session.mcp_registry.active_tool_schemas()
+            tool_schemas.extend(_capped_mcp_schemas(_adv, settings))
 
         _turn_t0 = time.monotonic()
         _first_token_t = None  # set on the first streamed fragment — marks TTFT boundary
         try:
+            _sent = _with_pinned_todos(
+                _with_recalled_memory(session.messages, user_message))
+            # GB-1: name the chunk that moved. Reuse is all-or-nothing from the
+            # first differing token (--cache-reuse is rejected for this hybrid
+            # architecture), so the FIRST chunk to change is the one that threw
+            # away everything after it , and until this ran, a compaction, a
+            # re-rendered system block and a changed tool schema were
+            # indistinguishable slow turns.
+            try:
+                from greenboost_cli.core.prefix import observe as _observe_prefix
+                _observe_prefix({
+                    "system": system_context,
+                    "tools": "".join(str(t.get("name", "")) for t in tool_schemas),
+                    "history": "".join(str(m.get("content", ""))
+                                       for m in session.messages[:-1]),
+                    "memory": "".join(str(m.get("content", "")) for m in _sent
+                                      if str(m.get("content", "")).startswith("<recalled-memory>")),
+                    "plan": "".join(str(m.get("content", "")) for m in _sent
+                                    if str(m.get("content", "")).startswith("<pinned-plan>")),
+                    "user": str(session.messages[-1].get("content", "")) if session.messages else "",
+                })
+            except Exception:
+                pass
             for event in generate(
                 model=settings["model"],
                 system=system_context,
-                messages=session.messages,
+                messages=_sent,
                 tool_schemas=tool_schemas,
                 settings=settings,
             ):
@@ -268,6 +593,42 @@ def execute_turn(
             # response) — this is the "it already happened" counterpart:
             # force-compact once and retry the same user turn.
             from greenboost_cli.inference.adapters import ContextOverflowError
+            # Compaction can only shrink HISTORY. When the prompt's fixed
+            # overhead (system prompt + every connected MCP server's tool
+            # schemas) already exceeds the window on its own, compacting frees
+            # a few hundred tokens, the retry fails identically, and the
+            # operator gets a raw 400 for their trouble. Live 2026-08-18: ten
+            # MCP servers, 238 tools, 29,507 prompt tokens against a 16,384
+            # window for a thirty-word message and an empty history.
+            #
+            # Detect that case from the server's own numbers and explain it
+            # instead of burning the one retry on something that cannot work.
+            if isinstance(_gen_err, ContextOverflowError):
+                _pt = getattr(_gen_err, "prompt_tokens", 0)
+                _nc = getattr(_gen_err, "n_ctx", 0)
+                _hist_chars = sum(len(str(m.get("content", "")))
+                                  for m in session.messages)
+                _hist_tokens = _hist_chars // 4
+                # If dropping the ENTIRE history still would not fit, the
+                # overhead is the problem and no compaction reaches it.
+                if _pt and _nc and (_pt - _hist_tokens) >= _nc:
+                    _fixed = _pt - _hist_tokens
+                    raise ContextOverflowError(
+                        f"This request needs {_pt:,} tokens but the server is "
+                        f"serving a {_nc:,}-token window.\n\n"
+                        f"Roughly {_fixed:,} of those are FIXED overhead , the "
+                        f"system prompt plus the tool schemas of every "
+                        f"connected MCP server , paid on every request no "
+                        f"matter how short your message is. Compacting the "
+                        f"conversation cannot reduce it, which is why "
+                        f"retrying would fail the same way.\n\n"
+                        f"Nothing is broken and nothing was lost , the turn "
+                        f"simply never started.\n\n"
+                        f"Fix it with either:\n"
+                        f"  /llamaserve restart --ctx {max(32768, 1 << (_pt - 1).bit_length())}\n"
+                        f"  /mcp disconnect <server>   (fewer tool schemas)",
+                        prompt_tokens=_pt, n_ctx=_nc,
+                    ) from _gen_err
             if isinstance(_gen_err, ContextOverflowError) and not _auto_compact_done:
                 try:
                     from greenboost_cli.environment.settings import invalidate_gb_synapse_ctx_cache
@@ -478,7 +839,15 @@ def execute_turn(
 
         # ── Execute each requested tool ──────────────────────────────────
         _guard_triggered = False
-        for tc in completed.tool_calls:
+        # Overlap the read-only calls in this batch before replaying the events
+        # in order. Failure here is never fatal: an empty map just means every
+        # call takes the serial path it always did.
+        try:
+            _prefetched = _prefetch_safe_batches(
+                completed.tool_calls, session, settings)
+        except Exception:
+            _prefetched = {}
+        for _tc_idx, tc in enumerate(completed.tool_calls):
             # ── Repeat guard ──────────────────────────────────────────────
             try:
                 call_key = f"{tc['name']}:{json.dumps(tc['input'], sort_keys=True)}"
@@ -526,6 +895,7 @@ def execute_turn(
                 # Questions don't count as errors; reset guards so they never
                 # trip the repeat / consecutive-error limits.
                 consec_errors = 0
+                transient_errors = 0   # timeouts/busy , see the guard below
                 last_key      = ""
                 repeat_count  = 0
                 continue
@@ -563,6 +933,8 @@ def execute_turn(
 
                 if not permitted:
                     result = "Denied: user rejected this operation"
+                elif _tc_idx in _prefetched:
+                    result = _prefetched[_tc_idx]      # already ran, concurrently
                 elif session.mcp_registry and session.mcp_registry.has_tool(tc["name"]):
                     result = session.mcp_registry.call_tool(tc["name"], tc["input"])
                 else:
@@ -570,6 +942,15 @@ def execute_turn(
                         tc["name"],
                         tc["input"],
                         approval_mode="accept-all",   # already gate-checked above
+                        # NemoClaw audit, Phase 3b: settings["_tool_policy"]/
+                        # ["_agent_label"] are private conventions (not
+                        # public settings), set by run_subagent()/
+                        # _invoke_agent() before calling execute_turn(s)ync)
+                        # — absent for the interactive REPL, so this stays a
+                        # no-op there (policy=None -> dispatch()'s own
+                        # PERMISSIVE default).
+                        policy=settings.get("_tool_policy"),
+                        agent=settings.get("_agent_label", "main"),
                     )
 
             # ── Consecutive-error guard ───────────────────────────────────
@@ -580,9 +961,27 @@ def execute_turn(
                 or result.startswith("error:")
             )
             if _is_error:
-                consec_errors += 1
+                # Not every failure is the same kind of failure. A Bash timeout
+                # or a busy device may well succeed on the next attempt; "file
+                # not found" will fail identically forever. Counting both the
+                # same trips the loop guard on a run of transient hiccups while
+                # letting a genuinely stuck sequence run just as long.
+                #
+                # Classification adapted from NemoClaw's validation-recovery
+                # (see instruments/handlers.classify_tool_failure).
+                from greenboost_cli.instruments.handlers import classify_tool_failure
+                _kind, _retryable = classify_tool_failure(result)
+                if _retryable:
+                    # Transient: do not advance the guard, but do not spin
+                    # either , cap how many of these one turn may absorb.
+                    transient_errors += 1
+                    if transient_errors > _TRANSIENT_ERROR_LIMIT:
+                        consec_errors += 1
+                else:
+                    consec_errors += 1
             else:
                 consec_errors = 0
+                transient_errors = 0
             if consec_errors >= _CONSEC_ERROR_LIMIT:
                 yield InstrumentResult(tc["name"], result, permitted)
                 session.messages.append({

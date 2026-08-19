@@ -69,6 +69,36 @@
         continuous view.
   aliases: [t2_pressure, ddr_pressure]
 
+- name: t2_overflow_active_mb
+  entity: pool
+  unit: megabytes
+  doc: >
+    Bytes the shim has actually routed to T2 DDR , "is overflow happening right
+    now". Distinct from t2_pressure_fraction, which is how full the T2 POOL is:
+    on a large pool the two diverge completely (measured 2026-08-17:
+    t2_overflow_total_mb=14326 into a 43 GB pool reading pressure 0.0). This is
+    the signal the Rule #1 tripwire needs , see rule1_underfilled.
+  resolver: t2_overflow_active_mb
+  source_fields:
+    - shim_stats.t2_overflow_total_mb
+  source_tier: measured
+  direction: lower_is_better
+  owner: GB-Tiering
+  aliases:
+    - t2_overflow_mb
+  never_use:
+    - field: t2_pressure
+      why: >
+        Pool FULLNESS, not overflow. A large pool reads low pressure while
+        substantial overflow is in progress, which is exactly how the Rule #1
+        tripwire was silenced on 2026-08-17 (14326 MB overflowing a 43 GB pool
+        at pressure 0.0, VRAM at 69%).
+    - field: t2_allocated_mb
+      why: >
+        The kmod's own allocation counter read 0 in the same sample where the
+        shim reported 14326 MB of live T2 overflow, so it does not track what
+        the shim actually routed.
+
 - name: t2_pressure_fraction
   entity: pool
   unit: fraction_0_1
@@ -239,6 +269,51 @@
   direction: lower_is_better
   owner: GB-Synapse
 
+- name: engine_prefill_ms
+  entity: serve_session
+  unit: milliseconds
+  doc: >-
+    The ENGINE's own prefill duration (llama-server's `timings.prompt_ms`), as
+    opposed to ttft_ms, which is measured by the proxy from request arrival to
+    first content token and therefore also contains queueing behind another
+    slot, proxy overhead, and any unrelated load on the box. Read the two
+    together: ttft_ms minus engine_prefill_ms is everything that was not
+    prefill. Recording only ttft_ms made a slow first token unattributable ,
+    on 2026-08-18 a 68.3 s ttft_ms was measured that had a 32-thread kernel
+    build running concurrently, and no field existed to separate "prefill is
+    slow" from "the box was busy".
+  resolver: engine_prefill_ms
+  source_fields: ["gb_dataflux.prompt_cache.engine_prompt_ms"]
+  source_tier: measured
+  direction: lower_is_better
+  owner: GB-Synapse
+  never_use:
+    - field: gb_dataflux.prompt_cache.ttft_ms
+      why: >
+        Not interchangeable with this metric. ttft_ms is measured by the proxy
+        from request arrival to first content token, so it also contains
+        queueing behind another slot, proxy overhead and unrelated load on the
+        box. Quoting it as "prefill time" is how a 68.3 s first token got
+        attributed to the model on 2026-08-18 when a 32-thread kernel build
+        was running concurrently. Use ttft_ms for what the client waited, this
+        for what prefill cost, and their difference for everything else.
+
+- name: prompt_depth_tokens
+  entity: serve_session
+  unit: count
+  doc: >-
+    Total prompt length of the most recent request, i.e. how deep the
+    conversation is. Prefill cost grows with this even at a near-perfect cache
+    hit rate, which a hit_pct alone cannot show: measured across one session,
+    ttft went 5.4 s at 13.8k reused tokens to 34.2 s at 18.5k, both at 96-99%
+    hit_pct. Any TTFT or tok/s figure quoted without the depth it was measured
+    at is not comparable to another.
+  resolver: prompt_depth_tokens
+  source_fields: ["gb_dataflux.prompt_cache.prompt_tokens"]
+  source_tier: measured
+  direction: neutral
+  owner: GB-Synapse
+
 - name: prompt_cache_hit_pct
   entity: serve_session
   unit: percent
@@ -247,6 +322,43 @@
   source_fields: ["gb_dataflux.prompt_cache.hit_pct"]
   source_tier: measured
   direction: higher_is_better
+  owner: GB-Synapse
+
+- name: slot_pin_rate_pct
+  entity: serve_session
+  unit: percent
+  doc: >
+    GB-1. Share of recent chat requests that were routed back to the engine
+    slot already holding that conversation's KV (`decision` = pinned or
+    pinned-edited), as opposed to being assigned a slot for the first time or
+    displacing another conversation (assigned/reassigned). A long single
+    conversation should sit near 100%; a persistently low value on a box with
+    one active session means the index is not recognising the conversation
+    (identity is the system+tools head plus the first user message), not that
+    the engine is misbehaving.
+  resolver: slot_pin_rate_pct
+  source_fields: ["gb_dataflux.cache_index.decision"]
+  source_tier: measured
+  direction: higher_is_better
+  owner: GB-Synapse
+  never_use:
+    - field: gb_dataflux.prompt_cache.hit_pct
+      why: "Reads as the same question and is not. hit_pct measures how much of ONE request's prefix the engine reused; slot_pin_rate_pct measures whether the request even reached the slot that held that prefix. A conversation evicted from its slot can still show a healthy hit_pct on the shared system-prompt head while having lost every token after it , which is exactly the failure GB-1 exists to catch."
+
+- name: last_edit_chunk
+  entity: serve_session
+  unit: index
+  doc: >
+    GB-1. Index of the first content-addressed chunk that changed on the most
+    recent chat request (chunk 0 is the system prompt + tool schemas, then one
+    chunk per message). `null` means the turn only appended, which is the case
+    that must cost nothing. A low index means an edit landed near the front of
+    the conversation, and everything after it has to be re-prefilled , the
+    measured 4.98x prefill penalty on this box.
+  resolver: last_edit_chunk
+  source_fields: ["gb_dataflux.cache_index.changed_chunk"]
+  source_tier: measured
+  direction: informational
   owner: GB-Synapse
 
 - name: served_ctx
@@ -379,3 +491,283 @@
   source_tier: measured
   direction: higher_is_better
   owner: Health
+
+- name: weights_gb
+  entity: serve_session
+  unit: gigabytes
+  doc: >
+    Weight footprint of the model currently being served, from the manifest
+    entry matched against the live run-state's model+quant. Governed because
+    "do the weights even fit?" is the first question a slow-decode
+    investigation should ask and nothing answered it before: on 2026-08-18 a
+    15.86 GB model on a 12227 MiB card decoded at 2.7-3.5 tok/s, and the only
+    thing the layer offered was five tok_s_drop advisories pointing at a KV
+    lever. Pairs with `weights_dont_fit_vram`.
+  resolver: weights_gb
+  source_fields: ["gb_synapse.ModelEntry.n_bytes"]
+  source_tier: measured
+  direction: informational
+  owner: GB-Synapse
+
+- name: pcie_link_gen_current
+  entity: gpu
+  unit: pcie_generation
+  doc: >
+    PCIe generation the link is negotiated at RIGHT NOW, read live from
+    nvidia-smi, plus the ceiling and the GPU utilization in the same sample so
+    a reading can be interpreted without a second call. Deliberately not
+    GpuTopology.pcie_gen_current, which is probed once at NVML init.
+  resolver: pcie_link_gen_current
+  source_fields: []
+  source_tier: measured
+  direction: informational
+  owner: GB-Tiering
+  never_use:
+    - field: pcie_gen_current
+      why: >
+        GpuTopology samples the link ONCE at telemetry init and caches it for
+        the process lifetime. A GPU downtrains its link to Gen1/Gen2 whenever
+        it is idle and only retrains under load, so the cached value answers
+        "what was the link doing at startup", which is almost never the
+        question. Reading it produced 13 false `pcie_degraded` events on this
+        box (2026-08-18, all claiming gen2 while the link measures Gen4 x16
+        under real load).
+
+- name: idle_vram_held_gb
+  entity: gpu
+  unit: gigabytes
+  doc: >
+    VRAM held by a serve session while the GPU is doing no work (utilization
+    below the busy threshold). Zero when the GPU is busy , this measures DEAD
+    residency, not residency. Governed because it is the number an operator
+    actually reacts to and nothing reported it: measured 2026-08-18, 10.4 GiB
+    of a 12 GB card allocated at 0% utilization, 787 MHz, 23 W, with no signal
+    anywhere saying that memory was reclaimable. Pairs with the
+    `idle_serve_holding_vram` segment and `gb synapse pause`.
+  resolver: idle_vram_held_gb
+  source_fields: []
+  source_tier: measured
+  direction: lower_is_better
+  owner: GB-Synapse
+
+- name: recurrent_replay_ms
+  entity: serve_session
+  unit: milliseconds
+  doc: >
+    Estimated per-turn cost of re-running the recurrent layers over the WHOLE
+    prompt. This architecture is hybrid , 17 attention layers and 48 Gated
+    DeltaNet recurrent layers , and a recurrent layer's state at position t only
+    exists by running every token up to t, so the KV cache can hit 99.9% and the
+    recurrent stack still replays the entire conversation. Measured 2026-08-18
+    over 29 warm turns: median 6,937 ms prefill for a median of 42 new tokens,
+    cost per TOTAL token stable at 0.151 ms while cost per NEW token scattered
+    146-191. DERIVED, not read , the engine reports one prompt_ms with no
+    breakdown; new tokens are charged at this box's cold-prefill rate and the
+    remainder attributed to replay. The largest recoverable per-turn cost here.
+  resolver: recurrent_replay_ms
+  source_fields: ["gb_dataflux.prompt_cache.engine_prompt_ms"]
+  source_tier: derived
+  direction: lower_is_better
+  owner: GB-Synapse
+
+- name: inference_endpoint_is_local
+  entity: serve_session
+  unit: boolean
+  doc: >
+    True when every configured inference endpoint is on hardware the owner
+    controls , loopback, this box, or a feeder on the owner's own LAN. The
+    executable half of CLAUDE.md's Local-First Must-Rule: GreenBoost exists so a
+    27B model runs on a 12 GB card instead of being rented by the token, so a
+    cloud endpoint does not merely leak data, it makes the whole stack pointless
+    for that request. A prose rule cannot notice a config drifting; this resolves
+    the actual serve binds and inference base-url environment variables in play.
+    A LAN feeder counts as local , the cluster fabric is the point of the
+    project, not an escape from it.
+  resolver: inference_endpoint_is_local
+  source_fields: []
+  source_tier: measured
+  direction: informational
+  owner: GB-Synapse
+
+- name: unregistered_cached_models
+  entity: node
+  unit: count
+  doc: >
+    Models whose weights are on disk in the HuggingFace cache but absent from
+    GB-Synapse's manifest , downloaded, paid for in bandwidth and disk, and
+    invisible to `gb`. Governed because this failure presents to the operator
+    as `no such model: <name>` at CLI startup with no hint that the weights are
+    right there: it happened three times on 2026-08-18 (a Full Install purge
+    resets the manifest but leaves `_hf_cache` untouched) and twice left the
+    CLI unable to start at all. Nonzero means `gb_synapse.recover_from_hf_cache()`
+    has work to do; it re-registers from GGUF headers and downloads nothing.
+  resolver: unregistered_cached_models
+  source_fields: ["gb_synapse._load_manifest", "MODEL_STORE_DIR/_hf_cache"]
+  source_tier: measured
+  direction: lower_is_better
+  owner: GB-Synapse
+  never_use:
+    - field: "len(gb_synapse.list_models())"
+      class: incomplete_population
+      why: >
+        The manifest count alone cannot reveal this: a wiped manifest reports a
+        perfectly consistent small number and nothing marks it as wrong. Only
+        comparing it against what is on disk shows the gap.
+
+- name: host_mem_available_gb
+  entity: node
+  unit: gigabytes
+  doc: >
+    Host MemAvailable , the kernel's own estimate of what a new allocation can
+    actually obtain, and the number that decides whether the OOM killer runs.
+    Governed because GreenBoost's T2 pool competes for exactly this pool and
+    nothing in the layer watched it: on 2026-08-18 the OOM killer took the
+    user's terminal twice (27.0 GB and 31.7 GB anon RSS) and the only warning
+    existed in dmesg.
+  resolver: host_mem_available_gb
+  source_fields: ["/proc/meminfo MemAvailable"]
+  source_tier: measured
+  direction: higher_is_better
+  owner: GB-Tiering
+  never_use:
+    - field: "MemFree"
+      class: misleading_proxy
+      why: >
+        MemFree excludes reclaimable page cache, so it reads alarmingly low on a
+        healthy box and says nothing about what an allocation would get. The
+        kmod's own guard compares against MemAvailable; so must this.
+
+- name: t2_oom_guard_state
+  entity: node
+  unit: state
+  doc: >
+    The kernel T2 OOM guard's verdict, from sysfs pool_brief's PRESSURE field.
+    greenboost.ko trips it when host MemAvailable falls under its reserve and
+    begins evicting T2. It fired twice on 2026-08-18, ~10 minutes before each
+    OOM kill, and announced it only to the kernel log.
+  resolver: t2_oom_guard_state
+  source_fields: ["/sys/class/greenboost/greenboost/pool_brief"]
+  source_tier: measured
+  direction: informational
+  owner: GB-Tiering
+  never_use:
+    - field: "dmesg 'T2 OOM guard TRIPPED'"
+      class: log_only_signal
+      why: >
+        The kernel log is not a queryable surface: it is not in dataflux, it is
+        not in this layer, and nothing alerts on it. It carried the only advance
+        warning of both 2026-08-18 OOM kills and nobody saw either one.
+
+- name: proxy_rss_mb
+  entity: node
+  unit: megabytes
+  doc: >
+    Resident memory of the gb-synapse proxy process (gb_synapse_api.py). The
+    proxy is long-lived and runs under an RLIMIT_AS cap, so its own footprint
+    is an operational number, not an implementation detail: on 2026-08-19 an
+    unbounded read_events() memo grew it at ~10.7 MB/s while completely idle
+    until requests began failing with MemoryError mid-generation.
+  resolver: proxy_rss_mb
+  source_fields: ["/proc/<pid>/status VmRSS"]
+  source_tier: measured
+  direction: lower_is_better
+  owner: GB-Synapse
+
+- name: proxy_mem_headroom_pct
+  entity: node
+  unit: percent
+  doc: >
+    Share of the gb-synapse proxy's address-space cap (RLIMIT_AS) still unused.
+    This is the number that predicts "gb-synapse stopped responding while
+    generating": the cap converts a runaway allocation into a MemoryError in
+    one request instead of an OOM kill of the whole session, so the box stays
+    healthy while requests fail, and host-level memory metrics look fine.
+    Resolves to null , never to 100 , when the proxy is not running or carries
+    no cap.
+  resolver: proxy_mem_headroom_pct
+  source_fields: ["/proc/<pid>/status VmRSS", "/proc/<pid>/limits Max address space"]
+  source_tier: measured
+  direction: higher_is_better
+  owner: GB-Synapse
+  never_use:
+    - field: mem_available_mb
+      class: wrong_scope
+      why: >
+        Host MemAvailable answers whether the OOM killer will run, not whether
+        the proxy can allocate. They disagree exactly when it matters: on
+        2026-08-19 the box had 32 GB available while the proxy was raising
+        MemoryError on every request against a 6.15 GiB cap.
+
+- name: agent_eval_overall
+  entity: node
+  unit: score
+  doc: >
+    greenboost-cli's own agent benchmark score, 0-1 (AE-1). The number every
+    other agent-evolution claim is checked against: MCP-Bench puts
+    gemma-3-27b-it at 0.582 and qwen3-30b-a3b at 0.627 against gpt-5 at 0.749,
+    so a local 27B is roughly 80% of frontier on tool use and harness quality,
+    not model choice, is the dominant term.
+  resolver: agent_eval_overall
+  source_fields: ["agent_eval_run.overall"]
+  source_tier: measured
+  direction: higher_is_better
+  owner: GB-CLI
+  never_use:
+    - field: overall
+      class: unit_ambiguous
+      why: >
+        The raw score is meaningless without the model that produced it. The
+        same harness scores differently per checkpoint, so comparing an
+        `overall` across models reads a harness change into what is really a
+        model change. The governed metric carries the model in its raw_source.
+
+- name: agent_hallucinated_tool_pct
+  entity: node
+  unit: percent
+  doc: >
+    Share of tool calls naming a tool the registry does not have (AE-5).
+    PATool's result is that small models fail tool use by schema misalignment,
+    emitting names learned in pretraining rather than the names offered. This
+    repo saw it live: the model emitted a fully-prefixed MCP name against a
+    registry that only knew the bare one.
+  resolver: agent_hallucinated_tool_pct
+  source_fields: ["agent_tool_schema_miss.outcome"]
+  source_tier: measured
+  direction: lower_is_better
+  owner: GB-CLI
+
+- name: agent_compaction_prefix_kept_pct
+  entity: node
+  unit: percent
+  doc: >
+    Share of compactions that preserved the engine's reusable prompt prefix
+    (AE-2). Dataflux has recorded a 97.9% prompt-cache hit on a 64k window
+    here; a compaction that rewrites the prefix throws that away and re-prefills
+    from scratch, which at ~5 tok/s is minutes of wall time per event.
+  resolver: agent_compaction_prefix_kept_pct
+  source_fields: ["agent_context_edit.extended_prior", "agent_context_edit.head_kept"]
+  source_tier: measured
+  direction: higher_is_better
+  owner: GB-CLI
+  never_use:
+    - field: middle_compacted
+      class: wrong_scope
+      why: >
+        It counts how many messages were summarised, which reads like the
+        saving and says nothing about the cost. A compaction can summarise a
+        great many messages and still be a loss if it moved the prefix.
+        extended_prior and head_kept are the fields that answer that.
+
+- name: agent_memory_recall_chars
+  entity: node
+  unit: characters
+  doc: >
+    Characters of recalled memory injected into the last turn (AE-9/10).
+    Recall that grows without bound is memory crowding out the conversation it
+    was supposed to serve, which on a small local window is a direct loss of
+    working context.
+  resolver: agent_memory_recall_chars
+  source_fields: ["agent_memory_recall.chars"]
+  source_tier: measured
+  direction: lower_is_better
+  owner: GB-CLI

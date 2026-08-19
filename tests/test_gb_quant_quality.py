@@ -425,6 +425,85 @@ def test_dp_plan_dataflux_event_carries_planner_field():
     assert event["planner"] == "dp"
 
 
+# ── Role floors merged into the DP planner's excluded set (missing_features.md
+# item (j), torch path) ────────────────────────────────────────────────────
+#
+# The fixture below reproduces item (j)'s actual failure mode: a weight-only
+# Frobenius proxy reports LOW error for an SSM/recurrent tensor even at int4
+# (0.02, comfortably under near_lossless's 3% ceiling) — the exact blind spot
+# the vault evidence describes (SSM errors compound through the recurrence in
+# ways a static weight-only proxy can't see). Without a role floor, DP's pure
+# loss-minimization has no reason to distrust that number and assigns int4 to
+# it. gb_quant_roles.role_from_torch_module() identifies the tensor as "ssm"
+# from its ANCESTOR MODULE CLASS (a _MambaMixer), not from its own leaf name
+# ("mixer.out_proj" contains no ssm-suggestive substring) — precisely the gap
+# item (j) identified on the torch path.
+
+class _MambaMixer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.out_proj = nn.Linear(4096, 4096, bias=False)  # fp8=17u int4=9u
+
+
+class _GenericBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.other_layer = nn.Linear(2048, 2048, bias=False)  # fp8=4u int4=2u
+
+
+class _SsmAndOther(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.mixer = _MambaMixer()
+        self.block = _GenericBlock()
+
+
+_SSM_SENSITIVITY = {
+    "mixer.out_proj": {"fp8": 0.01, 4: 0.02},
+    "block.other_layer": {"fp8": 0.02, 4: 0.90},
+}
+
+
+def test_dp_plan_enforces_ssm_role_floor_against_low_measured_error(monkeypatch):
+    """budget=19u: unconstrained DP minimum-loss combo is
+    mixer@int4(9u)+other@fp8(4u)=13u, loss=.04 (loss-minimizing, well under
+    budget — DP has no byte-saving incentive of its own, so it would only
+    reach this combo if it's genuinely the lowest-loss FEASIBLE one, which it
+    is here). With the ssm floor (>=8 bits) excluding int4/tq3/tq2 for
+    mixer.out_proj, the only way to keep mixer at fp8 (17u) within the same
+    19u budget is to push the non-floored other_layer down to int4 (2u):
+    17+2=19u, loss=.01+.90=.91 — worse total loss, but the floor is a hard
+    constraint, not a preference DP can trade away. This is a genuinely
+    different FEASIBLE plan, not an infeasible-budget fallback to greedy."""
+    monkeypatch.setenv("GB_QUANT_DP_PLAN", "1")
+    module = _SsmAndOther()
+    report = gb_quant.plan_quality(
+        module, target="near_lossless", sensitivity=_SSM_SENSITIVITY,
+        profile=_profile(precisions=(16, "fp8", 4)),
+        t1_budget_gb=19 / 1024, t2_budget_gb=0.0, verbose=False)
+
+    assert report.planner == "dp"
+    assert report.per_layer_bits["mixer.out_proj"] == "fp8"   # floor kept it out of int4
+    assert report.per_layer_bits["block.other_layer"] == 4     # had to compensate
+    assert report.role_breakdown["ssm"]["floor_bits"] == 8
+
+
+def test_role_breakdown_populated_for_greedy_planner_too():
+    """Role floors are only ENFORCED under the DP planner (plan scope), but
+    role_breakdown itself must be populated regardless of which planner ran
+    — it's a visibility field, not an enforcement mechanism."""
+    module = _SsmAndOther()
+    report = gb_quant.plan_quality(
+        module, target="near_lossless", sensitivity=_SSM_SENSITIVITY,
+        profile=_profile(precisions=(16, "fp8", 4)),
+        t1_budget_gb=100.0, t2_budget_gb=100.0, verbose=False)
+
+    assert report.planner == "greedy"
+    assert report.role_breakdown["ssm"]["floor_bits"] == 8
+    assert report.role_breakdown["other"]["floor_bits"] is None
+    assert "bytes_gb" in report.role_breakdown["ssm"]
+
+
 # ── sensitivity_source wiring (missing_features.md item (d)) ──────────────
 #
 # plan_quality's lazy-calibration path (sensitivity=None) previously always

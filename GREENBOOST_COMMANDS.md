@@ -1,7 +1,7 @@
 # GreenBoost Commands
 
 *Full CLI reference for GreenBoost , the CUDA Memory & Compute Orchestrator
-(memory tiering · gb-quant compression · cluster mode) , v3.3. See
+(memory tiering · gb-quant compression · cluster mode) , v3.4. See
 [README.md](README.md) for install/quick-start and [CHANGELOG.md](CHANGELOG.md)
 for what's new.*
 
@@ -15,7 +15,7 @@ command's output straight to an AI assistant or a log pipeline.
 - [🌐 Network cluster (distributed GPU)](#-network-cluster-distributed-gpu)
 - [🩺 Diagnostics](#-diagnostics)
 - [📦 TurboQuant K/V compression](#-turboquant-kv-compression)
-- [🖥️ ggml-2dev (feeder as CUDA device 1)](#️-ggml-2dev-feeder-as-cuda-device-1)
+- [🖥️ ggml-2dev (feeder as CUDA device 1)](#-ggml-2dev-feeder-as-cuda-device-1)
 - [🧠 gb-synapse (HuggingFace-native, cluster-distributed GGUF serving)](#-gb-synapse-huggingface-native-cluster-distributed-gguf-serving)
 - [⚡ Inference configuration](#-inference-configuration)
 - [📡 Live debug signals](#-live-debug-signals)
@@ -127,7 +127,7 @@ pulls GGUFs straight from any HuggingFace repo (gated or public, given a
 token), serves them with a matched llama.cpp build on every cluster node
 using llama.cpp's own `--rpc` backend for the cross-node split (real
 layer-granular tensor split, only activations cross the wire), and puts an
-Ollama + OpenAI + HuggingFace-TGI compatible API on one port (`:11435`) so
+Ollama + OpenAI + HuggingFace-TGI compatible API on one port (`:11369`) so
 existing tooling doesn't notice the difference. The GreenBoost shim still
 runs on every node underneath it, extending each node's own VRAM slice into
 that node's local RAM/disk , RPC owns the boundary *between* machines, the
@@ -135,7 +135,7 @@ shim owns the tiers *within* each one.
 
 | Command | Description |
 |---|---|
-| `greenboost doctor [--llm]` | Cluster hardware view: host + feeder GPU/RAM, aggregate VRAM/RAM, engine build status, HF token status |
+| `greenboost doctor [--llm\|--json]` | Cluster hardware view: host + feeder GPU/RAM, aggregate VRAM/RAM, engine build status, HF token status. `--json` (NemoClaw audit, Phase 6b) is a DIFFERENT, whole-stack readiness-contract report (`gb_readiness.py`, schema `schemas/readiness.schema.json`) — exits with the report's own status-mapped code (0/2/3), not always 0 |
 | `greenboost recommend [ctx] [--llm]` | Fit + throughput estimate for every pulled model against the live cluster VRAM budget |
 | `sudo greenboost synapse login [TOKEN]` | Store a HuggingFace token (masked prompt if omitted, or set `HF_TOKEN`) |
 | `sudo greenboost pull <repo>[:quant] [name]` | Download a GGUF from HuggingFace; auto-picks the largest quant that fits the cluster if none given |
@@ -145,7 +145,7 @@ shim owns the tiers *within* each one.
 | `sudo greenboost synapse index-ollama` | Register every GGUF Ollama has already downloaded so `synapse list`/`recommend` see them |
 | `sudo greenboost synapse build-engine` | Build llama-server/llama-cli/rpc-server from the vendored `greenboost-sources/llama.cpp` (CUDA+RPC). Must run on every cluster node - binaries are not portable across CPU vendors |
 | `sudo greenboost synapse update-engine` | Fetch the latest `ggml-org/llama.cpp` and rebuild |
-| `greenboost synapse run <model> [port]` | Serve a model: starts feeder `rpc-server`(s) if online, computes `--tensor-split` from real free VRAM, launches `llama-server --rpc` + the API proxy (Ollama + OpenAI + HuggingFace TGI endpoints) on `:11435` |
+| `greenboost synapse run <model> [port]` | Serve a model: starts feeder `rpc-server`(s) if online, computes `--tensor-split` from real free VRAM, launches `llama-server --rpc` + the API proxy (Ollama + OpenAI + HuggingFace TGI endpoints) on `:11369` |
 | `greenboost synapse stop <model>` | Stop a running gb-synapse server |
 | `greenboost synapse ps [--llm]` | Running gb-synapse servers (TUI loop when interactive) |
 
@@ -353,7 +353,7 @@ also available directly:
 
 | Command | Description |
 |---|---|
-| `gb` (or `greenboost-cli`) | Open the agentic terminal client , gb-synapse-only backend on `:11435` |
+| `gb` (or `greenboost-cli`) | Open the agentic terminal client , gb-synapse-only backend on `:11369` |
 | `gb -p "<prompt>" [-m model]` | One-shot prompt through gb-synapse (cross-GPU split when serving with `--rpc`) |
 | `gb <headless-subcommand>` | Script-friendly JSON subcommands: `rag-search`, `rag-status`, `tokens`, `skill-list`, `plan-list`, `convert`, `compress`, … |
 | `sudo greenboost install-cli` | (Re-)install just the CLI (venv under `/usr/local/lib/greenboost/cli-venv` + `/usr/local/bin/gb`) |
@@ -365,5 +365,5 @@ also available directly:
 1. `greenboost_overview()` / `flux_health()` (greenboost-orchestrator MCP) , know the system, confirm the loop is closed.
 2. Pick model + precision: `quant_advisor()` or `greenboost synapse recommend` , fp8 quality floor; below-fp8 only with the surfaced tradeoff.
 3. Serve on the cluster: `greenboost synapse serve <model>` (llama.cpp `--rpc` tensor-split: host GPU + feeder GPU, feeder share backed by feeder VRAM→DDR via the feeder shim).
-4. Query from the host, fully offline: `gb -p "…"`, any ollama client, or ai-forge pipelines via `FORGE_OLLAMA_URL=http://127.0.0.1:11435`.
+4. Query from the host, fully offline: `gb -p "…"`, any ollama client, or ai-forge pipelines via `FORGE_OLLAMA_URL=http://127.0.0.1:11369`.
 5. Watch the dataflux: `greenboost dataflux-ui` or the `greenboost-dataflux` MCP (`dataflux_tok_s`, `dataflux_models`).
