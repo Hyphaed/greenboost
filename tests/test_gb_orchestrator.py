@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
 from gb_orchestrator import ReactiveOrchestrator, GpuHealth
-from gb_telemetry import GpuMetrics, GbPoolInfo
+from gb_telemetry import GpuMetrics, GbPoolInfo, NVML_CLOCKS_THROTTLE_REASON_HW_SLOWDOWN
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -676,6 +676,10 @@ def test_do_kv_grow_clamp_path_fires_when_headroom_partial(orch):
     # weights floor is now %-of-VRAM derived (18%) — pin it so the arithmetic
     # in this test stays machine-independent.
     orch._weights_floor_mb = 2048
+    # kv_step_mb is likewise topology-derived (gb_topology.TopologyProfile) ,
+    # pin it too so "< kv_step_mb=512" in the docstring stays true regardless
+    # of the machine this test runs on.
+    orch._kv_step_mb = 512
     orch._ctrl._last["kv_reserve_mb"] = (3072, 0)
 
     for _ in range(25):
@@ -1321,12 +1325,20 @@ def test_loop_h_does_not_actuate_levers():
 
 # ── Loop I , SM clock throttle ────────────────────────────────────────────────
 
-def _feed_clock(o, sm_clock_mhz, count=1):
-    """Feed N polls of sm_clock_mhz through on_metrics."""
+def _feed_clock(o, sm_clock_mhz, count=1, throttle_reasons=0):
+    """Feed N polls of sm_clock_mhz through on_metrics.
+
+    throttle_reasons is the NVML clocks-throttle-reason bitmask , clock_throttled
+    is now driven by is_real_throttle(m.throttle_reasons) (the authoritative
+    hw signal), not the sm_clock_mhz drop ratio, which is advisory-only. Pass a
+    real reason (e.g. NVML_CLOCKS_THROTTLE_REASON_HW_SLOWDOWN) to simulate an
+    actual throttle condition.
+    """
     from gb_telemetry import GpuMetrics
     for _ in range(count):
         m = _make_metrics()
         m.sm_clock_mhz = sm_clock_mhz
+        m.throttle_reasons = throttle_reasons
         o.on_metrics(m)
 
 
@@ -1347,15 +1359,17 @@ def test_loop_i_no_fire_before_warmup():
 
 
 def test_loop_i_sets_clock_throttled_after_confirm():
-    """After warmup + enough low-clock polls, clock_throttled=True.
+    """After warmup + enough polls carrying a real NVML throttle reason,
+    clock_throttled=True.
 
-    EWMA α=1/6 is deliberately slow. With drop_pct ≈ 18.8% (2100 of 2587 MHz),
-    the EMA crosses the 12% entry threshold after ~6 post-warmup polls; 10 polls
-    gives headroom against confirm=2 rounding.
+    clock_throttled is driven by is_real_throttle(m.throttle_reasons) (the
+    authoritative hw-bitmask signal, confirm=2) , sm_clock_mhz/drop_pct is
+    advisory-only (KV-step sizing), so the throttle reason must actually be
+    set to flip the flag.
     """
     o = _make_orch_no_io()
     _feed_clock(o, 2587, 3)   # warmup: poll 3 feeds drop=0.0 to signal
-    _feed_clock(o, 2100, 10)  # EMA converges to ~15% after 10 polls at 18.8%
+    _feed_clock(o, 2100, 10, throttle_reasons=NVML_CLOCKS_THROTTLE_REASON_HW_SLOWDOWN)
     assert o.clock_throttled is True
 
 
@@ -1674,11 +1688,16 @@ def test_loop_j_last_phase_in_dump():
 
 # ── Loop K , post-throttle KV restore ────────────────────────────────────────
 
-def _feed_clock_and_pressure(o, mhz, pressure_ratio, count):
-    """Feed clock + KV pressure polls to drive both Loop I and Loop C signals."""
+def _feed_clock_and_pressure(o, mhz, pressure_ratio, count, throttle_reasons=0):
+    """Feed clock + KV pressure polls to drive both Loop I and Loop C signals.
+
+    See _feed_clock's docstring , throttle_reasons drives clock_throttled now,
+    sm_clock_mhz only drives the advisory drop-ratio EMA used for KV-step sizing.
+    """
     for _ in range(count):
         m = _make_metrics(kv_reserve_mb=512, kv_used_mb=int(512 * pressure_ratio))
         m.sm_clock_mhz = mhz
+        m.throttle_reasons = throttle_reasons
         m.shim_phase = "INFERENCE"
         o.on_metrics(m)
 
@@ -1694,8 +1713,10 @@ def test_loop_k_deferred_grow_after_clock_recovery():
     # Phase 1: warmup at full clock to establish sm_clock_max
     _feed_clock_and_pressure(o, 2850, 0.50, 5)
 
-    # Phase 2: throttled + high KV pressure (but Clock I blocks the grow)
-    _feed_clock_and_pressure(o, 2300, 0.95, 15)  # ~19% drop → clock_throttled=True
+    # Phase 2: throttled (real NVML hw-slowdown reason) + high KV pressure
+    # (but Clock I blocks the grow)
+    _feed_clock_and_pressure(o, 2300, 0.95, 15,
+                              throttle_reasons=NVML_CLOCKS_THROTTLE_REASON_HW_SLOWDOWN)
 
     assert o.clock_throttled is True
 
@@ -1725,8 +1746,9 @@ def test_loop_k_no_grow_when_kv_pressure_not_in_hysteresis():
 
     # Warmup max clock
     _feed_clock_and_pressure(o, 2850, 0.20, 5)  # low pressure
-    # Throttle
-    _feed_clock_and_pressure(o, 2300, 0.20, 15)  # still low pressure
+    # Throttle (real NVML hw-slowdown reason)
+    _feed_clock_and_pressure(o, 2300, 0.20, 15,  # still low pressure
+                              throttle_reasons=NVML_CLOCKS_THROTTLE_REASON_HW_SLOWDOWN)
     assert o.clock_throttled is True
 
     kv_before_recovery = ctrl._last.get("kv_reserve_mb", (0, 0))[0]
@@ -1753,9 +1775,10 @@ def test_loop_k_blocked_during_idle_phase():
     o = _make_orch_no_io(ctrl=ctrl)
     o._total_vram_mb = 12288
 
-    # Warmup + throttle with high KV pressure
+    # Warmup + throttle (real NVML hw-slowdown reason) with high KV pressure
     _feed_clock_and_pressure(o, 2850, 0.95, 5)
-    _feed_clock_and_pressure(o, 2300, 0.95, 15)
+    _feed_clock_and_pressure(o, 2300, 0.95, 15,
+                              throttle_reasons=NVML_CLOCKS_THROTTLE_REASON_HW_SLOWDOWN)
     assert o.clock_throttled is True
 
     kv_after_throttle = ctrl._last.get("kv_reserve_mb", (0, 0))[0]

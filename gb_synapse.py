@@ -52,6 +52,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -63,8 +64,12 @@ _REPO_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_REPO_DIR))
 
 import gb_cluster
+import gb_ports
 import gb_synapse_backends
+import gb_wait
+from gb_phase_activity import mark_phase_activity
 from gb_gguf_tensor_map import _load_gguf_reader
+from gb_state_io import atomic_write_json, update_json_locked
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -129,7 +134,13 @@ MANIFEST_FILE = MODEL_STORE_DIR / "manifest.json"
 RUN_DIR = Path(os.environ.get("GB_SYNAPSE_RUN_DIR", "/run/greenboost/synapse"))
 SLOT_DIR = Path(os.environ.get("GB_SYNAPSE_SLOT_DIR", "/var/lib/greenboost/synapse/slots"))
 
-DEFAULT_PORT = int(os.environ.get("GB_SYNAPSE_PORT", "11435"))
+# 11369, not 11435 (2026-08-05): NemoClaw's own Ollama auth proxy defaults
+# to 11435 (OLLAMA_PROXY_PORT) and that port sits in its bundled host-gateway
+# allowlist, so a box running both used to silently collide — moved off it
+# rather than asking every NemoClaw install to move instead. See
+# docs/nemoclaw-and-greenboost.md.
+# Validated centrally by gb_ports.py; import here to avoid double-parsing.
+DEFAULT_PORT = gb_ports.SYNAPSE_PORT
 RPC_PORT_BASE = 50052
 _SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
              "-o", "StrictHostKeyChecking=accept-new"]
@@ -295,6 +306,40 @@ def _preflight_build_tools(need_nvcc: bool = True) -> None:
         + "\n  " + "\n  ".join(hints))
 
 
+def _restore_build_dir_ownership(build_dir: "Path") -> None:
+    """Give the build tree back to the invoking user after a root build.
+
+    Full Install runs as root but builds INSIDE the user's own source
+    checkout, so every artifact lands root-owned. The next non-root
+    `cmake --build` then cannot overwrite them and dies with a linker/permission
+    error that names no cause , found 2026-08-18 with 511 root-owned files under
+    third_party/llama.cpp/build-synapse, which made the engine unbuildable for
+    anyone but root and cost an hour of chasing a phantom compile error.
+
+    Best-effort and silent on failure: a build that succeeded must not be
+    reported as failed because a chown did not stick.
+    """
+    import pwd
+
+    sudo_user = os.environ.get("SUDO_USER")
+    if not sudo_user or os.geteuid() != 0:
+        return          # not a root build on someone else's tree
+    try:
+        pw = pwd.getpwnam(sudo_user)
+    except KeyError:
+        return
+    for root, dirs, files in os.walk(build_dir):
+        for name in dirs + files:
+            try:
+                os.lchown(os.path.join(root, name), pw.pw_uid, pw.pw_gid)
+            except OSError:
+                pass
+    try:
+        os.lchown(build_dir, pw.pw_uid, pw.pw_gid)
+    except OSError:
+        pass
+
+
 def build_engine(src_dir: Path = ENGINE_SRC_DIR, install_dir: Path = ENGINE_DIR,
                   jobs: int | None = None) -> dict:
     """CMake-build llama-server, llama-cli, rpc-server, and llama-quantize
@@ -309,6 +354,13 @@ def build_engine(src_dir: Path = ENGINE_SRC_DIR, install_dir: Path = ENGINE_DIR,
 
     llama-quantize is what lets pull() serve HF repos with no GGUF release —
     see _pull_and_convert().
+
+    llama-imatrix and llama-perplexity (added for missing_features.md item
+    (j), the component-sensitivity-gated quantization plan): an importance
+    matrix is what makes the IQ2/IQ3 quant types worth using at all, and
+    llama-perplexity gives a quantitative quality reading alongside the
+    gb_aviary quality gates when validating a per-tensor requantize. Neither
+    was a build target before this — see gb_gguf_plan.py.
     """
     _preflight_build_tools(need_nvcc=True)
     src_dir = Path(src_dir)
@@ -330,7 +382,21 @@ def build_engine(src_dir: Path = ENGINE_SRC_DIR, install_dir: Path = ENGINE_DIR,
           # fails outright without them.
           "-DLLAMA_BUILD_TESTS=OFF",
           "-DLLAMA_BUILD_EXAMPLES=OFF",
-          "-DLLAMA_BUILD_APP=OFF"])
+          "-DLLAMA_BUILD_APP=OFF",
+          # The embedded Web UI defaults ON upstream and, with
+          # LLAMA_USE_PREBUILT_UI also ON, expects assets fetched from a
+          # HuggingFace bucket. Those assets are not vendored here (see NOTICE)
+          # and LLAMA_CURL=OFF above means nothing can fetch them, so the
+          # `ui-assets` target dies with a bare "No such file or directory" and
+          # takes llama-server down with it , the engine could not be rebuilt
+          # from source AT ALL. Found 2026-08-18 while deploying a
+          # llama-kv-cache change: the installed binaries still worked because
+          # they predated the UI target appearing in the vendored tree, so the
+          # breakage was invisible until someone actually rebuilt.
+          #
+          # gb-synapse already serves with --no-webui, so this builds nothing
+          # it would ever use.
+          "-DLLAMA_BUILD_UI=OFF"])
     # Upstream's CMake target for the RPC server is "ggml-rpc-server" (the
     # binary was renamed at some point; the source file is still
     # tools/rpc/rpc-server.cpp). gb-synapse keeps installing it AS
@@ -339,11 +405,14 @@ def build_engine(src_dir: Path = ENGINE_SRC_DIR, install_dir: Path = ENGINE_DIR,
     # rename map below.
     _run(["cmake", "--build", str(build_dir), "--config", "Release",
           "--target", "llama-server", "llama-cli", "ggml-rpc-server", "llama-quantize",
+          "llama-imatrix", "llama-perplexity",
           "-j", str(jobs)])
+    _restore_build_dir_ownership(build_dir)
 
     install_dir.mkdir(parents=True, exist_ok=True)
     install_map = {"llama-server": "llama-server", "llama-cli": "llama-cli",
-                   "ggml-rpc-server": "rpc-server", "llama-quantize": "llama-quantize"}
+                   "ggml-rpc-server": "rpc-server", "llama-quantize": "llama-quantize",
+                   "llama-imatrix": "llama-imatrix", "llama-perplexity": "llama-perplexity"}
     for built_name, installed_name in install_map.items():
         built = build_dir / "bin" / built_name
         if not built.exists():
@@ -379,7 +448,7 @@ def status() -> dict:
     """Gb-Synapse status in one dict: engine built (llama-server + rpc-server
     present in ENGINE_DIR) + version, and whether a gb-synapse llama-server
     and/or the gb-synapse Ollama/OpenAI proxy (gb_synapse_api, default port
-    11435, GB_SYNAPSE_PORT) are running now.
+    11369, GB_SYNAPSE_PORT) are running now.
 
     Single source of truth for the `synapse_status` MCP tools (gb_dataflux_mcp,
     gb_synapse_mcp, gb_mcp) and the `status` CLI verb. Matches gb-synapse's OWN
@@ -501,10 +570,37 @@ class ModelEntry:
 
 
 def _load_manifest() -> dict[str, ModelEntry]:
+    """Read the model manifest, tolerating a damaged entry.
+
+    Per-ENTRY error handling, deliberately. This used to wrap the whole loop in
+    one try/except that caught TypeError and returned `{}` , so a single entry
+    carrying a field this build's ModelEntry does not know about silently
+    discarded EVERY registration. list_models() then merged in its Ollama
+    re-scan and re-persisted, so a plain READ permanently erased every
+    HF-pulled model from disk.
+
+    Measured 2026-08-18: two models vanished this way, one of them a 21.27 GiB
+    download that had just been registered successfully. `list_models()` is
+    called by `ps`, `doctor`, `recommend` and the serve path, so the window
+    between "pulled" and "gone" is however long it takes anything to ask what
+    models exist. Nothing was logged, and the manifest's mtime was the only
+    evidence a read had rewritten it.
+
+    A bad entry is now skipped and named on stderr; the rest survive. Losing
+    one registration is a nuisance, losing all of them destroys hours of
+    downloads.
+    """
     try:
         raw = json.loads(MANIFEST_FILE.read_text())
-        out = {}
-        for k, v in raw.items():
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, ModelEntry] = {}
+    for k, v in raw.items():
+        try:
+            if not isinstance(v, dict):
+                raise TypeError(f"entry is {type(v).__name__}, expected dict")
             if v.get("engine") in ("gbquant", "vllm", "transformers"):
                 # Pre-torch-core manifests: "gbquant" (pre-taxonomy),
                 # "vllm", and "transformers" all meant "whatever backend
@@ -515,17 +611,90 @@ def _load_manifest() -> dict[str, ModelEntry]:
                 # constructs a ModelEntry directly.
                 v = {**v, "engine": "torch"}
             out[k] = ModelEntry(**v)
-        return out
-    except (OSError, json.JSONDecodeError, TypeError):
-        return {}
+        except (TypeError, ValueError) as e:
+            # Named, not swallowed: a silently-dropped model is indistinguishable
+            # from one that was never pulled, which is how this went unnoticed.
+            print(f"[gb-synapse] manifest entry {k!r} could not be read and was "
+                  f"skipped ({e}); other entries are unaffected. Re-pull that "
+                  f"model to restore it.", file=sys.stderr)
+            continue
+    return out
+
+
+import contextlib as _contextlib
+
+
+@_contextlib.contextmanager
+def manifest_lock(timeout_s: float = 30.0):
+    """Exclusive lock around a manifest read-modify-write.
+
+    The manifest is edited by read-modify-write from several places at once ,
+    `pull()`, `serve()`'s resolution path, `list_models()`'s Ollama re-persist ,
+    and without a lock those races are lost updates, not corruption: the later
+    writer saves a dict it loaded BEFORE the earlier writer's addition, and the
+    addition simply disappears.
+
+    That is not theoretical. On 2026-08-18 registrations vanished three separate
+    times while a serve or benchmark ran alongside a pull, twice breaking the
+    CLI with `no such model` for an alias that had been registered minutes
+    earlier. Nothing was logged, because from each process's point of view its
+    own write succeeded.
+
+    Uses a sidecar lock file so the lock outlives the atomic replace of the
+    manifest itself (locking the manifest inode would be released the moment
+    atomic_write_json renames a new file over it).
+    """
+    import fcntl, time as _t
+    lock_path = MANIFEST_FILE.with_suffix(".lock")
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        yield          # unwritable store , caller's own error handling applies
+        return
+    deadline = _t.monotonic() + timeout_s
+    fh = None
+    try:
+        fh = open(lock_path, "a+")
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if _t.monotonic() >= deadline:
+                    # Proceed unlocked rather than failing the operation: a
+                    # stuck lock must not make the tool unusable, and the
+                    # pre-lock behaviour is what we had before anyway.
+                    print(f"[gb-synapse] manifest lock busy for {timeout_s:.0f}s; "
+                          f"proceeding without it", file=sys.stderr)
+                    break
+                _t.sleep(0.05)
+        yield
+    finally:
+        if fh is not None:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            fh.close()
+
+
+def update_manifest(mutate) -> dict:
+    """Load, apply `mutate(entries)`, and save , all under one lock.
+
+    The only safe way to change the manifest. `mutate` receives the freshly
+    loaded dict and edits it in place; anything it does not touch is preserved
+    even if another process added it moments ago.
+    """
+    with manifest_lock():
+        entries = _load_manifest()
+        mutate(entries)
+        _save_manifest(entries)
+        return entries
 
 
 def _save_manifest(entries: dict[str, ModelEntry]) -> None:
     try:
-        MODEL_STORE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = MANIFEST_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps({k: asdict(v) for k, v in entries.items()}, indent=2))
-        tmp.rename(MANIFEST_FILE)  # atomic swap, same pattern as cmd_connect's cluster.conf write
+        atomic_write_json(MANIFEST_FILE, {k: asdict(v) for k, v in entries.items()})
     except PermissionError as e:
         raise PermissionError(
             f"cannot write to {MODEL_STORE_DIR} ({e}). One-time fix (run once as root):\n"
@@ -609,15 +778,50 @@ def _convert_hf_to_gguf(local_dir: str, out_path: Path, outtype: str = "bf16") -
     _run([sys.executable, str(script), local_dir, "--outfile", str(out_path), "--outtype", outtype])
 
 
-def _quantize_gguf(src_path: Path, dst_path: Path, quant: str) -> None:
+def _quantize_gguf(src_path: Path, dst_path: Path, quant: str,
+                    tensor_types: "Path | None" = None,
+                    output_tensor_type: "str | None" = None,
+                    allow_requantize: bool = False,
+                    dry_run: bool = False) -> "subprocess.CompletedProcess | None":
     """Quantize an unquantized GGUF with the vendored llama-quantize binary
-    (built by build_engine() alongside llama-server)."""
+    (built by build_engine() alongside llama-server).
+
+    `tensor_types`/`output_tensor_type`/`allow_requantize`/`dry_run`
+    (missing_features.md item (j)): the per-tensor override path built by
+    gb_gguf_plan.py. All four default to the prior behavior exactly (a
+    flat, whole-file `quant` string, no overrides) when left unset —
+    existing callers of this function are unaffected.
+
+    `allow_requantize` MUST be set when `src_path` is already quantized
+    (e.g. the Q8_0 source item (j)'s plan requires — see gb_gguf_plan.py's
+    module docstring for why no f16/bf16 source exists for the reference
+    model family) — llama-quantize refuses to requantize an already-
+    quantized tensor without this flag, per its own --help text warning
+    about quality loss doing so.
+
+    `dry_run` (llama-quantize's own `--dry-run`) reports what WOULD be
+    written without touching disk — verify a plan's predicted byte
+    accounting against the real tool's own numbers before spending a real
+    requantize pass on a 15-30 GB file. Returns the CompletedProcess (with
+    captured stdout) when `dry_run=True`, so the caller can parse it;
+    returns None for a real (non-dry-run) quantize, matching this
+    function's prior return contract."""
     binary = ENGINE_DIR / "llama-quantize"
     if not binary.exists():
         raise RuntimeError(f"llama-quantize not built — run: greenboost synapse build-engine "
                             f"(missing: {binary})")
     dst_path.parent.mkdir(parents=True, exist_ok=True)
-    _run([str(binary), str(src_path), str(dst_path), quant])
+    cmd = [str(binary)]
+    if allow_requantize:
+        cmd.append("--allow-requantize")
+    if output_tensor_type:
+        cmd += ["--output-tensor-type", output_tensor_type]
+    if tensor_types is not None:
+        cmd += ["--tensor-type-file", str(tensor_types)]
+    if dry_run:
+        cmd.append("--dry-run")
+    cmd += [str(src_path), str(dst_path), quant]
+    return _run(cmd, capture=dry_run)
 
 
 def _merge_lora_adapter(adapter_dir: str, dest_dir: Path) -> str:
@@ -684,10 +888,11 @@ def _pull_and_convert(repo: str, quant: str, name: str | None) -> ModelEntry:
 
     print(f"  [gb-synapse] no GGUF release for {repo} — downloading safetensors "
           f"for on-the-fly conversion (much larger than a GGUF pull)", flush=True)
-    local_dir = snapshot_download(
-        repo_id=repo, token=hf_token(), cache_dir=cache_dir,
-        allow_patterns=["*.safetensors", "*.json", "*.model", "*.txt", "tokenizer*"],
-    )
+    with mark_phase_activity(f"downloading {repo} safetensors from HuggingFace"):
+        local_dir = snapshot_download(
+            repo_id=repo, token=hf_token(), cache_dir=cache_dir,
+            allow_patterns=["*.safetensors", "*.json", "*.model", "*.txt", "tokenizer*"],
+        )
 
     if (Path(local_dir) / "adapter_config.json").exists():
         local_dir = _merge_lora_adapter(local_dir, converted_dir / f"{safe_stem}.merged")
@@ -707,9 +912,10 @@ def _pull_and_convert(repo: str, quant: str, name: str | None) -> ModelEntry:
     entry_name = name or repo.split("/")[-1]
     entry = ModelEntry(name=entry_name, path=str(quant_path), source="hf", repo=repo,
                         added_ts=time.time(), **meta)
-    manifest = _load_manifest()
-    manifest[entry_name] = entry
-    _save_manifest(manifest)
+    # Locked: concurrent pull/serve/list_models all read-modify-write this file,
+    # and an unlocked race is a LOST UPDATE, not corruption — three registrations
+    # disappeared that way on 2026-08-18. See manifest_lock().
+    update_manifest(lambda m: m.__setitem__(entry_name, entry))
     return entry
 
 
@@ -811,11 +1017,12 @@ def _pull_torch(repo: str, quant: str, name: str | None, engine: str = "torch") 
     _check_torch_engine_capability(repo, engine)
     snapshot_download = _require_huggingface_hub().snapshot_download
     cache_dir = str(MODEL_STORE_DIR / "_hf_cache")
-    local_dir = snapshot_download(
-        repo_id=repo, token=hf_token(), cache_dir=cache_dir,
-        allow_patterns=["*.safetensors", "*.bin", "*.json", "*.model", "*.txt", "tokenizer*"],
-        ignore_patterns=["training_args.bin"],
-    )
+    with mark_phase_activity(f"downloading {repo} safetensors from HuggingFace"):
+        local_dir = snapshot_download(
+            repo_id=repo, token=hf_token(), cache_dir=cache_dir,
+            allow_patterns=["*.safetensors", "*.bin", "*.json", "*.model", "*.txt", "tokenizer*"],
+            ignore_patterns=["training_args.bin"],
+        )
     entry_name = name or repo.split("/")[-1]
     meta = safetensors_summary(local_dir)
     checkpoint_quant = meta.get("quant_method", "")
@@ -830,9 +1037,10 @@ def _pull_torch(repo: str, quant: str, name: str | None, engine: str = "torch") 
         quant_token = requested or "BF16"
     entry = ModelEntry(name=entry_name, path=local_dir, source="hf", repo=repo,
                         engine=engine, quant=quant_token, added_ts=time.time(), **meta)
-    manifest = _load_manifest()
-    manifest[entry_name] = entry
-    _save_manifest(manifest)
+    # Locked: concurrent pull/serve/list_models all read-modify-write this file,
+    # and an unlocked race is a LOST UPDATE, not corruption — three registrations
+    # disappeared that way on 2026-08-18. See manifest_lock().
+    update_manifest(lambda m: m.__setitem__(entry_name, entry))
     return entry
 
 
@@ -863,16 +1071,18 @@ def _pull_diffusers(repo: str, name: str | None) -> ModelEntry:
         )
     except Exception:
         cache_dir = str(MODEL_STORE_DIR / "_hf_cache")
-        local_dir = snapshot_download(
-            repo_id=repo, token=hf_token(), cache_dir=cache_dir,
-            allow_patterns=patterns,
-        )
+        with mark_phase_activity(f"downloading {repo} from HuggingFace"):
+            local_dir = snapshot_download(
+                repo_id=repo, token=hf_token(), cache_dir=cache_dir,
+                allow_patterns=patterns,
+            )
     entry_name = name or repo.split("/")[-1]
     entry = ModelEntry(name=entry_name, path=local_dir, source="hf", repo=repo,
                         engine="diffusers", quant="fp8", added_ts=time.time())
-    manifest = _load_manifest()
-    manifest[entry_name] = entry
-    _save_manifest(manifest)
+    # Locked: concurrent pull/serve/list_models all read-modify-write this file,
+    # and an unlocked race is a LOST UPDATE, not corruption — three registrations
+    # disappeared that way on 2026-08-18. See manifest_lock().
+    update_manifest(lambda m: m.__setitem__(entry_name, entry))
     return entry
 
 
@@ -938,11 +1148,58 @@ def pull(repo_spec: str, name: str | None = None, engine: str = "") -> ModelEntr
             available = sorted({_quant_from_filename(f["filename"]) for f in files} - {""})
             raise RuntimeError(f"no GGUF matching quant {quant!r} in {repo}; "
                                 f"available: {', '.join(available) or 'unknown'}")
+        if len(matches) > 1:
+            # Refuse to guess. Quant matching is a plain substring test, and
+            # this repo family ships names where one request matches several
+            # files: "MTP-IQ4_XS" matches BOTH
+            # "...NEO-MAX-NEO-MTP-IQ4_XS.gguf" (15.85 GiB, the full quant) and
+            # "...NEO-MAX-NEO-LOW-MTP-IQ4_XS.gguf" (14.25 GiB, the reduced
+            # "LOW" build the model card describes as without the MTP/OT mods).
+            #
+            # This used to take matches[0] silently. On 2026-08-18 that
+            # downgraded the reference workload to the LOW build during a
+            # manifest rebuild, with nothing in the output to say a different
+            # model had been selected than the one asked for. _resolve_manifest_
+            # entry() already raises on exactly this ambiguity; pull() simply
+            # never got the same guard.
+            #
+            # An exact quant-token match still wins outright, so unambiguous
+            # requests are unaffected.
+            exact = [f for f in matches
+                     if _quant_from_filename(f["filename"]).upper() == quant.upper()]
+            if len(exact) == 1:
+                matches = exact
+            else:
+                listing = "\n  ".join(
+                    f'{f["filename"]}  ({(f.get("size") or 0) / 1024 ** 3:.2f} GiB)'
+                    for f in sorted(matches, key=lambda f: f["filename"]))
+                raise RuntimeError(
+                    f"quant {quant!r} matches {len(matches)} files in {repo} , "
+                    f"refusing to guess which one you meant:\n  {listing}\n"
+                    f"Pass a longer quant string that appears in only one of them.")
     else:
-        budget_mb = doctor(probe_feeders=False)["aggregate_vram_mb"]
-        fitting = [f for f in files if f["size"] and f["size"] / (1024 ** 2) <= budget_mb]
-        matches = [max(fitting, key=lambda f: f["size"])] if fitting \
-            else [min(files, key=lambda f: f["size"] or 0)]
+        # Choose for ZERO SPILL, not for "largest that fits VRAM total".
+        #
+        # The old line maximised file size against aggregate_vram_mb, which has
+        # no term for the KV cache, none for graph workspace, and no notion that
+        # spilling is catastrophic rather than gradual. Measured on this box
+        # 2026-08-18: the same 21.27 GiB model ran at 18.81 tok/s with 13,850 MB
+        # spilled and 45.72 tok/s with 39 MB spilled. A smaller quant that fits
+        # beats a larger one that streams, by more than any quality difference
+        # between adjacent quant levels.
+        budget_gb = zero_spill_weight_budget_gb(ctx=0)
+        pick = select_quant_by_fit(files, budget_gb) if budget_gb > 0 else {}
+        if pick.get("file") is not None:
+            if not pick.get("fits"):
+                # Say it plainly rather than quietly picking something that will
+                # be bus-bound: this is a capacity fact the owner needs to act on.
+                print(f"[gb-synapse] {pick['reason']}", file=sys.stderr)
+            matches = [pick["file"]]
+        else:
+            budget_mb = doctor(probe_feeders=False)["aggregate_vram_mb"]
+            fitting = [f for f in files if f["size"] and f["size"] / (1024 ** 2) <= budget_mb]
+            matches = [max(fitting, key=lambda f: f["size"])] if fitting \
+                else [min(files, key=lambda f: f["size"] or 0)]
 
     target = matches[0]
     hf_hub_download = _require_huggingface_hub().hf_hub_download
@@ -966,9 +1223,10 @@ def pull(repo_spec: str, name: str | None = None, engine: str = "") -> ModelEntr
     entry_name = name or repo.split("/")[-1]
     entry = ModelEntry(name=entry_name, path=local_path, source="hf", repo=repo,
                         added_ts=time.time(), **meta)
-    manifest = _load_manifest()
-    manifest[entry_name] = entry
-    _save_manifest(manifest)
+    # Locked: concurrent pull/serve/list_models all read-modify-write this file,
+    # and an unlocked race is a LOST UPDATE, not corruption — three registrations
+    # disappeared that way on 2026-08-18. See manifest_lock().
+    update_manifest(lambda m: m.__setitem__(entry_name, entry))
     return entry
 
 
@@ -1009,20 +1267,20 @@ def wait_ready(url: str, *, path: str = "/health", timeout_s: float = 120.0,
     import urllib.error
     import urllib.request
 
-    deadline = time.time() + timeout_s
-    n = 0
-    while time.time() < deadline:
-        n += 1
-        if attempts is not None and n > attempts:
-            return False
+    def check_ready() -> bool:
         try:
             with urllib.request.urlopen(f"{url}{path}", timeout=5) as r:
-                if r.status == 200:
-                    return True
+                return r.status == 200
         except (urllib.error.URLError, OSError, TimeoutError):
-            pass
-        time.sleep(min(2.0 * n, 10.0))
-    return False
+            return False
+
+    try:
+        gb_wait.wait_until(check_ready, deadline_s=timeout_s,
+                            initial_interval_s=2.0, max_interval_s=10.0,
+                            backoff_factor=1.5, max_attempts=attempts)
+        return True
+    except gb_wait.WaitTimeoutError:
+        return False
 
 
 def serve_gguf(model_path: str, port: int, mmproj: "str | None" = None,
@@ -1033,7 +1291,7 @@ def serve_gguf(model_path: str, port: int, mmproj: "str | None" = None,
     REIMPLEMENTS _resolve_engine_dir (its own docstring says so) then
     hand-launches and health-polls llama-server itself for its OCR-VL
     model on :8081, because gb-synapse had no "just serve this GGUF on
-    this port" call , serve_and_repoint only covers the :11435-compatible
+    this port" call , serve_and_repoint only covers the :11369-compatible
     proxy.
 
     Returns {"pid", "port"} , the raw process handle, not a full
@@ -1058,7 +1316,7 @@ def endpoints() -> dict:
     """The known inference endpoints this box exposes, read from
     /etc/greenboost/inference.env (the file gb_actuation.serve_and_repoint()
     writes) , the registry ai-forge's forge/config.py currently parses
-    itself, tracking 4 independent endpoints (gb-synapse :11435, OCR-VL
+    itself, tracking 4 independent endpoints (gb-synapse :11369, OCR-VL
     :8081, OCR-GPU :8082, AI-tools :8083) with no shared source of truth.
     Reuses gb_actuation._read_env_file rather than a second parser."""
     try:
@@ -1174,7 +1432,12 @@ def index_ollama_models() -> list[ModelEntry]:
                 manifest[entry_name] = entry
                 found.append(entry)
     try:
-        _save_manifest(manifest)
+        # Merge the scan under the lock rather than saving the dict loaded at
+        # the top of this function: `list_models()` calls this on every read, so
+        # an unlocked save here is the widest window for a lost update in the
+        # whole module.
+        _scanned = {e.name: e for e in found}
+        update_manifest(lambda m: m.update(_scanned))
     except PermissionError:
         pass  # discovery still succeeds without root/group write access to
               # MODEL_STORE_DIR — only the persisted cache is skipped, not
@@ -1200,14 +1463,14 @@ def list_models() -> list[ModelEntry]:
 
 
 def rm(name: str) -> None:
-    manifest = _load_manifest()
-    entry = manifest.get(name)
+    entry = _load_manifest().get(name)
     if entry is None:
         raise KeyError(f"no such model: {name}")
     if entry.source == "ollama":
         raise ValueError(f"{name} is an Ollama-managed blob — use 'ollama rm {name}' instead")
-    manifest.pop(name)
-    _save_manifest(manifest)
+    # Locked, and it removes ONLY this key: an unlocked read-modify-write here
+    # would drop every registration another process added in the meantime.
+    update_manifest(lambda m: m.pop(name, None))
     try:
         Path(entry.path).unlink()
     except OSError:
@@ -1663,6 +1926,29 @@ def _read_ram_available_mb() -> int:
     return 0
 
 
+def _nemoclaw_report() -> dict:
+    """Detect NVIDIA NemoClaw on this box and whether something other than
+    our own gb-synapse proxy is holding GB_SYNAPSE_PORT — the two facts an
+    operator needs before pointing NemoClaw at gb-synapse as an OpenAI-
+    compatible provider (see docs/nemoclaw-and-greenboost.md). MCP Tool Gaps
+    rule: this belongs in the tool, not only in a doc a human has to recall
+    to check."""
+    cli_path = shutil.which("nemoclaw") or ""
+    port = DEFAULT_PORT
+    port_open = False
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        port_open = s.connect_ex(("127.0.0.1", port)) == 0
+    ours = port_open and any(int(st.get("port", -1)) == port for st in ps())
+    return {
+        "cli_present": bool(cli_path),
+        "cli_path": cli_path,
+        "port_foreign": bool(port_open and not ours),
+        "port_owner_hint": ("a live gb-synapse server" if ours else
+                             "an unrecognized process" if port_open else ""),
+    }
+
+
 def doctor(probe_feeders: bool = True) -> dict:
     """Aggregate hardware view: host GPU/RAM + every cluster feeder's
     GPU/RAM, plus gb-synapse readiness (engine built, HF token set). This is
@@ -1702,6 +1988,7 @@ def doctor(probe_feeders: bool = True) -> dict:
         "cluster_configured": bool(fs),
         "torch_engine_ready": torch_env is not None,
         "torch_engine_env": str(torch_env) if torch_env else "",
+        "nemoclaw": _nemoclaw_report(),
     }
 
 
@@ -1826,9 +2113,77 @@ class FitReport:
 
 MEASURED_TOK_S_FILE = MODEL_STORE_DIR / "measured_tok_s.json"
 _MEASURED_TOK_S_MAX_SAMPLES = 20
+_TOK_S_LEGACY_KEY = "unknown-quant::0::"  # bucket for pre-keying-fix flat samples
 
 
-def _df_emit_tok_s(model: str, tok_s: float, source: str = "") -> None:
+def _tok_s_key(quant: str, ctx: int, kv_type: str) -> str:
+    """Same join-string convention as _kv_measurement_key(), extended with
+    `quant`: that omission is exactly what let missing_features.md item (k)
+    blend samples across quant swaps of the same model name (a fresh
+    IQ4_XS serve read back a Q4_K_M-era average, 2026-08-03)."""
+    return f"{quant or 'unknown-quant'}::{int(ctx or 0)}::{kv_type or ''}"
+
+
+def _load_tok_s_samples() -> dict:
+    """Load MEASURED_TOK_S_FILE, migrating any pre-keying-fix entries (a flat
+    {model: [tok_s, ...]} list) into the new {model: {key: [tok_s, ...]}}
+    shape under _TOK_S_LEGACY_KEY in place, so history survives the format
+    change instead of being discarded. Migration is applied on every load
+    (cheap, idempotent) rather than as a one-off script — the file is small
+    and this keeps old deployments self-healing without an install step."""
+    try:
+        raw = json.loads(MEASURED_TOK_S_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    out = {}
+    for model, val in raw.items():
+        if isinstance(val, list):
+            out[model] = {_TOK_S_LEGACY_KEY: val}
+        elif isinstance(val, dict):
+            out[model] = val
+    return out
+
+
+def _save_tok_s_samples(samples: dict) -> None:
+    try:
+        atomic_write_json(MEASURED_TOK_S_FILE, samples)
+    except PermissionError:
+        pass
+
+
+def _tok_s_sanity_ceiling(model: str) -> "float | None":
+    """A node- and model-derived upper bound a real decode sample cannot
+    exceed, used to reject corrupted/glitched readings before they enter the
+    rolling average (the concrete incident: a stored sample of 18355.3 tok/s
+    for a 27B dense model on a 12 GB card, missing_features.md item (k)).
+
+    Never a hardcoded literal (project rule): bounded by this node's own
+    detected VRAM bandwidth (gb_topology._detect_vram_bw_gb_s, NVML/
+    nvidia-smi) divided by this model's own real per-layer byte footprint
+    (ModelEntry.n_bytes / n_layers) — i.e. "at least one layer's weights must
+    cross the memory bus per token," the same weight-streaming arithmetic
+    the whole decode-throughput investigation is built on
+    (research/notes/final_report_greenboost-decode-throughput-3b65b4.md §2).
+    Deliberately loose (an upper BOUND, not an estimate) so it never clamps a
+    real slow-but-plausible sample — only catches physically-impossible ones.
+    Returns None (no clamp applied) when either input can't be detected."""
+    try:
+        entry = _load_manifest().get(model)
+        if entry is None or entry.n_bytes <= 0 or entry.n_layers <= 0:
+            return None
+        from gb_topology import _detect_vram_bw_gb_s
+        bw_gb_s = _detect_vram_bw_gb_s()
+        if bw_gb_s <= 0:
+            return None
+        bytes_per_layer = entry.n_bytes / entry.n_layers
+        return (bw_gb_s * 1e9) / bytes_per_layer
+    except Exception:
+        return None
+
+
+def _df_emit_tok_s(model: str, tok_s: float, source: str = "",
+                    quant: str = "", ctx: int = 0, kv_type: str = "",
+                    completion_tokens: int = 0, prompt_tokens: int = 0) -> None:
     """Record a real measured tok/s sample to the dataflux log , the one
     number that closes the loop between orchestration decisions (tier_move/
     quantize/turboquant_activate) and what they actually bought. Best-effort,
@@ -1841,7 +2196,12 @@ def _df_emit_tok_s(model: str, tok_s: float, source: str = "") -> None:
     points on the SAME turn, not duplicate samples of one true number — see
     summarize()'s per-source rollup in gb_dataflux.py for why blending them
     into one average was wrong (real incident 2026-08-01: proxy=0.3,
-    cli=2.4, engine truth=2.18 — the blended avg matched neither)."""
+    cli=2.4, engine truth=2.18 — the blended avg matched neither).
+
+    `quant`/`ctx`/`kv_type` (item (k) fix, 2026-08-03): the serve config this
+    sample was measured under, so dataflux_tok_s can disambiguate the same
+    model name served at different quants/contexts instead of only showing
+    an unlabeled blend."""
     try:
         import gb_dataflux
         gb_dataflux.emit({
@@ -1849,12 +2209,35 @@ def _df_emit_tok_s(model: str, tok_s: float, source: str = "") -> None:
             "n_items": 1, "items": [model], "duration_s": 0.0, "status": "ok",
             "model": model, "tok_s": round(tok_s, 1),
             **({"source": source} if source else {}),
+            **({"quant": quant} if quant else {}),
+            **({"ctx": int(ctx)} if ctx else {}),
+            **({"kv_type": kv_type} if kv_type else {}),
+            # Without this a tok/s sample is duration-blind and every consumer
+            # has to treat a 3-token reply and a 500-token generation as equal
+            # evidence — which is exactly how a mean of 33.2 got built out of a
+            # distribution whose median was 13.9 (2026-08-17). Optional: 0 means
+            # "caller didn't know", never "zero tokens", so absence stays
+            # distinguishable from a real short generation.
+            **({"completion_tokens": int(completion_tokens)} if completion_tokens else {}),
+            # KV depth this sample was decoded AT — the variable `ctx` does not
+            # capture. `ctx` is the configured window; prompt_tokens is how much
+            # of it was actually occupied, and decode rate falls as attention
+            # walks a longer cache. Without it the 2026-08-17 comparison
+            # "3.7 tok/s at ctx=65536 vs median 13.9 at ctx=32768" moves two
+            # variables at once and cannot attribute the gap to either the
+            # window setting or the conversation length. Same 0-means-unknown
+            # convention as completion_tokens above.
+            **({"prompt_tokens": int(prompt_tokens)} if prompt_tokens else {}),
         })
     except Exception:
         pass
 
 
-def record_measured_tok_s(model: str, tok_s: float, source: str = "") -> None:
+def record_measured_tok_s(model: str, tok_s: float, source: str = "",
+                           quant: "str | None" = None, ctx: "int | None" = None,
+                           kv_type: "str | None" = None,
+                           completion_tokens: int = 0,
+                           prompt_tokens: int = 0) -> None:
     """Append a real, client-observed decode speed for `model` — fed by
     greenboost-cli after each final answer (TurnComplete.tok_s), closing the
     gap _estimate_tok_s()'s docstring flags: "A --measure mode that runs a
@@ -1865,35 +2248,109 @@ def record_measured_tok_s(model: str, tok_s: float, source: str = "") -> None:
     calibration aid, not something worth failing a turn over.
 
     `source` (optional, "proxy" | "cli") — see _df_emit_tok_s's docstring.
-    The rolling MEASURED_TOK_S_FILE average stays source-blind (it already
-    only exists as an estimator input for recommend(), not a precision
-    metric) — only the dataflux event itself carries the distinction."""
+
+    `quant`/`ctx`/`kv_type` (item (k) fix, 2026-08-03): the serve
+    configuration this sample belongs to. Neither existing caller
+    (gb_synapse_api.py's proxy, greenboost-cli's repl.py) knows this at their
+    call site, so when omitted it's read from this model's own persisted
+    ServerState (_read_run_state) — the same config the shim actually
+    launched with — rather than making both callers thread it through their
+    own signatures. A sample is silently dropped, not misfiled under a wrong
+    key, when no run-state can be found (e.g. the server already stopped)."""
     if tok_s <= 0:
         return
-    _df_emit_tok_s(model, tok_s, source)
-    try:
-        samples = json.loads(MEASURED_TOK_S_FILE.read_text())
-    except (OSError, json.JSONDecodeError):
-        samples = {}
-    history = samples.get(model, [])
+    if quant is None or ctx is None or kv_type is None:
+        st = _read_run_state(model)
+        if st is None:
+            return
+        quant = quant if quant is not None else st.quant
+        ctx = ctx if ctx is not None else st.ctx
+        kv_type = kv_type if kv_type is not None else st.kv_type
+    ceiling = _tok_s_sanity_ceiling(model)
+    if ceiling is not None and tok_s > ceiling:
+        try:
+            import gb_dataflux
+            gb_dataflux.emit({
+                "node": "host", "label": "gb_synapse", "kind": "tok_s_measured",
+                "n_items": 1, "items": [model], "duration_s": 0.0, "status": "error",
+                "model": model, "tok_s": round(tok_s, 1), "ceiling_tok_s": round(ceiling, 1),
+                "error": "sample exceeds node/model-derived sanity ceiling, dropped",
+            })
+        except Exception:
+            pass
+        return
+    _df_emit_tok_s(model, tok_s, source, quant=quant or "", ctx=ctx or 0,
+                   kv_type=kv_type or "", completion_tokens=completion_tokens,
+                   prompt_tokens=prompt_tokens)
+    samples = _load_tok_s_samples()
+    key = _tok_s_key(quant, ctx, kv_type)
+    per_model = samples.setdefault(model, {})
+    history = per_model.get(key, [])
     history.append(round(tok_s, 1))
-    samples[model] = history[-_MEASURED_TOK_S_MAX_SAMPLES:]
+    per_model[key] = history[-_MEASURED_TOK_S_MAX_SAMPLES:]
+    _save_tok_s_samples(samples)
+
+
+def record_tok_s_skipped(model: str, reason: str, completion_tokens: int = 0,
+                          source: str = "") -> None:
+    """Record that a turn completed but produced NO decode-rate sample.
+
+    Why this exists. On 2026-08-18 a two-hour stretch of heavy agentic use
+    logged 7 `prompt_cache` events (7 completed turns) and 2
+    `tok_s_measured` samples. The other 5 turns vanished from throughput
+    telemetry entirely, because agentic turns are mostly short tool calls and
+    `_MIN_TOK_S_SAMPLE_TOKENS` (24) correctly rejects them: a handful of
+    tokens timed over a few milliseconds scores hundreds of tok/s, which is
+    exactly how a mean of 33.2 got built against a median of 13.9.
+
+    The floor is right. Silence about the rejected turns is not. Lowering the
+    floor would re-admit the outliers; dropping the turn on the floor leaves
+    an observer unable to tell "throughput is unmeasured" from "nothing ran".
+    So the turn is recorded with status="skipped" and no tok_s value, and
+    `gb_dataflux.summarize()` counts it under a `skipped` key instead of
+    averaging it.
+
+    The serve config (quant/ctx/kv_type) is resolved from this model's own
+    persisted ServerState the same way record_measured_tok_s does it. That is
+    not cosmetic: `summarize()` keys the rollup on it, so a skip emitted
+    without the config lands under a DIFFERENT key than the rate samples it
+    belongs beside, and the count shows up detached from the configuration it
+    describes. Same reasoning as the item (k) fix.
+
+    Best-effort, never raises , same contract as every other emit here."""
     try:
-        MODEL_STORE_DIR.mkdir(parents=True, exist_ok=True)
-        MEASURED_TOK_S_FILE.write_text(json.dumps(samples, indent=2))
-    except PermissionError:
+        quant = ctx = kv_type = None
+        st = _read_run_state(model)
+        if st is not None:
+            quant, ctx, kv_type = st.quant, st.ctx, st.kv_type
+        import gb_dataflux
+        gb_dataflux.emit({
+            "node": "host", "label": "gb_synapse", "kind": "tok_s_measured",
+            "n_items": 1, "items": [model], "duration_s": 0.0,
+            "status": "skipped",
+            "model": model,
+            "skip_reason": reason,
+            **({"source": source} if source else {}),
+            **({"quant": quant} if quant else {}),
+            **({"ctx": int(ctx)} if ctx else {}),
+            **({"kv_type": kv_type} if kv_type else {}),
+            **({"completion_tokens": int(completion_tokens)} if completion_tokens else {}),
+        })
+    except Exception:
         pass
 
 
 def record_prompt_cache_sample(model: str, ttft_ms: "float | None",
-                                hit_pct: "float | None", reused_tokens: int = 0) -> None:
+                                hit_pct: "float | None", reused_tokens: int = 0,
+                                engine_prompt_ms: "float | None" = None,
+                                prompt_tokens: int = 0) -> None:
     """Record one proxy-observed host-memory prompt-cache outcome (TTFT +
     reused-vs-total prompt token share) — the measurement GB-Semantics'
     `ttft_ms`/`prompt_cache_hit_pct` metrics resolve from. Fed by
     gb_synapse_api.py right where record_measured_tok_s already is, same
     best-effort/never-raise contract; silently skips when neither value is
     known (e.g. a non-streaming request that never reached a first token)."""
-    if ttft_ms is None and hit_pct is None:
+    if ttft_ms is None and hit_pct is None and engine_prompt_ms is None:
         return
     try:
         import gb_dataflux
@@ -1904,17 +2361,56 @@ def record_prompt_cache_sample(model: str, ttft_ms: "float | None",
             **({"ttft_ms": round(ttft_ms, 1)} if ttft_ms is not None else {}),
             **({"hit_pct": round(hit_pct, 1)} if hit_pct is not None else {}),
             "reused_tokens": reused_tokens,
+            # The engine's OWN prefill duration, next to the client-observed
+            # TTFT above. ttft_ms - engine_prompt_ms is everything that is not
+            # prefill: queueing behind another slot, proxy overhead, and
+            # whatever else is loading the box. Without the pair, a slow TTFT
+            # is unattributable — see _parse_sse_telemetry_timed's comment for
+            # the 2026-08-18 measurement that was silently contaminated by a
+            # concurrent kernel build.
+            **({"engine_prompt_ms": round(engine_prompt_ms, 1)}
+               if engine_prompt_ms is not None else {}),
+            # Total prompt length, so hit_pct and the two timings above can be
+            # read against the depth they were measured at. Prefill cost grows
+            # with conversation depth; a hit_pct alone cannot show that.
+            **({"prompt_tokens": int(prompt_tokens)} if prompt_tokens else {}),
         })
     except Exception:
         pass
 
 
-def _measured_tok_s(model: str) -> "float | None":
-    try:
-        samples = json.loads(MEASURED_TOK_S_FILE.read_text())
-    except (OSError, json.JSONDecodeError):
+def _measured_tok_s(model: str, quant: "str | None" = None,
+                     ctx: "int | None" = None, kv_type: "str | None" = None) -> "float | None":
+    """Rolling average of real tok/s samples for `model`.
+
+    Item (k) fix (2026-08-03): when `quant`/`ctx` are given (recommend()
+    always has both, from the manifest entry it's evaluating and the ctx
+    it's fitting against), only samples recorded under that exact
+    (quant, ctx) are averaged — never blended with a different quant/ctx
+    swap of the same model name, which is the bug this replaces. `kv_type`
+    is an optional third filter; decode tok/s here is weight-streaming-
+    dominated (see the decode-throughput research report), so leaving it
+    unset intentionally matches across kv_types rather than fragmenting an
+    already-small sample set over a dimension that barely moves the number.
+    With neither `quant` nor `ctx` given, this returns a coarse per-model
+    rollup across every recorded configuration — for display only
+    (synapse_status), never for a caller that needs a specific number."""
+    samples = _load_tok_s_samples().get(model)
+    if not samples:
         return None
-    history = samples.get(model)
+    if quant is None and ctx is None:
+        history = [v for hist in samples.values() for v in hist]
+    else:
+        history = []
+        for key, hist in samples.items():
+            k_quant, k_ctx, k_kv = (key.split("::", 2) + ["", "", ""])[:3]
+            if quant is not None and k_quant != (quant or "unknown-quant"):
+                continue
+            if ctx is not None and k_ctx != str(int(ctx or 0)):
+                continue
+            if kv_type is not None and k_kv != kv_type:
+                continue
+            history.extend(hist)
     if not history:
         return None
     return round(sum(history) / len(history), 1)
@@ -2050,7 +2546,7 @@ def recommend(ctx: int = 65536, probe_feeders: bool = True) -> list[FitReport]:
                     pass
             except Exception:
                 pass
-        measured = _measured_tok_s(entry.name)
+        measured = _measured_tok_s(entry.name, quant=entry.quant, ctx=ctx)
         est = measured if measured is not None else _estimate_tok_s(active_gb + kv_gb, budget_gb)
         if measured is not None:
             note = f"{note} (measured)".strip() if note else "measured"
@@ -2110,6 +2606,29 @@ class ServerState:
     ctx: int = 0
     kv_type: str = ""
     n_gpu_layers: int = 0
+    # entry.quant at serve time — the missing dimension that let
+    # _measured_tok_s() blend samples across incompatible quant swaps of the
+    # same model name (missing_features.md item (k), found 2026-08-03: a
+    # freshly-served IQ4_XS read back a blended Q4_K_M-era average). "" for
+    # old persisted run-state JSON (pre-this-field) or non-manifest serves.
+    quant: str = ""
+    # What the proxy was actually launched with (GB_SYNAPSE_BIND /
+    # GB_SYNAPSE_TOKEN at serve time — see _synapse_proxy_token()), so a
+    # client asking "is this endpoint authenticated right now" (synapse_doctor,
+    # synapse_status) has an authoritative answer instead of assuming the
+    # default. "127.0.0.1"/False for old persisted run-state JSON, which is
+    # also what every serve before this field existed actually was.
+    bind: str = "127.0.0.1"
+    auth_enabled: bool = False
+    # GB-6 (2026-08-19): the speculative-decode depth and confidence floor this
+    # server is running with. They were reachable as serve() parameters and as
+    # env defaults, and went into the synapse_serve dataflux event, but nothing
+    # recorded them in the run state — so `gb_bench_spec.py --current` could
+    # measure 6.02 tok/s and not say which depth produced it, which makes a
+    # depth sweep unattributable. 0/0.0 for old persisted run-state JSON and
+    # for backends with no draft head.
+    mtp_draft_n: int = 0
+    spec_draft_p_min: float = 0.0
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -2167,8 +2686,7 @@ def _pcore_threads() -> int:
 
 
 def _write_run_state(state: ServerState) -> None:
-    RUN_DIR.mkdir(parents=True, exist_ok=True)
-    _run_state_path(state.model).write_text(json.dumps(asdict(state), indent=2))
+    atomic_write_json(_run_state_path(state.model), asdict(state))
 
 
 def _read_run_states() -> list[ServerState]:
@@ -2181,6 +2699,17 @@ def _read_run_states() -> list[ServerState]:
         except (OSError, json.JSONDecodeError, TypeError):
             continue
     return out
+
+
+def _read_run_state(model: str) -> "ServerState | None":
+    """Single-model run-state read — the config (quant/ctx/kv_type) a proxy-
+    or CLI-side tok/s sample was actually measured under, without either
+    caller having to thread that config through its own call chain. See
+    record_measured_tok_s()'s docstring for why this exists."""
+    try:
+        return ServerState(**json.loads(_run_state_path(model).read_text()))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -2301,8 +2830,7 @@ def _resolve_model(spec: str) -> ModelEntry:
     if blob:
         meta = gguf_summary(blob)
         entry = ModelEntry(name=spec, path=blob, source="ollama", added_ts=time.time(), **meta)
-        manifest[spec] = entry
-        _save_manifest(manifest)
+        update_manifest(lambda m: m.__setitem__(spec, entry))
         return entry
 
     spec_lower = spec.lower()
@@ -2482,7 +3010,35 @@ def kill_feeder_gllm_slave(feeder) -> None:
               f"{result.stderr.strip()[:200]}", flush=True)
 
 
-MTP_DRAFT_N = int(os.environ.get("GB_SYNAPSE_MTP_DRAFT_N", "3"))
+# --spec-draft-n-max: 2026-08-05 sweep across (3 prompts x repeated runs) found
+# depth non-monotonic: 2→5.15, 3→5.58, 4→6.5 (best), 6→4.40, 8→5.76 tok/s —
+# deeper drafts get rejected more often and net out slower past the sweet
+# spot. 4 landed as the default from that sweep.
+MTP_DRAFT_N = int(os.environ.get("GB_SYNAPSE_MTP_DRAFT_N", "4"))
+# --spec-draft-p-min: minimum draft-head top-token probability before a
+# speculative draft bails out early instead of running to full n_max depth
+# regardless of confidence (llama.cpp default 0.0 = never bails — see
+# common/speculative.cpp:1559). Swept 2026-08-05 (second round): (n_max=4,
+# p_min=0.3) beat everything else tested, mean 5.620 vs baseline (4, 0.0)'s
+# 5.175 tok/s (+8.6%, quality-neutral, same output distribution) — a
+# low-confidence draft bails before paying for mostly-rejected tokens.
+MTP_P_MIN = float(os.environ.get("GB_SYNAPSE_MTP_P_MIN", "0.3"))
+# --slot-prompt-similarity: how much a new request's prompt must overlap an
+# idle slot's cached prompt for llama-server to reuse that slot instead of
+# falling back to LRU (server-context.cpp's slot-selection loop). Deployed
+# engine's own compiled-in default is 0.10 (confirmed via --help against
+# the live binary, e8f19cc0a) — NOT 0.0/disabled as a static source read
+# suggested. Live-tested 2026-08-05: at 0.10, two DIFFERENT concurrent
+# conversations sharing the same long system prompt both converged on
+# "cached=205" (exactly the shared-system-prompt length) on their second
+# turn — meaning the low bar was satisfied by ANY prior slot sharing just
+# the generic boilerplate, never correctly finding a conversation's OWN
+# accumulated turns. Raised default forces a real match against a specific
+# conversation's actual history, not just its common preamble with every
+# other session — this is what makes multi-turn GB-CLI sessions actually
+# skip re-prefilling their own growing history instead of settling for the
+# smallest common denominator across all concurrent sessions.
+GB_SLOT_PROMPT_SIMILARITY = float(os.environ.get("GB_SYNAPSE_SLOT_PROMPT_SIMILARITY", "0.5"))
 
 GPU_FIT_MARGIN = float(os.environ.get("GB_SYNAPSE_FIT_MARGIN", "0.85"))
 
@@ -2884,13 +3440,29 @@ def _compute_tensor_split(host_free_mb: int, online_feeders: list,
     return split
 
 
+_LOG_TAIL_MAX_BYTES = 65536  # item 8: bounded read, matches repl.py's dataflux-tail pattern
+
+
 def _upstream_log_tail(model: str, n: int = 8) -> str:
     """The lines the engine wrote just before it died. A client can only ever
     observe a closed connection; the actual reason (unsupported hyperparameter,
     missing blob, OOM) exists nowhere but this log, so every failure we raise
-    carries it."""
+    carries it.
+
+    Bounded to the last _LOG_TAIL_MAX_BYTES of the file (item 8), a long-running
+    llama-server serve session can accumulate a multi-MB log; the previous
+    whole-file read_text() loaded it all into memory just to keep the last
+    `n` lines."""
     try:
-        lines = _run_log_path(model).read_text(errors="replace").splitlines()
+        path = _run_log_path(model)
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - _LOG_TAIL_MAX_BYTES))
+            chunk = f.read()
+        lines = chunk.decode("utf-8", errors="replace").splitlines()
+        if size > _LOG_TAIL_MAX_BYTES:
+            lines = lines[1:]  # first partial line after the seek is likely truncated
     except OSError:
         return ""
     errs = [ln for ln in lines if re.search(r"\berror\b|\bfailed\b|\bE\b", ln)]
@@ -2969,9 +3541,9 @@ def _wait_upstream_ready(entry: ModelEntry, proc: subprocess.Popen, internal_por
         except OSError:
             return ""
 
-    deadline = time.time() + grace_s
     url = f"http://127.0.0.1:{internal_port}/health"
-    while time.time() < deadline:
+
+    def check_ready() -> bool:
         # poll() is the authoritative answer for a child WE spawned, and it
         # reaps — unlike a PID check, which a zombie passes.
         if proc.poll() is not None:
@@ -2998,12 +3570,87 @@ def _wait_upstream_ready(entry: ModelEntry, proc: subprocess.Popen, internal_por
             pass          # 503 "loading model" — alive and working
         except OSError:
             pass          # not listening yet
-        time.sleep(0.5)
-    return False
+        return False
+
+    try:
+        gb_wait.wait_until(check_ready, deadline_s=grace_s,
+                            initial_interval_s=0.5, max_interval_s=0.5,
+                            backoff_factor=1.0)
+        return True
+    except gb_wait.WaitTimeoutError:
+        return False
+
+
+def _trust_validate_root_file(path: Path, max_size: int = 64 * 1024) -> str:
+    """Audit TCB-U1 (2026-08-06): Validate that a root-owned config file is
+    trustworthy before reading its contents. Returns one of "trusted",
+    "absent", "rejected_symlink", "rejected_owner", "rejected_mode",
+    "rejected_size" — matches gb_dataflux_kinds.KINDS["allowlist_trust"]'s
+    documented decision enum exactly, so a caller can emit it verbatim.
+    Logs nothing and never emits dataflux itself; "absent" is the routine
+    "no file configured" case and callers should not treat it as a security
+    event the way the other rejections are.
+    (Mirrors gb_synapse_api._trust_validate_root_file() exactly.)
+    """
+    try:
+        st = path.lstat()  # lstat to detect symlinks
+    except (OSError, FileNotFoundError):
+        return "absent"
+
+    import stat
+    # Must be a regular file, not a symlink or other special file (a
+    # symlink swap is the attack this whole check exists to close; any
+    # other non-regular file at this path is equally "not what we expect
+    # here" and gets the same bucket).
+    if not stat.S_ISREG(st.st_mode):
+        return "rejected_symlink"
+
+    # Must be owned by root
+    if st.st_uid != 0:
+        return "rejected_owner"
+
+    # Must not be writable by group or others
+    if (st.st_mode & 0o022) != 0:
+        return "rejected_mode"
+
+    # Must be non-empty and within the size cap
+    if st.st_size == 0 or st.st_size > max_size:
+        return "rejected_size"
+
+    return "trusted"
+
+
+def _synapse_proxy_token() -> str:
+    """Mirrors gb_synapse_api._resolve_token() exactly, without importing
+    that module — this file stays importable with no aiohttp installed
+    (see gb_synapse_api.py's own module docstring for why the proxy is a
+    subprocess, never an import). GB_SYNAPSE_TOKEN env first, else the
+    installer-managed token file (TCB-U1 validated), else "" (loopback-only, no auth)."""
+    env = os.environ.get("GB_SYNAPSE_TOKEN", "").strip()
+    if env:
+        return env
+    try:
+        # TCB-U1: validate token file trust before reading
+        token_path = Path("/etc/greenboost/synapse_token")
+        decision = _trust_validate_root_file(token_path, max_size=8192)
+        if decision != "trusted":
+            if decision != "absent":
+                try:
+                    import gb_dataflux
+                    gb_dataflux.emit({"kind": "allowlist_trust",
+                                       "path": str(token_path), "decision": decision})
+                except Exception:
+                    pass
+            # Not a regular root-owned file, insecure mode, or wrong size
+            # — treat as if no file exists (loopback-only mode)
+            return ""
+        return token_path.read_text().strip()
+    except OSError:
+        return ""
 
 
 def _wait_proxy_ready(proxy_proc: subprocess.Popen, port: int, label: str,
-                      grace_s: float = 5.0) -> str | None:
+                      grace_s: float = 5.0, token: str = "") -> str | None:
     """Watch a freshly spawned gb_synapse_api.py proxy until it serves, dies,
     or `grace_s` runs out. Short grace vs the engine's own
     (SERVE_READY_GRACE_S): proxy startup is near-instant when it succeeds: it
@@ -3021,18 +3668,24 @@ def _wait_proxy_ready(proxy_proc: subprocess.Popen, port: int, label: str,
     instead — three layers removed from the actual cause.
 
     Returns None when healthy, else a short reason string (never raises —
-    the caller decides whether a dead proxy is fatal)."""
+    the caller decides whether a dead proxy is fatal). `token`: when the
+    proxy was launched with auth enabled, /health requires it too (no
+    bypass — see gb_synapse_api.py's _auth_middleware) or every poll here
+    gets a 401 and this reports a false "proxy never answered" failure."""
     import urllib.error
     import urllib.request
 
-    deadline = time.time() + grace_s
     url = f"http://127.0.0.1:{port}/health"
-    while time.time() < deadline:
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+    def check_ready() -> bool:
         if proxy_proc.poll() is not None:
-            return (f"proxy exited during startup (rc={proxy_proc.returncode})\n"
-                    f"{_upstream_log_tail(label)}")
+            raise RuntimeError(
+                f"proxy exited during startup (rc={proxy_proc.returncode})\n"
+                f"{_upstream_log_tail(label)}")
         try:
-            with urllib.request.urlopen(url, timeout=2) as r:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=2) as r:
                 # ONLY a genuine 200 counts. Real bug, found live 2026-07-16:
                 # an earlier version of this check treated ANY HTTP response
                 # (including urllib.error.HTTPError, i.e. any non-2xx status)
@@ -3044,17 +3697,27 @@ def _wait_proxy_ready(proxy_proc: subprocess.Popen, port: int, label: str,
                 # something else on the same port is exactly what this check
                 # exists to catch, not a pass condition.
                 if r.status == 200 and proxy_proc.poll() is None:
-                    return None
+                    return True
         except (urllib.error.HTTPError, OSError):
             pass              # not our proxy answering, or not listening yet
-        time.sleep(0.3)
-    if proxy_proc.poll() is not None:
-        return (f"proxy exited during startup (rc={proxy_proc.returncode})\n"
-                f"{_upstream_log_tail(label)}")
-    hint = ("raw ollama.service may own :11434 — gb-synapse now defaults to "
-             f":{DEFAULT_PORT}; set GB_SYNAPSE_PORT to change" if port == 11434 else
-             f"something else may already be listening on :{port}")
-    return f"proxy never answered /health with 200 within {grace_s}s — {hint}"
+        return False
+
+    try:
+        gb_wait.wait_until(check_ready, deadline_s=grace_s,
+                            initial_interval_s=0.3, max_interval_s=0.3,
+                            backoff_factor=1.0)
+        return None
+    except RuntimeError as e:
+        # Process died during the wait.
+        return str(e)
+    except gb_wait.WaitTimeoutError:
+        if proxy_proc.poll() is not None:
+            return (f"proxy exited during startup (rc={proxy_proc.returncode})\n"
+                    f"{_upstream_log_tail(label)}")
+        hint = ("raw ollama.service may own :11434 — gb-synapse now defaults to "
+                 f":{DEFAULT_PORT}; set GB_SYNAPSE_PORT to change" if port == 11434 else
+                 f"something else may already be listening on :{port}")
+        return f"proxy never answered /health with 200 within {grace_s}s — {hint}"
 
 
 def _health_says_loading(body: bytes) -> bool:
@@ -3108,6 +3771,44 @@ def _emit_serve(entry: ModelEntry, status: str, **fields) -> None:
         pass
 
 
+#: Hard address-space ceiling for the proxy, as a fraction of total RAM.
+#:
+#: The proxy is a STATELESS passthrough. It holds a request body, a response
+#: being forwarded, and a few counters , kilobytes of legitimate state, not
+#: gigabytes. Anything approaching this cap is a bug, and the cap turns that
+#: bug into a failed request instead of a dead machine.
+_PROXY_MEM_FRACTION = float(os.environ.get("GB_SYNAPSE_PROXY_MEM_FRACTION", "0.10"))
+_PROXY_MEM_FLOOR_GB = 2.0
+
+
+def _proxy_resource_limits() -> None:
+    """Cap the proxy's address space, in the child, before exec.
+
+    Why a cap rather than OOM protection: the proxy is the process that GREW.
+    Overnight 2026-08-19 it reached 39 GB of anonymous memory (28 GB of it
+    swapped) and the kernel killed it at 01:47 , correctly, because it was the
+    largest thing on a 61 GB box. Marking it un-killable would only redirect
+    the kill at the desktop or the engine while the proxy carried on toward
+    every byte of RAM. The bounded failure is the better one.
+
+    At the cap, a runaway allocation raises MemoryError inside one request
+    handler. aiohttp fails that request and the process keeps serving , which
+    is a far smaller loss than the whole box, and it leaves the engine (and its
+    KV cache) untouched.
+
+    Percentage-derived, never a literal size: the hardcoded-hardware rule.
+    """
+    try:
+        import resource
+
+        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        cap = max(int(_PROXY_MEM_FLOOR_GB * 1024 ** 3),
+                  int(total * _PROXY_MEM_FRACTION))
+        resource.setrlimit(resource.RLIMIT_AS, (cap, cap))
+    except Exception:
+        pass        # a cap that cannot be applied must not stop the serve
+
+
 def _start_proxy(entry: ModelEntry, port: int, internal_port: int,
                   engine: str) -> "tuple[subprocess.Popen, str | None]":
     """Launch gb_synapse_api.py in front of an already-running upstream
@@ -3116,13 +3817,20 @@ def _start_proxy(entry: ModelEntry, port: int, internal_port: int,
     reuse the exact same launch+readiness logic without re-running engine
     startup — see serve()'s docstring for why that distinction matters."""
     proxy_label = entry.name + "_proxy"
+    bind = os.environ.get("GB_SYNAPSE_BIND", "127.0.0.1")
     proxy_cmd = [sys.executable, str(_REPO_DIR / "gb_synapse_api.py"),
                  "--port", str(port), "--upstream-port", str(internal_port),
-                 "--model-name", entry.name, "--engine", engine]
+                 "--model-name", entry.name, "--engine", engine,
+                 "--bind", bind]
     proxy_log = open(_run_log_path(proxy_label), "ab")
+    # Token, if any, reaches the child via inherited environment (Popen with
+    # no env= kwarg passes os.environ through) — never on argv, which
+    # /proc/<pid>/cmdline makes world-readable.
     proxy_proc = subprocess.Popen(proxy_cmd, stdout=proxy_log, stderr=subprocess.STDOUT,
-                                   start_new_session=True)
-    proxy_error = _wait_proxy_ready(proxy_proc, port, proxy_label)
+                                   start_new_session=True,
+                                   preexec_fn=_proxy_resource_limits)
+    proxy_error = _wait_proxy_ready(proxy_proc, port, proxy_label,
+                                     token=_synapse_proxy_token())
     return proxy_proc, proxy_error
 
 
@@ -3147,11 +3855,24 @@ def _check_cache_reuse_support(entry: ModelEntry, common: dict) -> None:
         text = log_path.read_text(errors="replace")
         rejected = _CACHE_REUSE_REJECT in text
         if rejected:
+            # This message used to say "every turn re-pays full prompt-eval
+            # cost". That is FALSE and it cost real debugging time on
+            # 2026-08-18: --cache-reuse is only ONE of two reuse mechanisms.
+            # The other , ordinary same-slot prefix continuation , is
+            # unaffected by this rejection and does the heavy lifting.
+            # Measured the same day on the very model that prints this line:
+            # 99.7% prompt-cache hit, ~17,019 of 17,068 tokens reused,
+            # engine_prompt_ms 3.0-3.7 s on continuing turns.
+            #
+            # What the rejection actually costs is reuse when the prompt's
+            # MIDDLE changes (a compaction, an edited history), and the first
+            # turn after any restart, which is a genuine full prefill.
             print(f"  [gb-synapse] NOTE: {entry.name} rejected --cache-reuse "
-                  f"(\"{_CACHE_REUSE_REJECT}\") — this architecture can't "
-                  f"reuse a cached prompt prefix, so every turn re-pays full "
-                  f"prompt-eval cost. Not a bug in this serve, just a fact "
-                  f"worth knowing before blaming decode speed for a slow turn.",
+                  f"(\"{_CACHE_REUSE_REJECT}\"). Same-slot prefix reuse still "
+                  f"works and carries most turns (measured 99.7% hit on this "
+                  f"model), so this is NOT 'every turn re-pays prefill'. What "
+                  f"it does cost: the first turn after a restart, and any turn "
+                  f"whose prompt changed in the MIDDLE rather than the end.",
                   flush=True)
             common["cache_reuse_rejected"] = True
     except Exception:
@@ -3237,17 +3958,49 @@ def _load_kv_measurement(model: str, ctx: int, kv_type: str) -> "float | None":
 
 def _save_kv_measurement(model: str, ctx: int, kv_type: str, kv_t1_tracked_mb: float) -> None:
     try:
-        try:
-            data = json.loads(_KV_MEASUREMENT_PATH.read_text())
-        except Exception:
-            data = {}
-        data[_kv_measurement_key(model, ctx, kv_type)] = {
-            "kv_t1_tracked_mb": kv_t1_tracked_mb,
-            "ts": time.time(),
-        }
-        _KV_MEASUREMENT_PATH.write_text(json.dumps(data, indent=2))
+        def mutate_kv_cache(data: dict) -> dict:
+            data[_kv_measurement_key(model, ctx, kv_type)] = {
+                "kv_t1_tracked_mb": kv_t1_tracked_mb,
+                "ts": time.time(),
+            }
+            return data
+
+        update_json_locked(_KV_MEASUREMENT_PATH, mutate_kv_cache, default={})
     except Exception:
         pass
+
+
+def _peak_kv_used_mb(window_s: float = 6 * 3600, since_ts: float | None = None) -> float:
+    """Highest `kv_used_mb` the flight recorder saw in the last `window_s`.
+
+    Companion to _persist_kv_measurement()'s fallback: a KV reserve must cover
+    the high-water mark, and a single instantaneous read of the shim can catch
+    either the pre-allocation zero or the teardown zero. Best-effort , returns
+    0.0 when there is no history, which leaves the caller on the formula.
+
+    `since_ts` scopes the scan to one serve, and callers persisting a
+    per-(model, ctx, kv_type) measurement MUST pass it. `snapshot` events carry
+    no model field, so an unscoped 6-hour window spans model swaps: right after
+    switching reference models the window is still full of the PREVIOUS model's
+    KV, and persisting that under the new model's key writes a confidently
+    wrong reserve. Same cross-contamination class as the tok_s keying fix
+    (missing_features.md item (k), 2026-08-03), one metric over."""
+    try:
+        import gb_dataflux
+        cutoff = time.time() - window_s
+        if since_ts is not None:
+            cutoff = max(cutoff, since_ts)
+        peak = 0.0
+        for ev in gb_dataflux.read_events():
+            if ev.get("kind") != "snapshot" or ev.get("ts", 0) < cutoff:
+                continue
+            try:
+                peak = max(peak, float(ev.get("kv_used_mb") or 0))
+            except (TypeError, ValueError):
+                continue
+        return peak
+    except Exception:
+        return 0.0
 
 
 def _persist_kv_measurement(entry: ModelEntry, common: dict) -> None:
@@ -3288,11 +4041,39 @@ def _persist_kv_measurement(entry: ModelEntry, common: dict) -> None:
     try:
         import gb_monitor
         snap = gb_monitor.snapshot(probe_gpu=False)
-        if not snap.loaded or snap.shim_stale:
+        if not snap.loaded:
             return
-        shim = snap.shim or {}
+        # A stale shim_stats file means the LIVE read is untrustworthy, not that
+        # the recorded history is. Previously this returned outright, which made
+        # the whole function a no-op exactly when it is most useful , called from
+        # stop(), where the engine may already be tearing its counters down.
+        shim = {} if snap.shim_stale else (snap.shim or {})
         kv_t1_mb = float(shim.get("kv_t1_tracked_mb", 0) or 0)
+        # ALWAYS reconcile against the peak, never just the instantaneous read.
+        #
+        # A reserve has to cover the HIGH-WATER mark , _peak_kv_used_mb()'s own
+        # docstring says so , but the peak used to be consulted only when the
+        # live read came back zero. A non-zero read was trusted as if it were
+        # the maximum, and it usually is not: the read happens whenever the
+        # serve is recorded, which can be seconds after load.
+        #
+        # Measured 2026-08-18: `Qwen3.8-27B-Cold-Fusion-MTP-IQ4_XS::24576::f16`
+        # was persisted as 218 MB, sampled 11 SECONDS into the serve with an
+        # empty conversation. A 24,576-token context genuinely needs ~1.6 GB, so
+        # the next serve of that signature would have reserved ~240 MB , and
+        # under-reserving is not the safe direction: weights fill the VRAM the
+        # KV was supposed to get, and the KV then spills to T2 mid-conversation,
+        # which is precisely what the reserve exists to prevent.
+        peak_mb = _peak_kv_used_mb(window_s=6 * 3600,
+                                   since_ts=common.get("started_ts"))
+        if peak_mb > kv_t1_mb:
+            kv_t1_mb = peak_mb
         if kv_t1_mb <= 0:
+            # Both the live read AND the recorder came back empty. That happens
+            # right after load (KV not allocated yet) and during teardown (the
+            # shim zeroes its counters). Persisting a zero would pin the reserve
+            # at nothing, so leave the model on the formula , conservative, and
+            # the formula is only ever an over-estimate.
             return
         ctx = int(common.get("ctx") or 0)
         kv_type = str(common.get("kv_type") or "")
@@ -3329,7 +4110,7 @@ def _launch_proxy_and_record(entry: ModelEntry, upstream: subprocess.Popen, port
     engine = engine or entry.engine
     t0 = time.time()
     common = {"port": port, "tensor_split": tensor_split, "feeders": feeders or [],
-              "engine": engine, **serve_facts}
+              "engine": engine, "started_ts": t0, **serve_facts}
     try:
         ready = _wait_upstream_ready(entry, upstream, internal_port)
     except RuntimeError as e:
@@ -3354,7 +4135,12 @@ def _launch_proxy_and_record(entry: ModelEntry, upstream: subprocess.Popen, port
                          ready=ready, proxy_error=proxy_error,
                          ctx=int(serve_facts.get("ctx") or 0),
                          kv_type=str(serve_facts.get("kv_type") or ""),
-                         n_gpu_layers=int(serve_facts.get("n_gpu_layers") or 0))
+                         n_gpu_layers=int(serve_facts.get("n_gpu_layers") or 0),
+                         quant=entry.quant,
+                         bind=os.environ.get("GB_SYNAPSE_BIND", "127.0.0.1"),
+                         auth_enabled=bool(_synapse_proxy_token()),
+                         mtp_draft_n=int(serve_facts.get("mtp_draft_n") or 0),
+                         spec_draft_p_min=float(serve_facts.get("spec_draft_p_min") or 0.0))
     _write_run_state(state)
     if proxy_error:
         # The engine loaded a real model into memory (upstream.pid is alive);
@@ -3371,9 +4157,328 @@ def _launch_proxy_and_record(entry: ModelEntry, upstream: subprocess.Popen, port
     return state
 
 
+# ---- serving recipes (NemoClaw audit, Phase 5e; placement wiring Phase
+# 5/7 follow-up) ----
+#
+# A recipe (serving/recipes/*.yaml, validated by serving/recipe.schema.json
+# and serving/check_recipes.py) turns serve()'s heuristic-solved knobs into
+# pinned, measured values for a model that's been validated end to end:
+# ctx/mtp_draft_n map straight onto serve()'s own parameters; nGpuLayers/
+# kvCache (when symmetric)/nCpuMoe now reach LlamaCppBackend.serve()'s own
+# -ngl/--cache-type-k/-v/--n-cpu-moe decisions via the n_gpu_layers_override/
+# kv_type_override/n_cpu_moe_override parameters added to EngineBackend.
+# serve()'s uniform signature (the MCP Tool Gaps rule's usual shape for a
+# new knob) — see that base class's docstring for the full override
+# contract, including why cpu_quirk (a confirmed hardware crash) always
+# wins over any override, and why a dense-model override below all layers
+# still clears the T2-spill _gate_cpu_offload() check. kvReserveMb/
+# tierIntent stay schema-validated-but-not-yet-consumed; kvReserveMb has no
+# current serve()-level knob to override (GREENBOOST_KV_RESERVE_MB is
+# computed from a live KV measurement, not exposed as a parameter), and
+# tierIntent currently only feeds the Phase 7 preset resolver's requirement
+# matching, not a live use_cluster/tensor_split decision. A model with no
+# matching recipe is completely unaffected: load_recipe() returns None and
+# every caller below falls through to today's heuristics unchanged.
+def load_recipe(model_name: str) -> "dict | None":
+    """Look up and validate a serving recipe for `model_name` (matched
+    against ModelEntry.name). Returns the parsed recipe dict on success,
+    or None if no recipe file names this model OR the matching file fails
+    schema/digest validation — a broken recipe is never silently treated
+    as "no recipe" without saying so; this function logs to stderr and
+    still returns None so serve() falls back to heuristics rather than
+    hard-failing a serve because of a bad recipe file."""
+    try:
+        sys.path.insert(0, str(_REPO_DIR / "serving"))
+        import check_recipes as _cr
+    except ImportError:
+        return None
+
+    for path in _cr.find_recipe_files():
+        try:
+            import yaml
+            with open(path, encoding="utf-8") as f:
+                recipe = yaml.safe_load(f)
+        except Exception:
+            continue
+        if not isinstance(recipe, dict) or recipe.get("model", {}).get("name") != model_name:
+            continue
+        try:
+            _cr.check_recipe(path, _cr._load_schema())
+        except _cr.RecipeError as e:
+            print(f"gb_synapse: recipe {path} for {model_name!r} failed validation, "
+                  f"ignoring it and using heuristics instead: {e}", file=sys.stderr)
+            _emit_recipe_validate(model_name, str(path), "invalid", str(e))
+            return None
+        _emit_recipe_validate(model_name, str(path), "valid", "")
+        return recipe
+    return None
+
+
+def _emit_recipe_validate(model_name: str, path: str, status: str, message: str) -> None:
+    """dataflux `recipe_validate` event — every recipe lookup, found valid
+    OR found invalid, leaves a trace (Observability Must-Rule); a model
+    with no matching recipe file at all emits nothing here, same
+    no-news-when-nothing-happened convention as synapse_auth."""
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({"kind": "recipe_validate", "status": status,
+                          "model": model_name, "path": path, "message": message})
+    except Exception:
+        pass
+
+
+def _default_short_load_check(entry: ModelEntry) -> bool:
+    """Default short_load probe step: true if any run-state for this model
+    reports an alive engine pid right now. This does NOT launch a fresh
+    engine itself — the actual launch-and-wait sequence already lives in
+    backend.serve()/_launch_proxy_and_record and duplicating it here would
+    be a second, divergent copy of that logic. A caller that wants to probe
+    a genuinely fresh (not-yet-launched) engine should launch it first (or
+    via a real serve() call) and pass a callable that polls THAT process,
+    not rely on this default."""
+    for st in _read_run_states():
+        if st.model == entry.name and _pid_alive(st.llama_pid):
+            return True
+    return False
+
+
+def _http_probe(url: str, *, timeout_s: float, payload: "dict | None" = None) -> "tuple[bool, str]":
+    """Minimal stdlib HTTP probe (GET if payload is None, else POST JSON) —
+    no new dependency, bounded by `timeout_s`. Returns (ok, message); never
+    raises a network exception past this function — the caller (a
+    serving/probe.py step) maps a raised exception to the step's secondary
+    reason, but a probe step for HTTP specifically wants the primary
+    (health_unhealthy-shaped) reason for a real-but-bad response, so this
+    function itself catches connection errors and returns them as (False,
+    message) rather than letting them propagate as an exception."""
+    import urllib.error
+    import urllib.request
+    try:
+        if payload is None:
+            req = urllib.request.Request(url, method="GET")
+        else:
+            body = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=body, method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            status = resp.status
+            body_text = resp.read(65536).decode("utf-8", errors="replace")
+        if status != 200:
+            return False, f"HTTP {status}: {body_text[:200]}"
+        return True, body_text
+    except (urllib.error.URLError, OSError) as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def probe_serve_readiness_for(
+    entry: ModelEntry, port: int, *,
+    require_tool_call: "bool | None" = None,
+    is_engine_ready: "callable | None" = None,
+    timeouts_s: "dict[str, float] | None" = None,
+) -> "list":
+    """gb-synapse's own typed pre-serve probe sequence (NemoClaw audit,
+    Phase 5d), built on serving/probe.py's bounded, closed-reason-set
+    runner: GGUF header read -> short load -> /health -> one 1-token
+    completion -> one tool-call completion.
+
+    `require_tool_call=None` (the default) derives from
+    `entry.arch`-independent evidence the same way the rest of gb_synapse
+    does today: this function has no reliable capability signal without a
+    recipe, so it defaults to True (probe the tool-call path) unless a
+    caller explicitly says otherwise, or a matching recipe's
+    capabilities.toolCalls is False.
+
+    Every step's ProbeResult is emitted as a `serve_probe` dataflux event —
+    the direct fix for "discover incompatibility by crashing" (the
+    documented `rope.dimension_sections key not found` incident class):
+    this turns that into a named, queryable reason instead of a crash log
+    to interpret by hand. Stops (and returns) at the first failure, same
+    fail-closed-on-mixed-evidence contract as serving/probe.py itself."""
+    sys.path.insert(0, str(_REPO_DIR / "serving"))
+    import probe as _probe
+
+    if require_tool_call is None:
+        recipe = load_recipe(entry.name)
+        require_tool_call = bool(recipe["capabilities"]["toolCalls"]) if recipe else True
+
+    base = f"http://127.0.0.1:{port}"
+    ready_check = is_engine_ready or (lambda: _default_short_load_check(entry))
+
+    def _gguf_header_step():
+        if not entry.path or entry.source != "hf":
+            return True  # nothing GGUF-shaped to probe (e.g. safetensors/diffusers)
+        summary = gguf_summary(entry.path)
+        if not summary or not summary.get("n_layers"):
+            return False, "gguf_summary() returned no usable layer count"
+        return True
+
+    def _short_load_step():
+        ready = ready_check()
+        return ready, "" if ready else "engine not reporting alive"
+
+    def _health_step():
+        return _http_probe(f"{base}/health", timeout_s=5.0)
+
+    def _one_token_step():
+        return _http_probe(
+            f"{base}/v1/completions", timeout_s=30.0,
+            payload={"model": entry.name, "prompt": "hi", "max_tokens": 1},
+        )
+
+    def _tool_call_step():
+        return _http_probe(
+            f"{base}/v1/chat/completions", timeout_s=30.0,
+            payload={
+                "model": entry.name,
+                "messages": [{"role": "user", "content": "call the ping tool"}],
+                "tools": [{"type": "function", "function": {
+                    "name": "ping", "description": "test tool",
+                    "parameters": {"type": "object", "properties": {}},
+                }}],
+                "max_tokens": 16,
+            },
+        )
+
+    steps = {
+        "gguf_header": _gguf_header_step,
+        "short_load": _short_load_step,
+        "health": _health_step,
+        "one_token_completion": _one_token_step,
+        "tool_call_completion": _tool_call_step,
+    }
+    results = _probe.probe_serve_readiness(
+        steps, timeouts_s=timeouts_s, require_tool_call=require_tool_call,
+    )
+    for r in results:
+        try:
+            import gb_dataflux
+            gb_dataflux.emit({
+                "kind": "serve_probe", "status": "ok" if r.ok else r.reason,
+                "model": entry.name, "step": r.step, "reason": r.reason or "",
+            })
+        except Exception:
+            pass
+    return results
+
+
+def build_serving_facts() -> dict:
+    """Assemble a serving/resolver.py facts snapshot from GreenBoost's own
+    live signals (NemoClaw audit, Phase 7 integration) — read-only, no
+    side effects.
+
+    controller facts come from gb_readiness.build_report()'s observations
+    (kmod.greenboost.loaded, shim.so.present, the netd/a2a/synapse port
+    checks) flattened to {id: value}. Node facts come from
+    gb_cluster.feeders(), keyed by feeder ip, PLUS a "host" entry built
+    from gb_topology.get_topology() — the host counts as a node for
+    everyNode/anyNode-scoped requirements, matching resolver.py's own
+    documented convention.
+
+    Honest gap, not silently papered over: `synapse.engine_version` is
+    populated for the HOST (gb_synapse.engine_version()) but NOT currently
+    populated per-feeder — gb_cluster.py's Feeder dataclass has no
+    structured per-feeder engine-version field today (the existing engine
+    parity check, `greenboost feeders sync-synapse`, is a bash-side
+    comparison, not a Python-queryable fact). A preset requirement keyed
+    on `synapse.engine_version` with an `everyNode` scope will therefore
+    correctly fail-closed on a feeder node (missing fact) until that gap
+    is closed — this is resolver.py's fail-closed contract working as
+    designed, not a bug in this function."""
+    facts: dict = {"controller": {}, "nodes": {}}
+
+    try:
+        import gb_readiness
+        report = gb_readiness.build_report()
+        for obs in report["observations"]:
+            if obs["determined"]:
+                facts["controller"][obs["id"]] = obs["value"]
+        for cap in report["capabilities"]:
+            facts["controller"][cap["id"]] = cap["available"]
+    except Exception:
+        pass
+
+    try:
+        import gb_topology
+        host_topo = gb_topology.get_topology()
+        host_facts = {}
+        cc = getattr(host_topo, "compute_capability", "") or ""
+        if cc:
+            try:
+                host_facts["gpu.cc"] = float(cc)
+            except ValueError:
+                pass
+        host_facts["synapse.engine_version"] = engine_version() or ""
+        facts["nodes"]["host"] = host_facts
+    except Exception:
+        facts["nodes"]["host"] = {}
+
+    online_feeder_count = 0
+    try:
+        for f in gb_cluster.feeders(probe=True):
+            if not f.online:
+                continue
+            online_feeder_count += 1
+            node_facts = {}
+            cc = (f.topology or {}).get("compute_capability", "") if hasattr(f, "topology") else ""
+            if cc:
+                try:
+                    node_facts["gpu.cc"] = float(cc)
+                except (TypeError, ValueError):
+                    pass
+            facts["nodes"][f.ip] = node_facts
+    except Exception:
+        pass
+    # A single node (the host counting as its own sole node) is not a real
+    # cluster — this fact exists so a preset like rpc-split.yaml can
+    # require an ACTUAL feeder, not rely on anyNode/everyNode's own
+    # vacuous-on-one-node semantics (see rpc-split.yaml's own comment for
+    # the live incident this closed: a Blackwell-class host with zero
+    # feeders configured otherwise satisfied anyNode.gpu.cc>=12.0 against
+    # itself and looked eligible for an rpc split that doesn't exist).
+    facts["controller"]["cluster.feeder_count"] = online_feeder_count
+
+    return facts
+
+
+def resolve_serving_preset() -> dict:
+    """Resolve which serving/presets/*.yaml preset is currently eligible
+    and highest-priority, using live facts (build_serving_facts()) — the
+    read-only preview this session wires; live-changing gb_synapse.serve()
+    dispatch based on the result is deliberately NOT done in this pass
+    (see the NemoClaw audit plan's Phase 7 scoping note). Returns
+    {"selected": <preset id or None>, "recipeRef": ..., "error": ...} —
+    never raises; an AmbiguousSelectionError or "no eligible preset"
+    becomes a reported error string instead."""
+    sys.path.insert(0, str(_REPO_DIR / "serving"))
+    import resolver as _resolver
+
+    try:
+        presets = _resolver.load_presets()
+        facts = build_serving_facts()
+        selected, evaluations = _resolver.resolve(presets, facts)
+        return {
+            "selected": selected["id"], "recipeRef": selected["recipeRef"],
+            "facts": facts,
+            "evaluations": [{"preset": e.preset_id, "matched": e.matched,
+                            "failed_requirements": e.failed_requirements}
+                           for e in evaluations],
+        }
+    except _resolver.AmbiguousSelectionError as e:
+        return {"selected": None, "error": str(e), "tied_preset_ids": e.tied_preset_ids}
+    except Exception as e:
+        return {"selected": None, "error": str(e)}
+
+
 def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
           use_cluster: bool = True, n_slots: int = -1, extra_args: str = "",
-          cuda_graph: "bool | None" = None, cache_ram: "int | None" = None) -> ServerState:
+          cuda_graph: "bool | None" = None, cache_ram: "int | None" = None,
+          mtp_draft_n: "int | None" = None,
+          spec_draft_p_min: "float | None" = None,
+          slot_prompt_similarity: "float | None" = None,
+          kv_type: "str | None" = None,
+          use_preset: bool = False) -> ServerState:
     """Resolve `model` (manifest name, "org/repo[:quant]", or a bare Ollama
     model name) and hand it to whichever engine backend its manifest entry
     calls for (gb_synapse_backends.select_backend) — llama.cpp (default,
@@ -3400,6 +4505,42 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
     LlamaCppBackend.serve()'s comment) — never a literal MiB figure per this
     repo's hardcoded-hardware-values rule.
 
+    mtp_draft_n: per-call override for --spec-draft-n-max on an MTP-carrying
+    model (LlamaCppBackend only, ignored by other backends and by models
+    without a qualifying MTP head — see LlamaCppBackend.serve()'s comment).
+    None (default) falls back to the GB_SYNAPSE_MTP_DRAFT_N env var (default
+    4, the 2026-08-05 sweep's winner). A bandwidth-bound dense decode costs
+    the same per forward pass regardless of how many tokens speculative
+    decoding emits from it, so raising this is a quality-neutral throughput
+    lever, not a tradeoff.
+
+    spec_draft_p_min: per-call override for --spec-draft-p-min (LlamaCppBackend
+    only, same MTP-head gate as mtp_draft_n). None (default) falls back to
+    GB_SYNAPSE_MTP_P_MIN (default 0.3, the 2026-08-05 sweep's winner). Lets a draft
+    stop once its top-token probability drops below this threshold instead
+    of always running to full mtp_draft_n depth — verification stays exact
+    either way, this only affects how much compute a low-confidence draft
+    burns before being discarded.
+
+    slot_prompt_similarity: per-call override for --slot-prompt-similarity
+    (LlamaCppBackend only). None (default) falls back to
+    GB_SYNAPSE_SLOT_PROMPT_SIMILARITY (default 0.5, raised from the deployed
+    engine's own compiled default of 0.10 — found too permissive under real
+    multi-session load, see GB_SLOT_PROMPT_SIMILARITY's module-level
+    comment). Controls whether a multi-turn conversation's later turns reuse
+    their own prior slot (near-total prefill skip) or fall back to LRU
+    (full re-prefill of the whole growing conversation, every turn).
+
+    kv_type: per-call override for --cache-type-k/-v (LlamaCppBackend only —
+    e.g. "f16"/"q8_0"/"q4_0"). None (default) leaves KV precision to
+    _pick_kv_type()'s own budget-driven choice, or a recipe's `kvCache`
+    field when one applies. An explicit caller value here wins over both
+    (MCP Tool Gaps rule — before this, forcing a specific KV type for a
+    measurement pass required going around the tool via a raw `extra_args`
+    flag, which silently lost to LlamaCppBackend.serve()'s own
+    --cache-type-k/-v emission; gb_synapse_backends._dedupe_extra_args_overrides
+    fixes that path too, but this is the direct one).
+
     A THIRD case, not just alive/dead: the engine can be alive while only
     its proxy died (another process squatted the port, an OOM-killer got the
     proxy but not the much larger engine, ...). The old reuse-check required
@@ -3407,8 +4548,114 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
     spawns a brand-new engine while the first one, already holding VRAM for
     a loaded model, keeps running unreferenced. Restarting just the proxy
     (same ports the engine already committed to) is the fix.
+
+    use_preset=False (default — nothing about this call changes) means
+    "decide use_cluster the way this call always has: from the `use_cluster`
+    argument, whatever the caller passed" (NemoClaw audit, Phase 7 follow-up
+    — closes the "resolver doesn't drive serve()'s live dispatch yet" gap
+    left open when Phase 7 landed the resolver itself, read-only). Pass
+    True to hand that decision to resolve_serving_preset() instead: the
+    live-facts-derived preset (host-only vs rpc-split, or whatever presets
+    exist under serving/presets/ by the time this runs) decides
+    `use_cluster` OUTRIGHT from its resolved recipe's tierIntent
+    (rpcSplit -> True, t1Only/t2Spill -> False) — this is an unconditional
+    override, the same "pass this OR pass an explicit value, not both if
+    they might disagree" contract `recipe=` already has on the
+    `synapse_serve` MCP tool. Raises serving.resolver.AmbiguousSelectionError
+    on a priority tie, or ValueError when no preset is eligible at all,
+    rather than silently falling back to the `use_cluster` argument — an
+    explicit ask for preset-driven dispatch that can't actually be
+    resolved is a real error to surface, not a reason to pretend the
+    caller's own use_cluster value was requested. Neither exception is a
+    RuntimeError, so this failure is never caught by the cluster/RPC
+    retry-fallback below — resolving BEFORE that point failing is a
+    different problem than an RPC serve attempt failing.
     """
     entry = _resolve_model(model)
+
+    if use_preset:
+        sys.path.insert(0, str(_REPO_DIR / "serving"))
+        import resolver as _resolver
+        presets = _resolver.load_presets()
+        facts = build_serving_facts()
+        selected, _evals = _resolver.resolve(presets, facts)  # raises on tie/no-match
+        preset_recipe_path = _REPO_DIR / "serving" / "recipes" / selected["recipeRef"]
+        with open(preset_recipe_path, encoding="utf-8") as f:
+            import yaml
+            preset_recipe = yaml.safe_load(f)
+        tier_intent = preset_recipe["tierIntent"]
+        use_cluster = tier_intent == "rpcSplit"
+
+    # Recipe override (NemoClaw audit, Phase 5e) — only for the sentinel
+    # "let the heuristics decide" values, and only the two schema fields
+    # that map directly onto existing serve() parameters (ctx, mtpDraftN —
+    # see load_recipe()'s own comment for the recipe fields this does NOT
+    # yet override). An explicit caller-supplied value always wins over a
+    # recipe — a recipe pins a DEFAULT, it does not override an operator
+    # who asked for something specific on this one call.
+    _recipe = load_recipe(entry.name)
+    # Placement overrides (NemoClaw audit, Phase 5/7 follow-up — the item
+    # explicitly flagged as deferred when Phase 5 landed): nGpuLayers/
+    # kvCache/nCpuMoe now DO reach LlamaCppBackend.serve()'s own -ngl/
+    # --cache-type-k/-v/--n-cpu-moe decisions, via the same None-default
+    # override params cuda_graph/mtp_draft_n/etc. already use. Still
+    # additive: None on every backend that doesn't recognize them, and
+    # cpu_quirk (a confirmed hardware crash, not a heuristic) is checked
+    # BEFORE any of these inside LlamaCppBackend.serve() regardless.
+    _n_gpu_layers_override = None
+    _kv_type_override = None
+    _n_cpu_moe_override = None
+    _sampling_override = None
+    if _recipe is not None:
+        if ctx == 0:
+            ctx = int(_recipe["ctx"])
+        elif int(_recipe["ctx"]) != int(ctx):
+            # An explicit caller ctx still wins , that precedence is deliberate
+            # and every other override here follows it. But it must not win
+            # SILENTLY: a recipe's ctx is a MEASURED value, and discarding it
+            # for a stale config default is how a model that fits ends up
+            # spilling.
+            #
+            # Live on 2026-08-18: greenboost-cli passed llamacpp_n_ctx=65536
+            # from its config, the recipe's measured 16384 was dropped without
+            # a word, and Qwen3.8-27B-UD-IQ3_XXS , which fits this card at
+            # 16384 , served with VRAM at 52.3% and 11.5 GB overflowing to T2.
+            # `rule1_underfilled` caught the RESULT; nothing named the CAUSE.
+            _msg = (f"caller ctx={ctx} overrides recipe ctx={_recipe['ctx']} for "
+                    f"{entry.name} , the recipe's value was measured; pass ctx=0 "
+                    f"to use it")
+            print(f"[gb-synapse] NOTE: {_msg}", file=sys.stderr)
+            try:
+                import gb_dataflux
+                gb_dataflux.emit({
+                    "kind": "recipe_override", "node": "host", "label": "synapse",
+                    "status": "warn", "model": entry.name, "field": "ctx",
+                    "recipe_value": int(_recipe["ctx"]), "caller_value": int(ctx),
+                })
+            except Exception:
+                pass
+        if mtp_draft_n is None and "mtpDraftN" in _recipe:
+            mtp_draft_n = int(_recipe["mtpDraftN"])
+        _n_gpu_layers_override = _recipe["nGpuLayers"]
+        _kv_cache = _recipe["kvCache"]
+        if _kv_cache["key"] == _kv_cache["value"]:
+            _kv_type_override = _kv_cache["key"]
+        # else: asymmetric K/V precision isn't expressible through
+        # LlamaCppBackend.serve()'s current --cache-type-k/-v call (it
+        # always passes the same kv_type to both) — leave kv_type_override
+        # unset rather than silently dropping half the recipe's intent;
+        # the heuristic picks a single symmetric type instead.
+        if "nCpuMoe" in _recipe:
+            _n_cpu_moe_override = int(_recipe["nCpuMoe"])
+        # Model-card sampling defaults. Before this, a recipe could pin ctx and
+        # KV type but had no way to carry the values the model's own card
+        # publishes, so a card specifying top_k 20 / min_p 0.0 silently ran on
+        # llama.cpp's generic top_k 40 / min_p 0.05.
+        _sampling_override = _recipe.get("sampling") or None
+    if kv_type is not None:
+        # Explicit caller value always wins over a recipe , same precedence
+        # every other override param in this function already follows.
+        _kv_type_override = kv_type
 
     for st in _read_run_states():
         if st.model != entry.name:
@@ -3421,6 +4668,11 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
             proxy_proc, proxy_error = _start_proxy(entry, st.port, st.internal_port, st.engine)
             st.proxy_pid = proxy_proc.pid
             st.proxy_error = proxy_error
+            # The new proxy process — not the old one st was read from —
+            # decides bind/auth now; refresh both to match what's actually
+            # running rather than leaving stale values from the last serve.
+            st.bind = os.environ.get("GB_SYNAPSE_BIND", "127.0.0.1")
+            st.auth_enabled = bool(_synapse_proxy_token())
             _write_run_state(st)
             _emit_serve(entry, "proxy_error" if proxy_error else "ok",
                         port=st.port, tensor_split=st.tensor_split, feeders=st.feeders,
@@ -3432,7 +4684,14 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
     try:
         state = backend.serve(entry, port, ctx=ctx, use_cluster=use_cluster,
                               n_slots=n_slots, extra_args=extra_args,
-                              cuda_graph=cuda_graph, cache_ram=cache_ram)
+                              cuda_graph=cuda_graph, cache_ram=cache_ram,
+                              mtp_draft_n=mtp_draft_n,
+                              spec_draft_p_min=spec_draft_p_min,
+                              slot_prompt_similarity=slot_prompt_similarity,
+                              n_gpu_layers_override=_n_gpu_layers_override,
+                              kv_type_override=_kv_type_override,
+                              n_cpu_moe_override=_n_cpu_moe_override,
+                              sampling_override=_sampling_override)
     except RuntimeError:
         # A cluster/RPC load can fail for reasons that have nothing to do with
         # whether the model can run at all — a feeder's engine build gap, a
@@ -3452,16 +4711,27 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
             raise
         print(f"  [gb-synapse] {entry.name}: cluster/RPC serve failed — "
               f"retrying host-only before giving up.", flush=True)
+        # n_gpu_layers_override deliberately NOT passed on this retry: a
+        # recipe's placement was validated for the topology that just
+        # failed (potentially spanning a feeder) — degrading to host-only
+        # should fall back to the live heuristic solve for THIS topology,
+        # not replay an override tuned for a different one. kv_type_override
+        # still applies (a KV precision choice, unlike a layer count, isn't
+        # topology-dependent).
         state = backend.serve(entry, port, ctx=ctx, use_cluster=False,
                               n_slots=n_slots, extra_args=extra_args,
-                              cuda_graph=cuda_graph, cache_ram=cache_ram)
+                              cuda_graph=cuda_graph, cache_ram=cache_ram,
+                              mtp_draft_n=mtp_draft_n,
+                              spec_draft_p_min=spec_draft_p_min,
+                              slot_prompt_similarity=slot_prompt_similarity,
+                              kv_type_override=_kv_type_override)
     return _maybe_serve_embedding(state)
 
 
 def _maybe_serve_embedding(state: ServerState) -> ServerState:
     """Eagerly bring up a second, minimal embeddings engine alongside the
     primary serve when GB_SYNAPSE_EMBED_MODEL is set — the RAG-client-usable
-    half of the embeddings design (P6): a client can't call :11435/v1/
+    half of the embeddings design (P6): a client can't call :11369/v1/
     embeddings at all without SOME engine behind it. An on-demand,
     first-request lazy launch triggered from the proxy itself is a real,
     larger feature intentionally left for later — the proxy is a separate
@@ -3572,6 +4842,37 @@ def stop(model: str) -> bool:
     for st in _read_run_states():
         if st.model != model:
             continue
+        # Capture the KV footprint BEFORE killing the engine: this is the one
+        # moment the real number is known.
+        #
+        # _persist_kv_measurement() is otherwise only called right after the
+        # server reports ready, which is precisely when kv_t1_tracked_mb is
+        # still 0 for any engine that allocates its KV lazily on the first
+        # request — and its own `if kv_t1_mb <= 0: return` guard then skips the
+        # write. Such a model never gets a measurement written at all, so every
+        # future serve keeps using estimate_kv_gb()'s formula, which this
+        # architecture class is documented to inflate.
+        #
+        # Live 2026-08-17, first serve of Qwen3.8-27B-Cold-Fusion at ctx=32768
+        # f16: reserve 2908 MB against a real kv_t1_tracked_mb of 258 MB (11.3x),
+        # with nothing in kv_measurements.json for it. Per this function's own
+        # docstring an oversized reserve directly blocks the Rule #1 front-load
+        # split, so the model sat at 66.7% VRAM fill while 14326 MB streamed
+        # from T2 across PCIe every forward pass.
+        try:
+            # _persist_kv_measurement only reads `.name` off its entry, so a
+            # namespace avoids constructing a full ModelEntry (and re-reading
+            # the manifest) just to record a number.
+            import types as _types
+            # started_ts scopes the peak fallback to THIS serve. It matters most
+            # here: teardown is exactly when the live counter reads 0 and the
+            # fallback takes over, and an unscoped window would hand this model
+            # the previous reference model's KV peak.
+            _persist_kv_measurement(_types.SimpleNamespace(name=st.model),
+                                    {"ctx": st.ctx, "kv_type": st.kv_type,
+                                     "started_ts": getattr(st, "started_ts", None)})
+        except Exception:
+            pass  # telemetry must never block a stop
         for pid in (st.llama_pid, st.proxy_pid, st.embed_pid):
             if pid and _pid_alive(pid):
                 _kill_process_group(pid)
@@ -3595,6 +4896,16 @@ def ps() -> list[dict]:
             continue
         if engine_alive and not proxy_alive and not st.proxy_error:
             st.proxy_error = "proxy process is gone"
+            # `ready` means "a client can use this session". With the proxy
+            # dead nothing can reach the model, whatever the engine is doing,
+            # so reporting ready here is simply false.
+            #
+            # Overnight 2026-08-19 that falsehood was the whole problem: the
+            # proxy was OOM-killed at 01:47, llama-server kept 10.5 GB of VRAM,
+            # every request failed with "Cannot connect to :11369", and ps()
+            # still said ready=True , so nothing downstream (including
+            # GB-Semantics' serve_healthy) had any reason to look closer.
+            st.ready = False
         live.append(asdict(st))
     return live
 
@@ -3620,6 +4931,18 @@ def _format_doctor(d: dict) -> str:
                  else "missing — run: sudo greenboost install-synapse-engine"))
     lines.append("HF token:   " + ("set" if d['hf_token_set']
                  else "NOT SET — run: greenboost synapse login"))
+    nc = d.get("nemoclaw") or {}
+    if nc.get("port_foreign"):
+        lines.append(f"NemoClaw:   WARNING — :{DEFAULT_PORT} is held by "
+                      f"{nc.get('port_owner_hint') or 'an unrecognized process'}, "
+                      f"not this gb-synapse; a NemoClaw Ollama auth proxy "
+                      f"defaults to this same port (OLLAMA_PROXY_PORT) — see "
+                      f"docs/nemoclaw-and-greenboost.md")
+    elif nc.get("cli_present"):
+        lines.append(f"NemoClaw:   detected ({nc['cli_path']}) — onboard with "
+                      f"'Other OpenAI-compatible endpoint' -> "
+                      f"http://localhost:{DEFAULT_PORT}/v1, see "
+                      f"docs/nemoclaw-and-greenboost.md")
     return "\n".join(lines)
 
 
@@ -3770,3 +5093,487 @@ def _cli_main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(_cli_main(sys.argv[1:]))
+
+
+# ── pause / resume ──────────────────────────────────────────────────────────
+#
+# The problem this exists for, measured on this box 2026-08-18: an idle serve
+# session holds ~10.4 GiB of a 12 GB card at 0% GPU utilization, 787 MHz and
+# 23 W, indefinitely. Nothing is leaking — llama-server is simply keeping the
+# weights resident so the next request is fast — but from the operator's seat
+# it is 87% of the card doing nothing, and there was no way to get it back
+# without losing the conversation.
+#
+# llama.cpp's slot save/restore is what makes this recoverable rather than
+# destructive. Verified live against the reference workload before any of this
+# was written (54,377 tokens of f16 KV): save 3.72 GB in 740 ms, restore the
+# same 54,377 tokens in 537 ms. So a pause costs about a second of wall time
+# and a few GB of disk, and buys back the whole card.
+#
+# NOTE this is NOT the `--cache-reuse` / `/llamacache` mechanism that
+# CLAUDE.md records as broken for this hybrid architecture. That one is
+# checkpoint-based prompt-cache reuse across requests; this is the engine's own
+# per-slot KV state dump. They fail independently, and slot save/restore was
+# measured working on exactly the model the other one breaks on.
+
+PAUSE_DIR = Path(os.environ.get("GB_SYNAPSE_PAUSE_DIR", str(RUN_DIR / "paused")))
+
+
+def _pause_state_path(model: str) -> Path:
+    return PAUSE_DIR / f"{_safe_name(model)}.json"
+
+
+def _slot_endpoint(st: ServerState) -> str:
+    """The ENGINE's own port, not the proxy's.
+
+    /slots is a llama-server route; the proxy passes it through, but during a
+    pause the proxy is about to be killed too, so talk to the engine directly.
+    """
+    return f"http://127.0.0.1:{st.internal_port}"
+
+
+def _slots_list(st: ServerState, timeout: float = 10.0) -> list:
+    import urllib.request
+    with urllib.request.urlopen(f"{_slot_endpoint(st)}/slots", timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _slot_action(st: ServerState, slot_id: int, action: str, filename: str,
+                 timeout: float = 600.0) -> dict:
+    """POST /slots/{id}?action=save|restore.
+
+    The timeout is generous on purpose: the size of a slot dump scales with
+    context, and a full 65536-token f16 slot is several GB. Failing a pause
+    because a 4 GB write took longer than a default 30 s would leave the
+    caller believing state was saved when it was not.
+    """
+    import urllib.request
+    body = json.dumps({"filename": filename}).encode()
+    req = urllib.request.Request(
+        f"{_slot_endpoint(st)}/slots/{slot_id}?action={action}",
+        data=body, headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _vram_used_mb() -> "int | None":
+    """Live VRAM occupancy, for reporting how much a pause actually returned."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5).stdout.strip().splitlines()
+        return int(out[0].strip()) if out else None
+    except Exception:
+        return None
+
+
+def pause(model: str, force: bool = False) -> dict:
+    """Save the session's KV state, stop the engine, and give the VRAM back.
+
+    Returns a result dict rather than a bare bool: the caller needs to know how
+    much was actually freed and how many tokens survived, and a pause that
+    saved nothing is a very different outcome from one that saved 54k tokens.
+
+    `force` pauses even while a request is in flight. That request's output is
+    lost (llama.cpp has no way to checkpoint a half-finished generation), so it
+    is opt-in and the loss is reported rather than hidden.
+    """
+    PAUSE_DIR.mkdir(parents=True, exist_ok=True)
+    for st in _read_run_states():
+        if st.model != model:
+            continue
+        if st.engine and st.engine != "llama.cpp":
+            return {"ok": False, "model": model,
+                    "error": f"pause needs llama.cpp slot save/restore; this "
+                             f"session runs on {st.engine!r}"}
+
+        vram_before = _vram_used_mb()
+        try:
+            slots = _slots_list(st)
+        except Exception as e:
+            return {"ok": False, "model": model,
+                    "error": f"could not read /slots on the engine: {e}"}
+
+        busy = [s for s in slots if s.get("is_processing")]
+        if busy and not force:
+            return {"ok": False, "model": model, "busy_slots": [s["id"] for s in busy],
+                    "error": "a request is still being generated; pausing now "
+                             "would discard it. Wait for it to finish, or pass "
+                             "force=True to accept losing it."}
+
+        saved, tokens = [], 0
+        for s in slots:
+            n = int(s.get("n_prompt_tokens") or 0)
+            if n <= 0:
+                continue   # nothing cached in this slot; a dump would be noise
+            fn = f"{_safe_name(model)}.slot{s['id']}.bin"
+            try:
+                r = _slot_action(st, int(s["id"]), "save", fn)
+            except Exception as e:
+                # Do NOT stop the engine after a failed save — that is the one
+                # path that turns "pause failed" into "conversation lost".
+                return {"ok": False, "model": model, "slot": s["id"],
+                        "error": f"slot save failed, engine left running: {e}"}
+            saved.append({"slot": int(s["id"]), "filename": fn,
+                          "tokens": int(r.get("n_saved") or 0),
+                          "bytes": int(r.get("n_written") or 0),
+                          "save_ms": (r.get("timings") or {}).get("save_ms")})
+            tokens += int(r.get("n_saved") or 0)
+
+        state = {
+            "model": st.model, "quant": st.quant, "port": st.port,
+            "ctx": st.ctx, "kv_type": st.kv_type, "n_gpu_layers": st.n_gpu_layers,
+            "engine": st.engine, "tensor_split": st.tensor_split,
+            "slots": saved, "paused_ts": time.time(),
+            "forced_over_inflight": bool(busy),
+        }
+        _pause_state_path(model).write_text(json.dumps(state, indent=1))
+
+        stop(model)
+        time.sleep(1.0)   # let the driver actually reclaim before measuring
+        vram_after = _vram_used_mb()
+        freed = (vram_before - vram_after) if (vram_before and vram_after) else None
+
+        try:
+            import gb_dataflux
+            gb_dataflux.emit({
+                "node": "host", "label": "gb_synapse", "kind": "serve_pause",
+                "model": model, "action": "pause", "slots_saved": len(saved),
+                "tokens_saved": tokens, "vram_freed_mb": freed,
+                "forced_over_inflight": bool(busy),
+            })
+        except Exception:
+            pass
+
+        return {"ok": True, "model": model, "slots_saved": len(saved),
+                "tokens_saved": tokens, "vram_freed_mb": freed,
+                "discarded_inflight": [s["id"] for s in busy] if busy else [],
+                "state_file": str(_pause_state_path(model))}
+    return {"ok": False, "model": model, "error": "no running session for that model"}
+
+
+def resume(model: str) -> dict:
+    """Re-serve a paused session and restore its KV state.
+
+    The slow part is reloading the weights, not the KV restore — the restore
+    itself measured 537 ms for 54,377 tokens. Reported separately so the two
+    are not confused.
+    """
+    p = _pause_state_path(model)
+    if not p.exists():
+        return {"ok": False, "model": model, "error": "no paused session for that model"}
+    state = json.loads(p.read_text())
+
+    t0 = time.monotonic()
+    st = serve(model, port=state.get("port") or DEFAULT_PORT,
+               ctx=state.get("ctx") or 0,
+               kv_type=state.get("kv_type") or None)
+    serve_s = time.monotonic() - t0
+
+    restored, tokens, errors = [], 0, []
+    t1 = time.monotonic()
+    for s in state.get("slots", []):
+        try:
+            r = _slot_action(st, int(s["slot"]), "restore", s["filename"])
+            restored.append(int(s["slot"]))
+            tokens += int(r.get("n_restored") or 0)
+        except Exception as e:
+            # A failed restore is recoverable: the session is up, it just has a
+            # cold cache. Say so instead of failing the whole resume.
+            errors.append({"slot": s["slot"], "error": str(e)})
+    restore_s = time.monotonic() - t1
+
+    if not errors:
+        p.unlink(missing_ok=True)
+
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({
+            "node": "host", "label": "gb_synapse", "kind": "serve_pause",
+            "model": model, "action": "resume", "slots_restored": len(restored),
+            "tokens_restored": tokens, "reload_s": round(serve_s, 2),
+            "restore_s": round(restore_s, 2),
+            "status": "error" if errors else "ok",
+        })
+    except Exception:
+        pass
+
+    return {"ok": not errors, "model": model, "slots_restored": restored,
+            "tokens_restored": tokens, "reload_s": round(serve_s, 2),
+            "restore_s": round(restore_s, 2), "errors": errors,
+            "ready": getattr(st, "ready", True)}
+
+
+def paused() -> list[dict]:
+    """Paused sessions waiting to be resumed. Cheap; safe to poll."""
+    out = []
+    if not PAUSE_DIR.exists():
+        return out
+    for f in sorted(PAUSE_DIR.glob("*.json")):
+        try:
+            d = json.loads(f.read_text())
+            d["idle_s"] = round(time.time() - float(d.get("paused_ts") or 0), 1)
+            d["disk_bytes"] = sum(int(s.get("bytes") or 0) for s in d.get("slots", []))
+            out.append(d)
+        except Exception:
+            continue
+    return out
+
+
+# ── speculative-decode (MTP) acceptance ─────────────────────────────────────
+
+_DRAFT_ACCEPT_RE = re.compile(
+    r"draft acceptance = ([0-9.]+) \(\s*(\d+) accepted /\s*(\d+) generated\)"
+    r", mean len =\s*([0-9.]+)")
+
+# Below this token-weighted acceptance, the MTP quant is doing more work than it
+# saves and the plain quant is faster. Straight from the model card for the
+# reference workload: "If you see token acceptance rates BELOW 50% (predict 2
+# tokens) switch to normal quants."
+MTP_ACCEPTANCE_FLOOR = 0.50
+
+
+def recover_from_hf_cache() -> list:
+    """Re-register models whose weights are on disk but missing from the manifest.
+
+    A Full Install's purge resets the manifest while leaving the HuggingFace
+    cache alone, so every HF-pulled model silently disappears from `gb` while
+    tens of gigabytes of weights sit on disk untouched. That is not a rare edge
+    case: it happened three times on 2026-08-18, twice ending in the CLI
+    refusing to start with `no such model` for a model the box had fully
+    downloaded.
+
+    Re-registering from the cache is cheap (a GGUF header read) and safe: it
+    only ADDS entries for files that genuinely exist, never removes or rewrites
+    one. Nothing here downloads.
+
+    Returns the entries recovered, so a caller can report what it healed rather
+    than silently changing state.
+    """
+    import glob as _glob
+    cache = MODEL_STORE_DIR / "_hf_cache"
+    if not cache.exists():
+        return []
+    known_paths = {e.path for e in _load_manifest().values()}
+    recovered = []
+    for path in _glob.glob(str(cache / "models--*" / "snapshots" / "*" / "*.gguf")):
+        if path in known_paths:
+            continue
+        real = os.path.realpath(path)
+        if not os.path.exists(real) or os.path.getsize(real) < 1_000_000:
+            continue        # broken symlink or a stub, not a model
+        fname = os.path.basename(path)
+        if fname.startswith("mmproj"):
+            continue        # a projector is not a servable model on its own
+        # Repo name back out of HF's cache layout: models--org--repo
+        try:
+            repo_dir = path.split("/_hf_cache/")[1].split("/snapshots/")[0]
+            repo = repo_dir.replace("models--", "", 1).replace("--", "/", 1)
+        except (IndexError, AttributeError):
+            repo = ""
+        try:
+            meta = gguf_summary(real)
+        except Exception:
+            continue        # unreadable GGUF — leave it out rather than guess
+        name = fname[:-5] if fname.endswith(".gguf") else fname
+        entry = ModelEntry(name=name, path=path, source="hf", repo=repo,
+                           added_ts=time.time(),
+                           **{k: v for k, v in meta.items()})
+        recovered.append(entry)
+    if recovered:
+        update_manifest(lambda m: m.update({e.name: e for e in recovered}))
+    return recovered
+
+
+def zero_spill_weight_budget_gb(ctx: int = 0, kv_gb: float = 0.0,
+                                activation_reserve_gb: float = 0.0) -> float:
+    """GiB of weights that can sit in VRAM with NOTHING crossing PCIe.
+
+    Physical free VRAM, minus the KV cache, minus a workspace allowance. Read
+    live from NVML , never a stored figure, per this repo's
+    hardcoded-hardware-values rule.
+
+    This is the number quant selection should optimise against, and it is not
+    the same as "VRAM total". Measured on this box 2026-08-18: total 12227 MB,
+    free 10857 MB with the desktop running, and after a measured 594 MB of KV
+    the real weights budget is closer to 9.9 GiB. A quant chosen against 12227
+    spills, and spilling is not a small penalty , it is the difference between
+    reading weights at ~672 GB/s and at ~11.5.
+    """
+    try:
+        from gb_nvml import get_nvml
+        _, free_mb, _total_mb, _ = get_nvml(0).mem()
+    except Exception:
+        return 0.0
+    if kv_gb <= 0 and ctx:
+        # Prefer a real measurement when one exists , estimate_kv_gb() is
+        # documented as unreliable for this hybrid architecture class.
+        kv_gb = 0.0
+        try:
+            for _k, _v in (_load_all_kv_measurements() or {}).items():
+                if f"::{ctx}::" in _k:
+                    kv_gb = max(kv_gb, float(_v.get("kv_t1_tracked_mb", 0)) / 1024.0)
+        except Exception:
+            pass
+    if activation_reserve_gb <= 0:
+        # %-derived, not a literal: graph workspace scales with the card.
+        activation_reserve_gb = (free_mb / 1024.0) * 0.03
+    return max(0.0, free_mb / 1024.0 - kv_gb - activation_reserve_gb)
+
+
+def _load_all_kv_measurements() -> dict:
+    try:
+        import json as _json
+        return _json.loads((MODEL_STORE_DIR.parent / "kv_measurements.json").read_text())
+    except Exception:
+        return {}
+
+
+def select_quant_by_fit(files: list, budget_gb: float) -> dict:
+    """Largest candidate that fits `budget_gb` with zero spill, else the smallest.
+
+    The ordering principle, from measurement rather than preference: a SMALLER
+    quant that fits entirely in VRAM beats a LARGER quant that spills, and not
+    marginally. Measured 2026-08-18 on this box, same model family:
+
+        21.27 GiB serving with 13,850 MB spilled   18.81 tok/s
+        21.27 GiB serving with     39 MB spilled   45.72 tok/s
+
+    Same weights, same card, 2.4x purely from what crossed the bus. The old
+    selection maximised file size subject to fitting VRAM *total*, which has no
+    term for KV, no term for workspace, and no notion that spilling is
+    catastrophic rather than gradual.
+
+    Returns the chosen file dict plus why, so a surprising pick is explainable.
+    """
+    sized = [f for f in files if (f.get("size") or 0) > 0]
+    if not sized:
+        return {}
+    fitting = [f for f in sized if f["size"] / (1024 ** 3) <= budget_gb]
+    if fitting:
+        best = max(fitting, key=lambda f: f["size"])
+        return {"file": best, "fits": True,
+                "reason": (f"largest quant that fits {budget_gb:.2f} GiB of VRAM "
+                           f"with zero spill")}
+    best = min(sized, key=lambda f: f["size"])
+    over = best["size"] / (1024 ** 3) - budget_gb
+    return {"file": best, "fits": False, "overflow_gb": round(over, 2),
+            "reason": (f"NOTHING fits {budget_gb:.2f} GiB , smallest available "
+                       f"still spills {over:.2f} GiB over PCIe, which caps decode "
+                       f"near {budget_gb and 11.5 / max(over, 0.01):.1f} tok/s")}
+
+
+# Seconds of idleness after which llama-server sleeps and releases its VRAM.
+#
+# A native engine flag (`--sleep-idle-seconds`) that GreenBoost never set. The
+# problem it solves was measured on this box 2026-08-18: an idle serve session
+# held 10.4 GiB of a 12 GB card at 0% GPU utilization, 787 MHz, 23 W —
+# indefinitely — and blocked an unrelated GPU job with a CUDA OOM while doing
+# nothing. The `idle_serve_holding_vram` segment exists to surface exactly that
+# state; this is the engine-level way to stop it happening.
+#
+# Complements `gb_synapse.pause()` rather than replacing it: sleep is automatic
+# and recovers on the next request, while pause explicitly saves KV state to
+# disk and stops the process. Sleep is the cheap default; pause is what you want
+# before handing the whole card to something else.
+#
+# -1 (llama.cpp's own default) disables it. Off by default here too, because
+# waking costs a reload and the right threshold depends on how the box is used.
+SLEEP_IDLE_SECONDS = int(os.environ.get("GB_SYNAPSE_SLEEP_IDLE_SECONDS", "-1"))
+
+
+# Extra speculative-decoding modes stacked ALONGSIDE the model's own MTP head.
+#
+# llama.cpp's `--spec-type` takes a COMMA-SEPARATED LIST, and several of its
+# modes need no draft model and no extra VRAM at all: the ngram family predicts
+# the next tokens from text already in the context window. That matters here
+# because decode on this box is bandwidth-bound — a forward pass costs the same
+# whether it emits one token or five — so any additional accepted draft token is
+# close to free throughput.
+#
+# It also matches the workload. An agentic coding turn re-emits long spans that
+# are already in its own context: file contents being edited, paths, identifiers,
+# tool output being quoted back. That is precisely what ngram speculation
+# catches and what a model-based drafter spends parameters to relearn.
+#
+# Empty by default: this is a measured lever, not an assumption. Set
+# GB_SYNAPSE_SPEC_EXTRA=ngram-cache (or a comma list) and compare with
+# gb_bench_turn.py before making it a default for any model.
+SPEC_EXTRA_TYPES = os.environ.get("GB_SYNAPSE_SPEC_EXTRA", "").strip()
+
+# The modes llama.cpp actually accepts. Guarded because a typo here does not
+# fail loudly — llama-server rejects the whole --spec-type value and silently
+# serves with NO speculation, which reads as "the lever did nothing".
+SPEC_TYPES_KNOWN = (
+    "none", "draft-simple", "draft-eagle3", "draft-mtp", "draft-dflash",
+    "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod", "ngram-cache",
+)
+
+
+def spec_type_list(base: "list[str]", extra: str = "") -> str:
+    """Build the `--spec-type` value from a base list plus opt-in extras.
+
+    Returns a comma-joined string with unknown modes dropped (and named on
+    stderr) and duplicates removed while preserving order — the model's own
+    draft head should stay first so it is tried before the ngram fallbacks.
+    """
+    out: list[str] = []
+    for t in list(base) + [x.strip() for x in (extra or "").split(",")]:
+        if not t:
+            continue
+        if t not in SPEC_TYPES_KNOWN:
+            print(f"[gb-synapse] ignoring unknown --spec-type {t!r} "
+                  f"(known: {', '.join(SPEC_TYPES_KNOWN)})", file=sys.stderr)
+            continue
+        if t not in out:
+            out.append(t)
+    return ",".join(out)
+
+
+def draft_acceptance(model: str = "", max_lines: int = 20000) -> dict:
+    """Speculative-decode acceptance for a served model, from the engine's log.
+
+    llama-server prints `draft acceptance = 0.812 (52 accepted / 64 generated),
+    mean len = 4.25` per task and nothing ever read it , the single number that
+    decides whether the MTP quant is worth serving at all was written to a file
+    and dropped on the floor (Observability Must-Rule gap, found 2026-08-18).
+
+    The aggregate is TOKEN-WEIGHTED, not a mean of ratios: a 32-token task and a
+    1741-token task must not weigh the same, and on real traffic they differ by
+    two orders of magnitude. Measured on this box at the time this was written:
+    weighted 0.756 across 3,342 generated tokens, median 0.706, min 0.458 ,
+    comfortably above the floor, so MTP is earning its place here.
+    """
+    import statistics
+    if not model:
+        s = ps()
+        if not s:
+            return {"model": "", "samples": 0, "error": "no serve session running"}
+        model = s[0]["model"]
+    path = _run_log_path(model)
+    if not path.exists():
+        return {"model": model, "samples": 0, "error": f"no engine log at {path}"}
+    rows = []
+    try:
+        # Tail rather than read whole: these logs grow without bound.
+        lines = path.read_text(errors="replace").splitlines()[-max_lines:]
+    except OSError as e:
+        return {"model": model, "samples": 0, "error": str(e)}
+    for line in lines:
+        m = _DRAFT_ACCEPT_RE.search(line)
+        if m:
+            rows.append((float(m.group(1)), int(m.group(3)), float(m.group(4))))
+    if not rows:
+        return {"model": model, "samples": 0,
+                "error": "no draft-acceptance lines (model may not carry an MTP head)"}
+    total = sum(r[1] for r in rows)
+    return {
+        "model": model,
+        "samples": len(rows),
+        "generated_tokens": total,
+        "acceptance_weighted": round(sum(a * g for a, g, _ in rows) / total, 4),
+        "acceptance_median": round(statistics.median([r[0] for r in rows]), 4),
+        "acceptance_min": round(min(r[0] for r in rows), 4),
+        "mean_draft_len": round(statistics.median([r[2] for r in rows]), 2),
+        "floor": MTP_ACCEPTANCE_FLOOR,
+    }

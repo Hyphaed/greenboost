@@ -2087,7 +2087,25 @@ static int handle_cuda_memcpy_h2d(struct client *cli, const void *payload,
         int      ra_device_id = ra->device_id;
         void    *ra_dev_ptr   = ra->dev_ptr;
         void    *ra_host_ptr  = ra->host_ptr;
-        size_t   copy_size    = (data_len < (uint32_t)req_size) ? data_len : (size_t)req_size;
+        /* Audit 2026-08-19 (found by tests/c/fuzz_netd_protocol.c): this is
+         * min(data_len, req_size) and must be computed at ONE width. It used
+         * to compare `data_len < (uint32_t)req_size` , truncating the 64-bit
+         * wire field to 32 bits , and then copy `(size_t)req_size`, the
+         * untruncated value. A req_size whose low 32 bits are small and whose
+         * high bits are set (e.g. 0x7_00000010) therefore lost the comparison
+         * and won the copy, producing a copy_size far larger than the bytes
+         * actually received: an over-read of the receive buffer. ASan caught
+         * it as a 30 GB memcpy out of an 8 KB payload.
+         *
+         * The allocation bound-check above does constrain req_size against
+         * ra->size, so reaching this needs a correspondingly large registered
+         * allocation , which is why it survived review. It is still wrong: the
+         * "never read more than we received" invariant must not depend on how
+         * big some other allocation happens to be.
+         *
+         * Compare as uint64_t on both sides; the promotion is explicit. */
+        size_t   copy_size    = (req_size > (uint64_t)data_len)
+                                    ? (size_t)data_len : (size_t)req_size;
         if (ra_tier == 0) {
             /* T1 GPU: cudaMemcpy H2D */
             if (f_cudaSetDevice) f_cudaSetDevice(ra_device_id);

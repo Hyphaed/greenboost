@@ -3,16 +3,21 @@ Live status line — animated indicator during model inference.
 
 Visual design:
   ⠹  Thinking  ─────────────────────────────────────────────  2.4s
-  ●  Thinking  ──────────────────────────────────  1,234↑ 89↓  ·  T1  ·  2.4s
+  ●  Thinking  ──────────────────────────────────  1,234↑ 89↓  ·  2.4s
 
 Phases:
   thinking  → teal braille spinner  ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏
-  (final)   → static lime  ●  with full timing + tokens + tier
+  (final)   → static lime  ●  with full timing + tokens
 
 Overwrites itself in-place via \r — never scrolls.
 12 fps (80 ms per frame) — smooth without burning CPU.
 Breathing dashes: sin-wave variation ±3 chars for subtle life.
-Tier badge color: T1=teal · T2=lavender · T3=coral
+
+Tier usage (T1/T2/T3) is NOT shown here — that's the idle bottom toolbar's
+job (repl.py's _gb_stats_segs, right-aligned amid T1 and T3). A per-turn
+tier badge used to duplicate that here too; removed 2026-08-05 (it read as
+a second, inconsistent "T2" counter appearing near the bottom-left of the
+screen alongside the real one).
 """
 from __future__ import annotations
 
@@ -24,10 +29,27 @@ import time
 
 from greenboost_cli.terminal.theme import (
     ANSI_TEAL, ANSI_VIOLET, ANSI_LIME, ANSI_GRAY, ANSI_DIM, ANSI_RESET,
-    ANSI_T1, ANSI_T2, ANSI_T3, ANSI_AMBER,
+    ANSI_AMBER,
     SPINNER_THINK, CTX_AMBER_PCT,
-    TEAL, DIM, LAVENDER, CORAL,
+    TEAL, DIM,
 )
+from greenboost_cli.terminal.width import (
+    at_line_start, display_width, live_suspended, truncate_to_width, tty_write,
+)
+
+# Erase-to-end-of-line. Paired with \r it makes each repaint overwrite the
+# previous frame by construction, instead of relying on the new frame being
+# padded at least as wide as the old one. See _render() for why padding alone
+# was not enough.
+_ERASE_LINE = "\033[2K"
+
+# DECAWM off / on. With auto-wrap disabled the terminal TRUNCATES a too-long
+# line at the right margin instead of continuing it on the next row. That makes
+# the reported artifact structurally impossible: even if a glyph's width is
+# still mis-guessed on some exotic font, the status line can no longer push the
+# cursor onto a second row and strand its own head in the scrollback.
+_WRAP_OFF = "\033[?7l"
+_WRAP_ON = "\033[?7h"
 
 _H = "─"
 
@@ -37,7 +59,14 @@ _H = "─"
 # it feeds its live fields to the toolbar via toolbar_status_fragments(), and
 # asks pt to repaint via the registered invalidate callback.
 _pt_invalidate = None   # type: ignore  # callable() -> None, set by repl.py
-_pt_active_sl: "StatusLine | None" = None   # the StatusLine instance currently live, for the toolbar to read
+# The StatusLine instance currently live, whichever render path it is using.
+# Set on BOTH the pt-toolbar path and the raw \r path: it used to be assigned
+# only in the pt branch, which meant nothing tracked the status line during an
+# actual model turn (turns run the raw path by construction, since the pt app
+# has already returned from prompt()). That is why repl.py's Ctrl-C handler had
+# no way to reach it and crashed with `NameError: name 'sl' is not defined`
+# (owner report 2026-08-18).
+_live_sl: "StatusLine | None" = None
 _pt_is_live = None      # type: ignore  # callable() -> bool, set by repl.py
 
 # Set by repl._suspend_pt_for_wizard()/_resume_pt_after_wizard() while a wizard
@@ -78,30 +107,68 @@ def _use_pt() -> bool:
         return False
 
 
+def _is_tty() -> bool:
+    """True only when stdout is a real terminal.
+
+    The animated statusline repaints via a bare ``\\r`` every 0.08 s, which only
+    overwrites in place on a TTY. When stdout is a pipe or a file — ``gb -p``,
+    the AI Factory's ``_invoke_agent``, any CI capture — the carriage returns are
+    just bytes, so every frame ACCUMULATES: one 72-second turn measured 259 KB of
+    spinner frames around ~200 bytes of actual answer. That pollutes captured
+    output and, worse, inflates the gate/retry text the factory feeds back into
+    the next prompt, which is scarce context on a slow local model."""
+    try:
+        return bool(sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def renders_in_toolbar() -> bool:
+    """True when the live status is painted into prompt_toolkit's bottom
+    toolbar rather than written to stdout with a bare carriage return.
+
+    The distinction decides whether the status line can coexist with streamed
+    model output. In raw mode it cannot: both write to the same line and the
+    result is torn. In toolbar mode it can, because the toolbar is a separate,
+    pt-owned row that printed text scrolls above.
+
+    repl.py uses this so a long, slow response keeps showing elapsed time and
+    token counts instead of going completely silent the moment the first token
+    lands. At the decode rates this box reaches on a deep conversation, that
+    silence lasts minutes and is indistinguishable from a hang."""
+    return _use_pt()
+
+
 def set_wizard_active(active: bool) -> None:
     """Toggle wizard-active state — see _wizard_active docstring above."""
     global _wizard_active
     _wizard_active = active
 
 
+def is_prefilling() -> "bool | None":
+    """True while the model is still prefilling, False once it is decoding.
+
+    None means there is no live status line to ask — the caller must treat that
+    as "unknown" rather than assuming either state.
+
+    Exists so a caller outside the turn function can ask this without reaching
+    for a local variable that is not in its scope. repl.py's Ctrl-C handler did
+    exactly that (`getattr(sl, "_first_out_ts", None)`, with `sl` defined in a
+    different function) and crashed the whole CLI with a NameError on the first
+    Ctrl-C during a turn — taking its memory-pool cleanup down with it.
+    """
+    sl = _live_sl
+    if sl is None:
+        return None
+    return getattr(sl, "_first_out_ts", None) is None
+
+
 def toolbar_status_fragments() -> list[tuple[str, str]]:
     """Return (style, text) fragments for the live status, or [] when idle."""
-    sl = _pt_active_sl
+    sl = _live_sl
     if sl is None:
         return []
     return sl._toolbar_fragments()
-
-
-def _tier_ansi(label: str) -> str:
-    """Map a GB tier label to its ANSI color code."""
-    upper = label.upper()
-    if upper.startswith("T1"):
-        return ANSI_T1
-    if upper.startswith("T2"):
-        return ANSI_T2
-    if upper.startswith("T3"):
-        return ANSI_T3
-    return ANSI_TEAL
 
 
 class StatusLine:
@@ -112,7 +179,6 @@ class StatusLine:
 
         sl = StatusLine()
         sl.start("Thinking")
-        sl.update(gb_tier="T2")           # add GB info
         sl.update(in_tokens=1234, out_tokens=89)  # from TurnComplete
         sl.stop()                          # final static line + newline
     """
@@ -121,11 +187,15 @@ class StatusLine:
         self._phase: str    = "Thinking"
         self._in_tok: int   = 0
         self._out_tok: int  = 0
-        self._gb_tier: str | None = None
         self._ctx_pct: float | None = None   # 0.0–1.0 context fill estimate
         self._start: float  = 0.0
         self._frame: int    = 0
         self._lock  = threading.Lock()
+        # Monotonic time the first output token arrived, or None while the model
+        # is still prefilling. Decode rate must be measured from HERE, not from
+        # turn start, or a long prefill silently divides the number down. See
+        # the tps computation in _render().
+        self._first_out_ts: "float | None" = None
         self._stop_evt = threading.Event()
         self._thread: threading.Thread | None = None
         self._prev_vis_len: int = 0   # widest frame painted so far this run — see _render
@@ -137,11 +207,16 @@ class StatusLine:
         self._start    = time.monotonic()
         self._frame    = 0
         self._prev_vis_len = 0
+        self._first_out_ts = None
         self._stop_evt.clear()
+        if not _is_tty():
+            # Non-interactive: no animation thread at all. stop() still emits one
+            # final static line, so headless logs keep the turn summary.
+            return
+        global _live_sl
+        _live_sl = self
         if _use_pt():
             # pt app is live at the idle prompt — drive via toolbar repaint.
-            global _pt_active_sl
-            _pt_active_sl = self
             self._thread = threading.Thread(target=self._run_pt, daemon=True, name="gb-sl")
             self._thread.start()
             return
@@ -155,46 +230,66 @@ class StatusLine:
         phase: str | None       = None,
         in_tokens: int | None   = None,
         out_tokens: int | None  = None,
-        gb_tier: str | None     = None,
         ctx_pct: float | None   = None,
     ) -> None:
         with self._lock:
             if phase     is not None: self._phase    = phase
             if in_tokens is not None: self._in_tok   = in_tokens
-            if out_tokens is not None: self._out_tok = out_tokens
-            if gb_tier   is not None: self._gb_tier  = gb_tier
+            if out_tokens is not None:
+                if out_tokens > 0 and self._first_out_ts is None:
+                    self._first_out_ts = time.monotonic()
+                self._out_tok = out_tokens
             if ctx_pct   is not None: self._ctx_pct  = ctx_pct
 
     def stop(self) -> None:
         self._stop_evt.set()
+        self._forget_live()
         if self._thread:
             self._thread.join(timeout=0.5)
+        if not _is_tty():
+            # One plain summary line, no \r and no hint — safe to capture.
+            tty_write(self._render(final=True) + "\n")
+            return
         if _use_pt():
             self._pt_deactivate()
             return
         self._clear_hint()
-        sys.stdout.write("\r" + self._render(final=True) + "\n")
-        sys.stdout.flush()
+        # Erase before the final frame too: the static line inherits the row the
+        # animation was using, so anything wider left over there must go.
+        tty_write(
+            _WRAP_OFF + "\r" + _ERASE_LINE + self._render(final=True) + _WRAP_ON + "\n"
+        )
+
+    def _forget_live(self) -> None:
+        """Drop the module-level live reference if it still points at us.
+
+        Called from every termination route, not just the pt one. Without this
+        a finished turn leaves a stale instance behind and is_prefilling()
+        answers about a turn that already ended."""
+        global _live_sl
+        if _live_sl is self:
+            _live_sl = None
 
     def cancel(self) -> None:
         """Stop the animation and erase the line without printing a final static line."""
         self._stop_evt.set()
+        self._forget_live()
         if self._thread:
             self._thread.join(timeout=0.5)
+        if not _is_tty():
+            return  # nothing was painted, so there is nothing to erase
         if _use_pt():
             self._pt_deactivate()
             return
         self._clear_hint()
-        w = shutil.get_terminal_size((80, 24)).columns
-        sys.stdout.write("\r" + " " * w + "\r")
-        sys.stdout.flush()
+        tty_write("\r" + _ERASE_LINE)
 
     # ── prompt_toolkit mode ───────────────────────────────────────────────────
 
     def _pt_deactivate(self) -> None:
-        global _pt_active_sl
-        if _pt_active_sl is self:
-            _pt_active_sl = None
+        global _live_sl
+        if _live_sl is self:
+            _live_sl = None
         if _pt_invalidate is not None:
             try:
                 _pt_invalidate()
@@ -219,7 +314,6 @@ class StatusLine:
             phase   = self._phase
             in_tok  = self._in_tok
             out_tok = self._out_tok
-            gb_tier = self._gb_tier
             frame   = self._frame
         elapsed = time.monotonic() - self._start
         sp_char = SPINNER_THINK[frame % len(SPINNER_THINK)]
@@ -232,11 +326,6 @@ class StatusLine:
             if out_tok > 0 and elapsed > 0:
                 tps = out_tok / elapsed
                 frags.append((f"fg:{TEAL}", f"  ·  {tps:.0f}t/s"))
-        if gb_tier:
-            tier_style = {"T1": f"fg:{TEAL}", "T2": f"fg:{LAVENDER}", "T3": f"fg:{CORAL}"}.get(
-                gb_tier.upper()[:2], f"fg:{TEAL}"
-            )
-            frags.append((tier_style, f"  ·  {gb_tier}"))
         frags.append((f"fg:{DIM}", f"  ·  {elapsed:.1f}s"))
         return frags
 
@@ -244,28 +333,32 @@ class StatusLine:
 
     def _show_hint(self) -> None:
         """Print a one-line keyboard hint below the status line."""
-        w = shutil.get_terminal_size((80, 24)).columns
-        hint = "  esc to interrupt  ·  type to queue next prompt"
-        padded = hint + " " * max(0, w - len(hint))
-        sys.stdout.write(
-            f"\n{ANSI_DIM}{padded}{ANSI_RESET}"
+        # The hint carries a `·` too, so it was mis-measured the same way the
+        # status line was — and it padded to the full width, which pushed it one
+        # column over and cost the \033[1A its row. Erase instead of pad.
+        # ctrl+p is listed here too, not just on the idle toolbar: mid-turn is
+        # exactly when an operator decides they want the GPU back for something
+        # else, and a lever they cannot see is a lever they will not use.
+        hint = ("  esc to interrupt  ·  ctrl+p pause/resume  ·  ctrl+i compact  ·  "
+                "type to queue next prompt")
+        tty_write(
+            f"\n{_ERASE_LINE}{ANSI_DIM}{hint}{ANSI_RESET}"
             f"\033[1A"   # cursor up — keep status line owning the bottom row
         )
-        sys.stdout.flush()
 
     def _clear_hint(self) -> None:
         """Erase the hint line printed below the status line."""
-        w = shutil.get_terminal_size((80, 24)).columns
-        sys.stdout.write(f"\n{' ' * w}\033[1A")
-        sys.stdout.flush()
+        tty_write(f"\n{_ERASE_LINE}\033[1A")
 
     # ── Internal ───────────────────────────────────────────────────────────
 
     def _run(self) -> None:
         _hint_shown = False
         while not self._stop_evt.is_set():
-            sys.stdout.write("\r" + self._render())
-            sys.stdout.flush()
+            # live=True: dropped, atomically under the lock, if a multi-row
+            # block is being drawn or the cursor does not own a fresh row.
+            tty_write(_WRAP_OFF + "\r" + _ERASE_LINE + self._render() + _WRAP_ON,
+                      live=True, owner="statusline")
             # Show hint line after first 0.5 s so it doesn't flash on fast responses
             if not _hint_shown and (time.monotonic() - self._start) > 0.5:
                 self._show_hint()
@@ -279,29 +372,49 @@ class StatusLine:
             phase   = self._phase
             in_tok  = self._in_tok
             out_tok = self._out_tok
-            gb_tier = self._gb_tier
             ctx_pct = self._ctx_pct
             frame   = self._frame
+            first_out = self._first_out_ts
 
         width   = shutil.get_terminal_size((80, 24)).columns
         safe_w  = width - 2
         elapsed = time.monotonic() - self._start
 
-        # ── Right side: ctx% · tokens · tps · tier · elapsed ─────────────────
+        # ── Right side: ctx% · tokens · tps · elapsed ────────────────────────
         right_parts: list[str] = []
         tps_str = ""
+        ttft_str = ""
         ctx_str = ""
         if ctx_pct is not None and ctx_pct > 0.05:
             ctx_str = f"{int(ctx_pct * 100)}%"
             right_parts.append(ctx_str)
         if in_tok or out_tok:
             right_parts.append(f"{in_tok:,}↑  {out_tok:,}↓")
-            if out_tok > 0 and elapsed > 0:
-                tps = out_tok / elapsed
+            # DECODE rate, measured over the decode span only.
+            #
+            # This used to be out_tok / elapsed, i.e. divided by the WHOLE turn
+            # including prefill, and that is not a decode rate — it is a
+            # wall-clock average that collapses whenever the prompt is long.
+            # Measured on this box 2026-08-18: a turn with 27,438 prompt tokens
+            # took 73.5 s, of which 68.3 s was time-to-first-token and ~5 s was
+            # decode of 81 tokens. The old formula displayed "1t/s". The real
+            # decode rate was ~16 tok/s. Reading 1t/s for months is what made
+            # decode look like the problem when prefill was.
+            #
+            # gb_synapse's own proxy-side tok_s_measured has always measured the
+            # correct span (first token to last); this display was the outlier.
+            decode_span = (time.monotonic() - first_out) if first_out else 0.0
+            if out_tok > 0 and decode_span > 0:
+                tps = out_tok / decode_span
                 tps_str = f"{tps:.0f}t/s"
                 right_parts.append(tps_str)
-        if gb_tier:
-            right_parts.append(f"{gb_tier}")
+            # Surface prefill explicitly rather than letting it hide inside the
+            # elapsed figure — on a long conversation it is the dominant cost.
+            if first_out is not None:
+                ttft = first_out - self._start
+                if ttft >= 1.0:
+                    ttft_str = f"ttft {ttft:.0f}s"
+                    right_parts.append(ttft_str)
         right_parts.append(f"{elapsed:.1f}s")
         right_plain = "  ·  ".join(right_parts)
 
@@ -314,9 +427,10 @@ class StatusLine:
             right_ansi_parts.append(f"{ANSI_DIM}{in_tok:,}↑  {out_tok:,}↓{ANSI_RESET}")
             if tps_str:
                 right_ansi_parts.append(f"{ANSI_TEAL}{tps_str}{ANSI_RESET}")
-        if gb_tier:
-            tier_col = _tier_ansi(gb_tier)
-            right_ansi_parts.append(f"{tier_col}{gb_tier}{ANSI_RESET}")
+            if ttft_str:
+                # Amber: on a deep conversation this is the number that hurts,
+                # and it should not read as neutral decoration.
+                right_ansi_parts.append(f"{ANSI_AMBER}{ttft_str}{ANSI_RESET}")
         right_ansi_parts.append(f"{ANSI_GRAY}{elapsed:.1f}s{ANSI_RESET}")
         right_ansi = f"  {ANSI_DIM}·{ANSI_RESET}  ".join(right_ansi_parts)
 
@@ -340,7 +454,17 @@ class StatusLine:
         # so a frame is never wider than base_dashes; padding against
         # max(safe_w, prev_vis_len) is the belt-and-braces case where a
         # shrinking frame still needs to overwrite a wider previous one.
-        fixed_vis = 2 + 1 + 2 + len(phase) + 2 + 2 + len(right_plain)
+        # Measure in terminal COLUMNS, not codepoints. `·`, `↑` and `↓` are
+        # East-Asian-Ambiguous and render at two columns on a CJK-capable font,
+        # so the old len()-based count undershot by ~5 on a frame that only kept
+        # 2 columns of slack. The frame then wrapped, and every later repaint's
+        # \r landed on the wrapped row, stranding the first row in scrollback
+        # permanently (owner screenshots, 2026-08-18). display_width() counts
+        # those wide while keeping the `─` fill narrow — see width.py.
+        fixed_vis = (
+            2 + display_width(sp_char) + 2 + display_width(phase)
+            + 2 + 2 + display_width(right_plain)
+        )
         base_dashes = max(4, safe_w - fixed_vis)
         if final:
             dashes = base_dashes
@@ -354,7 +478,26 @@ class StatusLine:
             f"  {ANSI_DIM}{'─' * dashes}{ANSI_RESET}"
             f"  {right_ansi}"
         )
-        vis_len = fixed_vis + dashes
-        pad_to = max(safe_w, self._prev_vis_len)
-        self._prev_vis_len = vis_len
-        return line + " " * max(0, pad_to - vis_len)
+        # Hard clamp, in two steps. `dashes` has a floor of 4, so a narrow
+        # terminal or a long phase label can still overflow the arithmetic
+        # above. Drop the fill run first, since that is the part with no
+        # information in it.
+        overflow = display_width(line) - safe_w
+        if overflow > 0 and dashes > 0:
+            dashes = max(0, dashes - overflow)
+            line = (
+                f"  {sp_color}{sp_char}{ANSI_RESET}"
+                f"  {lbl_color}{phase}{ANSI_RESET}"
+                + (f"  {ANSI_DIM}{'─' * dashes}{ANSI_RESET}" if dashes else "")
+                + f"  {right_ansi}"
+            )
+        # With the fill fully gone the fixed content (spinner + label + the
+        # right-hand readout) can still be wider than the terminal — a ~60
+        # column window is enough. Cut it rather than let the terminal wrap it.
+        if display_width(line) > safe_w:
+            line = truncate_to_width(line, safe_w) + ANSI_RESET
+        # No trailing padding: \033[2K in _run() and stop() already erased the
+        # row, so overwriting a wider previous frame no longer needs the frame
+        # itself to be wide. _prev_vis_len is kept only for the pt toolbar path.
+        self._prev_vis_len = display_width(line)
+        return line

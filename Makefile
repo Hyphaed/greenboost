@@ -328,7 +328,12 @@ gb_cutlass:
 # `install` — a dev measurement tool, same status as gb_cutlass above.
 # GB_BENCH_ARCH overrides the target SM arch (default sm_120a — Blackwell,
 # this box's RTX 5070); NVCC overrides the compiler path.
-NVCC          ?= nvcc
+# Prefer the CUDA 13 toolkit when it is installed. The `nvcc` on PATH here is
+# 12.4, which cannot target sm_120 at all ("Value 'sm_120a' is not defined"),
+# so defaulting to it makes `make pathbench` fail on the very box the
+# benchmark exists for. Standing rule (2026-07-30): track the latest stable
+# CUDA 13.x. Override with NVCC=... as before.
+NVCC          ?= $(shell test -x /usr/local/cuda/bin/nvcc && echo /usr/local/cuda/bin/nvcc || echo nvcc)
 GB_BENCH_ARCH ?= sm_120a
 pathbench: tests/bench/gb_pathbench.cu
 	$(NVCC) -O3 -arch=$(GB_BENCH_ARCH) -std=c++17 \

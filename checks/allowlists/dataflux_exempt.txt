@@ -1,0 +1,25 @@
+# Dataflux-coverage exemptions — checks/check_dataflux_coverage.py.
+# One glob-or-literal pattern per line. Reviewed 2026-07-13 first run.
+
+# Explicit facade (CLAUDE.md's own taxonomy table) over gb_model_tier /
+# gb_mem_pool / gb_monitor — the real engine lives in the shim + kmod;
+# gb_tiering.py re-exports, it doesn't itself make placement decisions.
+gb_tiering.py
+
+# Pure reactive-primitives library (Signal, PidController, operators) —
+# consumed by gb_orchestrator, which is where the actual decisions AND
+# telemetry emission happen. Analogous to gb_placement.py's pure-math
+# helper functions not each needing their own emit call.
+gb_reactive.py
+
+# NOTE: gb_mem_pool.py is deliberately NOT here. It's a genuine, real
+# advisory gap (pool growth/shrink decisions with no dataflux telemetry) —
+# left as an open finding for a future session, not suppressed.
+
+# Vendored third-party inference engine (gLLM, see synapse_engine/NOTICE) —
+# its own internal scheduling/batching decisions are upstream's code, not
+# GreenBoost placement policy, and are out of scope for GreenBoost's own
+# dataflux telemetry conventions. GreenBoost-side integration (the future
+# SynapseTorchBackend in gb_synapse_backends.py) emits its own events and
+# is NOT covered by this exemption.
+synapse_engine/*

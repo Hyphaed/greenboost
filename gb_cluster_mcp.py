@@ -20,11 +20,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gb_cluster as gc  # noqa: E402
 
 from mcp.server.fastmcp import FastMCP  # noqa: E402
+from mcp.types import ToolAnnotations  # noqa: E402
 
 mcp = FastMCP("greenboost-cluster")
 
+# Per-tool MCP read-only declaration (AE-6). Judged one tool at a time, never
+# swept across the file: this server also carries tools that actuate, serve,
+# stop, dispatch or write policy, and mislabelling one of those as read-only
+# would let a client run it concurrently with anything else. `readOnlyHint` is
+# the protocol's own answer to "may this overlap"; a tool that does not carry
+# it stays serial, which is the safe default and the previous behaviour.
+_READ_ONLY = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
 
-@mcp.tool()
+
+@mcp.tool(annotations=_READ_ONLY)
 def cluster_status(probe: bool = True) -> dict:
     """Gb-Cluster overview , the cheap first call. Reports whether the shim is
     installed, whether a cluster is configured, how many feeders are online,
@@ -36,7 +50,7 @@ def cluster_status(probe: bool = True) -> dict:
     return gb_mcp_common.cluster_status(probe=probe)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def cluster_snapshot(force: bool = False) -> dict:
     """Live per-node telemetry snapshot for the whole cluster (host + every
     feeder): GPU util %, temp C, power W, VRAM/T2/T3 free & total MB, measured
@@ -68,7 +82,7 @@ def cluster_sync_dataflux(max_lines: int = 2000) -> dict:
     return gc.sync_cluster_dataflux(max_lines=max_lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def cluster_feeders(probe: bool = True) -> list[dict]:
     """Every configured feeder with its full live state: online flag, ssh
     target, T1/T2/T3 free/total MB, GPU util/temp/power, link + throughput
@@ -100,14 +114,14 @@ def cluster_dispatch(confirm: bool = False) -> dict:
     return gb_actuation.cluster_dispatch_plan(confirm=confirm)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def cluster_available() -> bool:
     """True when at least one feeder is online and reachable right now , the
     fast yes/no gate before deciding to dispatch cluster work."""
     return gc.cluster_available()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def cluster_topology(force: bool = False) -> dict:
     """Full STATIC hardware topology of every cluster node (host + feeders) ,
     the complement to cluster_snapshot's live telemetry: GPU model/VRAM/compute

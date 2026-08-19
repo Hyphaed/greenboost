@@ -800,6 +800,20 @@ def test_handle_shell_invalid_cwd_falls_back_to_cwd(tmp_path):
     _h._bash_cwd = ""  # reset
 
 
+def test_handle_shell_uses_bash_not_dash(tmp_path):
+    # Real incident, 2026-08-10: subprocess.run(..., shell=True) with no
+    # executable= set defaults to /bin/sh, which on Ubuntu is dash — no
+    # brace expansion. `mkdir -p X/{a,b,c}` silently "succeeded" against a
+    # literal `X/{a,b,c}` path instead of erroring, producing garbage
+    # directories the model never saw as a failure. Pin bash explicitly so
+    # this can't regress silently.
+    import greenboost_cli.instruments.handlers as _h
+    _h.handle_shell(f"mkdir -p {tmp_path}/braces/{{a,b,c}}")
+    for name in ("a", "b", "c"):
+        assert (tmp_path / "braces" / name).is_dir()
+    assert not (tmp_path / "braces" / "{a,b,c}").exists()
+
+
 # ── security.validate_path traversal ─────────────────────────────────────────
 
 def test_validate_path_traversal_rejected():

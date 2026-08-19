@@ -52,6 +52,13 @@
   metrics: [prompt_cache_hit_pct, ttft_ms]
   segments: [prompt_cache_cold]
 
+- intent: slot_routing
+  triggers: ["slot", "slots", "which slot", "slot pinning", "id_slot",
+             "conversation cache", "lost my cache", "why is prefill slow",
+             "re-prefill", "reprefill", "edited the conversation"]
+  metrics: [slot_pin_rate_pct, last_edit_chunk, prompt_cache_hit_pct]
+  segments: [prompt_cache_cold]
+
 - intent: cluster_health
   triggers: ["cluster", "feeder", "feeders", "whole cluster vram"]
   metrics: [cluster_vram_fill_pct, feeder_items, link_bw_gbps]
@@ -66,3 +73,52 @@
   triggers: ["health", "status", "is everything ok", "overview", "how is it doing"]
   metrics: [vram_fill_pct, kmod_loaded, shim_fresh, meets_fp8_floor]
   segments: [serve_healthy, rule1_underfilled, kmod_missing_silent_degrade, swap_thrash_not_gpu_throttle]
+
+- intent: proxy_stopped_responding
+  # Lowercase only , answer() lowercases the question before testing
+  # `trigger in question`, so a trigger carrying any capital can never fire.
+  triggers:
+    - "stopped responding"
+    - "stop responding"
+    - "not responding"
+    - "proxy died"
+    - "proxy die"
+    - "proxy out of memory"
+    - "proxy memory"
+    - "memoryerror"
+  metrics: ["proxy_rss_mb", "proxy_mem_headroom_pct", "host_mem_available_gb"]
+  segments: ["proxy_memory_near_cap", "host_oom_imminent"]
+  raw_tool_fallback: >
+    Read the proxy log at /run/greenboost/synapse/<model>_proxy.log , it prints
+    a gc heap census when it crosses 45% of its address-space cap.
+
+- intent: agent_harness_quality
+  triggers:
+    - "agent benchmark"
+    - "agent eval"
+    - "is the agent getting better"
+    - "hallucinated tool"
+    - "made up a tool"
+    - "making up tool"
+    - "invented a tool"
+    - "tool does not exist"
+    - "wrong tool name"
+    - "schema misalignment"
+  metrics: ["agent_eval_overall", "agent_hallucinated_tool_pct"]
+  segments: ["agent_eval_below_reference", "agent_hallucinating_tool_names"]
+  raw_tool_fallback: >
+    dataflux_events(kind="agent_eval_run") and kind="agent_tool_schema_miss".
+
+- intent: agent_context_cost
+  triggers:
+    - "slow after compact"
+    - "slow after compaction"
+    - "compaction cost"
+    - "prompt cache dropped"
+    - "prefix"
+    - "memory crowding"
+  metrics: ["agent_compaction_prefix_kept_pct", "agent_memory_recall_chars",
+            "prompt_cache_hit_pct"]
+  segments: ["agent_compaction_broke_prefix"]
+  raw_tool_fallback: >
+    dataflux_events(kind="agent_context_edit") correlated with kind="prompt_cache".

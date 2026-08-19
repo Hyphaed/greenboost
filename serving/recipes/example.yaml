@@ -1,0 +1,53 @@
+# serving/recipes/example.yaml — TEMPLATE, not a real, servable recipe.
+#
+# NemoClaw audit, Phase 5a. This exists so serving/check_recipes.py and
+# gb_synapse.py's load_recipe() have a real file to validate against
+# without inventing a "real-looking" but actually fabricated digest for a
+# live model — the `sha256` values below are visibly-fake placeholders
+# (all-zero), NOT computed from a real downloaded GGUF. A model whose
+# `model.name` doesn't match a real manifest entry, and whose
+# `model.files[].sha256` don't match the real file on disk, simply never
+# gets picked up by load_recipe() — safe by construction, not by policy.
+#
+# To promote this into a real recipe for a real model:
+#   1. sha256sum the actual GGUF file(s) and fill in model.files.
+#   2. Fill in model.revision with the real HF commit SHA (`git ls-remote`
+#      against the HF repo, or the commit hash HfApi reports).
+#   3. Set ctx/nGpuLayers/kvCache/mtpDraftN to MEASURED values (a
+#      synapse_recommend preview run, or a real serve() + synapse_ps
+#      readout), not aspirational ones.
+#   4. Recompute contentDigest: `python3 serving/check_recipes.py --fix`
+#      (or by hand: serving/digest.py's digest() over this file's own
+#      content with contentDigest itself excluded).
+#   5. `python3 serving/check_recipes.py --check` must pass before the
+#      recipe is trusted by gb_synapse.py's load_recipe().
+#
+# NOTE: `--fix` rewrites this file via yaml.safe_dump, which does NOT
+# preserve comments — if you hand-edit this template, keep a copy of this
+# header elsewhere before running --fix, or just re-add it after.
+
+schemaVersion: "1"
+
+model:
+  name: "example/not-a-real-manifest-entry"
+  revision: "0000000000000000000000000000000000000000"  # PLACEHOLDER — not a real commit SHA
+  files:
+    - path: "model.gguf"
+      sha256: "0000000000000000000000000000000000000000000000000000000000000000"  # PLACEHOLDER, 64 hex chars
+
+capabilities:
+  toolCalls: true
+  streaming: true
+  mtpDraftHead: false
+  visionProjector: false
+  recurrentState: false
+
+kvCache:
+  key: "q8_0"
+  value: "q8_0"
+
+ctx: 65536
+nGpuLayers: "all"
+tierIntent: "t2Spill"
+
+contentDigest: "sha256:5e9d477582d07241dbaa41dd37deb757a9eff90c5993beb59dbc135b3f555aa6"

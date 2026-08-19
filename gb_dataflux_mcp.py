@@ -45,13 +45,33 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gb_dataflux as gdf  # noqa: E402
+import gb_ports  # noqa: E402
 
 from mcp.server.fastmcp import FastMCP  # noqa: E402
+from mcp.types import ToolAnnotations  # noqa: E402
 
 mcp = FastMCP("greenboost-dataflux")
 
+# Every tool on this server answers a question and changes nothing , this is
+# the telemetry/query surface, the flight recorder's read head. Declaring that
+# in the protocol (MCP `tools/list` annotations) rather than leaving a client
+# to infer it from tool NAMES is what lets greenboost-cli overlap a batch of
+# dataflux lookups in one turn instead of running them one after another: at
+# ~5 tok/s the model spends real time emitting four calls, and the CLI used to
+# spend more real time running them serially. A client that does not read
+# annotations is unaffected.
+#
+# Any future tool here that WRITES must not carry _READ_ONLY , annotate it
+# separately or leave it bare.
+_READ_ONLY = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
 
-@mcp.tool()
+
+@mcp.tool(annotations=_READ_ONLY)
 def dataflux_summary(days: float = 5.0) -> dict:
     """Aggregate summary of GreenBoost cluster dispatch activity over the
     last `days` days: total events/items/compute-time, per-node throughput
@@ -63,7 +83,7 @@ def dataflux_summary(days: float = 5.0) -> dict:
     return gb_mcp_common.dataflux_summary(days=days)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def dataflux_events(days: float = 5.0, node: str | None = None,
                     label: str | None = None, kind: str | None = None,
                     status: str | None = None, stage: str | None = None,
@@ -115,7 +135,7 @@ def dataflux_events(days: float = 5.0, node: str | None = None,
     return list(reversed(events))[:limit]
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def dataflux_schema(kind: str | None = None) -> dict:
     """The dataflux event-kind registry (gb_dataflux_kinds.py) , what every
     known kind MEANS: its group, expected fields, which numeric fields are
@@ -129,7 +149,7 @@ def dataflux_schema(kind: str | None = None) -> dict:
     return gb_dataflux_kinds.schema(kind)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def dataflux_group(group: str, days: float = 5.0, limit: int = 200,
                    from_ts: float | None = None, to_ts: float | None = None) -> dict:
     """Every event across ALL kinds in one registry group (see
@@ -155,7 +175,7 @@ def dataflux_group(group: str, days: float = 5.0, limit: int = 200,
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def dataflux_errors(days: float = 5.0, limit: int = 50) -> list[dict]:
     """Every FAILED dispatch (remote exceptions, model-push failures, stage
     failures) in the last `days` days, most recent first , the fast path
@@ -165,7 +185,7 @@ def dataflux_errors(days: float = 5.0, limit: int = 50) -> list[dict]:
     return list(reversed(errors))[:limit]
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def dataflux_decisions(days: float = 2.0, limit: int = 100) -> list[dict]:
     """Per-decision SHIM placement events (`shim_decision`) , every time the
     CUDA shim placed bytes off the fastest tier (T2 DDR spill, T3 NVMe spill,
@@ -178,7 +198,7 @@ def dataflux_decisions(days: float = 2.0, limit: int = 100) -> list[dict]:
     return list(reversed(decs))[:limit]
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def dataflux_actuations(days: float = 2.0, limit: int = 100) -> list[dict]:
     """Reactive-orchestrator ACTUATION events (`actuation`) , every lever the
     orchestrator moved (kv_grow, tier auto-evict, clock/power cap, VM/PSI
@@ -191,7 +211,7 @@ def dataflux_actuations(days: float = 2.0, limit: int = 100) -> list[dict]:
     return list(reversed(acts))[:limit]
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def a2a_status(days: float = 1.0) -> dict:
     """GreenBoost A2A gateway state: whether the AgentCard/JSON-RPC endpoint is
     listening (GB_A2A_BIND, default 127.0.0.1:8790), the advertised skills, and
@@ -199,11 +219,12 @@ def a2a_status(days: float = 1.0) -> dict:
     Keeps the A2A control plane observable like every other subsystem."""
     import os
     import socket
-    bind = os.environ.get("GB_A2A_BIND", "127.0.0.1:8790")
-    host, _, port = bind.rpartition(":")
+    bind = os.environ.get("GB_A2A_BIND", f"127.0.0.1:{gb_ports.A2A_PORT}")
+    host, _, port_str = bind.rpartition(":")
     listening = False
     try:
-        with socket.create_connection((host or "127.0.0.1", int(port or "8790")),
+        port = int(port_str) if port_str else gb_ports.A2A_PORT
+        with socket.create_connection((host or "127.0.0.1", port),
                                       timeout=0.5):
             listening = True
     except OSError:
@@ -224,7 +245,7 @@ def a2a_status(days: float = 1.0) -> dict:
             "recent": list(reversed(reqs))[:20]}
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def dataflux_topology(days: float = 30.0, node: str | None = None) -> list[dict]:
     """node_topology events , the STATIC hardware identity of every node that
     has connected or (re)generated its profile: GPU model, VRAM GB, compute
@@ -246,7 +267,7 @@ def dataflux_topology(days: float = 30.0, node: str | None = None) -> list[dict]
     return sorted(latest.values(), key=lambda e: -e.get("ts", 0.0))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def dataflux_kinds(days: float = 5.0) -> dict:
     """Breakdown of how many events of each kind were logged in the last
     `days` days, with the most recent timestamp for each kind, sorted by
@@ -265,7 +286,7 @@ def dataflux_kinds(days: float = 5.0) -> dict:
     return dict(sorted(kinds.items(), key=lambda kv: -kv[1]["count"]))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def dataflux_tier_moves(days: float = 5.0, limit: int = 100) -> list[dict]:
     """Memory-tier movement events, most recent first, from BOTH real sources
     of tier placement on this node (each event carries a `source` field so a
@@ -296,7 +317,7 @@ def dataflux_tier_moves(days: float = 5.0, limit: int = 100) -> list[dict]:
     return list(reversed(merged))[:limit]
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def dataflux_quantization(days: float = 5.0, limit: int = 100) -> list[dict]:
     """Quantization decisions emitted by `gb_quant.py` (component quantized,
     bits/quality chosen, budget vs. actual GiB) over the last `days` days,
@@ -307,7 +328,7 @@ def dataflux_quantization(days: float = 5.0, limit: int = 100) -> list[dict]:
     return list(reversed(q))[:limit]
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def dataflux_tok_s(days: float = 5.0, model: str | None = None) -> dict:
     """Measured tokens/sec , the real, client-observed decode speed fed by
     `record_measured_tok_s()` after each turn, not a predicted or
@@ -329,7 +350,7 @@ def dataflux_tok_s(days: float = 5.0, model: str | None = None) -> dict:
             "series": list(reversed(series))}
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def dataflux_models(days: float = 5.0) -> dict:
     """Per-model usage rollup over the last `days` days, from the
     kind="model_call" events forge pipelines emit (forge/gb_models.py) and
@@ -360,7 +381,7 @@ def dataflux_models(days: float = 5.0) -> dict:
     return dict(sorted(models.items(), key=lambda kv: -kv[1]["calls"]))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def dataflux_critic(days: float = 1.0) -> dict:
     """Critic report: snapshot-correlated diagnosis of what was happening
     during cluster inference. Every incident (error events, shim_transition
@@ -376,7 +397,7 @@ def dataflux_critic(days: float = 1.0) -> dict:
     return gdf.critic_report(days=days)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def dataflux_candidates(days: float = 5.0) -> dict:
     """Rollup of best-of-N `candidate_selected` events emitted by ai-forge's
     run_pilot best-of reroll (FORGE_BEST_OF). One row per slug over the last
@@ -419,7 +440,7 @@ def dataflux_candidates(days: float = 5.0) -> dict:
                                  key=lambda kv: -kv[1]["last_ts"]))}
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def greenboost_pilot(days: float = 5.0) -> dict:
     """The pilot's instrument panel (gb_pilot): per-stage wall-time trends
     (stage_profile events from ai-forge's jobqueue/seedlog), measured tok/s
@@ -433,7 +454,7 @@ def greenboost_pilot(days: float = 5.0) -> dict:
     return gb_mcp_common.greenboost_pilot(days=days)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def greenboost_capabilities() -> dict:
     """What the installed/running GreenBoost shim supports, via gb_monitor's
     capability manifest (runtime /run/greenboost/capabilities.json written by
@@ -446,7 +467,7 @@ def greenboost_capabilities() -> dict:
     return gb_mcp_common.greenboost_capabilities()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def greenboost_status() -> dict:
     """Live read-only GreenBoost snapshot via gb_monitor: whether the kmod is
     loaded, GPU, the T1/T2/T3 tier pool (MB) + combined GB, pressure labels,
@@ -458,7 +479,7 @@ def greenboost_status() -> dict:
     return gb_mcp_common.greenboost_status()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def synapse_status() -> dict:
     """Gb-Synapse status: whether the llama.cpp `--rpc` engine is BUILT
     (llama-server + rpc-server present in ENGINE_DIR), its version, and whether
@@ -472,7 +493,7 @@ def synapse_status() -> dict:
     return gb_mcp_common.synapse_status()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def tiering_status() -> dict:
     """GB-Tiering live state via gb_tiering (the T1/T2/T3 memory tier layer):
     per-tier pool occupancy (MB) + combined GB, pressure labels, shim phase +

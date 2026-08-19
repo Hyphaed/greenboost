@@ -61,6 +61,16 @@ INSTRUMENT_DEFINITIONS = [
             "type": "object",
             "properties": {
                 "command": {"type": "string"},
+                "run_in_background": {
+                    "type": "boolean",
+                    "description": (
+                        "Start it and return immediately with a task id "
+                        "instead of waiting. Use for anything slow whose "
+                        "output you do not need in this same step , builds, "
+                        "test runs, installs, downloads. Collect it later with "
+                        "TaskOutput."
+                    ),
+                },
                 "timeout": {"type": "integer", "description": "Seconds before timeout (default 120)"},
             },
             "required": ["command"],
@@ -178,6 +188,87 @@ INSTRUMENT_DEFINITIONS = [
                             "description": "project = ./CLAUDE.md, global = ~/.claude/CLAUDE.md"},
             },
             "required": ["key", "content"],
+        },
+    },
+    {
+        "name": "TaskOutput",
+        "description": (
+            "Read what a backgrounded command has printed since you last "
+            "looked, and whether it is still running. Use after starting one "
+            "with Bash(run_in_background=true)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"task_id": {"type": "string",
+                                       "description": "The id Bash returned"}},
+            "required": ["task_id"],
+        },
+    },
+    {
+        "name": "TaskStop",
+        "description": "Kill a command started with Bash(run_in_background=true).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"task_id": {"type": "string",
+                                       "description": "The id Bash returned"}},
+            "required": ["task_id"],
+        },
+    },
+    {
+        "name": "Delegate",
+        "description": (
+            "Hand a self-contained subtask to a fresh agent with its own "
+            "context, and get back only its conclusion. Use it when a subtask "
+            "needs a lot of reading to answer a little question , a broad "
+            "search, tracing one behaviour through several files, checking a "
+            "hypothesis. The subtask's tool results stay out of your context; "
+            "you receive the summary. Do NOT use it for work you can do in one "
+            "or two calls, and do not delegate a task that needs your current "
+            "conversation to make sense , the subagent cannot see it."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": (
+                        "The complete, self-contained instruction. State the "
+                        "goal and what to report back; the subagent has no "
+                        "access to this conversation."
+                    ),
+                },
+                "label": {
+                    "type": "string",
+                    "description": "Short name for this subtask, for the audit trail",
+                },
+            },
+            "required": ["prompt"],
+        },
+    },
+    {
+        "name": "Skill",
+        "description": (
+            "Run a user-authored skill: a folder holding SKILL.md, and "
+            "optionally a run.sh or run.py. If the skill has a script, it is "
+            "executed and you get its output; otherwise you get the procedure "
+            "to follow. Skills are how this user packages their own scripts "
+            "and pipelines as tools, so prefer an existing skill over "
+            "reimplementing what it does. Call with no name to list what is "
+            "installed."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Skill name, as shown by listing. Omit to list all.",
+                },
+                "args": {
+                    "type": "string",
+                    "description": "Arguments passed to the skill's script, shell-quoted.",
+                },
+            },
+            "required": [],
         },
     },
     {

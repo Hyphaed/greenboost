@@ -69,6 +69,14 @@ STALL_TIMEOUT_S      = 300   # 5 min without progress
 GPU_WARN_THRESHOLD   = 0.90  # 90% VRAM used
 MIN_PRIORITY         = 1     # tasks cannot be bumped below this
 MAX_TASK_RETRIES     = 3     # abandon task after this many consecutive failures
+
+# How long a queued-but-never-run task stays resumable across process restarts.
+# Rows are only deleted after _run_task() returns, so an interrupted factory
+# leaves its work behind; without a bound, that work re-runs in whatever project
+# happens to start the next factory, using its own original metadata["cwd"].
+# 2h is long enough to resume a genuinely interrupted session and short enough
+# that yesterday's abandoned task never ambushes today's.
+PENDING_TASK_TTL_S   = float(os.environ.get("GB_FACTORY_PENDING_TTL_S", 2 * 3600))
 _SKILL_INJECT_BUDGET_CHARS = 1500  # total skill-body chars injected per task
 
 # Sleep-loop tuning. Hard caps so an autonomous agent cannot exhaust the user's
@@ -82,7 +90,7 @@ SLEEP_LOOP_DEFAULT_PRIORITY = 15      # autonomous tasks sit below manual ones
 # Same base URL convention as inference/registry.py's "gb-synapse" entry,
 # reused here rather than reinvented so both paths track a port override
 # (GB_SYNAPSE_PORT) identically.
-_GB_SYNAPSE_PORT = int(os.environ.get("GB_SYNAPSE_PORT", "11435"))
+_GB_SYNAPSE_PORT = int(os.environ.get("GB_SYNAPSE_PORT", "11369"))
 _GB_SYNAPSE_URL  = f"http://localhost:{_GB_SYNAPSE_PORT}/v1/chat/completions"
 
 def _gb_synapse_chat(
@@ -406,11 +414,48 @@ class FactoryDB:
         with self._conn() as c:
             c.execute("DELETE FROM pending_tasks WHERE task_id=?", (task_id,))
 
-    def load_pending(self) -> list[Task]:
+    def load_pending(self, ttl_s: float = 0.0) -> list[Task]:
+        """Restore queued tasks, dropping any older than `ttl_s` (0 = keep all).
+
+        `delete_task()` only runs AFTER `_run_task()` returns, so a factory whose
+        process exits mid-task — an interrupted run, a killed driver, a crash —
+        leaves its row behind. The next `AIFactory()` in any project then
+        re-queues it unconditionally, carrying its ORIGINAL `metadata["cwd"]`,
+        and starts editing files in a directory the current session never
+        mentioned.
+
+        Observed 2026-08-17: a completed 'edit src/game.ts' task from one
+        project was resurrected 37 minutes later at the start of an unrelated
+        project's first run, jumped ahead of that session's own task on
+        `created_at ASC`, and took the single local model with it. Nothing was
+        corrupted (the stale cwd pointed at its own project) but the new run was
+        blocked behind work nobody asked for.
+
+        Expired rows are deleted and returned to the caller so the drop is
+        logged rather than silent — a task vanishing without explanation is its
+        own debugging problem.
+        """
         with self._conn() as c:
             rows = c.execute(
                 "SELECT * FROM pending_tasks ORDER BY priority ASC, created_at ASC"
             ).fetchall()
+        if ttl_s and ttl_s > 0:
+            cutoff = time.time() - ttl_s
+            fresh, stale = [], []
+            for r in rows:
+                (stale if (r["created_at"] or 0) < cutoff else fresh).append(r)
+            if stale:
+                with self._conn() as c:
+                    for r in stale:
+                        c.execute("DELETE FROM pending_tasks WHERE task_id=?",
+                                  (r["task_id"],))
+                self.expired_on_load = [
+                    {"task_id": r["task_id"],
+                     "age_s": round(time.time() - (r["created_at"] or 0)),
+                     "prompt": (r["prompt"] or "")[:80]}
+                    for r in stale
+                ]
+            rows = fresh
         return [
             Task(
                 priority=r["priority"],
@@ -566,9 +611,18 @@ class AIFactory:
         self._sleep_enabled_default = False
         self._log       = self._setup_log()
 
-        # Reload persisted pending tasks
-        for task in self.db.load_pending():
+        # Reload persisted pending tasks, minus anything stale enough that
+        # re-running it now would be a surprise rather than a resumption
+        # (see TaskDB.load_pending's docstring for the incident).
+        self.db.expired_on_load = []
+        for task in self.db.load_pending(ttl_s=PENDING_TASK_TTL_S):
             self._task_q.put(task)
+        for exp in getattr(self.db, "expired_on_load", []):
+            self._log.warning(
+                "dropped stale pending task %s (age %ss): %s",
+                exp["task_id"][:12], exp["age_s"], exp["prompt"],
+            )
+            _emit("factory_task_expired", exp)
 
         # Reload persisted agent state (skills, sleep flag, paused).
         for st in self.db.load_agent_states():
@@ -1038,6 +1092,7 @@ class AIFactory:
             _settings = load_settings()
             _settings["model"] = agent.model
             _settings["permission_mode"] = "accept-all"
+            _settings["_agent_label"] = task.task_id
 
             system_context = ""
             if agent.skills:
@@ -1062,6 +1117,13 @@ class AIFactory:
                     f"read, write, edit, and shell command. Do not operate "
                     f"outside this directory unless explicitly asked to.\n\n"
                 )
+                # NemoClaw audit, Phase 3c: the prompt directive above asked
+                # nicely; this makes it enforcement. A factory task's Write/
+                # Edit calls are jailed to task.cwd via the same tool-policy
+                # mechanism Phase 3b wires through dispatch() — Read/Bash
+                # stay unrestricted by this (see instruments/policy.py).
+                from greenboost_cli.instruments.policy import build_policy
+                _settings["_tool_policy"] = build_policy(workspace_roots=[task.cwd])
             return execute_turn_sync(task.prompt, ConversationSession(), _settings, system_context)
         except ImportError:
             # Fallback: return a stub so the factory stays operational

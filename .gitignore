@@ -125,11 +125,15 @@ greenboost-cli/architecture.md
 greenboost-cli/debug_documentation.md
 
 
-# Checks
-checks/
-docs/
 AGENTS.md
-# hyperresearch (per-project research vault)
+# hyperresearch (per-project research vault) — LOCAL ONLY, never published.
+# The vault records absolute local paths, clone locations of the owner's other
+# private projects, and LAN addresses; both remotes are public. Excluded whole
+# rather than per-subdirectory (owner decision, 2026-08-19).
 .hyperresearch/
-research/temp/
-research/index/
+hyperresearch/
+research/
+
+# Fuzzer binaries (built on demand via tests/c/Makefile.fuzz; embed build paths)
+fuzz_netd_protocol
+tests/c/fuzz_netd_protocol

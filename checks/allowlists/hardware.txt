@@ -1,0 +1,106 @@
+# Hardware-literal allowlist — checks/check_hardware_literals.py.
+# First-run audit (2026-07-13): every entry below was individually read.
+# Format: "path:line  # reason". Exact line only (no globs) — a hardcoded
+# value belongs here because ITS SPECIFIC CONTEXT was judged sanctioned, not
+# because the file/directory is broadly exempt.
+
+# Docstrings/comments DESCRIBING a sanctioned max(floor, pct*capacity)
+# pattern or a historical fix — the literal appears in prose, not as a value
+# actually used in a placement decision.
+gb_cluster.py:139           # docstring describes the max(2048MB, 3%) pattern already implemented in code
+gb_orchestrator.py:1336     # DI-12 docstring describing its own max(256MiB, 2%) step-down, not a literal in code (was :1281, line drift)
+gb_topology.py:277          # docstring recounts a HISTORICAL fix (two divergent literals -> one derivation) (was :256, line drift)
+greenboost.c:126            # comment explains the VRAM*1024/6 derivation formula; the actual value is 0 (auto)
+greenboost.c:207            # --help text describing the same VRAM*1024/6 formula, not a literal default
+
+# Loud last-resort fallbacks fired ONLY when live detection fails — matches
+# the "fail LOUD or sentinel + downstream auto-detect, never silently
+# inherit reference-box numbers" rule verbatim; each logs/warns on the
+# fallback path so it is never silently wrong.
+gb_topology.py:281                  # hbm_headroom_mb: logs a WARNING before returning the 1024 MB last-resort floor (was :260, line drift)
+gb_moe.py:71                        # _get_pcie_high_water priority 3/3: hard fallback after live telemetry AND config-file topology both fail
+greenboost_cuda_shim.c:2105         # vram_headroom_bytes pre-NVML-probe placeholder (was :2108, line drift, Speed Program audit KV-compress dead-code removal shifted this) - rescaled to max(128MB, 2% of physical VRAM) at :5141-5151 once the NVML probe completes; GREENBOOST_VRAM_HEADROOM_MB overrides and skips the rescale
+
+# Pure documentation: example output formats / usage strings, not literals
+# used in any decision.
+greenboost_exporter.py:97       # docstring shows an EXAMPLE of the exporter's output format string
+greenboost_setup.sh:3111        # CLI usage string for `t3-memory <size>`, showing example sizes (100GB, 50GB) (was :3125, line drift, Speed Program audit gemlite/hqq installer edit shifted this)
+greenboost_setup.sh:3119        # error message showing the expected size format, same command (was :3133, line drift, same cause)
+patches/exllamav3/exllamav3/cache/greenboost.py:16   # comment showing an EXAMPLE KV-size calculation for illustration
+
+# Explicit, opt-in manual override — gated behind the `--owner-workstation`
+# CLI flag (greenboost_setup.sh:12089-12096), never the default path
+# (detect_hardware() is the default; this preset requires the flag AND
+# --full mode). Analogous to any other env-var override already sanctioned
+# throughout this codebase — a named, documented shortcut a user chooses,
+# not silent hardcoded behavior.
+greenboost_setup.sh:2402     # info log after set_owner_workstation_params(), itself gated behind --owner-workstation (was :2397, line drift)
+
+# Benchmark tool: a FIXED, controlled payload size for a disk/memory
+# throughput test needs to be constant across runs/machines to produce
+# comparable results — this is an experimental parameter, not a placement
+# decision, and topology-scaling it would make benchmark numbers
+# non-comparable across machines (the opposite of what a benchmark needs).
+tools/gb_workstation_bench.py:315   # SIZE = 512 MB fixed test buffer for the bench tool
+tools/gb_workstation_bench.py:456   # SEQ_SIZE = 256 MB fixed sequential-read test buffer
+
+# Ceiling cap in a min(ceiling, pct*capacity) expression — the same
+# sanctioned "bound a %-derived value with a fixed limit" shape as
+# max(floor, pct*capacity) above, just capping instead of flooring: the
+# dataflux log rotation trigger is min(512 MiB, 1% of the log filesystem's
+# free space), so a huge filesystem's 1% doesn't let a single log grow
+# unreasonably large before rotating. GB_DATAFLUX_MAX_BYTES overrides with
+# an explicit absolute value when set.
+gb_dataflux.py:126     # _DEFAULT_MAX_LOG_BYTES = 512 MiB ceiling, used only via min(this, 1%-of-free-space) in _max_log_bytes() (was :125, line drift)
+gb_dataflux.py:131     # docstring restating the same min(512 MiB, 1%) formula in prose (was :130, line drift)
+
+# Vendored third-party inference engine (gLLM, see synapse_engine/NOTICE) —
+# a directory-wide exception to this file's usual "exact line only" policy,
+# because the justification here is categorical, not per-literal: it's
+# upstream's own code, subject to upstream's own hardware assumptions
+# (page sizes, cc>=89 fp8 gates, kernel block-size tables keyed by detected
+# GPU), not GreenBoost's placement policy. GreenBoost-side integration code
+# that calls into this engine (gb_synapse_backends.py's future
+# SynapseTorchBackend) is NOT covered by this exemption and stays subject
+# to the normal per-line audit above.
+synapse_engine/*
+
+# ── 2026-08-19 pre-push review ──────────────────────────────────────────────
+# Every entry below was read in context. All are measured numbers quoted in
+# PROSE (docstrings, event-kind descriptions, operator messages) recording a
+# real incident or a real benchmark — none is a value any placement decision
+# reads. The rule forbids deciding against a hardcoded number, not citing the
+# measurement that motivated the code.
+
+# Benchmark/telemetry docstrings quoting measured figures from this box.
+gb_bench_turn.py:113        # docstring: measured t2_overflow_active_mb vs tok/s, an observation
+gb_bench_turn.py:147        # docstring: VRAM vs PCIe read-bandwidth comparison, explanatory
+gb_semantics.py:848         # docstring quotes the kernel's own OOM-guard log line verbatim
+gb_semantics.py:1308        # docstring: measured shim-inflated vs real overflow, the never_use trap's evidence
+gb_semantics.py:1311        # same docstring, continuation line
+gb_semantics.py:1744        # weights_dont_fit_vram docstring: the measurement that justifies the segment
+gb_synapse.py:4018          # docstring: measured KV vs formula estimate, motivates the measurement cache
+gb_synapse.py:4032          # docstring recounting the 2026-08 front-load incident
+gb_synapse.py:4033          # same incident narrative
+gb_synapse.py:4034          # same incident narrative
+gb_synapse.py:4035          # same incident narrative
+gb_synapse.py:5397          # docstring distinguishing "free VRAM" from "VRAM total", with the measurement
+gb_synapse.py:5398          # same docstring, continuation
+gb_synapse.py:5401          # same docstring: bandwidth comparison
+gb_synapse.py:5439          # docstring table of measured serving configurations
+gb_synapse_api.py:1710      # heap-watch docstring recording the 2026-08-19 proxy leak's measured shape (line moved by the 2026-08-20 native-route passthrough)
+
+# Descriptive text, not values.
+gb_cluster.py:173           # docstring DESCRIBES the max(2048MB, 3%) derivation already implemented
+gb_moe.py:85                # docstring lists the loud last-resort PCIe fallback (priority 3 of 3)
+gb_dataflux_kinds.py:138    # event-kind description quoting the 2026-08-18 OOM incident
+greenboost_exporter.py:108  # docstring showing the exporter's output FORMAT, with example numbers
+greenboost_setup.sh:3311    # `greenboost t3-memory` usage text, example size
+greenboost_setup.sh:3319    # invalid-size error message, example size
+greenboost_setup.sh:2562    # info() confirming the named owner-workstation preset; the preset itself is
+                            # an explicit, opt-in hardware profile, which is the sanctioned way to carry
+                            # machine-specific numbers
+
+# Pre-probe default, rescaled from live topology before use. Same class as the
+# greenboost.c entries above.
+greenboost_cuda_shim.c:2134 # 512MB initial value, rescaled to max(128MB, 2% of VRAM) after the NVML probe

@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Fuzzers for GreenBoost's untrusted C surfaces.
+#
+# -O0 and sanitizers on purpose: an optimised build hides exactly the bugs
+# these look for. Matches the sibling greenboost_vgpu project's own fuzz
+# targets (tests/fuzz_gbpvg.c), which use the same flags for the same reason.
+CC      ?= gcc
+CFLAGS  := -O0 -g -std=gnu11 -Wall -Wextra -Wno-unused-function \
+           -Wno-unused-parameter -fsanitize=address,undefined \
+           -fno-omit-frame-pointer
+LDFLAGS := -lpthread -ldl -lm
+
+ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
+
+.PHONY: all fuzz-netd clean
+all: fuzz_netd_protocol
+
+fuzz_netd_protocol: $(ROOT)/tests/c/fuzz_netd_protocol.c $(ROOT)/greenboost_netd.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+# Short by default so it can run in an ordinary check; crank it for a real soak.
+fuzz-netd: fuzz_netd_protocol
+	ASAN_OPTIONS=detect_leaks=0 ./fuzz_netd_protocol 20000
+
+clean:
+	rm -f fuzz_netd_protocol

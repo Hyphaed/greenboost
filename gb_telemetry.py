@@ -208,7 +208,30 @@ class GbPoolInfo:
 
 
 # PCIe encoding efficiency per generation (GB/s per lane, one direction).
-_PCIE_BW_GBPS_PER_LANE: Dict[int, float] = {3: 1.0, 4: 2.0, 5: 4.0, 6: 8.0}
+# Gen1/Gen2 are listed because they are exactly the generations a link idles
+# down to under ASPM, so they ARE reached in practice. Omitting them made
+# `.get(gen, 2.0)` fall through to the Gen4 default and report a downtrained
+# Gen2 link at full Gen4 bandwidth: live on 2026-08-18 every pcie_degraded
+# event carried `gen_current: 2` alongside `bw_mb_s == bw_max_mb_s == 32768`,
+# so the event contradicted itself and any consumer reading the bandwidth saw
+# no degradation at all.
+_PCIE_BW_GBPS_PER_LANE: Dict[int, float] = {
+    1: 0.25, 2: 0.5, 3: 1.0, 4: 2.0, 5: 4.0, 6: 8.0,
+}
+
+# Fallback for a generation not in the table above (a newer gen this build
+# predates). Deliberately the LOWEST known rate rather than a mid-table guess:
+# under-reporting bandwidth makes a bandwidth-aware decision conservative,
+# while over-reporting it silently hides a real bottleneck.
+_PCIE_BW_GBPS_PER_LANE_FALLBACK = 0.25
+
+# Minimum GPU utilization (%) that counts as "under load" when deciding
+# whether a PCIe gen reading can be trusted. A bare `util > 0` is not enough:
+# a display-attached GPU reports a few percent from ordinary desktop
+# compositing at all times, which made pcie_active almost permanently True and
+# defeated the ASPM guard it exists to provide. Expressed as a percentage
+# threshold, the form the hardcoded-hardware-values rule calls for.
+_PCIE_ACTIVE_UTIL_PCT = 25
 
 # Maximum NVLink ports to probe (NVML_NVLINK_MAX_LINKS = 18 as of vR595).
 _NVLINK_MAX_LINKS = 18
@@ -281,7 +304,8 @@ class GpuTopology:
         """One-direction theoretical bandwidth (MB/s) at current link speed."""
         return (
             self.pcie_width_current
-            * _PCIE_BW_GBPS_PER_LANE.get(self.pcie_gen_current, 2.0)
+            * _PCIE_BW_GBPS_PER_LANE.get(
+                self.pcie_gen_current, _PCIE_BW_GBPS_PER_LANE_FALLBACK)
             * 1024.0
         )
 
@@ -290,7 +314,8 @@ class GpuTopology:
         """One-direction theoretical bandwidth at device-max link speed."""
         return (
             self.pcie_width_max
-            * _PCIE_BW_GBPS_PER_LANE.get(self.pcie_gen_max, 2.0)
+            * _PCIE_BW_GBPS_PER_LANE.get(
+                self.pcie_gen_max, _PCIE_BW_GBPS_PER_LANE_FALLBACK)
             * 1024.0
         )
 
@@ -468,15 +493,21 @@ def _probe_gpu_topology(pynvml_mod: object, handle: object, device: int) -> Opti
             gen_max = min(gen_max, slot_gen_max)
             width_max = min(width_max, slot_width_max)
 
-    # Was the GPU active (doing compute) at probe time?  See GpuTopology.
-    # pcie_active docstring , gen_cur legitimately idles below gen_max under
-    # ASPM power saving, so a mismatch caught while idle must not be trusted.
+    # Was the GPU under REAL load at probe time?  See GpuTopology.pcie_active
+    # docstring , gen_cur legitimately idles below gen_max under ASPM power
+    # saving, so a mismatch caught while idle must not be trusted.
+    # The bar is _PCIE_ACTIVE_UTIL_PCT, not a bare `> 0`: on a display-attached
+    # GPU, desktop compositing keeps utilization a few percent above zero
+    # permanently, so `> 0` marked the card "active" essentially always and the
+    # ASPM guard never actually guarded anything. That is the measured cause of
+    # the 13 false pcie_degraded events on this box (2026-08-18: every one
+    # reported gen2 while the link measured Gen4 x16 under real load).
     # Default False (no gen flag) when utilization can't be read , bias away
     # from false alarms, never toward them.
     pcie_active = False
     try:
         util = nv.nvmlDeviceGetUtilizationRates(handle)
-        pcie_active = int(util.gpu) > 0
+        pcie_active = int(util.gpu) >= _PCIE_ACTIVE_UTIL_PCT
     except Exception:
         pass
 

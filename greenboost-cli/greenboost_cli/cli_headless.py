@@ -44,7 +44,7 @@ HEADLESS_SUBCOMMANDS = {
     "convert",
     "compress", "skill-route", "tokens", "semantics",
     # AI Factory plane
-    "factory-submit", "factory-status", "factory-list",
+    "factory-submit", "factory-status", "factory-list", "factory-run",
     "factory-pause", "factory-resume", "factory-agents",
     "factory-hot-swap", "factory-sleep",
     # Skill management, plan-mode, subagent, task tracker

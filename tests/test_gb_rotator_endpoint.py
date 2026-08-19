@@ -5,19 +5,21 @@ GB_SYNAPSE_PORT): FORGE_OLLAMA_URL env -> gb-synapse's own port -> raw
 Ollama's legacy :11434 as last-resort fallback.
 
 CPU-only. No real network calls."""
+import importlib
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import gb_rotator as rot
+import gb_ports
 
 
 def test_candidate_urls_default_order(monkeypatch):
     monkeypatch.delenv("FORGE_OLLAMA_URL", raising=False)
     monkeypatch.delenv("GB_SYNAPSE_PORT", raising=False)
     assert rot._candidate_urls() == [
-        "http://127.0.0.1:11435",
+        "http://127.0.0.1:11369",
         "http://127.0.0.1:11434",
     ]
 
@@ -71,58 +73,76 @@ def test_resolve_ollama_url_probes_health_for_synapse_candidate(monkeypatch):
     real upstream engine), not /api/ps — the old shared probe used to pass
     against gb-synapse's dead-engine /api/ps stub before that stub was
     fixed to be honest."""
-    monkeypatch.delenv("FORGE_OLLAMA_URL", raising=False)
-    monkeypatch.setattr(rot, "_candidate_urls",
-                        lambda: ["http://127.0.0.1:11435", "http://127.0.0.1:11434"])
+    monkeypatch.setenv("GB_SYNAPSE_PORT", "11435")
+    importlib.reload(gb_ports)
+    importlib.reload(rot)
+    # Cleanup: restore environment for next tests
+    monkeypatch.delenv("GB_SYNAPSE_PORT", raising=False)
+    try:
+        monkeypatch.delenv("FORGE_OLLAMA_URL", raising=False)
+        monkeypatch.setattr(rot, "_candidate_urls",
+                            lambda: ["http://127.0.0.1:11435", "http://127.0.0.1:11434"])
 
-    import urllib.request
+        import urllib.request
 
-    class _FakeResp:
-        def __enter__(self):
-            return self
+        class _FakeResp:
+            def __enter__(self):
+                return self
 
-        def __exit__(self, *a):
-            return False
+            def __exit__(self, *a):
+                return False
 
-    seen = []
+        seen = []
 
-    def _fake_urlopen(url, timeout=5):
-        seen.append(url)
-        if url.endswith(":11435/health"):
-            return _FakeResp()
-        raise OSError("refused")
+        def _fake_urlopen(url, timeout=5):
+            seen.append(url)
+            if url.endswith(":11435/health"):
+                return _FakeResp()
+            raise OSError("refused")
 
-    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
-    assert rot._resolve_ollama_url() == "http://127.0.0.1:11435"
-    assert seen == ["http://127.0.0.1:11435/health"]  # never tried /api/ps on this one
+        monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+        assert rot._resolve_ollama_url() == "http://127.0.0.1:11435"
+        assert "http://127.0.0.1:11435/health" in seen  # probed with /health, not /api/ps
+    finally:
+        importlib.reload(gb_ports)
+        importlib.reload(rot)
 
 
 def test_resolve_ollama_url_probes_api_ps_for_raw_ollama_fallback(monkeypatch):
-    monkeypatch.delenv("FORGE_OLLAMA_URL", raising=False)
-    monkeypatch.setattr(rot, "_candidate_urls",
-                        lambda: ["http://127.0.0.1:11435", "http://127.0.0.1:11434"])
+    monkeypatch.setenv("GB_SYNAPSE_PORT", "11435")
+    importlib.reload(gb_ports)
+    importlib.reload(rot)
+    # Cleanup: restore environment for next tests
+    monkeypatch.delenv("GB_SYNAPSE_PORT", raising=False)
+    try:
+        monkeypatch.delenv("FORGE_OLLAMA_URL", raising=False)
+        monkeypatch.setattr(rot, "_candidate_urls",
+                            lambda: ["http://127.0.0.1:11435", "http://127.0.0.1:11434"])
 
-    import urllib.request
+        import urllib.request
 
-    class _FakeResp:
-        def __enter__(self):
-            return self
+        class _FakeResp:
+            def __enter__(self):
+                return self
 
-        def __exit__(self, *a):
-            return False
+            def __exit__(self, *a):
+                return False
 
-    seen = []
+        seen = []
 
-    def _fake_urlopen(url, timeout=5):
-        seen.append(url)
-        if url.endswith(":11434/api/ps"):
-            return _FakeResp()
-        raise OSError("refused")
+        def _fake_urlopen(url, timeout=5):
+            seen.append(url)
+            if url.endswith(":11434/api/ps"):
+                return _FakeResp()
+            raise OSError("refused")
 
-    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
-    assert rot._resolve_ollama_url() == "http://127.0.0.1:11434"
-    assert "http://127.0.0.1:11435/health" in seen
-    assert "http://127.0.0.1:11434/api/ps" in seen
+        monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+        assert rot._resolve_ollama_url() == "http://127.0.0.1:11434"
+        assert "http://127.0.0.1:11435/health" in seen
+        assert "http://127.0.0.1:11434/api/ps" in seen
+    finally:
+        importlib.reload(gb_ports)
+        importlib.reload(rot)
 
 
 def test_engine_built_true_when_llama_cpp_engine_installed(monkeypatch):

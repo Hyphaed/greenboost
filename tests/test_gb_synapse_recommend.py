@@ -35,7 +35,7 @@ def _fake_entry(name="qwen3", n_bytes=4 * 1024 ** 3):
 def test_recommend_uses_measured_tok_s_when_a_sample_exists(monkeypatch):
     monkeypatch.setattr(gs, "doctor", _fake_doctor)
     monkeypatch.setattr(gs, "list_models", lambda: [_fake_entry()])
-    monkeypatch.setattr(gs, "_measured_tok_s", lambda model: 42.5)
+    monkeypatch.setattr(gs, "_measured_tok_s", lambda model, **kw: 42.5)
     # If the heuristic ran, this would prove the substitution didn't happen.
     monkeypatch.setattr(gs, "_estimate_tok_s", lambda active_gb, budget_gb: 999.0)
 
@@ -51,7 +51,7 @@ def test_recommend_uses_measured_tok_s_when_a_sample_exists(monkeypatch):
 def test_recommend_falls_back_to_estimate_without_a_sample(monkeypatch):
     monkeypatch.setattr(gs, "doctor", _fake_doctor)
     monkeypatch.setattr(gs, "list_models", lambda: [_fake_entry()])
-    monkeypatch.setattr(gs, "_measured_tok_s", lambda model: None)
+    monkeypatch.setattr(gs, "_measured_tok_s", lambda model, **kw: None)
     monkeypatch.setattr(gs, "_estimate_tok_s", lambda active_gb, budget_gb: 17.0)
 
     reports = gs.recommend(ctx=8192, probe_feeders=False)
@@ -71,7 +71,7 @@ def test_recommend_measured_flag_reaches_json_and_mcp_dict(monkeypatch):
 
     monkeypatch.setattr(gs, "doctor", _fake_doctor)
     monkeypatch.setattr(gs, "list_models", lambda: [_fake_entry()])
-    monkeypatch.setattr(gs, "_measured_tok_s", lambda model: 88.0)
+    monkeypatch.setattr(gs, "_measured_tok_s", lambda model, **kw: 88.0)
 
     reports = gs.recommend(ctx=8192, probe_feeders=False)
     d = asdict(reports[0])

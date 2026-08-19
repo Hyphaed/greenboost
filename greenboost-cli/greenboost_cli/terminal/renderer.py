@@ -23,6 +23,7 @@ Rules:
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -41,8 +42,22 @@ from greenboost_cli.terminal.theme import (
     render_markdown, has_markdown,
     ANSI_GRAY, ANSI_AMBER, ANSI_RESET, ANSI_LIME,
     ANSI_VIOLET, ANSI_CYAN, ANSI_DIM, ANSI_BOLD, ANSI_TEAL,
-    SPINNER_TOOL, BOX_H, BOX_V, BOX_TL, BOX_TR, BOX_BL, BOX_BR, BOX_ML, BOX_MR, TOOL_ICONS,
+    SPINNER_TOOL, WAVE_GLYPHS, WAVE_WIDTH, PULSE_GLYPHS,
+    BOX_H, BOX_V, BOX_TL, BOX_TR, BOX_BL, BOX_BR, BOX_ML, BOX_MR, TOOL_ICONS,
 )
+from greenboost_cli.terminal.width import (
+    TTY_LOCK, at_line_start, claim_live, display_width, drawn_as_block,
+    live_suspended, release_live, suspend_live, truncate_to_width, tty_write,
+)
+
+# Erase-to-end-of-line, and DECAWM off/on. The status line and this module's
+# tool spinner both repaint a row in place from separate threads; erasing the
+# row (rather than padding the new frame out to cover the old one) and refusing
+# to auto-wrap are what keep a frame from spilling onto a second row and
+# stranding its own head in the scrollback. See terminal/width.py.
+_ERASE_LINE = "\033[2K"
+_WRAP_OFF = "\033[?7l"
+_WRAP_ON = "\033[?7h"
 
 # ── Text buffer ────────────────────────────────────────────────────────────────
 _text_buffer: list[str] = []
@@ -155,53 +170,181 @@ _SPINNER_TIPS = [
 ]
 
 
+_ELLIPSIS = "\u2026"
+
+
+def _action_frame(frame: int, elapsed: float, safe_w: int) -> str:
+    """Compose one frame of the running-action line.
+
+    Space is ALLOCATED from a budget, not computed with one width equation.
+    The equation approach is what produced the wrapped, tail-stranded status
+    line fixed earlier today: one mis-measured glyph overflows the whole frame.
+    Here the frame can only ever be built to fit.
+
+    Allocation order, most important first:
+      1. marker + wave + elapsed timer — always present; this is what says the
+         agent is alive and how long it has been at it.
+      2. vitals — the thing a cloud CLI structurally cannot show. Kept ahead of
+         the label because "what it is doing" is guessable from the transcript
+         above, while "what the hardware is doing" is not.
+      3. the action label, TRUNCATED rather than dropped — a shortened
+         "Bash · verifying the tre…" carries far more than a bare dash run.
+      4. a rotating tip, only from leftover slack.
+    """
+    marker = PULSE_GLYPHS[(frame // 3) % len(PULSE_GLYPHS)]
+    wave = _wave(frame)
+    head = f"  {marker} {wave}  "
+    t = _fmt_elapsed(elapsed)
+    vitals = _vitals_text() if elapsed > 1.0 else ""
+
+    avail = safe_w - display_width(head)
+    SEP = "  ·  "
+
+    def tail_of(with_vitals: bool) -> str:
+        return "  " + (vitals + SEP + t if (with_vitals and vitals) else t)
+
+    # Give the label whatever is left after the tail and a minimum dash run.
+    tail = tail_of(True)
+    budget = avail - display_width(tail) - 4      # 4 = 2 min dashes + 2 spacing
+    if budget < 12 and vitals:                     # too tight to say anything useful
+        tail = tail_of(False)
+        budget = avail - display_width(tail) - 4
+
+    label = _tool_label or "running"
+    if budget < 6:
+        label = ""
+    elif display_width(label) > budget:
+        # Reserve the ellipsis's MEASURED width, not 1. U+2026 is East-Asian
+        # Ambiguous, so display_width() calls it 2 columns on a CJK-capable
+        # font — reserving 1 overflows the frame by exactly one column, which
+        # is the same class of bug as the wrapped status line.
+        label = truncate_to_width(label, budget - display_width(_ELLIPSIS)) + _ELLIPSIS
+
+    body = f"{label}  " if label else ""
+
+    # A tip only ever spends slack the rest of the line did not need.
+    tip = ""
+    if elapsed > 3.0 and label and display_width(label) == display_width(_tool_label or "running"):
+        cand = _SPINNER_TIPS[int(elapsed / 5) % len(_SPINNER_TIPS)]
+        slack = avail - display_width(body) - display_width(tail) - 4
+        if slack >= display_width(cand) + 8:
+            tip = cand + "  "
+
+    dashes = max(2, avail - display_width(body + tip) - display_width(tail))
+    # Final clamp. Every branch above is meant to fit, but a terminal narrower
+    # than the marker plus the timer has no fitting frame at all — clamp rather
+    # than emit a line that wraps and strands its own head in the scrollback.
+    plain = head + body + tip + ("─" * dashes) + tail
+    if display_width(plain) > safe_w:
+        return ANSI_DIM + truncate_to_width(plain, safe_w) + ANSI_RESET
+    return (
+        f"{ANSI_TEAL}{head}{ANSI_RESET}"
+        f"{ANSI_GRAY}{body}{ANSI_RESET}"
+        f"{ANSI_DIM}{tip}{'─' * dashes}{tail}{ANSI_RESET}"
+    )
+
+
 def _spinner_worker(stop: threading.Event, t0: float) -> None:
+    # Take the live row for the duration of the tool call. The status line
+    # paints the same row from its own thread; without this both claim it and
+    # the terminal grows a second "Processing" line with its own timer.
+    claim_live("action")
     frame = 0
-    # Widest line painted so far this run. The >3s "tip" branch used to
-    # append NO trailing pad at all (unlike the <3s branch), so crossing the
-    # 3s threshold — or the tip text changing length on its 5s rotation —
-    # could strand characters from a wider previous line at the right edge,
-    # the same class of bug as statusline.py's breathing-dash artifact.
-    prev_vis_len = 0
     while not stop.is_set():
         elapsed = time.monotonic() - t0
-        t      = _fmt_t(elapsed)
-        sp     = SPINNER_TOOL[frame % len(SPINNER_TOOL)]
         safe_w = _w() - 2
-
-        if elapsed > 3.0:
-            # After 3 seconds, replace some dashes with a rotating tip
-            tip = _SPINNER_TIPS[int(elapsed / 5) % len(_SPINNER_TIPS)]
-            left_d  = 4
-            right_d = max(2, safe_w - 2 - 1 - 2 - len("running") - 2 - left_d - 2 - len(tip) - 2 - len(t) - 2)
-            line = (
-                f"\r  {ANSI_TEAL}{sp}{ANSI_RESET}"
-                f"  {ANSI_DIM}running {'─' * left_d}  {tip}  {'─' * right_d}  {t}{ANSI_RESET}"
-            )
-            vis_len = 2 + 1 + 2 + len("running") + 2 + left_d + 2 + len(tip) + 2 + right_d + 2 + len(t)
-        else:
-            label_vis = 2 + 1 + 2 + len("running") + 2
-            right_vis = len(t) + 2
-            dashes    = max(2, safe_w - label_vis - right_vis)
-            line = (
-                f"\r  {ANSI_TEAL}{sp}{ANSI_RESET}"
-                f"  {ANSI_DIM}running {'─' * dashes}  {t}{ANSI_RESET}"
-            )
-            vis_len = label_vis + dashes + right_vis
-
-        pad_to = max(safe_w, prev_vis_len)
-        prev_vis_len = vis_len
-        line += " " * max(0, pad_to - vis_len)
-
-        sys.stdout.write(line)
-        sys.stdout.flush()
+        try:
+            line = _action_frame(frame, elapsed, safe_w)
+        except Exception:
+            # A decoration must never take down a turn. Fall back to the
+            # simplest thing that still says the agent is alive.
+            line = f"  {ANSI_TEAL}{SPINNER_TOOL[frame % len(SPINNER_TOOL)]}{ANSI_RESET}  {ANSI_DIM}{_fmt_elapsed(elapsed)}{ANSI_RESET}"
+        # Only take the row if it is ours to take. Mid-stream prose leaves the
+        # cursor partway along a line; painting there splices the frame into
+        # someone else's text and strands the result. See width.at_line_start().
+        # Erase the row rather than pad the frame out to cover the previous one.
+        # \033[2K plus auto-wrap off makes the overwrite correct regardless of
+        # whether every glyph's width was measured right. See terminal/width.py.
+        tty_write(
+            _WRAP_OFF + "\r" + _ERASE_LINE
+            + truncate_to_width(line, safe_w)
+            + ANSI_RESET + _WRAP_ON,
+            live=True, owner="action",   # one owner per live row, see width.py
+        )
         stop.wait(0.08)
         frame += 1
+
+
+# Live vitals for the running-action line, supplied by repl.py.
+#
+# A CALLBACK rather than a direct read, for two reasons. renderer.py cannot
+# import repl.py (circular), and more importantly the animation must never do
+# work: repl already refreshes T1/T2/T3 on a 5 s background cadence into
+# `_gb_stats_segs`, so this reads a value that was going to be computed anyway.
+# Polling NVML at 12 fps to decorate a spinner would take CPU and PCIe cycles
+# away from the inference the spinner is reporting on, which is self-defeating.
+_vitals_provider = None      # type: ignore  # callable() -> list[(text, style)]
+_tool_label = ""
+
+
+def set_quiet_mode(on: bool) -> None:
+    """Toggle compact tool output (ctrl+i, /quiet).
+
+    The renderer keeps its own `_quiet_mode` because it is consulted on the
+    hot path for every tool card; this keeps it in step with the settings dict
+    when the binding flips it mid-session.
+    """
+    global _quiet_mode
+    _quiet_mode = bool(on)
+
+
+def set_vitals_provider(cb) -> None:
+    """Register the cached-vitals source. Called once at startup by repl.py."""
+    global _vitals_provider
+    _vitals_provider = cb
+
+
+def _vitals_text() -> str:
+    """Compact vitals for the action line, or "" if none are cached yet.
+
+    Never raises and never blocks: a decoration that can fail a turn is worse
+    than no decoration.
+    """
+    try:
+        segs = _vitals_provider() if _vitals_provider else None
+    except Exception:
+        return ""
+    if not segs:
+        return ""
+    return "  ·  ".join(t for t, _ in segs if t)
+
+
+def _wave(frame: int) -> str:
+    """One frame of the travelling wave — a serpent of block elements.
+
+    Phase-shifted per cell so the crest moves along the run rather than every
+    cell pulsing together, which reads as motion instead of flicker.
+    """
+    n = len(WAVE_GLYPHS)
+    return "".join(WAVE_GLYPHS[(frame + i * 2) % n] for i in range(WAVE_WIDTH))
+
+
+def set_tool_label(label: str) -> None:
+    """What the agent is doing right now, shown on the action line."""
+    global _tool_label
+    _tool_label = (label or "").strip()
 
 
 def _start_tool_spinner() -> None:
     global _tool_t0, _tool_stop_evt, _tool_thread
     _tool_t0 = time.monotonic()
+    if not sys.stdout.isatty():
+        # Non-TTY: `gb -p ...` piped into a file, a CI job, a log. An animation
+        # repainting a row 12 times a second has nothing to repaint there — it
+        # just writes escape sequences forever (measured: 815 bytes of \r frames
+        # in 0.35 s, i.e. ~2 KB/s of junk for the whole run). The elapsed time
+        # still reaches the reader via show_instrument_result.
+        return
     if _pt_live():
         # pt app is live at the idle prompt — skip raw \r animation; toolbar
         # shows live status. (In practice this branch is unreachable during turns
@@ -226,6 +369,8 @@ def _stop_tool_spinner() -> float:
         _tool_thread.join(timeout=0.5)
     _tool_stop_evt = None
     _tool_thread   = None
+    set_tool_label("")
+    release_live("action")      # hand the row back to the status line
     return elapsed
 
 
@@ -237,8 +382,7 @@ def halt_tool_spinner() -> None:
     if _pt_live():
         return
     w = _w()
-    sys.stdout.write(f"\r{' ' * w}\r")
-    sys.stdout.flush()
+    tty_write(f"\r{' ' * w}\r")
 
 
 # ── Streaming ──────────────────────────────────────────────────────────────────
@@ -252,9 +396,8 @@ def emit_text_fragment(chunk: str) -> None:
         # pt app not live (or no pt) — stream raw; also the path during every turn.
         if not _text_buffer:
             # First chunk of a new prose block — lead with the CC-style bullet.
-            sys.stdout.write(f"  {ANSI_LIME}{_CC_BULLET}{ANSI_RESET}  ")
-        sys.stdout.write(chunk)
-        sys.stdout.flush()
+            tty_write(f"  {ANSI_LIME}{_CC_BULLET}{ANSI_RESET}  ")
+        tty_write(chunk)
         _stream_line_count += chunk.count("\n")
     _text_buffer.append(chunk)
 
@@ -291,7 +434,7 @@ def finalize_response() -> None:
         # just render once, no cursor-up erase needed.
         if full.strip():
             print()
-            sys.stdout.write(f"  {ANSI_LIME}{_CC_BULLET}{ANSI_RESET}  ")
+            tty_write(f"  {ANSI_LIME}{_CC_BULLET}{ANSI_RESET}  ")
             if has_markdown(full):
                 render_markdown(full)
             else:
@@ -312,14 +455,13 @@ def finalize_response() -> None:
         # \x1b[J   = clear from cursor to end of screen
         if sys.stdout.isatty():
             if _stream_line_count > 0:
-                sys.stdout.write(f"\x1b[{_stream_line_count}A")
-            sys.stdout.write("\r\x1b[J")
-            sys.stdout.flush()
+                tty_write(f"\x1b[{_stream_line_count}A")
+            tty_write("\r\x1b[J")
         elif _stream_line_count > 0:
             print()
         if full.strip():
             print()
-            sys.stdout.write(f"  {ANSI_LIME}{_CC_BULLET}{ANSI_RESET}  ")
+            tty_write(f"  {ANSI_LIME}{_CC_BULLET}{ANSI_RESET}  ")
             if has_markdown(full):
                 render_markdown(full)
             else:
@@ -397,10 +539,9 @@ def _flush_file_group() -> None:
     label = f"{verb} {n} file{'s' if n > 1 else ''}"
     suffix = "  (ctrl+o to expand)"
     pad    = " " * max(0, w - len(label) - len(suffix))
-    sys.stdout.write(
+    tty_write(
         f"\r  {ANSI_DIM}{label}  {ANSI_GRAY}(ctrl+o to expand){ANSI_RESET}{pad}\n"
     )
-    sys.stdout.flush()
     _last_truncated = {"name": "Files", "lines": list(names), "is_diff": False, "shown": 0}
 
 
@@ -484,6 +625,13 @@ def show_instrument_start(name: str, inputs: dict, verbose: bool) -> None:
     _last_tool_summary = summary
     _last_tool_badge   = _badge(_tool_call_counter)
 
+    # Name the action on the live line. Set once here rather than at each of the
+    # seven _start_tool_spinner() call sites below, so a new branch cannot ship
+    # an unlabelled spinner. The label is what turns "something is running" into
+    # "verifying the tree is green", which is the whole point of the animation.
+    _short = summary.strip().splitlines()[0] if summary.strip() else ""
+    set_tool_label(f"{name} · {_short}" if _short else name)
+
     # ── Consecutive Grep/Glob: coalesce into one updating block ───────────────
     if name in _GROUP_TOOLS:
         if name == _group_tool:
@@ -499,8 +647,7 @@ def show_instrument_start(name: str, inputs: dict, verbose: bool) -> None:
         if _quiet_mode:
             if not _pt_live():
                 label = f"{name}  {summary[:_w() - 20]}"
-                sys.stdout.write(f"  {ANSI_TEAL}◐{ANSI_RESET}  {ANSI_DIM}{label}{ANSI_RESET}  ")
-                sys.stdout.flush()
+                tty_write(f"  {ANSI_TEAL}◐{ANSI_RESET}  {ANSI_DIM}{label}{ANSI_RESET}  ")
             _start_tool_spinner()
             return
         console.print()
@@ -522,8 +669,7 @@ def show_instrument_start(name: str, inputs: dict, verbose: bool) -> None:
     if _quiet_mode:
         if not _pt_live():
             label = f"{name}  {summary[:w - 20]}"
-            sys.stdout.write(f"  {ANSI_TEAL}◐{ANSI_RESET}  {ANSI_DIM}{label}{ANSI_RESET}  ")
-            sys.stdout.flush()
+            tty_write(f"  {ANSI_TEAL}◐{ANSI_RESET}  {ANSI_DIM}{label}{ANSI_RESET}  ")
         _start_tool_spinner()
         return
 
@@ -542,6 +688,7 @@ def show_instrument_start(name: str, inputs: dict, verbose: bool) -> None:
     _start_tool_spinner()
 
 
+@drawn_as_block
 def show_instrument_result(name: str, result: str, verbose: bool) -> None:
     """Stop spinner and display tool output in Claude Code tree style."""
     global _pending_file_ops, _pending_file_names, _pending_file_tools
@@ -554,8 +701,7 @@ def show_instrument_result(name: str, result: str, verbose: bool) -> None:
     # Erase spinner line — during turns (pt app not live) a raw \r spinner was
     # drawn; clear it before printing the result. No-op if nothing was drawn.
     if not _pt_live():
-        sys.stdout.write(f"\r{' ' * safe_w}\r")
-        sys.stdout.flush()
+        tty_write(f"\r{' ' * safe_w}\r")
 
     # ── Grep/Glob group: condensed child rows + in-place header count update ───
     if name in _GROUP_TOOLS and not _quiet_mode:
@@ -570,7 +716,7 @@ def show_instrument_result(name: str, result: str, verbose: bool) -> None:
         # Rewrite header in-place to show running count (≥2nd call onward)
         if _group_count >= 2 and not _pt_live() and sys.stdout.isatty():
             lines_up = _group_rows + 1
-            sys.stdout.write(
+            tty_write(
                 f"\x1b[{lines_up}A"   # move up to header line
                 f"\r\x1b[2K"          # clear it
                 f"  {ANSI_LIME}{_CC_BULLET}{ANSI_RESET}"
@@ -578,7 +724,6 @@ def show_instrument_result(name: str, result: str, verbose: bool) -> None:
                 f" {ANSI_DIM}×{_group_count}{ANSI_RESET}"
                 f"\x1b[{lines_up}B\r" # move back down to current line
             )
-            sys.stdout.flush()
 
         # Print condensed child row (first uses └ prefix, rest use spaces)
         prefix = f"  {_CC_TREE} " if _group_rows == 0 else "      "
@@ -597,10 +742,9 @@ def show_instrument_result(name: str, result: str, verbose: bool) -> None:
                 from rich.markup import escape as _esc_q
                 console.print(f"  [{AMBER}]✗  {name}  {_esc_q(err_text)}  [{t}][/]")
             else:
-                sys.stdout.write(
+                tty_write(
                     f"  {ANSI_AMBER}✗  {name}  {err_text}  [{t}]{ANSI_RESET}\n"
                 )
-                sys.stdout.flush()
         return
 
     from rich.markup import escape
@@ -730,6 +874,24 @@ def expand_last_result() -> None:
 
 
 
+def _trailing_question(buffer: list) -> str:
+    """The question the model ended its turn on, or "" if it did not ask one.
+
+    Deliberately narrow. Only a question in the LAST couple of lines counts:
+    a model reasoning aloud mid-answer ("what should this return?") is not
+    addressed to the reader, and flagging that would train the reader to ignore
+    this line , the same way a warning on every startup gets ignored.
+    """
+    text = "".join(buffer).strip()
+    if not text or "?" not in text:
+        return ""
+    lines = [ln.strip(" -•\t") for ln in text.splitlines() if ln.strip()]
+    for ln in reversed(lines[-3:]):
+        if ln.endswith("?") and len(ln) > 8:
+            return ln if len(ln) <= 160 else ln[:157] + "\u2026"
+    return ""
+
+
 def _result_summary(name: str, result: str) -> str:
     if not result.strip():
         return "done"
@@ -846,8 +1008,7 @@ def open_response_block(
     _prev_todo_snapshot = []   # new turn always shows the full board first
 
     console.print()
-    sys.stdout.write(ANSI_GRAY)
-    sys.stdout.flush()
+    tty_write(ANSI_GRAY)
 
 
 def close_response_block(verbose: bool, in_tokens: int = 0, out_tokens: int = 0,
@@ -860,8 +1021,7 @@ def close_response_block(verbose: bool, in_tokens: int = 0, out_tokens: int = 0,
     since open_response_block() (every tool call + tool execution included),
     badly diluting tok/s for any answer that involved tool use."""
     _flush_file_group()   # flush any remaining Read/Write/Edit group
-    sys.stdout.write(ANSI_RESET)
-    sys.stdout.flush()
+    tty_write(ANSI_RESET)
     finalize_response()
 
     elapsed = time.monotonic() - _block_start_t
@@ -894,6 +1054,30 @@ def close_response_block(verbose: bool, in_tokens: int = 0, out_tokens: int = 0,
                 f"  [{DIM}]— try rephrasing, /retry, or check /backend connectivity.[/]"
             )
 
+        # The model asked something in prose instead of calling AskUserQuestion.
+        #
+        # The system prompt already carries a hard rule about this ("NEVER write
+        # a question as plain text"), and AskUserQuestion is advertised with a
+        # full schema , verified 2026-08-18. A 27B local model still writes the
+        # question as prose sometimes, and then the question scrolls past inside
+        # a wall of tool output. The owner hit this twice in one session
+        # ("C# or GDScript?", "Any existing pipelines you'd likely reuse?") and
+        # reported it as "asking a question, but I had no answer to choose".
+        #
+        # Fighting that with more prompt text has diminishing returns; surfacing
+        # it costs one line and works regardless of which model is serving.
+        _q = _trailing_question(_text_buffer)
+        if _q and "AskUserQuestion" not in _turn_tool_names:
+            from rich.markup import escape
+            console.print(
+                f"  [{AMBER}]?[/]  [{GRAY}]The model asked you something:[/] "
+                f"[{VIOLET}]{escape(_q)}[/]"
+            )
+            console.print(
+                f"  [{DIM}]Answer in your next message , it did not use the "
+                f"question wizard, so nothing is waiting on a keypress.[/]"
+            )
+
         # Compact "✻ Worked for Xm Xs · ↑ Nk · ↓ Nk" footer — no rule, every mode.
         console.print(
             f"  [{DIM}]✻  Worked for {t}  ·  {tok_str}{tps_str}[/]"
@@ -917,8 +1101,7 @@ def prompt_approval(description: str, settings: dict) -> bool:
     except Exception:
         # Fallback: plain numbered prompt if terminal doesn't support raw mode
         try:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+            tty_write("\n")
             w = _w()
             inner = w - 4
             console.print(f"  [{DIM}]{BOX_TL}{BOX_H * inner}{BOX_TR}[/]")
@@ -948,66 +1131,132 @@ def prompt_approval(description: str, settings: dict) -> bool:
 
 # ── Compaction progress ────────────────────────────────────────────────────────
 
+def _sweep_bar(frame: int, width: int) -> str:
+    """One frame of an INDETERMINATE activity band.
+
+    Deliberately not a percentage. Compaction is a single model call whose
+    completion fraction nothing measures, so a "28%" would be invented — the
+    same confidently-wrong reporting the GB-Semantics rule exists to prevent.
+    A travelling band says "working, still alive" without claiming to know how
+    far along it is. Sub-cell shading gives the band soft edges, borrowed from
+    bubbles/progress's half-block fill trick.
+    """
+    if width <= 0:
+        return ""
+    band = len(WAVE_GLYPHS)
+    pos = frame % (width + band)
+    cells = []
+    for i in range(width):
+        d = i - (pos - band)
+        cells.append(WAVE_GLYPHS[d] if 0 <= d < band else "░")
+    return "".join(cells)
+
+
 def show_compact_progress(
     n_before: int,
     n_after: int,
     tokens_est: int,
     elapsed_s: int = 0,
 ) -> None:
-    """Display compaction header + animated progress bar (Image #8 style)."""
-    import time as _t
+    """Print the FINAL compaction result line (no animation).
 
-    w      = _w()
-    tok_s  = _fmt_tokens(tokens_est)
-
-    # Elapsed time in "Xm Ys" or "Xs" form
-    if elapsed_s >= 60:
-        m, s  = elapsed_s // 60, elapsed_s % 60
-        time_s = f"{m}m {s}s"
-    else:
-        time_s = f"{elapsed_s}s"
-
+    Kept for callers that already did the work; live progress belongs to
+    `compaction_progress()` below.
+    """
+    freed = _fmt_tokens(max(0, tokens_est))
     console.print(
-        f"\n  [{TEAL}]✱[/] [{GRAY}]Compacting conversation…[/]"
-        f"  [{DIM}]{n_before} → {n_after} turns  ·  ↑ {tok_s} tokens  ·  {time_s}[/]"
+        f"  [{TEAL}]✱[/] [{GRAY}]Compacted[/]"
+        f"  [{DIM}]{n_before} → {n_after} messages  ·  ↓ {freed} tokens"
+        f"  ·  {_fmt_elapsed(elapsed_s)}[/]"
     )
 
-    bar_w = min(40, w - 12)
-    steps = [0.15, 0.35, 0.55, 0.72, 0.88, 1.0]
-    for frac in steps:
-        filled = int(bar_w * frac)
-        empty  = bar_w - filled
-        pct    = int(frac * 100)
-        bar    = f"{'▓' * filled}{'░' * empty}"
-        pad    = " " * max(0, w - bar_w - 10)
-        sys.stdout.write(
-            f"\r  {ANSI_DIM}{bar}{ANSI_RESET}"
-            f"  {ANSI_GRAY}{pct}%{ANSI_RESET}{pad}"
-        )
-        sys.stdout.flush()
-        if frac < 1.0:
-            _t.sleep(0.025)
 
-    sys.stdout.write("\n")
-    sys.stdout.flush()
+@contextlib.contextmanager
+def compaction_progress(tokens_before: int, msgs_before: int):
+    """Live compaction indicator: real elapsed time, real token counts.
+
+    The previous implementation animated a six-step bar to 100% in 0.15 s
+    AFTER compaction had already returned, so the percentage was decoration
+    and the elapsed time was whatever the caller passed in. Compaction on this
+    box is a real model call taking tens of seconds — long enough that a
+    frozen terminal reads as a hang. This runs a ticking line for the actual
+    duration of the work.
+
+    Usage:
+        with compaction_progress(tok_before, msg_before) as done:
+            ...compact...
+            done(msgs_after, tokens_after)
+    """
+    stop = threading.Event()
+    t0 = time.monotonic()
+    result: dict = {}
+
+    def worker() -> None:
+        frame = 0
+        while not stop.is_set():
+            elapsed = time.monotonic() - t0
+            safe_w = _w() - 2
+            head = (
+                f"  {ANSI_TEAL}✱{ANSI_RESET}  {ANSI_GRAY}Compacting conversation…{ANSI_RESET}"
+                f"  {ANSI_DIM}{_fmt_elapsed(elapsed)}"
+                f"  ·  from {_fmt_tokens(tokens_before)} tokens"
+                f"  ·  {msgs_before} messages{ANSI_RESET}"
+            )
+            bar_w = max(8, min(44, safe_w - 6))
+            bar = f"  {ANSI_DIM}{_sweep_bar(frame, bar_w)}{ANSI_RESET}"
+            # Paint both rows, then return the cursor to the first one, so the
+            # pair is overwritten in place instead of scrolling.
+            with TTY_LOCK:
+                tty_write(
+                    _WRAP_OFF
+                    + "\r" + _ERASE_LINE + truncate_to_width(head, safe_w) + ANSI_RESET
+                    + "\n" + _ERASE_LINE + truncate_to_width(bar, safe_w) + ANSI_RESET
+                    + "\033[1A\r" + _WRAP_ON
+                )
+            stop.wait(0.08)
+            frame += 1
+
+    if _pt_live():
+        # pt owns the screen at the idle prompt — no raw repaint there.
+        yield lambda *a: result.update(zip(("msgs", "tokens"), a))
+        return
+
+    th = threading.Thread(target=worker, daemon=True, name="gb-compact")
+    th.start()
+    try:
+        yield lambda msgs, tokens: result.update(msgs=msgs, tokens=tokens)
+    finally:
+        stop.set()
+        th.join(timeout=0.5)
+        # Clear both painted rows before the result line replaces them.
+        with TTY_LOCK:
+            tty_write("\r" + _ERASE_LINE + "\n" + _ERASE_LINE + "\033[1A\r")
+        elapsed = time.monotonic() - t0
+        if "tokens" in result:
+            show_compact_progress(
+                msgs_before, result["msgs"],
+                tokens_before - result["tokens"], int(elapsed),
+            )
 
 
 # ── Session banner ─────────────────────────────────────────────────────────────
 
 def _rag_banner_line() -> str:
     try:
-        from greenboost_cli.rag.engine import _load_store, _load_folders
-        _, metadata = _load_store()
-        folders     = _load_folders()
-        if not metadata and not folders:
+        # store_stats(), not _load_store(): this line needs two integers, and
+        # the full parse costs ~964 MB of peak RSS and a couple of seconds at
+        # every startup to produce them.
+        from greenboost_cli.rag.engine import store_stats, _load_folders
+        stats   = store_stats()
+        folders = _load_folders()
+        if not stats["chunks"] and not folders:
             return ""
-        n_chunks = len(metadata) if metadata else 0
-        n_files  = len({m["file"] for m in metadata}) if metadata else 0
-        return f"{n_chunks:,} chunks  ·  {n_files} files"
+        return f"{stats['chunks']:,} chunks  ·  {stats['files']} files"
     except Exception:
         return ""
 
 
+@drawn_as_block
 def show_session_banner(settings: dict, session=None) -> None:
     """Startup banner: brand header + model + live system status."""
     model   = settings.get("model", "unknown")

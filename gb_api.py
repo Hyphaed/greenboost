@@ -156,7 +156,7 @@ def endpoints() -> dict:
     """The known inference endpoints this box exposes
     (/etc/greenboost/inference.env) — replaces ai-forge's forge/config.py
     hand-parsing the same file for its 4 independent endpoints
-    (gb-synapse :11435, OCR-VL :8081, OCR-GPU :8082, AI-tools :8083)."""
+    (gb-synapse :11369, OCR-VL :8081, OCR-GPU :8082, AI-tools :8083)."""
     import gb_synapse
     return gb_synapse.endpoints()
 

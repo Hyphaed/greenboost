@@ -98,7 +98,7 @@ def test_find_layer_stack_returns_none_for_tiny_model():
 
 # ── Real CUDA end-to-end ─────────────────────────────────────────────────────
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a real CUDA device")
+@pytest.mark.gpu
 def test_layer_prefetcher_real_forward_pass():
     from gb_prefetch import LayerPrefetcher
     from gb_model_tier import ModelTierManager, Tier
@@ -138,7 +138,7 @@ def test_layer_prefetcher_real_forward_pass():
         tm.close()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a real CUDA device")
+@pytest.mark.gpu
 def test_layer_prefetcher_detach_demotes_all():
     from gb_prefetch import LayerPrefetcher
     from gb_model_tier import ModelTierManager, Tier

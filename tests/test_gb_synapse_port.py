@@ -15,26 +15,30 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import pytest
 
 import gb_synapse as gs
+import gb_ports
 
 
 @pytest.fixture
 def reload_gb_synapse(monkeypatch):
-    """Reload gb_synapse after mutating GB_SYNAPSE_PORT, then restore the
-    module to its default-env state so later tests importing it at module
-    scope see the expected DEFAULT_PORT again."""
+    """Reload gb_synapse and gb_ports after mutating GB_SYNAPSE_PORT, then
+    restore the modules to their default-env state so later tests importing
+    them at module scope see the expected DEFAULT_PORT again."""
     yield
     monkeypatch.delenv("GB_SYNAPSE_PORT", raising=False)
+    importlib.reload(gb_ports)
     importlib.reload(gs)
 
 
 def test_default_port_no_env(monkeypatch, reload_gb_synapse):
     monkeypatch.delenv("GB_SYNAPSE_PORT", raising=False)
+    importlib.reload(gb_ports)
     importlib.reload(gs)
-    assert gs.DEFAULT_PORT == 11435
+    assert gs.DEFAULT_PORT == 11369
 
 
 def test_default_port_env_override(monkeypatch, reload_gb_synapse):
     monkeypatch.setenv("GB_SYNAPSE_PORT", "9999")
+    importlib.reload(gb_ports)
     importlib.reload(gs)
     assert gs.DEFAULT_PORT == 9999
 

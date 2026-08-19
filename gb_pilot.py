@@ -28,11 +28,27 @@ import os
 import sys
 import time
 
+from gb_advisories import (
+    Advisory, AdvisorySeverity, AdvisoryPhase, AdvisoryKind,
+)
+
 # Trend thresholds (fractions). A stage is flagged when its latest wall time
 # exceeds the rolling median by REGRESSION_PCT; a model when its latest tok/s
 # drops below (1 - REGRESSION_PCT) of its average.
 REGRESSION_PCT = 0.20
 MIN_SAMPLES = 3          # below this, trends are noise — report, don't flag
+
+# Decode rate needs a bigger population than a stage wall-time does before a
+# latest-vs-median comparison means anything. Two reasons, both measured on
+# this box: a tok/s sample is duration-blind (see the long note in
+# _analyze_models below — median 13.9 against a max of 283.8 at n=41), and the
+# sample floor that keeps short replies out (_MIN_TOK_S_SAMPLE_TOKENS, 24
+# tokens) discards a large share of real agentic traffic, so what survives is
+# both few and skewed. On 2026-08-18 this produced five standing "decode
+# degraded" warnings built on n=3, n=5 and n=9 — noise presented as findings,
+# each carrying a real retune lever. Stage timings keep MIN_SAMPLES: they are
+# wall-clock measurements of the same unit of work, not rate estimates.
+MIN_TOK_S_SAMPLES = 8
 REBALANCE_DROP_PCT = 25.0  # DI-13: stricter than REGRESSION_PCT — a rebalance
                            # advisory is a bigger ask (re-serve) than a generic warn
 
@@ -78,7 +94,31 @@ def analyze(events: list) -> dict:
             if ev.get("status") == "error":
                 errors.append({"stage": st, "ts": ev.get("ts", 0)})
         elif kind == "tok_s_measured":
-            m = ev.get("model", "?")
+            # A sample the writer already rejected is not a measurement.
+            # gb_synapse.record_measured_tok_s() emits over-ceiling samples with
+            # status="error" for auditability; counting them here put an
+            # impossible 21065.2 tok/s into a 34-sample mean and reported
+            # avg=649.7 for a model that really runs at ~5 (live, 2026-08-17).
+            # That is not cosmetic: the inflated mean made `drop_pct` cross
+            # REGRESSION_PCT and raised a "decode degraded" advisory carrying a
+            # set_kv_size_threshold_mb lever, so bad data could have driven a
+            # real retune. The stage_profile branch above already checks status;
+            # this branch simply never did.
+            if ev.get("status") == "error":
+                continue
+            # Key the way gb_dataflux.summarize() does. The same model served
+            # from a different vantage point ([proxy] vs [cli]) or at a
+            # different quant/ctx/kv_type is a different throughput population;
+            # blending them yields an average that matches neither (the real
+            # 2026-08-01 incident: proxy=0.3, cli=2.4, engine truth=2.18,
+            # blended=0.6). summarize() was fixed for this; gb_pilot was not,
+            # so its advisories were still computed on blended series.
+            _src = ev.get("source") or ""
+            _quant = ev.get("quant") or ""
+            m = (f"[{_src}]" if _src else "") + str(ev.get("model", "?"))
+            if _quant:
+                m += (f"::{_quant}::{int(ev.get('ctx') or 0)}"
+                      f"::{ev.get('kv_type') or ''}")
             d = models.setdefault(m, {"samples": []})
             try:
                 d["samples"].append(float(ev.get("tok_s", 0.0)))
@@ -108,14 +148,42 @@ def analyze(events: list) -> dict:
     for m, d in models.items():
         xs = d["samples"]
         avg = sum(xs) / len(xs) if xs else 0.0
+        # Baseline on the MEDIAN, matching the stage branch above (`median_s`)
+        # rather than the mean this branch used to use.
+        #
+        # A tok/s sample is duration-blind: a short reply timed over a few ms
+        # scores hundreds of tok/s and weighs the same as a long generation.
+        # Even after the two fixes this module already carries (dropping
+        # status="error" samples, and keying by source+quant+ctx+kv_type), the
+        # surviving ok-status samples remain wildly skewed. Measured on the
+        # reference workload 2026-08-17, n=41 at ctx=32768: min 1.7, median
+        # 13.9, mean 33.2, max 283.8 — the mean sat 2.4x above the median, so a
+        # perfectly normal 17.8 tok/s sample scored a "46% regression" and
+        # raised an advisory carrying a real set_kv_size_threshold_mb retune
+        # lever. The outliers' own source (a missing sample floor on the
+        # non-streaming proxy path) is fixed separately in gb_synapse_api.py;
+        # this makes the detector robust to skew regardless of origin.
+        #
+        # `avg` stays in the output for backward compatibility, but nothing
+        # decides on it any more.
+        ordered = sorted(xs)
+        n = len(ordered)
+        median = (0.0 if not n else
+                  ordered[n // 2] if n % 2
+                  else (ordered[n // 2 - 1] + ordered[n // 2]) / 2.0)
         latest = xs[-1] if xs else 0.0
-        drop = ((avg - latest) / avg) if avg > 0 else 0.0
+        drop = ((median - latest) / median) if median > 0 else 0.0
         model_out[m] = {
             "samples": len(xs),
             "avg": round(avg, 1),
+            "median": round(median, 1),
             "latest": round(latest, 1),
             "drop_pct": round(drop * 100, 1),
-            "degraded": len(xs) >= MIN_SAMPLES and drop > REGRESSION_PCT,
+            "degraded": len(xs) >= MIN_TOK_S_SAMPLES and drop > REGRESSION_PCT,
+            # Distinguishes "measured, looks fine" from "not enough evidence to
+            # say either way". Without this the two are indistinguishable in the
+            # output, and a reader treats an unevaluated model as a healthy one.
+            "insufficient_samples": len(xs) < MIN_TOK_S_SAMPLES,
         }
 
     return {
@@ -141,6 +209,115 @@ def analyze(events: list) -> dict:
     }
 
 
+def collect_advisories(analysis: dict) -> list[Advisory]:
+    """Generate structured Advisory objects from analysis findings.
+
+    Returns advisories with stable IDs, severity, and phase for deduplication
+    across multiple runs. Maintains the exact same diagnostic logic as advise().
+
+    Args:
+        analysis: dict from analyze() with pressure, stages, models, last_split
+
+    Returns:
+        List of Advisory objects, or empty list if analysis is nominal
+    """
+    out: list[Advisory] = []
+    press = analysis.get("pressure", {})
+
+    # T3 spill is the single worst signal — inference goes ~100× slower.
+    if press.get("t3_used_mb", 0) > 0:
+        out.append(Advisory(
+            id="pilot.t3_spill",
+            severity=AdvisorySeverity.BLOCKING,
+            phase=AdvisoryPhase.RUNTIME_TIER,
+            title="NVMe tier in use (T3 spill)",
+            reason=f"T3 NVMe holds {press['t3_used_mb']} MB",
+            commands=("grep 'GB_VRAM_FRONTLOAD' ~/.bashrc || echo 'not set'",),
+            docs_url="https://docs.greenboost.io/rule-1-vram",
+            resume_safe=False,
+            kind=AdvisoryKind.INFO,
+        ))
+
+    if press.get("t2_pressure", 0) == 2:
+        out.append(Advisory(
+            id="pilot.t2_pressure_critical",
+            severity=AdvisorySeverity.WARNING,
+            phase=AdvisoryPhase.RUNTIME_TIER,
+            title="T2 DDR memory pressure CRITICAL",
+            reason="T2 DDR pressure CRITICAL in latest snapshot",
+            commands=(
+                "sudo sysctl -a | grep greenboost",
+                "ps aux | grep ollama",
+            ),
+            docs_url="https://docs.greenboost.io/t2-pressure",
+            resume_safe=False,
+            kind=AdvisoryKind.INFO,
+        ))
+
+    for st, s in sorted(analysis.get("stages", {}).items()):
+        if s.get("regressed"):
+            out.append(Advisory(
+                id=f"pilot.stage_regression.{st}",
+                severity=AdvisorySeverity.WARNING,
+                phase=AdvisoryPhase.RUNTIME_OPTIMIZE,
+                title=f"Stage '{st}' wall-time regressed",
+                reason=(f"{st}: latest {s['latest_s']}s vs median "
+                        f"{s['median_s']}s ({s['regression_pct']:+.0f}%, "
+                        f"n={s['count']})"),
+                commands=("gb dataflux summary",),
+                resume_safe=False,
+                kind=AdvisoryKind.INFO,
+            ))
+        if s.get("last_status") == "error":
+            out.append(Advisory(
+                id=f"pilot.stage_error.{st}",
+                severity=AdvisorySeverity.WARNING,
+                phase=AdvisoryPhase.RUNTIME_OPTIMIZE,
+                title=f"Stage '{st}' execution failed",
+                reason=f"{st}: last run ended in error",
+                commands=("gb dataflux events --kind=stage_profile --status=error",),
+                resume_safe=False,
+                kind=AdvisoryKind.INFO,
+            ))
+
+    for m, d in sorted(analysis.get("models", {}).items()):
+        if d.get("degraded"):
+            out.append(Advisory(
+                id=f"pilot.tok_s_drop.{m}",
+                severity=AdvisorySeverity.WARNING,
+                phase=AdvisoryPhase.RUNTIME_OPTIMIZE,
+                title=f"Model '{m}' decode speed degraded",
+                reason=(f"{m}: latest {d['latest']} tok/s vs median {d['median']} "
+                        f"({d['drop_pct']:.0f}% down, n={d['samples']})"),
+                commands=("gb synapse recommend --model {m}",),
+                resume_safe=False,
+                kind=AdvisoryKind.INFO,
+            ))
+            # DI-13 rebalance advisory: only when drop clears REBALANCE_DROP_PCT
+            # AND a multi-node cluster split is active (nodes>1).
+            split = analysis.get("last_split", {})
+            if d["drop_pct"] > REBALANCE_DROP_PCT and split.get("nodes", 1) > 1:
+                out.append(Advisory(
+                    id=f"pilot.rebalance_advice.{m}",
+                    severity=AdvisorySeverity.WARNING,
+                    phase=AdvisoryPhase.CLUSTER_DISPATCH,
+                    title=f"Model '{m}' tensor-split may need rebalancing",
+                    reason=(f"{m}: {d['drop_pct']:.0f}% tok/s drop with a "
+                            f"{split.get('nodes')}-node split active "
+                            f"({split.get('split', '?')})"),
+                    commands=(
+                        "export GB_SYNAPSE_SPLIT_V3=1",
+                        "gb synapse serve <model>",
+                    ),
+                    resume_safe=False,
+                    kind=AdvisoryKind.MANUAL,
+                ))
+
+    # Return empty list if nominal (no advisories) — the caller decides whether
+    # to emit an "all clear" advisory
+    return out
+
+
 def advise(analysis: dict) -> list:
     """Map analysis findings to concrete, evidence-backed actions. Each item:
     {severity, topic, evidence, action, lever} — `lever` is either None (the
@@ -151,9 +328,12 @@ def advise(analysis: dict) -> list:
     value, needed to compute a bounded relative bump) to compute safe
     arguments — gb_mcp.optimize_inference's apply loop treats that as
     NOT auto-appliable, not as a string to exec. Never build a lever whose
-    `args` looks plausible but isn't grounded in read state."""
-    out: list = []
+    `args` looks plausible but isn't grounded in read state.
+
+    DEPRECATED: Use collect_advisories() for new code to get typed Advisory objects.
+    This function is kept for backward compatibility."""
     press = analysis.get("pressure", {})
+    out: list = []
 
     # T3 spill is the single worst signal — inference goes ~100× slower.
     if press.get("t3_used_mb", 0) > 0:
@@ -174,10 +354,6 @@ def advise(analysis: dict) -> list:
                        "reserve so desktop apps stop competing (manual — needs "
                        "the current reserve value, not auto-appliable here), "
                        "and throttle prefetch while pressure holds (auto)."),
-            # set_prefetch_throttle is a plain boolean toggle — no current-value
-            # read needed, so this one IS safely auto-appliable, unlike the
-            # workstation-reserve bump above (which stays prose-only: it needs
-            # the CURRENT reserve to compute a bounded step, not an exec'd guess).
             "lever": {"call": "set_prefetch_throttle", "args": [True],
                       "kwargs": {"reason": "t2_pressure_critical"}},
         })
@@ -207,22 +383,14 @@ def advise(analysis: dict) -> list:
         if d.get("degraded"):
             out.append({
                 "severity": "warn", "topic": "tok_s_drop",
-                "evidence": (f"{m}: latest {d['latest']} tok/s vs avg {d['avg']} "
+                "evidence": (f"{m}: latest {d['latest']} tok/s vs median {d['median']} "
                              f"({d['drop_pct']:.0f}% down, n={d['samples']})"),
                 "action": (f"Decode speed for {m} degraded. Check for a competing "
                            "GPU load or KV spill to T2; gb_synapse recommend() "
                            "now has measured history to re-pick quant/split."),
-                # args=None: the right threshold depends on confirming KV
-                # misclassification in vitals first — a judgment call, not
-                # something this analysis can compute safely on its own.
                 "lever": {"call": "set_kv_size_threshold_mb", "args": None,
                           "kwargs": {"reason": "tok_s_drop"}},
             })
-            # DI-13 rebalance advisory (petals should_rebalance gate — see
-            # gb_placement.should_rebalance): only worth surfacing when the
-            # drop clears a STRICTER threshold than the generic tok_s_drop
-            # warn above, AND a multi-node cluster split is actually active
-            # (nodes>1) — single-node degradation isn't a rebalance question.
             split = analysis.get("last_split", {})
             if d["drop_pct"] > REBALANCE_DROP_PCT and split.get("nodes", 1) > 1:
                 out.append({
@@ -236,7 +404,7 @@ def advise(analysis: dict) -> list:
                               f"each node's real throughput. Re-serve with "
                               f"GB_SYNAPSE_SPLIT_V3=1 (link-quality-weighted split) "
                               f"and compare via optimize_inference(measure=true)."),
-                    "lever": None,  # re-serving needs an explicit model choice, not auto-appliable
+                    "lever": None,
                 })
 
     if not out:

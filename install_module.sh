@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-GB_VERSION="3.2"
+GB_VERSION="3.4"
 DRIVER_NAME="greenboost"
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DKMS_SRC="/usr/src/${DRIVER_NAME}-${GB_VERSION}"
@@ -465,7 +465,7 @@ mkdir -p "$GB_PY_DEST"
 # works standalone here as a library AND as its own runnable single-request
 # server — it is NOT missing gb_synapse.py/_api/_backends/_mcp/gb_rotator.py/
 # gb_diffusion_server.py by omission, those simply aren't this script's job).
-# `greenboost synapse serve` / the :11435 proxy / cluster RPC split need the
+# `greenboost synapse serve` / the :11369 proxy / cluster RPC split need the
 # full stack — that's `greenboost_setup.sh`'s Full Install, not this script.
 GB_PY_FILES=(
     gb_init.py

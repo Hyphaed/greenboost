@@ -23,6 +23,7 @@ from greenboost_cli.terminal.theme import (
 # Path to the GreenBoost source tree (gb_synapse.py lives here) — same
 # convention as slash_commands/backend_cmds.py and slash_commands/quant_cmds.py.
 from greenboost_cli.gb_paths import gb_py_root, gb_root_hint
+from greenboost_cli.terminal.width import drawn_as_block
 
 _GB_SRC = gb_py_root()
 
@@ -118,6 +119,7 @@ def _step_model_selection(gb_synapse, settings: dict) -> str:
 
 # ── Public entry point ─────────────────────────────────────────────────────
 
+@drawn_as_block
 def run_wizard(settings: dict, force: bool = False) -> None:
     """
     Run the interactive setup wizard.

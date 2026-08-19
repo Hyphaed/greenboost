@@ -23,7 +23,18 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 from typing import Any
+
+# Import gb_ports for centralized port validation
+_REPO_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_REPO_DIR))
+try:
+    import gb_ports
+    EXPORTER_PORT_DEFAULT = gb_ports.EXPORTER_PORT
+except ImportError:
+    # Fallback if gb_ports is not available (standalone usage)
+    EXPORTER_PORT_DEFAULT = 9742
 
 METRICS_PATH      = os.environ.get("GREENBOOST_METRICS_JSON", "/run/greenboost/metrics.json")
 SHIM_STATS_PATH   = "/run/greenboost/shim_stats"
@@ -290,7 +301,7 @@ def emit(m: dict[str, Any] | None) -> str:
     return "\n".join(lines) + "\n"
 
 
-def serve(port: int = 9742, bind: str = "127.0.0.1") -> None:
+def serve(port: int | None = None, bind: str = "127.0.0.1") -> None:
     """Audit F-L5-19: use ThreadingHTTPServer with daemon threads so a slow
     read_metrics() doesn't block other scrapers.  Per-request CPU is small
     enough that we don't need an explicit cache here - a request thread that
@@ -302,6 +313,9 @@ def serve(port: int = 9742, bind: str = "127.0.0.1") -> None:
     Operators who want LAN visibility should pass --bind 0.0.0.0
     explicitly (intentional opt-in, not a silent default). """
     from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+    if port is None:
+        port = EXPORTER_PORT_DEFAULT
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -326,8 +340,8 @@ def main() -> None:
     p = argparse.ArgumentParser(description="GreenBoost Prometheus exporter")
     p.add_argument("--serve", action="store_true", help="Run as an HTTP server")
     p.add_argument("--port", type=int,
-                   default=int(os.environ.get("GREENBOOST_EXPORTER_PORT", "9742")),
-                   help="HTTP port (default 9742, or $GREENBOOST_EXPORTER_PORT)")
+                   default=EXPORTER_PORT_DEFAULT,
+                   help=f"HTTP port (default {EXPORTER_PORT_DEFAULT}, or $GREENBOOST_EXPORTER_PORT)")
     p.add_argument("--bind", type=str,
                    default=os.environ.get("GREENBOOST_EXPORTER_BIND", "127.0.0.1"),
                    help="Bind address (default 127.0.0.1; pass 0.0.0.0 for LAN exposure, "

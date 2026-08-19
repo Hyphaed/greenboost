@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import urllib.request
 from pathlib import Path
 
@@ -883,6 +884,124 @@ def cmd_clear_memory(args: str, _session, _settings) -> bool:
     return True
 
 
+def _gb_py_call(fn: str, *args: str) -> "tuple[bool, str]":
+    """Call a gb_synapse function through the installed greenboost python root.
+
+    Goes through gb_paths rather than importing gb_synapse into this venv:
+    greenboost-cli ships its own environment and the orchestrator layer lives
+    outside it (see greenboost_cli/gb_paths.py, the same resolution every other
+    bridge here uses)."""
+    import json as _json
+    import subprocess
+    from greenboost_cli import gb_paths
+    root = gb_paths.py_root()
+    code = (f"import sys, json; sys.path.insert(0, {str(root)!r}); "
+            f"import gb_synapse; print(json.dumps(gb_synapse.{fn}(*{list(args)!r})))")
+    r = subprocess.run([sys.executable, "-c", code],
+                       capture_output=True, text=True, timeout=900)
+    if r.returncode != 0:
+        return False, (r.stderr or r.stdout or "unknown error").strip()
+    return True, r.stdout.strip()
+
+
+def cmd_pause(args: str, _session, settings: dict) -> bool:
+    """Pause the local model: save its KV state, stop the engine, free the VRAM.
+
+    The problem it solves, in the operator's terms: an idle model keeps most of
+    the card allocated while doing nothing (measured on this box, 10.4 GiB of
+    12 GB at 0% GPU usage). Pausing gives that back without losing the
+    conversation , the KV cache is written to disk and restored on /resume.
+    """
+    import json as _json
+    model = args.strip() or settings.get("model", "")
+    if not model:
+        emit_warn("No model to pause. Usage: /pause [model]")
+        return True
+    force = False
+    if model.endswith(" --force"):
+        model, force = model[:-8].strip(), True
+
+    emit_info(f"Pausing {model} , saving KV state, then releasing the GPU…")
+    ok, out = _gb_py_call("pause", model, *(["--force"] if force else []))
+    if not ok:
+        emit_err(f"pause failed: {out}")
+        return True
+    try:
+        d = _json.loads(out)
+    except Exception:
+        emit_warn(out); return True
+
+    if not d.get("ok"):
+        err = d.get("error", "unknown")
+        emit_warn(err)
+        if d.get("busy_slots"):
+            emit_info("Nothing was saved and the model is still serving. "
+                      "Re-run once the reply finishes, or `/pause --force` to "
+                      "accept losing the reply in progress.")
+        return True
+
+    freed = d.get("vram_freed_mb")
+    tok = d.get("tokens_saved", 0)
+    emit_ok(f"Paused. {tok:,} tokens of context saved"
+            + (f", {freed} MB of VRAM returned." if freed else "."))
+    emit_info("The conversation is intact , `/resume` brings it back.")
+    return True
+
+
+def cmd_resume(args: str, _session, settings: dict) -> bool:
+    """Resume a paused model and restore its saved KV state."""
+    import json as _json
+    model = args.strip() or settings.get("model", "")
+    if not model:
+        emit_warn("No model to resume. Usage: /resume [model]")
+        return True
+
+    emit_info(f"Resuming {model} , reloading weights, then restoring context…")
+    ok, out = _gb_py_call("resume", model)
+    if not ok:
+        emit_err(f"resume failed: {out}")
+        return True
+    try:
+        d = _json.loads(out)
+    except Exception:
+        emit_warn(out); return True
+
+    if not d.get("ok") and not d.get("slots_restored"):
+        emit_warn(d.get("error", "resume failed"))
+        return True
+
+    tok = d.get("tokens_restored", 0)
+    emit_ok(f"Resumed. {tok:,} tokens of context restored "
+            f"(weights {d.get('reload_s', '?')}s, context {d.get('restore_s', '?')}s).")
+    if d.get("errors"):
+        emit_warn("The model is serving again, but its cached context could not "
+                  "be restored, so the next reply will re-read the conversation "
+                  "from scratch. Nothing was lost, the first reply is just slower.")
+    return True
+
+
+def cmd_paused(args: str, _session, _settings) -> bool:
+    """List paused sessions waiting to be resumed."""
+    import json as _json
+    ok, out = _gb_py_call("paused")
+    if not ok:
+        emit_err(out); return True
+    try:
+        rows = _json.loads(out)
+    except Exception:
+        emit_warn(out); return True
+    if not rows:
+        emit_info("No paused sessions.")
+        return True
+    for d in rows:
+        tok = sum(int(s.get("tokens") or 0) for s in d.get("slots", []))
+        gb = (d.get("disk_bytes") or 0) / (1024 ** 3)
+        console.print(f"  [{VIOLET}]{d.get('model')}[/]  "
+                      f"[{GRAY}]{tok:,} tokens · {gb:.2f} GB on disk · "
+                      f"paused {d.get('idle_s', 0):.0f}s ago[/]")
+    return True
+
+
 def register(command_table: dict) -> None:
     """Register GreenBoost commands into the command table."""
     command_table["turboquant"]     = cmd_turboquant
@@ -893,3 +1012,6 @@ def register(command_table: dict) -> None:
     command_table["gb-kv-reserve"]  = cmd_gb_kv_reserve
     command_table["gb-pool-cap"]    = cmd_gb_pool_cap
     command_table["clear-memory"]   = cmd_clear_memory
+    command_table["pause"]          = cmd_pause
+    command_table["resume"]         = cmd_resume
+    command_table["paused"]         = cmd_paused

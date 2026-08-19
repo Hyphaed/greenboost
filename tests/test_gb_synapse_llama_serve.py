@@ -238,3 +238,137 @@ def test_shim_inactive_dense_offload_gate_cites_real_shim_reason(
 
     with pytest.raises(RuntimeError, match="reproduced known failure"):
         backend.serve(entry, port=11435)
+
+
+# ── MTP / slot-reuse flags actually reach llama-server (2026-08-10) ────────
+# gb_synapse.serve() has passed mtp_draft_n/spec_draft_p_min/
+# slot_prompt_similarity down to backend.serve() since 2026-08-05, but until
+# this fix LlamaCppBackend never turned them into cmd-line flags — the
+# constants (gs.MTP_DRAFT_N, gs.MTP_P_MIN, gs.GB_SLOT_PROMPT_SIMILARITY)
+# existed and were documented as tuned, but nothing read them.
+
+def _cmd_value_after(cmd: list, flag: str) -> str:
+    return cmd[cmd.index(flag) + 1]
+
+
+def test_slot_prompt_similarity_always_emitted(
+        backend, entry, _stub_gb_synapse, _stub_gb_cluster, _stub_popen, _shim_active, monkeypatch):
+    """Unconditional — governs slot reuse for every serve, not just MTP
+    ones, so it must appear even with no MTP head."""
+    import gb_nvml
+    monkeypatch.setattr(gb_nvml, "get_nvml", lambda *_a, **_k: _FakeNvml(10500.0))
+
+    backend.serve(entry, port=11435)
+
+    cmd = _stub_popen["cmd"]
+    assert "--slot-prompt-similarity" in cmd
+    assert _cmd_value_after(cmd, "--slot-prompt-similarity") == "0.5"  # GB_SLOT_PROMPT_SIMILARITY default
+
+
+def test_slot_prompt_similarity_per_call_override_wins(
+        backend, entry, _stub_gb_synapse, _stub_gb_cluster, _stub_popen, _shim_active, monkeypatch):
+    import gb_nvml
+    monkeypatch.setattr(gb_nvml, "get_nvml", lambda *_a, **_k: _FakeNvml(10500.0))
+
+    backend.serve(entry, port=11435, slot_prompt_similarity=0.9)
+
+    assert _cmd_value_after(_stub_popen["cmd"], "--slot-prompt-similarity") == "0.9"
+
+
+def test_mtp_flags_emitted_when_active(
+        backend, entry, _stub_gb_synapse, _stub_gb_cluster, _stub_popen, _shim_active, monkeypatch):
+    """mtp_active requires _has_mtp(entry) True and fits_vram/is_moe —
+    _shim_active gives the all-GPU placement (fits_vram=True)."""
+    import gb_synapse as gs
+    monkeypatch.setattr(gs, "_has_mtp", lambda entry: True)
+    import gb_nvml
+    monkeypatch.setattr(gb_nvml, "get_nvml", lambda *_a, **_k: _FakeNvml(10500.0))
+
+    backend.serve(entry, port=11435)
+
+    cmd = _stub_popen["cmd"]
+    assert _cmd_value_after(cmd, "--spec-draft-n-max") == "4"   # MTP_DRAFT_N default
+    assert _cmd_value_after(cmd, "--spec-draft-p-min") == "0.3"  # MTP_P_MIN default
+
+
+def test_mtp_flags_per_call_override_wins(
+        backend, entry, _stub_gb_synapse, _stub_gb_cluster, _stub_popen, _shim_active, monkeypatch):
+    import gb_synapse as gs
+    monkeypatch.setattr(gs, "_has_mtp", lambda entry: True)
+    import gb_nvml
+    monkeypatch.setattr(gb_nvml, "get_nvml", lambda *_a, **_k: _FakeNvml(10500.0))
+
+    backend.serve(entry, port=11435, mtp_draft_n=6, spec_draft_p_min=0.1)
+
+    cmd = _stub_popen["cmd"]
+    assert _cmd_value_after(cmd, "--spec-draft-n-max") == "6"
+    assert _cmd_value_after(cmd, "--spec-draft-p-min") == "0.1"
+
+
+def test_mtp_flags_absent_when_no_mtp_head(
+        backend, entry, _stub_gb_synapse, _stub_gb_cluster, _stub_popen, _shim_active, monkeypatch):
+    """_stub_gb_synapse's default _has_mtp stub is False — the common case
+    (no MTP head) must not pass --spec-type/--spec-draft-* at all."""
+    import gb_nvml
+    monkeypatch.setattr(gb_nvml, "get_nvml", lambda *_a, **_k: _FakeNvml(10500.0))
+
+    backend.serve(entry, port=11435)
+
+    cmd = _stub_popen["cmd"]
+    assert "--spec-type" not in cmd
+    assert "--spec-draft-n-max" not in cmd
+
+
+# ── KV type override + extra_args precedence (2026-08-10 M1 fix) ───────────
+
+def test_kv_type_override_reaches_cache_type_flags(
+        backend, entry, _stub_gb_synapse, _stub_gb_cluster, _stub_popen, _shim_active, monkeypatch):
+    """kv_type_override wins over _pick_kv_type()'s own budget-driven choice."""
+    import gb_nvml
+    monkeypatch.setattr(gb_nvml, "get_nvml", lambda *_a, **_k: _FakeNvml(10500.0))
+
+    backend.serve(entry, port=11435, kv_type_override="q4_0")
+
+    cmd = _stub_popen["cmd"]
+    assert _cmd_value_after(cmd, "--cache-type-k") == "q4_0"
+    assert _cmd_value_after(cmd, "--cache-type-v") == "q4_0"
+
+
+def test_extra_args_cache_type_override_wins_over_default(
+        backend, entry, _stub_gb_synapse, _stub_gb_cluster, _stub_popen, _shim_active, monkeypatch):
+    """Regression for the 2026-08-03 M1 measurement-pass bug: an explicit
+    --cache-type-k/-v in extra_args used to be silently ignored because
+    LlamaCppBackend.serve() already emitted its own --cache-type-k/-v
+    earlier in cmd, and llama.cpp's arg parser keeps the FIRST occurrence
+    of a duplicate flag. _dedupe_extra_args_overrides() must strip the
+    built-in pair before extra_args is appended, so the caller's value
+    appears exactly once."""
+    import gb_nvml
+    monkeypatch.setattr(gb_nvml, "get_nvml", lambda *_a, **_k: _FakeNvml(10500.0))
+
+    backend.serve(entry, port=11435, extra_args="--cache-type-k f16 --cache-type-v f16")
+
+    cmd = _stub_popen["cmd"]
+    assert cmd.count("--cache-type-k") == 1
+    assert cmd.count("--cache-type-v") == 1
+    assert _cmd_value_after(cmd, "--cache-type-k") == "f16"
+    assert _cmd_value_after(cmd, "--cache-type-v") == "f16"
+
+
+def test_extra_args_leaves_unrelated_flags_untouched(
+        backend, entry, _stub_gb_synapse, _stub_gb_cluster, _stub_popen, _shim_active, monkeypatch):
+    """_dedupe_extra_args_overrides() must only remove flags extra_args
+    itself supplies — every other built-in flag (boolean or valued) stays
+    exactly as emitted."""
+    import gb_nvml
+    monkeypatch.setattr(gb_nvml, "get_nvml", lambda *_a, **_k: _FakeNvml(10500.0))
+
+    backend.serve(entry, port=11435, extra_args="--cache-type-k q8_0")
+
+    cmd = _stub_popen["cmd"]
+    assert cmd.count("--cache-type-k") == 1
+    assert _cmd_value_after(cmd, "--cache-type-k") == "q8_0"
+    # --cache-type-v (not named in extra_args) keeps its own built-in value
+    assert cmd.count("--cache-type-v") == 1
+    assert "--jinja" in cmd
+    assert "--no-webui" in cmd

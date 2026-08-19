@@ -39,6 +39,7 @@ honest: every metric needs a real `_res_*` resolver, every segment a real
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -277,6 +278,81 @@ def _latest_event(kind: str, node: "str | None" = None,
     return ev
 
 
+def _events_in_window(kind: str, node: "str | None" = None,
+                      max_age_s: "float | None" = None,
+                      days: float = 2.0) -> "list[dict]":
+    """All events of a kind inside the freshness window, newest last.
+
+    `_latest_event` answers "what happened to the last one", which is the wrong
+    shape for any metric that is a RATE. Same contract otherwise: an empty list
+    means unavailable, and a caller must not report it as a zero.
+    """
+    try:
+        import gb_dataflux
+    except Exception:
+        return []
+    try:
+        events = gb_dataflux.read_events(since_hours=days * 24)
+    except Exception:
+        return []
+    cand = [e for e in events if e.get("kind") == kind]
+    if node:
+        cand = [e for e in cand if gb_dataflux.canonical_node(e.get("node")) == node]
+    if max_age_s is not None:
+        now = time.time()
+        cand = [e for e in cand if (now - e.get("ts", 0)) <= max_age_s]
+    return sorted(cand, key=lambda e: e.get("ts", 0))
+
+
+# Minimum GPU utilization (%) before a PCIe gen reading is trusted. Mirrors
+# gb_telemetry._PCIE_ACTIVE_UTIL_PCT deliberately rather than importing it:
+# this module wraps existing accessors and must not pull in the NVML stack
+# just to read one threshold. Keep the two in step.
+_PCIE_ACTIVE_UTIL_PCT = 25
+
+# Below this GPU utilization a serve session counts as doing no work, so its
+# resident VRAM is "held while idle" rather than "in use".
+_GPU_BUSY_UTIL_PCT = 10
+
+# VRAM fill (%) at which idle residency is worth surfacing. Below this the card
+# still has room and there is nothing for the operator to decide.
+_IDLE_HOLD_FILL_PCT = 60
+
+# Share of prompt_ms attributable to recurrent replay before it counts as
+# dominating the turn's prefill. Half is the natural line: past it, most of
+# what the operator waits for is work already done once.
+_REPLAY_DOMINANT_SHARE = 0.5
+
+
+def _latest_event_with_field(kind: str, field: str, node: "str | None" = None,
+                             max_age_s: "float | None" = None,
+                             days: float = 2.0) -> "dict | None":
+    """Latest event of `kind` that actually CARRIES `field` (non-null).
+
+    `_latest_event` takes the newest event of a kind and then checks the field
+    on it. That is wrong for any field emitted conditionally: a single newer
+    event without the field hides every older one that has it, and the metric
+    reads as "no data" while the data exists. Same freshness contract —
+    None means unavailable, never zero."""
+    try:
+        import gb_dataflux
+    except Exception:
+        return None
+    try:
+        events = gb_dataflux.read_events(since_hours=days * 24)
+    except Exception:
+        return None
+    cand = [e for e in events if e.get("kind") == kind and e.get(field) is not None]
+    if node:
+        cand = [e for e in cand if gb_dataflux.canonical_node(e.get("node")) == node]
+    if not cand:
+        return None
+    ev = max(cand, key=lambda e: e.get("ts", 0))
+    if max_age_s is not None and (time.time() - ev.get("ts", 0)) > max_age_s:
+        return None
+    return ev
+
+
 def _free_swap_mb() -> "tuple[float, float] | tuple[None, None]":
     try:
         out = subprocess.run(["free", "-b"], capture_output=True, text=True, timeout=5).stdout
@@ -455,10 +531,57 @@ def _res_tok_s_decode(entity_id, window_s):
 
 
 def _res_ttft_ms(entity_id, window_s):
+    """Latest measured TTFT.
+
+    Scans back for the most recent event that CARRIES ttft_ms rather than
+    reading only the newest prompt_cache event: the field is emitted
+    conditionally (gb_synapse.record_prompt_cache_sample omits it when the
+    proxy could not latch a first-token timestamp), so one such event at the
+    head of the log used to mask every good sample behind it.
+
+    Deliberately does NOT fall back to engine_prompt_ms. They answer different
+    questions and the gap between them is the diagnostic value — see
+    _res_engine_prefill_ms's docstring. Conflating them would report queueing
+    and contention as prefill cost.
+    """
+    ev = _latest_event_with_field("prompt_cache", "ttft_ms",
+                                  node=entity_id, max_age_s=window_s)
+    if ev is not None:
+        return {"value": ev["ttft_ms"], "unit": "milliseconds",
+                "raw_source": "dataflux.prompt_cache.ttft_ms"}
+    # Say which of the two failure modes actually happened. Reporting "no
+    # prompt_cache events yet" while 138 of them existed sent a 2026-08-18
+    # audit looking in the wrong place; the real cause was that every one of
+    # them came from a tool-call turn, whose SSE frames the proxy did not
+    # recognise as generated content (fixed in gb_synapse_api.py).
+    any_ev = _latest_event("prompt_cache", node=entity_id, max_age_s=window_s)
+    reason = ("prompt_cache events exist but none carried ttft_ms"
+              if any_ev is not None else "no prompt_cache events yet")
+    return {"value": None, "unit": "milliseconds", "raw_source": reason}
+
+
+def _res_engine_prefill_ms(entity_id, window_s):
+    """The engine's own prefill time, the companion to ttft_ms.
+
+    Kept as a separate metric rather than folded into ttft_ms because the two
+    answer different questions and the difference between them is the whole
+    diagnostic value: ttft_ms is what the client waited, engine_prefill_ms is
+    what prefill actually cost, and the gap is queueing plus contention."""
     ev = _latest_event("prompt_cache", node=entity_id, max_age_s=window_s)
-    if ev and ev.get("ttft_ms") is not None:
-        return {"value": ev["ttft_ms"], "unit": "milliseconds", "raw_source": "dataflux.prompt_cache.ttft_ms"}
-    return {"value": None, "unit": "milliseconds", "raw_source": "no prompt_cache events yet"}
+    if ev and ev.get("engine_prompt_ms") is not None:
+        return {"value": ev["engine_prompt_ms"], "unit": "milliseconds",
+                "raw_source": "dataflux.prompt_cache.engine_prompt_ms"}
+    return {"value": None, "unit": "milliseconds",
+            "raw_source": "no prompt_cache event carrying engine_prompt_ms yet"}
+
+
+def _res_prompt_depth_tokens(entity_id, window_s):
+    ev = _latest_event("prompt_cache", node=entity_id, max_age_s=window_s)
+    if ev and ev.get("prompt_tokens") is not None:
+        return {"value": ev["prompt_tokens"], "unit": "count",
+                "raw_source": "dataflux.prompt_cache.prompt_tokens"}
+    return {"value": None, "unit": "count",
+            "raw_source": "no prompt_cache event carrying prompt_tokens yet"}
 
 
 def _res_prompt_cache_hit_pct(entity_id, window_s):
@@ -466,6 +589,40 @@ def _res_prompt_cache_hit_pct(entity_id, window_s):
     if ev and ev.get("hit_pct") is not None:
         return {"value": ev["hit_pct"], "unit": "percent", "raw_source": "dataflux.prompt_cache.hit_pct"}
     return {"value": None, "unit": "percent", "raw_source": "no prompt_cache events yet"}
+
+
+def _res_slot_pin_rate_pct(entity_id, window_s):
+    """GB-1: how often a conversation got the slot that still held its KV.
+
+    Counted over the window rather than read off the newest event, because one
+    event answers "what happened to that request", not "is routing working".
+    Returns None with the reason named when there are no events , an absent
+    measurement is not a 0%, and reporting it as one would read as a total
+    failure of a feature that simply has not been exercised yet.
+    """
+    evs = _events_in_window("cache_index", node=entity_id, max_age_s=window_s)
+    if not evs:
+        return {"value": None, "unit": "percent",
+                "raw_source": "no cache_index events in window (slot pinning "
+                              "may be off: GB_SYNAPSE_SLOT_PIN=0, or the engine "
+                              "reports a single slot)"}
+    kept = sum(1 for e in evs if str(e.get("decision", "")).startswith("pinned"))
+    return {"value": round(100.0 * kept / len(evs), 1), "unit": "percent",
+            "raw_source": f"dataflux.cache_index.decision over {len(evs)} events"}
+
+
+def _res_last_edit_chunk(entity_id, window_s):
+    """GB-1: which chunk the most recent turn changed, if any."""
+    ev = _latest_event("cache_index", node=entity_id, max_age_s=window_s)
+    if not ev:
+        return {"value": None, "unit": "index",
+                "raw_source": "no cache_index events yet"}
+    if "changed_chunk" not in ev:
+        return {"value": None, "unit": "index",
+                "raw_source": "cache_index event carries no changed_chunk field"}
+    return {"value": ev.get("changed_chunk"), "unit": "index",
+            "raw_source": "dataflux.cache_index.changed_chunk"
+                          + (" (null = appended only)" if ev.get("changed_chunk") is None else "")}
 
 
 def _res_served_ctx(entity_id, window_s):
@@ -494,6 +651,436 @@ def _res_n_gpu_layers_effective(entity_id, window_s):
     except Exception as e:
         return {"value": None, "unit": "layer_count", "raw_source": "unavailable", "error": str(e)}
     return {"value": None, "unit": "layer_count", "raw_source": "no serve session running"}
+
+
+def _proxy_mem() -> "tuple[float | None, float | None, str]":
+    """(rss_mb, addr_space_cap_mb, provenance) for the gb-synapse proxy.
+
+    The proxy runs under an RLIMIT_AS cap (_proxy_resource_limits in
+    gb_synapse.py) so a runaway allocation raises MemoryError in ONE request
+    instead of inviting the OOM killer to take the whole session. That makes
+    "how close is the proxy to its cap" a real operational question, and until
+    2026-08-19 nothing could answer it: the proxy hit the cap, raised
+    MemoryError mid-generation, and the only symptom the operator saw was
+    "gb-synapse stopped responding while generating".
+    """
+    try:
+        import glob as _glob
+        for cmd in _glob.glob("/proc/[0-9]*/cmdline"):
+            try:
+                with open(cmd, "rb") as f:
+                    argv = f.read().decode("utf-8", "replace")
+            except OSError:
+                continue
+            # Match an argv TOKEN, not the raw cmdline. /proc cmdline is
+            # NUL-separated, and a substring test over the joined string
+            # matches any shell that merely MENTIONS the proxy , including
+            # the grep that is looking for it, which is how this resolver
+            # first reported 7.6 MB of "proxy" that was really a pipeline.
+            tokens = [t for t in argv.split("\0") if t]
+            if not tokens:
+                continue
+            # argv[0] must be a python interpreter AND some later token must be
+            # the script path itself , a bare endswith() over tokens is not
+            # enough, because a shell invoked as
+            #   bash -c "pgrep -af gb_synapse_api.py"
+            # carries the whole command as ONE token that also ends with the
+            # script name. Requiring no embedded whitespace rules that out.
+            if not os.path.basename(tokens[0]).startswith("python"):
+                continue
+            if not any(t.endswith("gb_synapse_api.py") and len(t.split()) == 1
+                       for t in tokens[1:]):
+                continue
+            # Derive the process directory from the entry we actually
+            # matched rather than indexing a fixed path component , the
+            # latter silently reads the wrong pid the moment the glob root
+            # is not literally /proc.
+            pdir = os.path.dirname(cmd)
+            if os.path.basename(pdir) == str(os.getpid()):
+                continue
+            rss = cap = None
+            with open(os.path.join(pdir, "status")) as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        rss = float(line.split()[1]) / 1024
+            with open(os.path.join(pdir, "limits")) as f:
+                for line in f:
+                    if line.startswith("Max address space"):
+                        tok = line.split()[3]
+                        cap = None if tok == "unlimited" else float(tok) / (1024 * 1024)
+            return rss, cap, f"{pdir}/{{status,limits}}"
+        return None, None, "no gb_synapse_api process is running"
+    except Exception as e:
+        return None, None, f"could not read /proc: {e}"
+
+
+def _res_proxy_rss_mb(entity_id, window_s):
+    """Resident memory of the gb-synapse proxy, in MB."""
+    rss, _cap, prov = _proxy_mem()
+    return {"value": None if rss is None else round(rss, 1),
+            "unit": "megabytes", "raw_source": prov}
+
+
+def _res_proxy_mem_headroom_pct(entity_id, window_s):
+    """How much of the proxy's address-space cap is still unused, in percent.
+
+    Falls to None (never to 100) when the proxy is not running or carries no
+    cap , "I cannot tell" and "there is plenty of room" are different answers,
+    and reporting the second for the first is the failure this layer exists to
+    prevent.
+    """
+    rss, cap, prov = _proxy_mem()
+    if rss is None or not cap:
+        why = prov if rss is None else "proxy runs with an unlimited address space"
+        return {"value": None, "unit": "percent", "raw_source": why}
+    return {"value": round(max(0.0, 100.0 * (1.0 - rss / cap)), 1),
+            "unit": "percent", "raw_source": f"{prov} , VmRSS vs RLIMIT_AS"}
+
+
+def _agent_events(kind: str, window_s=None, days: float = 2.0) -> list:
+    """All events of an agent kind in the window, oldest first."""
+    try:
+        import gb_dataflux
+        hours = (window_s / 3600.0) if window_s else days * 24
+        return [e for e in gb_dataflux.read_events(since_hours=hours)
+                if e.get("kind") == kind]
+    except Exception:
+        return []
+
+
+def _res_agent_eval_overall(entity_id, window_s):
+    """greenboost-cli's own agent benchmark score, 0-1 (AE-1).
+
+    Comparable ONLY against a run of the same model: MCP-Bench puts
+    gemma-3-27b-it at 0.582 and qwen3-30b-a3b at 0.627 against gpt-5 at 0.749,
+    so a score means nothing without knowing which model produced it.
+    """
+    ev = _agent_events("agent_eval_run", window_s)
+    if not ev:
+        return {"value": None, "unit": "score",
+                "raw_source": "no agent_eval_run events yet , "
+                              "run greenboost_cli.bench.agent_eval"}
+    last = ev[-1]
+    v = last.get("overall")
+    if v is None:
+        return {"value": None, "unit": "score",
+                "raw_source": "latest agent_eval_run carried no 'overall'"}
+    return {"value": round(float(v), 3), "unit": "score",
+            "raw_source": f"agent_eval_run.overall (model={last.get('model', '?')})"}
+
+
+def _res_agent_hallucinated_tool_pct(entity_id, window_s):
+    """Share of tool calls naming a tool the registry does not have (AE-5).
+
+    PATool's finding is that small models fail tool use by SCHEMA
+    MISALIGNMENT , they emit names learned in pretraining rather than the
+    names offered. This repo has already seen it live: the model emitted
+    `mcp__knowledge-rag__search_knowledge` against a registry that only knew
+    the bare name. This is that failure rate, measured instead of assumed.
+    """
+    ev = _agent_events("agent_tool_schema_miss", window_s)
+    if not ev:
+        return {"value": None, "unit": "percent",
+                "raw_source": "no agent_tool_schema_miss events yet"}
+    missed = sum(1 for e in ev if e.get("outcome") not in ("resolved", "ok"))
+    return {"value": round(100.0 * missed / len(ev), 1), "unit": "percent",
+            "raw_source": f"agent_tool_schema_miss over {len(ev)} call(s)"}
+
+
+def _res_agent_compaction_prefix_kept_pct(entity_id, window_s):
+    """Share of compactions that preserved the reusable prompt prefix (AE-2).
+
+    The whole point of prefix-stable compaction. A compaction that rewrites
+    the prefix throws away the engine's KV reuse , dataflux has recorded a
+    97.9% prompt-cache hit on a 64k window here, and at ~5 tok/s re-prefilling
+    that is minutes of wall time per event.
+    """
+    ev = _agent_events("agent_context_edit", window_s)
+    if not ev:
+        return {"value": None, "unit": "percent",
+                "raw_source": "no agent_context_edit events yet"}
+    kept = sum(1 for e in ev
+               if e.get("extended_prior") is True or (e.get("head_kept") or 0) > 0)
+    return {"value": round(100.0 * kept / len(ev), 1), "unit": "percent",
+            "raw_source": f"agent_context_edit over {len(ev)} compaction(s)"}
+
+
+def _res_agent_memory_recall_chars(entity_id, window_s):
+    """Characters of recalled memory injected on the last recall (AE-9/10)."""
+    ev = _agent_events("agent_memory_recall", window_s)
+    if not ev:
+        return {"value": None, "unit": "characters",
+                "raw_source": "no agent_memory_recall events yet"}
+    v = ev[-1].get("chars")
+    if v is None:
+        return {"value": None, "unit": "characters",
+                "raw_source": "latest agent_memory_recall carried no 'chars'"}
+    return {"value": int(v), "unit": "characters",
+            "raw_source": "agent_memory_recall.chars"}
+
+
+def _res_host_mem_available_gb(entity_id, window_s):
+    """MemAvailable on the host, in GB.
+
+    The number that decides whether the OOM killer runs. NOT MemFree: the
+    kernel's own estimate of what a new allocation can actually get, which is
+    what the T2 pool competes for.
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    kb = float(line.split()[1])
+                    return {"value": round(kb / (1024 * 1024), 2), "unit": "gigabytes",
+                            "raw_source": "/proc/meminfo MemAvailable"}
+        return {"value": None, "unit": "gigabytes",
+                "raw_source": "MemAvailable absent from /proc/meminfo"}
+    except Exception as e:
+        return {"value": None, "unit": "gigabytes",
+                "raw_source": f"could not read /proc/meminfo: {e}"}
+
+
+def _res_t2_oom_guard_state(entity_id, window_s):
+    """The kernel T2 OOM guard's own verdict, from the pool's sysfs brief.
+
+    greenboost.ko trips this guard when host MemAvailable falls under its
+    reserve and starts evicting T2. Until now it announced that ONLY to the
+    kernel log: `greenboost: T2 OOM guard TRIPPED - avail=4044MB < reserve=4GB`.
+    It fired twice on 2026-08-18, roughly ten minutes before each of two OOM
+    kills that took the user's terminal with them, and reached neither dataflux
+    nor this layer , a direct Observability Must-Rule violation ("do not let
+    shim decisions stay log-only").
+    """
+    try:
+        with open("/sys/class/greenboost/greenboost/pool_brief") as f:
+            brief = f.read().strip()
+    except Exception as e:
+        return {"value": None, "unit": "state",
+                "raw_source": f"pool_brief unreadable (kmod loaded?): {e}"}
+    for tok in brief.split():
+        if tok.startswith("PRESSURE:"):
+            return {"value": tok.split(":", 1)[1], "unit": "state",
+                    "raw_source": "sysfs pool_brief PRESSURE",
+                    "evidence": {"pool_brief": brief}}
+    return {"value": None, "unit": "state",
+            "raw_source": f"no PRESSURE field in pool_brief: {brief!r}"}
+
+
+def _res_unregistered_cached_models(entity_id, window_s):
+    """Models on disk in the HF cache that the manifest does not list.
+
+    Counts GGUF files under the model store's `_hf_cache` whose path no
+    manifest entry claims. A Full Install purge resets the manifest while
+    leaving the cache alone, so this goes from 0 to "everything you ever
+    downloaded" in one install, and the only symptom the operator sees is
+    `no such model` when the CLI starts.
+    """
+    try:
+        import glob as _glob
+        import os as _os
+        import gb_synapse
+        cache = gb_synapse.MODEL_STORE_DIR / "_hf_cache"
+        if not cache.exists():
+            return {"value": 0, "unit": "count",
+                    "raw_source": "no _hf_cache directory (nothing pulled from HF)"}
+        known = {e.path for e in gb_synapse.list_models()}
+        missing = []
+        for path in _glob.glob(str(cache / "models--*" / "snapshots" / "*" / "*.gguf")):
+            if path in known or _os.path.basename(path).startswith("mmproj"):
+                continue
+            real = _os.path.realpath(path)
+            if _os.path.exists(real) and _os.path.getsize(real) >= 1_000_000:
+                missing.append(_os.path.basename(path))
+        return {"value": len(missing), "unit": "count",
+                "raw_source": "_hf_cache/*.gguf vs gb_synapse.list_models()",
+                "evidence": {"missing": sorted(missing)[:8]}}
+    except Exception as e:
+        # Never report 0 on failure — that is a clean bill inferred from an
+        # error, the exact pattern the GB-Semantics rule forbids.
+        return {"value": None, "unit": "count",
+                "raw_source": f"could not read model cache: {e}"}
+
+
+def _res_weights_gb(entity_id, window_s):
+    """Weight footprint of the model currently being served.
+
+    Read from the manifest entry (ModelEntry.n_bytes) matched against the live
+    run-state's model+quant, so it reflects what is actually loaded rather than
+    whatever the manifest happens to list first."""
+    try:
+        import gb_synapse
+        sessions = gb_synapse.ps()
+        if entity_id:
+            sessions = [s for s in sessions if s.get("model") == entity_id]
+        if not sessions:
+            return {"value": None, "unit": "gigabytes",
+                    "raw_source": "no serve session running"}
+        s = sessions[0]
+        for e in gb_synapse.list_models():
+            if e.name == s.get("model") and (not s.get("quant") or e.quant == s.get("quant")):
+                return {"value": round(e.n_bytes / (1024 ** 3), 2), "unit": "gigabytes",
+                        "raw_source": "gb_synapse.list_models().n_bytes",
+                        "model": e.name, "quant": e.quant}
+        return {"value": None, "unit": "gigabytes",
+                "raw_source": "served model not found in manifest"}
+    except Exception as e:
+        return {"value": None, "unit": "gigabytes", "raw_source": "unavailable", "error": str(e)}
+
+
+def _res_inference_endpoint_is_local(entity_id, window_s):
+    """Is every configured inference endpoint on hardware the owner controls?
+
+    The executable half of CLAUDE.md's Local-First Must-Rule. GreenBoost exists
+    so a 27B model runs on a 12 GB card instead of being rented by the token; a
+    cloud endpoint does not merely leak data, it makes the whole stack pointless
+    for that request. A prose rule cannot notice a config drifting, so this
+    resolves the actual endpoints in play.
+
+    Local means loopback, this box's own LAN, or a configured feeder. A remote
+    `api_base` (integrate.api.nvidia.com, api.openai.com, ...) is not local even
+    when it is fast or free.
+    """
+    remote = []
+    checked = []
+    try:
+        import gb_synapse
+        for st in gb_synapse.ps():
+            bind = st.get("bind") or "127.0.0.1"
+            checked.append(bind)
+            if not _is_local_host(bind):
+                remote.append(bind)
+    except Exception as e:
+        return {"value": None, "unit": "boolean", "raw_source": "unavailable",
+                "error": str(e)}
+    for var in ("OPENAI_BASE_URL", "OPENAI_API_BASE", "FORGE_OLLAMA_URL",
+                "GB_SYNAPSE_UPSTREAM", "ANTHROPIC_BASE_URL"):
+        val = os.environ.get(var, "").strip()
+        if not val:
+            continue
+        checked.append(f"{var}={val}")
+        host = val.split("//")[-1].split("/")[0].split(":")[0]
+        if not _is_local_host(host):
+            remote.append(f"{var}={val}")
+    return {"value": not remote, "unit": "boolean",
+            "raw_source": "gb_synapse.ps().bind + inference base-url env vars",
+            "remote_endpoints": remote, "checked": checked}
+
+
+def _is_local_host(host: str) -> bool:
+    """Loopback, this machine, or the owner's own LAN , all count as local.
+
+    A feeder on the owner's LAN IS local: the cluster fabric is the whole point
+    of the project, not an escape from it.
+    """
+    h = (host or "").strip().lower()
+    if not h or h in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+        return True
+    if h.startswith(("10.", "192.168.", "127.")):
+        return True
+    if h.startswith("172."):
+        try:
+            return 16 <= int(h.split(".")[1]) <= 31      # 172.16/12
+        except (IndexError, ValueError):
+            return False
+    return h.endswith((".local", ".lan", ".internal"))
+
+
+def _res_recurrent_replay_ms(entity_id, window_s):
+    """Estimated per-turn cost of re-running the recurrent layers over the whole
+    prompt, from the most recent prompt_cache sample.
+
+    THE governed number for the inference-speed program. This architecture is
+    hybrid , 17 attention layers and 48 Gated DeltaNet recurrent layers , and a
+    recurrent layer's state at position t only exists by running every token up
+    to t. So the KV cache can hit 99.9% and the recurrent stack still replays
+    the entire conversation. Measured 2026-08-18 across 29 warm turns: median
+    6,937 ms of prefill for a median of 42 genuinely-new tokens, with cost per
+    TOTAL token stable at 0.151 ms and cost per NEW token scattering 146-191.
+
+    DERIVED, not measured: the engine reports one `prompt_ms` and does not break
+    it down. New tokens are charged at this box's own cold-prefill rate and the
+    remainder attributed to replay. The raw_source says so, because presenting a
+    derived figure as a reading is how a plausible story outlives its evidence.
+    """
+    ev = _latest_event_with_field("prompt_cache", "engine_prompt_ms",
+                                  node=entity_id, max_age_s=window_s)
+    if ev is None:
+        return {"value": None, "unit": "milliseconds",
+                "raw_source": "no prompt_cache event carrying engine_prompt_ms"}
+    try:
+        import gb_bench_turn
+        split = gb_bench_turn.split_prefill(
+            int(ev.get("prompt_tokens") or 0),
+            int(ev.get("reused_tokens") or 0),
+            float(ev.get("engine_prompt_ms") or 0.0))
+    except Exception as e:
+        return {"value": None, "unit": "milliseconds",
+                "raw_source": "unavailable", "error": str(e)}
+    return {"value": split["recurrent_replay_ms_est"], "unit": "milliseconds",
+            "raw_source": ("derived from dataflux.prompt_cache "
+                           "(engine_prompt_ms minus new tokens at cold-prefill rate) "
+                           ", ESTIMATE, the engine reports no breakdown"),
+            "prompt_ms": split["prompt_ms"], "new_tokens": split["new_tokens"],
+            "replay_share": split["replay_share"]}
+
+
+def _res_idle_vram_held_gb(entity_id, window_s):
+    """VRAM held by a serve session that is not currently doing any work.
+
+    0 when the GPU is busy , this measures *dead* residency, not residency.
+    The number the operator actually sees when they open a system monitor and
+    find 87% of the card allocated at 0% utilization (measured 2026-08-18:
+    10.4 GiB held, 787 MHz, 23 W). Governed so "should I pause?" has an
+    answer that is not a screenshot."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5).stdout.strip().splitlines()
+        if not out:
+            return {"value": None, "unit": "gigabytes",
+                    "raw_source": "nvidia-smi returned no rows"}
+        used_mb, util = [int(x.strip()) for x in out[0].split(",")]
+        import gb_synapse
+        sessions = gb_synapse.ps()
+        if not sessions:
+            return {"value": 0.0, "unit": "gigabytes",
+                    "raw_source": "no serve session running",
+                    "gpu_util_pct": util}
+        held = round(used_mb / 1024.0, 2) if util < _GPU_BUSY_UTIL_PCT else 0.0
+        return {"value": held, "unit": "gigabytes",
+                "raw_source": "nvidia-smi memory.used gated on utilization.gpu",
+                "gpu_util_pct": util, "vram_used_gb": round(used_mb / 1024.0, 2),
+                "model": sessions[0].get("model")}
+    except Exception as e:
+        return {"value": None, "unit": "gigabytes", "raw_source": "unavailable",
+                "error": str(e)}
+
+
+def _res_pcie_link_gen_current(entity_id, window_s):
+    """Negotiated PCIe generation, sampled NOW rather than at telemetry init.
+
+    Deliberately a live read: GpuTopology probes the link once at NVML init and
+    a GPU downtrains its link to Gen1/Gen2 whenever it is idle, so the cached
+    value answers "what was the link doing at startup", which is almost never
+    the question being asked."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=pcie.link.gen.current,pcie.link.gen.max,"
+             "pcie.link.width.current,pcie.link.width.max,utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5).stdout.strip().splitlines()
+        if not out:
+            return {"value": None, "unit": "pcie_generation",
+                    "raw_source": "nvidia-smi returned no rows"}
+        gen_cur, gen_max, w_cur, w_max, util = [int(x.strip()) for x in out[0].split(",")]
+        return {"value": gen_cur, "unit": "pcie_generation",
+                "raw_source": "nvidia-smi pcie.link.gen.current (live)",
+                "gen_max": gen_max, "width_current": w_cur, "width_max": w_max,
+                "gpu_util_pct": util}
+    except Exception as e:
+        return {"value": None, "unit": "pcie_generation",
+                "raw_source": "unavailable", "error": str(e)}
 
 
 def _res_cluster_vram_fill_pct(entity_id, window_s):
@@ -642,6 +1229,165 @@ def _res_kmod_loaded(entity_id, window_s):
         return {"value": None, "unit": "boolean", "raw_source": "unavailable", "error": str(e)}
 
 
+def _shim_stats(window_s: "float | None" = None) -> "tuple[dict | None, str]":
+    """Parse /run/greenboost/shim_stats, gated on the WRITER still being alive.
+
+    Returns (fields, reason). `fields` is None when the file cannot be trusted,
+    and `reason` says why in terms a caller can put in a raw_source.
+
+    The gate used to be file mtime alone (stale after 30 s). That is wrong, and
+    the mistake is easy to make: the shim writes this file from its CUDA hooks,
+    so it stops being rewritten the moment inference goes idle — while every
+    number in it stays exactly true, because nothing has moved. Weights sitting
+    in T2 do not come back to VRAM just because no one asked a question.
+
+    Measured on this box 2026-08-18, and the reason this helper exists: the file
+    was 266 s old, so `t2_overflow_active_mb` resolved to None — while the PID
+    that wrote it was alive, still in phase=INFERENCE, still holding
+    t2_overflow_total_mb=11468 (11.2 GB crossing PCIe on every forward pass).
+    The governed layer went blind at precisely the moment an operator looks at a
+    system monitor and asks why the card is full.
+
+    A dead writer is a genuinely different case and still rejected: those
+    numbers describe a process that no longer exists.
+    """
+    p = Path("/run/greenboost/shim_stats")
+    if not p.exists():
+        return None, "/run/greenboost/shim_stats missing"
+    try:
+        fields = {}
+        for line in p.read_text().splitlines():
+            k, _, v = line.partition("=")
+            if k:
+                fields[k.strip()] = v.strip()
+    except Exception as e:
+        return None, f"/run/greenboost/shim_stats unreadable: {e}"
+
+    age = time.time() - p.stat().st_mtime
+    fields["_age_s"] = round(age, 1)
+
+    pid = fields.get("pid")
+    if pid and pid.isdigit():
+        try:
+            os.kill(int(pid), 0)
+            fields["_writer_alive"] = "1"
+            return fields, ("shim_stats (writer alive; file idle for "
+                            f"{age:.0f}s, values unchanged)"
+                            if age > (window_s or 30.0) else "shim_stats (live)")
+        except (ProcessLookupError, PermissionError, OSError) as e:
+            # PermissionError means the process EXISTS but is owned by another
+            # user — alive for our purposes.
+            if isinstance(e, PermissionError):
+                fields["_writer_alive"] = "1"
+                return fields, "shim_stats (writer alive, other uid)"
+            fields["_writer_alive"] = "0"
+            return None, f"shim_stats writer pid {pid} is gone (file {age:.0f}s old)"
+
+    # No pid to check: fall back to the old mtime gate rather than trusting it.
+    if age > (window_s or 30.0):
+        return None, f"/run/greenboost/shim_stats stale ({age:.0f}s, no pid to verify)"
+    return fields, "shim_stats (live, no pid field)"
+
+
+# Measured bulk-DMA throughput of this box's PCIe link (host->VRAM, pinned),
+# 24.43 GB/s on 2026-08-18 , about 94% of the Gen4 x16 usable ceiling. Used as a
+# PHYSICAL LIMIT for sanity-checking, never as a target: no more than this many
+# bytes can cross the bus per second, so any telemetry implying more is wrong.
+_PCIE_BULK_DMA_GBS = float(os.environ.get("GB_PCIE_BULK_DMA_GBS", "24.43"))
+
+
+def _overflow_resident_vs_streamed(overflow_mb: float) -> "tuple[bool | None, dict]":
+    """Is all of this T2 allocation being read every token, or only part of it?
+
+    NOT a correctness check on the counter , a check on how it is READ.
+    `t2_overflow_active_mb` counts bytes ALLOCATED to T2. T2 also holds the KV
+    cache and compute/scratch buffers, and those are not read in full on every
+    forward pass. So the intuitive reading , "this many bytes cross PCIe per
+    token" , is only true for the weights portion.
+
+    The distinction has teeth. Measured 2026-08-18: 5,923 MB reported alongside
+    an end-to-end 8.37 tok/s. Treating all of it as per-token traffic implies
+    48.4 GB/s across a link measured at 24.43, which is impossible , so at most
+    ~2,900 MB of that allocation can be weights actually streamed each token.
+    The remainder is resident-but-not-hot.
+
+    That inference was initially made in the wrong direction (concluding the
+    counter over-reported by 2x). It does not: adds and subtracts in
+    greenboost_cuda_shim.c both use the same size, and `alloc_bytesize ==
+    bytesize` on the allocation path. The number is a faithful allocation
+    figure; only the per-token interpretation was wrong.
+
+    Returns (all_streamed, evidence). None means no decode rate to compare
+    against, which is NOT the same as "all of it streams".
+    """
+    tok_s = None
+    try:
+        ev = _latest_event_with_field("tok_s_measured", "tok_s", max_age_s=3600)
+        if ev:
+            tok_s = float(ev.get("tok_s") or 0) or None
+    except Exception:
+        tok_s = None
+    if not tok_s or not overflow_mb:
+        return None, {}
+    implied = (overflow_mb / 1024.0) * tok_s
+    return implied <= _PCIE_BULK_DMA_GBS, {
+        "implied_gbs_if_all_streamed": round(implied, 1),
+        "link_gbs": _PCIE_BULK_DMA_GBS,
+        "decode_tok_s": round(tok_s, 2),
+        "max_streamed_mb": round(_PCIE_BULK_DMA_GBS / tok_s * 1024),
+    }
+
+
+def _res_t2_overflow_active_mb(entity_id, window_s):
+    """Bytes the shim has actually routed to T2 DDR — "is overflow happening",
+    read straight from the shim's own counter.
+
+    This is NOT `t2_pressure_fraction`. Pressure is how full the T2 POOL is
+    relative to its capacity; overflow is whether weights are being served from
+    T2 at all. On a large pool the two diverge completely: measured 2026-08-17
+    while serving a 15.85 GiB model on 11.26 GB of VRAM, the shim reported
+    `t2_overflow_total_mb=14326` against a 43 GB pool whose pressure read 0.0.
+    Because `rule1_underfilled` tested pressure, the Rule #1 tripwire could not
+    fire in exactly the situation it exists to catch.
+
+    Read from shim_stats directly rather than gb_monitor.GbSnapshot, which has
+    no field for it (t2_pool/allocated/available/pressure only) — and note the
+    kmod's own `t2_allocated_mb` read 0 in that same sample, so the shim counter
+    is the trustworthy signal here.
+    """
+    try:
+        fields, reason = _shim_stats(window_s)
+        if fields is None:
+            return {"value": None, "unit": "megabytes", "raw_source": reason}
+        v = fields.get("t2_overflow_total_mb")
+        if v is None:
+            return {"value": None, "unit": "megabytes",
+                    "raw_source": "shim_stats has no t2_overflow_total_mb"}
+        val = float(v)
+        all_streamed, ev = _overflow_resident_vs_streamed(val)
+        out = {"value": val, "unit": "megabytes",
+               "raw_source": f"shim_stats.t2_overflow_total_mb , {reason}",
+               "age_s": fields.get("_age_s"),
+               "shim_phase": fields.get("phase")}
+        if all_streamed is False:
+            # The allocation figure is correct; it simply is not all hot. Say
+            # which part can be per-token traffic, so a reader does not multiply
+            # the whole number by tok/s and conclude the bus is doing the
+            # impossible.
+            out["partly_resident"] = True
+            out["streaming"] = ev
+            out["raw_source"] += (
+                f" , NOTE: only ~{ev['max_streamed_mb']} MB of this can be "
+                f"streamed per token at {ev['decode_tok_s']} tok/s over a "
+                f"{ev['link_gbs']} GB/s link; the rest is resident, not hot")
+        elif all_streamed is True:
+            out["streaming"] = ev
+        return out
+    except Exception as e:
+        return {"value": None, "unit": "megabytes", "raw_source": "unavailable",
+                "error": str(e)}
+
+
 def _res_shim_fresh(entity_id, window_s):
     try:
         p = Path("/run/greenboost/shim_stats")
@@ -755,12 +1501,108 @@ def discover(query: str, k: int = 5) -> list[dict]:
 
 def _seg_rule1_underfilled():
     vram = resolve("vram_fill_pct")
+    t2o = resolve("t2_overflow_active_mb")
     t2f = resolve("t2_pressure_fraction")
     t3 = resolve("t3_spill_active_mb")
     v = vram.get("value")
-    overflow_active = (t2f.get("value") or 0) > 0 or (t3.get("value") or 0) > 0
-    matched = v is not None and v < 85.0 and overflow_active
-    return matched, [vram, t2f, t3]
+    # "Overflow is active" means bytes are actually being served from T2/T3.
+    # t2_pressure_fraction is POOL FULLNESS, not overflow, and on a large pool
+    # it reads 0 while overflow is substantial — measured 2026-08-17,
+    # t2_overflow_total_mb=14326 into a 43 GB pool at pressure 0.0 while VRAM
+    # sat at 69%. Testing pressure alone made this tripwire unable to fire in
+    # precisely the scenario Rule #1 exists to catch, so the shim's own overflow
+    # counter leads and pressure is kept only as a secondary signal.
+    overflow_active = ((t2o.get("value") or 0) > 0
+                       or (t2f.get("value") or 0) > 0
+                       or (t3.get("value") or 0) > 0)
+
+    # `None` (unknown) and `0` (measured zero) are NOT the same answer, and
+    # collapsing them silences this tripwire exactly when the shim goes quiet.
+    # The shim rewrites /run/greenboost/shim_stats every 250 ms *from its CUDA
+    # hooks*, so the file legitimately goes stale whenever inference is idle —
+    # and t2_overflow_active_mb then resolves to None. Before this fix that
+    # produced `matched: False`, i.e. a clean bill of health, from a state that
+    # was actually a live violation. Measured 2026-08-17: vram_fill_pct=50.3
+    # (below_target) with t2_overflow_total_mb=16312 sitting in the file the
+    # resolver had just declined to trust.
+    #
+    # Return None = "cannot tell", which evaluate_segment already carries (it
+    # uses the same value on its exception path). This still never ASSERTS a
+    # violation on absent data — the rule this segment's tests encode — it only
+    # stops asserting health on absent data, which is the other half of the same
+    # principle. Only the decisive signal (the shim's own overflow counter)
+    # triggers it; a known-zero overflow with quiet pressure/T3 stays a
+    # definitive False.
+    overflow_unknown = (t2o.get("value") is None
+                        and not (t2f.get("value") or 0) > 0
+                        and not (t3.get("value") or 0) > 0)
+    if v is not None and v < 85.0 and overflow_unknown:
+        return None, [vram, t2o, t2f, t3]
+
+    # VRAM that is RESERVED for KV but not yet written is not "unfilled" in the
+    # sense Rule #1 cares about. The shim holds kv_reserve_effective_mb from
+    # the moment the model loads and consumes it as the conversation grows, so
+    # a fresh session at a large ctx legitimately shows a gap.
+    #
+    # Measured 2026-08-18, a healthy serve caught by this tripwire: fill 79.4%,
+    # kv_reserve_effective_mb=2009, kv_t1_tracked_mb=218 , about 1.8 GB of the
+    # 2.5 GB "free" was reservation, not waste. Counting it as a violation
+    # trains the operator to ignore the one tripwire Rule #1 depends on, which
+    # is worse than the occasional real miss.
+    #
+    # Only the reserve that is NOT yet in use is added back. A reserve the
+    # engine has actually filled already shows up in vram_fill_pct on its own,
+    # and adding it twice would hide a genuine underfill.
+    # _shim_stats() returns (fields, reason); fields is None when the file
+    # cannot be trusted. Treat "cannot read" as "no reserve credit", never as
+    # a reason to soften the verdict.
+    _fields, _ = _shim_stats()
+    _fields = _fields or {}
+    held = _fields.get("kv_reserve_effective_mb")
+    used = _fields.get("kv_t1_tracked_mb")
+    effective = v
+    reserve_note = None
+
+    def _num(x):
+        # shim_stats is a flat key=value text file, so every field arrives as a
+        # STRING. An isinstance(x, (int, float)) check silently rejects all of
+        # them, which is how the first version of this credit did nothing at
+        # all while looking correct.
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
+
+    held_v, used_v = _num(held), _num(used)
+    if v is not None and held_v is not None and used_v is not None:
+        pending_mb = max(0.0, held_v - used_v)
+        # Physical VRAM read live, never a stored constant (hardcoded-hardware
+        # rule) , same source _seg_weights_dont_fit_vram uses.
+        total = None
+        try:
+            import gb_monitor
+            snap = gb_monitor.snapshot()
+            total = (getattr(snap, "vram_physical_mb", None)
+                     or getattr(snap, "gpu_mem_total_mb", None))
+        except Exception:
+            total = None
+        if pending_mb > 0 and total:
+            effective = min(100.0, v + 100.0 * pending_mb / float(total))
+            reserve_note = {
+                "metric": "kv_reserve_pending_mb",
+                "value": round(pending_mb, 1),
+                "unit": "megabytes",
+                "doc": ("VRAM reserved for KV that the conversation has not "
+                        "reached yet. Counted as filled for Rule #1: it is "
+                        "committed, not wasted."),
+                "vram_fill_pct_effective": round(effective, 1),
+            }
+
+    matched = effective is not None and effective < 85.0 and overflow_active
+    ev = [vram, t2o, t2f, t3]
+    if reserve_note:
+        ev.append(reserve_note)
+    return matched, ev
 
 
 def _seg_weights_on_t3():
@@ -769,14 +1611,299 @@ def _seg_weights_on_t3():
     return bool(v) and v > 0, [t3]
 
 
+def _seg_proxy_memory_near_cap(entity_id=None, window_s=None):
+    """The gb-synapse proxy is close to its own address-space cap.
+
+    Past this line the next allocation inside a request raises MemoryError and
+    that request dies, while the box itself stays healthy , which is exactly
+    what makes the symptom confusing ("plenty of free RAM, yet generation
+    stopped"). Returns None, never False, when the proxy is not running or has
+    no cap: absence of a reading is not a clean bill of health.
+    """
+    rss = resolve("proxy_rss_mb")
+    head = resolve("proxy_mem_headroom_pct")
+    hv = head.get("value")
+    if hv is None:
+        return None, [rss, head]
+    return hv <= 20.0, [rss, head]
+
+
+def _seg_agent_compaction_broke_prefix(entity_id=None, window_s=None):
+    """A compaction rewrote the prefix instead of appending to it.
+
+    This is AE-2's failure mode, and it is expensive rather than incorrect:
+    the answer is still right, it just costs a full re-prefill. Returns None,
+    never False, when no compaction has happened , "nothing has gone wrong
+    yet" and "nothing has happened yet" are different answers.
+    """
+    kept = resolve("agent_compaction_prefix_kept_pct")
+    v = kept.get("value")
+    if v is None:
+        return None, [kept]
+    return v < 100.0, [kept]
+
+
+def _seg_agent_hallucinating_tool_names(entity_id=None, window_s=None):
+    """The model is naming tools the registry does not have.
+
+    Above a few percent this is schema misalignment, not bad luck, and PATool
+    says the fix is to align the offered schema to what the model expects ,
+    not to instruct the model harder.
+    """
+    pct = resolve("agent_hallucinated_tool_pct")
+    v = pct.get("value")
+    if v is None:
+        return None, [pct]
+    return v >= 5.0, [pct]
+
+
+def _seg_agent_eval_below_reference(entity_id=None, window_s=None):
+    """This harness scores below a 27B's published MCP-Bench reference.
+
+    0.582 is where MCP-Bench puts gemma-3-27b-it. Scoring under that with a
+    27B-class local model points at the harness, not the weights , which is
+    the whole reason AE-1 exists before any other AE task may claim a win.
+    """
+    sc = resolve("agent_eval_overall")
+    v = sc.get("value")
+    if v is None:
+        return None, [sc]
+    return v < 0.582, [sc]
+
+
+def _seg_host_oom_imminent():
+    """Host RAM is close enough to exhaustion that the OOM killer is a real risk.
+
+    This is the signal that was missing on 2026-08-18, when the OOM killer took
+    the whole terminal twice , 12:30:46 killed a python3 holding 27.0 GB of
+    anonymous RSS, and 07:52:32 killed one holding 31.7 GB. Both times
+    greenboost.ko's T2 OOM guard had already tripped and said so in dmesg
+    minutes earlier, where nothing was watching.
+
+    Severity is `violation` rather than `diagnosis` because, unlike weights that
+    do not fit, this one destroys work in progress: it does not slow the session
+    down, it ends it.
+
+    Returns None, never False, when either input is unreadable. "I cannot see
+    host memory" must not be reported as "host memory is fine".
+    """
+    avail = resolve("host_mem_available_gb")
+    guard = resolve("t2_oom_guard_state")
+    av = avail.get("value")
+    gv = guard.get("value")
+    if av is None and gv is None:
+        return None, [avail, guard]
+    tripped = isinstance(gv, str) and gv.lower() not in ("ok", "none", "")
+    # 4 GB mirrors the kmod's own reserve, which is what it compares
+    # MemAvailable against before it starts evicting T2.
+    low = av is not None and av < 4.0
+    ev = {"host_mem_available_gb": av, "t2_oom_guard": gv,
+          "kmod_reserve_gb": 4.0,
+          "action": "greenboost clear memory-pool  (frees T1+T2 now)"}
+    if av is None or gv is None:
+        # One input missing: report only if the one we DO have is alarming,
+        # otherwise say we cannot tell.
+        return (True, [ev]) if (tripped or low) else (None, [avail, guard])
+    return (tripped or low), [ev]
+
+
+def _seg_models_wiped_from_manifest():
+    """Weights on disk that GB-Synapse cannot serve because the manifest lost them.
+
+    Severity is `violation`, not `diagnosis`: unlike a model that genuinely
+    does not fit, nothing about the hardware makes this true. It is pure
+    bookkeeping loss, it makes the CLI refuse to start, and it is fixed in
+    seconds by `gb_synapse.recover_from_hf_cache()` without downloading a byte.
+
+    Happened three times on 2026-08-18. Twice the operator's next action was
+    to open the CLI and find it dead with `no such model:
+    Qwen3.8-27B-Cold-Fusion-MTP-IQ4_XS` — a model whose 15.85 GiB of weights
+    were sitting on the disk the whole time.
+    """
+    n = resolve("unregistered_cached_models")
+    if n.get("value") is None:
+        # Cannot tell — never False. A clean bill inferred from an unreadable
+        # cache is the failure mode this layer exists to prevent.
+        return None, [n]
+    count = int(n["value"])
+    ev = dict(n)
+    ev["examples"] = (n.get("evidence") or {}).get("missing", [])
+    ev["fix"] = "greenboost recover-models"
+    return count > 0, [ev]
+
+
+def _seg_weights_dont_fit_vram():
+    """The served model's weights alone exceed physical VRAM.
+
+    This is a CAPACITY FACT, not a fault, and it is the honest answer to "why
+    is decode slow" whenever it matches: whatever does not fit crosses PCIe on
+    every forward pass, which caps decode at (bytes over PCIe) / (link
+    bandwidth) no matter how well everything else is tuned.
+
+    It exists because nothing in the governed layer said this out loud.
+    Measured on this box 2026-08-18: 15.86 GB of weights against 12227 MiB of
+    VRAM, decode 2.7-3.5 tok/s — arithmetic that predicts the measurement
+    almost exactly. What the operator actually saw instead was five
+    `tok_s_drop` advisories built on n=3 populations, pointing at a KV
+    threshold lever that cannot move a weights-overflow problem.
+
+    Severity is `diagnosis`, not `violation`: the fix is a model/quant/ctx
+    choice, not a bug to repair, and Rule #1 is not being broken — the tiering
+    layer is doing exactly what it exists to do.
+    """
+    w = resolve("weights_gb")
+    fill = resolve("vram_fill_pct")
+    wv = w.get("value")
+    if wv is None:
+        return None, [w, fill]
+    # Physical VRAM read live, never a stored constant (hardcoded-hardware rule).
+    total_gb = None
+    try:
+        import gb_monitor
+        snap = gb_monitor.snapshot()
+        phys_mb = (getattr(snap, "vram_physical_mb", None)
+                   or getattr(snap, "gpu_mem_total_mb", None))
+        if phys_mb:
+            total_gb = float(phys_mb) / 1024.0
+    except Exception:
+        total_gb = None
+    if not total_gb:
+        return None, [w, fill]
+    overflow_gb = round(wv - total_gb, 2)
+    ev = dict(w)
+    ev["vram_physical_gb"] = round(total_gb, 2)
+    ev["weights_overflow_gb"] = overflow_gb
+    return overflow_gb > 0, [ev, fill]
+
+
+def _seg_cloud_inference_in_use():
+    """An inference endpoint is pointed at hardware the owner does not control.
+
+    Severity `violation`: this is the one rule whose breach invalidates the
+    entire stack for that request. Every tier, the shim, the kernel module and
+    the cluster fabric exist so inference stays on this hardware.
+
+    Returns None (cannot tell) rather than False when endpoints cannot be
+    resolved , silence must never read as compliance.
+    """
+    m = resolve("inference_endpoint_is_local")
+    v = m.get("value")
+    if v is None:
+        return None, [m]
+    return (not v), [m]
+
+
+def _seg_prefill_dominated_by_replay():
+    """Most of this turn's prefill was re-running work the engine already did.
+
+    Matches when the recurrent replay estimate is the majority of prompt_ms.
+    A capacity/architecture FACT rather than a fault , the model is hybrid and
+    llama.cpp has no way to resume a recurrent layer mid-prefix, which is also
+    why it refuses `--cache-reuse` for this model and says so at startup.
+
+    It is governed because it is the largest recoverable per-turn cost on this
+    box and nothing named it: an operator watching a 99.9% cache-hit rate has
+    every reason to believe prefill is already solved. Actionable via the
+    sparse-prefix-checkpointing work (arXiv 2605.05219) on top of llama.cpp slot
+    save/restore, which does carry recurrent state.
+    """
+    m = resolve("recurrent_replay_ms")
+    v = m.get("value")
+    if v is None:
+        return None, [m]
+    return (m.get("replay_share") or 0) >= _REPLAY_DOMINANT_SHARE, [m]
+
+
+def _seg_idle_serve_holding_vram():
+    """A serve session is holding significant VRAM while doing no work.
+
+    Not a fault , llama-server keeps weights resident precisely so the next
+    request is fast, and that is usually the right trade. It becomes a finding
+    only when the operator wants the card back (a game, a training run, another
+    model) and has no signal telling them the memory is reclaimable.
+
+    Actionable by construction: `gb synapse pause <model>` saves the KV state
+    and returns the VRAM, and `resume` brings the conversation back. Measured
+    on this box: save 740 ms / restore 537 ms for 54,377 tokens.
+    """
+    m = resolve("idle_vram_held_gb")
+    v = m.get("value")
+    if v is None:
+        return None, [m]
+    fill = resolve("vram_fill_pct")
+    # Only interesting once it is a meaningful share of the card, not for a
+    # few hundred MB of context left over.
+    f = fill.get("value")
+    return (v > 0 and f is not None and f >= _IDLE_HOLD_FILL_PCT), [m, fill]
+
+
+def _seg_pcie_link_degraded_under_load():
+    """PCIe link below its ceiling WHILE the GPU is genuinely busy.
+
+    Separate from the `pcie_degraded` dataflux event, which is sampled once at
+    telemetry init and produced 13 false positives on this box (2026-08-18:
+    every one reported gen2 while the link measures Gen4 x16 under real load).
+    A GPU downtrains its link whenever it is idle, so a gen comparison is only
+    meaningful alongside proof the card was working at the time — this reads
+    both in the same call so the two cannot drift apart.
+    """
+    g = resolve("pcie_link_gen_current")
+    gen = g.get("value")
+    if gen is None:
+        return None, [g]
+    util = g.get("gpu_util_pct")
+    if util is None or util < _PCIE_ACTIVE_UTIL_PCT:
+        # Idle or unknown: refuse to answer rather than report a downtrained
+        # link as a fault. "Cannot tell" is the honest verdict here.
+        return None, [g]
+    return (gen < (g.get("gen_max") or gen)
+            or (g.get("width_current") or 0) < (g.get("width_max") or 0)), [g]
+
+
+# Node labels in dataflux's per-node rollup that are NOT feeders. "host" is
+# this box; "?" is the unknown-node bucket dataflux uses for events that
+# carried no node label at all. Neither can be "a feeder sitting idle".
+_NON_FEEDER_NODES = {"host", "?", "", None}
+
+
 def _seg_feeder_idle_while_host_saturated():
+    """Two false-positive sources fixed 2026-08-18, both observed live on this
+    box at once (the segment reported matched=true with a feeder that does not
+    exist and a feeder that was not connected):
+
+    1. The `"?"` unknown-node bucket was being counted as a feeder. dataflux's
+       per-node rollup returned {"host": 173, "?": 0}, and `"?" != "host"` with
+       0 items read as "a feeder processed nothing". There is no feeder named
+       "?" — it is where events with no node label land.
+
+    2. An UNREACHABLE feeder was counted as idle. This segment's own doc says
+       it "assumes the feeder IS connected and only checks whether it's doing
+       work", and `feeder_unreachable` exists precisely to cover the other
+       case. Firing both at once tells an agent there are two independent
+       cluster violations when there is one condition with one fix, and the
+       remediations differ: bring the feeder up, versus find out why a
+       connected feeder is not being dispatched to.
+
+    Idle-and-reachable stays a real violation and still matches."""
     host_fill = resolve("vram_fill_pct", entity_id="host")
     feeders = resolve("feeder_items")
+    reach = resolve("feeder_reachable")
     v_host = host_fill.get("value")
     items = feeders.get("value") or {}
-    idle_feeders = [n for n, c in items.items() if n != "host" and (c or 0) == 0]
+    reachable = reach.get("value") or {}
+
+    idle_feeders = [
+        n for n, c in items.items()
+        if n not in _NON_FEEDER_NODES
+        and (c or 0) == 0
+        # Unknown reachability (feeder not in the map at all) is treated as
+        # reachable: the pre-existing behaviour, so a cluster whose probe is
+        # unavailable still surfaces a genuinely idle feeder rather than
+        # silently passing.
+        and reachable.get(n, True) is not False
+    ]
     matched = bool(idle_feeders) and v_host is not None and v_host >= 85.0
-    return matched, [host_fill, feeders]
+    return matched, [host_fill, feeders, reach]
 
 
 def _seg_below_quality_floor():
@@ -806,6 +1933,29 @@ def _seg_prompt_cache_cold():
     return (v is not None and v < 10.0), [hit]
 
 
+def _serve_sessions_with_dead_proxy() -> list:
+    """Serve sessions whose engine is alive but whose proxy is gone.
+
+    That combination is an outage that looks like health from every other
+    angle: the kernel module is loaded, VRAM is full, the GPU is idle because
+    nothing can reach it. Returns [] when gb_synapse cannot be consulted ,
+    "cannot tell" must not be reported as "a proxy died", the same way it must
+    not be reported as health.
+    """
+    try:
+        import gb_synapse
+        out = []
+        for s in gb_synapse.ps():
+            if s.get("proxy_error") and s.get("llama_pid"):
+                out.append({"model": s.get("model"),
+                            "llama_pid": s.get("llama_pid"),
+                            "proxy_error": s.get("proxy_error"),
+                            "port": s.get("port")})
+        return out
+    except Exception:
+        return []
+
+
 def _seg_serve_healthy():
     """Fixed 2026-07-30: this previously required shim_fresh unconditionally,
     so it could never match on a genuinely idle-but-healthy box (shim_fresh
@@ -824,6 +1974,30 @@ def _seg_serve_healthy():
     floor = resolve("meets_fp8_floor")
     if kmod.get("value") is not True:
         return False, [kmod, fresh, vram, floor]
+
+    # A serve session whose PROXY is dead is not healthy, however idle the box
+    # looks. gb_synapse.ps() already reports `proxy_error: "proxy process is
+    # gone"` in exactly this state , the information existed and this segment
+    # ignored it.
+    #
+    # Overnight 2026-08-19: the proxy was OOM-killed at 01:47, llama-server
+    # survived holding 10.5 GB of VRAM, every request failed with "Cannot
+    # connect to http://localhost:11369/v1" , and this segment answered
+    # MATCHED, a clean bill of health, for eight hours. Nothing else in the
+    # layer contradicted it. That is the exact failure this layer exists to
+    # prevent, one level up from a null metric.
+    broken = _serve_sessions_with_dead_proxy()
+    if broken:
+        return False, [kmod, fresh, vram, floor, {
+            "metric": "serve_proxy_dead",
+            "value": True,
+            "unit": "boolean",
+            "doc": ("A serve session is running with no reachable proxy. The "
+                    "engine still holds its VRAM; nothing can send it a "
+                    "request."),
+            "sessions": broken,
+            "action": "greenboost synapse stop && greenboost synapse serve <model>",
+        }]
     if _latest_event("tok_s_measured", max_age_s=60.0) is None:
         # No recent decode activity — idle GPU. Healthy iff kmod is loaded;
         # the VRAM target band / freshness gate / quality floor only apply

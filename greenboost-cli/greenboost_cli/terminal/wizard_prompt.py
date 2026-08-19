@@ -30,6 +30,9 @@ from greenboost_cli.terminal.theme import (
     ANSI_VIOLET, ANSI_LIME, ANSI_AMBER, ANSI_GRAY, ANSI_DIM, ANSI_RESET,
     ANSI_BOLD,
 )
+from greenboost_cli.terminal.width import (
+    display_width, suspend_live, truncate_to_width,
+)
 
 _CANCELLED: object = object()
 
@@ -45,12 +48,30 @@ def _term_w() -> int:
 
 # ── Raw keyboard reading ──────────────────────────────────────────────────────
 
-def _getch() -> str:
-    """Read one logical keypress (handles arrow-key escape sequences)."""
+#: How long a question waits for a human before answering itself.
+#: greenboost-cli is meant to run unattended for days (CLAUDE.md's
+#: Unattended-For-Days Must-Rule): asking is fine and expected, but a question
+#: nobody is there to answer must not hold the run until someone wanders back.
+UNATTENDED_ANSWER_AFTER_S = 300.0
+
+#: Returned by _getch when the wait elapsed with no keypress.
+TIMEOUT = "TIMEOUT"
+
+
+def _getch(timeout: "float | None" = None) -> str:
+    """Read one logical keypress (handles arrow-key escape sequences).
+
+    With `timeout`, returns TIMEOUT if nothing is pressed in that many seconds
+    , the caller decides what unattended means.
+    """
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
+        if timeout is not None:
+            rlist, _, _ = select.select([sys.stdin], [], [], timeout)
+            if not rlist:
+                return TIMEOUT
         ch = os.read(fd, 1)
         if ch == b"\x1b":
             # Peek for CSI sequence with a short timeout
@@ -88,6 +109,7 @@ def _picker(
     options: list[dict],
     multi: bool = False,
     title: str = "",
+    timeout_s: "float | None" = None,
 ) -> list[int] | None:
     """Arrow-key + Space interactive picker.
 
@@ -146,7 +168,9 @@ def _picker(
     try:
         _draw(initial=True)
         while True:
-            key = _getch()
+            key = _getch(timeout_s)
+            if key is TIMEOUT or key == TIMEOUT:
+                return TIMEOUT          # nobody is here; the caller decides
 
             if key == "UP":
                 cursor = (cursor - 1) % n
@@ -207,11 +231,29 @@ def _ask_freetext(prompt: str = "Free-text answer") -> str | object:
 
 def _wrap_lines(text: str, width: int) -> list[str]:
     """Greedy word-wrap *text* to *width* columns. Never cuts mid-word."""
+    # display_width, not len: a Bash command can carry any glyph, and an
+    # East-Asian-Ambiguous character counted as one column overflows the row
+    # it was measured for. Same defect class as the status line fixed the same
+    # day — see terminal/width.py.
     words = text.split()
     lines: list[str] = []
     line:  list[str] = []
     for word in words:
-        if len(" ".join(line + [word])) > width:
+        # A single token longer than the row (a long path, a URL, a command
+        # with no spaces) can never fit by wrapping between words. Break it
+        # rather than emit a line that overflows the box.
+        while display_width(word) > width:
+            head = truncate_to_width(word, width)
+            if not head:
+                break
+            if line:
+                lines.append(" ".join(line))
+                line = []
+            lines.append(head)
+            word = word[len(head):]
+        if not word:
+            continue
+        if display_width(" ".join(line + [word])) > width:
             if line:
                 lines.append(" ".join(line))
             line = [word]
@@ -257,10 +299,17 @@ def _box_bot(w: int) -> None:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def run_question_wizard(questions: list[dict]) -> list[dict] | None:
+def run_question_wizard(questions: list[dict],
+                       timeout_s: "float | None" = UNATTENDED_ANSWER_AFTER_S,
+                       ) -> list[dict] | None:
     """Render a full stepped wizard for *questions*.
 
     Returns list of answer dicts (one per question), or None on cancel.
+
+    Asking is the expected workflow, especially at the start of a session. What
+    is not acceptable is a question outliving the person it was asked of: after
+    `timeout_s` with no keypress the wizard answers itself with the safe
+    option and says so. Pass `timeout_s=None` to wait indefinitely.
     """
     if not questions:
         return []
@@ -299,9 +348,31 @@ def run_question_wizard(questions: list[dict]) -> list[dict] | None:
         console.print()
 
         # ── Interactive picker ─────────────────────────────────────────────
-        chosen = _picker(picker_opts, multi=multi, title=header)
+        chosen = _picker(picker_opts, multi=multi, title=header,
+                         timeout_s=timeout_s)
         if chosen is None:
             return None
+        if chosen == TIMEOUT:
+            # Unattended: answer it rather than hold the run. The choice is the
+            # same safe-option logic /auto-answer uses, and it is recorded in
+            # the journal with its reason so /session-report shows exactly what
+            # was decided on the user's behalf and why.
+            from greenboost_cli.core.autonomy import choose_answer, get_state
+            idx, why = choose_answer(q)
+            label = (options[idx]["label"] if 0 <= idx < len(options)
+                     else "(no answer)")
+            try:
+                get_state().record("question", header=header, why=why,
+                                   answer=label, unattended=True)
+            except Exception:
+                pass
+            console.print(
+                f"  [{AMBER}]no answer for "
+                f"{int(timeout_s // 60)} min , continuing with "
+                f"'{label}'[/]  [{DIM}]({why}; /session-report to review)[/]")
+            results.append({"header": header, "question": question,
+                            "answers": [label]})
+            continue
 
         # ── Resolve → answer strings ───────────────────────────────────────
         other_idx = len(picker_opts)   # 1-based index of Other
@@ -370,13 +441,21 @@ def _summarize_call(description: str) -> str:
 
 def run_approval_picker(description: str) -> str:
     """Arrow-key approval dialog. Returns 'allow' | 'allow-all' | 'deny'."""
-    opts = [
-        {"label": "Allow once",                 "description": "permit this operation"},
-        {"label": "Allow for this session",     "description": "no more prompts (accept-all)"},
-        {"label": "Deny",                       "description": "skip this operation"},
-    ]
     w = _term_w()
 
+    # The card is many rows drawn one print at a time. Without this the status
+    # line paints between them — that is the mangled box in the 2026-08-18
+    # screenshots, where the borders land at whatever column the cursor was at.
+    with suspend_live():
+        return _draw_approval_card_and_pick(description, w)
+
+
+def _draw_approval_card_and_pick(description: str, w: int) -> str:
+    opts = [
+        {"label": "Allow once",             "description": "permit this operation"},
+        {"label": "Allow for this session", "description": "no more prompts (accept-all)"},
+        {"label": "Deny",                   "description": "skip this operation"},
+    ]
     sys.stdout.write("\n")
     sys.stdout.flush()
 
@@ -388,7 +467,12 @@ def run_approval_picker(description: str) -> str:
     # no right edge). Pad each row to `inner` and close it, matching the top
     # rule's width (2 leading spaces + BOX_TL/BOX_V + inner + BOX_TR/BOX_V).
     header_text = "⚠  Permission required"
-    header_pad  = " " * max(0, inner - 2 - len(header_text))
+    # display_width: the warning sign U+26A0 is East-Asian-Ambiguous, so it
+    # occupies two columns on a CJK-capable font while len() calls it one.
+    # One column of over-pad pushes the right border past the margin, the
+    # row wraps, and the card renders as the mangled box in the 2026-08-18
+    # screenshots.
+    header_pad  = " " * max(0, inner - 2 - display_width(header_text))
     console.print(
         f"  [{DIM}]{BOX_V}[/]  [{AMBER}]{header_text}[/]{header_pad}[{DIM}]{BOX_V}[/]"
     )
@@ -399,7 +483,7 @@ def run_approval_picker(description: str) -> str:
     if overflow:
         shown[-1] = shown[-1].rstrip() + "…"
     for ln in shown:
-        pad = " " * max(0, inner - 2 - len(ln))
+        pad = " " * max(0, inner - 2 - display_width(ln))
         console.print(f"  [{DIM}]{BOX_V}[/]  [{GRAY}]{escape(ln)}[/]{pad}[{DIM}]{BOX_V}[/]")
     console.print(f"  [{DIM}]{BOX_BL}{BOX_H * inner}{BOX_BR}[/]")
     console.print()

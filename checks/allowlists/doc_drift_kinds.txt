@@ -1,0 +1,58 @@
+# Doc-drift exemptions (dataflux kinds) — checks/check_doc_drift.py.
+# Pre-existing gap, recorded 2026-08-05 (NemoClaw audit round 2, item 6):
+# these kinds are registered in gb_dataflux_kinds.py but not yet mentioned
+# in DOCUMENTATION.md. Grandfathered so the check doesn't fail on day one
+# over a pre-existing backlog — any kind NOT in this list is a real, new
+# violation. Shrink this list as DOCUMENTATION.md catches up; do not add
+# a newly-introduced kind here instead of documenting it.
+
+a2a_request
+agent_run
+allowlist_trust
+bench_result
+bw_undetectable
+candidate_selected
+capacity_fit
+chunk_local
+chunk_remote
+cli_tool_call
+feeder_provision
+finish_summary
+gaming_fan_curve
+gaming_gpu_profile_applied
+gaming_session
+gaming_vram_pressure
+health_transition
+image_gen
+job_local
+job_local_retry
+job_remote
+link_transfer
+mem_pool_trim
+model_call
+model_push
+model_rotation
+niah_cert
+node_capabilities
+node_topology
+pcie_degraded
+prompt_cache
+purge_action
+qc_summary
+quant_budget_fallback
+quant_plan
+recipe_validate
+serve_probe
+shim_decision
+shim_transition
+smoke_gate
+stage_profile
+synapse_build_preflight
+synapse_engine_error
+synapse_engine_placement
+synapse_stall
+tensor_split
+tok_s_measured
+turboquant_activate
+video_render
+yarn_bake

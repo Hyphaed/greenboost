@@ -44,6 +44,8 @@ import subprocess
 import sys
 from typing import Any, Awaitable, Callable
 
+from greenboost_cli.core.bounded_lines import BoundedLineDecoder
+
 # Bind only on the loopback interface. NEVER change to 0.0.0.0 — the
 # coordinator must reach us through an `ssh -L` tunnel.
 LOOPBACK = "127.0.0.1"
@@ -248,18 +250,33 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
         return
 
     try:
-        while True:
-            line = await reader.readline()
-            if not line:
-                break
+        # BoundedLineDecoder caps how much unterminated output can accumulate
+        # from one client before truncation kicks in (item 8: a client that
+        # never sends a newline must not grow this buffer without bound).
+        max_line_size = 1024 * 1024
+        pending_requests = []
+
+        def on_line(line: str) -> None:
             try:
-                req = json.loads(line.decode("utf-8"))
+                req = json.loads(line)
             except json.JSONDecodeError as e:
                 resp = {"id": "", "ok": False, "error": f"bad json: {e}"}
             else:
                 resp = _dispatch(req)
-            writer.write((json.dumps(resp) + "\n").encode("utf-8"))
-            await writer.drain()
+            pending_requests.append(resp)
+
+        decoder = BoundedLineDecoder(max_line_size, on_line)
+
+        while True:
+            chunk = await reader.read(4096)
+            if not chunk:
+                decoder.end()
+                break
+            decoder.write(chunk)
+            while pending_requests:
+                resp = pending_requests.pop(0)
+                writer.write((json.dumps(resp) + "\n").encode("utf-8"))
+                await writer.drain()
     except (ConnectionResetError, BrokenPipeError):
         pass
     finally:

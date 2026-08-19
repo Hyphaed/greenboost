@@ -223,6 +223,112 @@ def _summarize_turn_pair(user_msg: dict, asst_msg: dict | None) -> str:
     return f"User: {user_summary}\nAssistant: {asst_summary}"
 
 
+#: Messages at the FRONT of the history that compaction never moves or
+#: rewrites. The opening exchange is the task framing , the cheapest tokens in
+#: the session to keep and the ones every later turn is conditioned on.
+#: Keeping them pinned in place is what makes the served prompt's leading
+#: tokens byte-identical from turn to turn, which is the precondition for the
+#: engine reusing its KV cache instead of re-prefilling.
+_HEAD_KEEP = 2
+
+#: Marker opening a compaction block. Also how a later compaction RECOGNISES
+#: the previous one, so summaries extend instead of being rebuilt , an
+#: extended block keeps its existing bytes and therefore its cache reuse.
+_MEMORY_MARKER = "[Structured session memory , earlier conversation compacted]"
+
+
+#: Tool results whose CONTENT can be cleared once it is stale. A file read
+#: from twenty steps ago is re-readable; the fact that it was read is what the
+#: conversation still needs. Deliberately excludes anything whose output is a
+#: decision the run depends on (AskUserQuestion, TodoRead) rather than a
+#: lookup.
+_COMPACTABLE_TOOLS = frozenset({
+    "Read", "Bash", "Grep", "Glob", "Semble", "WebFetch", "WebSearch",
+    "Edit", "Write",
+})
+
+#: How many of the most recent compactable results keep their content.
+_MICROCOMPACT_KEEP = 4
+
+#: What replaces cleared content. Short, and honest about what happened , the
+#: model must be able to tell "this was dropped" from "this was empty".
+_CLEARED = "[Old tool result content cleared , re-run the tool if you need it again]"
+
+#: Below this many characters a result is not worth clearing.
+_MICROCOMPACT_MIN_CHARS = 400
+
+
+def _microcompact(session, keep: int = _MICROCOMPACT_KEEP) -> int:
+    """Clear stale tool-result CONTENT in place. Returns characters freed.
+
+    The cheap alternative to compaction, and it should be tried first.
+
+    Full compaction rewrites the conversation into a summary: it changes
+    message count, message order and message text, and everything downstream of
+    the first changed token has to be re-prefilled. Measured on this box, that
+    is the difference between a ~5.5s turn and a ~140s one.
+
+    Microcompaction changes none of that. Message count, roles and order stay
+    identical; only the BODY of tool results the run has moved past is
+    replaced. Those bodies are where context actually goes , one file read or
+    one `grep -r` is worth more characters than a dozen turns of dialogue , so
+    clearing them buys most of the room a compaction would, at a fraction of
+    the disruption, and it postpones the expensive event rather than
+    performing it.
+
+    What is never cleared: the most recent `keep` results (the ones the model
+    is still reasoning about), anything small enough not to matter, and any
+    tool not on the compactable list.
+    """
+    msgs = getattr(session, "messages", None) or []
+    idxs = [i for i, m in enumerate(msgs)
+            if m.get("role") == "tool"
+            and m.get("name") in _COMPACTABLE_TOOLS
+            and isinstance(m.get("content"), str)
+            and not m["content"].startswith(_CLEARED)
+            and len(m["content"]) >= _MICROCOMPACT_MIN_CHARS]
+    if len(idxs) <= keep:
+        return 0
+    freed = 0
+    for i in idxs[:-keep] if keep else idxs:
+        freed += len(msgs[i]["content"]) - len(_CLEARED)
+        msgs[i]["content"] = _CLEARED
+    if freed:
+        try:
+            import gb_dataflux
+            gb_dataflux.emit({
+                "kind": "agent_context_edit", "status": "ok",
+                "op": "microcompact",
+                "results_cleared": len(idxs) - keep,
+                "results_kept": keep,
+                "chars_freed": freed,
+            })
+        except Exception:
+            pass
+    return freed
+
+
+#: Idle gap after which the serving engine's KV cache for this conversation is
+#: assumed gone. Past it, editing history costs nothing that was not already
+#: lost , which turns the usual rule on its head: normally we protect the
+#: prefix, but there is no prefix left to protect.
+_COLD_CACHE_GAP_S = 600.0
+
+
+def microcompact_if_cold(session, last_turn_ts: float) -> int:
+    """Clear aggressively when the cache is already cold. Returns chars freed.
+
+    The expensive thing about editing history is losing cache reuse. After a
+    long idle gap there is no reuse left to lose, so this is the one moment
+    when clearing almost everything is free , and doing it here means the next
+    active stretch starts small instead of compacting under pressure mid-task.
+    """
+    import time as _t
+    if not last_turn_ts or (_t.time() - last_turn_ts) < _COLD_CACHE_GAP_S:
+        return 0
+    return _microcompact(session, keep=1)
+
+
 def _compress_context(
     session: "ConversationSession", settings: dict, force: bool = False,
     extra_tokens: int = 0,
@@ -266,9 +372,53 @@ def _compress_context(
         if (estimated + extra_tokens) < threshold:
             return
 
+    # Cheapest first. If clearing stale tool-result bodies gets the session
+    # back under threshold, the conversation is never rewritten at all , and a
+    # rewrite is the thing that costs a re-prefill.
+    if _microcompact(session) and not force:
+        if (_estimate_tokens(session) + extra_tokens) < threshold:
+            return
+
     keep_count   = 8
-    old_messages = session.messages[:-keep_count]
-    session.messages = session.messages[-keep_count:]
+    # Three regions, not two. `head` is pinned at the front and never moves;
+    # `tail` is the live recent context; only the middle is compacted. The
+    # previous shape sliced into two and then `insert(0, ...)`-ed the summary,
+    # which put freshly-generated text at token position zero on every single
+    # compaction , the worst possible placement for prefix reuse, because the
+    # engine's KV cache can only reuse tokens up to the first byte that
+    # changed. Measured over 14 days of this box's own sessions, a turn whose
+    # prefix was reused >=99% reached first token in ~5.5s; a turn in the
+    # 50-90% band took ~140s. Where the summary goes is worth minutes.
+    head = session.messages[:_HEAD_KEEP]
+    prior_memory = ""
+    for m in head:
+        if isinstance(m.get("content"), str) and m["content"].startswith(_MEMORY_MARKER):
+            head = []                     # degenerate: head IS a memory block
+            break
+    middle = session.messages[len(head):-keep_count]
+    # A memory block already in the middle is absorbed verbatim, so its bytes
+    # survive into the new block unchanged rather than being re-summarised
+    # into different words that invalidate the cache all over again.
+    kept_middle = []
+    for m in middle:
+        c = m.get("content")
+        if isinstance(c, str) and c.startswith(_MEMORY_MARKER):
+            prior_memory = c
+        elif isinstance(c, str) and c.startswith("[Structured memory loaded"):
+            continue
+        else:
+            kept_middle.append(m)
+    old_messages = kept_middle
+    if not old_messages and not prior_memory:
+        # force=True can fire on a session that's short in MESSAGE COUNT but
+        # still over threshold in TOKENS (e.g. one huge tool result) — but
+        # when there are fewer than keep_count messages total, there is
+        # nothing older than the kept tail to summarize. Injecting the
+        # "[Earlier conversation compressed]" pair here would GROW the
+        # session instead of compacting it (a real regression this exact
+        # early return exists to prevent).
+        return
+    tail = session.messages[-keep_count:]
 
     # Build structured memory from old messages:
     #   Files modified, architecture decisions, completed tasks, open TODOs,
@@ -345,10 +495,16 @@ def _compress_context(
         sections.append("## Notable Tool Outputs\n" + "\n".join(f"- {o}" for o in tool_outputs[:10]))
 
     if sections:
-        summary = (
-            "[Structured session memory — earlier conversation compacted]\n\n"
-            + "\n\n".join(sections)
-        )
+        new_block = "\n\n".join(sections)
+        if prior_memory:
+            # Append-only: the earlier block's bytes are reproduced exactly and
+            # the new material is added after them. A rewritten summary would
+            # change tokens the engine had already cached; an extended one only
+            # adds tokens after them, so everything before the extension point
+            # is still reusable.
+            summary = prior_memory.rstrip() + "\n\n" + new_block
+        else:
+            summary = _MEMORY_MARKER + "\n\n" + new_block
     else:
         # Fallback to simple pair summaries when nothing structured was extracted
         pair_parts: list[str] = []
@@ -367,13 +523,32 @@ def _compress_context(
                     j += 1
             else:
                 j += 1
-        summary = (
-            "[Earlier conversation compressed]\n\n"
-            + "\n\n".join(pair_parts)
-        )
+        body = "\n\n".join(pair_parts)
+        summary = (prior_memory.rstrip() + "\n\n" + body) if prior_memory else (
+            _MEMORY_MARKER + "\n\n" + body)
 
-    session.messages.insert(0, {"role": "user",      "content": summary})
-    session.messages.insert(1, {"role": "assistant",  "content": "[Structured memory loaded. Continuing task.]"})
+    # Reassemble in place: pinned head, then the memory block, then the live
+    # tail. The head's tokens are byte-identical to the previous request's, so
+    # the engine reuses them instead of re-prefilling from zero.
+    session.messages = list(head) + [
+        {"role": "user", "content": summary},
+        {"role": "assistant", "content": "[Structured memory loaded. Continuing task.]"},
+    ] + list(tail)
+
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({
+            "kind": "agent_context_edit",
+            "status": "ok",
+            "op": "compact",
+            "head_kept": len(head),
+            "middle_compacted": len(old_messages),
+            "tail_kept": len(tail),
+            "extended_prior": bool(prior_memory),
+            "summary_chars": len(summary),
+        })
+    except Exception:
+        pass
 
 
 def _auto_load_skills(user_input: str, settings: dict) -> str:

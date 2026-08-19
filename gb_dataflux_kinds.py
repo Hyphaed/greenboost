@@ -115,30 +115,164 @@ KINDS: dict[str, KindSpec] = {
     "bw_undetectable": KindSpec(
         group="synapse", doc="recommend()'s link-bandwidth probe could not determine feeder link speed.",
         incident_when=("warn",)),
+    "recipe_override": KindSpec(
+        group="synapse",
+        doc="A serving recipe's MEASURED value was discarded because the caller "
+            "passed an explicit one. The precedence is deliberate, but the "
+            "override used to be silent, and a measured value dropped without a "
+            "word is how a model that fits ends up spilling: live 2026-08-18, "
+            "greenboost-cli passed llamacpp_n_ctx=65536 from its config, the "
+            "recipe's measured 16384 was dropped, and a model that fits this "
+            "card at 16384 served with VRAM at 52.3% and 11.5 GB overflowing to "
+            "T2. `rule1_underfilled` caught the RESULT; nothing named the CAUSE. "
+            "Carries `field`, `recipe_value` and `caller_value`.",
+        incident_when=("warn",)),
+    "host_mem_pressure": KindSpec(
+        group="health",
+        doc="gb_supervisor._RamMonitor observed a host RAM/swap pressure "
+            "TRANSITION (ok/warn/critical). Distinct from GreenBoost's own T2 "
+            "pool accounting: CPU-offload streaming and any non-GreenBoost "
+            "consumer take ordinary system RAM the shim never sees. Exists "
+            "because this monitor already computed the state and wrote it only "
+            "to the journal and a status file — on 2026-08-18 it went critical "
+            "twice (MemAvailable 4044 MB = 6.6% of 61 GB, past its own 8% "
+            "floor) about ten minutes before the OOM killer killed a 27 GB "
+            "python3 and took the user's terminal with it, and nothing "
+            "downstream could see either warning. Pairs with the governed "
+            "segment host_oom_imminent. status: ok | warn | error(=critical).",
+        incident_when=("warn", "error")),
     "cpu_spillover": KindSpec(
         group="synapse", doc="gb_synapse_backends.py LlamaCppBackend.serve() put some of a "
                              "model's layers on the CPU instead of GPU (dense partial-offload, "
-                             "or an OOM retry backing off -ngl) — the state that used to be "
-                             "invisible to dataflux, root cause of the 2026-08-01 6 tok/s "
-                             "incident. status is one of dense_partial_offload/"
-                             "vram_fragmentation_oom_retry/compute_graph_oom_retry, all of "
+                             "an OOM retry backing off -ngl, or a recipe's nGpuLayers override "
+                             "asking for fewer than all layers on a dense model — NemoClaw "
+                             "audit Phase 5/7 follow-up, same gate applies regardless of "
+                             "whether the reduced layer count came from a live heuristic or a "
+                             "YAML file) — the state that used to be invisible to dataflux, "
+                             "root cause of the 2026-08-01 6 tok/s incident. status is one of "
+                             "dense_partial_offload/vram_fragmentation_oom_retry/"
+                             "compute_graph_oom_retry/recipe_dense_partial_offload, all of "
                              "which are the incident itself, not a side detail.",
         fields=("model", "engine"),
         numeric_fields=("weights_gb", "budget_gb", "n_gpu_layers", "n_layers"),
         incident_when=("dense_partial_offload", "vram_fragmentation_oom_retry",
-                       "compute_graph_oom_retry")),
+                       "compute_graph_oom_retry", "recipe_dense_partial_offload")),
     "tok_s_measured": KindSpec(
-        group="synapse", doc="Real, client-observed decode tokens/sec for one model.",
-        fields=("model",), numeric_fields=("tok_s",)),
+        group="synapse", doc="Real, client-observed decode tokens/sec for one model. "
+                             "completion_tokens (generation length) and prompt_tokens "
+                             "(KV depth decoded at) are optional and omitted when the "
+                             "caller didn't know them — absent is not zero. Without "
+                             "both, samples are duration- and depth-blind: a 3-token "
+                             "reply and a 600-token generation at opposite ends of the "
+                             "context window weigh the same.",
+        fields=("model", "completion_tokens", "prompt_tokens", "skip_reason"),
+        numeric_fields=("tok_s",)),
     "model_rotation": KindSpec(
         group="synapse", doc="gb_rotator.py overnight rotation phase event.",
         fields=("model", "phase")),
     "prompt_cache": KindSpec(
         group="synapse", doc="Proxy-observed llama.cpp host-memory prompt-cache "
                              "outcome for one request (--cache-reuse/--cache-ram): "
-                             "TTFT and the reused-vs-total prompt token share. "
+                             "TTFT, the engine's own prefill duration, and the "
+                             "reused-vs-total prompt token share at a known "
+                             "prompt depth. ttft_ms minus engine_prompt_ms is "
+                             "everything that is not prefill (queueing, proxy "
+                             "overhead, contention on the box). "
                              "Feeds GB-Semantics' ttft_ms/prompt_cache_hit_pct metrics.",
-        fields=("model",), numeric_fields=("ttft_ms", "hit_pct", "reused_tokens")),
+        fields=("model", "prompt_tokens"),
+        numeric_fields=("ttft_ms", "engine_prompt_ms", "hit_pct", "reused_tokens")),
+    "kv_quality": KindSpec(
+        group="synapse",
+        doc="GB-4: what quantizing the KV cache costs, measured rather than "
+            "assumed. `recall` is a NIAH score (secret codes planted at spread "
+            "depths and retrieved), NOT a smoke-gate pass , that distinction "
+            "is the point: quantized WEIGHTS fail by collapsing into "
+            "repetition, which a smoke gate catches, while quantized KV stays "
+            "fluent and quietly loses long-range retrieval, which only a "
+            "recall gate sees. `kv_gb` is what the setting actually costs in "
+            "VRAM, so the pair turns \"q8_0 is a budget config\" into a "
+            "number: how much VRAM it frees against how much recall it loses.",
+        fields=("kv_type", "kv_gb", "ctx", "recall", "found", "needles",
+                "niah_tokens"),
+        numeric_fields=("kv_gb", "recall", "found", "niah_tokens"),
+        sync_scope="host"),
+    "spec_decode": KindSpec(
+        group="synapse", doc="GB-6: what speculative decoding (the model's own "
+                             "MTP draft head) is actually paying at the depth "
+                             "being served. `draft_n` is the depth, "
+                             "`median_accept_rate` how often the engine kept a "
+                             "drafted token, `median_tok_s` the decode rate "
+                             "that produced. Depth is NON-monotonic on this "
+                             "class of model , deeper drafts get rejected more "
+                             "often and net out slower past a sweet spot , so "
+                             "the depth is chosen from a sweep, not by picking "
+                             "the largest. `accept_rate_source` names why a "
+                             "rate is absent (depth 0, or no draft head) "
+                             "rather than reporting it as zero.",
+        fields=("model", "draft_n", "accept_rate_source"),
+        numeric_fields=("median_tok_s", "mean_tok_s", "median_accept_rate", "samples")),
+    "cache_index": KindSpec(
+        group="synapse", doc="GB-1: which engine slot the proxy routed one "
+                             "conversation to, and why. `decision` is "
+                             "assigned/reassigned/pinned/pinned-edited; "
+                             "`changed_chunk` is the index of the first "
+                             "content-addressed chunk that differs from the "
+                             "previous turn (null = pure append, which must "
+                             "cost nothing), so a prompt_cache hit_pct drop is "
+                             "attributable to a specific edit instead of being "
+                             "a mystery. `conv` is a 16-char digest of the "
+                             "conversation head, never message text.",
+        fields=("model", "conv", "slot", "decision"),
+        numeric_fields=("chunks", "chunks_before", "changed_chunk", "n_slots", "tracked")),
+    "synapse_auth": KindSpec(
+        group="synapse", doc="gb_synapse_api.py's proxy (:11369) rejected a "
+                             "request with a missing/wrong Bearer token "
+                             "(GB_SYNAPSE_TOKEN or /etc/greenboost/synapse_token "
+                             "configured) — the audit trail for the auth gate "
+                             "that refuses a non-loopback bind with no token. "
+                             "Only rejections are emitted; a successful "
+                             "authenticated (or loopback, no-auth) request "
+                             "emits nothing here, same convention as gb_a2a.py.",
+        fields=("path", "peer"), incident_when=("rejected",)),
+    "allowlist_trust": KindSpec(
+        group="cluster", doc="Trusted root-config-file validation (TCB-U1) before honoring "
+                             "kernels.allow, cluster.conf, or synapse_token. decision is "
+                             "trusted|rejected_owner|rejected_mode|rejected_symlink|"
+                             "rejected_size|absent. Only rejections are emitted — a successful "
+                             "trust validation and the routine 'no file configured' absent case "
+                             "are both silent. Emitted from gb_synapse.py/gb_synapse_api.py's "
+                             "synapse_token resolution (_trust_validate_root_file). The C-side "
+                             "netd/netc checks on kernels.allow/cluster.conf fail closed and log "
+                             "loudly via netd_log(), but do not yet bridge into this dataflux "
+                             "kind — that bridge (tailing shim_stats or a similar mechanism) is "
+                             "a follow-up, not done this pass.",
+        fields=("path", "decision"), incident_when=(
+            "rejected_owner", "rejected_mode", "rejected_symlink", "rejected_size")),
+    "recipe_validate": KindSpec(
+        group="synapse", doc="gb_synapse.load_recipe()'s lookup of a serving recipe "
+                             "(NemoClaw audit, Phase 5e) for a model about to be "
+                             "served — status is valid|invalid. A model with no "
+                             "matching recipe file at all emits nothing here (no "
+                             "news when there's nothing to report, same convention "
+                             "as synapse_auth). An invalid recipe still lets serve() "
+                             "proceed via the heuristic path, but this event is the "
+                             "trace that a recipe existed and was rejected, rather "
+                             "than silently ignored.",
+        fields=("model", "path", "message"), incident_when=("invalid",)),
+    "serve_probe": KindSpec(
+        group="synapse", doc="gb_synapse.probe_serve_readiness_for()'s typed "
+                             "pre-serve probe suite (NemoClaw audit, Phase 5d) "
+                             "result for one step of one serve attempt — the "
+                             "closed-set failure reason (see serving/probe.py's "
+                             "PROBE_FAILURE_REASONS) instead of a bare crash log "
+                             "to interpret by hand. status is ok|<one of the "
+                             "closed-set reason strings>.",
+        fields=("model", "step", "reason"), incident_when=(
+            "gguf_unreadable", "gguf_malformed", "load_timeout", "load_crashed",
+            "health_unreachable", "health_unhealthy", "completion_timeout",
+            "completion_malformed", "completion_empty", "tool_call_unsupported",
+            "tool_call_malformed", "probe_aborted",
+        )),
 
     # ── cluster ──────────────────────────────────────────────────────────
     "node_topology": KindSpec(
@@ -266,6 +400,53 @@ KINDS: dict[str, KindSpec] = {
     "health_transition": KindSpec(
         group="health", doc="Reactive orchestrator health-state transition (thermal/ECC/clock).",
         incident_when=("warn",)),
+    "route_decision": KindSpec(
+        group="agent",
+        doc="gb_router picked a model for one turn. Records the turn class "
+            "(fast/deep), the model chosen and WHY, because a routing heuristic "
+            "nobody can audit is worse than none , without the reason recorded, "
+            "'the wrong model answered that' is unfalsifiable. The spread being "
+            "routed across is real: measured 2026-08-18 on one box, MoE with "
+            "expert offload 45.72 tok/s vs dense Qwen3.8-27B 2.7-3.5.",
+        fields=("turn_class", "model", "reason", "tool_result_chars")),
+    "turn_bench": KindSpec(
+        group="agent",
+        doc="One gb_bench_turn.py benchmark run , the before/after record every "
+            "inference-speed change is measured against. Splits a turn's cost "
+            "into real prefill (tokens the engine has never seen) and estimated "
+            "recurrent replay (re-running the recurrent layers over the whole "
+            "prompt, which this hybrid architecture pays on every turn even at a "
+            "99.9% KV hit rate). The replay figure is DERIVED, not read: the "
+            "engine reports one prompt_ms and never breaks it down.",
+        fields=("model", "n_turns", "median_prompt_ms", "median_replay_ms_est",
+                "median_decode_tok_s", "median_new_tokens")),
+    "semantic_transition": KindSpec(
+        group="health",
+        doc="A governed GB-Semantics segment changed verdict (matched/clear/"
+            "unknown). Emitted ON TRANSITION ONLY by gb_semantics_watch, so a "
+            "condition that stays true costs one event, not one per tick. "
+            "Exists because evaluate_segment() is a pull API and nothing asked: "
+            "on 2026-08-18 rule1_underfilled was matched while Rule #1's own "
+            "text requires a tripwire to fire on exactly that condition, and "
+            "weights_dont_fit_vram had been true for a whole session before "
+            "anyone looked. `from`/`to` carry the three-valued verdict , "
+            "`unknown` is tracked separately from `clear` because a telemetry "
+            "failure must never read as a clean bill of health.",
+        fields=("segment", "from", "to", "severity"),
+        incident_when=("error",)),
+    "serve_pause": KindSpec(
+        group="health",
+        doc="A serve session was paused (KV state saved to disk, engine stopped, "
+            "VRAM returned) or resumed (engine re-served, KV state restored). "
+            "Exists because an idle session holding most of the card is invisible "
+            "otherwise: measured 2026-08-18, ~10.4 GiB of a 12 GB card held at 0% "
+            "GPU utilization with nothing to show it. `action` is pause|resume; a "
+            "pause carries vram_freed_mb and tokens_saved, a resume carries "
+            "reload_s and restore_s so weight-loading cost is never confused with "
+            "KV-restore cost.",
+        fields=("model", "action", "tokens_saved", "vram_freed_mb",
+                "tokens_restored", "reload_s", "restore_s"),
+        incident_when=("error",)),
 
     # ── agent ──────────────────────────────────────────────────────────
     "actuation": KindSpec(
@@ -275,12 +456,111 @@ KINDS: dict[str, KindSpec] = {
         group="agent", doc="run_under_greenboost() subprocess lifecycle (started/ok/error).",
         fields=("run_id", "status")),
     "a2a_request": KindSpec(group="agent", doc="A2A JSON-RPC gateway request (verb, gated/dry-run, outcome)."),
+    "support_bundle": KindSpec(
+        group="agent", doc="Diagnostic support bundle collection result (path, sections collected, feeders queried, redaction status).",
+        fields=("path", "sections", "feeders"), incident_when=("error",)),
+    "agent_tool_schema_miss": KindSpec(
+        group="agent",
+        doc="greenboost-cli: the model called a tool by a name it was not "
+            "shown (AE-5). outcome is one of unknown_instrument (resolved to "
+            "nothing , the strongest hallucinated-tool signal), "
+            "rescued_bare_name (a bare MCP tool name the registry recovered "
+            "to its mcp__server__tool form), or rescued_other. This is the "
+            "measurement behind schema alignment: small models fail tool use "
+            "mainly by emitting pretraining-familiar names instead of the "
+            "provided schema, and a rename can only be judged against a "
+            "before/after rate.",
+        fields=("requested", "resolved", "outcome", "known_tools"),
+        numeric_fields=("known_tools",),
+        incident_when=("error",), sync_scope="host"),
+    "agent_memory_recall": KindSpec(
+        group="agent",
+        doc="greenboost-cli recalled project memory into a turn (AE-9/AE-10). "
+            "`rules` counts standing corrections (recalled unconditionally , "
+            "the ratchet that stops a mistake recurring), `scoped` counts "
+            "memories surfaced because the turn touched their subsystem. "
+            "`chars` is what recall spent of the context budget: memory that "
+            "grows without bound is memory that crowds out the conversation.",
+        fields=("n_items", "chars", "rules", "scoped"),
+        numeric_fields=("n_items", "chars", "rules", "scoped"),
+        sync_scope="host"),
+    "agent_prefix_shift": KindSpec(
+        group="agent",
+        doc="greenboost-cli's assembled prompt changed somewhere OTHER than "
+            "the trailing user turn (GB-1). `first_changed` names the earliest "
+            "chunk that moved (system/tools/history/memory/plan) , that chunk "
+            "invalidated every token after it, and reuse here is "
+            "all-or-nothing because --cache-reuse is rejected for this hybrid "
+            "architecture. Correlate with prompt_cache: a shift at `system` or "
+            "`tools` should be rare and is worth chasing, since the 14-day "
+            "baseline puts a lost prefix at ~166s time-to-first-token against "
+            "~5.5s for a kept one. A shift at `user` is normal and is never "
+            "emitted.",
+        fields=("first_changed", "changed", "stable_prefix_chars",
+                "invalidated_chars", "turns"),
+        numeric_fields=("stable_prefix_chars", "invalidated_chars", "turns"),
+        incident_when=("warn",), sync_scope="host"),
+    "agent_context_edit": KindSpec(
+        group="agent",
+        doc="greenboost-cli edited its conversation context. `op` is either "
+            "`microcompact` (cleared stale tool-result BODIES in place , "
+            "message count, roles and order all unchanged, so the served "
+            "prefix is untouched; `chars_freed`/`results_cleared` say how much "
+            "room it bought) or `compact` (rewrote history into a summary , "
+            "the expensive path microcompaction exists to postpone). For a "
+            "compact (AE-2), "
+            "head_kept is the pinned leading messages compaction never moves "
+            "(what preserves the engine's reusable KV prefix), "
+            "middle_compacted is how many were summarised, extended_prior is "
+            "True when the previous memory block's bytes were reproduced and "
+            "extended rather than rewritten. Correlate with prompt_cache: a "
+            "compaction followed by a hit_pct collapse means the prefix moved "
+            "when it should not have.",
+        fields=("op", "head_kept", "middle_compacted", "tail_kept",
+                "extended_prior", "summary_chars", "results_cleared",
+                "results_kept", "chars_freed"),
+        numeric_fields=("head_kept", "middle_compacted", "tail_kept",
+                        "summary_chars", "results_cleared", "chars_freed"),
+        sync_scope="host"),
+    "agent_eval_run": KindSpec(
+        group="agent",
+        doc="greenboost-cli agent benchmark result (AE-1). One event per "
+            "run of greenboost_cli.bench.agent_eval, scoring completion, "
+            "tool_selection, efficiency and grounding in [0,1]. The "
+            "before/after record any claim that a harness change helped has "
+            "to be checked against.",
+        fields=("overall", "completion", "tool_selection", "efficiency",
+                "grounding", "total_tokens", "model"),
+        numeric_fields=("overall", "completion", "tool_selection",
+                        "efficiency", "grounding", "total_tokens"),
+        sync_scope="host"),
+    "cli_tool_call": KindSpec(
+        group="agent", doc="greenboost-cli instruments/dispatcher.py's per-tool-call "
+                            "audit trail (NemoClaw audit, Phase 3): every dispatch() "
+                            "call emits one of these, allowed AND denied alike — a "
+                            "declined call must leave a trace, same as one that ran. "
+                            "decision is one of allowed|denied_policy|denied_user|"
+                            "blocked_hook. `args` is captured through "
+                            "instruments/capture.py's bounded_capture() (adapted from "
+                            "NemoClaw's nemoclaw_observability.py, see "
+                            "third_party/nemoclaw_patterns/NOTICE) — depth/size-bounded "
+                            "and credential-shaped-value redacted before it ever "
+                            "reaches this log.",
+        fields=("name", "decision", "agent", "args"), sync_scope="host"),
 
     # ── eval (model-quality verification gates) ───────────────────────
     "yarn_bake": KindSpec(group="eval", doc="gb_aviary YaRN context-extension bake result."),
     "niah_cert": KindSpec(group="eval", doc="gb_aviary needle-in-a-haystack quality certification result."),
     "smoke_gate": KindSpec(group="eval", doc="gb_aviary repetition-collapse smoke-gate result.",
-                           incident_when=("warn", "error")),
+                                   # 2026-08-18: gained turn_id / duration_ms / outcome. Before that the
+        # event said WHAT was called but not which turn it belonged to, how
+        # long it took, or whether it worked , so "where did this 14-minute
+        # turn go?" could only be answered by hand-reading the engine log.
+        # Span-shaped correlation is the idea from NemoClaw's trace.ts
+        # (trace_id / parent / duration_ms / status), carried on dataflux
+        # rather than a second telemetry system. outcome is
+        # ok|transient|semantic|denied, from handlers.classify_tool_failure.
+        incident_when=("warn", "error")),
 
     # ── bench (Speed Program Phase 0 measurement harness) ────────────────
     "bench_result": KindSpec(
@@ -293,6 +573,27 @@ KINDS: dict[str, KindSpec] = {
         fields=("path", "config_hash", "model"),
         numeric_fields=("bandwidth_gb_s", "prefill_tok_s", "decode_tok_s"),
         incident_when=("error",)),
+
+    # ── install ────────────────────────────────────────────────────────
+    "purge_action": KindSpec(
+        group="install", doc="greenboost_setup.sh's do_purge/_rmmod_with_retry/"
+                              "cmd_feed-stop PID-ownership proof (NemoClaw audit, "
+                              "Phase 2): the decision made about one candidate PID "
+                              "before a kill would have happened unconditionally. "
+                              "decision is one of stopped|skipped_foreign|"
+                              "skipped_no_match|failed — a purge that DECLINES to "
+                              "kill something must leave a trace, same as one that "
+                              "does, otherwise the next session re-diagnoses 'why "
+                              "is the port still bound' from nothing.",
+        fields=("target", "pid", "decision"), incident_when=("failed",),
+        sync_scope="host"),
+
+    # ── orchestration (advisories and decision-making) ──────────────────
+    "advisory": KindSpec(
+        group="orchestration",
+        doc="Structured advisory notice from gb_pilot, gb_dataflux, gb_mcp, or other orchestration layer (id, severity, phase, title, reason).",
+        fields=("advisory_id", "severity", "phase"),
+        incident_when=("blocking", "fatal")),
 }
 
 

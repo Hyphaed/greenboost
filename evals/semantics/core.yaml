@@ -97,12 +97,42 @@
   expect: {value: 4200.0}
   question: "What's the time-to-first-token for the current serve session?"
 
+- id: engine_prefill_ms_exact
+  kind: metric
+  name: engine_prefill_ms
+  source: fixture
+  expect: {value: 1350.0}
+  question: "How long did the engine itself spend on prefill?"
+
+- id: prompt_depth_tokens_exact
+  kind: metric
+  name: prompt_depth_tokens
+  source: fixture
+  expect: {value: 1333}
+  question: "How deep is the conversation the last sample was measured at?"
+
 - id: prompt_cache_hit_pct_exact
   kind: metric
   name: prompt_cache_hit_pct
   source: fixture
   expect: {value: 3.0}
   question: "What's the prompt-cache hit rate right now?"
+
+- id: slot_pin_rate_pct_from_window
+  kind: metric
+  name: slot_pin_rate_pct
+  source: fixture
+  # 1 of 2 events kept its slot ("pinned-edited" counts — the conversation DID
+  # come back to its own slot, it just also changed a chunk).
+  expect: {value: 50.0}
+  question: "How often are conversations getting the slot that still holds their cache?"
+
+- id: last_edit_chunk_names_the_chunk
+  kind: metric
+  name: last_edit_chunk
+  source: fixture
+  expect: {value: 2}
+  question: "Which part of the conversation changed on the last turn?"
 
 - id: feeder_items_exact
   kind: metric
@@ -128,6 +158,16 @@
   kind: metric
   name: t3_spill_active_mb
   source: live
+
+- id: t2_overflow_active_mb_structural
+  kind: metric
+  name: t2_overflow_active_mb
+  source: live
+  # Structural only: the resolver reads /run/greenboost/shim_stats directly, so
+  # the dataflux fixture harness cannot stage a value for it. The pressure-vs-
+  # overflow trap this metric exists to avoid is captured where it is
+  # enforceable: metrics.yaml's never_use (t2_pressure, t2_allocated_mb, each
+  # with its reason) and tests/test_gb_semantics_rule1_overflow.py.
 
 - id: served_ctx_structural
   kind: metric
@@ -329,3 +369,163 @@
   question: "is greenboost kernel module loaded"
   source: live
   expect: {governed: true, intent: kernel_module_state}
+
+# ── 2026-08-18 post-reboot audit additions ─────────────────────────────────
+# All `source: live` — each reads the actual box (running serve session,
+# nvidia-smi, NVML) rather than the frozen fixture, so the assertion is
+# structural: the resolver exists, runs, and returns a well-formed dict. That
+# is the regression class check_semantics_coverage.py cannot catch on its own.
+
+- id: weights_gb_structural
+  kind: metric
+  name: weights_gb
+  source: live
+
+- id: pcie_link_gen_current_structural
+  kind: metric
+  name: pcie_link_gen_current
+  source: live
+
+- id: idle_vram_held_gb_structural
+  kind: metric
+  name: idle_vram_held_gb
+  source: live
+
+- id: weights_dont_fit_vram_structural
+  kind: segment
+  name: weights_dont_fit_vram
+  source: live
+
+- id: pcie_link_degraded_under_load_structural
+  kind: segment
+  name: pcie_link_degraded_under_load
+  source: live
+
+- id: idle_serve_holding_vram_structural
+  kind: segment
+  name: idle_serve_holding_vram
+  source: live
+
+- id: recurrent_replay_ms_structural
+  kind: metric
+  name: recurrent_replay_ms
+  source: live
+
+- id: prefill_dominated_by_replay_structural
+  kind: segment
+  name: prefill_dominated_by_replay
+  source: live
+
+- id: inference_endpoint_is_local_structural
+  kind: metric
+  name: inference_endpoint_is_local
+  source: live
+
+- id: cloud_inference_in_use_structural
+  kind: segment
+  name: cloud_inference_in_use
+  source: live
+
+# ── 2026-08-18 manifest-wipe additions ──────────────────────────────────────
+# A Full Install purge resets the GB-Synapse manifest while leaving the HF
+# cache untouched, so downloaded weights become unservable and the CLI dies
+# with `no such model`. Happened three times on 2026-08-18. `source: live`
+# because both read the real model store — the assertion is structural: the
+# resolver runs and returns a well-formed dict rather than raising.
+
+- id: unregistered_cached_models_structural
+  kind: metric
+  name: unregistered_cached_models
+  source: live
+
+- id: models_wiped_from_manifest_structural
+  kind: segment
+  name: models_wiped_from_manifest
+  source: live
+
+# ── 2026-08-18 host-OOM additions ───────────────────────────────────────────
+# The OOM killer took the terminal twice this day (27.0 GB and 31.7 GB anon
+# RSS). greenboost.ko's T2 OOM guard had tripped ~10 min before each kill and
+# said so only in dmesg. These make that reachable through the governed layer.
+
+- id: host_mem_available_gb_structural
+  kind: metric
+  name: host_mem_available_gb
+  source: live
+
+- id: t2_oom_guard_state_structural
+  kind: metric
+  name: t2_oom_guard_state
+  source: live
+
+- id: host_oom_imminent_structural
+  kind: segment
+  name: host_oom_imminent
+  source: live
+
+# ── proxy memory (2026-08-19) ────────────────────────────────────────────
+# These read the ACTUAL box (is a gb_synapse_api process alive, and what is
+# its VmRSS against its RLIMIT_AS), so they are structural `live` entries:
+# the fixture cannot pin a process that may or may not be running. The
+# behaviour worth pinning is that all three degrade to "unknown" rather than
+# to "fine" when the proxy is absent , that is asserted in
+# tests/test_semantics_proxy_memory.py, where it can be made deterministic.
+- id: proxy_rss_mb_structural
+  kind: metric
+  name: proxy_rss_mb
+  source: live
+
+- id: proxy_mem_headroom_pct_structural
+  kind: metric
+  name: proxy_mem_headroom_pct
+  source: live
+
+- id: proxy_memory_near_cap_structural
+  kind: segment
+  name: proxy_memory_near_cap
+  source: live
+  question: "Is the gb-synapse proxy about to run out of memory?"
+
+# ── agent-evolution kinds (AE-*, 2026-08-19) ─────────────────────────────────
+# Structural `live` entries: these read the real dataflux log, whose agent_*
+# content depends on whether a benchmark or compaction has run on this box.
+# The behaviour worth pinning , that all of them degrade to "unknown" rather
+# than to a reassuring number when no event exists , is asserted
+# deterministically in tests/test_semantics_agent_metrics.py.
+- id: agent_eval_overall_structural
+  kind: metric
+  name: agent_eval_overall
+  source: live
+
+- id: agent_hallucinated_tool_pct_structural
+  kind: metric
+  name: agent_hallucinated_tool_pct
+  source: live
+
+- id: agent_compaction_prefix_kept_pct_structural
+  kind: metric
+  name: agent_compaction_prefix_kept_pct
+  source: live
+
+- id: agent_memory_recall_chars_structural
+  kind: metric
+  name: agent_memory_recall_chars
+  source: live
+
+- id: agent_compaction_broke_prefix_structural
+  kind: segment
+  name: agent_compaction_broke_prefix
+  source: live
+  question: "Did compaction throw away the prompt cache?"
+
+- id: agent_hallucinating_tool_names_structural
+  kind: segment
+  name: agent_hallucinating_tool_names
+  source: live
+  question: "Is the model making up tool names?"
+
+- id: agent_eval_below_reference_structural
+  kind: segment
+  name: agent_eval_below_reference
+  source: live
+  question: "Is the agent harness underperforming for this model size?"

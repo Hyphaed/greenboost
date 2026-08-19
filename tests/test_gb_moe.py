@@ -63,6 +63,318 @@ def test_int8_quant_dtype():
     assert scale.dtype == torch.float32
 
 
+# ── lossless expert compress/decompress round-trip (2026-08-10) ────────────
+#
+# Added alongside the fix replacing _rebalance()'s use of
+# gb_quant.quantize_module() (irreversible, lossy — see gb_moe.py's comment
+# above _lossless_compress_tensor for the full story) with
+# _demote_expert_module/_restore_expert_module. Unlike the int8 round-trip
+# above, which is explicitly tolerance-bounded (int8 quantization IS lossy
+# by design), everything here asserts EXACT equality — that's the entire
+# point of the fix, so a tolerance-based assertion here would silently
+# validate the wrong property.
+
+def test_lossless_tensor_roundtrip_bfloat16_exact():
+    """bfloat16 has no native numpy dtype — this is what makes
+    .view(torch.uint8) (not .numpy() directly) the correct approach; this
+    test would fail with a TypeError before reaching the assertion if that
+    weren't handled correctly."""
+    from gb_moe import _lossless_compress_tensor, _lossless_decompress_tensor
+    torch.manual_seed(0)
+    t = torch.randn(4, 8, dtype=torch.bfloat16)
+    is_compressed, payload, shape, dtype = _lossless_compress_tensor(t)
+    out = _lossless_decompress_tensor(is_compressed, payload, shape, dtype)
+    assert torch.equal(t, out), "lossless round-trip must be bit-exact, not approximate"
+    assert out.dtype == torch.bfloat16
+
+
+def test_lossless_tensor_roundtrip_float32_exact():
+    from gb_moe import _lossless_compress_tensor, _lossless_decompress_tensor
+    torch.manual_seed(1)
+    t = torch.randn(6, 12, dtype=torch.float32)
+    is_compressed, payload, shape, dtype = _lossless_compress_tensor(t)
+    out = _lossless_decompress_tensor(is_compressed, payload, shape, dtype)
+    assert torch.equal(t, out)
+
+
+def test_lossless_tensor_roundtrip_preserves_shape_and_dtype():
+    from gb_moe import _lossless_compress_tensor, _lossless_decompress_tensor
+    t = torch.randn(3, 5, 2, dtype=torch.float16)
+    is_compressed, payload, shape, dtype = _lossless_compress_tensor(t)
+    out = _lossless_decompress_tensor(is_compressed, payload, shape, dtype)
+    assert out.shape == t.shape
+    assert out.dtype == t.dtype
+
+
+def test_demote_then_restore_expert_module_is_bit_exact():
+    """The end-to-end claim: an expert demoted via _demote_expert_module and
+    later restored via _restore_expert_module comes back with EXACTLY the
+    same parameter values it had before — not int4/int8-degraded, unlike
+    the gb_quant.quantize_module() path this replaced (which had no restore
+    at all; promote() just moved the already-degraded module back).
+    """
+    from gb_moe import GbMoEManager, _BlockState
+    torch.manual_seed(2)
+    model = _MoEBlock(2)
+    tm = MagicMock()
+    with patch("gb_moe._vram_budget_ok", return_value=True):
+        mgr = GbMoEManager(model, tier_manager=tm)
+    mgr.attach()
+    st = mgr._blocks[0]
+    key, mod = st.experts[0]
+
+    original_params = {n: p.data.clone() for n, p in mod.named_parameters()}
+    entry_name = f"moe::{st.block_name}::{key}"
+
+    mgr._demote_expert_module(st, key, mod, entry_name)
+    # Demoted: real weights replaced with 1-element placeholders.
+    for n, p in mod.named_parameters():
+        assert p.data.numel() == 1, f"{n} should be a placeholder while cold"
+    assert key in st.lossless_bufs
+
+    mgr._restore_expert_module(st, key, mod, entry_name)
+    # Restored: every parameter must match its pre-demote value exactly.
+    for n, p in mod.named_parameters():
+        assert torch.equal(p.data, original_params[n]), f"{n} not bit-exact after restore"
+    assert key not in st.lossless_bufs
+
+
+def test_demote_records_compress_ratio_for_entropy_aware_placement():
+    """compress_ratio is the signal entropy-aware placement (rank eviction
+    by frequency * compress_ratio, not frequency alone — see
+    docs/research/spark-parity-survey.md Track 2.2 in ~/Dev/kernel_inference)
+    needs: a cheaper-to-refill (better-compressing) expert is a cheaper
+    eviction than an equally-cold, poorly-compressing one.
+    """
+    from gb_moe import GbMoEManager
+    model = _MoEBlock(2)
+    tm = MagicMock()
+    with patch("gb_moe._vram_budget_ok", return_value=True):
+        mgr = GbMoEManager(model, tier_manager=tm)
+    mgr.attach()
+    st = mgr._blocks[0]
+    key, mod = st.experts[0]
+    entry_name = f"moe::{st.block_name}::{key}"
+
+    mgr._demote_expert_module(st, key, mod, entry_name)
+    assert key in st.compress_ratio
+    assert 0.0 < st.compress_ratio[key] <= 1.0, "ratio must be a real fraction of original size"
+
+
+def test_restore_is_idempotent_on_already_hot_expert():
+    """Calling _restore_expert_module on an expert that was never demoted
+    (no lossless_bufs entry) must not raise and must still call
+    tm.promote() — matches the pre-existing pre-hook contract."""
+    from gb_moe import GbMoEManager
+    model = _MoEBlock(2)
+    tm = MagicMock()
+    with patch("gb_moe._vram_budget_ok", return_value=True):
+        mgr = GbMoEManager(model, tier_manager=tm)
+    mgr.attach()
+    st = mgr._blocks[0]
+    key, mod = st.experts[0]
+    entry_name = f"moe::{st.block_name}::{key}"
+
+    mgr._restore_expert_module(st, key, mod, entry_name)  # never demoted
+    tm.promote.assert_called_once_with(entry_name)
+
+
+def test_detach_restores_cold_experts_before_clearing_state():
+    """detach() must decompress any still-cold expert back to real weights
+    before clearing manager state — otherwise the model is left holding
+    1-element placeholders permanently after detach(), a materially worse
+    failure than the precision loss this whole fix addresses.
+    """
+    from gb_moe import GbMoEManager
+    torch.manual_seed(3)
+    model = _MoEBlock(2)
+    tm = MagicMock()
+    with patch("gb_moe._vram_budget_ok", return_value=True):
+        mgr = GbMoEManager(model, tier_manager=tm)
+    mgr.attach()
+    st = mgr._blocks[0]
+    key, mod = st.experts[0]
+    original_params = {n: p.data.clone() for n, p in mod.named_parameters()}
+    entry_name = f"moe::{st.block_name}::{key}"
+
+    mgr._demote_expert_module(st, key, mod, entry_name)
+    for n, p in mod.named_parameters():
+        assert p.data.numel() == 1  # confirm it's actually cold before detach
+
+    mgr.detach()
+
+    for n, p in mod.named_parameters():
+        assert torch.equal(p.data, original_params[n]), (
+            f"{n} left as a placeholder after detach() — data loss"
+        )
+
+
+# ── entropy-aware placement (spark-parity-survey.md Track 2.2) ─────────────
+
+def test_entropy_adjusted_threshold_defaults_to_base_when_never_demoted():
+    """No compression history yet (compress_ratio unset) must behave
+    identically to the pre-existing flat-threshold behavior — ratio
+    defaults to 1.0, so (2.0 - 1.0) == 1.0, no adjustment."""
+    from gb_moe import GbMoEManager, _BlockState
+    model = _MoEBlock(2)
+    with patch("gb_moe._vram_budget_ok", return_value=True):
+        mgr = GbMoEManager(model, tier_manager=MagicMock(), hot_threshold=0.1)
+    mgr.attach()
+    st = mgr._blocks[0]
+    key, _ = st.experts[0]
+    assert mgr._entropy_adjusted_threshold(st, key) == pytest.approx(0.1)
+
+
+def test_entropy_adjusted_threshold_raises_bar_for_compressible_expert():
+    """An expert that compresses well (low ratio, cheap to re-fetch) gets a
+    HIGHER hot-bar — it's allowed to stay cold more readily, freeing VRAM
+    budget for experts that are expensive to re-fetch."""
+    from gb_moe import GbMoEManager
+    model = _MoEBlock(2)
+    with patch("gb_moe._vram_budget_ok", return_value=True):
+        mgr = GbMoEManager(model, tier_manager=MagicMock(), hot_threshold=0.1)
+    mgr.attach()
+    st = mgr._blocks[0]
+    key, _ = st.experts[0]
+    st.compress_ratio[key] = 0.2  # compresses to 20% of original — cheap to evict
+    adjusted = mgr._entropy_adjusted_threshold(st, key)
+    assert adjusted > 0.1, "compressible expert should need a HIGHER freq bar to stay hot"
+    assert adjusted == pytest.approx(0.1 * 1.8)
+
+
+def test_entropy_adjusted_threshold_no_penalty_for_incompressible_expert():
+    """An incompressible expert (ratio ~1.0, expensive to re-fetch) gets no
+    adjustment — same treatment as an expert never yet demoted."""
+    from gb_moe import GbMoEManager
+    model = _MoEBlock(2)
+    with patch("gb_moe._vram_budget_ok", return_value=True):
+        mgr = GbMoEManager(model, tier_manager=MagicMock(), hot_threshold=0.1)
+    mgr.attach()
+    st = mgr._blocks[0]
+    key, _ = st.experts[0]
+    st.compress_ratio[key] = 1.0
+    assert mgr._entropy_adjusted_threshold(st, key) == pytest.approx(0.1)
+
+
+def test_rebalance_uses_entropy_adjusted_threshold():
+    """End-to-end: _rebalance() must actually consult
+    _entropy_adjusted_threshold, not the flat self.hot_threshold, when
+    deciding hot/cold for a previously-demoted (and thus ratio-tracked)
+    expert.
+    """
+    from gb_moe import GbMoEManager
+    model = _MoEBlock(2)
+    tm = MagicMock()
+    with patch("gb_moe._vram_budget_ok", return_value=True):
+        mgr = GbMoEManager(model, tier_manager=tm, hot_threshold=0.5,
+                           hysteresis_margin=0.0)
+    mgr.attach()
+    st = mgr._blocks[0]
+    key, mod = st.experts[0]
+
+    # Give this expert a very compressible history — its effective bar
+    # becomes hot_threshold * 1.8 = 0.9, well above a freq_norm of 0.6,
+    # which alone would clear the flat 0.5 threshold. freq sums to 1.0 so
+    # norm[0] == 0.6 directly, no normalization surprise.
+    st.compress_ratio[key] = 0.2
+    st.hot.discard(key)
+    st.freq = torch.tensor([0.6, 0.4])
+
+    mgr._rebalance(st)
+
+    assert key not in st.hot, (
+        "a highly-compressible expert at freq_norm=0.6 should stay cold "
+        "under the entropy-adjusted bar (0.9), even though 0.6 would "
+        "clear the flat hot_threshold (0.5) alone"
+    )
+
+
+# ── MTP predictive-prefetch oracle (optional, off by default) ──────────────
+
+def test_mtp_predicted_indices_returns_empty_when_no_oracle_configured():
+    """Default (mtp_oracle=None) must behave byte-identically to before
+    this feature existed — an empty set, unioned with the historical
+    top-n, changes nothing."""
+    from gb_moe import GbMoEManager
+    model = _MoEBlock(2)
+    with patch("gb_moe._vram_budget_ok", return_value=True):
+        mgr = GbMoEManager(model, tier_manager=MagicMock())
+    assert mgr.mtp_oracle is None
+    assert mgr._mtp_predicted_indices("block0", torch.randn(4), 2) == set()
+
+
+def test_mtp_predicted_indices_returns_empty_when_gate_output_none():
+    """Even with an oracle configured, no gate_output (the default for any
+    caller that doesn't pass one) means no call is made."""
+    from gb_moe import GbMoEManager
+    model = _MoEBlock(2)
+    oracle = MagicMock(return_value=[0])
+    with patch("gb_moe._vram_budget_ok", return_value=True):
+        mgr = GbMoEManager(model, tier_manager=MagicMock(), mtp_oracle=oracle)
+    assert mgr._mtp_predicted_indices("block0", None, 2) == set()
+    oracle.assert_not_called()
+
+
+def test_mtp_predicted_indices_calls_oracle_and_filters_out_of_range():
+    """Oracle predictions outside [0, num_experts) must be dropped — a
+    misbehaving or model-mismatched oracle can't corrupt indexing
+    downstream (_restore_expert_slice/_restore_expert_module index
+    directly into real tensors/dicts)."""
+    from gb_moe import GbMoEManager
+    model = _MoEBlock(4)
+    oracle = MagicMock(return_value=[0, 2, 99, -5])
+    with patch("gb_moe._vram_budget_ok", return_value=True):
+        mgr = GbMoEManager(model, tier_manager=MagicMock(), mtp_oracle=oracle)
+    gate_output = torch.randn(4)
+    result = mgr._mtp_predicted_indices("block0", gate_output, 4)
+    oracle.assert_called_once_with("block0", gate_output)
+    assert result == {0, 2}
+
+
+def test_mtp_predicted_indices_swallows_oracle_exceptions():
+    """A raising oracle must never propagate — this is a predictive hint,
+    not a correctness dependency (see __init__ docstring)."""
+    from gb_moe import GbMoEManager
+    model = _MoEBlock(2)
+    oracle = MagicMock(side_effect=RuntimeError("boom"))
+    with patch("gb_moe._vram_budget_ok", return_value=True):
+        mgr = GbMoEManager(model, tier_manager=MagicMock(), mtp_oracle=oracle)
+    assert mgr._mtp_predicted_indices("block0", torch.randn(2), 2) == set()
+
+
+def test_prefetch_next_unions_mtp_prediction_with_historical_topn():
+    """End-to-end: _prefetch_next must widen its restore set to include an
+    MTP-predicted expert the historical top-n alone would have missed.
+    """
+    from gb_moe import GbMoEManager
+    model = nn.Sequential(_MoEBlock(4), _MoEBlock(4))
+    tm = MagicMock()
+    # Oracle always predicts expert 3 — deliberately NOT the historically
+    # hottest one (freq below), so its presence in the restore set proves
+    # the union actually happened, not just history alone.
+    oracle = MagicMock(return_value=[3])
+    with patch("gb_moe._vram_budget_ok", return_value=True):
+        mgr = GbMoEManager(model, tier_manager=tm, prefetch_topn=1, mtp_oracle=oracle)
+    mgr.attach()
+    if len(mgr._blocks) < 2:
+        pytest.skip("model has fewer than 2 MoE blocks")
+    st0, nxt = mgr._blocks[0], mgr._blocks[1]
+    nxt.freq = torch.tensor([0.0, 0.0, 1.0, 0.0])  # expert 2 is historically hottest
+    entry_2 = MagicMock(); entry_2.tier = "T2_DDR"
+    entry_3 = MagicMock(); entry_3.tier = "T2_DDR"
+    tm._entries = {
+        f"moe::{nxt.block_name}::2": entry_2,
+        f"moe::{nxt.block_name}::3": entry_3,
+    }
+
+    with patch("gb_moe._vram_budget_ok", return_value=True):
+        mgr._prefetch_next(st0, gate_output=torch.randn(4))
+
+    oracle.assert_called_once()
+    assert "2" in nxt.hot, "historically-hottest expert should still be restored"
+    assert "3" in nxt.hot, "MTP-predicted expert should ALSO be restored via the union"
+
+
 # ── _find_moe_blocks ──────────────────────────────────────────────────────────
 
 class _DummyExpertMLP(nn.Module):
@@ -1145,7 +1457,17 @@ def test_attach_skips_batched_block_with_zero_experts():
 
 
 def test_make_pre_hook_promotes_cold_entry():
-    """Pre-hook calls tm.promote() when an entry exists but is not T1_HBM."""
+    """Pre-hook calls tm.promote() when an entry exists but is not T1_HBM.
+
+    2026-08-10: _make_pre_hook now also takes (st, key, mod) so it can
+    decompress a lossless-demoted expert (_restore_expert_module) before
+    promoting, not just flip tier bookkeeping — see gb_moe.py's comment on
+    the pre-hook and the _demote_expert_module/_restore_expert_module pair
+    that replaced the old irreversible gb_quant.quantize_module() demote.
+    Since this expert was never actually demoted here (st.lossless_bufs is
+    empty), _restore_expert_module's buf-is-None branch runs, which still
+    calls tm.promote(entry_name) exactly as before — same assertion holds.
+    """
     from gb_moe import GbMoEManager
     model = _MoEBlock(2)
     tm = MagicMock()
@@ -1155,15 +1477,19 @@ def test_make_pre_hook_promotes_cold_entry():
 
     # Simulate a cold entry for expert 0
     entry_name = "moe::::0"   # _MoEBlock has no name when top-level
+    target_st = mgr._blocks[0]
     for name, st in [(s.block_name, s) for s in mgr._blocks]:
         entry_name = f"moe::{name}::0"
+        target_st = st
+    key, mod = next((k, m) for k, m in target_st.experts if k == "0")
     entry = MagicMock()
     entry.tier = "T2_DDR"
     tm._entries = {entry_name: entry}
 
-    hook = mgr._make_pre_hook(entry_name)
+    hook = mgr._make_pre_hook(target_st, key, mod, entry_name)
     hook(None, None)  # fire the pre-hook
     tm.promote.assert_called_once_with(entry_name)
+    assert key in target_st.hot
 
 
 def test_batched_hook_skips_non_tensor_output():
@@ -1346,14 +1672,30 @@ def test_prefetch_next_skips_when_budget_not_ok():
         mgr._prefetch_next(st0)  # must not raise, cold path skipped
 
 
-def test_prefetch_next_dispatches_to_transfer_stream():
-    """_prefetch_next() calls gb_stream_sched.on('transfer') for cold experts in next block (lines 584-594)."""
-    import sys, types
+def test_prefetch_next_restores_cold_experts_losslessly():
+    """_prefetch_next() must promote cold experts in the next block through
+    _restore_expert_module (-> self.tm.promote()), not a bare
+    mod.to("cuda") + tier flip.
+
+    2026-08-10: previously this called gb_stream_sched.on("transfer")
+    directly and flipped entry.tier by hand. That was WRONG once
+    _demote_expert_module exists: a cold expert's parameters may be
+    1-element placeholders (their real weights compressed off into
+    st.lossless_bufs), so moving them to CUDA as-is and marking the entry
+    T1_HBM would silently hand the model placeholder weights for real
+    compute — AND the pre-hook safety net would see tier==T1_HBM and skip
+    restoring, since it only checks tier, not whether the data is real.
+    _restore_expert_module decompresses first; ModelTierManager.promote()
+    (already tested elsewhere) owns the actual transfer-stream dispatch,
+    so this test asserts against tm.promote(), the correct integration
+    point, instead of reaching into gb_stream_sched directly.
+    """
     from gb_moe import GbMoEManager
 
     model = nn.Sequential(_MoEBlock(3), _MoEBlock(3))
+    tm = MagicMock()
     with patch("gb_moe._vram_budget_ok", return_value=True):
-        mgr = GbMoEManager(model, tier_manager=MagicMock())
+        mgr = GbMoEManager(model, tier_manager=tm)
     mgr.attach()
 
     if len(mgr._blocks) < 2:
@@ -1369,16 +1711,54 @@ def test_prefetch_next_dispatches_to_transfer_stream():
 
     cold_entry = MagicMock()
     cold_entry.tier = "T2_DDR"
-    mgr.tm._entries = {entry_name: cold_entry}
+    tm._entries = {entry_name: cold_entry}
 
-    ctx_mock = MagicMock()
-    ctx_mock.__enter__ = MagicMock(return_value=None)
-    ctx_mock.__exit__ = MagicMock(return_value=False)
-    gs_mock = MagicMock()
-    gs_mock.on.return_value = ctx_mock
-
-    with patch("gb_moe._vram_budget_ok", return_value=True), \
-         patch.dict(sys.modules, {"gb_stream_sched": gs_mock}):
+    with patch("gb_moe._vram_budget_ok", return_value=True):
         mgr._prefetch_next(st0)
 
-    gs_mock.on.assert_called_with("transfer")
+    tm.promote.assert_called_with(entry_name)
+    assert key in nxt.hot
+
+
+def test_prefetch_next_decompresses_lossless_demoted_expert():
+    """End-to-end: an expert actually demoted via _demote_expert_module
+    (real 1-element placeholder + compressed buffer, not a MagicMock
+    stand-in) must come back with its exact original weights after
+    _prefetch_next picks it as the top prediction — this is the scenario
+    the bug above would have silently corrupted.
+    """
+    from gb_moe import GbMoEManager
+    torch.manual_seed(4)
+
+    model = nn.Sequential(_MoEBlock(3), _MoEBlock(3))
+    tm = MagicMock()
+    with patch("gb_moe._vram_budget_ok", return_value=True):
+        mgr = GbMoEManager(model, tier_manager=tm)
+    mgr.attach()
+    if len(mgr._blocks) < 2:
+        pytest.skip("model has fewer than 2 MoE blocks")
+
+    st0 = mgr._blocks[0]
+    nxt = mgr._blocks[1]
+    key, mod = nxt.experts[0]
+    entry_name = f"moe::{nxt.block_name}::{key}"
+    original_params = {n: p.data.clone() for n, p in mod.named_parameters()}
+
+    mgr._demote_expert_module(nxt, key, mod, entry_name)
+    nxt.hot.discard(key)
+    for n, p in mod.named_parameters():
+        assert p.data.numel() == 1  # confirm real demotion happened
+
+    nxt.freq = torch.tensor([1.0, 0.0, 0.0])[:nxt.freq.numel()]
+    cold_entry = MagicMock()
+    cold_entry.tier = "T2_DDR"
+    tm._entries = {entry_name: cold_entry}
+
+    with patch("gb_moe._vram_budget_ok", return_value=True):
+        mgr._prefetch_next(st0)
+
+    for n, p in mod.named_parameters():
+        assert torch.equal(p.data, original_params[n]), (
+            f"{n} still a placeholder (or wrong) after prefetch — this is "
+            "exactly the corruption a bare mod.to('cuda') would cause"
+        )

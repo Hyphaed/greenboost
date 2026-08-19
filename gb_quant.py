@@ -63,6 +63,8 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from gb_phase_activity import mark_phase_activity
+
 # GreenBoost layer bootstrap , patches empty_cache, starts telemetry singleton,
 # wires stream scheduler + tier manager + mem pools.  No-op when not active.
 try:
@@ -573,6 +575,13 @@ class QualityFitReport:
     # "greedy" (default per-layer ladder walk) or "dp" (GB_QUANT_DP_PLAN=1 ,
     # global budget-constrained knapsack, see gb_quant_dp.plan_bits_dp).
     planner: str = "greedy"
+    # missing_features.md item (j): bytes assigned per gb_quant_roles.ROLES
+    # component (ssm/mtp/norm/embed/output/attn/ffn/other) + that role's
+    # configured floor bits (None = no floor). Always populated for
+    # visibility, regardless of which planner ran; the floor is only
+    # actually ENFORCED (excluded from the DP planner's candidate search)
+    # when GB_QUANT_DP_PLAN=1 — see plan_quality()'s DP branch.
+    role_breakdown: Dict[str, Dict] = field(default_factory=dict)
 
     def __str__(self) -> str:
         hist_str = "  ".join(
@@ -1203,8 +1212,9 @@ def quantize_to_fit(obj, budget_gb: "float | None" = None, device: str = "cuda",
         if verbose:
             print(f"[gb_quant] quantizing {plan.name} -> "
                   f"{_bits_tag(plan.bits)} ...", flush=True)
-        quantize_module(name_to_module[plan.name], bits=plan.bits, device=device,
-                        dtype=dtype, group_size=group_size)
+        with mark_phase_activity(f"quantizing {plan.name} -> {_bits_tag(plan.bits)}"):
+            quantize_module(name_to_module[plan.name], bits=plan.bits, device=device,
+                            dtype=dtype, group_size=group_size)
     # Move the small BF16-kept components (e.g. VAE) to the GPU last.
     for plan in report.components:
         if plan.bits != 16:
@@ -1400,13 +1410,33 @@ def plan_quality(module: "torch.nn.Module",
     # against (every layer already goes to the floor), so DP is skipped
     # there regardless of the env var , nothing to optimize.
     planner_used = "greedy"
+    # Role classification (missing_features.md item (j)) , always computed,
+    # not just under the DP planner, so role_breakdown below reflects
+    # whichever planner actually ran (see QualityFitReport.role_breakdown).
+    try:
+        from gb_quant_calib import layer_roles
+        roles_map = layer_roles(module, skip_modules)
+    except Exception:
+        roles_map = {}
     if target != "compact" and os.environ.get("GB_QUANT_DP_PLAN") == "1" and per_layer_bits:
         try:
             import gb_quant_dp
+            import gb_quant_roles
             candidates = tuple(
                 b for b in profile.calibrated_precisions if b != 16) + (16,)
             excluded = {n: (4,) for n, in_f in layer_in_features.items()
                        if in_f % group_size != 0}
+            # Role floors: protect quantization-sensitive components
+            # (recurrent/SSM, the MTP draft head) regardless of what a flat
+            # per-layer error proxy alone would suggest — merged into the
+            # SAME excluded dict the group-size fallback above already
+            # populates, no gb_quant_dp core change needed.
+            for n in per_layer_bits:
+                role = roles_map.get(n, "other")
+                bad_bits = tuple(b for b in candidates
+                                 if not gb_quant_roles.meets_floor_bits(b, role))
+                if bad_bits:
+                    excluded[n] = tuple(set(excluded.get(n, ())) | set(bad_bits))
             dp_result = gb_quant_dp.plan_bits_dp(
                 sensitivity, {n: layer_sizes[n] for n in per_layer_bits},
                 _BYTES_PER_PARAM, budget_gb=t1_budget_gb + t2_budget_gb,
@@ -1453,6 +1483,20 @@ def plan_quality(module: "torch.nn.Module",
         k = _bits_tag(bits)
         hist[k] = hist.get(k, 0) + 1
 
+    # Per-role byte breakdown (missing_features.md item (j)) , bytes actually
+    # assigned per component, whichever planner produced per_layer_bits.
+    import gb_quant_roles
+    role_bytes: Dict[str, float] = {}
+    for name, bits in per_layer_bits.items():
+        role = roles_map.get(name, "other")
+        n = layer_sizes.get(name, 0)
+        gb = n * _BYTES_PER_PARAM.get(bits, 2.0) / 2 ** 30
+        role_bytes[role] = role_bytes.get(role, 0.0) + gb
+    role_breakdown = {
+        role: {"bytes_gb": round(b, 3), "floor_bits": gb_quant_roles.ROLE_FLOORS_BITS.get(role)}
+        for role, b in role_bytes.items()
+    }
+
     report = QualityFitReport(
         target=target,
         per_layer_bits=per_layer_bits,
@@ -1463,6 +1507,7 @@ def plan_quality(module: "torch.nn.Module",
         max_rel_err=round(max_err, 5),
         precision_histogram=hist,
         planner=planner_used,
+        role_breakdown=role_breakdown,
     )
     if verbose:
         print(str(report), flush=True)
@@ -1477,6 +1522,7 @@ def plan_quality(module: "torch.nn.Module",
             "bf16_kept": hist.get("bf16", 0),
             "mean_rel_err": round(mean_err, 5), "max_rel_err": round(max_err, 5),
             "planner": planner_used,
+            "role_breakdown": role_breakdown,
         })
     except Exception:
         pass

@@ -1,5 +1,67 @@
 # GreenBoost Changelog
 
+## v3.4 : 2026-08-18
+
+GreenBoost's reference coding model changed to 
+[`Qwen3.8-27B-Cold-Fusion-MTP-IQ4_XS`](https://huggingface.co/DavidAU)
+
+### GB-CLI
+
+GB-CLI is now much more resilient and easier to recover.
+
+You can pause and resume models, reclaim VRAM, and let plans execute automatically.
+
+The terminal now shows what action is running and what the hardware is doing.
+
+It also survives `/exit`, Ctrl-C, and crashes without leaving memory behind.
+
+### Proxy reliability
+
+The proxy can no longer consume unlimited system memory. It now has a hard memory limit based on host RAM.
+
+If it reaches that limit, the affected request fails instead of taking down the whole machine.
+
+We also added automatic memory diagnostics to identify what is consuming RAM when usage gets too high.
+
+The main memory leak was found and fixed: an internal event cache was growing forever.
+
+The cache is now bounded and automatically removes obsolete entries.
+
+Idle proxy memory growth went from **~10.7 MB/s to 0 MB/s**.
+
+If the proxy dies, the supervisor now automatically cleans up the engine so the GPU can recover.
+
+Health checks now correctly report a proxy outage instead of falsely reporting the system as healthy.
+
+### Better diagnostics
+
+GB-Semantics can now answer questions such as **“Is the proxy running out of memory?”** and report available headroom.
+
+Diagnostics now distinguish proxy memory from overall machine memory, avoiding misleading results such as “the machine has plenty of RAM” when the proxy itself is capped.
+
+Several diagnostic bugs were also fixed, including false process matches and broken `MemoryError` detection.
+
+### Better agent behavior
+
+Tool failures are now more actionable, with suggestions for how to recover.
+
+Trying to read a directory suggests `ls` or `Glob`.
+
+Missing files can now produce useful near-match suggestions.
+
+Edit failures distinguish between **“the file exists but the text differs”** and **“the file doesn't exist.”**
+
+Tool errors are classified as **successful, temporary, semantic, or denied**, so transient failures don't trigger the same safeguards as real errors.
+
+### Better visibility
+
+Tool calls now record their **turn, duration, and outcome**, making long-running turns much easier to investigate.
+
+The CLI also surfaces unanswered questions when a turn ends with a question but `AskUserQuestion` wasn't used.
+
+Overall, GB-CLI is now **safer under failure, easier to diagnose, and better at recovering automatically**—with the proxy's runaway memory leak fixed and safeguards in place to prevent similar failures from taking down the machine.
+
+
 ## v3.3 : 2026-08-02
 
 GreenBoost's reference coding model changed to

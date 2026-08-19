@@ -377,7 +377,7 @@ async def health(request: web.Request) -> web.Response:
 async def models(request: web.Request) -> web.Response:
     """GET /v1/models — this backend was the one of the 4 gb-synapse
     backends missing it entirely (gb_diffusion_server.py has the same
-    route), so `:11435/v1/models` 404s exactly when the transformers
+    route), so `:11369/v1/models` 404s exactly when the transformers
     fallback is the last-resort backend actually serving."""
     return web.json_response({"object": "list", "data": [{"id": MODEL_NAME, "object": "model"}]})
 

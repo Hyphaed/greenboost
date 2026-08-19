@@ -23,6 +23,10 @@ DEFAULT_SETTINGS: dict = {
     # Context compaction thresholds (fractions of context_window):
     #   0.75 → soft start (48K of 64K): compact oldest history into structured memory
     #   0.875 → aggressive (56K of 64K): more aggressive compaction
+    # Plan mode hands straight to implementation once the plan file is
+    # written. Typing "implement the plan" carried no decision — the plan
+    # was already on disk and the user asked for it by entering plan mode.
+    "plan_auto_implement":    True,
     "auto_compact_pct":       0.75,
     "auto_compact_hard_pct":  0.875,
     "permission_mode": "auto",    # auto | accept-all | manual
@@ -151,7 +155,7 @@ def _probe_synapse_slots_ctx() -> int:
     must never make a hung server stall the REPL."""
     try:
         import httpx
-        port = os.environ.get("GB_SYNAPSE_PORT", "11435")
+        port = os.environ.get("GB_SYNAPSE_PORT", "11369")
         r = httpx.get(f"http://127.0.0.1:{port}/slots", timeout=0.5)
         if r.status_code == 200:
             slots = r.json()

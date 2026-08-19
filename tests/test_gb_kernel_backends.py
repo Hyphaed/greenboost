@@ -134,7 +134,7 @@ def test_scaled_mm_from_linear_packs_fp8_on_cpu():
     assert impl.bias_t is not None
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="fp8 GEMM needs CUDA")
+@pytest.mark.gpu
 def test_scaled_mm_forward_matches_bf16_reference():
     torch.manual_seed(0)
     lin = nn.Linear(256, 128, bias=True).cuda().to(torch.bfloat16)

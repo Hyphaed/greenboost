@@ -6,7 +6,7 @@ gb_rotator.py — sequential model-rotation runner for overnight autonomy.
 
 A 12+8 GB cluster serves ONE model at a time; multi-model overnight work is
 therefore a rotation, not a scheduler: serve model → run the pipeline that
-consumes it (via the gb-synapse Ollama-compatible endpoint, default :11435)
+consumes it (via the gb-synapse Ollama-compatible endpoint, default :11369)
 → unload → next. This module is that rotation, dataflux-recorded end to end
 so the whole night is followable through the dataflux MCP (`dataflux_models`).
 
@@ -43,6 +43,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gb_dataflux  # noqa: E402
+import gb_ports  # noqa: E402
 
 MAX_CONSECUTIVE_FAILURES = 3
 
@@ -50,18 +51,13 @@ MAX_CONSECUTIVE_FAILURES = 3
 def _candidate_urls() -> list[str]:
     """Priority order for the Ollama-compatible endpoint this rotation talks
     to: an explicit FORGE_OLLAMA_URL override, then gb-synapse's own proxy
-    port (GB_SYNAPSE_PORT, default 11435), then raw Ollama's legacy :11434
+    port (GB_SYNAPSE_PORT, default 11369), then raw Ollama's legacy :11434
     as a last-resort fallback for a box still mid-migration off it."""
     urls = []
     env = os.environ.get("FORGE_OLLAMA_URL")
     if env:
         urls.append(env.rstrip("/"))
-    try:
-        import gb_synapse
-        port = gb_synapse.DEFAULT_PORT
-    except Exception:
-        port = int(os.environ.get("GB_SYNAPSE_PORT", "11435"))
-    synapse_url = f"http://127.0.0.1:{port}"
+    synapse_url = f"http://127.0.0.1:{gb_ports.SYNAPSE_PORT}"
     if synapse_url not in urls:
         urls.append(synapse_url)
     if "http://127.0.0.1:11434" not in urls:
@@ -84,12 +80,7 @@ def _resolve_ollama_url() -> "str | None":
     (backed by gb_synapse.ps()), but /health remains the more direct signal
     and doesn't depend on a model name being resolvable. Raw Ollama has no
     /health endpoint, so the legacy :11434 fallback still uses /api/ps."""
-    try:
-        import gb_synapse
-        synapse_port = gb_synapse.DEFAULT_PORT
-    except Exception:
-        synapse_port = int(os.environ.get("GB_SYNAPSE_PORT", "11435"))
-    synapse_url = f"http://127.0.0.1:{synapse_port}"
+    synapse_url = f"http://127.0.0.1:{gb_ports.SYNAPSE_PORT}"
 
     for url in _candidate_urls():
         probe = "/health" if url == synapse_url else "/api/ps"

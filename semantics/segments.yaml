@@ -104,3 +104,154 @@
   evaluator: gaming_inference_contention
   reads: [gaming_session_active, t2_pressure_fraction]
   severity: diagnosis
+
+- name: weights_dont_fit_vram
+  doc: >
+    The served model's weights alone exceed physical VRAM, so whatever does
+    not fit crosses PCIe on every forward pass and caps decode regardless of
+    tuning. A capacity FACT, not a fault , the fix is a model/quant/ctx
+    choice, and Rule #1 is not being violated (the tiering layer is doing
+    exactly its job). Exists because nothing in the governed layer said this
+    out loud: measured 2026-08-18, 15.86 GB of weights against 12227 MiB of
+    VRAM at 2.7-3.5 tok/s, arithmetic that predicts the measurement almost
+    exactly, while the operator was shown five n=3 tok_s_drop advisories
+    instead.
+  evaluator: weights_dont_fit_vram
+  reads: [weights_gb, vram_fill_pct]
+  severity: diagnosis
+
+- name: pcie_link_degraded_under_load
+  doc: >
+    The PCIe link is below its ceiling WHILE the GPU is genuinely busy , the
+    only condition under which a gen comparison means anything, since an idle
+    card downtrains its link by design. Returns matched=None (cannot tell)
+    rather than false when the GPU is idle or utilization is unreadable.
+    Distinct from the `pcie_degraded` dataflux event, which samples once at
+    telemetry init and produced 13 false positives on this box.
+  evaluator: pcie_link_degraded_under_load
+  reads: [pcie_link_gen_current]
+  severity: warning
+
+- name: idle_serve_holding_vram
+  doc: >
+    A serve session is holding a significant share of the card while doing no
+    work. NOT a fault , keeping weights resident is exactly why the next
+    request is fast, and usually the right trade. It is a finding only when the
+    operator wants the card back (a game, a training run, a different model)
+    and has nothing telling them the memory is reclaimable without losing the
+    conversation. Actionable: `gb synapse pause <model>` saves the KV state and
+    returns the VRAM; `resume` restores it (measured 740 ms save / 537 ms
+    restore for 54,377 tokens).
+  evaluator: idle_serve_holding_vram
+  reads: [idle_vram_held_gb, vram_fill_pct]
+  severity: diagnosis
+
+- name: prefill_dominated_by_replay
+  doc: >
+    Most of the turn's prefill was re-running work the engine had already done.
+    An architecture FACT, not a fault: llama.cpp cannot resume a recurrent layer
+    mid-prefix, which is also why it refuses `--cache-reuse` for this model and
+    says so at startup. Governed because it is the largest recoverable per-turn
+    cost on this box and nothing named it , an operator watching a 99.9%
+    cache-hit rate has every reason to think prefill is already solved.
+    Actionable via sparse prefix checkpointing (arXiv 2605.05219) on top of
+    llama.cpp slot save/restore, which does carry recurrent state.
+  evaluator: prefill_dominated_by_replay
+  reads: [recurrent_replay_ms]
+  severity: diagnosis
+
+- name: cloud_inference_in_use
+  doc: >
+    An inference endpoint points at hardware the owner does not control.
+    Severity violation: this is the one rule whose breach invalidates the entire
+    stack for that request , every tier, the shim, the kernel module and the
+    cluster fabric exist so inference stays local. Returns matched=None (cannot
+    tell) rather than false when endpoints cannot be resolved, because silence
+    must never read as compliance.
+  evaluator: cloud_inference_in_use
+  reads: [inference_endpoint_is_local]
+  severity: violation
+
+- name: models_wiped_from_manifest
+  doc: >
+    Weights exist on disk that GB-Synapse cannot serve because the manifest
+    does not list them. The operator-visible symptom is `no such model` at CLI
+    startup for a model the box fully downloaded. Distinct from "model not
+    downloaded", which is a bandwidth problem; this is a bookkeeping problem
+    with a seconds-long fix. Returns matched=None when the cache directory
+    cannot be read, never false , absence of evidence is not a clean bill.
+  evaluator: models_wiped_from_manifest
+  reads: [unregistered_cached_models]
+  severity: violation
+
+- name: host_oom_imminent
+  doc: >
+    Host RAM is close enough to exhaustion that the OOM killer is a real risk to
+    the running session. Severity violation rather than diagnosis because,
+    unlike weights that do not fit, this does not slow the session down , it
+    ends it, along with whatever work was in flight. Returns matched=None when
+    host memory or the guard state cannot be read; "I cannot see host memory"
+    is never reported as "host memory is fine".
+  evaluator: host_oom_imminent
+  reads: [host_mem_available_gb, t2_oom_guard_state]
+  severity: violation
+
+- name: proxy_memory_near_cap
+  entity: node
+  severity: violation
+  doc: >
+    The gb-synapse proxy is within 20% of its address-space cap. Past the cap
+    the next allocation inside a request raises MemoryError and that request
+    dies mid-stream, while the host itself stays healthy , which is why the
+    symptom reads as "gb-synapse stopped responding while generating" with
+    plenty of free RAM on the box. Returns null, not false, when the proxy is
+    not running or has no cap.
+  evaluator: proxy_memory_near_cap
+  metrics: ["proxy_rss_mb", "proxy_mem_headroom_pct"]
+  remediation: >
+    Restart the serve to reclaim it now (/llamaserve restart). If it climbs
+    again while idle, that is a leak, not load , the proxy logs a gc heap
+    census when it crosses 45% of the cap; read it in the proxy log.
+
+- name: agent_compaction_broke_prefix
+  entity: node
+  severity: violation
+  doc: >
+    A compaction rewrote the reusable prompt prefix instead of appending to it.
+    Expensive rather than incorrect , the answer is still right, it just costs
+    a full re-prefill, minutes of wall time at ~5 tok/s. Returns null, not
+    false, when no compaction has happened yet.
+  evaluator: agent_compaction_broke_prefix
+  metrics: ["agent_compaction_prefix_kept_pct"]
+  remediation: >
+    Compact by APPENDING a summary and dropping a suffix region, leaving the
+    system prompt, tool schemas and pinned block byte-identical. Check
+    prompt_cache hit_pct across the compaction: a drop is the proof.
+
+- name: agent_hallucinating_tool_names
+  entity: node
+  severity: warning
+  doc: >
+    The model is naming tools the registry does not have, above a few percent.
+    That is schema misalignment, not bad luck. Returns null when no tool call
+    has been observed.
+  evaluator: agent_hallucinating_tool_names
+  metrics: ["agent_hallucinated_tool_pct"]
+  remediation: >
+    Align the offered schema to the names the model reaches for rather than
+    instructing it harder , PATool's finding is to fit the schema to the
+    model, not the model to the schema.
+
+- name: agent_eval_below_reference
+  entity: node
+  severity: diagnosis
+  doc: >
+    The harness scores below where MCP-Bench puts a 27B-class model (0.582 for
+    gemma-3-27b-it). With comparable weights that points at the harness rather
+    than the model. Returns null until a benchmark has actually been run.
+  evaluator: agent_eval_below_reference
+  metrics: ["agent_eval_overall"]
+  remediation: >
+    Run greenboost_cli.bench.agent_eval twice and confirm the runs agree before
+    reading anything into the number , a benchmark that cannot reproduce itself
+    cannot measure a 5% change.

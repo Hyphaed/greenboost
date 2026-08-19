@@ -54,6 +54,8 @@ from pathlib import Path
 
 _REPO_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_REPO_DIR))  # for gb_feeder_diag when imported from a consumer
+import gb_ports  # noqa: E402
+from gb_phase_activity import mark_phase_activity  # noqa: E402
 
 GREENBOOST_SHIM = os.environ.get(
     "GREENBOOST_SHIM", "/usr/local/lib/libgreenboost_cuda.so")
@@ -252,7 +254,7 @@ def _read_cluster_conf() -> list[tuple[str, int, str, str]]:
         try:
             parts = line.split()
             ip, _, port = parts[0].partition(":")
-            entries.append((ip, int(port or 9740),
+            entries.append((ip, int(port or gb_ports.NETD_PORT),
                             parts[1] if len(parts) > 1 else "",
                             parts[2] if len(parts) > 2 else ""))
         except ValueError:
@@ -1231,14 +1233,15 @@ def ensure_feeder_ready(feeder: Feeder,
         push = None
         t_push = time.monotonic()
         if mk.returncode == 0:
-            push = subprocess.run(
-                ["rsync", "-rltO", "--stats",
-                 "-e", "ssh " + " ".join(_ssh_opts(compress=True)),
-                 "--exclude", ".git", "--exclude", ".venv",
-                 "--exclude", "__pycache__", "--exclude", "*.pyc",
-                 "--exclude", "outputs", "--exclude", "generated",
-                 f"{root}/", f"{tgt}:{root}/"],
-                capture_output=True, text=True, timeout=timeout_s)
+            with mark_phase_activity(f"rsyncing {root} to feeder {node}"):
+                push = subprocess.run(
+                    ["rsync", "-rltO", "--stats",
+                     "-e", "ssh " + " ".join(_ssh_opts(compress=True)),
+                     "--exclude", ".git", "--exclude", ".venv",
+                     "--exclude", "__pycache__", "--exclude", "*.pyc",
+                     "--exclude", "outputs", "--exclude", "generated",
+                     f"{root}/", f"{tgt}:{root}/"],
+                    capture_output=True, text=True, timeout=timeout_s)
             if push.returncode == 0:
                 _emit_link_transfer(feeder, "rsync_push",
                                     _rsync_sent_bytes(push.stdout) or 0,

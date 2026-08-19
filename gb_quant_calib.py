@@ -251,6 +251,29 @@ def _iter_quantizable_linears(
         yield name, layer
 
 
+def layer_roles(
+    module: nn.Module,
+    skip_modules: Tuple[str, ...] = _DEFAULT_SKIP_MODULES,
+) -> Dict[str, str]:
+    """{layer_name: role} for every layer calibrate_sensitivity()/
+    calibrate_activations() would calibrate — the torch-path companion to
+    gb_quant_roles.role_from_gguf_tensor() (missing_features.md item (j)).
+
+    Deliberately a SEPARATE call, not a value folded into
+    calibrate_sensitivity's own {layer: {bits: rel_err}} return dict: that
+    dict is round-tripped through a JSON cache via _serializable()/
+    _fix_key_types(), which calls float(v) on every value , a string role
+    like "ssm" would crash that round-trip. Role classification is also
+    free relative to calibration (a module-tree walk, no quantization math),
+    so there's no cost to keeping it out of the cached artifact.
+
+    Consumed by gb_quant.plan_quality()'s DP branch to apply
+    gb_quant_roles.ROLE_FLOORS_BITS without touching sensitivity's shape."""
+    import gb_quant_roles
+    return {name: gb_quant_roles.role_from_torch_module(module, name)
+            for name, _layer in _iter_quantizable_linears(module, skip_modules)}
+
+
 # ---------------------------------------------------------------------------
 # Main calibration entry point
 # ---------------------------------------------------------------------------

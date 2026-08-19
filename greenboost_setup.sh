@@ -106,7 +106,7 @@ GB_SWAP_FILE="/var/lib/greenboost/swapfile"
 GB_SWAP_MIN_GB=8      # minimum existing swap to consider adequate (skip provisioning)
 GB_SWAP_MAX_GB=120    # cap for auto-provisioned swapfile
 
-GB_VERSION="3.3"
+GB_VERSION="3.4"
 GB_REPO_API="https://gitlab.com/api/v4/projects/IsolatedOctopi%2Fgreenboost/repository/tags"
 
 # Colours
@@ -335,6 +335,78 @@ _gb_install_cuda_toolkit() {
     return $rc
 }
 
+# _gb_install_nvidia_gds - install nvidia-gds (GPUDirect Storage), which
+# DKMS-builds the nvidia-fs.ko kernel module. Full-install only, called
+# unconditionally after _gb_install_cuda_toolkit - deliberately NOT gated
+# on that function's own "already >= 12.8, skip" early return, since
+# nvidia-gds isn't part of the cuda-toolkit dependency chain at all.
+#
+# Real gap found 2026-08-10: `apt -y install cuda-toolkit` pulls in
+# cuda-tools -> gds-tools (userspace libcufile etc.) as a transitive
+# dependency, which LOOKS like GDS is set up, but gds-tools does not
+# depend on nvidia-gds - the actual kernel-module package - so a box can
+# have the full userspace GDS stack installed with nvidia-fs.ko never
+# built, and GPUDirect Storage silently falls back to POSIX/compat mode
+# (every NVMe<->GPU byte bounces through a host RAM staging buffer,
+# crossing PCIe twice instead of once via true peer-to-peer DMA). This
+# happened on the reference box: cuda-toolkit-13-3 installed 2026-07-07,
+# gds-tools-13-3 came along for free, nvidia-gds was never installed.
+#
+# Idempotent via dkms status, not a package-manager query - what actually
+# matters is whether the module is DKMS-registered, not which package
+# manager thinks it satisfied a dependency.
+_gb_install_nvidia_gds() {
+    if dkms status 2>/dev/null | grep -q '^nvidia-fs'; then
+        gb_ok "nvidia-fs (GDS kernel module) already DKMS-registered - skipping"
+        return 0
+    fi
+
+    local id family
+    id=$(. /etc/os-release 2>/dev/null && echo "${ID:-}" | tr '[:upper:]' '[:lower:]')
+    family=$(_detect_distro_family)
+
+    if [[ "$family" == "arch" ]]; then
+        gb_warn_ui "nvidia-gds has no official Arch repo package - install manually if GPUDirect Storage is wanted: https://docs.nvidia.com/gpudirect-storage/troubleshooting-guide/"
+        return 0
+    fi
+
+    gb_info "Installing nvidia-gds (GPUDirect Storage kernel module)..."
+
+    local pkg_mgr=""
+    case "$id" in
+        ubuntu|debian) pkg_mgr="apt" ;;
+        rhel|centos|rocky|almalinux|ol) pkg_mgr="dnf" ;;
+        fedora) pkg_mgr="dnf5" ;;
+        sles) pkg_mgr="zypper" ;;
+        opensuse*|opensuse-leap|opensuse-tumbleweed) pkg_mgr="zypper" ;;
+        *)
+            gb_warn_ui "Unrecognized distro '${id}' for nvidia-gds install - skipping. Install manually if GPUDirect Storage is wanted."
+            return 1
+            ;;
+    esac
+
+    # Relies on the NVIDIA CUDA repo already being configured - either by
+    # _gb_install_cuda_toolkit earlier in this same run, or from a prior
+    # run/manual setup. Not re-deriving repo/keyring setup here: if the
+    # repo genuinely isn't present, the install below fails with a clear
+    # "not found" the user can act on, same failure mode
+    # _gb_install_cuda_toolkit itself would hit without the keyring step.
+    local rc=0
+    case "$pkg_mgr" in
+        apt)    apt-get update -qq; apt-get -y install nvidia-gds || rc=$? ;;
+        dnf)    dnf -y install nvidia-gds || rc=$? ;;
+        dnf5)   dnf -y install nvidia-gds || rc=$? ;;
+        zypper) zypper --non-interactive install nvidia-gds || rc=$? ;;
+    esac
+
+    if [[ $rc -eq 0 ]]; then
+        gb_ok "nvidia-gds installed - run 'gdscheck -p' after reboot to confirm DMA mode"
+    else
+        gb_warn_ui "nvidia-gds install failed (rc=${rc}) - if the NVIDIA CUDA repo isn't configured, run _gb_install_cuda_toolkit first, or install manually: sudo apt install nvidia-gds"
+    fi
+    return $rc
+}
+
 # Idempotent kernel header install - uses the appropriate package manager
 _ensure_kernel_headers() {
     local kver family
@@ -437,7 +509,43 @@ gb_fail()    { echo -e "  ${C_RED}✗${C_RESET}  $*"; }
 gb_warn()    { echo -e "  ${C_AMBER}⚠${C_RESET}  ${C_AMBER}$*${C_RESET}"; }
 gb_warn_ui() { echo -e "  ${C_AMBER}⚠${C_RESET}  $*"; }
 
-# gb_spin PID "message" - braille spinner until PID exits
+# ---- Phase activity registry (long-running operation labeling) ----------
+# Process-wide stack of active sub-stage labels for accurate progress reporting.
+# Ported from NemoClaw's phase-activity.ts (design reference only): allows
+# nested operations to register their own label so a progress heartbeat shows
+# what is ACTUALLY happening instead of a stale outer-phase name through a
+# long nested operation (e.g., a HuggingFace model download mid-quantization).
+# Bash-side companion to gb_phase_activity.py's mark_phase_activity() — same
+# stack shape, separate implementation, since a bash gb_spin heartbeat and a
+# Python caller never share process memory.
+#
+# Usage (paired with a RETURN trap so a `return`/`die` mid-operation still
+# pops correctly):
+#   _gb_mark_phase_activity_push "downloading weights"
+#   trap '_gb_mark_phase_activity_pop; trap - RETURN' RETURN
+declare -a _GB_PHASE_ACTIVITY_STACK=()
+
+_gb_mark_phase_activity_push() {
+    local label="$1"
+    _GB_PHASE_ACTIVITY_STACK+=("$label")
+}
+
+_gb_mark_phase_activity_pop() {
+    local n=${#_GB_PHASE_ACTIVITY_STACK[@]}
+    (( n > 0 )) && unset '_GB_PHASE_ACTIVITY_STACK[-1]'
+}
+
+_gb_current_phase_activity_label() {
+    local n=${#_GB_PHASE_ACTIVITY_STACK[@]}
+    if (( n > 0 )); then
+        echo "${_GB_PHASE_ACTIVITY_STACK[$((n-1))]}"
+    fi
+}
+
+# gb_spin PID "message" - braille spinner until PID exits. Appends the
+# innermost _gb_current_phase_activity_label (if any caller has pushed one)
+# so a long spin shows what's ACTUALLY happening right now, not just the
+# static outer message it was called with.
 gb_spin() {
     local pid=$1 msg="$2" i=0 start_time
     start_time=$(date +%s)
@@ -449,8 +557,11 @@ gb_spin() {
         else
             time_str="${elapsed}s"
         fi
+        local _activity; _activity="$(_gb_current_phase_activity_label)"
+        local _display_msg="$msg"
+        [[ -n "$_activity" ]] && _display_msg="$msg — $_activity"
         printf "\r  ${C_LIME}%s${C_RESET}  ${C_DIM}%s${C_RESET} ${C_GRAY}[%s]${C_RESET}   " \
-            "${GB_SPIN_FRAMES[$((i % ${#GB_SPIN_FRAMES[@]}))]}" "$msg" "$time_str"
+            "${GB_SPIN_FRAMES[$((i % ${#GB_SPIN_FRAMES[@]}))]}" "$_display_msg" "$time_str"
         sleep 0.08
         (( i++ )) || true
     done
@@ -2457,6 +2568,37 @@ need_root() {
     [[ $EUID -eq 0 ]] || die "Root required. Use: sudo $0 $1"
 }
 
+
+# ── Port validation (gb_ports.py integration) ───────────────────────────────
+
+check_ports() {
+    info "Validating service ports..."
+
+    # Resolve gb_ports.py from a dev checkout (MODULE_DIR) first, falling back
+    # to the installed copy (GB_PY_DEST) — same two-candidate shape as
+    # _gb_feeders_upgrade_from_source's source resolution.
+    local _gb_ports_py="$MODULE_DIR/gb_ports.py"
+    [[ -f "$_gb_ports_py" ]] || _gb_ports_py="$GB_PY_DEST/gb_ports.py"
+    if [[ ! -f "$_gb_ports_py" ]]; then
+        gb_warn "gb_ports.py not found in $MODULE_DIR or $GB_PY_DEST , skipping port validation"
+        return 0
+    fi
+
+    # Call into Python to validate ports centrally via gb_ports.py.
+    # Exit code 0 = no collisions, non-zero = collision detected. Let its own
+    # diagnostics (range errors, colliding pairs) reach the operator instead
+    # of swallowing them.
+    local _out rc
+    _out="$(python3 "$_gb_ports_py" 2>&1)"
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        gb_err "Port validation failed:"
+        while IFS= read -r _l; do [[ -n "$_l" ]] && gb_err "  $_l"; done <<< "$_out"
+        return 1
+    fi
+    return 0
+}
+
 check_deps() {
     info "Checking build prerequisites..."
     # Provide distro-specific install hints for missing tools
@@ -3364,7 +3506,7 @@ cmd_install_llama_configs() {
     # Keep the feature set in sync with gb_write_capabilities_file() in the shim.
     cat > "$SHIM_DEST/greenboost_capabilities.json" << 'CAPEOF'
 {
-  "shim_version": "3.3",
+  "shim_version": "3.4",
   "abi": 1,
   "source": "install",
   "features": {
@@ -3579,6 +3721,163 @@ cmd_restore_tune_grub() {
     gb_ok "GRUB restored. Changes take effect after next reboot."
 }
 
+# ── PID ownership proof (NemoClaw audit, Phase 2) ──────────────────────────
+# Every unattended kill in this file used to go straight to `pkill -f`/
+# `fuser -k`/`kill -9 $(...)` with no check that the PID it hits is actually
+# ours — a foreign process holding /dev/greenboost, or bound to port 9740 with
+# a matching-looking cmdline, died right alongside the real target. Ported
+# design (re-implemented in bash) from NemoClaw's `run-plan.ts`
+# (`pidOwnedByCurrentUser`/`isOllamaAuthProxyPid`/`tryStopOllamaProxyPid`):
+# prove OWNERSHIP, then prove the CMDLINE actually matches, THEN kill, THEN
+# poll for a REAL exit before escalating to SIGKILL. Ownership is checked
+# before cmdline matching, so a foreign process with a matching cmdline is
+# skipped, not killed — the same order NemoClaw's proof uses and for the
+# same reason: cmdline alone is attacker/coincidence-controlled, UID is not.
+#
+# _gb_pid_owned <pid> - true if <pid>'s process owner matches the operator
+# running this script (SUDO_USER when running under sudo, else the current
+# user; root always passes, since do_purge itself runs as root and a
+# root-owned GreenBoost daemon is the normal case).
+_gb_pid_owned() {
+    local pid="$1" expected actual
+    expected="${SUDO_USER:-$(id -un)}"
+    actual=$(ps -p "$pid" -o user= 2>/dev/null | tr -d '[:space:]')
+    [[ -z "$actual" ]] && return 1   # gone or unreadable - never "owned"
+    [[ "$actual" == "$expected" || "$actual" == "root" ]]
+}
+
+# _gb_pid_cmdline_matches <pid> <regex> - true if `ps -p <pid> -o args=`
+# matches <regex> (extended regex, passed to `grep -E`). Callers MUST pass
+# the same regex string both here and wherever the process was launched -
+# never a second, independently-written copy that can drift from the first.
+_gb_pid_cmdline_matches() {
+    local pid="$1" re="$2" args
+    args=$(ps -p "$pid" -o args= 2>/dev/null)
+    [[ -n "$args" ]] && grep -qE -- "$re" <<< "$args"
+}
+
+# _gb_pid_alive <pid> - existence probe via `ps -p`, not `kill -0`.
+# `kill -0` collapses EPERM (process exists, caller can't signal it) and
+# ESRCH (process is gone) into the same "false" - a foreign PID owned by
+# someone else would then look identical to an already-reaped one, and a
+# caller could log "stopped" for a process that never received a signal at
+# all. `ps -p` reports existence regardless of signalling permission.
+_gb_pid_alive() { ps -p "$1" &>/dev/null; }
+
+# _gb_stop_pid <pid> <label> - SIGTERM, poll up to 1s for real exit, escalate
+# to SIGKILL, poll again. Prints via gb_ok/gb_warn_ui using <label>. Returns
+# 0 if the process is confirmed gone, 1 if it survived SIGKILL too.
+_gb_stop_pid() {
+    local pid="$1" label="$2" waited=0
+    kill -TERM "$pid" 2>/dev/null || true
+    while _gb_pid_alive "$pid"; do
+        sleep 0.1; waited=$((waited + 1))
+        [[ $waited -ge 10 ]] && break   # ~1s
+    done
+    if ! _gb_pid_alive "$pid"; then
+        gb_ok "Stopped ${label} (pid ${pid})"; return 0
+    fi
+    kill -KILL "$pid" 2>/dev/null || true
+    waited=0
+    while _gb_pid_alive "$pid"; do
+        sleep 0.1; waited=$((waited + 1))
+        [[ $waited -ge 10 ]] && break
+    done
+    if ! _gb_pid_alive "$pid"; then
+        gb_ok "Stopped ${label} (pid ${pid}, needed SIGKILL)"; return 0
+    fi
+    gb_warn_ui "Failed to stop ${label} (pid ${pid}) - still running after SIGKILL"
+    return 1
+}
+
+# _gb_purge_action_emit <target> <pid> <decision> - dataflux `purge_action`
+# event (Observability Must-Rule: a purge that DECLINES to kill something
+# must leave a trace, same as one that does - otherwise the next session
+# re-diagnoses "why is the port still bound" from nothing). decision is one
+# of stopped|skipped_foreign|skipped_no_match|failed; status mirrors decision
+# literally (same convention as gb_a2a.py/gb_synapse_api.py's synapse_auth
+# events), and gb_dataflux_kinds.py's incident_when=("failed",) is what makes
+# a failed stop surface as an incident.
+_gb_purge_action_emit() {
+    local target="$1" pid="$2" decision="$3"
+    gb_dataflux_emit "$(printf '{"ts":%s,"label":"purge","kind":"purge_action","status":"%s","target":"%s","pid":%s,"decision":"%s"}' \
+        "$(date +%s 2>/dev/null || echo 0)" "$decision" "$target" "${pid:-0}" "$decision")"
+}
+
+# _gb_kill_matching <pattern> <label> - the gated replacement for a bare
+# `pkill -f <pattern>`. Enumerates PIDs via `pgrep -f`, then for EACH one:
+# ownership check -> cmdline re-check (pgrep -f can match more loosely than
+# intended) -> proven stop. Every decision emits a purge_action event.
+_gb_kill_matching() {
+    local pattern="$1" label="$2" pid
+    command -v pgrep &>/dev/null || { gb_warn_ui "pgrep not found - skipping ${label}"; return 0; }
+    while IFS= read -r pid; do
+        [[ -z "$pid" ]] && continue
+        if ! _gb_pid_owned "$pid"; then
+            _gb_purge_action_emit "$label" "$pid" "skipped_foreign"; continue
+        fi
+        if ! _gb_pid_cmdline_matches "$pid" "$pattern"; then
+            _gb_purge_action_emit "$label" "$pid" "skipped_no_match"; continue
+        fi
+        if _gb_stop_pid "$pid" "$label"; then
+            _gb_purge_action_emit "$label" "$pid" "stopped"
+        else
+            _gb_purge_action_emit "$label" "$pid" "failed"
+        fi
+    done < <(pgrep -f -- "$pattern" 2>/dev/null)
+}
+
+# _kill_dev_users - kill everything holding /dev/greenboost open. Shared by
+# _rmmod_with_retry (module unload path) and do_purge's own separate
+# device-holder sweep, so the logic lives in exactly one place.
+#
+# CORRECTED (live incident, 2026-08-05): the original NemoClaw-audit
+# Phase 2 version of this function ALSO gated on _gb_pid_owned (operator's
+# own UID or root) before killing a holder. That gate is wrong for THIS
+# specific call site and broke a real uninstall live: /dev/greenboost is
+# `crw-rw---- root:video` (+ ACL grants for specific service accounts, e.g.
+# ollama.service runs as User=ollama/Group=ollama and holds the device via
+# its own ACL entry) — the kernel's own DAC/ACL check at open() time is
+# ALREADY the authorization boundary here, so "holds /dev/greenboost open"
+# is sufficient proof on its own; there is no scenario where a truly
+# foreign, unrelated process ends up holding this exact special-purpose
+# device by coincidence. Layering an operator-UID check on top only
+# rejects legitimate, differently-privileged consumers (any systemd
+# service GreenBoost integrates with that runs under its own dedicated
+# service account) — confirmed live: ollama.service's `Restart=always`
+# (RestartSec=3) respawned under the `ollama` user every retry iteration,
+# and the ownership gate refused to touch it every single time, so rmmod
+# never saw refcnt reach 0 and the purge/reinstall aborted asking for a
+# reboot. Removed the gate; kept the proven-exit stop mechanics
+# (_gb_stop_pid: SIGTERM -> poll -> SIGKILL -> poll, never a blind
+# `kill -9` or `fuser -k`) and the purge_action trace.
+#
+# The PID-ownership proof itself is still correct and still applies to the
+# OTHER kill sites in this file (netd/ebpf-tracer PID files, cmd_feed
+# stop) — those match by NAME or PID FILE CONTENTS, which a coincidentally
+# similar foreign process genuinely could satisfy with no device-level
+# authorization behind it at all. This device-holder sweep is the one
+# call site where the target-identification mechanism is already strong
+# enough on its own.
+_kill_dev_users() {
+    [[ -e /dev/greenboost ]] || return 0
+    local _pids pid
+    if command -v lsof &>/dev/null; then
+        _pids=$(lsof -t /dev/greenboost 2>/dev/null | sort -u)
+    else
+        # fuser has no clean PID-only output mode; parse its text report.
+        _pids=$(fuser /dev/greenboost 2>&1 | grep -oE '[0-9]+' | sort -u)
+    fi
+    for pid in $_pids; do
+        [[ -z "$pid" ]] && continue
+        if _gb_stop_pid "$pid" "/dev/greenboost holder"; then
+            _gb_purge_action_emit "/dev/greenboost" "$pid" "stopped"
+        else
+            _gb_purge_action_emit "/dev/greenboost" "$pid" "failed"
+        fi
+    done
+}
+
 # ---- _rmmod_with_retry - unload the kernel module, retrying up to ~15 s ----
 # Usage: _rmmod_with_retry [quiet]
 # Returns 0 on success, 1 if the module is still loaded after all retries.
@@ -3592,27 +3891,31 @@ _rmmod_with_retry() {
     local MAX_TRIES=15
     local attempt=0
 
-    # Helper: kill everything holding the device open.
-    _kill_dev_users() {
-        if [[ -e /dev/greenboost ]]; then
-            fuser -k /dev/greenboost 2>/dev/null || true
-            # lsof fallback - catches processes fuser sometimes misses
-            local _pids
-            _pids=$(lsof /dev/greenboost 2>/dev/null | awk 'NR>1 {print $2}' | sort -u || true)
-            [[ -n "$_pids" ]] && kill -9 $( echo "$_pids" ) 2>/dev/null || true
-        fi
-    }
-
     grep -q "^${DRIVER_NAME} " <<< "$(lsmod)" || return 0   # not loaded - nothing to do
 
     # Stop the eBPF tracer first , its kprobes take a module reference and
     # would hold every rmmod below in EBUSY forever.  fuser/lsof can't see it
     # (it holds no fd on /dev/greenboost), so kill it explicitly here, the
     # common choke point for all unload paths (purge, reload, unload).
+    # PID-ownership proof applies here too: the PID-file kill is gated on
+    # ownership + cmdline match, and the pkill fallback (for a stale/absent
+    # PID file) routes through _gb_kill_matching, which applies the same
+    # two gates per matched PID instead of a blind `pkill -f`.
     if [[ -f /run/greenboost/ebpf_trace.pid ]]; then
-        kill "$(cat /run/greenboost/ebpf_trace.pid 2>/dev/null)" 2>/dev/null || true
+        local _ebpf_pid
+        _ebpf_pid=$(cat /run/greenboost/ebpf_trace.pid 2>/dev/null)
+        if [[ -n "$_ebpf_pid" ]] && _gb_pid_owned "$_ebpf_pid" \
+                && _gb_pid_cmdline_matches "$_ebpf_pid" 'greenboost-ebpf-trace'; then
+            if _gb_stop_pid "$_ebpf_pid" "eBPF tracer"; then
+                _gb_purge_action_emit "greenboost-ebpf-trace" "$_ebpf_pid" "stopped"
+            else
+                _gb_purge_action_emit "greenboost-ebpf-trace" "$_ebpf_pid" "failed"
+            fi
+        elif [[ -n "$_ebpf_pid" ]]; then
+            _gb_purge_action_emit "greenboost-ebpf-trace" "$_ebpf_pid" "skipped_foreign"
+        fi
     fi
-    pkill -f '/usr/local/bin/greenboost-ebpf-trace' 2>/dev/null || true
+    _gb_kill_matching '/usr/local/bin/greenboost-ebpf-trace' "eBPF tracer"
 
     # Check if the module is already stuck in Unloading state (MODULE_STATE_GOING).
     # This happens when a previous rmmod process was killed before the exit function
@@ -3953,7 +4256,7 @@ cmd_apparmor_uninstall() {
 # services like ollama/llama-server just above, so nothing else in do_purge
 # ever stopped them. Without this, `rm -rf /usr/local/lib/greenboost` deleted
 # the llama-server binary out from under a LIVE process, which kept running,
-# holding VRAM and :11435, after "GreenBoost uninstalled cleanly."
+# holding VRAM and :11369, after "GreenBoost uninstalled cleanly."
 _gb_stop_synapse() {
     local run_dir="/run/greenboost/synapse"
     [[ -d "$run_dir" ]] || return 0
@@ -4062,9 +4365,10 @@ do_purge() {
     done
     [[ -n "$_stopped_svcs" ]] && gb_ok "Services stopped:${_stopped_svcs}"
 
-    # Kill any remaining process with the device open.
+    # Kill any remaining process with the device open (ownership-gated —
+    # see _kill_dev_users, shared with _rmmod_with_retry).
+    _kill_dev_users
     if [[ -e /dev/greenboost ]]; then
-        fuser -k /dev/greenboost 2>/dev/null || true
         local waited=0
         while [[ -e /dev/greenboost ]] && fuser /dev/greenboost &>/dev/null; do
             sleep 0.2
@@ -4153,9 +4457,14 @@ do_purge() {
         # cluster.conf silently drops all connected feeders (this broke the
         # omen feeder on 2026-07-06). Preserve state files across the wipe;
         # everything else in /etc/greenboost is regenerated by the install.
+        # synapse_token is included for the same reason: GreenBoost never
+        # auto-generates secrets at install (GB_A2A_TOKEN is operator-set
+        # via systemd override, same convention), so an operator who set
+        # /etc/greenboost/synapse_token to unlock a non-loopback gb-synapse
+        # bind must not have it silently wiped by a reinstall.
         local _keep_dir _kf
         _keep_dir=$(mktemp -d /run/greenboost-keep.XXXXXX)
-        for _kf in cluster.key cluster.conf known_hosts turboquant.enabled ggml_2dev.enabled; do
+        for _kf in cluster.key cluster.conf known_hosts turboquant.enabled ggml_2dev.enabled synapse_token; do
             [[ -f "/etc/greenboost/$_kf" ]] && cp -a "/etc/greenboost/$_kf" "$_keep_dir/" || true
         done
         rm -rf /etc/greenboost
@@ -4447,13 +4756,38 @@ cmd_install_python_files() {
         # Monitoring / serving / cluster stack (the installed greenboost-cli
         # resolves these from /usr/local/lib/greenboost via GB_PY_ROOT)
         gb_monitor.py
+        # Standalone OOM forensics — samples top RSS consumers so the process
+        # that eats the box is identified BEFORE oom_reaper erases /proc/<pid>.
+        # Both 2026-08-18 post-mortems stalled on "python3" being all the
+        # kernel report named.
+        gb_memwatch.py
         gb_pilot.py
         gb_tiering.py
+        gb_state_io.py
         gb_synapse.py
         gb_synapse_api.py
         gb_synapse_backends.py
         gb_diffusion_server.py gb_longlive_server.py
         gb_aviary.py
+        # Measurement tools (2026-08-20). Same manifest hazard the 2026-07-14
+        # audit hit with gb_mcp_common: a file that exists in the repo but not
+        # in this list is simply absent on a freshly Full-Installed box, and
+        # the failure is a ModuleNotFoundError at the moment someone tries to
+        # certify a config. gb_bench_kv drives niah_certify (the evidence
+        # CLAUDE.md's "never below fp8 without gate evidence" rule needs);
+        # gb_bench_spec picks the speculative-decode depth from a sweep.
+        gb_bench_turn.py gb_bench_kv.py gb_bench_spec.py gb_bench_codec.py
+        # Modules that INSTALLED modules import, but which were never in this
+        # list (found 2026-08-20 by checks/check_python_manifest.py, the check
+        # written after this same class of bug bit twice before):
+        #   gb_quant_roles      <- gb_quant.py, gb_quant_calib.py, gb_gguf_plan.py
+        #   gb_prompt_index     <- gb_synapse_api.py
+        #   gb_gguf_plan        <- gb_mcp.py
+        #   gb_semantics_watch  <- gb_dataflux.py
+        # Their importers all guard the import, so the box degrades quietly
+        # rather than crashing , which is exactly why this went unnoticed.
+        gb_quant_roles.py gb_prompt_index.py gb_gguf_plan.py
+        gb_semantics_watch.py gb_router.py gb_pcie_tune.py
         gb_cluster.py
         gb_mcp.py
         gb_synapse_mcp.py gb_synapse_tools.py
@@ -4515,6 +4849,38 @@ cmd_install_python_files() {
         # `install-python` silently ships without either capability).
         gb_shim_probe.py
         gb_reclaim.py
+        # Whole-stack readiness-contract report (NemoClaw audit, Phase 6b) —
+        # cmd_doctor's `greenboost doctor --json` (greenboost_setup.sh,
+        # _GB_READINESS_PY) invokes this as a subprocess the same way
+        # _gb_synapse_run does for gb_synapse.py; missing it here would
+        # break --json silently on an installed (non-dev-checkout) box.
+        gb_readiness.py
+        # NemoClaw round-2 (2026-08-06): gb_ports.py (item 3, central port
+        # registry — imported by gb_readiness/gb_mcp/gb_synapse/gb_pilot/
+        # gb_feeder_diag/gb_cluster/greenboost_exporter/gb_dataflux_mcp),
+        # gb_advisories.py (item 4, one advisory contract), gb_failures.py
+        # (item 7, closed-set failure classification — consumed by
+        # gb_synapse_backends._gate_cpu_offload and serving/probe.py). All
+        # three were missing from this manifest despite being imported at
+        # runtime by modules already on it — same class of gap as
+        # gb_mcp_common.py above; verified live 2026-08-06:
+        # `import gb_readiness` against $GB_PY_DEST raised
+        # ModuleNotFoundError: No module named 'gb_ports' before this fix.
+        gb_ports.py
+        gb_advisories.py
+        gb_failures.py
+        # NemoClaw round-2 item 9: testable deadline+backoff waiting
+        # (gb_wait.wait_until, injectable clock/sleep) — replaces the fixed,
+        # hardware-blind while-loops in gb_synapse.py's serve-readiness polls.
+        gb_wait.py
+        # NemoClaw round-2 item 10: process-wide innermost-sub-stage label
+        # registry — gb_synapse.py (HF pull), gb_quant.py (quantize_to_fit),
+        # gb_cluster.py (feeder rsync) all import mark_phase_activity from it.
+        gb_phase_activity.py
+        # NemoClaw round-2 item 11: redacted diagnostic support bundle
+        # (`greenboost debug bundle`, greenboost-orchestrator's
+        # support_bundle MCP tool).
+        gb_debug_bundle.py
     )
     local _installed=0
     for _f in "${_py_files[@]}"; do
@@ -4569,6 +4935,26 @@ cmd_install_python_files() {
         fi
     else
         gb_warn "semantics/ not found in $MODULE_DIR — gb_semantics.py will have no definitions to load"
+    fi
+
+    # serving/ (GreenBoost-native serving recipes — NemoClaw audit, Phase 5)
+    # is a directory for the same reason semantics/ is above: gb_synapse.py's
+    # load_recipe()/probe_serve_readiness_for() insert $_dest/serving onto
+    # sys.path and import check_recipes/probe/digest from it at RUNTIME, not
+    # just at dev-time lint — missing this sync would leave those two
+    # functions silently returning None/failing on every installed box while
+    # working fine from a dev checkout, exactly the installer-parity trap
+    # this repo's MUST-RULE exists to catch.
+    if [[ -d "$MODULE_DIR/serving" ]]; then
+        if command -v rsync >/dev/null 2>&1; then
+            rsync -a --delete "$MODULE_DIR/serving/" "$_dest/serving/" 2>/tmp/gb_serving_sync.log \
+                || gb_warn "serving/ sync failed (see /tmp/gb_serving_sync.log)"
+        else
+            rm -rf "$_dest/serving"
+            cp -r "$MODULE_DIR/serving" "$_dest/serving"
+        fi
+    else
+        gb_warn "serving/ not found in $MODULE_DIR — gb_synapse.py's recipe/probe features will have nothing to load"
     fi
 
     # gb_semantics.py's only dependency this Python layer doesn't already
@@ -4809,6 +5195,72 @@ WRAPEOF
 # GB_CLI_SRC is still honoured for CLI development against a separate
 # checkout; the co-located sibling path is kept as a second fallback for that
 # same dev workflow, but the vendored copy is what every real install uses.
+# cmd_recover_models , re-register cached models missing from the manifest.
+#
+# Full Install's purge resets /var/lib/greenboost/synapse's manifest but leaves
+# the HuggingFace blob cache alone, so downloaded weights become unservable.
+# Symptom is `no such model: <name>` when greenboost-cli starts. This restores
+# the registrations from what is already on disk; it never downloads and never
+# removes an entry.
+# cmd_memwatch , OOM forensics. Wraps gb_memwatch.py (top|watch|report).
+#
+# Exists because the kernel's OOM report names only "python3": by the time a
+# human looks, oom_reaper has freed the process and /proc/<pid> is gone. Both
+# 2026-08-18 post-mortems stalled exactly there.
+cmd_memwatch() {
+    local _py="${GB_PY_DEST:-/usr/local/lib/greenboost}"
+    if [[ ! -f "$_py/gb_memwatch.py" ]]; then
+        gb_warn "gb_memwatch.py not installed , run: sudo greenboost install-python"
+        return 1
+    fi
+    PYTHONPATH="$_py" python3 "$_py/gb_memwatch.py" "$@"
+}
+
+# _gb_restore_tree_ownership , hand the source checkout back to the invoking user.
+#
+# Full Install runs as root but compiles INSIDE the user's own checkout, so
+# every build artifact lands root-owned. A later non-root build then cannot
+# overwrite them and dies with a linker/permission error naming no cause.
+# Found 2026-08-18: 518 root-owned files (511 of them under
+# third_party/llama.cpp/build-synapse) made the llama.cpp engine unbuildable
+# for anyone but root, which is how a one-line kv-cache patch turned into an
+# hour of chasing a phantom compile failure.
+#
+# Ownership only , this never deletes anything. .git is deliberately left
+# alone: if root touched it, that is worth seeing rather than silently fixing.
+_gb_restore_tree_ownership() {
+    [[ $EUID -eq 0 ]] || return 0
+    local _u="${SUDO_USER:-}"
+    [[ -n "$_u" ]] || return 0
+    id -u "$_u" >/dev/null 2>&1 || return 0
+    local _n
+    _n="$(find "$MODULE_DIR" -path "$MODULE_DIR/.git" -prune -o ! -user "$_u" -print 2>/dev/null | wc -l)"
+    [[ "${_n:-0}" -gt 0 ]] || return 0
+    find "$MODULE_DIR" -path "$MODULE_DIR/.git" -prune -o ! -user "$_u" -print0 2>/dev/null \
+        | xargs -0 -r chown "$_u":"$_u" 2>/dev/null || true
+    gb_info "Returned $_n build file(s) in the source tree to $_u (root builds would otherwise block later non-root rebuilds)"
+}
+
+cmd_recover_models() {
+    local _py="${GB_PY_DEST:-/usr/local/lib/greenboost}"
+    [[ -f "$_py/gb_synapse.py" ]] || return 0
+    local _out
+    _out="$(PYTHONPATH="$_py" python3 -c "
+import gb_synapse
+r = gb_synapse.recover_from_hf_cache()
+print(len(r))
+for e in r[:12]:
+    print('  ' + e.name)
+" 2>/dev/null)" || return 0
+    local _n="${_out%%$'\n'*}"
+    [[ "$_n" =~ ^[0-9]+$ ]] || return 0
+    if [[ "$_n" -gt 0 ]]; then
+        gb_ok "Re-registered $_n model(s) found on disk but missing from the manifest:"
+        printf '%s\n' "$_out" | tail -n +2
+    fi
+    return 0
+}
+
 cmd_install_cli() {
     local _src="" _cand
     for _cand in "${GB_CLI_SRC:-}" "$MODULE_DIR/greenboost-cli" "$MODULE_DIR/../greenboost-cli"; do
@@ -5000,7 +5452,16 @@ cmd_install_synapse_engine() {
 
     gb_info "Installing the synapse torch engine into $_venv (multi-GB download) ..."
     "$_venv/bin/pip" install --upgrade pip -q &>/tmp/gb_synapse_engine_pip.log || true
-    if ! "$_venv/bin/pip" "${_pip_args[@]}" &>>/tmp/gb_synapse_engine_pip.log; then
+    # item 10: this multi-GB torch download used to sit behind a single
+    # static "Installing..." message with no progress signal at all until it
+    # finished or failed — background it under gb_spin so the phase-activity
+    # label (pushed below) is actually visible while it runs.
+    _gb_mark_phase_activity_push "downloading torch + gb-synapse engine deps"
+    "$_venv/bin/pip" "${_pip_args[@]}" &>>/tmp/gb_synapse_engine_pip.log &
+    local _pip_pid=$!
+    gb_spin "$_pip_pid" "Installing synapse torch engine"
+    _gb_mark_phase_activity_pop
+    if ! wait "$_pip_pid"; then
         gb_warn "synapse torch engine pip install failed (see /tmp/gb_synapse_engine_pip.log) — skipping; gb-synapse falls back to transformers for safetensors serving"
         return 0
     fi
@@ -5012,9 +5473,14 @@ cmd_install_synapse_engine() {
     # torch 2.11/CUDA 13 (undefined symbol at import time); the project
     # renamed its distribution to "sglang_kernel" at v0.4.x (same `sgl_kernel`
     # import name, drop-in) and publishes CUDA-13 wheels via its own index.
-    if ! "$_venv/bin/pip" install -q "sglang_kernel==0.4.5+cu130" \
+    _gb_mark_phase_activity_push "downloading sglang-kernel"
+    "$_venv/bin/pip" install -q "sglang_kernel==0.4.5+cu130" \
         --extra-index-url https://sgl-project.github.io/whl/cu130 \
-        &>>/tmp/gb_synapse_engine_pip.log; then
+        &>>/tmp/gb_synapse_engine_pip.log &
+    local _sgl_pid=$!
+    gb_spin "$_sgl_pid" "Installing sglang-kernel"
+    _gb_mark_phase_activity_pop
+    if ! wait "$_sgl_pid"; then
         gb_warn "sglang_kernel install failed (see /tmp/gb_synapse_engine_pip.log) — synapse torch engine will fail to import gllm; retry with 'sudo greenboost install-synapse-engine'"
         return 0
     fi
@@ -5405,8 +5871,12 @@ _gb_install_abort_recover() {
         fi
     fi
     # Supervisor: the purge disable+removes its unit; reinstall + start it.
+    # gb_supervisor.py imports gb_telemetry/gb_nvml/gb_orchestrator from
+    # $GB_PY_DEST, populated by cmd_install_python_files (a later install
+    # step) — restore those first or the unit crash-loops on ModuleNotFoundError.
     if [[ "${GB_SUPERVISOR_WAS_ACTIVE:-0}" -eq 1 ]] && \
        ! systemctl is-active --quiet greenboost-supervisor.service 2>/dev/null; then
+        [[ -d "$MODULE_DIR" ]] && cmd_install_python_files 2>/dev/null
         cmd_install_supervisor \
             || gb_fail "greenboost-supervisor NOT restored , run: sudo greenboost install-sys-configs"
     fi
@@ -5435,6 +5905,7 @@ cmd_install() {
 
     detect_hardware
     check_deps
+    check_ports || die "Port validation failed"
 
     # Capture pre-install system state for potential rollback
     _gb_backup_create
@@ -5655,6 +6126,8 @@ case "\$1" in
     synapse)         exec "\$GB_SETUP" synapse "\${@:2}" ;;
     setup|install|full-install) exec "\$GB_SETUP" "\$@" ;;
     install-python)          exec "\$GB_SETUP" install-python ;;
+    recover-models)          exec "\$GB_SETUP" recover-models ;;
+    memwatch)                exec "\$GB_SETUP" memwatch "\${@:2}" ;;
     install-cli)             exec "\$GB_SETUP" install-cli ;;
     install-synapse-engine)  exec "\$GB_SETUP" install-synapse-engine ;;
     install-pipelines)  exec "\$GB_SETUP" install-pipelines ;;
@@ -5715,6 +6188,19 @@ WRAPEOF
         cmd_install_python_files || gb_warn "Python file install had failures , re-run: sudo greenboost install-python"
         # Install greenboost-cli (`gb`) into its venv , best-effort, never aborts.
         cmd_install_cli || gb_warn "greenboost-cli install failed , continuing"
+        # Re-register models whose weights survived the purge but whose manifest
+        # entries did not. A Full Install resets the GB-Synapse manifest while
+        # leaving the HuggingFace cache untouched, so every HF-pulled model
+        # silently vanishes from `gb` while its weights sit on disk. That is not
+        # theoretical: on 2026-08-18 it happened three times, twice leaving the
+        # CLI unable to start at all with `no such model:
+        # Qwen3.8-27B-Cold-Fusion-MTP-IQ4_XS` for a model the box had fully
+        # downloaded. Reads GGUF headers only , downloads nothing, removes
+        # nothing, and is a no-op when the manifest is already complete.
+        cmd_recover_models || gb_warn "model re-registration skipped , run: greenboost recover-models"
+        # Root just compiled inside the user's checkout , give it back, or the
+        # next non-root build fails with an error that names no cause.
+        _gb_restore_tree_ownership || true
     fi
     # ai-forge pipeline deps (PaddleOCR etc.) are NOT provisioned by Full
     # Install , they belong to ai-forge, not greenboost core. Run explicitly:
@@ -7303,12 +7789,27 @@ cmd_debug() {
     local subcmd="${1:-vitals}"
     case "$subcmd" in
         vitals) cmd_debug_vitals "${@:2}" ;;
+        bundle) cmd_debug_bundle "${@:2}" ;;
         *)
-            gb_fail "Unknown debug subcommand: '${subcmd}'  (use: vitals [on|off])"
+            gb_fail "Unknown debug subcommand: '${subcmd}'  (use: vitals [on|off] | bundle [--output PATH] [--timeout SECS])"
             echo ""
             return 1
             ;;
     esac
+}
+
+# cmd_debug_bundle — NemoClaw round-2 item 11: redacted diagnostic support
+# bundle (gb_debug_bundle.py). Delegates to Python; this wrapper only
+# resolves the module path (dev checkout vs installed) the same way
+# check_ports() does, and prints the "review before sharing" warning.
+cmd_debug_bundle() {
+    local _bundle_py="$MODULE_DIR/gb_debug_bundle.py"
+    [[ -f "$_bundle_py" ]] || _bundle_py="$GB_PY_DEST/gb_debug_bundle.py"
+    if [[ ! -f "$_bundle_py" ]]; then
+        gb_fail "gb_debug_bundle.py not found in $MODULE_DIR or $GB_PY_DEST"
+        return 1
+    fi
+    python3 "$_bundle_py" collect "$@"
 }
 
 # Returns 0 (true) if a process comm is essential and must never be killed.
@@ -7395,9 +7896,27 @@ cmd_clear_memory_pool() {
     # candidate, tracked or not) - explicit opt-in only, per CLAUDE.md's own
     # "Never run it while other genuinely-in-progress GreenBoost work is on
     # the SAME node unless the owner explicitly authorizes it" rule.
-    local scope="residue" arg
+    # Default scope is "inference": every local AI-inference session (gb-synapse
+    # servers, ollama, greenboost-cli, and the ai-forge workers — ComfyUI,
+    # diffusers, LongLive, art_wizard), tracked or not. Desktop, GNOME, VM and
+    # GreenBoost's own fabric daemons stay protected.
+    #
+    # It used to default to "residue", which spared any genuinely-in-progress
+    # gb-synapse server. That is a defensible default for an automated caller,
+    # but it made the command useless for the thing its name promises: the
+    # owner ran it repeatedly on 2026-08-18 to get the card back and it kept
+    # reporting success while 10.4 GiB stayed held by an idle server at 0% GPU
+    # utilization. Owner decision, same day: "clear memory-pool" must clean T1
+    # and T2 and any GPU compute related to greenboost-cli, greenboost itself,
+    # or a session started through ~/Dev/ai-forge.
+    #
+    # --residue restores the old conservative behaviour; --all is unchanged
+    # (every non-protected candidate, inference or not).
+    local scope="inference" arg
     for arg in "$@"; do
-        [[ "$arg" == "--all" ]] && scope="all"
+        [[ "$arg" == "--all" ]]       && scope="all"
+        [[ "$arg" == "--residue" ]]   && scope="residue"
+        [[ "$arg" == "--ambiguous" ]] && scope="ambiguous"
     done
 
     gb_header
@@ -7406,9 +7925,14 @@ cmd_clear_memory_pool() {
     if [[ "$scope" == "all" ]]; then
         echo -e "  Kills EVERY GPU compute job (CUDA / GreenBoost), including genuinely"
         echo -e "  in-progress servers (--all); desktop & GNOME processes are protected.${C_RESET}"
+    elif [[ "$scope" == "inference" ]]; then
+        echo -e "  Ends every local AI-inference session — gb-synapse, ollama,"
+        echo -e "  greenboost-cli and ai-forge workers — and returns their GPU VRAM"
+        echo -e "  and T2 system RAM. Your desktop and VMs are left alone."
+        echo -e "  Use --residue to spare servers that are mid-request.${C_RESET}"
     else
         echo -e "  Kills orphaned GPU inference processes only; a genuinely in-progress"
-        echo -e "  gb-synapse server is left running (pass --all to override).${C_RESET}"
+        echo -e "  gb-synapse server is left running (default is --inference).${C_RESET}"
     fi
     echo -e ""
 
@@ -7427,7 +7951,19 @@ cmd_clear_memory_pool() {
 
     local before
     before=$(cat "$SYSFS/pool_brief" 2>/dev/null || echo "unavailable")
+    # pool_brief's own "T1:<n>GB" is the card's PHYSICAL CAPACITY (the kmod
+    # prints the physical_vram_gb module param there), while every other tier
+    # in the same string prints used/total. Read on its own it looks like
+    # "11 GB is still held", which is exactly how a successful clear got
+    # reported as a failure on 2026-08-18. Show real T1 occupancy from NVML
+    # next to it rather than changing the sysfs string, which Waybar and other
+    # scripts parse.
+    query_gpu_vram 2>/dev/null || true
+    local t1_before_used="${GPU_VRAM_USED_MB:-}"
     echo -e "  Before: ${C_DIM}${before}${C_RESET}"
+    if [[ -n "$t1_before_used" ]]; then
+        echo -e "  T1 GPU: ${C_DIM}${t1_before_used}/${GPU_VRAM_TOTAL_MB}MB used (${GPU_VRAM_PCT}%)  [pool_brief's T1 figure is the card's size, not usage]${C_RESET}"
+    fi
     echo -e "  RAM:    ${C_DIM}free=${ram_before_free}MB cache=${ram_before_cached}MB avail=${ram_before_avail}MB${C_RESET}"
 
     # Minimum GPU memory (MiB) for a *compute* process to count as "big data"
@@ -7473,6 +8009,8 @@ for e in d.get('failed', []):
     print(f\"    ! PID {e['pid']} ({e['comm']}) - could not be killed (permission?)\")
 for m in d.get('unloaded', []):
     print(f\"    • unloaded Ollama model: {m}\")
+for m in d.get('stopped_servers', []):
+    print(f\"    • stopped gb-synapse server cleanly: {m}\")
 " 2>/dev/null
     fi
 
@@ -7540,12 +8078,27 @@ PYEOF
     ram_after_cached=$(awk '/^Cached:/{print int($2/1024)}' /proc/meminfo)
     ram_after_avail=$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo)
     local ram_reclaimed=$(( ram_after_avail - ram_before_avail ))
+    query_gpu_vram 2>/dev/null || true
+    local t1_after_used="${GPU_VRAM_USED_MB:-}"
     echo -e "  After:  ${C_DIM}${after}${C_RESET}"
+    if [[ -n "$t1_after_used" ]]; then
+        echo -e "  T1 GPU: ${C_DIM}${t1_after_used}/${GPU_VRAM_TOTAL_MB}MB used (${GPU_VRAM_PCT}%)${C_RESET}"
+    fi
     echo -e "  RAM:    ${C_DIM}free=${ram_after_free}MB cache=${ram_after_cached}MB avail=${ram_after_avail}MB${C_RESET}"
-    if (( ram_reclaimed > 0 )); then
-        gb_ok "Memory pool clear complete  (+${ram_reclaimed}MB DDR reclaimed)."
+
+    # Say what actually changed per tier, so "complete" is never read as
+    # "everything was freed" when a serve session was deliberately spared.
+    local t1_freed=0
+    if [[ -n "$t1_before_used" && -n "$t1_after_used" ]]; then
+        t1_freed=$(( t1_before_used - t1_after_used ))
+    fi
+    local summary=""
+    (( t1_freed > 0 )) && summary="${summary}+${t1_freed}MB VRAM "
+    (( ram_reclaimed > 0 )) && summary="${summary}+${ram_reclaimed}MB DDR "
+    if [[ -n "$summary" ]]; then
+        gb_ok "Memory pool clear complete  (${summary%% })."
     else
-        gb_ok "Memory pool clear complete."
+        gb_ok "Memory pool clear complete  (nothing left to reclaim , the tiers were already empty)."
     fi
 }
 
@@ -9357,10 +9910,22 @@ OEOF
             if [[ -f "$GB_NETD_PID" ]]; then
                 local pid
                 pid=$(cat "$GB_NETD_PID" 2>/dev/null)
-                if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-                    kill "$pid"
-                    sleep 0.5
-                    gb_ok "Feeder daemon stopped (pid $pid)"
+                if [[ -n "$pid" ]] && _gb_pid_alive "$pid"; then
+                    # PID-ownership proof (NemoClaw audit, Phase 2): the old
+                    # `kill "$pid"; sleep 0.5` claimed success without ever
+                    # confirming the process actually exited, and never
+                    # checked the PID file wasn't pointing at a foreign
+                    # process that happened to reuse this PID after a reboot.
+                    if _gb_pid_owned "$pid" && _gb_pid_cmdline_matches "$pid" 'greenboost-netd'; then
+                        if _gb_stop_pid "$pid" "feeder daemon"; then
+                            _gb_purge_action_emit "greenboost-netd" "$pid" "stopped"
+                        else
+                            _gb_purge_action_emit "greenboost-netd" "$pid" "failed"
+                        fi
+                    else
+                        gb_warn_ui "PID $pid in $GB_NETD_PID is not an owned greenboost-netd process - not killing it"
+                        _gb_purge_action_emit "greenboost-netd" "$pid" "skipped_foreign"
+                    fi
                 else
                     info "Feeder daemon not running"
                 fi
@@ -10515,7 +11080,20 @@ set -e
 PORT="${1:-9740}"
 cd /tmp/gb_src
 make netd >/tmp/gb_src/build.log 2>&1 || { echo BUILD_FAILED; tail -5 /tmp/gb_src/build.log; exit 2; }
-pkill -9 -f greenboost-netd 2>/dev/null || true; sleep 2
+# PID-ownership proof (NemoClaw audit, Phase 2), inlined: `pkill -f
+# greenboost-netd` alone matches on cmdline substring, which a coincidentally
+# named foreign process would also match. Verify each candidate PID's real
+# executable (/proc/<pid>/exe) actually resolves to our installed binary
+# before killing it - root here is a given (this whole block runs via
+# `sudo -n bash -s --`), so exe-path identity is the discriminator that
+# matters, not UID.
+for _p in $(pgrep -f greenboost-netd 2>/dev/null); do
+    _exe=$(readlink -f "/proc/$_p/exe" 2>/dev/null || true)
+    if [ "$_exe" = "/usr/local/bin/greenboost-netd" ]; then
+        kill -9 "$_p" 2>/dev/null || true
+    fi
+done
+sleep 2
 install -m 755 greenboost-netd /usr/local/bin/greenboost-netd
 [ -f libgreenboost_netd_capture.so ] && install -m 755 libgreenboost_netd_capture.so /usr/local/lib/libgreenboost_netd_capture.so
 mkdir -p /etc/greenboost /run/greenboost /var/log/greenboost
@@ -10672,12 +11250,21 @@ SETUP=/tmp/gb_update/greenboost_setup.sh
 SHIM=/tmp/gb_update/libgreenboost_cuda.so
 BI=/tmp/gb_update/build_info
 
-# Stop old daemon - SIGTERM first, then SIGKILL to guarantee no ETXTBSY on cp
+# Stop old daemon - SIGTERM first, then SIGKILL to guarantee no ETXTBSY on cp.
+# PID-ownership proof (NemoClaw audit, Phase 2), inlined: verify each
+# candidate's real executable path before signalling it, same reasoning as
+# the netd-rebuild block above - `pkill -x` matches on exact process name
+# alone, which a foreign same-named process would still satisfy.
 systemctl stop greenboost-netd 2>/dev/null || true
-pkill -x    greenboost-netd 2>/dev/null || true
-sleep 1
-pkill -9 -x greenboost-netd 2>/dev/null || true
-sleep 1
+for _sig in TERM KILL; do
+    for _p in $(pgrep -x greenboost-netd 2>/dev/null); do
+        _exe=$(readlink -f "/proc/$_p/exe" 2>/dev/null || true)
+        if [ "$_exe" = "/usr/local/bin/greenboost-netd" ]; then
+            kill "-$_sig" "$_p" 2>/dev/null || true
+        fi
+    done
+    sleep 1
+done
 
 # Install binaries - 'install' writes to a temp then renames atomically,
 # avoiding ETXTBSY even if a stale copy is still mapped in memory
@@ -12396,6 +12983,9 @@ PYEOF
 # thin CLI wrappers, per the project rule that bash only dispatches + renders.
 # See workflow/gb-synapse.md.
 _GB_SYNAPSE_PY="$MODULE_DIR/gb_synapse.py"
+# gb_readiness.py — whole-stack readiness-contract report (NemoClaw audit,
+# Phase 6b), distinct from gb_synapse.py's own synapse-layer-only doctor.
+_GB_READINESS_PY="$MODULE_DIR/gb_readiness.py"
 
 _gb_synapse_run() {
     [[ -f "$_GB_SYNAPSE_PY" ]] || die "gb-synapse script not found: $_GB_SYNAPSE_PY"
@@ -12437,6 +13027,16 @@ cmd_synapse_update_engine(){ need_root "synapse update-engine"; _gb_synapse_run 
 
 cmd_synapse_serve() {
     [[ -z "${1:-}" ]] && die "Usage: greenboost synapse run <model> [port]"
+    # The gb-synapse proxy (gb_synapse_api.py) binds 127.0.0.1 with no auth
+    # by default — every local consumer (greenboost-cli, ai-forge) keeps
+    # working unchanged. LAN/container reach (e.g. a sandboxed agent runtime
+    # such as NemoClaw, whose OpenShell sandbox reaches the host over a
+    # docker bridge, not loopback) requires BOTH a bind and a token, same
+    # convention as GB_A2A_BIND/GB_A2A_TOKEN above:
+    #   export GB_SYNAPSE_BIND=0.0.0.0
+    #   export GB_SYNAPSE_TOKEN=<secret>   # or root-owned /etc/greenboost/synapse_token, 0600
+    # A non-loopback bind with no token refuses to start (gb_synapse_api.py
+    # main()), it does not silently fall back to unauthenticated.
     _gb_synapse_run serve "$@"
 }
 cmd_synapse_stop() { [[ -z "${1:-}" ]] && die "Usage: greenboost synapse stop <model>"; _gb_synapse_run stop "$@"; }
@@ -12483,8 +13083,24 @@ _cmd_doctor_snapshot() {
     echo ""
 }
 cmd_doctor() {
-    local _llm_mode=0
-    for _a in "$@"; do [[ "$_a" == "--llm" ]] && _llm_mode=1; done
+    local _llm_mode=0 _json_mode=0
+    for _a in "$@"; do
+        [[ "$_a" == "--llm"  ]] && _llm_mode=1
+        [[ "$_a" == "--json" ]] && _json_mode=1
+    done
+    # --json is a DIFFERENT report than --llm: --llm is gb_synapse.py's own
+    # synapse-layer-only doctor dict, machine-formatted; --json is
+    # gb_readiness.py's whole-stack readiness contract (schemaVersion/
+    # status/exitCode/mutated/provenance + observations/capabilities/
+    # qualifications/findings/evidence — see schemas/readiness.schema.json).
+    # Exits with the report's own exitCode (0 supported / 2 incompatible /
+    # 3 inconclusive), not always 0, so a script checking $? gets a real
+    # signal instead of always seeing success.
+    if (( _json_mode )); then
+        [[ -f "$_GB_READINESS_PY" ]] || die "gb_readiness.py not found: $_GB_READINESS_PY"
+        python3 "$_GB_READINESS_PY" doctor --json
+        return $?
+    fi
     (( _llm_mode )) && { _gb_synapse_run doctor --llm; return; }
     if [[ ! -t 0 ]]; then _cmd_doctor_snapshot; return; fi
     _gb_run_tui_loop "_cmd_doctor_snapshot" 5 \
@@ -12534,7 +13150,7 @@ cmd_wizard() {
         gb_menu_item  7  "Tune sysctl"               "Persistent kernel tunables - 99-zzz-greenboost.conf"  root
         gb_menu_item  8  "Tune GRUB"                 "Boot params: hugepages, rcu_nocbs, nohz_full (needs reboot)"  root
         gb_menu_item  9  "Generate inference config"  "Optimized Ollama/HF config for this hardware & environment"
-        gb_menu_item 10  "Build gb-synapse engine"   "From-source llama.cpp build (llama-server, rpc-server, llama-quantize)"  root
+        gb_menu_item 10  "Build gb-synapse engine"   "From-source llama.cpp build (llama-server, rpc-server, llama-quantize, llama-imatrix, llama-perplexity)"  root
         gb_menu_item 21  "Install synapse torch engine"  "gb-synapse torch-core engine (vendored gLLM) into synapse-torch-env"  root
 
         gb_section "Restore"
@@ -13234,6 +13850,12 @@ cmd_full_install() {
     gb_info "Checking CUDA toolkit (gb-synapse's engine build needs a current one)..."
     _gb_install_cuda_toolkit
 
+    # 4c - GPUDirect Storage kernel module (not pulled in by cuda-toolkit -
+    # see _gb_install_nvidia_gds's own comment for why). Full install only,
+    # same as the CUDA toolkit step above.
+    gb_info "Checking nvidia-gds (GPUDirect Storage kernel module)..."
+    _gb_install_nvidia_gds || gb_warn "nvidia-gds install failed , run manually: sudo apt install nvidia-gds"
+
 
     # 5 - System tuning (sysctl + NVMe + CPU governor + THP)
     gb_step 5 5 "Applying system tuning..."
@@ -13259,8 +13881,9 @@ cmd_full_install() {
             || warn "$svc restart failed - run: sudo systemctl restart $svc"
     done
 
-    # 6 - gb-synapse engine (llama-server, rpc-server, llama-quantize),
-    # from-source build against the CUDA toolkit installed in step 4b.
+    # 6 - gb-synapse engine (llama-server, rpc-server, llama-quantize,
+    # llama-imatrix, llama-perplexity), from-source build against the CUDA
+    # toolkit installed in step 4b.
     # Owner rule (2026-07-16): `sudo greenboost synapse build-engine` stays
     # part of Full Install — NOT reuse-only — so a fresh `git clone` + Full
     # Install always produces a working engine with zero manual steps.
@@ -13270,7 +13893,7 @@ cmd_full_install() {
     # toolchain issue) shouldn't take down an otherwise-successful full
     # install; the same step is also offered standalone (menu option 10 /
     # `sudo greenboost synapse build-engine`) for retrying afterward.
-    gb_info "Building gb-synapse engine (llama.cpp: llama-server, rpc-server, llama-quantize)..."
+    gb_info "Building gb-synapse engine (llama.cpp: llama-server, rpc-server, llama-quantize, llama-imatrix, llama-perplexity)..."
     if cmd_synapse_build_engine; then
         gb_ok "gb-synapse engine built"
     else
@@ -13506,6 +14129,8 @@ case "$COMMAND" in
     recover)                cmd_recover               ;;
     install-python|install_python) cmd_install_python_files ;;
     install-cli|install_cli)       cmd_install_cli           ;;
+    recover-models|recover_models) cmd_recover_models        ;;
+    memwatch)                      cmd_memwatch "${@:2}"      ;;
     install-synapse-engine|install_synapse_engine) cmd_install_synapse_engine ;;
     install-pipelines|install_pipelines) cmd_install_pipelines ;;
     register-mcp|register_mcp)     cmd_register_mcp          ;;

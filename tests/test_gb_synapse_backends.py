@@ -143,6 +143,52 @@ def test_select_backend_gbquant_legacy_routes_to_torch(monkeypatch):
     assert isinstance(backend, gsb.SynapseTorchBackend)
 
 
+# ── adapter registry (NemoClaw audit, Phase 1) ────────────────────────────
+
+def test_adapter_registry_has_one_ref_per_concrete_backend():
+    assert set(gsb._ADAPTERS) == {
+        "llama-cpp.host-local/v1",
+        "torch.gllm-local/v1",
+        "transformers.single-request/v1",
+        "diffusers.host-local/v1",
+        "video.host-local/v1",
+    }
+    for cls in gsb._ADAPTERS.values():
+        assert cls.ADAPTER_REF in gsb._ADAPTERS
+
+
+def test_resolve_adapter_unknown_ref_lists_known_refs():
+    with pytest.raises(ValueError) as exc_info:
+        gsb.resolve_adapter("does-not-exist/v1")
+    msg = str(exc_info.value)
+    assert "does-not-exist/v1" in msg
+    for ref in gsb._ADAPTERS:
+        assert ref in msg
+
+
+def test_register_rejects_malformed_ref():
+    with pytest.raises(ValueError, match="must match"):
+        @gsb.register("no-version-suffix")
+        class _Bad(gsb.EngineBackend):
+            pass
+
+
+@pytest.mark.parametrize("ref", ["llama-cpp.host-local/v1", "video.host-local/v1"])
+def test_register_rejects_duplicate_ref(ref):
+    with pytest.raises(ValueError, match="already registered"):
+        @gsb.register(ref)
+        class _Dup(gsb.EngineBackend):
+            pass
+
+
+def test_select_backend_unknown_engine_falls_back_to_llama_cpp():
+    """An engine value select_backend has never seen still resolves — the
+    llama.cpp adapter is the unconditional tail, matching the pre-registry
+    if/elif chain's final `return LlamaCppBackend()`."""
+    backend = gsb.select_backend(_FakeEntry("some-future-engine"))
+    assert isinstance(backend, gsb.LlamaCppBackend)
+
+
 # ── effective_vram_budget_mb: %-derived T2 sizing ─────────────────────────
 
 def test_effective_budget_zero_fraction_is_shimless(monkeypatch):

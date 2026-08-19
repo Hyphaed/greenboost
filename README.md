@@ -4,7 +4,7 @@
 
 ### CUDA Memory & Compute Orchestrator for NVIDIA GPUs
 
-![Version](https://img.shields.io/badge/version-3.3-6C4FF6?style=flat-square)
+![Version](https://img.shields.io/badge/version-3.4-6C4FF6?style=flat-square)
 ![License](https://img.shields.io/badge/license-GPLv2%20%2B%20Commercial-blue?style=flat-square)
 ![CUDA](https://img.shields.io/badge/CUDA-12%20%7C%2013-76B900?style=flat-square&logo=nvidia&logoColor=white)
 ![Linux](https://img.shields.io/badge/Linux-supported-333333?style=flat-square&logo=linux)
@@ -12,25 +12,33 @@
 
 ## Run bigger models on the GPU you already own.
 
-**Turn GPU VRAM + System RAM + NVMe + idle LAN GPUs into one larger CUDA device.**
+**Turn GPU VRAM + system RAM + NVMe + idle LAN GPUs into one larger CUDA device.**
 
-**No retraining. No code changes.** Just install **GreenBoost** and keep using **Ollama**, **llama.cpp**, **vLLM**, **PyTorch**, and **Diffusers** and/or step further, use directly **GB-Synapse + Greenboost MCP** for your pipelines.
+No retraining, no code changes. Install it and keep using **Ollama**,
+**llama.cpp**, **PyTorch** and **Diffusers** exactly as you do now , or go
+straight to **GB-Synapse** and drive the whole stack from **GB-CLI**.
 
-are you looking for Greenboost Gaming Suite instead? https://gitlab.com/IsolatedOctopi/greenboost_gaming_suite
+**Status:** daily driver on the author's machine. Every number in this README
+was measured on one box , an RTX 5070, 12 GB, PCIe 4.0 x16, 61 GB DDR , against
+real workloads. Beyond that box, I genuinely don't know, which is where you
+come in.
+
+Looking for the **[GreenBoost Gaming Suite](https://gitlab.com/IsolatedOctopi/greenboost_gaming_suite)** instead?
 
 </div>
 
 <div align="center">
 
-| Subsystem | Description |
-|---------|-------------|
-| 📦 **GB-Tiering** | Extend GPU memory using system RAM and NVMe. |
-| 🗜️ **GB-Quant** | Compress model weights and the KV cache so larger models fit into available VRAM. |
-| 📡 **GB-Dataflux** | Live telemetry exposed through the GreenBoost Dataflux MCP server and a web dashboard. Launch the UI with `greenboost dataflux-ui`. |
-| 🌐 **GB-Cluster** | Borrow idle GPU and RAM resources from other machines on your local network. |
-| 🔗 **GB-Synapse** | Translation proxy exposing Ollama-compatible endpoints (`/api/generate`, `/api/chat`, `/api/tags`, `/api/ps`) and the OpenAI-compatible `/v1/*` API on port `11435`. It sits in front of `gb-synapse` (`llama-server --rpc`), enabling cross-GPU RPC execution, GB-Quant, proxy-side Dataflux telemetry (including tokens/sec), HuggingFace models model serving. A genuine full featured backend, drop-in replacement for Ollama  :: Do not use Ollama, point directly to GB-Synapse for orchestrated ai inference |
-| 🖥️ **GB-CLI** | Agentic terminal client, installed by Full Install , no separate setup. Open it with `gb` or `greenboost-cli`; one-shot prompts with `gb -p "…"`; headless JSON subcommands for scripts (`gb rag-search …`). Always talks to GB-Synapse on `:11435` (Ollama **and** HuggingFace models via `greenboost synapse pull` / `index-ollama`). |
-| 🧭 **GB-Semantics** | Standardized metrics layer that gives every important system concept, such as VRAM usage, throughput (tokens per second), cache hit rate, cluster health, or quality level, a single, well-defined name and source. |
+| Subsystem | What it does |
+|---|---|
+| 📦 **GB-Tiering** | Your GPU's VRAM (T1), system DDR (T2) and NVMe (T3) as one pool. Weights and KV land in the fastest tier with room; only the overflow moves down. Kernel module + CUDA shim. |
+| 🗜️ **GB-Quant** | Compresses the two things that fill a card: model weights at load, and the KV cache on every decode step. TurboQuant does the KV branch (PolarQuant + a 1-bit residual), 3-8x less attention bandwidth. |
+| 📡 **GB-Dataflux** | The flight recorder. Every placement decision, spill, quantization and throughput sample lands in one event log, queryable over MCP or a live web UI (`greenboost dataflux-ui`). |
+| 🌐 **GB-Cluster** | Borrows a GPU sitting idle on your LAN. The remote card's VRAM *and* its compute join the pool , a feeder that only holds bytes is half-wired, and the code says so. |
+| 🔗 **GB-Synapse** | GreenBoost's own model server on `:11369`, speaking both the Ollama API (`/api/generate`, `/api/chat`, `/api/tags`) and OpenAI's `/v1/*`. Serves GGUF and HuggingFace models, splits one model across host + feeder GPUs over RPC, and reports real tokens/sec. This replaces Ollama rather than sitting beside it. Loopback-only and unauthenticated by default; set `GB_SYNAPSE_BIND`/`GB_SYNAPSE_TOKEN` before exposing it. |
+| 🖥️ **GB-CLI** | The agentic terminal client, installed by Full Install , no separate setup. `gb` or `greenboost-cli` for a session, `gb -p "…"` for one shot, JSON subcommands for scripts. It shows live VRAM/tier/throughput while it works, and can pause a model mid-session to hand the card back. |
+| 🧭 **GB-Semantics** | One name per concept, one source per name. Ask "why is inference slow" and get a governed answer instead of a plausible-sounding raw field. Keeps a `never_use` list of the fields that look right and aren't. |
+
 </div>
 
 <div align="center">
@@ -72,57 +80,63 @@ wouldn't exist without them.
 
 ## What is GreenBoost?
 
-**Your GPU ran out of VRAM.**
-**Most tools tell you to buy a bigger GPU.**
-**GreenBoost is the third option.**
+You have a model that is bigger than your graphics card. The usual advice is to
+buy a bigger card. GreenBoost is the third option.
 
-It extends CUDA memory with system RAM, NVMe, model compression, and even
-idle GPUs on your local network - allowing models much larger than your
-card's VRAM to keep running, while computation stays on the GPU.
+It extends CUDA's memory with everything else you already own , system RAM,
+NVMe, weight and KV compression, and idle GPUs on your LAN , so a model larger
+than your VRAM keeps running. The important part is what *doesn't* move: only
+memory crosses PCIe. Every kernel still executes on the GPU.
 
-Under the hood it is six subsystems you mix and match: **GB-Tiering**
-(VRAM → DDR → NVMe as one virtual pool), **GB-Quant** (compress the model's
-weights at load and its KV cache on every decode step), **GB-Cluster**
-(borrow an idle GPU and its RAM over LAN), **GB-Synapse** (GreenBoost's own
-cluster-aware model server, drop-in for Ollama), **GB-Dataflux** (live
-telemetry for all of the above), and **GB-CLI** (the agentic terminal client
-on top). Each has its own section below, in that order.
+**This is not CPU offload, and the difference is the whole project.** CPU
+offload moves the *work* to your processor, and you pay for it in tokens per
+second , heavily. GreenBoost moves the *bytes* and leaves the maths where it
+belongs. There is exactly one deliberate exception, MoE expert offload, and it
+exists because it measured faster on this hardware, not because something
+quietly fell back.
 
-Nothing in your model code changes. No retraining required. It just works
-with Ollama, llama.cpp, vLLM, PyTorch, and anything else that calls
-`cudaMalloc()`.
+**What you actually get.** It runs daily on this machine against real models,
+so here is the honest shape rather than a benchmark. A 15.85 GB model on an
+11.9 GB card still streams roughly 4 GB across PCIe every single token, and
+that arithmetic lands near 5 tok/s no matter how well everything else is tuned.
+GreenBoost makes that model *run*, and tells you plainly why it runs at the
+speed it does. It does not make PCIe faster , nothing can, and this board's
+root port caps at Gen4 in read-only silicon. Where a model does fit, or where
+it is a mixture-of-experts that spreads across the tiers properly, you will see
+numbers like 45.72 tok/s.
 
-GreenBoost grew out of running local AI at home and constantly hitting the
-same wall: not enough VRAM. My answer was never "buy a bigger GPU" - it was
-"find the memory somewhere else and keep using what I have." DDR and NVMe
-were the first places to look; a second GPU on the network (GB-Cluster,
-below) is the next. It's the same idea DLSS proved years ago: software
-squeezing more out of hardware that's already there isn't a workaround, it's
-legitimate engineering. Every part of GreenBoost gets exercised daily against
-real workloads on my own machines - a range of local LLMs served through
-Ollama (dense and mixture-of-experts, small and large) and Hugging Face
-diffusion pipelines for image and video - not just synthetic benchmarks.
+**If what you want is a longer context**, that is the same problem wearing a
+different hat, and GB-Quant is the piece that helps: weights compressed at
+load, KV cache compressed on every decode step. On the reference workload a KV
+measurement cache took VRAM fill from 67% to 85% and decode from ~3 to 5.3
+tok/s, purely by stopping the planner from over-reserving.
+
+Everything runs on hardware you control. No inference, embedding or agent
+reasoning is sent to a cloud endpoint , that is a rule enforced in the
+codebase, not an aspiration.
+
+---
 
 ### Who is this for?
 
-- **Newcomers to local LLMs:** you have a 12 GB or 16 GB GPU and want to
-  run a 30 B+ model that needs 24 GB. Install GreenBoost, 
-  use gb-synapse as backend and/or greenboost-cli, 
-  greenboost at first versions was intercepting ollama,
-  on those new latest versions greenboost ships GB-Synapse, 
-  a proper backend serving GGUF (with full compatible ollama endpoints) + 
-  hugging face models while using whole greenboost features. Type "greenboost-cli" on terminal, 
-  is a simple cli to manage those models directly from your terminal,
-- **Inference engineers:** you want to push context length or batch size
-  past VRAM, without paying a 100× CPU offload penalty. GreenBoost keeps
-  compute on the GPU; only memory crosses PCIe.
-- **Quality-conscious users:** your model is 1.5-3× your VRAM. GB-Quant
-  quantizes both branches - weights at load, KV cache on every decode step -
-  to fit it in VRAM with near-zero quality loss, and no offload penalty at
-  all, because the whole working set runs at full GPU bandwidth.
-- **Cluster operators:** you have a few workstations with idle VRAM.
-  GB-Cluster turns them into "feeders" so one host can borrow VRAM and
-  compute from them over TCP.
+Anyone running a local model on a card one size too small.
+
+- **Newcomers to local LLMs.** You have a 12 or 16 GB card and want a 30B+
+  model. Install GreenBoost, let **GB-Synapse** serve it (GGUF or HuggingFace,
+  full Ollama-compatible endpoints), and drive it from `greenboost-cli`. Early
+  versions of GreenBoost intercepted Ollama; current ones replace it.
+- **Inference engineers.** You want context length or batch size past VRAM
+  without paying the CPU-offload penalty. Compute stays on the GPU; only bytes
+  move.
+- **Quality-conscious users.** Your model is 1.5-3x your VRAM. GB-Quant
+  compresses both branches to fit it, and `gb_aviary`'s gates measure whether
+  quality actually held rather than assuming a bit-width implies it.
+- **Anyone with more than one machine.** If you have a second PC, a laptop, or
+  an old workstation sitting on the same network, GreenBoost can put its GPU to
+  work on the same model. You connect them over your LAN, they become
+  "feeders", and the main machine borrows both their spare VRAM *and* their
+  compute , so the inference is spread across every card in the house instead
+  of being limited to the one in front of you.
 
 ---
 
@@ -174,44 +188,73 @@ that same tier ladder onto any idle LAN machine, **GB-Dataflux** logs every
 layer above, and the **Central MCP** (`greenboost-orchestrator`) gives an
 LLM assistant one query surface over all of it:
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  Your app , gb CLI, or any Ollama / OpenAI / HF-TGI client        │
-└───────────────────────────────┬──────────────────────────────────┘
-                                 │  :11435
-                    ┌────────────┴─────────────┐
-                    │  GB-Synapse  +  GB-CLI     │── tok/s, requests ──┐
-                    │  (Ollama/OpenAI/TGI proxy)  │                     │
-                    └────────────┬─────────────┘                     │
-                                 │  cudaMalloc / cuMemAlloc /           │
-                                 │  cuLaunchKernel                      │
-                    ┌────────────┴─────────────┐                     │
-                    │  GB-Quant                   │── quantize events ──┤
-                    │  (weight + KV compression)   │                     │
-                    └────────────┬─────────────┘                     │
-                                 │                                     │
-                    ┌────────────┴─────────────┐                     │
-                    │  libgreenboost_cuda.so       │── tier moves,  ─────┤
-                    │  the GB-Tiering shim + kmod   │  phase transitions   │
-                    └────────────┬─────────────┘                     │
-                                 ▼                                     │
-      ┌─────────────┐   ┌────────────────────┐   ┌────────────┐       │
-      │ T1: VRAM    │ → │ T2: System DDR      │ → │ T3: NVMe   │       │
-      │ (local GPU) │   │ (DMA-BUF pinned)     │   │ (swap)     │       │
-      └──────┬──────┘   └──────────┬──────────┘   └─────┬──────┘       │
-             │     GB-Cluster mirrors this same ladder    │              │
-             │     onto every connected feeder over LAN    │              │
-             ▼                     ▼                       ▼              │
-      ┌─────────────┐   ┌────────────────────┐   ┌────────────┐       │
-      │ feeder T1   │   │ feeder T2           │   │ feeder T3  │       │
-      │ (remote GPU)│   │ (remote DDR)        │   │ (remote NVMe)│      │
-      └─────────────┘   └────────────────────┘   └────────────┘       │
-                                                                        │
-   Every box above emits into GB-Dataflux (log + web UI + MCP) ◄───────┘
-                                 │
-                                 ▼
-        Central MCP  `greenboost-orchestrator`  , one query + control
-        surface for an LLM assistant across every subsystem above
+```mermaid
+%%{init: {"flowchart": {"curve": "basis", "padding": 12}}}%%
+flowchart TD
+    client(["Your app &nbsp;·&nbsp; gb CLI &nbsp;·&nbsp; any Ollama / OpenAI / HF-TGI client"])
+
+    subgraph SERVE ["&nbsp;Serving&nbsp;"]
+        direction TB
+        synapse["<b>GB-Synapse</b> + <b>GB-CLI</b><br/><small>Ollama / OpenAI / TGI proxy</small>"]
+        quant["<b>GB-Quant</b><br/><small>weight + KV compression</small>"]
+    end
+
+    shim["<b>libgreenboost_cuda.so</b><br/><small>GB-Tiering shim + greenboost.ko</small>"]
+
+    subgraph LOCAL ["&nbsp;Local tier ladder &nbsp;·&nbsp; fastest that has room wins&nbsp;"]
+        direction LR
+        t1["<b>T1 · VRAM</b><br/><small>local GPU</small>"]
+        t2["<b>T2 · System DDR</b><br/><small>DMA-BUF pinned</small>"]
+        t3["<b>T3 · NVMe</b><br/><small>swap</small>"]
+        t1 -- "overflow" --> t2 -- "overflow" --> t3
+    end
+
+    subgraph LAN ["&nbsp;GB-Cluster &nbsp;·&nbsp; the same ladder on every idle LAN feeder&nbsp;"]
+        direction LR
+        f1["feeder T1<br/><small>remote GPU</small>"]
+        f2["feeder T2<br/><small>remote DDR</small>"]
+        f3["feeder T3<br/><small>remote NVMe</small>"]
+    end
+
+    flux[/"<b>GB-Dataflux</b><br/><small>flight recorder &nbsp;·&nbsp; log + web UI + MCP</small>"/]
+    mcp(["<b>Central MCP</b> &nbsp;·&nbsp; greenboost-orchestrator<br/><small>one query + control surface for an LLM assistant</small>"])
+
+    client -- ":11369" --> synapse
+    synapse -- "cudaMalloc / cuMemAlloc / cuLaunchKernel" --> quant
+    quant --> shim
+    shim --> t1
+
+    t1 -. "peer into idle VRAM" .-> f1
+    t2 -.-> f2
+    t3 -.-> f3
+
+    synapse -. "tok/s, requests" .-> flux
+    quant   -. "quantize events" .-> flux
+    shim    -. "tier moves, phase transitions" .-> flux
+    t3      -. "pressure, spill" .-> flux
+    f1      -. "remote chunks" .-> flux
+
+    flux ==> mcp
+
+    classDef entry  fill:#0f766e,stroke:#0b5f58,stroke-width:1px,color:#ffffff
+    classDef svc    fill:#1e3a5f,stroke:#16304f,stroke-width:1px,color:#ffffff
+    classDef kern   fill:#4c1d95,stroke:#3d1778,stroke-width:1px,color:#ffffff
+    classDef tier1  fill:#166534,stroke:#12512a,stroke-width:1px,color:#ffffff
+    classDef tier2  fill:#854d0e,stroke:#6b3d0b,stroke-width:1px,color:#ffffff
+    classDef tier3  fill:#7f1d1d,stroke:#661717,stroke-width:1px,color:#ffffff
+    classDef feed   fill:#334155,stroke:#293546,stroke-width:1px,color:#e2e8f0
+    classDef obs    fill:#a16207,stroke:#7d4c05,stroke-width:1px,color:#ffffff
+    classDef brain  fill:#1e40af,stroke:#17338c,stroke-width:1px,color:#ffffff
+
+    class client entry
+    class synapse,quant svc
+    class shim kern
+    class t1 tier1
+    class t2 tier2
+    class t3 tier3
+    class f1,f2,f3 feed
+    class flux obs
+    class mcp brain
 ```
 
 The kernel module (`greenboost.ko`) is the trick behind GB-Tiering: it pins
@@ -231,8 +274,8 @@ a feeder's VRAM/DDR/NVMe are just T1/T2/T3 one hop further away.
    GPU speed for the parts that fit, and degrades gracefully for the rest.
 
 Jump to a subsystem's own section for the details: [GB-Tiering](#-gb-tiering) ·
-[GB-Quant](#️-gb-quant) · [GB-Dataflux](#-gb-dataflux) · [GB-Cluster](#-gb-cluster) ·
-[GB-Synapse](#-gb-synapse) · [GB-CLI](#️-gb-cli).
+[GB-Quant](#-gb-quant) · [GB-Dataflux](#-gb-dataflux) · [GB-Cluster](#-gb-cluster) ·
+[GB-Synapse](#-gb-synapse) · [GB-CLI](#-gb-cli).
 
 ### Containers, VMs, WSL2: Path B
 
@@ -495,21 +538,26 @@ Full security model: [DOCUMENTATION.md § Cluster security](DOCUMENTATION.md).
 
 ## 🔗 GB-Synapse
 
-**GreenBoost's own model server and Ollama-compatible proxy on `:11435`,
+**GreenBoost's own model server and Ollama-compatible proxy on `:11369`,
 spread across the cluster.**
 
-New in v3.2. Ollama only serves models from its own registry. GB-Synapse
-pulls GGUFs straight from any HuggingFace repository, gated or public, given
-a token, and also indexes GGUFs Ollama already downloaded, so one tool sees
-both. For clustering, it hands the cross-machine split to llama.cpp's own
-RPC backend, real layer-granular tensor split, only activations cross the
-wire, while the GreenBoost shim keeps extending each node's own share into
-that node's local RAM/disk underneath it.
+Greenboost at first versions was intercepting ollama calls,
+on those new latest versions greenboost ships GB-Synapse, 
+a proper backend serving GGUF (with full compatible ollama endpoints) + 
+hugging face models + 100% integrated / making use of all greenboost features. 
+
+Type "greenboost-cli" on terminal, if you haven't yet,
+you can also point your custom scripts to gb-synapse.
+
+is a simple cli to manage those models directly from your terminal. |
+
+
+
 
 ```bash
 sudo greenboost synapse login              # store a HuggingFace token
 sudo greenboost pull <repo>[:quant]        # download a GGUF
-greenboost synapse run <model>             # serve it, cluster-aware, on :11435
+greenboost synapse run <model>             # serve it, cluster-aware, on :11369
 ```
 
 The proxy in front of `llama-server` speaks Ollama's API (`/api/generate`,
@@ -522,7 +570,16 @@ between an orchestration decision and its real, client-observed throughput.
 Serving control is also exposed over the `greenboost-synapse` MCP server
 (`synapse_status`, `synapse_models`, `synapse_ps`, `synapse_recommend`,
 `synapse_doctor`; `synapse_serve`/`synapse_stop` are confirmation-gated so an
-assistant can't yank a live `:11435` out from under you).
+assistant can't yank a live `:11369` out from under you).
+
+**Security:** the proxy binds `127.0.0.1` with no auth by default — every
+local consumer (greenboost-cli, ai-forge) keeps working unchanged. LAN or
+container reach (e.g. exposing `:11369` to a sandboxed agent runtime) needs
+`GB_SYNAPSE_BIND` + `GB_SYNAPSE_TOKEN` (or `/etc/greenboost/synapse_token`,
+0600); a non-loopback bind with no token refuses to start rather than
+silently serving unauthenticated. See
+[docs/nemoclaw-and-greenboost.md](docs/nemoclaw-and-greenboost.md) for the
+worked example (NVIDIA NemoClaw as a client of gb-synapse).
 
 Full reference: [GREENBOOST_COMMANDS.md § gb-synapse](GREENBOOST_COMMANDS.md#-gb-synapse-huggingface-native-cluster-distributed-gguf-serving).
 
@@ -564,7 +621,7 @@ gb -p "summarize this repo"   # one-shot prompt
 gb rag-search "kv cache"      # headless JSON subcommand, for scripts
 ```
 
-GB-CLI always talks to **GB-Synapse on `:11435`**, so whatever you served
+GB-CLI always talks to **GB-Synapse on `:11369`**, so whatever you served
 (Ollama-indexed or HuggingFace-pulled GGUF, single-GPU or RPC-split across the
 cluster) is what the agent runs on, with GB-Quant and GB-Tiering underneath and
 every turn's measured tokens/sec landing in GB-Dataflux.
@@ -578,7 +635,20 @@ rag/goals/factory surface to other assistants.
 
 ## 🧭 GB-Semantics
 
-This is a standardized metrics layer that gives every important system concept—such as VRAM usage, throughput (tokens per second), cache hit rate, cluster health, or quality level—a single, well-defined name and source. Instead of letting applications or LLMs read raw telemetry directly, they must go through this layer, which acts as the authoritative resolver for each metric. It enforces consistency, hides implementation details, and prevents accidental use of low-level fields by explicitly marking them as internal or unsupported. In practice, it becomes the default interface for accessing system state, ensuring that all clients interpret metrics the same way regardless of how the underlying telemetry changes.
+One name per concept, one source per name.
+
+The problem this solves is specific and it bit repeatedly before the layer
+existed. Several raw GreenBoost fields look like the answer and are not: a
+shim-inflated "virtual" VRAM figure that reads full while physical VRAM is
+nearly empty, and a pressure field that means a 0/1/2 severity level in one
+place and a 0.0-1.0 fraction in another , under the identical name. Read the
+wrong one and you get a confident, wrong answer.
+
+So metrics go through a resolver instead. Every metric declares its source, its
+units, its owner, and a `never_use` list naming the traps with the incident
+that proves each one. Segment verdicts are three-valued , `matched`, `clear`,
+or **`unknown`** , because a telemetry failure that reads as a clean bill of
+health is the exact failure this layer exists to prevent.
 
 ```bash
 python3 gb_semantics.py answer "is rule 1 satisfied?"

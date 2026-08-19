@@ -38,6 +38,7 @@ import re
 import socketserver
 import sys
 import time
+from collections import OrderedDict
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -170,7 +171,8 @@ class SnapshotRecorder:
     still giving a real time-series, not just point-in-time snapshots.
     """
 
-    def __init__(self, telemetry_manager, interval_s: float = 5.0, node: str | None = None):
+    def __init__(self, telemetry_manager, interval_s: float = 5.0,
+                 node: str | None = None, watch_segments: bool = False):
         self._interval_s = interval_s
         self._last_emit = 0.0
         self._node = node
@@ -186,6 +188,16 @@ class SnapshotRecorder:
         # persistent violation must stay visible in a dataflux time window,
         # not just fire once on the edge and scroll away.
         self._rule1_underfill_last_emit_ts = 0.0
+        # Segment-watcher throttle , see _on_metrics.
+        self._last_segment_tick = 0.0
+        # Opt-IN, and deliberately off by default. Ticking the governed
+        # segment watcher evaluates real telemetry (nvidia-smi, running
+        # servers) and emits its own semantic_transition events into this
+        # same log. A recorder built in a unit test with a fake metrics
+        # source must do neither , it would both hit real hardware and
+        # break every test that counts events. Production turns it on
+        # explicitly in start_snapshot_recorder().
+        self._watch_segments = watch_segments
         # Per-tier decision tracking , the shim already exports monotonic
         # per-tier alloc counts + lifetime bytes to /run/greenboost/shim_stats.
         # We diff them each poll and emit one `shim_decision` event per tier
@@ -397,6 +409,24 @@ class SnapshotRecorder:
         # shim, the read simply finds nothing new).
         if self._node in (None, "host"):
             self._detect_shim_decisions(m, gb, node)
+            # Governed-segment verdicts , reactive, transition-only.
+            #
+            # Rides this existing tick rather than starting a second poller:
+            # every segment resolver wraps an accessor the recorder is already
+            # reading on the same pass, so the marginal cost is the evaluation
+            # itself. Without this, evaluate_segment() only ever runs when a
+            # human asks, which is how a matched rule1_underfilled went
+            # unreported on 2026-08-18 despite Rule #1 requiring a tripwire.
+            # Throttled to interval_s like the snapshot below: segment verdicts
+            # move on the timescale of placement decisions, not of polls.
+            if (self._watch_segments
+                    and (now - self._last_segment_tick) >= self._interval_s):
+                self._last_segment_tick = now
+                try:
+                    import gb_semantics_watch
+                    gb_semantics_watch.tick()
+                except Exception:
+                    pass   # never let the governed layer break the recorder
         # Continuous flight-recorder snapshot , throttled to interval_s.
         if now - self._last_emit < self._interval_s:
             return
@@ -510,7 +540,11 @@ def start_snapshot_recorder(telemetry_manager=None, interval_s: float = 5.0):
             feeder_idx += 1
         else:
             node = "host" if getattr(m, "device", 0) == 0 else f"gpu{m.device}"
-        recorders.append(SnapshotRecorder(m, interval_s=interval_s, node=node))
+        # watch_segments=True only here: this is the real, long-lived
+        # recorder started by gb_init/gb_supervisor. Segment verdicts ride
+        # this tick rather than getting a poller of their own.
+        recorders.append(SnapshotRecorder(m, interval_s=interval_s, node=node,
+                                          watch_segments=True))
     return recorders[0] if len(recorders) == 1 else recorders
 
 
@@ -545,7 +579,18 @@ def emit(event: dict) -> None:
         # every event kind, so grouping by pid always disambiguates
         # single-process-bug from multi-process-normal.
         event.setdefault("pid", os.getpid())
+        # item 11 hygiene fold-in: this log carries full internal telemetry
+        # (paths, model names, tier state) and shouldn't be group/world
+        # readable; tighten to 0600 the first time it's created (not every
+        # append — a repeated chmod on the hot write path is unnecessary
+        # syscall overhead and would also stomp an operator's own override).
+        _is_new = not log_path.exists()
         with open(log_path, "a") as f:
+            if _is_new:
+                try:
+                    os.chmod(log_path, 0o600)
+                except OSError:
+                    pass
             f.write(json.dumps(event) + "\n")
             size = f.tell()
         if size > _max_log_bytes(log_path):
@@ -692,7 +737,27 @@ def _read_jsonl_file(path: Path, cutoff: "float | None") -> list[dict]:
 # process makes many read_events() calls per request (dataflux_critic ->
 # critic_report -> read_events, etc.), and the same (path, mtime, size)
 # pair means the file hasn't changed since the last read.
-_READ_EVENTS_MEMO: "dict[tuple, list[dict]]" = {}
+#
+# It MUST be bounded. The original was a plain dict, which is safe in the
+# short-lived process it was written for and a slow memory leak in a daemon:
+# gb-synapse's proxy imports gb_init, whose SnapshotRecorder appends to this
+# very log every 5 s and then ticks the segment watcher, which calls
+# read_events(). Each append moves st_mtime_ns/st_size, so every tick minted a
+# BRAND NEW key and retained the whole parsed event list (~100k dicts for an
+# 8.5 MB log) under it forever , measured at +10.7 MB/s while completely idle,
+# reaching the proxy's address-space cap in minutes (2026-08-19 incident: the
+# proxy raised MemoryError mid-generation and the CLI reported "gb-synapse
+# stopped responding while generating").
+#
+# `since_hours` is a second unbounded axis , callers pass window_s / 3600.0,
+# a float that varies per query , so supersession eviction alone is not
+# enough and a hard cap is required as well.
+_READ_EVENTS_MEMO: "OrderedDict[tuple, list[dict]]" = OrderedDict()
+
+#: Distinct (file-generation, window) results kept. Small on purpose: the memo
+#: exists to collapse the several read_events() calls made while serving ONE
+#: request, not to be a history cache.
+_READ_EVENTS_MEMO_MAX = max(1, int(os.environ.get("GB_DATAFLUX_MEMO_MAX", "8")))
 
 
 def _stat_key(p: Path) -> "tuple | None":
@@ -721,7 +786,16 @@ def read_events(since_hours: float | None = None) -> list[dict]:
     memo_key = (str(log_path), archive_key, main_key, since_hours)
     cached = _READ_EVENTS_MEMO.get(memo_key)
     if cached is not None:
+        _READ_EVENTS_MEMO.move_to_end(memo_key)
         return list(cached)
+
+    # This read supersedes every cached generation of the same (path, window):
+    # stat keys only ever move forward, so those entries can never be hit
+    # again. Dropping them here is exact , it costs no future cache hit.
+    for stale in [k for k in _READ_EVENTS_MEMO
+                  if k[0] == memo_key[0] and k[3] == memo_key[3]
+                  and k != memo_key]:
+        _READ_EVENTS_MEMO.pop(stale, None)
 
     out: list[dict] = []
     if archive_key is not None:
@@ -733,6 +807,9 @@ def read_events(since_hours: float | None = None) -> list[dict]:
 
     out.sort(key=lambda e: e.get("ts", 0))
     _READ_EVENTS_MEMO[memo_key] = out
+    _READ_EVENTS_MEMO.move_to_end(memo_key)
+    while len(_READ_EVENTS_MEMO) > _READ_EVENTS_MEMO_MAX:
+        _READ_EVENTS_MEMO.popitem(last=False)
     return list(out)
 
 
@@ -844,7 +921,37 @@ def summarize(events: list[dict]) -> dict:
         _ev_node = canonical_node(ev.get("node"))
         _node_prefix = f"{_ev_node}:" if _ev_node not in ("", "host", None, "?") else ""
 
-        if ev.get("kind") == "tok_s_measured":
+        # A sample the WRITER already rejected is not a measurement, so it must
+        # not reach the throughput rollup. gb_synapse.record_measured_tok_s()
+        # applies a node/model-derived sanity ceiling and, when a sample exceeds
+        # it, still emits the event but marked status="error" +
+        # error="sample exceeds ... ceiling, dropped". This rollup used to count
+        # those anyway, so a physically impossible figure became the reported
+        # `latest` and polluted `avg` — observed live 2026-08-17 (latest=21065.2
+        # tok/s against a ceiling of 2566.0) and, on the previous reference
+        # model, 18355.3. Honouring the writer's own verdict here also cleans
+        # history retroactively, because the rejection marker is in the log.
+        # Note this narrow condition rather than a `continue`: the event must
+        # still reach the node/label/run accounting below, where it is correctly
+        # counted as an error.
+        # "skipped" joins "error" as a status that must not enter the rate
+        # rollup. It marks a turn that completed but was too short to be a
+        # decode-rate measurement (see gb_synapse.record_tok_s_skipped): the
+        # event exists so those turns are COUNTABLE instead of invisible, not
+        # so they can be averaged. It carries no tok_s value, so including it
+        # would drag every average toward zero — the mirror image of the
+        # 283.8 tok/s outliers the sample floor was added to keep out.
+        if ev.get("kind") == "tok_s_measured" and ev.get("status") == "skipped":
+            _src = ev.get("source") or ""
+            _quant = ev.get("quant") or ""
+            _cfg = (f"::{_quant}::{int(ev.get('ctx') or 0)}::{ev.get('kv_type') or ''}"
+                    if _quant else "")
+            _key = (_node_prefix + (f"[{_src}]" if _src else "")
+                    + ev.get("model", "?") + _cfg)
+            _t = tok_s.setdefault(_key, {"latest": 0.0, "samples": 0, "_sum": 0.0,
+                                         "_vals": [], "last_ts": 0})
+            _t["skipped"] = _t.get("skipped", 0) + 1
+        elif ev.get("kind") == "tok_s_measured" and ev.get("status") != "error":
             # Two different, both-valid vantage points on the same turn
             # (gb_synapse_api.py's proxy measures first-content-token→last
             # across ANY client; greenboost-cli measures its own turn
@@ -856,11 +963,29 @@ def summarize(events: list[dict]) -> dict:
             # key, so this is backward compatible with existing dashboards.
             _src = ev.get("source") or ""
             _src_prefix = f"[{_src}]" if _src else ""
-            model = _node_prefix + _src_prefix + ev.get("model", "?")
-            t = tok_s.setdefault(model, {"latest": 0.0, "samples": 0, "_sum": 0.0, "last_ts": 0})
+            # missing_features.md item (k): the SAME model name served at a
+            # different quant/ctx/kv_type must never blend into one rollup
+            # here either — this mirrors gb_synapse._tok_s_key()'s fix to
+            # the persisted measured_tok_s.json, applied independently
+            # because this function reads the raw dataflux event log, not
+            # that file. Events with no `quant` (older data, pre-fix, or a
+            # caller that genuinely doesn't know it) keep the exact old
+            # unprefixed key , backward compatible with existing dashboards
+            # and historical rows. This does NOT retroactively clean a
+            # historical impossible sample already in the append-only log
+            # (e.g. the 18355.3 tok/s incident that exposed item (k)) , the
+            # write-side sanity ceiling in gb_synapse.record_measured_tok_s
+            # is what prevents new ones; a reader of raw history should
+            # still apply judgment to any one outlier sample.
+            _quant = ev.get("quant") or ""
+            _cfg_suffix = f"::{_quant}::{int(ev.get('ctx') or 0)}::{ev.get('kv_type') or ''}" if _quant else ""
+            model = _node_prefix + _src_prefix + ev.get("model", "?") + _cfg_suffix
+            t = tok_s.setdefault(model, {"latest": 0.0, "samples": 0, "_sum": 0.0,
+                                         "_vals": [], "last_ts": 0})
             t["latest"] = ev.get("tok_s", 0.0)
             t["samples"] += 1
             t["_sum"] += ev.get("tok_s", 0.0)
+            t["_vals"].append(ev.get("tok_s", 0.0))
             t["last_ts"] = ev.get("ts", 0)
 
         if ev.get("kind") == "stage_profile":
@@ -901,6 +1026,28 @@ def summarize(events: list[dict]) -> dict:
 
     for t in tok_s.values():
         t["avg"] = round(t.pop("_sum") / t["samples"], 1) if t["samples"] else 0.0
+        # `avg` alone is not a usable baseline for this metric and must not be
+        # compared against on its own. A tok/s sample is duration-blind: a
+        # 3-token reply whose timer spans a few ms scores hundreds of tok/s and
+        # weighs exactly as much as a 500-token generation. Measured over one
+        # real day on the reference workload (2026-08-17, n=41 at ctx=32768):
+        # min 1.7, median 13.9, mean 33.2, max 283.8 — plus a 21065.2 outlier
+        # that only the sanity ceiling caught. The mean sat 2.4x above the
+        # median, which is what made the pilot report a "46% regression" for a
+        # sample that was in fact close to normal.
+        #
+        # The median is the honest central value for a distribution this skewed,
+        # so it is published alongside (never instead of — `avg` stays for
+        # backward compatibility with existing consumers/UI).
+        vals = sorted(t.pop("_vals", []))
+        if vals:
+            n = len(vals)
+            t["median"] = round(vals[n // 2] if n % 2
+                                else (vals[n // 2 - 1] + vals[n // 2]) / 2.0, 1)
+            t["min"] = round(vals[0], 1)
+            t["max"] = round(vals[-1], 1)
+        else:
+            t["median"] = t["min"] = t["max"] = 0.0
 
     for s in stages.values():
         raw = s.pop("_walls")

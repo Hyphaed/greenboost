@@ -60,6 +60,7 @@ def _run_hook(command: str, payload: dict) -> tuple[bool, str]:
         r = subprocess.run(
             command,
             shell=True,
+            executable="/bin/bash",
             input=json.dumps(payload),
             capture_output=True,
             text=True,
@@ -121,12 +122,33 @@ def run_user_prompt_hooks(prompt: str) -> tuple[bool, str]:
     return True, ""
 
 
-def run_stop_hooks(session_summary: str) -> None:
-    """Run Stop hooks (fires when the agent loop finishes)."""
+def run_stop_hooks(session_summary: str, *, turns: int = 0) -> "tuple[bool, str]":
+    """Run Stop hooks. Returns (may_stop, reason_to_keep_going).
+
+    A Stop hook that answers `{"continue": false}` is REFUSING THE STOP , the
+    same convention the other hook events use for "do not proceed", where here
+    the thing not being proceeded with is ending the turn. Its reason is fed
+    back as the next instruction.
+
+    This is the extension point that makes the non-stop chain a project's own:
+    a repo can require its test suite green, or its formatter clean, before a
+    chain is allowed to hand the prompt back, without patching this CLI.
+
+    A refusing hook cannot create an unbounded loop , the returned reason goes
+    through the same chain that the stall detector governs, so a hook that
+    refuses forever still stops once the run produces nothing.
+
+    Callers that ignore the return value keep the old fire-and-forget
+    behaviour, which is why the signature stays compatible.
+    """
     hooks = _load_hooks().get("Stop", [])
-    payload = {"hook_event_name": "Stop", "session_summary": session_summary}
+    payload = {"hook_event_name": "Stop", "session_summary": session_summary,
+               "turns": turns}
     for hook in hooks:
-        _run_hook(hook.get("command", ""), payload)
+        ok, reason = _run_hook(hook.get("command", ""), payload)
+        if not ok:
+            return False, (reason or "a Stop hook asked for more work")
+    return True, ""
 
 
 def invalidate_cache() -> None:
