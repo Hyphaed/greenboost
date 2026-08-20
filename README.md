@@ -61,6 +61,7 @@ Looking for the **[GreenBoost Gaming Suite](https://gitlab.com/IsolatedOctopi/gr
 [GB-Synapse](#-gb-synapse) ·
 [GB-CLI](#-gb-cli) ·
 [GB-Semantics](#-gb-semantics) ·
+[Kernel](#-the-kernel-underneath) ·
 [Changelog](CHANGELOG.md)
 
 </div>
@@ -283,6 +284,19 @@ git clone https://gitlab.com/IsolatedOctopi/greenboost.git
 cd greenboost
 sudo ./greenboost_setup.sh
 ```
+
+That gives you `main`, which is currently **v3.5 in development**. There is no
+v3.5 release and no v3.5 tag: it builds, its gates pass, and it has had less
+running time on real hardware than a tagged release. That is the whole
+difference, and it is the reason `main` is not presented as stable.
+
+For the last stable release instead:
+
+```bash
+git checkout v3.4 && sudo ./greenboost_setup.sh
+```
+
+[CHANGELOG.md](CHANGELOG.md) tracks what is on `main` ahead of v3.4.
 
 The installer detects your hardware and asks which mode to use:
 
@@ -922,6 +936,79 @@ declares its own version agreeing with every other, after a 3.2/3.4 skew made
 the Gaming Suite offer an upgrade to a release that was already installed.
 
 ---
+## 🐧 The kernel underneath
+
+GreenBoost is a userspace stack plus one out-of-tree kernel module. Running
+that module hard, on real workloads, keeps finding places where mainline Linux
+has no way to express what this kind of work needs. Those findings live in a
+separate repository,
+[linux-kernel-inference](https://gitlab.com/IsolatedOctopi/linux-kernel-inference)
+([GitHub mirror](https://github.com/Hyphaed/linux-kernel-inference)), which
+builds a kernel tuned for local inference and carries the patches.
+
+**You do not need it.** GreenBoost runs on a stock distribution kernel, and
+that is the supported path. The patches exist because a handful of them remove
+real friction, and because two of them are attempts to give the kernel a
+generic version of something GreenBoost currently has to fake.
+
+Why each one matters here:
+
+**External modules inherit sanitizer flags they never asked for.** Any `obj-m`
+object picks up the kernel's UBSAN `KBUILD_CFLAGS`, because `is-kernel-object`
+is `y` for external modules too. A module whose code trips a UBSAN check then
+misbehaves at runtime while loading perfectly cleanly, which is the worst
+possible combination to debug. `greenboost.ko` is an external module and sits
+squarely in that blast radius. The fix makes UBSAN opt-in for external builds
+and leaves in-tree builds untouched.
+
+**dma-buf has nowhere to say "reclaim this one first".** This is the big one,
+and GreenBoost is living proof of the gap. Pages pinned through
+`pin_user_pages()`/`FOLL_LONGTERM` sit outside normal reclaim by design, so
+when memory gets tight nothing generic lets an exporter rank its own pinned
+buffers. A KV cache re-read on every decode step and a cold expert's weights
+are not equally valuable, and only the exporter knows that.
+
+So GreenBoost built its own: the `gaming_mode` module parameter, a per-buffer
+heat score the CUDA shim pushes continuously through the private
+`GB_IOCTL_SET_HEAT`, and a module-managed LRU it reorders under pressure. That
+machinery is a workaround for one missing hint, and every other out-of-tree
+tiering driver invents the same thing incompatibly. The RFC proposes an
+advisory `0..255` priority on `struct dma_buf` instead. `greenboost.ko` reads
+it today in its T2 eviction sweep.
+
+The honest part: that patch's only user is out-of-tree, and adding kernel UAPI
+with no in-tree user is normally declined. Correctly, since UAPI is permanent
+and nothing in-tree would constrain the semantics. The submission leads with
+that rather than burying it.
+
+**Keeping a cold buffer compressed has no shared vocabulary either.** GB-Quant
+holds cold mixture-of-experts weights compressed in place rather than evicting
+them, because inflating locally beats re-fetching over PCIe. There is no
+standard way to tell an importer "this one is compressed, here is how to read
+it back". A sibling RFC adds that descriptor. It is finished, it is applied
+locally, and it is deliberately **not** submitted: nothing in-tree produces or
+reads that state yet, so sending it would spend reviewer attention on an API
+nobody can exercise.
+
+**One sysfs attribute was quietly lying to us.** `current_link_speed` performs
+a fresh `PCI_EXP_LNKSTA` read on every open, so it reports the link at that
+instant, and modern GPUs retrain their link constantly while idling. Comparing
+it against `max_link_speed` reads exactly like a degraded-link test and is not
+one. GreenBoost got this wrong in production: its `pcie_degraded` alarm fired
+thirteen times claiming a gen2 link on a connection that measures Gen4 x16
+whenever it is actually used, because the guard sampled at idle. Measured on
+the reference box, same boot, no configuration change: 5.0 GT/s idle,
+16.0 GT/s under load. The patch changes no behaviour, it documents four
+attributes that have been exported since 2018 with no `Documentation/ABI`
+entry, so the next person does not build the same false alarm.
+
+That last one is the pattern worth noticing. Most of these patches did not come
+from wanting a faster kernel. They came from GreenBoost being wrong about
+something, finding out why, and the answer being "the kernel never offered a
+way to ask that question properly."
+
+---
+
 ## 🙌 Contributors
 
 - **Alan Sill** ([@alansill](https://gitlab.com/alansill)) - setup scripts
