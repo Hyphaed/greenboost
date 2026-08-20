@@ -202,3 +202,39 @@ def test_session_audit_kind_is_registered():
     checks/check_dataflux_coverage.py requires every emitted kind be declared."""
     import gb_dataflux_kinds
     assert "session_audit" in gb_dataflux_kinds.KINDS
+
+
+# ----------------------------------------------- version-consistency check
+
+def test_unreleased_changelog_heading_is_not_a_version_claim(tmp_path):
+    """An "in development, not released" heading describes `main`, not the
+    built artifact. Comparing it against MODULE_VERSION would force the core's
+    version literals to a number no release carries , and the Gaming Suite
+    reads exactly that field as "installed core version", which is the
+    confusion this check exists to prevent, inverted."""
+    import sys
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "checks"))
+    import check_version_consistency as cvc
+
+    ch = tmp_path / "CHANGELOG.md"
+    ch.write_text(
+        "# Changelog\n\n"
+        "## v3.5 : in development, not released\n\n"
+        "stuff\n\n"
+        "## v3.4 : 2026-08-18\n\n"
+        "released stuff\n")
+    pat = next(p for f, p, _ in cvc._SITES if f == "CHANGELOG.md")
+    got = cvc._first_match(ch, pat)
+    assert got is not None
+    assert got[0] == "3.4", "must fall through to the newest RELEASED heading"
+
+
+def test_released_changelog_heading_is_still_matched(tmp_path):
+    import sys
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "checks"))
+    import check_version_consistency as cvc
+
+    ch = tmp_path / "CHANGELOG.md"
+    ch.write_text("# Changelog\n\n## v3.4 : 2026-08-18\n\nreleased\n")
+    pat = next(p for f, p, _ in cvc._SITES if f == "CHANGELOG.md")
+    assert cvc._first_match(ch, pat)[0] == "3.4"

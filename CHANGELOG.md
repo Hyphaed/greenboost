@@ -1,5 +1,59 @@
 # GreenBoost Changelog
 
+## v3.5 : in development, not released
+
+**There is no v3.5 release and no v3.5 tag.** This section describes what is
+on `main` right now, ahead of the last stable release. It is written as it
+lands rather than at release time, so it will be incomplete and it will
+change.
+
+If you want stable, use v3.4:
+
+    git clone https://gitlab.com/IsolatedOctopi/greenboost.git
+    cd greenboost && git checkout v3.4
+
+If you want what is described below, take `main` directly. It builds and its
+gates pass, but it has had less running time on real hardware than a tagged
+release, and that is the whole difference:
+
+    git clone https://gitlab.com/IsolatedOctopi/greenboost.git
+    cd greenboost && sudo ./greenboost_setup.sh
+
+Already on a checkout:
+
+    git fetch origin && git checkout main && git pull
+
+### The kernel underneath is now a repository
+
+The Linux kernel work that came out of running GreenBoost has been published
+as [linux-kernel-inference](https://gitlab.com/IsolatedOctopi/linux-kernel-inference)
+([GitHub mirror](https://github.com/Hyphaed/linux-kernel-inference)). It builds
+a kernel tuned for local inference and carries the patch series.
+
+**GreenBoost does not require it.** A stock distribution kernel remains the
+supported path. The new "The kernel underneath" section in `README.md`
+explains why each patch exists, and the short version is that most of them
+came from GreenBoost being wrong about something rather than from wanting a
+faster kernel:
+
+- External modules inherit the kernel's UBSAN flags whether or not they asked,
+  so a module that trips a check misbehaves at runtime while loading cleanly.
+  `greenboost.ko` sits in that blast radius.
+- dma-buf has no generic way for an exporter to rank its own pinned buffers
+  for reclaim, which is exactly why GreenBoost carries `gaming_mode`, a
+  per-buffer heat score, the private `GB_IOCTL_SET_HEAT`, and its own LRU. An
+  RFC proposes the generic hint; `greenboost.ko` already reads it in its T2
+  eviction sweep. Its blocker is stated rather than hidden: the only user is
+  out-of-tree.
+- Keeping a cold MoE expert compressed in place has no shared vocabulary
+  either. That sibling RFC is finished, applied locally, and deliberately not
+  submitted, because nothing in-tree produces or reads the state it describes.
+- `current_link_speed` reports the link at the instant it is read, and idle
+  GPUs retrain constantly, so comparing it to `max_link_speed` looks like a
+  degraded-link test and is not. GreenBoost's own `pcie_degraded` alarm fired
+  13 times on that mistake. The patch is documentation for four attributes
+  exported since 2018 with no `Documentation/ABI` entry.
+
 ## v3.4 : 2026-08-18
 
 GreenBoost's reference coding model changed to 

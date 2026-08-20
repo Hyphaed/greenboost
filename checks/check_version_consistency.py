@@ -55,9 +55,26 @@ _SITES: "list[tuple[str, re.Pattern[str], str]]" = [
 _CANONICAL = ("greenboost.c", "kernel module MODULE_VERSION")
 
 
+# A CHANGELOG heading that says outright it is not released is NOT a claim
+# about what the built artifact is, so it must not be compared against
+# MODULE_VERSION. Bumping the core's version literals to match an unreleased
+# heading would be actively harmful: the running module would report a version
+# no release carries, and the Gaming Suite reads exactly that field as
+# "installed core version" and compares it to the newest published release ,
+# which is the 2026-08-20 confusion this whole check exists to prevent, only
+# inverted. Development on `main` ahead of a tag is normal and must not be
+# forced to lie about it in either direction.
+_UNRELEASED_RE = re.compile(
+    r"(unreleased|not released|in development|in-development|wip|draft)",
+    re.IGNORECASE)
+
+
 def _first_match(path: Path, pat: "re.Pattern[str]") -> "tuple[str, int] | None":
     """First (value, lineno) the pattern yields. Only the FIRST hit matters:
-    CHANGELOG.md lists every past version, and the newest heading is on top."""
+    CHANGELOG.md lists every past version, and the newest heading is on top.
+
+    A heading marked unreleased is skipped rather than matched, so the scan
+    falls through to the newest heading that IS a release claim."""
     try:
         lines = path.read_text(errors="ignore").splitlines()
     except OSError:
@@ -65,6 +82,8 @@ def _first_match(path: Path, pat: "re.Pattern[str]") -> "tuple[str, int] | None"
     for lineno, line in enumerate(lines, 1):
         m = pat.match(line.strip())
         if m:
+            if _UNRELEASED_RE.search(line):
+                continue
             return m.group(1), lineno
     return None
 
