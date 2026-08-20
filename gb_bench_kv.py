@@ -47,14 +47,28 @@ DEFAULT_NEEDLES = 8
 
 
 def _kv_gb(entry: dict, niah: dict):
-    """KV footprint in GB, from the serve entry or derived from the context.
+    """KV footprint in GB, from the serve entry or derived from real geometry.
 
     `ps()` does not always carry `kv_gb` (it is absent right after a restart),
     and a curve with a blank cost column cannot answer the question it exists
-    for. Falling back to the served context length times the per-token cost of
-    the kv_type keeps the column populated with something honest, and the
-    source is recorded so a derived figure is never mistaken for a measured
-    one.
+    for. The fallback therefore derives one , but it derives it from the
+    MODEL's own geometry, via the same `gb_synapse.estimate_kv_gb()` the serve
+    path sizes its VRAM budget with, not from a shape written into this file.
+
+    It used to hardcode `layers, heads_dim = 64, 128 * 8` under the comment
+    "this model's shape". That shape was wrong for the model it named: the
+    served qwen35 merge has 65 blocks of which only 17 are full-attention
+    (`full_attention_interval=4`, the other 48 are Gated DeltaNet with small
+    fixed state), 4 KV heads, and head_dim 256 , not 64 layers of 8x128.
+    Wrong by ~4x, and wrong in the expensive direction: it reported KV f16 as
+    6.0 GB against a real 1.59 GB, and 3.0 GB for q8_0 against 0.80 GB. Those
+    numbers reached dataflux `kv_quality` events on 2026-08-20 and were read as
+    "switching to q8_0 frees 3 GB of VRAM", which is four times the truth.
+
+    Any per-model constant in a benchmark will eventually be read against a
+    different model. Ask the entry, and if the entry cannot say, return None
+    and leave the column blank , a blank column asks a question, a confident
+    wrong number answers one.
     """
     v = entry.get("kv_gb")
     if v:
@@ -62,10 +76,27 @@ def _kv_gb(entry: dict, niah: dict):
     ctx = entry.get("ctx") or 0
     if not ctx:
         return None
-    # bytes/elem: f16 = 2, q8_0 = 1, q4_0 = 0.5 (llama.cpp cache types)
-    per = {"f16": 2.0, "q8_0": 1.0, "q4_0": 0.5}.get(entry.get("kv_type") or "f16", 2.0)
-    layers, heads_dim = 64, 128 * 8          # this model's shape, K and V
-    return round(ctx * layers * heads_dim * 2 * per / (1024 ** 3), 3)
+    try:
+        import gb_synapse
+        name = entry.get("model") or ""
+        me = next((m for m in gb_synapse.list_models() if m.name == name), None)
+        if me is None:
+            return None
+        # KV lives only in the full-attention layers; n_kv_layers already
+        # excludes the recurrent ones. n_layers is the honest fallback only
+        # when the split was never derived for this architecture.
+        kv_layers = me.n_kv_layers or me.n_layers
+        if not (kv_layers and me.n_kv_heads and me.head_dim):
+            return None
+        # bytes/elem: f16 = 2, q8_0 = 1, q4_0 = 0.5 (llama.cpp cache types)
+        per = {"f16": 2.0, "q8_0": 1.0, "q4_0": 0.5}.get(
+            entry.get("kv_type") or "f16", 2.0)
+        return round(gb_synapse.estimate_kv_gb(
+            ctx, me.n_bytes, me.quant, n_layers=kv_layers,
+            n_kv_heads=me.n_kv_heads, head_dim=me.head_dim,
+            kv_bytes_per_elem=per), 3)
+    except Exception:
+        return None
 
 
 def _served(model: str = ""):

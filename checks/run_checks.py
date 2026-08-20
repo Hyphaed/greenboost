@@ -30,6 +30,7 @@ import check_python_manifest
 import check_secrets
 import check_semantics_coverage
 import check_vendor_notices
+import check_version_consistency
 
 _CHECKS = {
     "hardware_literals": check_hardware_literals.run,
@@ -44,6 +45,7 @@ _CHECKS = {
     "semantics_coverage": check_semantics_coverage.run,
     "import_boundaries": check_import_boundaries.run,
     "doc_drift": check_doc_drift.run,
+    "version_consistency": check_version_consistency.run,
 }
 
 

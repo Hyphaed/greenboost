@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
- * GreenBoost v3.2 - Network Client Implementation
+ * GreenBoost v3.4 - Network Client Implementation
  *
  * Author  : Ferran Duarri
  * License : GPL v2 (open-source) / Commercial - see LICENSE

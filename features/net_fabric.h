@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
- * GreenBoost v3.2 - Network Fabric Protocol Definitions
+ * GreenBoost v3.4 - Network Fabric Protocol Definitions
  *
  * Shared between greenboost_netd (feeder daemon) and the CUDA shim (host client).
  * Wire format: little-endian, binary.  TCP transport on port GB_NET_PORT.

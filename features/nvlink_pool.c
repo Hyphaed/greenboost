@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0
- * GreenBoost v3.2 - NVLink Pooling Feature
+ * GreenBoost v3.4 - NVLink Pooling Feature
  *
  * Aggregates multiple GPU VRAM into a unified T1 pool via NVLink 2.0.
  *

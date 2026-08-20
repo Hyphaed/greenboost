@@ -13,8 +13,16 @@
 
 - intent: is_rule1_satisfied
   triggers: ["rule 1", "rule #1", "90%", "vram full", "is vram filled", "physical vram"]
-  metrics: [vram_fill_pct]
-  segments: [rule1_underfilled]
+  metrics: [vram_fill_pct, vram_headroom_pct]
+  segments: [rule1_underfilled, vram_headroom_exhausted]
+
+- intent: core_version_state
+  triggers: ["what version", "greenboost version", "core version", "module version",
+             "update available", "upgrade now", "am i up to date", "out of date",
+             "is the running module the one i installed", "reload the module",
+             "version drift"]
+  metrics: [core_build_version, kmod_loaded_version, kmod_loaded]
+  segments: [kmod_version_drift]
 
 - intent: why_is_it_slow
   triggers: ["slow", "throttl", "stall", "why is generation slow", "performance problem", "tok/s dropped"]

@@ -316,6 +316,12 @@ _GPU_BUSY_UTIL_PCT = 10
 
 # VRAM fill (%) at which idle residency is worth surfacing. Below this the card
 # still has room and there is nothing for the operator to decide.
+# Rule #1's own words: "~90% occupancy (10% headroom so the system never
+# collapses under memory pressure)". The reserve IS the rule, so the threshold
+# is the rule's own number rather than a tuned one. A percentage of the card's
+# own capacity, never an absolute MB figure , see CLAUDE.md's prohibition on
+# hardware-shaped constants.
+_VRAM_MIN_HEADROOM_PCT = 10.0
 _IDLE_HOLD_FILL_PCT = 60
 
 # Share of prompt_ms attributable to recurrent replay before it counts as
@@ -385,6 +391,36 @@ def _res_vram_fill_pct(entity_id, window_s):
         return {"value": None, "unit": "percent", "raw_source": "unavailable", "error": str(e)}
     return {"value": None, "unit": "percent", "raw_source": "unavailable",
             "error": "no fresh snapshot event and gb_monitor probe unavailable"}
+
+
+def _res_vram_headroom_pct(entity_id, window_s):
+    """How much physical VRAM is NOT occupied , Rule #1's safety margin.
+
+    Rule #1 is two clauses, and only the first one had a governed reading
+    before this metric existed: "drive VRAM to ~90%" AND "10% headroom so the
+    system never collapses under memory pressure". `vram_fill_pct` answers the
+    first. This answers the second, which is the one that bites: a card at
+    97.9% is not 8 points better than one at 90%, it is 8 points into the
+    reserve that exists precisely so an allocation spike has somewhere to go.
+
+    Measured 2026-08-20, three sessions of the SAME model at a byte-identical
+    serve config (weights 15.85 GB, ctx 24576, q4_0, 65 layers, mtp_draft_n 4):
+    93.8% fill decoded at 8.45 tok/s, 90.9% at 4.90, and 97.9% , 254 MB free
+    on the whole card , at 3.00, with TTFT rising 506 ms to 6426 ms at an
+    unchanged 99.7% prompt-cache hit. Correlation on n=3, not a proven cause;
+    what is certain is that nothing in the governed layer said a word about it.
+    """
+    fill = resolve("vram_fill_pct", entity_id=entity_id, window_s=window_s)
+    v = fill.get("value")
+    prov = fill.get("provenance") or {}
+    src = prov.get("raw_source") or fill.get("raw_source") or "unavailable"
+    if v is None:
+        return {"value": None, "unit": "percent", "raw_source": src,
+                "error": "vram_fill_pct did not resolve: %s"
+                         % (fill.get("error") or "no source")}
+    return {"value": round(100.0 - float(v), 1), "unit": "percent",
+            "raw_source": "derived: 100 - (%s)" % src,
+            "freshness_s": prov.get("freshness_s")}
 
 
 def _res_t2_pressure_level(entity_id, window_s):
@@ -1229,6 +1265,47 @@ def _res_kmod_loaded(entity_id, window_s):
         return {"value": None, "unit": "boolean", "raw_source": "unavailable", "error": str(e)}
 
 
+def _res_kmod_loaded_version(entity_id, window_s):
+    """Version the RUNNING module declares. None when it isn't loaded."""
+    vf = Path("/sys/module/greenboost/version")
+    try:
+        if not vf.exists():
+            return {"value": None, "unit": "version",
+                    "raw_source": "/sys/module/greenboost/version absent "
+                                  "(module not loaded)"}
+        v = vf.read_text().strip()
+        if not v:
+            return {"value": None, "unit": "version",
+                    "raw_source": "/sys/module/greenboost/version empty"}
+        return {"value": v, "unit": "version",
+                "raw_source": "/sys/module/greenboost/version"}
+    except Exception as e:
+        return {"value": None, "unit": "version",
+                "raw_source": "/sys/module/greenboost/version unreadable",
+                "error": str(e)}
+
+
+def _res_core_build_version(entity_id, window_s):
+    """Installed release, from the stamp the installer writes."""
+    bi = Path("/etc/greenboost/build_info")
+    try:
+        if not bi.exists():
+            return {"value": None, "unit": "version",
+                    "raw_source": "/etc/greenboost/build_info absent "
+                                  "(no install stamp on this node)"}
+        for line in bi.read_text().splitlines():
+            key, _, val = line.partition("=")
+            if key.strip() == "BUILD_VERSION" and val.strip():
+                return {"value": val.strip(), "unit": "version",
+                        "raw_source": "/etc/greenboost/build_info BUILD_VERSION"}
+        return {"value": None, "unit": "version",
+                "raw_source": "/etc/greenboost/build_info has no BUILD_VERSION line"}
+    except Exception as e:
+        return {"value": None, "unit": "version",
+                "raw_source": "/etc/greenboost/build_info unreadable",
+                "error": str(e)}
+
+
 def _shim_stats(window_s: "float | None" = None) -> "tuple[dict | None, str]":
     """Parse /run/greenboost/shim_stats, gated on the WRITER still being alive.
 
@@ -1732,6 +1809,29 @@ def _seg_models_wiped_from_manifest():
     return count > 0, [ev]
 
 
+def _seg_vram_headroom_exhausted():
+    """VRAM filled PAST the Rule #1 target into the 10% safety reserve.
+
+    The mirror of `rule1_underfilled`, and it existed as a blind spot for as
+    long as that one has existed: the tripwire watched the low side only, so a
+    card at 97.9% , 254 MB free of 12227 , produced no verdict at all, while
+    the identical card at 84.9% produced a `violation`. Rule #1 asks for ~90%
+    WITH 10% headroom; both directions are departures from it, and the high
+    side is the one that has nowhere to fail safely.
+
+    Matched means: reduce what is resident (shorter ctx, a smaller quant, or
+    stop a second process holding VRAM), do NOT read it as "excellent
+    utilisation". Returns None when fill cannot be read , an unknown card is
+    never a healthy card.
+    """
+    hr = resolve("vram_headroom_pct")
+    fill = resolve("vram_fill_pct")
+    v = hr.get("value")
+    if v is None:
+        return None, [hr, fill]
+    return (v < _VRAM_MIN_HEADROOM_PCT), [hr, fill]
+
+
 def _seg_weights_dont_fit_vram():
     """The served model's weights alone exceed physical VRAM.
 
@@ -1925,6 +2025,22 @@ def _seg_kmod_missing_silent_degrade():
     fresh = resolve("shim_fresh")
     matched = kmod.get("value") is False and fresh.get("value") is True
     return matched, [kmod, fresh]
+
+
+def _seg_kmod_version_drift():
+    """Installed release != running module. None when either side is unknown.
+
+    Deliberately returns None rather than False when the module isn't loaded
+    or no build stamp exists: a clean bill of health inferred from absent data
+    is the exact failure this layer exists to prevent, and "no drift" is a
+    claim you can only make when you have read both numbers.
+    """
+    installed = resolve("core_build_version")
+    running = resolve("kmod_loaded_version")
+    iv, rv = installed.get("value"), running.get("value")
+    if not iv or not rv:
+        return None, [installed, running]
+    return (iv != rv), [installed, running]
 
 
 def _seg_prompt_cache_cold():
