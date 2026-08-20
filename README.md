@@ -25,6 +25,10 @@ come in.
 
 Looking for the **[GreenBoost Gaming Suite](https://gitlab.com/IsolatedOctopi/greenboost_gaming_suite)** instead?
 
+Don't miss to check **[Hyphaed kernel]https://gitlab.com/IsolatedOctopi/linux-kernel-inference** , 
+custom patched linux kernel being used alongside greenboost, includes patches (sent to kernel lists),
+yet not included elsewhere at Aug 21 00:46.
+
 </div>
 
 <div align="center">
