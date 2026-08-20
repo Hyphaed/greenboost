@@ -55,6 +55,37 @@
   reads: [swap_pressure, iowait_pct]
   severity: diagnosis
 
+- name: vram_headroom_exhausted
+  doc: >
+    VRAM is filled PAST the Rule #1 target, into the 10% reserve that exists
+    so an allocation spike has somewhere to go. The exact mirror of
+    `rule1_underfilled`, and a blind spot for as long as that segment existed:
+    the tripwire only ever watched the low side, so a card at 84.9% raised a
+    `violation` while the same card at 97.9% (254 MB free of 12227) raised
+    nothing at all. Matched means: reduce what is resident , a shorter ctx, a
+    smaller quant, or a second process to stop , and do NOT read a
+    high number as excellent utilisation. Returns matched: None when fill
+    cannot be read; an unknown card is never a healthy card.
+  evaluator: vram_headroom_exhausted
+  reads: [vram_headroom_pct, vram_fill_pct]
+  severity: warning
+
+- name: kmod_version_drift
+  doc: >
+    A newer GreenBoost core is installed on disk than the kernel module
+    currently running , `core_build_version` (the installer's build stamp)
+    and `kmod_loaded_version` (`/sys/module/greenboost/version`) disagree.
+    Installing core does NOT swap the running module; the old one stays
+    resident until something reloads it, so every fix in the new build is
+    silently absent while every version banner still looks plausible. Matched
+    means: reload the module (`sudo greenboost load`), do NOT reinstall and
+    do NOT treat this as being out of date , the bytes are already on disk.
+    Returns matched: None when either side is unknown (module not loaded, or
+    no build stamp) , "cannot tell" is never "no drift".
+  evaluator: kmod_version_drift
+  reads: [core_build_version, kmod_loaded_version, kmod_loaded]
+  severity: diagnosis
+
 - name: kmod_missing_silent_degrade
   doc: >
     greenboost.ko is not loaded (kmod_loaded=false) but the shim/logs still

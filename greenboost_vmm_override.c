@@ -1,5 +1,5 @@
 /*
- * GreenBoost v3.2 - Blackwell VMM override library
+ * GreenBoost v3.4 - Blackwell VMM override library
  *
  * WHY THIS FILE EXISTS:
  *   glibc's dynamic linker explicitly PREFERS unversioned symbol definitions

@@ -16,6 +16,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import gb_bench_kv as B
 
 
+class _FakeEntry:
+    """The served model's REAL geometry, read from its GGUF 2026-08-20.
+
+    Spelled out rather than rounded because the numbers are the point: 65
+    blocks but only 17 carrying KV (`full_attention_interval=4` leaves 48
+    Gated DeltaNet layers with small fixed state), 4 KV heads, head_dim 256.
+    `gb_bench_kv._kv_gb` used to assume 64 layers of 8x128 and was wrong by
+    ~4x in the expensive direction.
+    """
+    name = "m"
+    n_layers, n_kv_layers, n_recurrent_layers = 65, 17, 48
+    n_kv_heads, head_dim = 4, 256
+    n_bytes, quant = 17_017_000_000, "IQ4_XS"
+
+
 class _FakeSynapse:
     def __init__(self, kv_type="f16", kv_gb=2.12):
         self.kv_type, self.kv_gb, self.calls = kv_type, kv_gb, []
@@ -23,6 +38,18 @@ class _FakeSynapse:
     def ps(self):
         return [{"model": "m", "kv_type": self.kv_type,
                  "kv_gb": self.kv_gb, "ctx": 24576}]
+
+    def list_models(self):
+        return [_FakeEntry()]
+
+    @staticmethod
+    def estimate_kv_gb(ctx, n_bytes, quant, n_layers=0, n_kv_heads=0,
+                       head_dim=0, kv_bytes_per_elem=1.0):
+        """Mirrors gb_synapse.estimate_kv_gb's exact-geometry branch, which is
+        the only branch _kv_gb is allowed to reach (it returns None rather
+        than fall through to the param-count bucket heuristic)."""
+        return (ctx * 2 * n_layers * n_kv_heads * head_dim
+                * kv_bytes_per_elem) / (1024 ** 3)
 
     def stop(self, model):
         self.calls.append(("stop", model))
@@ -100,14 +127,35 @@ def test_recall_is_a_ratio_not_a_needle_count(monkeypatch):
     assert 0.0 <= s["recall"] <= 1.0
 
 
-def test_kv_gb_is_populated_even_when_ps_omits_it(monkeypatch):
-    """A cost curve with a blank cost column answers nothing. ps() drops
-    kv_gb right after a restart, which is exactly when a sweep reads it."""
+def test_kv_gb_falls_back_to_the_models_real_geometry(monkeypatch):
+    """ps() drops kv_gb right after a restart, which is exactly when a sweep
+    reads it, so the fallback has to produce a number. It must derive that
+    number from the MODEL, not from a shape written into the benchmark.
+
+    The old fallback hardcoded `layers, heads_dim = 64, 128 * 8` under the
+    comment "this model's shape" and was wrong for the model it named: it
+    reported KV f16 as 6.0 GB against a real 1.59 GB. Those figures reached
+    dataflux `kv_quality` events on 2026-08-20 and were read as "q8_0 frees
+    3 GB of VRAM", four times the truth.
+    """
     fake = _FakeSynapse()
     fake.kv_gb = None
     _install(monkeypatch, fake)
     s = B.measure_current("m", emit=False)["summary"]
-    assert s["kv_gb"] and s["kv_gb"] > 0
+    # 24576 ctx * 2(K+V) * 17 kv-layers * 4 heads * 256 dim * 2 bytes
+    assert s["kv_gb"] == 1.594
+    assert s["kv_gb"] != 6.0, "the hardcoded 64x(128*8) shape is back"
+
+
+def test_kv_gb_is_blank_rather_than_invented_for_an_unknown_model(monkeypatch):
+    """A blank cost column asks a question; a confident wrong number answers
+    one. When the geometry cannot be established, say nothing."""
+    fake = _FakeSynapse()
+    fake.kv_gb = None
+    fake.list_models = lambda: []          # model not in the index
+    _install(monkeypatch, fake)
+    s = B.measure_current("m", emit=False)["summary"]
+    assert s["kv_gb"] is None
 
 
 def test_kv_type_is_recorded_from_what_was_served_not_what_was_asked(monkeypatch):

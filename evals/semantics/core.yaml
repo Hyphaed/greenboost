@@ -209,6 +209,26 @@
   name: kmod_loaded
   source: live
 
+- id: kmod_loaded_version_structural
+  kind: metric
+  name: kmod_loaded_version
+  source: live
+
+- id: core_build_version_structural
+  kind: metric
+  name: core_build_version
+  source: live
+
+- id: vram_headroom_pct_structural
+  kind: metric
+  name: vram_headroom_pct
+  source: live
+
+- id: vram_headroom_exhausted_structural
+  kind: segment
+  name: vram_headroom_exhausted
+  source: live
+
 - id: shim_fresh_structural
   kind: metric
   name: shim_fresh
@@ -270,6 +290,16 @@
 - id: weights_on_t3_structural
   kind: segment
   name: weights_on_t3
+  source: live
+
+# Structural, not fixture-exact: this segment reads real files on the box it
+# runs on (/etc/greenboost/build_info, /sys/module/greenboost/version), so its
+# verdict is legitimately true, false, or None depending on the machine. What
+# must hold everywhere is that it answers in the right SHAPE and never
+# fabricates "no drift" out of a missing file.
+- id: kmod_version_drift_structural
+  kind: segment
+  name: kmod_version_drift
   source: live
 
 - id: feeder_unreachable_structural

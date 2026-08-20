@@ -409,6 +409,21 @@ KINDS: dict[str, KindSpec] = {
             "routed across is real: measured 2026-08-18 on one box, MoE with "
             "expert offload 45.72 tok/s vs dense Qwen3.8-27B 2.7-3.5.",
         fields=("turn_class", "model", "reason", "tool_result_chars")),
+    "session_audit": KindSpec(
+        group="orchestration",
+        doc="One gb_session_audit.py run , the record that a session WAS "
+            "audited, what it concluded, and when. Exists so 'has anyone "
+            "looked at that run, and what did they find' is answerable "
+            "without re-deriving the whole audit; the audit itself is "
+            "reconstructed from other kinds and stores nothing, so without "
+            "this event a completed audit leaves no trace. `codes` carries "
+            "the finding codes (cold_prefill_dominates, "
+            "decode_below_baseline, cache_cold_repeat, ...) and "
+            "worst_severity the highest one, so a trend across sessions is a "
+            "query rather than a re-run.",
+        fields=("model", "codes", "worst_severity"),
+        numeric_fields=("session_started", "session_wall_s", "findings"),
+        sync_scope="host"),
     "turn_bench": KindSpec(
         group="agent",
         doc="One gb_bench_turn.py benchmark run , the before/after record every "

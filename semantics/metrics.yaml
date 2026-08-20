@@ -482,6 +482,82 @@
   direction: higher_is_better
   owner: Health
 
+- name: kmod_loaded_version
+  entity: node
+  unit: version
+  doc: >
+    The version string the RUNNING kernel module declares
+    (`/sys/module/greenboost/version`, i.e. greenboost.c's MODULE_VERSION).
+    This is what is executing right now , NOT which GreenBoost release is
+    installed on disk. Resolves to None when the module isn't loaded; pair
+    it with `kmod_loaded` rather than reading None as "old".
+  resolver: kmod_loaded_version
+  source_fields: ["gb_monitor.GbSnapshot.version"]
+  source_tier: measured
+  direction: informational
+  owner: Health
+  never_use:
+    - field: version
+      why: >
+        `GbSnapshot.version` (and `modinfo -F version greenboost`, its
+        equivalent) is the module's own hand-maintained MODULE_VERSION
+        literal , NOT the release that is installed. The two drifted for
+        real: on 2026-08-20 a freshly installed core 3.4 still declared 3.2,
+        because greenboost.c/dkms.conf/Makefile had never been bumped. The
+        GreenBoost Gaming Suite reads exactly this field as "installed core
+        version", compared it to the newest GitLab release, and offered an
+        "Upgrade now" button for the release the box was already running.
+        Use `core_build_version` for "which release is installed"; use this
+        one only for "which build is currently executing", and compare the
+        two via the `kmod_version_drift` segment.
+  aliases: [module_version, running_module_version, sysfs_version]
+
+- name: core_build_version
+  entity: node
+  unit: version
+  doc: >
+    The GreenBoost release actually installed on this node, from the build
+    stamp the installer writes (`/etc/greenboost/build_info`'s
+    `BUILD_VERSION`). This is the authority for "which release is installed",
+    because it is written by the installer that installed it rather than
+    hand-maintained in a source literal. None when no build stamp exists
+    (core never installed, or installed by something that skipped the stamp)
+    , which means "cannot tell", not "not installed".
+  resolver: core_build_version
+  source_fields: ["/etc/greenboost/build_info BUILD_VERSION"]
+  source_tier: measured
+  direction: informational
+  owner: Health
+  aliases: [installed_core_version, build_version, greenboost_version]
+
+- name: vram_headroom_pct
+  entity: gpu
+  unit: percent
+  doc: >
+    Physical VRAM NOT occupied , the second half of Rule #1, which asks for
+    ~90% fill AND 10% headroom "so the system never collapses under memory
+    pressure". `vram_fill_pct` governs the first half; nothing governed the
+    second until 2026-08-20, when three sessions of the same model at a
+    byte-identical serve config decoded at 8.45, 4.90 and 3.00 tok/s while
+    fill read 93.8%, 90.9% and 97.9%. Derived as 100 - vram_fill_pct, so it
+    inherits that metric's physical source and its never_use trap.
+  resolver: vram_headroom_pct
+  source_fields: ["gb_dataflux.snapshot.fb_phys_used_pct"]
+  source_tier: derived
+  direction: higher_is_better
+  threshold: {min: 10}
+  owner: GB-Tiering
+  never_use:
+    - field: fb_free_mb
+      why: >
+        The snapshot's free-megabyte figure is the SHIM-INFLATED view when the
+        shim is active , the same virtual-VRAM inflation `fb_used_pct` carries
+        and that vram_fill_pct's never_use already names. It can report
+        gigabytes free on a card with 254 MB physically available, which is
+        exactly backwards for a headroom question. Derive headroom from
+        fb_phys_used_pct, never from a free-byte field.
+  aliases: [vram_free_pct, vram_reserve_pct, headroom_pct]
+
 - name: shim_fresh
   entity: node
   unit: boolean

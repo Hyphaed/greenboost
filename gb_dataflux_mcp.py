@@ -8,7 +8,7 @@ Lets an LLM (or any MCP client) query "how did data flow through the
 greenboost cluster" without shelling out or scraping the web UI: same JSONL
 log (gb_dataflux.py) that backs `greenboost dataflux-ui`, read-only.
 
-Tools (21 — keep this list in sync with the @mcp.tool defs below):
+Tools (23 — keep this list in sync with the @mcp.tool defs below):
     dataflux_summary       , cheap aggregate overview (nodes/labels/runs/tok_s/by_kind)
     dataflux_events         , raw events, filterable by node/label/kind/status/from_ts/to_ts/cursor
     dataflux_errors         , failed dispatches only
@@ -25,6 +25,8 @@ Tools (21 — keep this list in sync with the @mcp.tool defs below):
     dataflux_tok_s          , measured (not predicted) tokens/sec, per model
     dataflux_candidates     , best-of-N candidate_selected rollup, per slug
     dataflux_models         , per-model call/rotation rollup + tok_s merged
+    dataflux_sessions       , serving/agent SESSIONS on record (the index an audit takes)
+    dataflux_session_audit  , full cross-kind audit of ONE session + graded findings
     greenboost_pilot        , stage/tok_s trends + evidence-backed advice (gb_pilot)
     greenboost_capabilities , installed/running shim feature manifest (gb_monitor)
     greenboost_status       , live tier/phase/KV-prefetch snapshot (gb_monitor)
@@ -506,6 +508,60 @@ def tiering_status() -> dict:
         return gb_tiering.tiering_status()
     except Exception as e:
         return {"error": f"gb_tiering unavailable: {e}"}
+
+
+@mcp.tool(annotations=_READ_ONLY)
+def dataflux_sessions(days: float = 7.0) -> dict:
+    """List the serving/agent SESSIONS on record , the index an audit takes.
+
+    A session is discovered from activity gaps in the session-defining kinds
+    (tok_s_measured, prompt_cache, synapse_serve, cli_tool_call, ...) and
+    widened to the shim phase transitions that bracket it, so model-load time
+    belongs to the session rather than being orphaned before it. Snapshots
+    never extend a session: the SnapshotRecorder runs on a timer whether or
+    not anything is served, so counting them would fuse every run since boot
+    into one. Index 0 is the newest , pass it to `dataflux_session_audit`."""
+    try:
+        import gb_session_audit
+        ss = gb_session_audit.sessions(days=days)
+        return {"count": len(ss), "sessions": [
+            {"index": s.index, "started": s.started, "finished": s.finished,
+             "started_iso": gb_session_audit._iso(s.started),
+             "wall_s": round(s.wall_s, 1), "events": len(s.events),
+             "model": (gb_session_audit._identity(s) or {}).get("model")}
+            for s in ss]}
+    except Exception as e:
+        return {"error": f"gb_session_audit unavailable: {e}"}
+
+
+@mcp.tool(annotations=_READ_ONLY)
+def dataflux_session_audit(session: int = 0, days: float = 7.0,
+                           with_governed: bool = True) -> dict:
+    """Full end-to-end audit of ONE session: identity, decode throughput vs
+    this box's own historical baseline for the same model/ctx/kv key, the
+    prefill and prompt-cache curve (including what the cold first turn cost),
+    VRAM/tier trajectory, GB-Semantics segment transitions, quality-gate runs,
+    agent tool calls, errors by kind, and graded `findings` that each carry
+    their evidence and one action.
+
+    Use this instead of assembling the picture from per-kind tools: the
+    findings that matter are cross-kind. The 2026-08-20 case that motivated it
+    looked like flat 'slow decode' in every single-kind view, while the
+    timeline showed a 283-second cold prefill (11% of the session) and a
+    decode median 2.6x below the same box's own baseline for a byte-identical
+    serve config.
+
+    `session` 0 is the newest (see `dataflux_sessions`). Read-only: it
+    reconstructs from the log and emits one `session_audit` event recording
+    that the audit ran. The `governed` block is LIVE state, deliberately not
+    windowed to the session , it is labelled as such and must not be read as
+    a historical measurement."""
+    try:
+        import gb_session_audit
+        return gb_session_audit.audit(index=session, days=days,
+                                      with_governed=with_governed)
+    except Exception as e:
+        return {"error": f"gb_session_audit unavailable: {e}"}
 
 
 if __name__ == "__main__":

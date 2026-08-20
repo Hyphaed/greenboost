@@ -10,8 +10,8 @@
 gb_cluster.py:139           # docstring describes the max(2048MB, 3%) pattern already implemented in code
 gb_orchestrator.py:1336     # DI-12 docstring describing its own max(256MiB, 2%) step-down, not a literal in code (was :1281, line drift)
 gb_topology.py:277          # docstring recounts a HISTORICAL fix (two divergent literals -> one derivation) (was :256, line drift)
-greenboost.c:126            # comment explains the VRAM*1024/6 derivation formula; the actual value is 0 (auto)
-greenboost.c:207            # --help text describing the same VRAM*1024/6 formula, not a literal default
+greenboost.c:133            # comment explains the VRAM*1024/6 derivation formula; the actual value is 0 (auto)
+greenboost.c:214            # --help text describing the same VRAM*1024/6 formula, not a literal default
 
 # Loud last-resort fallbacks fired ONLY when live detection fails — matches
 # the "fail LOUD or sentinel + downstream auto-detect, never silently
@@ -75,10 +75,12 @@ synapse_engine/*
 # Benchmark/telemetry docstrings quoting measured figures from this box.
 gb_bench_turn.py:113        # docstring: measured t2_overflow_active_mb vs tok/s, an observation
 gb_bench_turn.py:147        # docstring: VRAM vs PCIe read-bandwidth comparison, explanatory
-gb_semantics.py:848         # docstring quotes the kernel's own OOM-guard log line verbatim
-gb_semantics.py:1308        # docstring: measured shim-inflated vs real overflow, the never_use trap's evidence
-gb_semantics.py:1311        # same docstring, continuation line
-gb_semantics.py:1744        # weights_dont_fit_vram docstring: the measurement that justifies the segment
+gb_semantics.py:884         # docstring quotes the kernel's own OOM-guard log line verbatim (was :848, line drift)
+gb_semantics.py:1385        # docstring: measured shim-inflated vs real overflow, the never_use trap's evidence (was :1349, line drift)
+gb_semantics.py:1388        # same docstring, continuation line (was :1352, line drift)
+gb_semantics.py:1844        # weights_dont_fit_vram docstring: the measurement that justifies the segment (was :1785, line drift)
+gb_semantics.py:408         # vram_headroom_pct docstring: the 3-session measurement (93.8/90.9/97.9% fill vs 8.45/4.90/3.00 tok/s) that motivates the metric
+gb_semantics.py:1817        # vram_headroom_exhausted docstring: the 97.9%-fill card the old low-side-only tripwire said nothing about
 gb_synapse.py:4018          # docstring: measured KV vs formula estimate, motivates the measurement cache
 gb_synapse.py:4032          # docstring recounting the 2026-08 front-load incident
 gb_synapse.py:4033          # same incident narrative

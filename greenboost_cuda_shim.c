@@ -1,5 +1,5 @@
 /*
- * GreenBoost v3.2 - CUDA LD_PRELOAD memory shim
+ * GreenBoost v3.4 - CUDA LD_PRELOAD memory shim
  *
  * Routes CUDA VRAM overflow to system RAM via GPU-compute paths (tried in order):
  *
@@ -142,7 +142,7 @@
  * change to the /run/greenboost/capabilities.json feature set; bump
  * GB_SHIM_CAP_ABI only on a breaking manifest schema change (consumers gate on
  * it via gb_monitor.capabilities()). */
-#define GB_SHIM_VERSION "3.2"
+#define GB_SHIM_VERSION "3.4"
 #define GB_SHIM_CAP_ABI 1
 
 /* ------------------------------------------------------------------ */
@@ -5637,7 +5637,8 @@ static void gb_shim_init(void)
      * libcuda.so.1 is in ldconfig (NVIDIA driver installs it), so the shim
      * activates for ls, bash, systemd, etc.  Silent by default. */
     if (gb_debug) {
-        fprintf(stderr, "[GreenBoost] v3.2 patched - vram_headroom=%zuMB kv_reserve=%zuMB(adaptive) kv_threshold=%zuMB virtual_vram=%zuMB use_dmabuf=%d debug=%d report_phys=%d\n",
+        fprintf(stderr, "[GreenBoost] v%s patched - vram_headroom=%zuMB kv_reserve=%zuMB(adaptive) kv_threshold=%zuMB virtual_vram=%zuMB use_dmabuf=%d debug=%d report_phys=%d\n",
+                GB_SHIM_VERSION,
                 vram_headroom_bytes >> 20, g_kv_reserve_bytes >> 20,
                 g_kv_size_threshold_bytes >> 20,
                 gb_virtual_vram_bytes >> 20, gb_use_dmabuf, gb_debug, g_report_physical_vram);

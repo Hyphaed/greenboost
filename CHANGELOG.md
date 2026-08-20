@@ -15,6 +15,89 @@ The terminal now shows what action is running and what the hardware is doing.
 
 It also survives `/exit`, Ctrl-C, and crashes without leaving memory behind.
 
+### Session auditing , one reproducible answer to "how did that run go?"
+
+`gb_session_audit.py` reconstructs a whole serving/agent session from the
+flight recorder and grades it. A session is discovered from activity gaps and
+the shim's own phase transitions rather than assumed from "the last N hours",
+so two audits of the same run agree.
+
+It reports decode against **this box's own historical median** for the same
+model/context/KV key, not against a figure from a document; the prefill and
+prompt-cache curve, including what the cold first turn cost; the VRAM
+trajectory; governed segment verdicts; quality-gate runs; agent tool calls;
+errors by kind; and findings that each carry their evidence and one action.
+
+It exists because the findings that matter are cross-kind and invisible in any
+single-kind view. A 41.9-minute run on 2026-08-20 read as flat "slow decode"
+everywhere; on one timeline it was a 283-second cold prefill (11% of the whole
+session, ~51 tok/s over 14,507 tokens at 0% cache hit) followed by turns that
+all hit 99.7% cache, plus a decode median 2.6x below this same box's baseline
+for a byte-identical serve config.
+
+A panel with no data reports that it has no data, rather than returning a zero
+that reads as a healthy measurement.
+
+    python3 gb_session_audit.py --list
+    python3 gb_session_audit.py --session 0
+
+Over MCP: `dataflux_sessions` and `dataflux_session_audit` on
+`greenboost-dataflux`. Every run emits a `session_audit` event, so "was that
+run audited, and what did it conclude" is a query rather than a re-run.
+
+### Rule #1 is now governed in both directions
+
+GreenBoost's first rule asks for ~90% VRAM fill **and** 10% headroom "so the
+system never collapses under memory pressure". Only the first half had a
+tripwire, so a card at 84.9% raised a violation while the same card at 97.9%,
+with 254 MB free, raised nothing at all.
+
+`vram_headroom_pct` and the `vram_headroom_exhausted` segment cover the high
+side. The shim-inflated free-byte field is named as the `never_use` trap: it
+reports gigabytes free on a card that has megabytes, which is exactly backwards
+for a headroom question.
+
+### Version consistency is enforced
+
+Every place the core declares its own version must now agree, checked by
+`checks/check_version_consistency.py`. The kernel module, DKMS, the Makefile
+and the shim had all still said 3.2 on a shipped 3.4, and neither symptom was
+loud: the Gaming Suite reads the module's version as "installed core version"
+and offered an Upgrade button for the release already running, while
+`dkms autoinstall` could never match what `make install` had registered and
+silently did nothing for every other installed kernel.
+
+Governed as `core_build_version` (what the installer put on disk) versus
+`kmod_loaded_version` (what is actually executing), compared by the
+`kmod_version_drift` segment, so "new build installed, old module still
+resident" is a stated verdict rather than a silent mystery.
+
+### Two measurement bugs that were reporting confident wrong numbers
+
+- The repetition smoke gate failed a **correct** answer for being brief. A flat
+  eight-token floor scored "Hello! Three colors: red, blue, green." as a
+  failure, identically under f16 and q4_0 KV, so it was grading the prompt
+  rather than the model, and would have blocked a KV configuration that is
+  1.48x faster at long prompts with full needle recall. Too-short output is now
+  `INCONCLUSIVE`, which is a different finding from `FAIL`, and only one of
+  them is about the model.
+- The KV benchmark derived its cost column from a model shape written into the
+  file (`64 layers x 8 x 128`). The served model is 65 blocks of which only 17
+  are full-attention, with 4 KV heads and head_dim 256, so the figure was ~4x
+  too high in the expensive direction and had reached telemetry. It now asks
+  the model's real geometry, and returns nothing rather than a confident wrong
+  number when it cannot.
+
+### Serving recipe: q4_0 KV on the reference model
+
+Measured 1.48x at a 14,549-token prompt (7.18 vs 4.74 tok/s), with the
+end-to-end needle test dropping from 570 s to 135 s. Not a memory decision:
+the footprint is identical across all three KV types on this hybrid
+architecture, because 48 of its 65 blocks hold a fixed recurrent state that
+does not depend on the cache type at all. It is a kernel-selection effect, and
+q8_0 is a 1.8x **regression**, so it is pinned per-model in the recipe rather
+than generalized. Gate evidence and the reasoning live in the recipe file.
+
 ### Proxy reliability
 
 The proxy can no longer consume unlimited system memory. It now has a hard memory limit based on host RAM.
@@ -96,7 +179,7 @@ model, replacing the older 35B mixture-of-experts one).
   model , one engine to maintain instead of two, and nothing changes for
   anyone already using it.
 - The built-in model server's default network port moved from 11434 (which
-  collided with Ollama, if you also run that) to 11435, so both can run
+  collided with Ollama, if you also run that) to 11369, so both can run
   side by side without a fight.
 
 ### 🧭 GB-Semantics , one governed answer, not a guess
@@ -195,8 +278,8 @@ telemetry and the MCP servers all use the same names:
 | 🗜️ **GB-Quant** | Compresses **weights** (quantize-to-fit planner, bf16 > int8 > int4, GemLite kernels) **and the KV cache** (TurboQuant, the KV branch , it is *not* a separate product). |
 | 📡 **GB-Dataflux** | The flight recorder. Every placement, quantization, tier move, serve and measured tok/s lands in one event log, queryable live over MCP and in a web UI (`greenboost dataflux-ui`). |
 | 🌐 **GB-Cluster** | Borrows idle GPUs and RAM from LAN machines ("feeders"), and now peers their *compute*, not just their memory. |
-| 🔗 **GB-Synapse** | GreenBoost's own model server + Ollama/OpenAI proxy on `:11435`, in front of `llama-server --rpc`. A drop-in replacement for Ollama that can split one model across two machines' GPUs. |
-| 🖥️ **GB-CLI** | The agentic terminal client, **installed by Full Install , no separate setup**. `gb` for the REPL, `gb -p "…"` for one-shot prompts, `gb rag-search …` for headless JSON. It always talks to GB-Synapse on `:11435`, so whatever the cluster is serving is what the agent thinks with. |
+| 🔗 **GB-Synapse** | GreenBoost's own model server + Ollama/OpenAI proxy on `:11369`, in front of `llama-server --rpc`. A drop-in replacement for Ollama that can split one model across two machines' GPUs. |
+| 🖥️ **GB-CLI** | The agentic terminal client, **installed by Full Install , no separate setup**. `gb` for the REPL, `gb -p "…"` for one-shot prompts, `gb rag-search …` for headless JSON. It always talks to GB-Synapse on `:11369`, so whatever the cluster is serving is what the agent thinks with. |
 
 ### 🖥️ GB-CLI , the agent that ships with GreenBoost
 
@@ -394,7 +477,7 @@ own RAM if it doesn't fit VRAM. In short: llama.cpp's RPC handles the split
 ```bash
 sudo greenboost synapse login              # store a HuggingFace token
 sudo greenboost pull <repo>[:quant]        # download a GGUF
-greenboost synapse run <model>             # serve it, cluster-aware, on :11435
+greenboost synapse run <model>             # serve it, cluster-aware, on :11369
 ```
 
 Once running, it speaks Ollama's API, OpenAI's API, and HuggingFace's TGI API

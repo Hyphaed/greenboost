@@ -42,6 +42,48 @@
 # Sampling is the model card's Qwen3.8 thinking-mode set.
 # mtpDraftN 4 is this repo's own swept optimum (2->5.15, 3->5.58, 4->6.5, 6->4.40).
 #
+# kvCache q4_0 — measured 2026-08-20, and NOT for the reason you would guess
+# -------------------------------------------------------------------------
+# It is not a memory decision. The shim-measured KV+SSM footprint
+# (/var/lib/greenboost/synapse/kv_measurements.json, real cudaMalloc
+# interception) is 218 MB at ctx 24576 for f16, q8_0 AND q4_0 alike — 48 of
+# this model's 65 blocks are Gated DeltaNet whose recurrent state does not
+# depend on --cache-type-k/v at all. Quantizing the KV frees nothing.
+#
+# It is a kernel-selection decision. At a fixed 14,549-token prompt, n=5 per
+# leg, f16 run first AND last as a drift control:
+#
+#     f16   4.74 tok/s  (4.66-4.89)   prefill 786 ms
+#     q8_0  2.69        (2.60-2.69)   prefill 1095 ms   <- WORSE than f16
+#     q4_0  7.18        (7.17-7.18)   prefill  511 ms   <- 1.48x
+#     f16   4.89        (4.88-5.03)   prefill 751 ms    (control, reproduced)
+#
+# Non-monotonic, which is why nobody guessed it: q8_0 is a 1.8x REGRESSION.
+# Working theory is llama.cpp flash-attention kernel coverage — head_dim 256
+# is unusual and quantized-KV FA kernels are chosen per type and head_dim.
+# Untested; the measurement does not rest on it. Do NOT generalize this to
+# other models, which is why it is pinned here and not in _pick_kv_type().
+#
+# The effect is INVISIBLE at short prompts — at 71-73 tokens f16 spans
+# 4.0-7.4 tok/s and kv_type does nothing measurable, which is the shape
+# gb_bench_spec sends. This box's real requests carry ~13k tokens of system
+# prompt and MCP schemas, so the long-prompt number is the relevant one.
+# End-to-end on a 15-query NIAH: 135 s at q4_0 vs 570 s at f16.
+#
+# Gate evidence, as CLAUDE.md's "never below fp8 without gate evidence"
+# requires — q4_0 KV is below fp8:
+#   * niah_certify 20000 tokens / 15 needles (the gb_aviary city-list cap):
+#     15/15 for q4_0 AND 15/15 for f16. Read that honestly: the strongest
+#     gate available cannot SEPARATE them. It is not proof of losslessness.
+#   * smoke_gate: PASS for both, byte-identical greedy output at temp 0.
+#     (That gate had to be fixed first — it was failing a correct 6-token
+#     answer against an 8-token floor, for f16 and q4_0 alike. See
+#     gb_aviary.smoke_gate's docstring.)
+#
+# Revert to f16 if long-context retrieval ever degrades in real use: the
+# certification gate is saturated at this haystack size and would not catch
+# a subtle loss. `GB_SYNAPSE_KV=f16` pins it for one run without editing.
+#
 # NOTE: `check_recipes.py --fix` does not preserve comments. Re-add after --fix.
 
 schemaVersion: '1'
@@ -58,8 +100,8 @@ capabilities:
   visionProjector: false
   recurrentState: false
 kvCache:
-  key: f16
-  value: f16
+  key: q4_0
+  value: q4_0
 sampling:
   temperature: 1.0
   topP: 0.95
@@ -71,4 +113,4 @@ ctx: 24576
 nGpuLayers: all
 tierIntent: t2Spill
 mtpDraftN: 4
-contentDigest: sha256:4ee133ac172c0e7b1da140987b168cd726070a5cc9c84d51376f4b4f4b8fd999
+contentDigest: sha256:cbd065ca062388ac85e9a2317eb7ae69995d8a6e794cb49795a56675beac53f7

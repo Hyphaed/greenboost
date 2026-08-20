@@ -1,4 +1,4 @@
-# GreenBoost v3.2 - Kernel module + CUDA shim build system
+# GreenBoost v3.4 - Kernel module + CUDA shim build system
 # Author: Ferran Duarri
 #
 # Kbuild file handles kernel-internal rules (obj-m, ccflags-y).
@@ -29,7 +29,7 @@ AUDIT32 := libgreenboost_audit32.so
 VMM_OVERRIDE := libgreenboost_vmm_override.so
 MODULE  := greenboost.ko
 NETD    := greenboost-netd
-GB_VERSION := 3.2
+GB_VERSION := 3.4
 
 PHYS_GB    ?= 0
 VIRT_GB    ?= 0

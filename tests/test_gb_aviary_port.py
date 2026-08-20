@@ -76,3 +76,80 @@ def test_smoke_gate_resolves_default_url_when_omitted(monkeypatch):
     monkeypatch.setattr(gb_aviary.urllib.request, "urlopen", _fake_urlopen)
     gb_aviary.smoke_gate("some-model")
     assert captured["url"].startswith("http://127.0.0.1:11435")
+
+def _smoke_with_content(monkeypatch, content: str) -> dict:
+    """Run smoke_gate against a canned completion."""
+    import json as _json
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return _json.dumps(
+                {"choices": [{"message": {"content": content}}]}).encode()
+
+    monkeypatch.setattr(gb_aviary.urllib.request, "urlopen",
+                        lambda req, timeout=30: _FakeResp())
+    monkeypatch.setattr(gb_aviary, "_emit", lambda *a, **k: None)
+    return gb_aviary.smoke_gate("some-model", url="http://127.0.0.1:1")
+
+
+def test_a_correct_but_terse_answer_is_not_reported_as_collapse(monkeypatch):
+    """The exact live output that exposed this, 2026-08-20.
+
+    The gate asked "Say hello and name three colors." and the model answered
+    "Hello! Three colors: red, blue, green." — right, and six whitespace
+    tokens against a flat `len(toks) < 8 -> FAIL`. Both f16 and q4_0 KV
+    produced that byte-identical string and both were failed, so the gate was
+    grading its own prompt. It would have blocked a q4_0 KV configuration
+    measured 1.48x faster at long prompt with 15/15 needle recall.
+    """
+    out = _smoke_with_content(monkeypatch, "Hello! Three colors: red, blue, green.")
+    assert out["verdict"] == "INCONCLUSIVE"
+    assert out["verdict"] != "FAIL", "a right answer must never read as collapse"
+    assert "too short to score repetition" in out["reason"]
+
+
+def test_no_content_at_all_is_still_a_failure(monkeypatch):
+    """Short-but-present and empty are different findings. Only one is the
+    model's fault, and it keeps FAIL."""
+    out = _smoke_with_content(monkeypatch, "")
+    assert out["verdict"] == "FAIL"
+    assert out["reason"] == "no content returned"
+
+
+def test_real_repetition_collapse_still_fails(monkeypatch):
+    """The behaviour the gate exists for must survive the fix."""
+    out = _smoke_with_content(monkeypatch, "red blue green " * 12)
+    assert out["verdict"] == "FAIL"
+    assert out["reason"] == "repetition collapse"
+    assert out["max6gram"] >= 4
+
+
+def test_the_prompt_asks_for_enough_text_to_score(monkeypatch):
+    """Prevent the regression at its source: a prompt whose ideal answer is
+    shorter than the six-gram window makes the length branch unavoidable."""
+    captured = {}
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"choices":[{"message":{"content":"a b c d e f g h i"}}]}'
+
+    def _fake_urlopen(req, timeout=30):
+        captured["body"] = req.data.decode()
+        return _FakeResp()
+
+    monkeypatch.setattr(gb_aviary.urllib.request, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(gb_aviary, "_emit", lambda *a, **k: None)
+    gb_aviary.smoke_gate("some-model", url="http://127.0.0.1:1")
+    assert "short sentence" in captured["body"]

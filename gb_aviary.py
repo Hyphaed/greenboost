@@ -239,12 +239,30 @@ def smoke_gate(model: str, url: "str | None" = None) -> dict:
     token-uniqueness catch that signature in one cheap turn, which is what lets
     gb-quant's "never below fp8" rule be enforced against evidence instead of
     against a table of assumptions.
+
+    The prompt asks for a sentence per colour, and that is not decoration.
+    2026-08-20: the prompt was "Say hello and name three colors." and the
+    length floor below was a flat `len(toks) < 8 -> FAIL`. The served model
+    answered "Hello! Three colors: red, blue, green." — correct, and six
+    whitespace tokens. The gate failed a right answer for being brief, on a
+    model whose entire training goal is fewer tokens. Verified against BOTH
+    f16 and q4_0 KV: byte-identical output, identical FAIL, so it graded the
+    prompt rather than the model. It would have blocked a q4_0 KV config that
+    is 1.48x faster at long prompt with 15/15 needle recall.
+
+    A gate that can produce a FAIL no correct answer can avoid is worse than
+    no gate, because it is read as evidence. Hence two changes: ask for enough
+    text that the six-gram window is meaningful, and stop reporting "FAIL"
+    when the real situation is "not enough output to judge" — those are
+    different findings and only one of them is about the model.
     """
     if url is None:
         url = _default_synapse_url()
     body = json.dumps({
         "model": model,
-        "messages": [{"role": "user", "content": "Say hello and name three colors."}],
+        "messages": [{"role": "user", "content":
+                      "Say hello, then name three colors and describe each "
+                      "one in a short sentence."}],
         "temperature": 0.0, "max_tokens": 220,
         "chat_template_kwargs": {"enable_thinking": False},
     }).encode()
@@ -254,8 +272,17 @@ def smoke_gate(model: str, url: "str | None" = None) -> dict:
         content = (json.load(r)["choices"][0]["message"]["content"] or "")
 
     toks = content.split()
-    if len(toks) < 8:
-        out = {"verdict": "FAIL", "reason": f"only {len(toks)} tokens of content",
+    if not toks:
+        # Nothing came back at all. That IS a model failure, not a measurement
+        # problem, and it is the one short-output case that deserves FAIL.
+        out = {"verdict": "FAIL", "reason": "no content returned",
+               "max6gram": 0, "uniq": 0.0}
+    elif len(toks) < 8:
+        # Too short for a six-gram window to mean anything. Says nothing about
+        # repetition either way — report that, do not manufacture a verdict.
+        out = {"verdict": "INCONCLUSIVE",
+               "reason": f"only {len(toks)} tokens of content — too short to "
+                         f"score repetition; not evidence of collapse",
                "max6gram": 0, "uniq": 0.0}
     else:
         grams = collections.Counter(tuple(toks[i:i + 6]) for i in range(len(toks) - 5))

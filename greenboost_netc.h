@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
- * GreenBoost v3.2 - Network Client (host-side, compiled into CUDA shim)
+ * GreenBoost v3.4 - Network Client (host-side, compiled into CUDA shim)
  *
  * Manages TCP connections to feeder daemons, remote device tracking,
  * fake pointer mapping, and CUDA operation forwarding.

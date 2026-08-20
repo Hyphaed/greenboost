@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * Copyright (C) 2026 Ferran Duarri. GPL v2 - see LICENSE for the full text.
- * GreenBoost v3.2 - Network Feeder Daemon (greenboost-netd)
+ * GreenBoost v3.4 - Network Feeder Daemon (greenboost-netd)
  *
  * Exposes local GPU(s) + system RAM to remote GreenBoost hosts over TCP.
  * Phase 1: handshake, heartbeat, GPU info query, memory info.
