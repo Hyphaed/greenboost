@@ -27,7 +27,7 @@ come in.
 
 🐧 Don’t miss to check **[Hyphaed kernel](https://gitlab.com/IsolatedOctopi/linux-kernel-inference)** ;  
 Custom patched linux kernel being used alongside greenboost, includes patches (sent to kernel lists),
-yet not included elsewhere at Aug 21 00:46.
+yet not included elsewhere as of Aug 21, 00:46.
 
 
 </div>
