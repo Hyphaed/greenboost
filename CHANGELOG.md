@@ -2,57 +2,94 @@
 
 ## v3.5 : in development, not released
 
-**There is no v3.5 release and no v3.5 tag.** This section describes what is
-on `main` right now, ahead of the last stable release. It is written as it
-lands rather than at release time, so it will be incomplete and it will
-change.
+**There is no v3.5 release and no v3.5 tag.** This section tracks what is on
+`main` ahead of the last stable release, written as it lands rather than at
+release time, so it will be incomplete and it will change.
 
-If you want stable, use v3.4:
-
-    git clone https://gitlab.com/IsolatedOctopi/greenboost.git
-    cd greenboost && git checkout v3.4
-
-If you want what is described below, take `main` directly. It builds and its
-gates pass, but it has had less running time on real hardware than a tagged
-release, and that is the whole difference:
+Take `main` directly, it builds and its gates pass:
 
     git clone https://gitlab.com/IsolatedOctopi/greenboost.git
     cd greenboost && sudo ./greenboost_setup.sh
 
-Already on a checkout:
+Already have a checkout: `git fetch origin && git checkout main && git pull`.
+Prefer the last stable release: `git checkout v3.4`.
 
-    git fetch origin && git checkout main && git pull
+### Four contributions to the Linux kernel, and what they buy local inference
 
-### The kernel underneath is now a repository
-
-The Linux kernel work that came out of running GreenBoost has been published
-as [linux-kernel-inference](https://gitlab.com/IsolatedOctopi/linux-kernel-inference)
+The kernel work GreenBoost produced is now its own repository,
+[linux-kernel-inference](https://gitlab.com/IsolatedOctopi/linux-kernel-inference)
 ([GitHub mirror](https://github.com/Hyphaed/linux-kernel-inference)). It builds
-a kernel tuned for local inference and carries the patch series.
+a kernel tuned for running large models locally and carries the patch series.
+GreenBoost itself does not require it; a stock distribution kernel remains the
+supported path.
 
-**GreenBoost does not require it.** A stock distribution kernel remains the
-supported path. The new "The kernel underneath" section in `README.md`
-explains why each patch exists, and the short version is that most of them
-came from GreenBoost being wrong about something rather than from wanting a
-faster kernel:
+**A generic reclaim-priority hint for dma-buf** (`0019`). Adds an advisory
+`priority` field to `struct dma_buf` (0-255, default 128, lower reclaimed
+first), two exported helpers, two ioctls so userspace holding an fd can set it,
+and fdinfo reporting. This is the first generic way for any dma-buf exporter to
+rank its own pinned buffers.
 
-- External modules inherit the kernel's UBSAN flags whether or not they asked,
-  so a module that trips a check misbehaves at runtime while loading cleanly.
-  `greenboost.ko` sits in that blast radius.
-- dma-buf has no generic way for an exporter to rank its own pinned buffers
-  for reclaim, which is exactly why GreenBoost carries `gaming_mode`, a
-  per-buffer heat score, the private `GB_IOCTL_SET_HEAT`, and its own LRU. An
-  RFC proposes the generic hint; `greenboost.ko` already reads it in its T2
-  eviction sweep. Its blocker is stated rather than hidden: the only user is
-  out-of-tree.
-- Keeping a cold MoE expert compressed in place has no shared vocabulary
-  either. That sibling RFC is finished, applied locally, and deliberately not
-  submitted, because nothing in-tree produces or reads the state it describes.
-- `current_link_speed` reports the link at the instant it is read, and idle
-  GPUs retrain constantly, so comparing it to `max_link_speed` looks like a
-  degraded-link test and is not. GreenBoost's own `pcie_degraded` alarm fired
-  13 times on that mistake. The patch is documentation for four attributes
-  exported since 2018 with no `Documentation/ABI` entry.
+*What it buys local inference:* memory pinned through `FOLL_LONGTERM` sits
+outside normal reclaim by design, so when RAM gets tight nothing could
+distinguish a KV cache re-read on every decode step from a cold expert's
+weights. With the hint, the buffer that costs you tokens per second is the one
+that survives. Every tiering driver that previously had to invent a private
+ioctl for this can now say it in a way other subsystems can read.
+`greenboost.ko` consumes it in its T2 eviction sweep today.
+
+**A compressed-content descriptor for dma-buf** (`0020`). Lets an exporter that
+compressed a buffer's backing memory in place publish how an importer should
+inflate it, so "compressed" becomes an alternative to "evicted".
+
+*What it buys local inference:* a cold mixture-of-experts expert can stay
+resident and compressed instead of being dropped and re-fetched across PCIe
+when routing picks it again. On the reference box the host-to-device path
+measures ~11-12 GB/s, so not paying that re-fetch is worth more than the RAM
+the compression saves.
+
+**UBSAN made opt-in for external modules** (`0017`). Any `obj-m` object
+inherited the kernel's UBSAN `KBUILD_CFLAGS`, because `is-kernel-object` is `y`
+for external modules too. Now in-tree builds are unchanged and an external
+module that wants sanitizers sets `UBSAN_SANITIZE := y` itself.
+
+*What it buys local inference:* out-of-tree GPU and memory-tiering modules stop
+inheriting instrumentation they never asked for, which previously produced
+modules that loaded cleanly and then misbehaved at runtime, the hardest failure
+shape to attribute. Observed against VMware's `vmnet`/`vmmon`; `greenboost.ko`
+is in the same blast radius.
+
+**Documentation/ABI for four PCI link attributes** (`0021`).
+`max_link_speed`, `max_link_width`, `current_link_speed` and
+`current_link_width` have been exported under `/sys/bus/pci/devices/.../` since
+2018 with no entry anywhere in `Documentation/ABI`. This writes them down, and
+in particular records that `current_link_speed` performs a fresh
+`PCI_EXP_LNKSTA` read on every open.
+
+*What it buys local inference:* it stops a whole class of false diagnosis.
+Idle GPUs retrain their link constantly, so comparing `current_link_speed`
+against `max_link_speed` reads exactly like a degraded-link test and is not
+one. Measured on the reference box, same boot, no configuration change:
+5.0 GT/s idle, 16.0 GT/s under load. Anyone tuning a PCIe-bound inference box
+can now tell a real problem from power management doing its job.
+
+**Upstream status, stated plainly.** None of these are merged. `0021` is a
+straightforward documentation patch. `0019` is ready to send as an RFC, leading
+with its own blocker rather than burying it: its only consumer is out-of-tree,
+and adding UAPI without an in-tree user is normally declined. `0020` is
+finished and applied locally but deliberately **not** submitted, because
+nothing in-tree yet produces or reads the state it describes.
+`upstream-candidates/SUBMISSION.md` records that judgement per patch.
+
+### The kernel build itself
+
+Beyond the originals, the series curates sixteen patches from CachyOS, XanMod
+and TKG with attribution intact and every source pinned by sha256: BORE
+scheduling, BBR3, vmscan and VFS-cache behaviour under sustained memory
+pressure, `max_map_count`, timer frequency, block-layer latency and mq-deadline
+tuning, THP defrag defaults. Config fragments are selected against the
+machine's detected topology rather than a fixed profile. The result is a kernel
+whose defaults assume a box that holds a large model resident and reads it hard,
+instead of one that assumes a desktop.
 
 ## v3.4 : 2026-08-18
 
