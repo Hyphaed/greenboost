@@ -196,6 +196,12 @@ class StatusLine:
         # turn start, or a long prefill silently divides the number down. See
         # the tps computation in _render().
         self._first_out_ts: "float | None" = None
+        # Server-measured decode rate from the last TurnComplete. Preferred over
+        # anything computed here: gb_synapse measures first-token-to-last, which
+        # is the real decode span, while this process only ever sees the totals
+        # after the fact. Survives start(), because a turn that calls three tools
+        # is still one turn and its decode rate did not change when a tool ran.
+        self._tok_s: float = 0.0
         self._stop_evt = threading.Event()
         self._thread: threading.Thread | None = None
         self._prev_vis_len: int = 0   # widest frame painted so far this run — see _render
@@ -208,6 +214,11 @@ class StatusLine:
         self._frame    = 0
         self._prev_vis_len = 0
         self._first_out_ts = None
+        # _tok_s is NOT cleared here. start() runs again after every tool call
+        # (_restart_sl), and clearing _first_out_ts there is what left the
+        # post-tool blocks with a token count and no rate to divide it by: the
+        # decode already happened, before the tool ran. Keeping the measured
+        # rate is what puts a t/s on every block instead of only the last one.
         self._stop_evt.clear()
         if not _is_tty():
             # Non-interactive: no animation thread at all. stop() still emits one
@@ -231,6 +242,7 @@ class StatusLine:
         in_tokens: int | None   = None,
         out_tokens: int | None  = None,
         ctx_pct: float | None   = None,
+        tok_s: float | None     = None,
     ) -> None:
         with self._lock:
             if phase     is not None: self._phase    = phase
@@ -240,6 +252,7 @@ class StatusLine:
                     self._first_out_ts = time.monotonic()
                 self._out_tok = out_tokens
             if ctx_pct   is not None: self._ctx_pct  = ctx_pct
+            if tok_s     is not None and tok_s > 0: self._tok_s = tok_s
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -315,6 +328,8 @@ class StatusLine:
             in_tok  = self._in_tok
             out_tok = self._out_tok
             frame   = self._frame
+            measured_tps = self._tok_s
+            first_out    = self._first_out_ts
         elapsed = time.monotonic() - self._start
         sp_char = SPINNER_THINK[frame % len(SPINNER_THINK)]
 
@@ -323,8 +338,10 @@ class StatusLine:
         ]
         if in_tok or out_tok:
             frags.append((f"fg:{DIM}", f"  ·  {in_tok:,}↑  {out_tok:,}↓"))
-            if out_tok > 0 and elapsed > 0:
-                tps = out_tok / elapsed
+            span = (time.monotonic() - first_out) if first_out else 0.0
+            tps = measured_tps if measured_tps > 0 else (
+                out_tok / span if out_tok > 0 and span > 0 else 0.0)
+            if tps > 0:
                 frags.append((f"fg:{TEAL}", f"  ·  {tps:.0f}t/s"))
         frags.append((f"fg:{DIM}", f"  ·  {elapsed:.1f}s"))
         return frags
@@ -375,6 +392,7 @@ class StatusLine:
             ctx_pct = self._ctx_pct
             frame   = self._frame
             first_out = self._first_out_ts
+            measured_tps = self._tok_s
 
         width   = shutil.get_terminal_size((80, 24)).columns
         safe_w  = width - 2
@@ -404,8 +422,12 @@ class StatusLine:
             # gb_synapse's own proxy-side tok_s_measured has always measured the
             # correct span (first token to last); this display was the outlier.
             decode_span = (time.monotonic() - first_out) if first_out else 0.0
-            if out_tok > 0 and decode_span > 0:
+            tps = 0.0
+            if measured_tps > 0:
+                tps = measured_tps
+            elif out_tok > 0 and decode_span > 0:
                 tps = out_tok / decode_span
+            if tps > 0:
                 tps_str = f"{tps:.0f}t/s"
                 right_parts.append(tps_str)
             # Surface prefill explicitly rather than letting it hide inside the

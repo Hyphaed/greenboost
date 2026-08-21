@@ -1119,7 +1119,8 @@ def process_query(user_input: str, session: ConversationSession,
                     _ctx_real["tokens"] = last_in_tok
                     _ctx_real["chars"] = sum(
                         len(str(m.get("content", ""))) for m in session.messages)
-                sl.update(in_tokens=last_in_tok, out_tokens=last_out_tok)
+                sl.update(in_tokens=last_in_tok, out_tokens=last_out_tok,
+                          tok_s=last_tok_s)
                 _step_tools.clear()
                 try:
                     # Feeds the non-stop chain's stall check , the one guard a
