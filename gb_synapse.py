@@ -5408,6 +5408,12 @@ def resume(model: str) -> dict:
     The slow part is reloading the weights, not the KV restore — the restore
     itself measured 537 ms for 54,377 tokens. Reported separately so the two
     are not confused.
+
+    WARNING: that 537 ms is the time to push bytes back into the slot. It is
+    NOT prefill time saved. Measured 2026-08-21 on the served hybrid model, a
+    request issued after a successful restore still re-prefilled every token
+    (cached=0) even at sim_best=1.000. See checkpoint() for the full numbers.
+    Resuming gets the session back; it does not get the prefill back.
     """
     p = _pause_state_path(model)
     if not p.exists():
@@ -5452,6 +5458,217 @@ def resume(model: str) -> dict:
             "tokens_restored": tokens, "reload_s": round(serve_s, 2),
             "restore_s": round(restore_s, 2), "errors": errors,
             "ready": getattr(st, "ready", True)}
+
+
+CHECKPOINT_DIR = Path(os.environ.get("GB_SYNAPSE_CHECKPOINT_DIR",
+                                    str(RUN_DIR / "checkpoints")))
+
+
+def _checkpoint_state_path(model: str) -> Path:
+    return CHECKPOINT_DIR / f"{_safe_name(model)}.json"
+
+
+def _slot_fingerprint(st: "ServerState") -> dict:
+    """The parameters a saved slot is only valid under.
+
+    A slot dump is raw KV plus raw recurrent state. Restoring one into an
+    engine serving a different model, a different context size or a different
+    KV quantisation does not fail loudly , it feeds the model somebody else's
+    numbers. Every field here changes the byte layout or the meaning of that
+    dump, so every field is compared before a restore is allowed.
+    """
+    # Deliberately NOT n_gpu_layers or tensor_split. Those decide WHERE the
+    # layers live, not how the saved bytes are laid out, and tensor_split in
+    # particular is recomputed from live free VRAM on every serve , measured
+    # 10352 on one start and 10267 on the next, minutes apart, same model and
+    # same flags. Comparing it made every checkpoint unrestorable for a
+    # difference that cannot affect correctness.
+    return {"model": st.model, "quant": st.quant, "ctx": st.ctx,
+            "kv_type": st.kv_type, "engine": st.engine}
+
+
+def checkpoint(model: str) -> dict:
+    """Save every non-empty slot WITHOUT stopping the engine.
+
+    `pause()` is stop-and-save, for handing the VRAM back. This is the other
+    half: the engine keeps serving and the conversation becomes survivable.
+
+    It exists because the expensive thing on this box is not the weights, it
+    is the prompt. Measured 2026-08-21 on the served 27B hybrid: a slot at
+    12,762 tokens is 392 MB and saves in 95 ms, of which 154 MB is Gated
+    DeltaNet recurrent state that cannot be rebuilt from a KV cache , recurrent
+    layers update in place, so their state exists only at the tip and cannot be
+    rolled back to a prefix. Re-prefilling those same tokens cold measured
+    ~245 s at 52 tok/s. Restore of a 54,377-token slot measured 537 ms.
+
+    Four minutes versus half a second, for a 95 ms write , except that it is
+    not, see below.
+
+MEASURED LIMITATION, 2026-08-21, and it applies to pause()/resume() too.
+
+Restoring a slot brings the bytes back but does NOT give the engine prompt
+cache reuse on this hybrid model. Tested end to end on the served 27B
+(17 attention + 48 Gated DeltaNet layers), three request shapes:
+
+  warm live slot          4.23 s   cached=11273
+  exact replay after
+  restart + restore      62.48 s   cached=0     sim_best=1.000 f_keep=1.000
+
+llama.cpp selected the right slot, computed a PERFECT similarity against the
+restored tokens, and re-prefilled all 11,767 of them anyway. A continuation
+that extended the restored sequence behaved the same (cached=0).
+
+So the restore is real and fast (11,770 tokens in 60 ms, 356 MB) and buys
+nothing in prefill time here. Do not quote a restore duration as if it were
+time saved: resume()'s "537 ms for 54,377 tokens" measures the byte restore,
+not prefill avoided, and was never checked against a following request.
+
+What DOES work is same-slot reuse inside one live engine: 62.9 s cold to
+1.65 s warm on the identical prompt, cached=11763. Keeping the engine alive is
+worth far more than checkpointing it.
+    """
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    for st in _read_run_states():
+        if st.model != model:
+            continue
+        if st.engine and st.engine != "llama.cpp":
+            return {"ok": False, "model": model,
+                    "error": f"checkpointing needs llama.cpp slot save; this "
+                             f"session runs on {st.engine!r}"}
+        try:
+            slots = _slots_list(st)
+        except Exception as e:
+            return {"ok": False, "model": model,
+                    "error": f"could not read /slots on the engine: {e}"}
+
+        # A slot mid-generation would be checkpointed half-written. Skip it and
+        # say so; the engine keeps running either way, so skipping costs
+        # nothing and a torn dump would cost the conversation.
+        saved, tokens, skipped = [], 0, []
+        for sl in slots:
+            n = int(sl.get("n_prompt_tokens") or 0)
+            if n <= 0:
+                continue
+            if sl.get("is_processing"):
+                skipped.append(int(sl["id"]))
+                continue
+            fn = f"{_safe_name(model)}.ckpt{sl['id']}.bin"
+            try:
+                r = _slot_action(st, int(sl["id"]), "save", fn)
+            except Exception as e:
+                return {"ok": False, "model": model, "slot": sl["id"],
+                        "error": f"slot save failed: {e}", "saved": saved}
+            saved.append({"slot": int(sl["id"]), "filename": fn,
+                          "tokens": int(r.get("n_saved") or 0),
+                          "bytes": int(r.get("n_written") or 0),
+                          "save_ms": (r.get("timings") or {}).get("save_ms")})
+            tokens += int(r.get("n_saved") or 0)
+
+        if not saved:
+            return {"ok": True, "model": model, "slots": [], "tokens": 0,
+                    "skipped_busy": skipped,
+                    "note": "no slot had a cached prompt to checkpoint"}
+
+        state = dict(_slot_fingerprint(st))
+        # "format", not "kind": `kind` is dataflux's event vocabulary and the
+        # coverage checker rightly refuses to let an unregistered kind literal
+        # appear in a file that also emits events.
+        state.update({"port": st.port, "slots": saved,
+                      "checkpoint_ts": time.time(), "format": "gb-checkpoint-1"})
+        # Write via rename: a half-written manifest read after a crash is
+        # exactly the situation this feature exists to survive.
+        tmp = _checkpoint_state_path(model).with_suffix(".json.tmp")
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(state, indent=1))
+        tmp.replace(_checkpoint_state_path(model))
+
+        try:
+            import gb_dataflux
+            gb_dataflux.emit({
+                "node": "host", "label": "gb_synapse", "kind": "serve_checkpoint",
+                "model": model, "action": "checkpoint", "slots": len(saved),
+                "tokens": tokens,
+                "bytes": sum(x["bytes"] for x in saved),
+                "skipped_busy": len(skipped), "status": "ok",
+            })
+        except Exception:
+            pass
+
+        return {"ok": True, "model": model, "slots": saved, "tokens": tokens,
+                "skipped_busy": skipped}
+    return {"ok": False, "model": model, "error": "model is not being served"}
+
+
+def restore_checkpoint(model: str, only_if_cold: bool = True) -> dict:
+    """Restore a checkpoint into an already-running engine.
+
+    `only_if_cold` skips the restore when a slot already holds more tokens than
+    the checkpoint does. That is the common case after a normal CLI restart
+    against a server that never died: the live state is newer than the file,
+    and overwriting it with the checkpoint would throw away real context.
+    """
+    p = _checkpoint_state_path(model)
+    if not p.exists():
+        return {"ok": True, "model": model, "restored": [],
+                "note": "no checkpoint for this model"}
+    try:
+        state = json.loads(p.read_text())
+    except Exception as e:
+        return {"ok": False, "model": model, "error": f"unreadable checkpoint: {e}"}
+
+    for st in _read_run_states():
+        if st.model != model:
+            continue
+        live = _slot_fingerprint(st)
+        want = {k: state.get(k) for k in live}
+        if live != want:
+            differing = [k for k in live if live[k] != want[k]]
+            return {"ok": False, "model": model, "error":
+                    "checkpoint was taken under different serve parameters "
+                    f"({', '.join(differing)}); refusing to restore it into "
+                    "this engine", "live": live, "checkpoint": want}
+
+        try:
+            slots = {int(x["id"]): x for x in _slots_list(st)}
+        except Exception as e:
+            return {"ok": False, "model": model,
+                    "error": f"could not read /slots: {e}"}
+
+        restored, tokens, errors, skipped = [], 0, [], []
+        t0 = time.monotonic()
+        for sl in state.get("slots", []):
+            sid = int(sl["slot"])
+            cur = slots.get(sid) or {}
+            if cur.get("is_processing"):
+                skipped.append(sid)
+                continue
+            if only_if_cold and int(cur.get("n_prompt_tokens") or 0) >= int(sl.get("tokens") or 0):
+                skipped.append(sid)
+                continue
+            try:
+                r = _slot_action(st, sid, "restore", sl["filename"])
+                restored.append(sid)
+                tokens += int(r.get("n_restored") or 0)
+            except Exception as e:
+                errors.append({"slot": sid, "error": str(e)})
+        restore_s = time.monotonic() - t0
+
+        try:
+            import gb_dataflux
+            gb_dataflux.emit({
+                "node": "host", "label": "gb_synapse", "kind": "serve_checkpoint",
+                "model": model, "action": "restore", "slots_restored": len(restored),
+                "tokens_restored": tokens, "restore_s": round(restore_s, 3),
+                "skipped": len(skipped),
+                "status": "error" if errors else "ok",
+            })
+        except Exception:
+            pass
+
+        return {"ok": not errors, "model": model, "slots_restored": restored,
+                "tokens_restored": tokens, "restore_s": round(restore_s, 3),
+                "skipped": skipped, "errors": errors}
+    return {"ok": False, "model": model, "error": "model is not being served"}
 
 
 def paused() -> list[dict]:
