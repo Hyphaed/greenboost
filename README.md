@@ -47,7 +47,7 @@ yet not included elsewhere as of Aug 21, 00:46.
 
 <div align="center">
 
-**MCP servers** (LLM-facing): `greenboost-orchestrator` (central, full awareness via `greenboost_overview`, `optimize_inference`, `quant_advisor`, `flux_health`, and the GB-Semantics `semantic_*` tools) · `greenboost-dataflux` (event log) · `greenboost-cluster` (live cluster state) · `greenboost-synapse` (serving control + CLI bridge) · `greenboost` (GB-CLI: rag/goals/factory)
+**MCP servers** (LLM-facing): `greenboost-orchestrator` (central, full awareness via `greenboost_overview`, `optimize_inference`, `quant_advisor`, `flux_health`, `tuner_tick` (the control loop, one tick per call , advice by default), and the GB-Semantics `semantic_*` tools) · `greenboost-dataflux` (event log) · `greenboost-cluster` (live cluster state) · `greenboost-synapse` (serving control + CLI bridge) · `greenboost` (GB-CLI: rag/goals/factory)
 
 </div>
 

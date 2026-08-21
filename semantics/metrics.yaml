@@ -834,6 +834,158 @@
         great many messages and still be a loss if it moved the prefix.
         extended_prior and head_kept are the fields that answer that.
 
+- name: kv_t2_resident_mb
+  entity: node
+  unit: megabytes
+  doc: >
+    KV cache bytes living in T2 DDR right now , the field that decides whether
+    lookahead KV prefetch (staging T2-resident KV into T1 ahead of the step
+    that needs it) has anything at all to move. Measured on this box
+    2026-08-20 while serving the reference model at ctx 24576: KV sat entirely
+    in T1 (427 MB tracked) and the 6687 MB in T2 was all weights. Published by
+    the shim unconditionally as of the same date; an older build reports null
+    with the reason rather than a zero that would read as a clean answer.
+  resolver: kv_t2_resident_mb
+  source_fields: ["shim_stats.kv_t2_live_mb"]
+  source_tier: measured
+  direction: lower_is_better
+  owner: GB-Tiering
+  never_use:
+    - field: kv_prefetch_t2_kv_mb
+      class: conditionally_emitted
+      why: >
+        It is only written by the shim's prefetch tick, which only runs when
+        GREENBOOST_KV_PREFETCH is set. With the feature off (the default) it
+        reads 0 forever , indistinguishable from "measured, and there is no KV
+        in T2". Answering the question that justifies arming the feature would
+        have required arming it first.
+    - field: t2_overflow_total_mb
+      class: wrong_scope
+      why: >
+        It is ALL of T2, weights included, and on this box the weights are
+        almost all of it (6687 MB of overflow with 0 MB of KV, 2026-08-20).
+        Read as "KV is spilling" it says yes when the truth is no.
+
+- name: kv_prefetch_opportunities
+  entity: node
+  unit: count
+  doc: >
+    Ticks in which the shim saw T2-resident KV AND room left in the T1 KV
+    reserve , the opportunity count for lookahead prefetch, measured with no
+    data movement (GREENBOOST_KV_PREFETCH=stats). Zero with the counter armed
+    is a real answer that closes the branch; null means it was never armed,
+    which has not started the investigation. The two are deliberately
+    different values.
+  resolver: kv_prefetch_opportunities
+  source_fields: ["shim_stats.kv_prefetch_opportunities", "shim_stats.kv_prefetch_mode"]
+  source_tier: measured
+  direction: higher_is_better
+  owner: GB-Tiering
+  never_use:
+    - field: kv_prefetch_ticks
+      class: wrong_scope
+      why: >
+        It counts how often the tick RAN, not how often it found anything.
+        With the mode armed and no KV in T2 it climbs every two seconds while
+        the opportunity count stays at zero , which is the outcome that
+        decides whether the branch is worth building.
+
+- name: draft_accept_pct
+  entity: serve_session
+  unit: percent
+  doc: >
+    Share of speculatively-drafted tokens the target model accepted, from the
+    engine's own `draft_n` / `draft_n_accepted` on real traffic , not from a
+    synthetic bench. This is the state the 2026-08-05 depth sweep was missing:
+    that sweep found tok/s is non-monotonic in draft depth (2:5.15, 3:5.58,
+    4:6.50, 6:4.40, 8:5.76 on the then-reference model), which is what it looks
+    like when the right depth depends on something nobody is reading.
+  resolver: draft_accept_pct
+  source_fields: ["tok_s_measured.draft_n", "tok_s_measured.draft_n_accepted"]
+  source_tier: measured
+  direction: higher_is_better
+  owner: Gb-Synapse
+  never_use:
+    - field: median_accept_rate
+      class: conditionally_emitted
+      why: >
+        `spec_decode.median_accept_rate` comes from gb_bench_spec.py's
+        synthetic prompts, not from traffic, and it is suppressed at depth 0
+        for a reason the raw field cannot carry: with nothing drafted, nothing
+        can be rejected, so the engine reports acceptance 1.0. Read alone that
+        says "drafting is working perfectly" when the truth is "drafting is
+        off". `accept_rate_source` on the same event names which case it is;
+        this governed metric sidesteps both by excluding depth-0 responses.
+
+- name: tuner_harvesting
+  entity: node
+  unit: boolean
+  doc: >
+    Whether GreenBoost's control loop is currently holding a lever back
+    because the bottleneck is elsewhere , today, the GPU power limit while
+    decode is bandwidth-bound. A state, not a fault: the fault is a card
+    sitting at full board power waiting on PCIe, which is what this box did
+    before the loop existed. Null when no tick has run yet.
+  resolver: tuner_harvesting
+  source_fields: ["tuner_decision.action", "tuner_decision.applied"]
+  source_tier: measured
+  direction: higher_is_better
+  owner: Central MCP
+  never_use:
+    - field: action
+      class: wrong_scope
+      why: >
+        A `harvest` action on its own means the loop DECIDED to harvest, not
+        that anything moved , tuner_tick is read-only unless double-gated, so
+        most harvest events in the log were never applied. `applied` is the
+        field that separates advice from actuation.
+
+- name: ctx_estimate_error_pct
+  entity: node
+  unit: percent
+  doc: >
+    Signed gap between the CLI's own token estimate for a request and the count
+    the server reported for the same request (median over the window). Negative
+    means the client predicted FEWER tokens than were charged, which is the
+    direction that ends turns: it reports headroom that is not there. Live
+    2026-08-20, this box, mid-session , an auto-compaction retry was fired at
+    24654 tokens against a 24576-token window and the operator got the raw 400.
+  resolver: ctx_estimate_error_pct
+  source_fields: ["agent_context_edit.estimate_error_pct"]
+  source_tier: measured
+  direction: higher_is_better
+  owner: GB-CLI
+  never_use:
+    - field: chars_per_token
+      class: derived_not_measured
+      why: >
+        It is the estimator's current calibration, not its accuracy. A ratio
+        that has settled at 3.2 says nothing about whether the last request
+        fit; only the signed error against a real usage.prompt_tokens does.
+
+- name: ctx_hard_trims
+  entity: node
+  unit: count
+  doc: >
+    Times the last-resort context eviction ran in the window , the path that
+    truncates or drops messages compaction cannot reach, because the bytes that
+    did not fit were in the live tail rather than the summarisable middle.
+    Nonzero is the trim doing its job; a rising count means the served window
+    is too small for how this session actually works, and the fix is a larger
+    ctx or fewer connected MCP servers, not more trimming.
+  resolver: ctx_hard_trims
+  source_fields: ["agent_context_edit.op", "agent_context_edit.met"]
+  source_tier: measured
+  direction: lower_is_better
+  owner: GB-CLI
+  never_use:
+    - field: freed_tokens
+      class: conditionally_emitted
+      why: >
+        Only present on op=hard_trim events, and it measures how much was
+        thrown away, not whether the turn survived. `met` is the field that
+        says whether the budget was actually reached.
+
 - name: agent_memory_recall_chars
   entity: node
   unit: characters
@@ -847,3 +999,318 @@
   source_tier: measured
   direction: lower_is_better
   owner: GB-CLI
+
+- name: gaming_mode_active
+  entity: node
+  unit: bool
+  doc: >
+    greenboost.ko's `gaming_mode` flag as it reads RIGHT NOW. Set by the
+    Proton wrapper at game launch, cleared at exit; while it is 1 the kernel
+    moves inference T2 buffers to the LRU tail so a game never loses VRAM to
+    a model. That is correct while a game is running and a silent throughput
+    tax when no game is.
+  resolver: gaming_mode_active
+  source_fields: ["gb_monitor.GbSnapshot.gaming_mode"]
+  source_tier: measured
+  direction: informational
+  owner: GB-Tiering
+  never_use:
+    - field: gaming_mode
+      why: >
+        The raw flag answers "is gaming priority applied", NOT "is a game
+        running" , the two diverge exactly when a session dies hard, which
+        is the case worth catching. Pair it with a live process check (see
+        the `gaming_mode_stuck` segment) before concluding anything about a
+        game being present.
+  aliases: [gaming_mode, game_priority_active]
+
+- name: gaming_session_orphans
+  entity: node
+  unit: count
+  doc: >
+    How many game processes survived BOTH SIGTERM and SIGKILL on the most
+    recent stop request. 0 is a clean teardown; anything above 0 means part
+    of the game is still running and holding VRAM after the Suite believed
+    it had stopped it. Resolved from the newest `gaming_session` event that
+    actually carries the field (only `action="terminated"` does).
+  resolver: gaming_session_orphans
+  source_fields: ["gb_dataflux.gaming_session.orphans"]
+  source_tier: measured
+  direction: lower_is_better
+  threshold: {warn_at: 1}
+  owner: GB-Tiering
+  never_use:
+    - field: pids_kill
+      why: >
+        The number force-killed is not a failure count , a game that ignores
+        SIGTERM and dies to SIGKILL was still stopped successfully. Only
+        `orphans` says something survived.
+  aliases: [stuck_game_processes, orphaned_game_pids]
+
+- name: inter_token_p95_ms
+  entity: node
+  unit: milliseconds
+  doc: >
+    95th-percentile gap between generated tokens on the newest STREAMED
+    response. The signal `tok_s` cannot provide: tok_s is a mean over a whole
+    response, and with MTP speculative decode the real distribution is bimodal
+    , near-zero inside an accepted draft batch, a full forward pass at the
+    boundary. Absent for non-streaming replies, which carry no per-token
+    arrival times at all.
+  resolver: inter_token_p95_ms
+  source_fields: ["gb_dataflux.tok_s_measured.p95_ms"]
+  source_tier: measured
+  direction: lower_is_better
+  owner: Gb-Synapse
+  never_use:
+    - field: tok_s
+      why: >
+        A mean read as a latency signal. A response that streams 200 tokens
+        in a fast burst and then stalls once for two seconds has a healthy
+        tok_s and a terrible p95, and the user feels the p95. The mean cannot
+        represent a bimodal distribution , which is exactly what speculative
+        decode produces.
+  aliases: [p95_latency, token_latency_p95, tail_latency]
+
+- name: slow_token_ratio
+  entity: node
+  unit: fraction_0_1
+  doc: >
+    Share of tokens whose inter-token gap exceeded twice that response's OWN
+    median gap. Relative on purpose: what counts as slow depends on the model,
+    the quant, and how much of the model is streaming over PCIe, so an
+    absolute millisecond threshold would be both wrong and a hardcoded
+    hardware value.
+  resolver: slow_token_ratio
+  source_fields: ["gb_dataflux.tok_s_measured.slow_token_ratio"]
+  source_tier: measured
+  direction: lower_is_better
+  threshold: {warn_at: 0.10}
+  owner: Gb-Synapse
+  never_use:
+    - field: max_ms
+      why: >
+        The single worst gap is one sample and says nothing about how often it
+        happens , a lone 3-second stall in a thousand tokens is a hiccup, not
+        a pattern. Use the ratio to decide whether the tail is worth chasing,
+        then max_ms to size it.
+  aliases: [tail_token_share, slow_tokens_pct]
+
+- name: kmod_load_stage
+  entity: host
+  unit: stage
+  doc: >
+    Where the RUNNING greenboost module was loaded from this boot ,
+    "initramfs" or "realroot". This is the field that separates a version
+    drift you can fix from one that returns on every reboot. MODULES=most
+    makes initramfs-tools bake greenboost.ko into the boot image, whose own
+    systemd-modules-load inserts it before switch-root; a reinstall rebuilds
+    /lib/modules and never touches that image. Anything inserted before
+    `initrd-switch-root.target` came from the initramfs. None when the journal
+    is unreadable or the boot has no switch-root marker.
+  resolver: kmod_load_stage
+  source_fields: []
+  source_tier: measured
+  direction: informational
+  owner: GB-Tiering
+  never_use:
+    - field: loaded
+      why: >
+        PRESENCE IS NOT IDENTITY. `GbSnapshot.loaded` (and the `lsmod | grep
+        greenboost` it stands in for) says a greenboost module is resident. It
+        says nothing about WHICH one, or where it came from. This is not a
+        theoretical distinction: greenboost_boot_guard.sh gated on exactly this
+        signal, so the guard that exists to self-heal a bad module reported
+        success while the box booted v3.2 for days with v3.4 installed
+        (2026-08-21). A hit on the string is the START of the check, never the
+        end of it , compare srcversion, and read this metric for the origin.
+  aliases: [module_load_stage, loaded_from_initramfs, kmod_origin]
+
+- name: t3_enabled
+  entity: pool
+  unit: boolean
+  doc: >
+    Whether Tier 3 actually OPENED its backing file this boot , not whether a
+    cap is configured. When the module loads before /var is mounted it logs
+    `T3 backing file unavailable (/var/lib/greenboost/t3_store): -2 - T3
+    disabled` and runs with T3 off, while every capacity readout keeps
+    reporting the configured 73 GB. The kernel log at module init is the only
+    place the open is reported, so that is what this reads. None when the
+    journal is unreadable , an unknown state is never a healthy state.
+  resolver: t3_enabled
+  source_fields: []
+  source_tier: measured
+  direction: higher_is_better
+  owner: GB-Tiering
+  never_use:
+    - field: t3_total_mb
+      why: >
+        The CONFIGURED cap (the module's nvme_swap_total_mb, set by the
+        t3_max_gb parameter), reported whether or not the backing file ever
+        opened. Measured 2026-08-21 on this box: t3_total_mb = 74752 while the
+        kernel log said "T3 disabled" and not one byte could reach T3. Reading
+        it as available capacity is how T3 stayed silently off across several
+        boots. Pair it with t3_enabled or don't read it.
+    - field: t3_used_mb
+      why: >
+        Zero is the reading you get BOTH when T3 is healthy and idle AND when
+        T3 never opened at all. It cannot distinguish the two, so it can never
+        confirm T3 is working.
+  aliases: [is_t3_on, tier3_enabled, t3_active, t3_open]
+
+- name: t3_capacity_configured_mb
+  entity: pool
+  unit: megabytes
+  doc: >
+    T3's configured cap, named for what it is so it cannot be mistaken for
+    available capacity. Always read alongside `t3_enabled`: this number is
+    identical whether T3 opened or failed open.
+  resolver: t3_capacity_configured_mb
+  source_fields: ["gb_monitor.GbSnapshot.t3_total_mb"]
+  source_tier: measured
+  direction: informational
+  owner: GB-Tiering
+  aliases: [t3_cap_mb, t3_configured_mb, t3_total_configured]
+
+- name: apparmor_profiles_contaminated
+  entity: host
+  unit: count
+  doc: >
+    Count of snapd-generated `snap-confine.snapd.*` profiles carrying
+    GreenBoost rules AFTER their final top-level closing brace. Such a rule is
+    at top level, where apparmor_parser expects `profile NAME {`: it grants
+    nothing AND makes the entire profile unparseable, which kills
+    snapd.apparmor.service and every snap with it (2026-07-27 , Firefox,
+    Chromium, snap-store, cups; reintroduced by gb_supervisor.py 2026-08-20).
+    Returns None when the directory is unreadable , an unknown state is never
+    a healthy state, least of all for security policy.
+  resolver: apparmor_profiles_contaminated
+  source_fields: []
+  source_tier: measured
+  direction: lower_is_better
+  threshold: {warn_at: 1, critical_at: 1}
+  owner: GB-Tiering
+  never_use:
+    - field: files_written
+      why: >
+        The apparmor_remediation event's own field says what a remediation
+        pass WROTE. It cannot tell you what is on disk now: snapd regenerates
+        these profiles on every snap refresh, and the contamination this metric
+        counts was appended by a different code path than the one that reports
+        files_written. Read the profiles, not the event.
+  aliases: [apparmor_broken_profiles, snapconfine_contaminated]
+
+- name: system_degraded
+  entity: host
+  unit: boolean
+  doc: >
+    systemd's own verdict , `systemctl is-system-running` != running , with
+    the failed-unit list carried as evidence so the answer names what broke
+    rather than just asserting degradation. None when systemctl cannot be
+    consulted.
+  resolver: system_degraded
+  source_fields: []
+  source_tier: measured
+  direction: lower_is_better
+  owner: GB-Tiering
+  aliases: [is_system_degraded, systemd_degraded, failed_units]
+
+- name: proton_tools_installed
+  entity: host
+  unit: count
+  doc: >
+    GreenBoost Proton compat tools visible to Steam in compatibilitytools.d.
+    More than one is legal (stable + experimental) and is also the
+    precondition for the 2026-08-21 race, where two of them started the same
+    appid two seconds apart into one wine prefix.
+  resolver: proton_tools_installed
+  source_fields: []
+  source_tier: measured
+  direction: informational
+  owner: GB-Gaming
+  aliases: [greenboost_proton_tools, compat_tools_installed]
+
+- name: game_launch_attempts
+  entity: host
+  unit: count
+  doc: >
+    GreenBoost Proton wrapper starts in the last 15 minutes, counted from
+    Steam's console log. One press of Launch should produce exactly one.
+    Repeated starts at a regular interval mean something is killing the game
+    and Steam is retrying , the 2026-08-21 shape was four starts about 62
+    seconds apart, which on screen was indistinguishable from a slow load.
+  resolver: game_launch_attempts
+  source_fields: []
+  source_tier: measured
+  direction: lower_is_better
+  threshold: {warn_at: 2, critical_at: 3}
+  owner: GB-Gaming
+  aliases: [launch_attempts, proton_wrapper_starts, relaunch_count]
+
+- name: game_process_running
+  entity: host
+  unit: boolean
+  doc: >
+    Whether a real game process is alive , wine/Proton processes with Proton's
+    own helpers excluded. This is the question a launch turns on and the one
+    Steam's "Launching" spinner does not answer: Steam reports that it
+    accepted the request, not that anything started.
+  resolver: game_process_running
+  source_fields: []
+  source_tier: measured
+  direction: informational
+  owner: GB-Gaming
+  never_use:
+    - field: gaming_mode
+      why: >
+        gaming_mode is a flag GreenBoost sets around a session, not evidence a
+        game is running. It has been observed stuck at 1 with nothing running
+        at all (that is what the gaming_mode_stuck segment exists for), so
+        reading it as "a game is up" inverts the exact failure it was written
+        to catch.
+  aliases: [is_game_running, wine_game_running, game_up]
+
+- name: shader_cache_mb
+  entity: game
+  unit: megabytes
+  doc: >
+    Fossilize shader pre-cache size for an appid (pass it as entity_id).
+    Near-zero on a title that has been played means the pre-cache never ran,
+    so the first session pays every pipeline compile in-frame. Fossilize
+    reports no progress of its own, so this is the only observable it leaves
+    , which is why "is it compiling shaders?" was unanswerable on 2026-08-21
+    (it was not: the cache was 108 KB because the game never started).
+  resolver: shader_cache_mb
+  source_fields: []
+  source_tier: measured
+  direction: higher_is_better
+  owner: GB-Gaming
+  aliases: [fossilize_cache_mb, shader_precache_mb, pipeline_cache_mb]
+
+- name: last_game_session_s
+  entity: game
+  unit: seconds
+  doc: >
+    Duration of the most recent COMPLETED game session, from the Proton
+    wrapper's own gaming_session events , the only record that survives the
+    game exiting. Carries peak/avg VRAM, peak T2, sample count and exit code
+    as evidence. Exists because counting launch attempts alone cries wolf: on
+    2026-08-21 six wrapper starts inside 29 seconds looked exactly like a
+    failed retry loop, and five of them were aborted, but the sixth ran the
+    game for 335 s and exited rc=0. A session that completed outranks the
+    noise before it. Pass an appid as entity_id to scope it to one game.
+  resolver: last_game_session_s
+  source_fields: []
+  source_tier: measured
+  direction: informational
+  owner: GB-Gaming
+  never_use:
+    - field: elapsed_s
+      why: >
+        The raw gaming_session field is written for EVERY wrapper invocation,
+        including the 2-9 second aborted ones the duplicate-compat-tool race
+        produces, and several carry appid "0" because no appid could be
+        resolved for a Proton helper process. Taking the newest elapsed_s
+        without filtering to a real stop event for the appid you care about
+        reports a 6-second abort as the play session.
+  aliases: [game_session_seconds, last_playtime_s, session_length]

@@ -43,6 +43,7 @@ import os
 import subprocess
 import time
 from dataclasses import dataclass, field
+import re as _re
 from pathlib import Path
 
 try:
@@ -460,6 +461,92 @@ def _res_t3_spill_active_mb(entity_id, window_s):
     return {"value": None, "unit": "megabytes", "raw_source": "unavailable"}
 
 
+#: Share of tokens in the slow tail above which the tail, not the average, is
+#: the thing to investigate. Dimensionless, so it carries across models and
+#: boxes , this is a shape threshold, not a hardware one.
+_TAIL_HEAVY_RATIO = 0.10
+
+
+def _res_inter_token_p95_ms(entity_id, window_s):
+    """95th-percentile gap between generated tokens, from the newest streamed
+    sample that actually carries one.
+
+    This is the signal `tok_s` cannot give: tok_s is a mean over a whole
+    response, and with MTP speculative decode the real distribution is bimodal
+    , near-zero inside an accepted draft batch, a full forward pass at the
+    boundary. A user feels the boundary.
+    """
+    ev = _latest_event_with_field("tok_s_measured", "p95_ms", max_age_s=window_s)
+    if ev is None:
+        return {"value": None, "unit": "milliseconds",
+                "raw_source": "no tok_s_measured event carrying 'p95_ms' yet "
+                              "(non-streaming replies never carry one)"}
+    return {"value": ev.get("p95_ms"), "unit": "milliseconds",
+            "raw_source": "dataflux.tok_s_measured.p95_ms"}
+
+
+def _res_slow_token_ratio(entity_id, window_s):
+    """Share of tokens whose gap exceeded twice that response's median gap.
+
+    Relative to the response's own median on purpose: what counts as slow
+    depends on model, quant and how much of the model is streaming over PCIe.
+    """
+    ev = _latest_event_with_field("tok_s_measured", "slow_token_ratio",
+                                  max_age_s=window_s)
+    if ev is None:
+        return {"value": None, "unit": "fraction_0_1",
+                "raw_source": "no tok_s_measured event carrying "
+                              "'slow_token_ratio' yet"}
+    return {"value": ev.get("slow_token_ratio"), "unit": "fraction_0_1",
+            "raw_source": "dataflux.tok_s_measured.slow_token_ratio"}
+
+
+def _res_gaming_mode_active(entity_id, window_s):
+    """greenboost.ko's `gaming_mode` flag, read live.
+
+    This is the flag that parks inference T2 buffers at the LRU tail. It is
+    SET by the Proton wrapper at launch and cleared at exit , so a session
+    that died hard leaves it at 1 with no game running, and every inference
+    allocation after that quietly loses its place in the queue. Nothing used
+    to report that state; this metric is what makes it visible.
+    """
+    try:
+        import gb_monitor
+        snap = gb_monitor.snapshot(probe_gpu=False)
+        if snap.loaded:
+            return {"value": bool(snap.gaming_mode), "unit": "bool",
+                    "raw_source": "gb_monitor.GbSnapshot.gaming_mode"}
+    except Exception:
+        pass
+    # Kernel module not loaded / not readable through the ioctl , the sysfs
+    # parameter is the same value by another door.
+    try:
+        with open("/sys/module/greenboost/parameters/gaming_mode") as fh:
+            return {"value": fh.read().strip() not in ("0", "N", ""), "unit": "bool",
+                    "raw_source": "/sys/module/greenboost/parameters/gaming_mode"}
+    except OSError:
+        pass
+    return {"value": None, "unit": "bool",
+            "raw_source": "unavailable , greenboost.ko not loaded"}
+
+
+def _res_gaming_session_orphans(entity_id, window_s):
+    """Processes that survived BOTH signals on the last stop request.
+
+    `orphans` is emitted only on `action="terminated"` events, so this must
+    search for the newest event that actually carries the field , taking the
+    newest gaming_session event of any action would let one ordinary `start`
+    hide every real teardown result (the exact shape of the 2026-08-18
+    ttft_ms defect).
+    """
+    ev = _latest_event_with_field("gaming_session", "orphans", max_age_s=window_s, days=7.0)
+    if ev is None:
+        return {"value": None, "unit": "count",
+                "raw_source": "no gaming_session event carrying 'orphans' yet"}
+    return {"value": ev.get("orphans"), "unit": "count",
+            "raw_source": "dataflux.gaming_session.orphans"}
+
+
 def _res_kv_resident_share(entity_id, window_s):
     ev = _latest_event("snapshot", node=entity_id or "host", max_age_s=window_s or 30.0)
     if not ev:
@@ -839,6 +926,168 @@ def _res_agent_compaction_prefix_kept_pct(entity_id, window_s):
                if e.get("extended_prior") is True or (e.get("head_kept") or 0) > 0)
     return {"value": round(100.0 * kept / len(ev), 1), "unit": "percent",
             "raw_source": f"agent_context_edit over {len(ev)} compaction(s)"}
+
+
+def _res_kv_t2_resident_mb(entity_id, window_s):
+    """KV bytes living in T2 right now , the only field that says whether
+    lookahead KV prefetch has anything to prefetch.
+
+    Read from the shim's `kv_t2_live_mb`. Until 2026-08-20 that counter was
+    published only when GREENBOOST_KV_PREFETCH was already armed, so answering
+    "is there KV in T2?" required turning on the feature the answer was meant
+    to justify , and a reader seeing `kv_prefetch_t2_kv_mb=0` could not tell
+    "no KV in T2" from "nobody measured". It is now written unconditionally.
+
+    An older shim that predates that change returns None here, with the reason
+    named, rather than a zero that would read as a clean bill of health.
+    """
+    fields, reason = _shim_stats()
+    if fields is None:
+        return {"value": None, "unit": "megabytes", "raw_source": reason}
+    raw = fields
+    if "kv_t2_live_mb" not in raw:
+        return {"value": None, "unit": "megabytes",
+                "raw_source": "this shim build does not publish kv_t2_live_mb "
+                              "(added 2026-08-20) , rebuild and reinstall the "
+                              "shim, or read kv_prefetch_t2_kv_mb with "
+                              "GREENBOOST_KV_PREFETCH=stats armed"}
+    try:
+        return {"value": float(raw["kv_t2_live_mb"]), "unit": "megabytes",
+                "raw_source": "shim_stats.kv_t2_live_mb"}
+    except (TypeError, ValueError):
+        return {"value": None, "unit": "megabytes",
+                "raw_source": "shim_stats.kv_t2_live_mb was unparseable"}
+
+
+def _res_kv_prefetch_opportunities(entity_id, window_s):
+    """Ticks where the shim saw T2-resident KV AND room in the T1 reserve.
+
+    Zero with the counter armed is a real, useful answer: it means the
+    prefetch branch has no work on this workload. Null means the counter is
+    not armed (GREENBOOST_KV_PREFETCH unset), which is the default , and the
+    two must not be confused, because one closes the investigation and the
+    other has not started it.
+    """
+    fields, reason = _shim_stats()
+    if fields is None:
+        return {"value": None, "unit": "count", "raw_source": reason}
+    raw = fields
+    mode = str(raw.get("kv_prefetch_mode", "0"))
+    if mode in ("", "0"):
+        return {"value": None, "unit": "count",
+                "raw_source": "GREENBOOST_KV_PREFETCH is unset, so the shim's "
+                              "opportunity counter never ticks , serve with "
+                              "GREENBOOST_KV_PREFETCH=stats (measures only, "
+                              "moves no bytes) to populate it"}
+    try:
+        return {"value": int(raw.get("kv_prefetch_opportunities") or 0),
+                "unit": "count",
+                "raw_source": f"shim_stats.kv_prefetch_opportunities "
+                              f"(mode={mode}, ticks="
+                              f"{raw.get('kv_prefetch_ticks')})"}
+    except (TypeError, ValueError):
+        return {"value": None, "unit": "count",
+                "raw_source": "shim_stats.kv_prefetch_opportunities unparseable"}
+
+
+def _res_draft_accept_pct(entity_id, window_s):
+    """Share of speculatively-drafted tokens the target model accepted.
+
+    The engine reports `draft_n` / `draft_n_accepted` on every response that
+    drafted anything, so this is measured, not modelled. It is the state the
+    2026-08-05 depth sweep was missing: that sweep found the tok/s curve is
+    non-monotonic in depth (2:5.15, 3:5.58, 4:6.50, 6:4.40, 8:5.76), which is
+    what it looks like when the right depth depends on something nobody is
+    reading.
+
+    Depth 0 is excluded rather than counted: with nothing drafted, nothing can
+    be rejected, and the engine duly reports 100% , which reads as "drafting is
+    working perfectly" when the truth is "drafting is off".
+    """
+    ev = [e for e in _agent_events("tok_s_measured", window_s)
+          if (e.get("draft_n") or 0) > 0]
+    if not ev:
+        return {"value": None, "unit": "percent",
+                "raw_source": "no tok_s_measured event carried draft_n , "
+                              "either nothing was drafted (depth 0 / no MTP "
+                              "head) or the proxy has not seen a response yet"}
+    drafted = sum(int(e.get("draft_n") or 0) for e in ev)
+    accepted = sum(int(e.get("draft_n_accepted") or 0) for e in ev)
+    if not drafted:
+        return {"value": None, "unit": "percent",
+                "raw_source": "draft_n present but zero across the window"}
+    return {"value": round(100.0 * accepted / drafted, 1), "unit": "percent",
+            "raw_source": f"tok_s_measured.draft_n_accepted/draft_n over "
+                          f"{len(ev)} response(s)"}
+
+
+def _res_tuner_harvesting(entity_id, window_s):
+    """Whether the control loop is currently holding a lever back.
+
+    True means a harvest is in effect: something (today, the GPU power limit)
+    has been given back because decode is bandwidth-bound and holding it buys
+    no throughput. It is a state, not a fault , the fault would be sitting at
+    full board power waiting on PCIe, which is what this box did before the
+    loop existed.
+    """
+    ev = _agent_events("tuner_decision", window_s)
+    if not ev:
+        return {"value": None, "unit": "boolean",
+                "raw_source": "no tuner_decision events yet , run tuner_tick"}
+    last_move = next((e for e in reversed(ev)
+                      if e.get("action") in ("harvest", "restore")), None)
+    if last_move is None:
+        return {"value": False, "unit": "boolean",
+                "raw_source": f"tuner_decision over {len(ev)} tick(s), none "
+                              f"moved a lever"}
+    return {"value": last_move.get("action") == "harvest"
+                     and bool(last_move.get("applied")),
+            "unit": "boolean",
+            "raw_source": f"latest tuner_decision action="
+                          f"{last_move.get('action')} applied="
+                          f"{last_move.get('applied')}"}
+
+
+def _res_ctx_estimate_error_pct(entity_id, window_s):
+    """How far the CLI's token estimate sits from the server's own count.
+
+    Signed, and the sign is the whole point: a NEGATIVE value means the client
+    predicted fewer tokens than the server charged, which is the dangerous
+    direction , it reports headroom that is not there and lets a turn walk into
+    a 400. Live 2026-08-20: a compaction retry was fired at 24654 tokens
+    against a 24576-token window and the operator got the raw error.
+    """
+    ev = [e for e in _agent_events("agent_context_edit", window_s)
+          if e.get("op") == "calibrate" and e.get("estimate_error_pct") is not None]
+    if not ev:
+        return {"value": None, "unit": "percent",
+                "raw_source": "no agent_context_edit op=calibrate events yet "
+                              "(the CLI has not completed a turn against a "
+                              "server that reported usage.prompt_tokens)"}
+    vals = sorted(float(e["estimate_error_pct"]) for e in ev)
+    med = vals[len(vals) // 2]
+    return {"value": round(med, 2), "unit": "percent",
+            "raw_source": f"agent_context_edit op=calibrate, median of "
+                          f"{len(vals)} sample(s)"}
+
+
+def _res_ctx_hard_trims(entity_id, window_s):
+    """Times the last-resort context eviction had to run.
+
+    Every one of these is a turn that compaction alone could not save, because
+    the bytes that did not fit were in the live tail. Nonzero is not a failure
+    , the trim is what kept the turn alive , but a rising count means the
+    served window is too small for how this session actually works.
+    """
+    ev = [e for e in _agent_events("agent_context_edit", window_s)
+          if e.get("op") == "hard_trim"]
+    if not ev:
+        return {"value": 0, "unit": "count",
+                "raw_source": "no agent_context_edit op=hard_trim events in window"}
+    unmet = sum(1 for e in ev if e.get("met") is False)
+    return {"value": len(ev), "unit": "count",
+            "raw_source": f"agent_context_edit op=hard_trim, {unmet} of "
+                          f"{len(ev)} could not reach the budget"}
 
 
 def _res_agent_memory_recall_chars(entity_id, window_s):
@@ -1285,6 +1534,476 @@ def _res_kmod_loaded_version(entity_id, window_s):
                 "error": str(e)}
 
 
+def _journal_this_boot(grep: str, limit: int = 4000) -> "list[tuple[float, str]]":
+    """(unix_ts, message) pairs from the CURRENT boot matching `grep`.
+
+    Read-only, no root: journalctl is readable by members of systemd-journal
+    and by the owner for their own boot. Returns [] on any failure , a caller
+    that cannot read the journal must report "cannot tell", never "fine".
+    """
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["journalctl", "-b", "-o", "short-unix", "--no-pager", "-g", grep],
+            capture_output=True, text=True, timeout=15)
+    except Exception:
+        return []
+    if out.returncode != 0 or not out.stdout:
+        return []
+    rows = []
+    for line in out.stdout.splitlines()[:limit]:
+        head, _, rest = line.partition(" ")
+        try:
+            rows.append((float(head), rest))
+        except ValueError:
+            continue
+    return rows
+
+
+def _greenboost_load_blocks() -> "list[tuple[float, list[tuple[float, str]]]]":
+    """This boot's greenboost module loads, newest last.
+
+    Each module init prints exactly one `GreenBoost vX.Y - CUDA Memory ...`
+    banner, so that line delimits one load. Returns
+    [(banner_ts, [(ts, msg), ...]), ...] where the list is every greenboost
+    kernel line belonging to that load.
+
+    Why this exists: a boot can contain SEVERAL loads. This box booted v3.2
+    out of the initramfs at 01:29 and was reloaded to v3.4 at 02:56. A
+    resolver that reads the FIRST greenboost line of the boot answers a
+    question about a module that is no longer running , which is a stale
+    verdict presented as a current one, the exact failure this layer exists to
+    prevent. Anything asking "what is true NOW" must read the LAST block.
+    """
+    rows = _journal_this_boot("greenboost: ")
+    blocks: list = []
+    for ts, msg in rows:
+        if "GreenBoost v" in msg and "CUDA Memory" in msg:
+            blocks.append((ts, []))
+        if blocks:
+            blocks[-1][1].append((ts, msg))
+    return blocks
+
+
+def _res_kmod_load_stage(entity_id, window_s):
+    """WHERE the running greenboost module was loaded from: the initramfs, or
+    the real root.
+
+    This is the field that distinguishes a drift you can fix from one that
+    comes back every boot. `initramfs.conf`'s MODULES=most makes
+    initramfs-tools copy greenboost.ko into the boot image, and the initrd's
+    own systemd-modules-load inserts it before switch-root. A reinstall
+    rebuilds /lib/modules and never touches that image, so the machine keeps
+    loading the frozen copy , `sudo greenboost load` fixes it until the next
+    reboot and no further (incident 2026-08-21: v3.2 across several reboots
+    while v3.4 was installed).
+
+    Anything inserted BEFORE `initrd-switch-root.target` came from the
+    initramfs. That marker is used rather than local-fs.target because there
+    are two local-fs.targets per boot , one per systemd instance , and the
+    initrd's own fires first, which would read as "real root" and invert the
+    verdict.
+
+    Returns None when the journal cannot be read or the boot has no switch-root
+    marker (a system booted without an initrd at all). Unknown is not "fine".
+    """
+    if not Path("/sys/module/greenboost").exists():
+        return {"value": None, "unit": "stage",
+                "raw_source": "module not loaded , nothing to attribute"}
+    blocks = _greenboost_load_blocks()
+    if not blocks:
+        return {"value": None, "unit": "stage",
+                "raw_source": "journalctl returned no greenboost init banner for this boot"}
+    sw = _journal_this_boot("Reached target initrd-switch-root.target|Switching root")
+    if not sw:
+        return {"value": None, "unit": "stage",
+                "raw_source": "no switch-root marker this boot , cannot place the load "
+                              "relative to the initrd (system may have booted without one)"}
+    # LAST block: the module running right now, not the one the boot started with.
+    load_ts, switch_ts = blocks[-1][0], sw[0][0]
+    stage = "initramfs" if load_ts < switch_ts else "realroot"
+    out = {"value": stage, "unit": "stage",
+           "raw_source": f"journalctl -b: current load@{load_ts:.3f} vs switch-root@{switch_ts:.3f}",
+           "loads_this_boot": len(blocks)}
+    if len(blocks) > 1:
+        out["note"] = (f"{len(blocks)} loads this boot; this is the newest. The "
+                       f"first was at {blocks[0][0]:.3f} "
+                       f"({'initramfs' if blocks[0][0] < switch_ts else 'realroot'}).")
+    return out
+
+
+# ── Gaming Suite: the launch path ──────────────────────────────────────────
+#
+# Added 2026-08-21 after a launch failure that the governed layer could say
+# nothing at all about. Coverage was three metrics, none of them about
+# launching, so "why will this game not start" was answerable only by reading
+# the Steam console log by hand , which is what this layer exists to replace.
+#
+# Everything below is derived from files on disk (the wrapper's own logs,
+# Steam's console log, compatibilitytools.d, the shader cache). No new
+# plumbing, and nothing that requires the Suite to be running.
+
+def _steam_root() -> "Path | None":
+    from pathlib import Path as _P
+    import os
+    home = _P(os.path.expanduser("~"))
+    for r in (home / ".local/share/Steam", home / ".steam/steam", home / ".steam/root",
+              home / ".var/app/com.valvesoftware.Steam/data/Steam"):
+        if r.is_dir():
+            return r
+    return None
+
+
+def _steam_console_tail(max_lines: int = 6000) -> "list[str]":
+    r = _steam_root()
+    if r is None:
+        return []
+    for cand in (r / "logs/console-linux.txt", _P_home_logs()):
+        try:
+            if cand and cand.is_file():
+                return cand.read_text(errors="replace").splitlines()[-max_lines:]
+        except OSError:
+            continue
+    return []
+
+
+def _P_home_logs():
+    from pathlib import Path as _P
+    import os
+    p = _P(os.path.expanduser("~/.steam/steam/logs/console-linux.txt"))
+    return p if p.is_file() else None
+
+
+_GB_TOOL_RE = _re.compile(r"compatibilitytools\.d/(greenboost-proton[a-z-]*)")
+_TS_RE = _re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
+
+
+def _launch_runs(window_s: float = 900.0) -> "list[tuple[float, str]]":
+    """(epoch, tool_name) for each GreenBoost Proton wrapper start recently.
+
+    One "Delegating to:" line per wrapper invocation, and the pre-flight line
+    just above it names which compatibilitytools.d entry is running. Both come
+    from Steam's console log, which is the only place with timestamps.
+    """
+    import time, datetime as _dt
+    cutoff = time.time() - window_s
+    # The tool path appears in the pre-flight line, which the wrapper writes
+    # AFTER "Delegating to:", not before , so a run is opened on the
+    # Delegating line and named by the next tool path that follows it.
+    runs: list = []
+    for ln in _steam_console_tail():
+        if "[greenboost-proton] Delegating to:" in ln:
+            mt = _TS_RE.match(ln)
+            if not mt:
+                continue
+            try:
+                ts = _dt.datetime.strptime(mt.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
+            except ValueError:
+                continue
+            runs.append([ts, None])
+            continue
+        m = _GB_TOOL_RE.search(ln)
+        if m and runs and runs[-1][1] is None:
+            runs[-1][1] = m.group(1)
+    return [(ts, tool or "unknown") for ts, tool in runs if ts >= cutoff]
+
+
+def _res_proton_tools_installed(entity_id, window_s):
+    """How many GreenBoost Proton compat tools Steam can see.
+
+    More than one is legal and useful (stable + experimental), and is also the
+    precondition for the 2026-08-21 race: two of them started the SAME appid
+    two seconds apart, into one wine prefix.
+    """
+    r = _steam_root()
+    if r is None:
+        return {"value": None, "unit": "count", "raw_source": "no Steam root found"}
+    d = r / "compatibilitytools.d"
+    if not d.is_dir():
+        return {"value": 0, "unit": "count", "details": {"tools": []},
+                "raw_source": f"{d} absent"}
+    tools = sorted(e.name for e in d.iterdir()
+                   if e.is_dir() and e.name.startswith("greenboost-proton"))
+    return {"value": len(tools), "unit": "count", "details": {"tools": tools},
+            "raw_source": str(d)}
+
+
+def _res_game_launch_attempts(entity_id, window_s):
+    """GreenBoost Proton wrapper starts in the last 15 minutes.
+
+    One press of Launch should produce one. Repeated starts at a regular
+    interval mean something is killing the game and Steam is retrying , the
+    2026-08-21 shape was four starts about 62 s apart.
+    """
+    runs = _launch_runs(window_s or 900.0)
+    return {"value": len(runs), "unit": "count",
+            "details": {"tools": sorted({t for _, t in runs}),
+                        "first_ts": runs[0][0] if runs else None,
+                        "last_ts": runs[-1][0] if runs else None},
+            "raw_source": "Steam console log , '[greenboost-proton] Delegating to:' lines"}
+
+
+def _res_game_process_running(entity_id, window_s):
+    """Is a wine/Proton game process actually alive right now.
+
+    The question every launch failure turns on, and the one Steam's own
+    "Launching" spinner does not answer: Steam reports that it accepted the
+    request, not that anything started.
+    """
+    from pathlib import Path as _P
+    try:
+        names = []
+        for pd in _P("/proc").iterdir():
+            if not pd.name.isdigit():
+                continue
+            try:
+                comm = (pd / "comm").read_text().strip()
+            except OSError:
+                continue
+            if not (comm in ("wine64-preloader", "wine-preloader", "wineserver")
+                    or comm.endswith(".exe")):
+                continue
+            # comm.endswith(".exe") is NOT sufficient, and the difference is
+            # not academic: it matched an unrelated host binary named
+            # `claude.exe` on 2026-08-21 and reported it as a running game.
+            # Only processes wine actually started carry WINEPREFIX /
+            # STEAM_COMPAT_DATA_PATH, so the environment is the real test.
+            try:
+                env = (pd / "environ").read_bytes()
+            except OSError:
+                continue
+            if b"WINEPREFIX=" not in env and b"STEAM_COMPAT_DATA_PATH=" not in env:
+                continue
+            names.append(comm)
+    except OSError as e:
+        return {"value": None, "unit": "boolean", "raw_source": "/proc unreadable",
+                "error": str(e)}
+    # Proton's own furniture. Every one of these starts for ANY launch,
+    # successful or not , `steam.exe` is Proton's Steamworks shim and
+    # `wineserver` is the prefix's own daemon, so both are present for a
+    # launch that produced no game at all. Counting them as "the game is
+    # running" is precisely the misread this metric exists to prevent
+    # (observed 2026-08-21: a 13-minute session whose entire process list was
+    # this set, with the GPU at 0%).
+    _WINE_INFRA = {
+        "explorer.exe", "services.exe", "winedevice.exe", "plugplay.exe",
+        "rpcss.exe", "svchost.exe", "conhost.exe", "tabtip.exe",
+        "wineboot.exe", "start.exe", "steam.exe", "wineserver",
+        "wine64-preloader", "wine-preloader", "winemenubuilder.exe",
+        "wineconsole.exe", "cmd.exe", "iexplore.exe",
+    }
+    real = [n for n in names if n not in _WINE_INFRA]
+    return {"value": bool(real), "unit": "boolean",
+            "details": {"processes": sorted(set(real))[:8],
+                        "wine_infrastructure_only": bool(names) and not real},
+            "raw_source": "/proc/*/comm , wine processes, Proton's own helpers excluded"}
+
+
+def _res_last_game_session_s(entity_id, window_s):
+    """Duration of the most recent COMPLETED game session, in seconds.
+
+    Read from the Proton wrapper's own `gaming_session` events, which are the
+    only record that survives the game exiting. The wrapper writes them
+    directly to ~/.local/share/greenboost/dataflux.jsonl when gb_dataflux is
+    not importable from inside the Steam sandbox, which is the normal case.
+
+    Exists because launch-attempt counting alone cries wolf. On 2026-08-21 six
+    wrapper starts inside 29 s looked exactly like a failed retry loop, and
+    five of them WERE aborted , but the sixth ran the game for 335 s and
+    exited cleanly. A session that completed is the evidence that outranks the
+    noise before it.
+    """
+    import json, os
+    f = os.path.expanduser("~/.local/share/greenboost/dataflux.jsonl")
+    best = None
+    try:
+        with open(f, errors="replace") as fh:
+            try:
+                fh.seek(max(0, os.path.getsize(f) - 2_000_000))
+            except OSError:
+                pass
+            for line in fh:
+                line = line.strip()
+                if not line or '"gaming_session"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("kind") != "gaming_session" or d.get("action") != "stop":
+                    continue
+                if entity_id and str(d.get("appid")) != str(entity_id):
+                    continue
+                ts = d.get("ts") or 0
+                if best is None or ts > best.get("ts", 0):
+                    best = d
+    except OSError as e:
+        return {"value": None, "unit": "seconds", "raw_source": "wrapper dataflux unreadable",
+                "error": str(e)}
+    if best is None:
+        return {"value": None, "unit": "seconds",
+                "raw_source": "no gaming_session stop event recorded"}
+    return {"value": round(float(best.get("elapsed_s") or 0.0), 1), "unit": "seconds",
+            "details": {"appid": best.get("appid"),
+                        "peak_vram_mb": best.get("peak_vram_mb"),
+                        "avg_vram_mb": best.get("avg_vram_mb"),
+                        "peak_t2_mb": best.get("peak_t2_mb"),
+                        "vram_samples": best.get("vram_samples"),
+                        "rc": best.get("rc"),
+                        "ended_ts": best.get("ts")},
+            "raw_source": "wrapper gaming_session events (~/.local/share/greenboost/dataflux.jsonl)"}
+
+
+def _res_shader_cache_mb(entity_id, window_s):
+    """Fossilize shader cache size for an appid (entity_id), in MB.
+
+    Near-zero on a title that has been played means the pre-cache never ran,
+    so the first session pays every pipeline compile in-frame. Fossilize
+    reports no progress of its own , this is the only observable it leaves.
+    """
+    r = _steam_root()
+    if r is None or not entity_id:
+        return {"value": None, "unit": "megabytes",
+                "raw_source": "need an appid as entity_id, and a Steam root"}
+    d = r / "steamapps/shadercache" / str(entity_id)
+    if not d.is_dir():
+        return {"value": 0.0, "unit": "megabytes",
+                "raw_source": f"{d} absent , nothing pre-cached for this appid"}
+    total = 0
+    for f in d.rglob("*"):
+        try:
+            if f.is_file():
+                total += f.stat().st_size
+        except OSError:
+            pass
+    return {"value": round(total / (1024 * 1024), 2), "unit": "megabytes",
+            "raw_source": str(d)}
+
+
+def _res_apparmor_profiles_contaminated(entity_id, window_s):
+    """snapd-generated profiles carrying GreenBoost rules AFTER their final
+    top-level closing brace.
+
+    Counting is the whole point, and so is the direction of the reading. A rule
+    past the closing brace is at top level, where apparmor_parser expects
+    `profile NAME {`; it grants nothing AND makes the entire profile
+    unparseable, which takes `snapd.apparmor.service` down and every snap with
+    it (2026-07-27: Firefox, Chromium, snap-store, cups; reintroduced by
+    gb_supervisor.py on 2026-08-20).
+
+    Returns None when the directory cannot be read , an unknown state is never
+    a healthy state, and this is a security-policy question.
+    """
+    from pathlib import Path as _P
+    d = _P("/var/lib/snapd/apparmor/profiles")
+    if not d.is_dir():
+        return {"value": None, "unit": "count",
+                "raw_source": f"{d} absent , snapd may not be installed"}
+    bad = []
+    try:
+        for f in sorted(d.glob("snap-confine.snapd.*")):
+            try:
+                lines = f.read_text().splitlines()
+            except OSError:
+                return {"value": None, "unit": "count",
+                        "raw_source": f"{f} unreadable (needs root?) , cannot tell"}
+            last_close = max((i for i, ln in enumerate(lines) if ln.startswith("}")),
+                             default=None)
+            if last_close is None:
+                continue
+            if any("libgreenboost_audit" in ln for ln in lines[last_close + 1:]):
+                bad.append(f.name)
+    except OSError as e:
+        return {"value": None, "unit": "count", "raw_source": f"{d} unreadable",
+                "error": str(e)}
+    return {"value": len(bad), "unit": "count", "profiles": bad,
+            "raw_source": f"{d}/snap-confine.snapd.* , rules after the final top-level '}}'"}
+
+
+def _res_system_degraded(entity_id, window_s):
+    """systemd's own verdict, with the failed units as evidence."""
+    import subprocess as _sp
+    try:
+        r = _sp.run(["systemctl", "is-system-running"], capture_output=True,
+                    text=True, timeout=10)
+        state = (r.stdout or "").strip()
+    except Exception as e:
+        return {"value": None, "unit": "boolean",
+                "raw_source": "systemctl is-system-running unavailable", "error": str(e)}
+    if not state:
+        return {"value": None, "unit": "boolean",
+                "raw_source": "systemctl is-system-running returned nothing"}
+    failed = []
+    try:
+        r2 = _sp.run(["systemctl", "--failed", "--no-legend", "--no-pager", "--plain"],
+                     capture_output=True, text=True, timeout=10)
+        failed = [ln.split()[0] for ln in (r2.stdout or "").splitlines() if ln.strip()]
+    except Exception:
+        pass
+    return {"value": state != "running", "unit": "boolean", "state": state,
+            "failed_units": failed,
+            "raw_source": f"systemctl is-system-running -> {state}"}
+
+
+def _res_t3_capacity_configured_mb(entity_id, window_s):
+    """T3's CONFIGURED cap , named for what it is, so it can never be read as
+    available capacity.
+
+    `GbSnapshot.t3_total_mb` is the module's `nvme_swap_total_mb`, which
+    reports the cap set by the `t3_max_gb` module parameter whether or not the
+    backing file ever opened. On 2026-08-21 this box reported 74752 MB with T3
+    disabled. Pair every read of this with `t3_enabled`.
+    """
+    try:
+        import gb_monitor
+        snap = gb_monitor.snapshot(probe_gpu=False)
+        if snap.loaded:
+            return {"value": snap.t3_total_mb, "unit": "megabytes",
+                    "raw_source": "gb_monitor.GbSnapshot.t3_total_mb (CONFIGURED cap)"}
+    except Exception as e:
+        return {"value": None, "unit": "megabytes", "raw_source": "unavailable", "error": str(e)}
+    return {"value": None, "unit": "megabytes", "raw_source": "kernel module not loaded"}
+
+
+def _res_t3_enabled(entity_id, window_s):
+    """Whether Tier 3 actually OPENED its backing file , not whether one is
+    configured.
+
+    The two are routinely different and only one of them is visible in the
+    obvious place. When the module loads before /var is mounted it logs
+    `T3 backing file unavailable (...): -2 - T3 disabled` and runs with T3
+    off, while `/sys/class/greenboost/greenboost/status` still prints
+    `Tier 3  T3 backing file : 73 GB NVMe file [GreenBoost-managed,
+    pre-allocated]` and `GbSnapshot.t3_total_mb` still reports 74752. Both are
+    reporting the CONFIGURED cap. Reading either as capacity is how T3 stayed
+    silently off for days (incident 2026-08-21).
+
+    The kernel log is the only place the open is actually reported, so that is
+    what this reads. None when the journal is unreadable.
+    """
+    if not Path("/sys/module/greenboost").exists():
+        return {"value": None, "unit": "boolean",
+                "raw_source": "module not loaded , T3 cannot be open"}
+    blocks = _greenboost_load_blocks()
+    if not blocks:
+        return {"value": None, "unit": "boolean",
+                "raw_source": "journalctl returned no greenboost init banner for this boot"}
+    # Only the CURRENT load's lines. A "T3 disabled" from an earlier load that
+    # has since been replaced is history, not state , reporting it as state is
+    # how a fixed problem keeps being reported as broken.
+    current = blocks[-1][1]
+    t3_lines = [m for _, m in current if "T3" in m]
+    for msg in t3_lines:
+        if "T3 disabled" in msg or "T3 backing file unavailable" in msg:
+            return {"value": False, "unit": "boolean",
+                    "raw_source": f"kernel log (current load): {msg.split('greenboost: ')[-1][:120]}"}
+    if not t3_lines:
+        return {"value": None, "unit": "boolean",
+                "raw_source": "current load logged no T3 line at all , cannot tell"}
+    return {"value": True, "unit": "boolean",
+            "raw_source": f"kernel log (current load): {t3_lines[0].split('greenboost: ')[-1][:120]}"}
+
+
 def _res_core_build_version(entity_id, window_s):
     """Installed release, from the stamp the installer writes."""
     bi = Path("/etc/greenboost/build_info")
@@ -1547,6 +2266,16 @@ def resolve(metric_name: str, entity_id: "str | None" = None,
         },
         "never_use": [n["field"] for n in metric.never_use],
     }
+    # Optional evidence a resolver wants to carry with the number.
+    #
+    # resolve() returns a fixed schema on purpose, and everything not in it was
+    # silently dropped , which meant a resolver could compute exactly the
+    # detail a segment needed (which Proton tools fired, which processes are
+    # alive) and have it discarded on the way out, leaving the segment to
+    # report "cannot tell". Anything under `details` is passthrough: it is the
+    # resolver's own structured evidence, never a second place to put `value`.
+    if raw.get("details") is not None:
+        out["details"] = raw["details"]
     if "error" in raw:
         out["error"] = raw["error"]
     return out
@@ -1575,6 +2304,77 @@ def discover(query: str, k: int = 5) -> list[dict]:
 
 
 # ── segment evaluators , canonical filters, each {matched, evidence} ────────
+
+def _seg_decode_tail_heavy():
+    """Decode is dominated by a slow tail rather than a slow average.
+
+    Matters because the two have different fixes. A uniformly slow decode is a
+    bandwidth or placement problem; a heavy tail with a fast median is a
+    stall , a draft batch boundary, a slot eviction, or something else on the
+    box competing. Reading the mean alone cannot tell them apart, which is why
+    this segment exists.
+    """
+    p95 = resolve("inter_token_p95_ms")
+    ratio = resolve("slow_token_ratio")
+    if p95.get("value") is None or ratio.get("value") is None:
+        return None, [{"why": p95.get("raw_source") or ratio.get("raw_source")}]
+    # A tail is "heavy" when a meaningful share of tokens sit in it. One
+    # outlier in a hundred is a hiccup, not a pattern.
+    matched = ratio["value"] >= _TAIL_HEAVY_RATIO
+    return matched, [{"inter_token_p95_ms": p95["value"],
+                      "slow_token_ratio": ratio["value"],
+                      "threshold": _TAIL_HEAVY_RATIO}]
+
+
+def _wine_game_running() -> "bool | None":
+    """Is a Wine/Proton game process alive right now?
+
+    Deliberately a presence test over /proc, not a PID: the Suite's own
+    `find_game_pid` returns ONE pid, which is not the tree and must never be
+    read as one. None means /proc could not be read at all.
+    """
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return None
+    for name in entries:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/comm") as fh:
+                comm = fh.read().strip()
+        except OSError:
+            continue
+        if comm.startswith("wine") and "preloader" in comm:
+            return True
+    return False
+
+
+def _seg_gaming_mode_stuck():
+    """gaming_mode left at 1 with no game running.
+
+    Costs real throughput and nothing else reports it: while this is true,
+    every inference T2 buffer is parked at the eviction queue's tail, so
+    weights get evicted ahead of gaming buffers that no longer exist.
+    Clears itself on the next clean game exit; `greenboost gaming-mode off`
+    fixes it now.
+    """
+    mode = resolve("gaming_mode_active")
+    active = mode.get("value")
+    if active is None:
+        # Cannot read the flag , say so. A clean bill of health inferred
+        # from absent data is the failure mode this layer exists to prevent.
+        return None, [{"gaming_mode_active": None, "why": mode.get("raw_source")}]
+    running = _wine_game_running()
+    if active and running is None:
+        return None, [{"gaming_mode_active": True,
+                       "why": "/proc unreadable , cannot tell if a game is running"}]
+    matched = bool(active) and running is False
+    orphans = resolve("gaming_session_orphans")
+    return matched, [{"gaming_mode_active": bool(active),
+                      "wine_game_running": running,
+                      "last_stop_orphans": orphans.get("value")}]
+
 
 def _seg_rule1_underfilled():
     vram = resolve("vram_fill_pct")
@@ -1718,6 +2518,82 @@ def _seg_agent_compaction_broke_prefix(entity_id=None, window_s=None):
     if v is None:
         return None, [kept]
     return v < 100.0, [kept]
+
+
+def _seg_kv_prefetch_has_no_target(entity_id=None, window_s=None):
+    """There is no T2-resident KV to prefetch.
+
+    The gate on the whole lookahead-KV-prefetch branch. Measured on this box
+    2026-08-20 while serving the reference model at ctx 24576: KV sat entirely
+    in T1 (427 MB tracked) and the 6687 MB in T2 was all weights , a prefetch
+    mechanism there would move zero bytes. True is a legitimate, branch-ending
+    answer, not a failure.
+
+    Null when the shim is not reporting: "nobody measured" must stay
+    distinguishable from "measured, and there is nothing there".
+    """
+    kv = resolve("kv_t2_resident_mb")
+    v = kv.get("value")
+    if v is None:
+        return None, [kv]
+    return v <= 0, [kv]
+
+
+def _seg_bandwidth_bound_harvestable(entity_id=None, window_s=None):
+    """The card is holding power it cannot use.
+
+    Decode is bandwidth-bound (weights streaming from T2, GPU utilisation low)
+    while the board still draws near its limit. Nothing is broken , throughput
+    is exactly what the link allows , but the watts are being spent waiting,
+    and the control loop can give them back without touching tok/s.
+
+    Returns None, not False, when the power or overflow reading is missing:
+    "the sensors did not answer" is not "there is nothing to harvest".
+    """
+    over = resolve("t2_overflow_active_mb")
+    harvesting = resolve("tuner_harvesting")
+    ov = over.get("value")
+    if ov is None:
+        return None, [over, harvesting]
+    if ov <= 0:
+        return False, [over, harvesting]
+    # Already harvesting is not "harvestable" , the loop has it in hand.
+    if harvesting.get("value") is True:
+        return False, [over, harvesting]
+    util = None
+    try:
+        import subprocess
+        r = subprocess.run(["nvidia-smi",
+                            "--query-gpu=utilization.gpu,power.draw,power.limit",
+                            "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=5)
+        f = [x.strip() for x in r.stdout.strip().splitlines()[0].split(",")]
+        util, draw, limit = float(f[0]), float(f[1]), float(f[2])
+    except Exception:
+        return None, [over, harvesting]
+    ev = [over, harvesting,
+          {"metric": "gpu_util_pct_live", "value": util, "unit": "percent",
+           "governed": False,
+           "provenance": {"raw_source": "nvidia-smi utilization.gpu (live)"}},
+          {"metric": "gpu_power_headroom_pct", "value": round(100.0 * draw / limit, 1)
+           if limit else None, "unit": "percent", "governed": False,
+           "provenance": {"raw_source": "nvidia-smi power.draw/power.limit (live)"}}]
+    return (util < 60.0 and limit > 0 and draw >= limit * 0.80), ev
+
+
+def _seg_ctx_estimate_undercounts(entity_id=None, window_s=None):
+    """The client thinks requests are smaller than the server says they are.
+
+    Only the under-count direction matters. Over-estimating compacts earlier
+    than strictly needed, which costs some prefix reuse; under-estimating lets
+    a request be assembled that the server then rejects, which costs the turn.
+    Returns None, not False, when no turn has been graded yet.
+    """
+    err = resolve("ctx_estimate_error_pct")
+    v = err.get("value")
+    if v is None:
+        return None, [err]
+    return v <= -5.0, [err]
 
 
 def _seg_agent_hallucinating_tool_names(entity_id=None, window_s=None):
@@ -2041,6 +2917,131 @@ def _seg_kmod_version_drift():
     if not iv or not rv:
         return None, [installed, running]
     return (iv != rv), [installed, running]
+
+
+def _seg_proton_tool_race():
+    """Two different GreenBoost Proton tools started the same game at once.
+
+    Measured 2026-08-21: `greenboost-proton-experimental` at 02:57:48 and
+    `greenboost-proton` at 02:57:50 , two seconds apart, both delegating to a
+    DIFFERENT upstream Proton, both into wine prefix compatdata/2909400. One
+    prefix cannot be brought up twice; each run's explorer.exe came up, the
+    game never did, and the pair was force-killed about a minute later. Steam
+    then retried, four times.
+
+    Steam's CompatToolMapping named only ONE of the two, so this is not a
+    user misconfiguration that shows up in Steam's UI , it needs the
+    wrapper's own logs to see at all, which is why it is a segment.
+    """
+    runs = resolve("game_launch_attempts")
+    tools = (runs.get("details") or {}).get("tools")
+    if tools is None:
+        return None, [runs]
+    return (len(tools) > 1), [runs, resolve("proton_tools_installed")]
+
+
+def _seg_game_launch_retry_loop(entity_id=None, window_s=None):
+    """Repeated wrapper starts with no game process , a launch that is looping.
+
+    Three or more starts inside the window means something kills the game and
+    Steam retries; a spinner cannot distinguish that from a slow first run,
+    and on 2026-08-21 it looked exactly like "still loading" for four minutes.
+    """
+    attempts = resolve("game_launch_attempts")
+    running = resolve("game_process_running")
+    last = resolve("last_game_session_s")
+    n, r = attempts.get("value"), running.get("value")
+    if n is None or r is None:
+        return None, [attempts, running, last]
+    # A completed session outranks the noise before it. Five aborted starts
+    # followed by one 335-second clean run is a launch that WORKED, and
+    # reporting it as a retry loop would be crying wolf on a success
+    # (measured 2026-08-21). Only sessions that ended recently count , an
+    # hours-old success says nothing about a loop happening now.
+    import time as _t
+    ended = (last.get("details") or {}).get("ended_ts") or 0
+    secs = last.get("value") or 0
+    recent_success = (secs >= 60 and ended and (_t.time() - ended) <= (window_s or 900.0))
+    return (n >= 3 and not r and not recent_success), [attempts, running, last]
+
+
+def _seg_launch_made_only_wine_infrastructure():
+    """Proton came up, the game did not.
+
+    wine's own helpers (explorer.exe, services.exe, wineboot) start for every
+    launch whether or not the title does. Counting any .exe as "the game is
+    running" reports a dead launch as a live one , this segment is matched
+    precisely when the ONLY wine processes present are Proton's own.
+    """
+    running = resolve("game_process_running")
+    infra = (running.get("details") or {}).get("wine_infrastructure_only")
+    if running.get("value") is None:
+        return None, [running]
+    return bool(infra), [running]
+
+
+def _seg_apparmor_contaminated_by_greenboost():
+    """GreenBoost rules sitting past a snapd profile's closing brace.
+
+    Matched means every snap on the machine is one `apparmor_parser` run away
+    from refusing to launch, and that `snapd.apparmor.service` is already dead.
+
+    The trap this encodes: `grep libgreenboost_audit <profile>` returning a hit
+    reads like "the grant is active". It is the exact opposite. A rule past the
+    closing brace grants nothing and invalidates the whole profile, so the
+    presence of the string IS the failure signal. That misreading is why the
+    same bug shipped twice.
+    """
+    n = resolve("apparmor_profiles_contaminated")
+    v = n.get("value")
+    if v is None:
+        return None, [n]
+    return (v >= 1), [n]
+
+
+def _seg_kmod_stale_from_initramfs():
+    """Version drift that a reload will NOT durably fix, because the stale
+    module is coming out of the initramfs on every boot.
+
+    This is deliberately a separate segment from `kmod_version_drift` rather
+    than a refinement of it, because the two carry different instructions and
+    handing out the wrong one costs a reboot to discover:
+
+      kmod_version_drift          -> `sudo greenboost load` and you are done.
+      kmod_stale_from_initramfs   -> `sudo greenboost load` fixes THIS boot and
+                                     the next boot puts v-old back. The durable
+                                     fix is to stop shipping the module in the
+                                     boot image (`update-initramfs -u -k all`
+                                     with the exclusion hook installed).
+
+    Returns None when either input is unknown , the module isn't loaded, no
+    build stamp exists, or the journal can't be read. "Cannot tell" is never
+    "no drift", which is the whole reason this layer exists.
+    """
+    drift = evaluate_segment("kmod_version_drift")
+    stage = resolve("kmod_load_stage")
+    d, st = drift.get("matched"), stage.get("value")
+    ev = [{"kmod_version_drift": d, "evidence": drift.get("evidence")}, stage]
+    if d is None or st is None:
+        return None, ev
+    return (bool(d) and st == "initramfs"), ev
+
+
+def _seg_t3_configured_but_disabled():
+    """T3 has a configured cap and is not actually open.
+
+    The failure this names is not "T3 is off" , it is that everything an
+    operator would check says T3 is fine. The status page prints the cap,
+    `t3_total_mb` reports 74752, and the only place the truth appears is one
+    kernel log line at module init. Matched means: no byte will ever reach
+    T3 in this boot, whatever the capacity readouts say.
+    """
+    enabled = resolve("t3_enabled")
+    total = resolve("t3_capacity_configured_mb")
+    e, t = enabled.get("value"), total.get("value")
+    if e is None:
+        return None, [enabled, total]
+    return (e is False and bool(t)), [enabled, total]
 
 
 def _seg_prompt_cache_cold():

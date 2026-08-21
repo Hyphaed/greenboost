@@ -280,9 +280,180 @@ async def _upstream_stream(method: str, url: str, model: str, **kw):
 # bursts rather than one. Env-overridable for deliberately short workloads.
 _MIN_TOK_S_SAMPLE_TOKENS = max(2, int(os.environ.get("GB_SYNAPSE_MIN_TOK_S_TOKENS", "24")))
 
+#: Fewest inter-token gaps a percentile may be computed from. A p95 over three
+#: samples is arithmetic, not evidence , the same n=3 population problem the
+#: 2026-08-18 audit found in tok_s_drop advisories.
+_MIN_LATENCY_SAMPLES = max(8, int(os.environ.get("GB_SYNAPSE_MIN_LATENCY_SAMPLES", "16")))
+
+#: A token is "slow" when its gap exceeds this multiple of the response's own
+#: median gap. Relative by design , see latency_stats().
+_SLOW_TOKEN_FACTOR = float(os.environ.get("GB_SYNAPSE_SLOW_TOKEN_FACTOR", "2.0"))
+
+
+# ---------------------------------------------------------------------------
+# Adaptive speculative depth , the proxy is the only place that sees both
+# halves of the loop: every response's draft acceptance, and every outgoing
+# request it could stamp a depth on.
+# ---------------------------------------------------------------------------
+#
+# Depth used to be a launch flag, so changing it meant restarting the server
+# and discarding every warm slot. GreenBoost's vendored engine now accepts
+# `speculative.n_max` per request (third_party/llama.cpp/NOTICE, 2026-08-20),
+# and the value can only clamp DOWN from the server's own ceiling , so the
+# worst case of a wrong decision here is a shallower draft, never an overrun.
+#
+# OFF by default. The engine patch and this controller are new, and the pinned
+# constant (depth 4, p_min 0.3) is a real measured result on this box; a
+# controller that cannot beat it should not be running. Turn it on to A/B:
+#
+#     GB_SYNAPSE_ADAPTIVE_DRAFT=1
+_ADAPTIVE_DRAFT = os.environ.get("GB_SYNAPSE_ADAPTIVE_DRAFT", "0") == "1"
+
+#: Responses to accumulate before re-deciding. One turn's acceptance is a tiny
+#: population and depth is non-monotonic, so reacting per response would be
+#: the same n=3 mistake the tuner exists to avoid.
+_SPEC_WINDOW = int(os.environ.get("GB_SYNAPSE_ADAPTIVE_DRAFT_WINDOW", "8"))
+
+
+class _SpecDepth:
+    """Per-request draft depth, decided from measured acceptance.
+
+    Holds only counters , the policy is `gb_tuner.decide_draft_depth`, which
+    is pure and unit-tested. Never raises: a controller that can break a
+    request is worse than one that never changes anything.
+    """
+
+    def __init__(self) -> None:
+        self.depth: "int | None" = None      # None = leave the server's own value
+        self.drafted = 0
+        self.accepted = 0
+        self.responses = 0
+
+    def observe(self, spec: "dict | None", t2_overflow_mb: "float | None" = None) -> None:
+        if not _ADAPTIVE_DRAFT or not spec:
+            return
+        try:
+            self.drafted += int(spec.get("draft_n") or 0)
+            self.accepted += int(spec.get("draft_n_accepted") or 0)
+            self.responses += 1
+            if self.responses < _SPEC_WINDOW or not self.drafted:
+                return
+            import gb_tuner
+            accept_pct = 100.0 * self.accepted / self.drafted
+            current = self.depth if self.depth is not None else _served_draft_depth()
+            if not current:
+                self._reset()
+                return
+            snap = gb_tuner.TunerSnapshot(
+                draft_depth=current, draft_accept_pct=accept_pct,
+                t2_overflow_mb=t2_overflow_mb,
+                # Depth can only be RAISED on a bandwidth-bound pass, and the
+                # proxy cannot see GPU utilisation. Claiming the bottleneck it
+                # cannot observe would let it raise depth on a compute-bound
+                # box, so it stays unknown and only the lowering rule fires
+                # unless the caller supplies the overflow figure.
+                gpu_util_pct=None)
+            state = gb_tuner.TunerState(bottleneck=(
+                gb_tuner.Bottleneck.BANDWIDTH_BOUND if (t2_overflow_mb or 0) > 0
+                else gb_tuner.Bottleneck.UNKNOWN))
+            d = gb_tuner.decide_draft_depth(snap, state)
+            if d is not None and d.value != current:
+                self.depth = int(d.value)
+                _emit_spec_depth(current, self.depth, accept_pct, d.reason,
+                                 self.responses)
+            self._reset()
+        except Exception:
+            self._reset()
+
+    def _reset(self) -> None:
+        self.drafted = self.accepted = self.responses = 0
+
+    def stamp(self, parsed: dict) -> bool:
+        """Put the chosen depth on an outgoing request. Returns True when the
+        body changed. A client that set the field itself always wins."""
+        if not _ADAPTIVE_DRAFT or self.depth is None:
+            return False
+        if "speculative.n_max" in parsed:
+            return False
+        parsed["speculative.n_max"] = int(self.depth)
+        return True
+
+
+_SPEC_DEPTH = _SpecDepth()
+
+
+#: Cache TTL for the shim's overflow figure. It changes on the timescale of a
+#: model load, not a token, and this is read on a response path.
+_T2_TTL_S = 30.0
+
+#: Beyond this the stats file describes a serve that has already ended.
+_T2_STALE_S = 60.0
+_t2_cache: dict = {"ts": 0.0, "mb": None}
+
+
+def _t2_overflow_mb() -> "float | None":
+    """MB of weights/KV the shim is streaming from T2 right now.
+
+    Read from `t2_overflow_total_mb` in the shim's own stats file , the only
+    field that answers "is overflow active". `t2_allocated_mb` and
+    `t2_pressure` look like they do and do not; reading either was the
+    2026-08-17 bug that silenced the Rule #1 tripwire. None when nothing is
+    serving under the shim, which is a different answer from zero.
+    """
+    now = time.monotonic()
+    if now - _t2_cache["ts"] < _T2_TTL_S:
+        return _t2_cache["mb"]
+    mb = None
+    try:
+        import os as _os
+        path = "/run/greenboost/shim_stats"
+        # The file outlives the process that wrote it. A stale one reports the
+        # last serve's numbers as if they were current , exactly the trap
+        # gb_semantics guards ("shim_stats writer pid N is gone"), so age it
+        # out rather than trusting whatever is on disk.
+        if time.time() - _os.path.getmtime(path) <= _T2_STALE_S:
+            with open(path) as f:
+                for line in f:
+                    if line.startswith("t2_overflow_total_mb="):
+                        mb = float(line.split("=", 1)[1].strip())
+                        break
+    except Exception:
+        mb = None
+    _t2_cache.update(ts=now, mb=mb)
+    return mb
+
+
+def _served_draft_depth() -> "int | None":
+    """The depth the running server was launched with , the ceiling this
+    controller clamps down from. None when nothing is serving."""
+    try:
+        import gb_synapse
+        ps = gb_synapse.ps()
+        return ps[0].get("mtp_draft_n") if ps else None
+    except Exception:
+        return None
+
+
+def _emit_spec_depth(old: int, new: int, accept_pct: float, reason: str,
+                     responses: int) -> None:
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({
+            "node": "host", "label": "synapse", "kind": "spec_decode",
+            "status": "ok", "n_items": 1, "items": [], "duration_s": 0.0,
+            "model": MODEL_NAME, "draft_n": new, "draft_n_previous": old,
+            "median_accept_rate": round(accept_pct / 100.0, 3),
+            "accept_rate_source": f"live proxy traffic, {responses} response(s)",
+            "reason": reason, "adaptive": True,
+        })
+    except Exception:
+        pass
+
 
 def _record_tok_s(model: str, t_first: "float | None", t_last: "float | None",
-                  completion_tokens: int, prompt_tokens: int = 0) -> None:
+                  completion_tokens: int, prompt_tokens: int = 0,
+                  latency: "dict | None" = None,
+                  spec: "dict | None" = None) -> None:
     """Compute client-observed decode tok/s from first→last token timing and
     the upstream's usage count, then hand it to gb_synapse.record_measured_tok_s
     (dataflux emit + rolling store). Proxy-side so ANY client on the gb-synapse
@@ -308,7 +479,9 @@ def _record_tok_s(model: str, t_first: "float | None", t_last: "float | None",
         import gb_synapse
         gb_synapse.record_measured_tok_s(model, tok_s, source="proxy",
                                          completion_tokens=completion_tokens,
-                                         prompt_tokens=prompt_tokens)
+                                         prompt_tokens=prompt_tokens,
+                                         latency=latency, spec=spec)
+        _SPEC_DEPTH.observe(spec, _t2_overflow_mb())
     except Exception:
         pass
 
@@ -474,16 +647,27 @@ def _record_non_stream_telemetry(model: str, raw: bytes) -> None:
         # Prompt-cache telemetry below deliberately stays on the looser >1
         # guard — TTFT/hit-rate are meaningful for a short reply; decode rate
         # is not.
+        # Same speculative counters as the streaming path. The non-streaming
+        # response carries the whole timings block in one piece, so this is a
+        # plain read , the acceptance rate is measured on real traffic here,
+        # not only in gb_bench_spec.py's synthetic sweep.
+        _spec = ({"draft_n": timings["draft_n"],
+                  "draft_n_accepted": timings.get("draft_n_accepted", 0)}
+                 if timings.get("draft_n") else None)
         if tok_s and completion_tokens >= _MIN_TOK_S_SAMPLE_TOKENS:
             gb_synapse.record_measured_tok_s(model, tok_s, source="proxy",
                                              completion_tokens=completion_tokens,
-                                             prompt_tokens=prompt_tokens)
+                                             prompt_tokens=prompt_tokens,
+                                             spec=_spec)
         else:
             gb_synapse.record_tok_s_skipped(
                 model,
                 "below_sample_floor" if completion_tokens < _MIN_TOK_S_SAMPLE_TOKENS
                 else "no_engine_rate",
                 completion_tokens=completion_tokens, source="proxy")
+        # Acceptance is worth observing even on a sample too short to time:
+        # the tokens were still drafted and still verified.
+        _SPEC_DEPTH.observe(_spec, _t2_overflow_mb())
         prompt_ms = timings.get("prompt_ms")
         tokens_cached = _cache_info_from_chunk(data, None)
         if prompt_ms is not None or tokens_cached is not None:
@@ -548,15 +732,30 @@ class _SSETelemetry:
     #: sending a delimiter.
     MAX_PARTIAL = 1 << 20      # 1 MiB
 
+    #: Inter-token gaps kept for percentiles, newest-wins ring. A mean hides
+    #: exactly the thing worth seeing here: with MTP speculative decode the
+    #: gaps are bimodal , near-zero inside an accepted draft batch, a full
+    #: forward pass at the batch boundary , so the mean describes no real
+    #: token. 4096 gaps is ~13 minutes of decode at this box's rate and 32 KB
+    #: per in-flight request; the ring exists because this proxy is long-lived
+    #: and an unbounded per-request buffer already cost 37.5 GB once.
+    LAT_RING = 4096
+
     __slots__ = ("ctok", "ptok", "tokens_cached", "t_first", "t_last",
-                 "engine_prompt_ms", "_partial")
+                 "engine_prompt_ms", "_partial", "_gaps", "_gap_i", "_gap_n",
+                 "draft_n", "draft_n_accepted")
 
     def __init__(self) -> None:
         self.ctok = self.ptok = 0
         self.tokens_cached = None
         self.t_first = self.t_last = None
         self.engine_prompt_ms = None
+        self.draft_n = None
+        self.draft_n_accepted = None
         self._partial = ""
+        self._gaps = [0.0] * self.LAT_RING
+        self._gap_i = 0          # next write position
+        self._gap_n = 0          # how many slots hold a real sample
 
     def feed(self, ts: float, raw: bytes) -> None:
         try:
@@ -589,6 +788,13 @@ class _SSETelemetry:
         _t = chunk.get("timings")
         if isinstance(_t, dict) and _t.get("prompt_ms") is not None:
             self.engine_prompt_ms = _t.get("prompt_ms")
+        # Speculative accounting, when the engine drafted anything. It only
+        # appears on the frame that carries timings (the last one), and the
+        # engine omits it entirely at depth 0 , which is the honest shape,
+        # because nothing drafted means nothing could be rejected.
+        if isinstance(_t, dict) and _t.get("draft_n") is not None:
+            self.draft_n = _t.get("draft_n")
+            self.draft_n_accepted = _t.get("draft_n_accepted")
         delta = (chunk.get("choices") or [{}])[0].get("delta", {})
         # tool_calls counts as generated content , an agentic turn can emit
         # nothing else, and leaving it out is what made ttft_ms never resolve.
@@ -596,7 +802,57 @@ class _SSETelemetry:
                 or delta.get("tool_calls") or delta.get("function_call")):
             if self.t_first is None:
                 self.t_first = ts
+            else:
+                # Gap from the PREVIOUS content event, not from the request
+                # start , the first interval would otherwise carry the whole
+                # prefill and skew every percentile.
+                self._gaps[self._gap_i] = (ts - self.t_last) * 1000.0
+                self._gap_i = (self._gap_i + 1) % self.LAT_RING
+                if self._gap_n < self.LAT_RING:
+                    self._gap_n += 1
             self.t_last = ts
+
+    def spec_stats(self) -> "dict | None":
+        """The engine's own draft counters for this turn, or None when it
+        drafted nothing. None and {"draft_n": 0} are different answers and the
+        caller must not conflate them , see the draft_accept_pct metric."""
+        if not self.draft_n:
+            return None
+        return {"draft_n": self.draft_n,
+                "draft_n_accepted": self.draft_n_accepted or 0}
+
+    def latency_stats(self) -> "dict | None":
+        """p50 / p95 / max inter-token latency and the slow-token ratio.
+
+        None when there are too few gaps to say anything , two samples cannot
+        support a p95, and reporting one anyway is how an n=3 population turns
+        into a confident wrong answer.
+
+        `slow_token_ratio` is measured against this response's OWN median, not
+        an absolute millisecond threshold: what counts as slow depends on the
+        model, the quant and how much of it is streaming over PCIe, none of
+        which is knowable here. A hardcoded ms figure would also be a
+        hardcoded hardware value.
+        """
+        if self._gap_n < _MIN_LATENCY_SAMPLES:
+            return None
+        gaps = sorted(self._gaps[:self._gap_n])
+        n = len(gaps)
+
+        def _pct(q: float) -> float:
+            # Nearest-rank; no interpolation, so every reported figure is a
+            # gap that actually occurred.
+            idx = min(n - 1, max(0, int(round(q * n)) - 1))
+            return gaps[idx]
+
+        p50 = _pct(0.50)
+        slow_cut = p50 * _SLOW_TOKEN_FACTOR
+        slow = sum(1 for g in gaps if g > slow_cut)
+        return {"p50_ms": round(p50, 2),
+                "p95_ms": round(_pct(0.95), 2),
+                "max_ms": round(gaps[-1], 2),
+                "slow_token_ratio": round(slow / n, 4),
+                "gap_samples": n}
 
     def result(self) -> "tuple[int, int, int | None, float | None, float | None, float | None]":
         return (self.ctok, self.ptok, self.tokens_cached,
@@ -1410,6 +1666,13 @@ async def openai_passthrough(request: web.Request) -> web.StreamResponse:
         if _slot is not None or _had_conv:
             body = json.dumps(parsed).encode()
 
+    # Adaptive speculative depth, on both completion paths and independently of
+    # slot pinning , a client that picks its own slot still deserves the depth
+    # the measured acceptance says is right. No-op unless
+    # GB_SYNAPSE_ADAPTIVE_DRAFT=1 and a decision has been made.
+    if is_completions_path and parsed and _SPEC_DEPTH.stamp(parsed):
+        body = json.dumps(parsed).encode()
+
     if not stream:
         try:
             async with SESSION.post(url, data=body, headers=headers) as r:
@@ -1469,7 +1732,13 @@ async def openai_passthrough(request: web.Request) -> web.StreamResponse:
     await resp.write_eof()
     if _telemetry is not None:
         ctok, ptok, tokens_cached, t_first, t_last, engine_prompt_ms = _telemetry.result()
-        _record_tok_s(req_model, t_first, t_last, ctok, ptok)
+        # Streaming only: a non-streaming reply arrives in one piece, so it
+        # carries no per-token arrival times and no percentile can be built
+        # from it. That is a real coverage limit of this signal, not an
+        # oversight , see the inter_token_p95_ms metric's doc.
+        _record_tok_s(req_model, t_first, t_last, ctok, ptok,
+                      latency=_telemetry.latency_stats(),
+                      spec=_telemetry.spec_stats())
         _record_prompt_cache(req_model, t_start, t_first, ptok, tokens_cached,
                              engine_prompt_ms=engine_prompt_ms)
     return resp

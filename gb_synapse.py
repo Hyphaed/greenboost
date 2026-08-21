@@ -2183,7 +2183,9 @@ def _tok_s_sanity_ceiling(model: str) -> "float | None":
 
 def _df_emit_tok_s(model: str, tok_s: float, source: str = "",
                     quant: str = "", ctx: int = 0, kv_type: str = "",
-                    completion_tokens: int = 0, prompt_tokens: int = 0) -> None:
+                    completion_tokens: int = 0, prompt_tokens: int = 0,
+                    latency: "dict | None" = None,
+                    spec: "dict | None" = None) -> None:
     """Record a real measured tok/s sample to the dataflux log , the one
     number that closes the loop between orchestration decisions (tier_move/
     quantize/turboquant_activate) and what they actually bought. Best-effort,
@@ -2228,6 +2230,25 @@ def _df_emit_tok_s(model: str, tok_s: float, source: str = "",
             # window setting or the conversation length. Same 0-means-unknown
             # convention as completion_tokens above.
             **({"prompt_tokens": int(prompt_tokens)} if prompt_tokens else {}),
+            # Inter-token percentiles, when the sample came from a streamed
+            # reply. tok_s is a mean and a mean cannot show a tail: with MTP
+            # speculative decode the gaps are bimodal (near-zero inside an
+            # accepted draft, a whole forward pass at the boundary), so the
+            # mean describes no token that actually happened. Emitted as
+            # separate keys rather than a nested dict so dataflux_events and
+            # the GB-Semantics resolvers can read them without special-casing
+            # a sub-object.
+            **({k: v for k, v in latency.items()} if latency else {}),
+            # Speculative-decode accounting for THIS turn, when the engine
+            # drafted anything: draft_n tokens proposed, draft_n_accepted
+            # kept. It rides here rather than on its own event because it
+            # describes the same turn as the tok/s figure, and the whole point
+            # of the pair is that acceptance explains the rate. Absent when
+            # depth is 0 or the model carries no draft head , and absent is
+            # the honest answer there, because an engine that drafted nothing
+            # reports 100% acceptance.
+            **({k: int(v) for k, v in spec.items() if v is not None}
+               if spec else {}),
         })
     except Exception:
         pass
@@ -2237,7 +2258,9 @@ def record_measured_tok_s(model: str, tok_s: float, source: str = "",
                            quant: "str | None" = None, ctx: "int | None" = None,
                            kv_type: "str | None" = None,
                            completion_tokens: int = 0,
-                           prompt_tokens: int = 0) -> None:
+                           prompt_tokens: int = 0,
+                           latency: "dict | None" = None,
+                           spec: "dict | None" = None) -> None:
     """Append a real, client-observed decode speed for `model` — fed by
     greenboost-cli after each final answer (TurnComplete.tok_s), closing the
     gap _estimate_tok_s()'s docstring flags: "A --measure mode that runs a
@@ -2256,7 +2279,20 @@ def record_measured_tok_s(model: str, tok_s: float, source: str = "",
     ServerState (_read_run_state) — the same config the shim actually
     launched with — rather than making both callers thread it through their
     own signatures. A sample is silently dropped, not misfiled under a wrong
-    key, when no run-state can be found (e.g. the server already stopped)."""
+    key, when no run-state can be found (e.g. the server already stopped).
+
+    `latency` (optional): the streaming path's inter-token percentile block
+    (p50_ms/p95_ms/max_ms/slow_token_ratio/gap_samples). It rides along on the
+    same `tok_s_measured` event rather than getting an event of its own ,
+    they describe the same turn, and splitting them would make it possible to
+    read one without the other. Absent on non-streaming replies, which carry
+    no per-token arrival times at all.
+
+    `spec` (optional): {"draft_n", "draft_n_accepted"} straight from the
+    engine's own timings block. This is the input the 2026-08-05 depth sweep
+    did not have , it found the tok/s-vs-depth curve is non-monotonic, which
+    is the signature of a variable nobody was reading. Governed as
+    `draft_accept_pct`."""
     if tok_s <= 0:
         return
     if quant is None or ctx is None or kv_type is None:
@@ -2281,7 +2317,7 @@ def record_measured_tok_s(model: str, tok_s: float, source: str = "",
         return
     _df_emit_tok_s(model, tok_s, source, quant=quant or "", ctx=ctx or 0,
                    kv_type=kv_type or "", completion_tokens=completion_tokens,
-                   prompt_tokens=prompt_tokens)
+                   prompt_tokens=prompt_tokens, latency=latency, spec=spec)
     samples = _load_tok_s_samples()
     key = _tok_s_key(quant, ctx, kv_type)
     per_model = samples.setdefault(model, {})
@@ -4001,6 +4037,120 @@ def _peak_kv_used_mb(window_s: float = 6 * 3600, since_ts: float | None = None) 
         return peak
     except Exception:
         return 0.0
+
+
+def kv_spill_reachability(model: str = "", ctx: int = 0,
+                          kv_type: str = "") -> dict:
+    """At what context length does this model's KV stop fitting in T1?
+
+    The question exists because lookahead KV prefetch , staging T2-resident KV
+    blocks into T1 ahead of the step that needs them , only has something to do
+    if any KV is in T2 at all. Measured on this box 2026-08-20 while serving
+    the reference model at ctx 24576: `kv_t1_tracked_mb=427`,
+    `t2_overflow_total_mb=6687`, i.e. the entire spill was WEIGHTS and none of
+    it was KV. Building a prefetch mechanism for that state would move zero
+    bytes.
+
+    Answers it without a serve, from bytes-per-token:
+      * measured, when a prior serve of this exact (model, ctx, kv_type)
+        recorded a real `kv_t1_tracked_mb` , preferred, because the formula is
+        known to over-estimate ~2.9x on this hybrid Gated-DeltaNet
+        architecture (2026-08-02);
+      * otherwise `estimate_kv_gb()`, flagged as an estimate.
+
+    Returns the threshold ctx, the source of the per-token figure, and the
+    reserve it was compared against , never a bare number, because a threshold
+    computed from a formula and one computed from a measurement deserve
+    different confidence.
+    """
+    out: dict = {"model": model, "ctx": ctx, "kv_type": kv_type,
+                 "kv_bytes_per_token": None, "source": None,
+                 "reserve_mb": None, "spill_ctx": None, "note": ""}
+    st = None
+    if not model:
+        states = _read_run_states()
+        st = states[0] if states else None
+    else:
+        st = _read_run_state(model)
+    if st is not None:
+        model = model or st.model
+        ctx = ctx or int(getattr(st, "ctx", 0) or 0)
+        kv_type = kv_type or str(getattr(st, "kv_type", "") or "")
+    out.update(model=model, ctx=ctx, kv_type=kv_type)
+    if not (model and ctx):
+        out["note"] = ("no serve on record , pass model/ctx/kv_type explicitly "
+                       "to size a config that is not running")
+        return out
+
+    measured_mb = _load_kv_measurement(model, ctx, kv_type)
+    if measured_mb:
+        out["kv_bytes_per_token"] = (measured_mb * 1024 * 1024) / ctx
+        out["source"] = "measured (shim kv_t1_tracked_mb from a prior serve)"
+    else:
+        try:
+            entry = next((e for e in list_models() if e.name == model), None)
+        except Exception:
+            entry = None
+        if entry is None:
+            out["note"] = (f"no manifest entry for {model!r} and no prior "
+                           f"measurement , cannot size KV per token")
+            return out
+        gb = estimate_kv_gb(
+            ctx, getattr(entry, "n_bytes", 0), getattr(entry, "quant", ""),
+            n_layers=getattr(entry, "n_kv_layers", 0) or getattr(entry, "n_layers", 0),
+            n_kv_heads=getattr(entry, "n_kv_heads", 0),
+            head_dim=getattr(entry, "head_dim", 0),
+            kv_bytes_per_elem=(2.0 if str(kv_type).startswith("f16") else 1.0))
+        out["kv_bytes_per_token"] = (gb * (1024 ** 3)) / ctx if ctx else None
+        out["source"] = ("estimated (formula; known ~2.9x high on this hybrid "
+                         "architecture until a real serve measures it)")
+
+    # What the KV is competing for: the shim's own KV reserve when it is
+    # publishing one, else the card's physical VRAM as an upper bound. Both are
+    # read live , no absolute figure belongs in this file.
+    reserve_mb = None
+    kv_t2_live_mb = None
+    try:
+        import os as _os
+        path = "/run/greenboost/shim_stats"
+        # The stats file outlives the process that wrote it, so an old one
+        # would answer with the PREVIOUS serve's reserve as though it were
+        # current. Age it out , the same trap gb_semantics names when it says
+        # "shim_stats writer pid N is gone".
+        if time.time() - _os.path.getmtime(path) <= 60.0:
+            stats = {}
+            with open(path) as f:
+                for line in f:
+                    k, _, v = line.partition("=")
+                    stats[k.strip()] = v.strip()
+            reserve_mb = float(stats.get("kv_reserve_nominal_mb") or 0) or None
+            if reserve_mb is None:
+                reserve_mb = float(stats.get("physical_vram_mb") or 0) or None
+            if "kv_t2_live_mb" in stats:
+                kv_t2_live_mb = float(stats["kv_t2_live_mb"])
+    except Exception:
+        pass
+    out["reserve_mb"] = reserve_mb
+    out["kv_t2_live_mb"] = kv_t2_live_mb
+    bpt = out["kv_bytes_per_token"]
+    if reserve_mb and bpt:
+        out["reserve_ctx"] = int((reserve_mb * 1024 * 1024) / bpt)
+        # Deliberately NOT called "the ctx where KV spills to T2". Exceeding
+        # the reserve means KV stops having a guaranteed T1 window and starts
+        # competing with weights for what is left; it reaches T2 only once T1
+        # is genuinely full. `kv_t2_live_mb` is the only field that answers the
+        # spill question, and it comes from the shim, not from arithmetic.
+        out["spill_ctx"] = out["reserve_ctx"]
+        out["note"] = (f"beyond ~{out['reserve_ctx']:,} tokens KV no longer "
+                       f"fits its guaranteed T1 reserve and competes with "
+                       f"weights for the rest; whether any of it actually "
+                       f"reaches T2 is answered by kv_t2_live_mb, not by this "
+                       f"arithmetic")
+    elif not reserve_mb:
+        out["note"] = ("no live shim stats to compare against , this reads a "
+                       "reserve from a running serve and there is none (or the "
+                       "stats file is stale)")
+    return out
 
 
 def _persist_kv_measurement(entry: ModelEntry, common: dict) -> None:

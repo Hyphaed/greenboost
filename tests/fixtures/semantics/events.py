@@ -47,6 +47,35 @@ _TEMPLATE: list[dict] = [
         "node": NODE, "label": "gb_synapse", "kind": "tok_s_measured", "status": "ok",
         "n_items": 1, "items": ["fable-fusion-27b"], "duration_s": 0.0,
         "model": "fable-fusion-27b", "tok_s": 5.2,
+        # Bimodal by construction, the shape MTP speculative decode actually
+        # produces: the median gap sits inside an accepted draft batch, the
+        # p95 is a whole forward pass. A fixture with a flat distribution
+        # would let a resolver that just reads the mean pass.
+        "p50_ms": 2.0, "p95_ms": 190.0, "max_ms": 240.0,
+        "slow_token_ratio": 0.25, "gap_samples": 96,
+        # The engine's own speculative accounting for the same turn: 40 tokens
+        # drafted, 26 kept. 65% acceptance is a working draft head, which is
+        # the case worth fixturing , a broken one is easy to spot, a working
+        # one at the wrong depth is not.
+        "draft_n": 40, "draft_n_accepted": 26,
+    },
+    # A game session that was stopped cleanly, followed by a NEWER
+    # gaming_session event that carries no `orphans` field at all. That
+    # ordering is the point: `orphans` is emitted only on
+    # action="terminated", so a resolver that reads the newest event of the
+    # kind sees the `start` below and reports "no data" while the real answer
+    # sits one event back , the exact shape of the 2026-08-18 ttft_ms defect.
+    {
+        "node": NODE, "label": "greenboost-gaming", "kind": "gaming_session",
+        "status": "ok", "n_items": 1, "items": ["3274469611"], "duration_s": 0.0,
+        "action": "terminated", "appid": "3274469611", "method": "wrapper",
+        "root_pid": 4242, "pids_term": 5, "pids_kill": 3, "orphans": 0,
+        "reason": "suite_quit",
+    },
+    {
+        "node": NODE, "label": "greenboost-gaming", "kind": "gaming_session",
+        "status": "ok", "n_items": 1, "items": ["3274469611"], "duration_s": 0.0,
+        "action": "start", "appid": "3274469611", "gpu": "NVIDIA GeForce RTX 5070",
     },
     {
         "node": NODE, "label": "gb_attn", "kind": "turboquant_activate", "status": "ok",
@@ -86,6 +115,37 @@ _TEMPLATE: list[dict] = [
         "decision": "pinned-edited", "chunks": 6, "chunks_before": 6,
         "changed_chunk": 2, "n_slots": 4, "tracked": 2, "identity": "explicit",
         "applied": False,
+    },
+    {
+        # A control-loop tick that harvested the power limit and applied it ,
+        # so `tuner_harvesting` must read True. The `applied` field is what
+        # separates this from the far more common advisory tick, and reading
+        # `action` alone would call both a harvest.
+        "node": NODE, "label": "gb_tuner", "kind": "tuner_decision",
+        "status": "ok", "n_items": 1, "items": [], "duration_s": 0.0,
+        "lever": "gpu_power_limit_w", "action": "harvest", "value": 237,
+        "reason": "decode is bandwidth-bound while the card draws near its limit",
+        "verify": True, "bottleneck": "bandwidth_bound", "settle_remaining": 3,
+        "baseline_tok_s": 5.2, "baseline_samples": 12, "applied": True,
+        "frozen_levers": 0,
+    },
+    {
+        # The context-budget pair, from the live 2026-08-20 incident: the CLI
+        # predicted 22,000 tokens for a request the server charged 24,654 for
+        # (-10.8%), which is the under-count direction that ends turns, and the
+        # last-resort trim that had to run afterwards because compaction cannot
+        # reach the live tail.
+        "node": NODE, "label": "gb-cli", "kind": "agent_context_edit",
+        "status": "ok", "n_items": 1, "items": [], "duration_s": 0.0,
+        "op": "calibrate", "actual_prompt_tokens": 24654,
+        "estimated_prompt_tokens": 22000, "estimate_error_pct": -10.76,
+        "chars_per_token": 3.4, "samples": 1,
+    },
+    {
+        "node": NODE, "label": "gb-cli", "kind": "agent_context_edit",
+        "status": "ok", "n_items": 1, "items": [], "duration_s": 0.0,
+        "op": "hard_trim", "budget_tokens": 18432, "before_tokens": 24654,
+        "after_tokens": 17800, "freed_tokens": 6854, "met": True, "steps": 3,
     },
     {
         "node": "feeder1 (192.0.2.10)", "label": "cluster_dispatch", "kind": "chunk_remote",

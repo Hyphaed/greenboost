@@ -548,9 +548,27 @@ def execute_turn(
 
         _turn_t0 = time.monotonic()
         _first_token_t = None  # set on the first streamed fragment — marks TTFT boundary
+        _est_prompt_tokens = 0
+        _fixed_overhead_tokens = 0
         try:
             _sent = _with_pinned_todos(
                 _with_recalled_memory(session.messages, user_message))
+            # What we PREDICT this request costs, in the same units the server
+            # reports back. Kept so the response can grade the prediction: an
+            # estimator that reads low is worse than none, because it reports
+            # headroom that is not there (live 2026-08-20, a retry fired at
+            # 24654 tokens into a 24576-token window).
+            try:
+                from greenboost_cli.workflow.intelligence import (
+                    estimate_request_tokens, _estimate_tokens as _est_hist,
+                )
+                _est_prompt_tokens = estimate_request_tokens(
+                    system_context, tool_schemas, _sent)
+                # The part of the request that trimming history cannot reach.
+                _fixed_overhead_tokens = max(
+                    0, _est_prompt_tokens - _est_hist(session))
+            except Exception:
+                _est_prompt_tokens = 0
             # GB-1: name the chunk that moved. Reuse is all-or-nothing from the
             # first differing token (--cache-reuse is rejected for this hybrid
             # architecture), so the FIRST chunk to change is the one that threw
@@ -606,9 +624,8 @@ def execute_turn(
             if isinstance(_gen_err, ContextOverflowError):
                 _pt = getattr(_gen_err, "prompt_tokens", 0)
                 _nc = getattr(_gen_err, "n_ctx", 0)
-                _hist_chars = sum(len(str(m.get("content", "")))
-                                  for m in session.messages)
-                _hist_tokens = _hist_chars // 4
+                from greenboost_cli.workflow.intelligence import _estimate_tokens
+                _hist_tokens = _estimate_tokens(session)
                 # If dropping the ENTIRE history still would not fit, the
                 # overhead is the problem and no compaction reaches it.
                 if _pt and _nc and (_pt - _hist_tokens) >= _nc:
@@ -638,13 +655,58 @@ def execute_turn(
                 if (session.messages
                         and session.messages[-1].get("role") == "assistant"):
                     session.messages.pop()  # drop the failed assistant turn, if any
-                from greenboost_cli.workflow.intelligence import _compress_context
+                from greenboost_cli.workflow.intelligence import (
+                    _compress_context, _estimate_tokens, hard_trim_to_fit,
+                )
                 _compress_context(session, settings, force=True)
+
+                # Compaction leaves the live tail verbatim, so it can finish
+                # having freed less than the overflow demanded , and the retry
+                # then fails identically, spending the one attempt allowed.
+                # Live 2026-08-20: 24654 tokens against a 24576-token window,
+                # post-compaction. Size the retry against the server's OWN
+                # numbers and evict until it fits, or say why it cannot.
+                _pt = getattr(_gen_err, "prompt_tokens", 0)
+                _nc = getattr(_gen_err, "n_ctx", 0)
+                _trim = None
+                if _pt and _nc:
+                    # Everything in the request that history-trimming cannot
+                    # touch: system prompt + tool schemas.
+                    _fixed = max(0, _pt - _hist_tokens)
+                    # Room for the answer as well as the question , the window
+                    # holds both. Derived from the window, never a literal.
+                    _out_reserve = min(int(settings.get("max_tokens", 8192) or 8192),
+                                       max(512, _nc // 8))
+                    _budget = _nc - _fixed - _out_reserve
+                    if _budget > 0:
+                        _trim = hard_trim_to_fit(session, _budget)
+                    if _budget <= 0 or (_trim and not _trim["met"]):
+                        raise ContextOverflowError(
+                            f"That request needed {_pt:,} tokens and the server "
+                            f"is serving a {_nc:,}-token window. Compacting the "
+                            f"history was not enough to close the gap.\n\n"
+                            f"What it costs you: this turn did not run. Your "
+                            f"conversation is intact , nothing was deleted "
+                            f"beyond the tool output that was already trimmed, "
+                            f"and the files on disk are untouched.\n\n"
+                            f"About {_fixed:,} tokens of that request are fixed "
+                            f"overhead (the system prompt plus every connected "
+                            f"MCP server's tool schemas), paid on every request "
+                            f"no matter how short your message is.\n\n"
+                            f"Fix it with either:\n"
+                            f"  /llamaserve restart --ctx "
+                            f"{max(32768, 1 << max(0, (_pt - 1)).bit_length())}\n"
+                            f"  /mcp disconnect <server>   (fewer tool schemas)",
+                            prompt_tokens=_pt, n_ctx=_nc,
+                        ) from _gen_err
                 _auto_compact_done = True
+                _freed = (_trim or {}).get("freed", 0)
                 yield LoopGuardTriggered(
                     "auto_compact",
                     "Request exceeded the server's context window — "
-                    "auto-compacted history and retrying.",
+                    "auto-compacted history"
+                    + (f" and trimmed {_freed:,} more tokens" if _freed else "")
+                    + " before retrying.",
                 )
                 continue
             raise
@@ -652,6 +714,16 @@ def execute_turn(
 
         if completed is None:
             break
+
+        # Grade the estimate against the server's own prompt count. This is the
+        # only free ground truth in the loop, and it is what keeps the budget
+        # checks honest as the conversation shifts between prose and code.
+        try:
+            from greenboost_cli.workflow.intelligence import note_real_prompt_tokens
+            note_real_prompt_tokens(int(getattr(completed, "in_tokens", 0) or 0),
+                                    _est_prompt_tokens)
+        except Exception:
+            pass
 
         session.messages.append({
             "role":       "assistant",
@@ -1022,7 +1094,12 @@ def execute_turn(
                         _estimate_tokens, _compress_context,
                     )
                     _ctx_budget = int(settings.get("context_window", 0)) or gb_synapse_ctx(settings)
-                    if _ctx_budget and _estimate_tokens(session) > int(_ctx_budget * 0.85):
+                    # Count the fixed overhead too. Checking history alone
+                    # against 85% of the window ignores the larger half of a
+                    # local request (system prompt + MCP tool schemas), which
+                    # is how a "safe" 60%-full session still 400s.
+                    _projected = _estimate_tokens(session) + _fixed_overhead_tokens
+                    if _ctx_budget and _projected > int(_ctx_budget * 0.85):
                         _compress_context(session, settings, force=True)
                 except Exception:
                     pass

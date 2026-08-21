@@ -537,10 +537,69 @@
   name: agent_compaction_prefix_kept_pct
   source: live
 
+- id: kv_t2_resident_mb_structural
+  kind: metric
+  name: kv_t2_resident_mb
+  source: live
+  question: "Is any KV cache actually living in T2?"
+
+- id: kv_prefetch_opportunities_structural
+  kind: metric
+  name: kv_prefetch_opportunities
+  source: live
+  question: "Would a KV prefetch have had anything to do?"
+
+- id: draft_accept_pct_from_real_traffic
+  kind: metric
+  name: draft_accept_pct
+  source: fixture
+  question: "Is speculative decoding paying at the depth we are serving?"
+  expect: {value: 65.0}
+
+- id: tuner_harvesting_needs_applied_not_just_decided
+  kind: metric
+  name: tuner_harvesting
+  source: fixture
+  question: "Is the control loop holding a lever back right now?"
+  expect: {value: true}
+
+- id: ctx_estimate_error_pct_undercount
+  kind: metric
+  name: ctx_estimate_error_pct
+  source: fixture
+  question: "Is the CLI's context estimate low enough to walk into a 400?"
+  expect: {value: -10.76}
+
+- id: ctx_hard_trims_counts_the_last_resort
+  kind: metric
+  name: ctx_hard_trims
+  source: fixture
+  question: "How often did compaction fail to free enough on its own?"
+  expect: {value: 1}
+
 - id: agent_memory_recall_chars_structural
   kind: metric
   name: agent_memory_recall_chars
   source: live
+
+- id: kv_prefetch_has_no_target_structural
+  kind: segment
+  name: kv_prefetch_has_no_target
+  source: live
+  question: "Is there anything for lookahead KV prefetch to prefetch?"
+
+- id: bandwidth_bound_harvestable_structural
+  kind: segment
+  name: bandwidth_bound_harvestable
+  source: live
+  question: "Is the card holding power it cannot use?"
+
+- id: ctx_estimate_undercounts_fires_on_the_live_incident
+  kind: segment
+  name: ctx_estimate_undercounts
+  source: fixture
+  question: "Why did my turn fail with 'exceeds the available context size'?"
+  expect: {matched: true}
 
 - id: agent_compaction_broke_prefix_structural
   kind: segment
@@ -559,3 +618,155 @@
   name: agent_eval_below_reference
   source: live
   question: "Is the agent harness underperforming for this model size?"
+
+# ── gaming lifecycle (2026-08-20) ────────────────────────────────────────
+- id: gaming_session_orphans_survives_a_newer_event_without_the_field
+  kind: metric
+  name: gaming_session_orphans
+  source: fixture
+  category: trap
+  question: "Did the last stop leave any game processes running?"
+  expect: {value: 0, threshold_state: ok}
+  trap_raw_field: pids_kill
+  trap_raw_value: 3
+  trap_raw_wrong: true
+  trap_why: >
+    pids_kill=3 reads as "three processes had to be force-killed, something
+    went wrong". It did not: force-killing a process that ignores SIGTERM is
+    a successful stop. orphans=0 is the field that says everything actually
+    died. The fixture also places a NEWER gaming_session event that carries
+    no orphans field at all, so a resolver reading the newest event of the
+    kind reports "no data" while the answer is one event back.
+
+- id: gaming_mode_active_structural
+  kind: metric
+  name: gaming_mode_active
+  source: live
+
+- id: gaming_mode_stuck_structural
+  kind: segment
+  name: gaming_mode_stuck
+  source: live
+
+# ── decode latency shape (2026-08-20) ────────────────────────────────────
+- id: inter_token_p95_ms_exact
+  kind: metric
+  name: inter_token_p95_ms
+  source: fixture
+  category: trap
+  question: "How does decode actually feel , is output smooth?"
+  expect: {value: 190.0}
+  trap_raw_field: tok_s
+  trap_raw_value: 5.2
+  trap_raw_wrong: true
+  trap_why: >
+    tok_s=5.2 reads as "a steady 5.2 tokens a second", i.e. a token every
+    ~192 ms, evenly. The real distribution in the same event is bimodal: a
+    2 ms median inside each accepted draft batch and a 190 ms p95 at the
+    forward-pass boundary. The mean describes no token that actually
+    happened, and the boundary is the part a user feels.
+
+- id: slow_token_ratio_exact
+  kind: metric
+  name: slow_token_ratio
+  source: fixture
+  expect: {value: 0.25, threshold_state: warn}
+  question: "What share of tokens land in the slow tail?"
+
+- id: decode_tail_heavy_matches
+  kind: segment
+  name: decode_tail_heavy
+  source: fixture
+  expect: {matched: true}
+  question: "Is decode tail-heavy rather than uniformly slow?"
+
+# ── the 2026-08-21 stale-module-from-initramfs incident ──────────────────
+# All `source: live` by necessity: these resolvers read this boot's journal
+# and the running kernel module, which is exactly the state that cannot be
+# pinned into a fixture. The structural assertion (resolver exists, runs,
+# returns a well-formed dict) is what these guard, jointly with
+# check_semantics_coverage.py — a renamed or deleted resolver is the
+# regression class that matters here.
+- id: kmod_load_stage_structural
+  kind: metric
+  name: kmod_load_stage
+  source: live
+
+- id: t3_enabled_structural
+  kind: metric
+  name: t3_enabled
+  source: live
+
+- id: t3_capacity_configured_mb_structural
+  kind: metric
+  name: t3_capacity_configured_mb
+  source: live
+
+- id: kmod_stale_from_initramfs_structural
+  kind: segment
+  name: kmod_stale_from_initramfs
+  source: live
+
+- id: t3_configured_but_disabled_structural
+  kind: segment
+  name: t3_configured_but_disabled
+  source: live
+
+# ── the 2026-08-20 AppArmor recurrence ───────────────────────────────────
+# `source: live` , these read the machine's actual /var/lib/snapd tree and
+# systemd state, which cannot be pinned into a fixture.
+- id: apparmor_profiles_contaminated_structural
+  kind: metric
+  name: apparmor_profiles_contaminated
+  source: live
+
+- id: system_degraded_structural
+  kind: metric
+  name: system_degraded
+  source: live
+
+- id: apparmor_contaminated_by_greenboost_structural
+  kind: segment
+  name: apparmor_contaminated_by_greenboost
+  source: live
+
+# ── Gaming Suite launch path (2026-08-21 launch failure) ─────────────────
+- id: proton_tools_installed_structural
+  kind: metric
+  name: proton_tools_installed
+  source: live
+
+- id: game_launch_attempts_structural
+  kind: metric
+  name: game_launch_attempts
+  source: live
+
+- id: game_process_running_structural
+  kind: metric
+  name: game_process_running
+  source: live
+
+- id: shader_cache_mb_structural
+  kind: metric
+  name: shader_cache_mb
+  source: live
+
+- id: proton_tool_race_structural
+  kind: segment
+  name: proton_tool_race
+  source: live
+
+- id: game_launch_retry_loop_structural
+  kind: segment
+  name: game_launch_retry_loop
+  source: live
+
+- id: launch_made_only_wine_infrastructure_structural
+  kind: segment
+  name: launch_made_only_wine_infrastructure
+  source: live
+
+- id: last_game_session_s_structural
+  kind: metric
+  name: last_game_session_s
+  source: live

@@ -1,0 +1,72 @@
+#!/bin/sh
+# zz-greenboost-exclude , initramfs-tools hook.
+#
+# Keeps greenboost.ko and its autoload fragment OUT of the initramfs image.
+#
+# Why this exists (incident 2026-08-21, this box, v3.2-for-days):
+#
+#   /etc/initramfs-tools/initramfs.conf carries MODULES=most, so initramfs-tools
+#   copies /lib/modules/<kver>/updates/dkms/greenboost.ko into the image, and the
+#   systemd hook copies /etc/modules-load.d/greenboost.conf in alongside it. The
+#   initrd's own systemd-modules-load then inserts greenboost before the real
+#   root is mounted. Two things follow, both bad and neither obvious:
+#
+#   1. The initrd copy is frozen at the moment the image was last built. A
+#      GreenBoost reinstall rebuilds /lib/modules/... and does not touch the
+#      initrd, so the machine keeps booting the OLD module. Rebooting , the
+#      instinctive fix , is the one action guaranteed not to help. This box ran
+#      v3.2 across several reboots while v3.4 was the installed build.
+#
+#   2. /var is not mounted that early, so the T3 backing file cannot be opened:
+#        greenboost: T3 backing file unavailable (/var/lib/greenboost/t3_store): -2 - T3 disabled
+#      Tier 3 was silently off on every boot. The status page still printed the
+#      configured 73 GB cap, because that line reports configuration, not state.
+#
+# greenboost is a CUDA memory/compute orchestrator. It is never needed to mount
+# the root filesystem, so the correct place for it is real root, after
+# local-fs.target , which is exactly where greenboost-boot-guard.service and the
+# real-root systemd-modules-load.service load it from.
+#
+# Removing files in a hook is safe: mkinitramfs runs `depmod -b "$DESTDIR"`
+# AFTER all hooks, so modules.dep in the image is regenerated without us.
+
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "${1:-}" in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+[ -n "${DESTDIR:-}" ] || exit 0
+
+# The module itself, wherever this distro's DKMS put it and whatever
+# compression the kernel uses (.ko, .ko.zst, .ko.xz, .ko.gz).
+for d in "$DESTDIR"/lib/modules/*/ "$DESTDIR"/usr/lib/modules/*/; do
+    [ -d "$d" ] || continue
+    find "$d" -name 'greenboost.ko*' -delete 2>/dev/null || true
+done
+
+# The autoload fragment, so early userspace has nothing telling it to load one
+# even if some other path drops a .ko back in.
+rm -f "$DESTDIR"/etc/modules-load.d/greenboost.conf \
+      "$DESTDIR"/usr/lib/modules-load.d/greenboost.conf 2>/dev/null || true
+
+# The Gaming Suite's tmpfiles rule, for the same reason and with a second one.
+#
+# It group-scopes /sys/module/greenboost/parameters/gaming_mode, which cannot
+# exist before the module is loaded , so in the initrd it has nothing to act on
+# even in principle. What it DOES do there is fail loudly on every boot:
+#
+#   systemd-tmpfiles[484]: /etc/tmpfiles.d/greenboost-gaming.conf:14:
+#       Failed to resolve group 'greenboost': Unknown group
+#
+# The group exists on the real root (gid 972). The initrd is a different root
+# filesystem with its own /etc/group, and it does not. That log line was read
+# for weeks as a tmpfiles-vs-groupadd ordering race and "fixed" by proposals to
+# ship the group earlier via sysusers.d , which could not have worked, because
+# a sysusers fragment on the real root is not in the initrd either. Removing
+# the rule from the image is the actual fix: the real-root run 13 s later
+# succeeds and leaves root:greenboost 0664, which is the end state that matters.
+rm -f "$DESTDIR"/etc/tmpfiles.d/greenboost-gaming.conf \
+      "$DESTDIR"/usr/lib/tmpfiles.d/greenboost-gaming.conf 2>/dev/null || true
+
+exit 0

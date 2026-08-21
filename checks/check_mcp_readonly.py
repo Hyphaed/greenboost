@@ -34,6 +34,7 @@ _KNOWINGLY_UNDECLARED: dict = {
     "optimize_inference": "applies an inference plan",
     "set_quant_policy": "writes quant policy",
     "tier_actuate": "moves tiers",
+    "tuner_tick": "advances the control loop's state and can actuate levers",
     "run_under_greenboost": "executes a command under the shim",
     "reclaim_run": "reclaims memory for real",
     "support_bundle": "writes a tarball",

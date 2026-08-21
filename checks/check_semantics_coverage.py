@@ -112,7 +112,14 @@ def _token_in_declared_files(metric, token: str) -> bool:
     import os as _os
     for sf in getattr(metric, "source_fields", []) or []:
         path = str(sf).split()[0]
-        if not path.startswith(("/proc/", "/sys/")):
+        # `shim_stats.<field>` is the repo's shorthand for the shim's own
+        # key=value dump. It is a real file with real field names, so a trap
+        # naming one of them IS checkable , and the traps that matter most
+        # here (the conditionally-written kv_prefetch_* counters, and
+        # t2_overflow_total_mb read as "KV is spilling") all live in it.
+        if path.startswith("shim_stats."):
+            path = "/run/greenboost/shim_stats"
+        elif not path.startswith(("/proc/", "/sys/")):
             continue
         try:
             if not _os.path.exists(path):

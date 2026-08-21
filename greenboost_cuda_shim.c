@@ -3726,6 +3726,18 @@ static void gb_write_stats(void)
     fprintf(f, "kv_t1_effective_mb=%zu\n",    _kv_t1_eff >> 20);
     fprintf(f, "ssm_state_t1_lifetime_mb=%zu\n",
             atomic_load_explicit(&g_ssm_state_t1_bytes, memory_order_relaxed) >> 20);
+    /* KV bytes currently resident in T2, published UNCONDITIONALLY.
+     *
+     * This is the number that says whether lookahead KV prefetch has anything
+     * to prefetch at all, and until 2026-08-20 it was only written by
+     * gb_kv_prefetch_tick(), i.e. only when GREENBOOST_KV_PREFETCH was already
+     * set. Answering "is there KV in T2?" therefore required arming the very
+     * feature the answer was supposed to justify , and a reader who saw
+     * kv_prefetch_t2_kv_mb=0 with the mode off could not tell "no KV in T2"
+     * from "nobody measured". It is one relaxed atomic read; there is no
+     * reason to gate it. */
+    fprintf(f, "kv_t2_live_mb=%zu\n",
+            atomic_load_explicit(&g_kv_t2_live_bytes, memory_order_relaxed) >> 20);
     fprintf(f, "kv_prefetch_mode=%d\n",       g_kv_prefetch_mode);
     fprintf(f, "kv_prefetch_ticks=%llu\n",
             (unsigned long long)atomic_load_explicit(&g_kv_prefetch_ticks, memory_order_relaxed));

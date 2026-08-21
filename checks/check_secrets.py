@@ -95,7 +95,7 @@ def run(repo_root: Path) -> list[Finding]:
                     message="line matches a live-secret-token pattern (HF/OpenAI/GitHub/AWS key shape)",
                     remediation="remove the literal token; use os.environ.get(\"VAR\", \"\") "
                                 "or ${VAR:?VAR not set} in shell, never a hardcoded value"))
-            if _IP_RE.search(line) and not is_allowlisted(rel, lineno, allow):
+            if _IP_RE.search(line) and not is_allowlisted(rel, lineno, allow, line):
                 findings.append(Finding(
                     check="secrets", severity="blocking", file=rel, line=lineno,
                     message="line contains a real LAN IP shape (192.168.x.x) — identifies real infrastructure",
@@ -104,7 +104,7 @@ def run(repo_root: Path) -> list[Finding]:
                                 "checks/allowlists/secrets_reviewed.txt"))
             m = _HOME_RE.search(line)
             if (m and "/home/<" not in line and "/home/user" not in line
-                    and not is_allowlisted(rel, lineno, allow)):
+                    and not is_allowlisted(rel, lineno, allow, line)):
                 findings.append(Finding(
                     check="secrets", severity="blocking", file=rel, line=lineno,
                     message=f"line contains an absolute developer home path ({m.group(0)!r})",

@@ -941,6 +941,161 @@ def res_taxonomy() -> str:
     return json.dumps(taxonomy)
 
 
+# ── GB-Tuner: the decision loop, one tick per call ────────────────────────
+#
+# `gb_tuner.decide()` is pure, so the state that makes it a CONTROL loop (the
+# EMA baseline, the settle countdown, which levers are frozen) has to live
+# somewhere. It lives here, in the MCP server process, for the same reason the
+# tuner does not own it: a controller that reloads its own history from disk on
+# every call has no way to tell "I just actuated" from "I restarted", and the
+# settle window is exactly the thing that must not be forgotten.
+_TUNER_STATE: dict = {}
+
+
+def _tuner_snapshot() -> "tuple[object, dict]":
+    """Assemble one TunerSnapshot from the governed layer + live NVML.
+
+    Every field is resolved through GB-Semantics where a governed metric
+    exists, so the tuner inherits the never_use traps rather than re-reading
+    the raw fields they warn about. A metric that cannot resolve stays None ,
+    the tuner is written to say "I don't know" instead of treating a missing
+    sensor as a zero.
+    """
+    import gb_tuner
+    vals: dict = {}
+
+    def _g(metric: str):
+        try:
+            import gb_semantics
+            r = gb_semantics.resolve(metric)
+            vals[metric] = {"value": r.get("value"),
+                            "raw_source": r.get("provenance", {}).get("raw_source")}
+            return r.get("value")
+        except Exception as e:                      # noqa: BLE001
+            vals[metric] = {"value": None, "raw_source": f"resolve failed: {e}"}
+            return None
+
+    util = power = limit = clock = clock_max = None
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,power.draw,power.limit,"
+             "clocks.current.sm,clocks.max.sm", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5).stdout.strip().splitlines()
+        if out:
+            f = [x.strip() for x in out[0].split(",")]
+            util, power, limit, clock, clock_max = (float(f[0]), float(f[1]),
+                                                    float(f[2]), float(f[3]),
+                                                    float(f[4]))
+    except Exception:
+        pass
+
+    serving = False
+    depth = None
+    try:
+        import gb_synapse
+        ps = gb_synapse.ps()
+        serving = bool(ps)
+        if ps:
+            depth = ps[0].get("mtp_draft_n")
+    except Exception:
+        pass
+
+    snap = gb_tuner.TunerSnapshot(
+        tok_s=_g("tok_s_decode"),
+        inter_token_p95_ms=_g("inter_token_p95_ms"),
+        slow_token_ratio=_g("slow_token_ratio"),
+        vram_fill_pct=_g("vram_fill_pct"),
+        t2_overflow_mb=_g("t2_overflow_active_mb"),
+        draft_accept_pct=_g("draft_accept_pct"),
+        draft_depth=depth,
+        gpu_util_pct=util, power_draw_w=power, power_limit_w=limit,
+        sm_clock_mhz=clock, sm_clock_max_mhz=clock_max,
+        serving=serving,
+    )
+    return snap, vals
+
+
+@mcp.tool()
+def tuner_tick(apply: bool = False, confirm: bool = False) -> dict:
+    """ADVISE (read-only by default): run one tick of GreenBoost's control loop
+    and return what it would move, and why.
+
+    The loop is `gb_tuner.decide()` , settle cycles, latching hysteresis, an
+    EMA baseline with a minimum population, frozen domains with re-probe, and
+    harvest (give clocks/power back when decode is bandwidth-bound and holding
+    them buys nothing). Calling this repeatedly IS the loop: each call is one
+    tick, and the state between ticks lives in this server process.
+
+    apply=True executes the decisions through GbControl, and is DOUBLE-GATED:
+    it also needs confirm=True AND GB_ORCH_ACTUATE=1. Every decision , applied
+    or not , is emitted as a `tuner_decision` dataflux event, including the
+    ticks where nothing moved, because "why did nothing happen" is the question
+    a control loop is usually asked."""
+    import gb_tuner
+    node = "host"
+    state = _TUNER_STATE.get(node) or gb_tuner.TunerState()
+    snap, provenance = _tuner_snapshot()
+    decisions, state = gb_tuner.decide(snap, state)
+    _TUNER_STATE[node] = state
+
+    out = {"tick": state.ticks,
+           "bottleneck": state.bottleneck,
+           "settle_remaining": state.settle_remaining,
+           "baseline_tok_s": (round(state.baseline_tok_s, 2)
+                              if state.baseline_tok_s else None),
+           "baseline_samples": state.baseline_samples,
+           "frozen": dict(state.frozen),
+           "decisions": [d.__dict__ for d in decisions],
+           "inputs": provenance,
+           "applied": []}
+
+    gated = apply and confirm and os.environ.get("GB_ORCH_ACTUATE") == "1"
+    if apply and not gated:
+        out["apply_skipped"] = ("needs confirm=True AND GB_ORCH_ACTUATE=1 "
+                                "(double gate)")
+    elif gated:
+        try:
+            from gb_control import GbControl
+            ctl = GbControl()
+            for d in decisions:
+                if d.action == "harvest" and d.lever == "gpu_clocks_locked":
+                    # A ceiling, not a floor: the card may still clock DOWN on
+                    # its own. GbControl captures the unlocked state as the
+                    # baseline, so restore_baseline() is a real undo.
+                    r = ctl.lock_gpu_clocks(0, int(d.value), reason=d.reason)
+                    out["applied"].append({"lever": d.lever, "value": d.value,
+                                           "ok": bool(getattr(r, "applied", False))})
+                elif d.action == "harvest" and d.lever == "gpu_power_limit_w":
+                    r = ctl.set_gpu_power_limit(int(d.value), reason=d.reason)
+                    out["applied"].append({"lever": d.lever, "value": d.value,
+                                           "ok": bool(getattr(r, "applied", False))})
+                elif d.action == "restore":
+                    r = ctl.restore_baseline()
+                    out["applied"].append({"lever": d.lever, "restore_baseline": r})
+        except Exception as e:                      # noqa: BLE001
+            out["apply_error"] = str(e)
+
+    try:
+        import gb_dataflux
+        for d in decisions:
+            gb_dataflux.emit({
+                "node": node, "label": "gb_tuner", "kind": "tuner_decision",
+                "status": "ok", "n_items": 1, "items": [], "duration_s": 0.0,
+                "lever": d.lever, "action": d.action, "value": d.value,
+                "reason": d.reason, "verify": d.verify,
+                "bottleneck": state.bottleneck,
+                "settle_remaining": state.settle_remaining,
+                "baseline_tok_s": state.baseline_tok_s,
+                "baseline_samples": state.baseline_samples,
+                "applied": bool(gated),
+                "frozen_levers": len(state.frozen),
+            })
+    except Exception:
+        pass
+    return out
+
+
 @mcp.resource("greenboost://semantics")
 def res_semantics() -> str:
     """Full GB-Semantics registry dump: every governed metric, segment,

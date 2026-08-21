@@ -139,3 +139,50 @@ def test_no_restore_when_the_best_depth_was_measured_last(monkeypatch):
     assert res["best"]["draft_n"] == 4
     assert res["restored_depth"] is None
     assert [c[2] for c in fake.calls if c[0] == "serve"] == [2, 4]   # no third serve
+
+
+# ── per-request sweep (2026-08-20 engine patch) ────────────────────────────
+
+def test_per_request_sweep_skips_depths_above_the_served_ceiling(monkeypatch):
+    """The per-request field clamps DOWN only. Reporting a number for a depth
+    the server cannot reach would be a measurement of something else."""
+    import gb_bench_spec as bs
+    import gb_synapse
+    monkeypatch.setattr(gb_synapse, "ps",
+                        lambda *a, **kw: [{"model": "m", "mtp_draft_n": 4}])
+    monkeypatch.setattr(bs, "_measure_once",
+                        lambda *a, **kw: {"decode_tok_s": 5.0,
+                                          "accept_rate": 0.6})
+    out = bs.sweep_per_request("http://x/v1", "m", depths=[2, 8], repeats=1)
+    by_depth = {r["draft_n"]: r for r in out["depths"]}
+    assert by_depth[8].get("skipped"), "depth above the ceiling must be skipped"
+    assert by_depth[2].get("median_tok_s") == 5.0
+    assert out["served_ceiling"] == 4
+
+
+def test_per_request_sweep_stamps_the_depth_on_each_request(monkeypatch):
+    import gb_bench_spec as bs
+    import gb_synapse
+    seen = []
+    monkeypatch.setattr(gb_synapse, "ps",
+                        lambda *a, **kw: [{"model": "m", "mtp_draft_n": 8}])
+    monkeypatch.setattr(bs, "_measure_once",
+                        lambda url, model, prompt, mt, draft_n=None: (
+                            seen.append(draft_n) or {"decode_tok_s": 4.0,
+                                                     "accept_rate": 0.5}))
+    bs.sweep_per_request("http://x/v1", "m", depths=[2, 4], repeats=1)
+    assert set(seen) == {2, 4}
+
+
+def test_depth_zero_reports_no_acceptance_rather_than_a_perfect_one(monkeypatch):
+    import gb_bench_spec as bs
+    import gb_synapse
+    monkeypatch.setattr(gb_synapse, "ps",
+                        lambda *a, **kw: [{"model": "m", "mtp_draft_n": 8}])
+    monkeypatch.setattr(bs, "_measure_once",
+                        lambda *a, **kw: {"decode_tok_s": 3.0,
+                                          "accept_rate": 1.0})
+    out = bs.sweep_per_request("http://x/v1", "m", depths=[0], repeats=1)
+    row = out["depths"][0]
+    assert row["median_accept_rate"] is None
+    assert "nothing drafted" in row["accept_rate_source"]

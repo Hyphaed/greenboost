@@ -164,9 +164,18 @@ KINDS: dict[str, KindSpec] = {
                              "caller didn't know them — absent is not zero. Without "
                              "both, samples are duration- and depth-blind: a 3-token "
                              "reply and a 600-token generation at opposite ends of the "
-                             "context window weigh the same.",
-        fields=("model", "completion_tokens", "prompt_tokens", "skip_reason"),
-        numeric_fields=("tok_s",)),
+                             "context window weigh the same. Streamed replies "
+                             "also carry the inter-token latency block "
+                             "(p50_ms/p95_ms/max_ms/slow_token_ratio/gap_samples) "
+                             "— tok_s is a mean and cannot show a tail, and "
+                             "speculative decode makes the real distribution "
+                             "bimodal. Non-streaming replies arrive in one "
+                             "piece and carry no per-token arrival times, so "
+                             "the block is absent there by construction.",
+        fields=("model", "completion_tokens", "prompt_tokens", "skip_reason",
+                "gap_samples"),
+        numeric_fields=("tok_s", "p50_ms", "p95_ms", "max_ms",
+                        "slow_token_ratio")),
     "model_rotation": KindSpec(
         group="synapse", doc="gb_rotator.py overnight rotation phase event.",
         fields=("model", "phase")),
@@ -367,9 +376,20 @@ KINDS: dict[str, KindSpec] = {
     # Python Proton wrapper, greenboost_gaming/greenboost_proton/proton's
     # own _df_emit() helper (gaming_session at launch/exit, gaming_vram_pressure
     # from _check_t2t3_pressure() polling /sys/class/greenboost/greenboost/pool_brief).
+    # `action` distinguishes the lifecycle points: start / stop (both from the
+    # wrapper) and, since 2026-08-20, `terminated` — the Suite or the tray
+    # asked for the game to be stopped. `method` on a terminated event names
+    # WHO owned the tree ("wrapper" = GreenBoost Proton's own subreaper,
+    # "reaper" = Steam's, "tree" = we walked it ourselves), which is the
+    # difference between a reliable teardown and a best-effort one; `orphans`
+    # > 0 means processes survived both signals.
     "gaming_session": KindSpec(
-        group="gaming", doc="greenboost_gaming/greenboost_proton/proton (Python Proton wrapper): "
-                            "a game session's start/stop lifecycle event.",
+        group="gaming", doc="greenboost_gaming (Python Proton wrapper + gb_gaming.game_lifecycle): "
+                            "a game session's start/stop/terminated lifecycle event.",
+        fields=("action", "appid", "method", "pids_term", "pids_kill", "orphans",
+                "elapsed_s", "peak_vram_mb", "avg_vram_mb", "peak_t2_mb",
+                "vram_samples", "vram_source", "rc"),
+        numeric_fields=("elapsed_s", "peak_vram_mb", "avg_vram_mb", "peak_t2_mb"),
         planned=True),
     "gaming_vram_pressure": KindSpec(
         group="gaming", doc="greenboost_gaming/greenboost_proton/proton (Python Proton wrapper): "
@@ -515,6 +535,29 @@ KINDS: dict[str, KindSpec] = {
                 "invalidated_chars", "turns"),
         numeric_fields=("stable_prefix_chars", "invalidated_chars", "turns"),
         incident_when=("warn",), sync_scope="host"),
+    "tuner_decision": KindSpec(
+        group="orchestration",
+        doc="One tick of GreenBoost's control loop (`gb_tuner.decide()`), "
+            "emitted whether or not anything moved , a tick that decided to "
+            "hold is the answer to 'why did nothing happen', which is what a "
+            "control loop is usually asked. `action` is harvest (give a lever "
+            "back because the bottleneck is elsewhere), restore (a harvest "
+            "regressed, or the bottleneck moved back), set (a new value, e.g. "
+            "speculative depth from measured acceptance), hold, or observe. "
+            "`applied` False means it was advice only , the tool is read-only "
+            "unless double-gated. `settle_remaining` > 0 means the tick was "
+            "deliberately blind: a measurement taken before an actuation lands "
+            "describes the previous state, and acting on it is how a rollback "
+            "gets triggered by pre-change data. `baseline_samples` below the "
+            "policy minimum is why an obvious-looking decision was not taken , "
+            "the n=3-population advisory bug the 2026-08-18 audit caught.",
+        fields=("lever", "action", "value", "reason", "verify", "bottleneck",
+                "settle_remaining", "baseline_tok_s", "baseline_samples",
+                "applied", "frozen_levers"),
+        numeric_fields=("settle_remaining", "baseline_tok_s",
+                        "baseline_samples", "frozen_levers"),
+    ),
+
     "agent_context_edit": KindSpec(
         group="agent",
         doc="greenboost-cli edited its conversation context. `op` is either "
@@ -530,12 +573,28 @@ KINDS: dict[str, KindSpec] = {
             "True when the previous memory block's bytes were reproduced and "
             "extended rather than rewritten. Correlate with prompt_cache: a "
             "compaction followed by a hit_pct collapse means the prefix moved "
-            "when it should not have.",
+            "when it should not have. Two more ops exist for the budget side "
+            "(2026-08-20): `calibrate` grades the CLI's own token estimate "
+            "against the server's `usage.prompt_tokens` "
+            "(`estimate_error_pct` NEGATIVE means the client predicted fewer "
+            "tokens than were charged , the direction that ends turns), and "
+            "`hard_trim` is the last-resort eviction that reaches the live "
+            "tail compaction leaves verbatim (`met` False means even that "
+            "could not fit the budget, so the caller must explain rather than "
+            "retry).",
         fields=("op", "head_kept", "middle_compacted", "tail_kept",
                 "extended_prior", "summary_chars", "results_cleared",
-                "results_kept", "chars_freed"),
+                "results_kept", "chars_freed",
+                "actual_prompt_tokens", "estimated_prompt_tokens",
+                "estimate_error_pct", "chars_per_token", "samples",
+                "budget_tokens", "before_tokens", "after_tokens",
+                "freed_tokens", "met", "steps"),
         numeric_fields=("head_kept", "middle_compacted", "tail_kept",
-                        "summary_chars", "results_cleared", "chars_freed"),
+                        "summary_chars", "results_cleared", "chars_freed",
+                        "actual_prompt_tokens", "estimated_prompt_tokens",
+                        "estimate_error_pct", "chars_per_token", "samples",
+                        "budget_tokens", "before_tokens", "after_tokens",
+                        "freed_tokens", "steps"),
         sync_scope="host"),
     "agent_eval_run": KindSpec(
         group="agent",
@@ -601,6 +660,40 @@ KINDS: dict[str, KindSpec] = {
                               "does, otherwise the next session re-diagnoses 'why "
                               "is the port still bound' from nothing.",
         fields=("target", "pid", "decision"), incident_when=("failed",),
+        sync_scope="host"),
+
+    "apparmor_remediation": KindSpec(
+        group="install",
+        doc="gb_supervisor._patch_apparmor() ran , what it wrote to "
+            "/etc/apparmor.d/local/, whether apparmor_parser accepted the "
+            "profile afterwards, and the fact that the snapd-generated profile "
+            "directory was deliberately left alone. This function modifies "
+            "system security policy and used to emit nothing, which is why the "
+            "2026-08-20 recurrence (it appended rules PAST the closing brace of "
+            "two snap-confine.snapd.* profiles, making them unparseable and "
+            "leaving the system `degraded`) could only be found by reading a "
+            "journal. snapd_profiles_skipped is always true and is recorded "
+            "anyway , it is the assertion that the 2026-07-27 lesson still "
+            "holds in the code that ran.",
+        fields=("files_written", "parser_ok", "snapd_profiles_skipped", "reason"),
+        sync_scope="host"),
+
+    "kmod_version_drift": KindSpec(
+        group="install",
+        doc="greenboost_boot_guard.sh found the LOADED kernel module is not the "
+            "INSTALLED one, and what it did about it. action is one of "
+            "reloaded|deferred_in_use|reload_failed|reloaded_still_mismatched. "
+            "Incident 2026-08-21: MODULES=most baked greenboost.ko into the "
+            "initramfs, whose systemd-modules-load inserted it before the real "
+            "root was mounted; a reinstall rebuilds /lib/modules and never "
+            "touches the initrd, so the box booted v3.2 for days while v3.4 was "
+            "installed, and T3 failed open every boot because /var was not "
+            "mounted yet. The old guard checked `lsmod | grep greenboost` and "
+            "exited 0 on a hit , presence is not identity, which is exactly why "
+            "this event exists.",
+        fields=("action", "loaded_version", "ondisk_version", "loaded_srcversion",
+                "ondisk_srcversion", "refcnt", "kver", "detail"),
+        incident_when=("reload_failed", "reloaded_still_mismatched", "deferred_in_use"),
         sync_scope="host"),
 
     # ── orchestration (advisories and decision-making) ──────────────────

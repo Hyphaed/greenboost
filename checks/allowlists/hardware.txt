@@ -75,12 +75,13 @@ synapse_engine/*
 # Benchmark/telemetry docstrings quoting measured figures from this box.
 gb_bench_turn.py:113        # docstring: measured t2_overflow_active_mb vs tok/s, an observation
 gb_bench_turn.py:147        # docstring: VRAM vs PCIe read-bandwidth comparison, explanatory
-gb_semantics.py:884         # docstring quotes the kernel's own OOM-guard log line verbatim (was :848, line drift)
-gb_semantics.py:1385        # docstring: measured shim-inflated vs real overflow, the never_use trap's evidence (was :1349, line drift)
-gb_semantics.py:1388        # same docstring, continuation line (was :1352, line drift)
-gb_semantics.py:1844        # weights_dont_fit_vram docstring: the measurement that justifies the segment (was :1785, line drift)
-gb_semantics.py:408         # vram_headroom_pct docstring: the 3-session measurement (93.8/90.9/97.9% fill vs 8.45/4.90/3.00 tok/s) that motivates the metric
-gb_semantics.py:1817        # vram_headroom_exhausted docstring: the 97.9%-fill card the old low-side-only tripwire said nothing about
+gb_semantics.py:~27ab0914         # docstring quotes the kernel's own OOM-guard log line verbatim
+gb_semantics.py:~d1534ace        # t3_capacity_configured_mb docstring: the 74752 MB this box reported while T3 was DISABLED , the never_use trap's own evidence (2026-08-21)
+gb_semantics.py:~14dc254d        # docstring: measured shim-inflated vs real overflow, the never_use trap's evidence
+gb_semantics.py:~3b7d9123        # same docstring, continuation line
+gb_semantics.py:~2db72b20        # weights_dont_fit_vram docstring: the measurement that justifies the segment
+gb_semantics.py:~ac1aa691         # vram_headroom_pct docstring: the 3-session measurement (93.8/90.9/97.9% fill vs 8.45/4.90/3.00 tok/s) that motivates the metric
+gb_semantics.py:~5fce7548        # vram_headroom_exhausted docstring: the 97.9%-fill card the old low-side-only tripwire said nothing about
 gb_synapse.py:4018          # docstring: measured KV vs formula estimate, motivates the measurement cache
 gb_synapse.py:4032          # docstring recounting the 2026-08 front-load incident
 gb_synapse.py:4033          # same incident narrative
@@ -90,7 +91,7 @@ gb_synapse.py:5397          # docstring distinguishing "free VRAM" from "VRAM to
 gb_synapse.py:5398          # same docstring, continuation
 gb_synapse.py:5401          # same docstring: bandwidth comparison
 gb_synapse.py:5439          # docstring table of measured serving configurations
-gb_synapse_api.py:1710      # heap-watch docstring recording the 2026-08-19 proxy leak's measured shape (line moved by the 2026-08-20 native-route passthrough)
+gb_synapse_api.py:~1f01fae7      # heap-watch docstring recording the 2026-08-19 proxy leak's measured shape (line moved by the 2026-08-20 native-route passthrough)
 
 # Descriptive text, not values.
 gb_cluster.py:173           # docstring DESCRIBES the max(2048MB, 3%) derivation already implemented
@@ -106,3 +107,32 @@ greenboost_setup.sh:2562    # info() confirming the named owner-workstation pres
 # Pre-probe default, rescaled from live topology before use. Same class as the
 # greenboost.c entries above.
 greenboost_cuda_shim.c:2134 # 512MB initial value, rescaled to max(128MB, 2% of VRAM) after the NVML probe
+gb_semantics.py:~b5e59064        # kv_prefetch_has_no_target docstring: the 2026-08-20 measurement (KV 427 MB in T1, the 6687 MB of T2 all weights) that is the branch's whole gate
+
+# ── Pre-existing prose findings, allowlisted 2026-08-20 ───────────────────
+# None of these is a value any code reads; every one is either an evidence
+# citation inside a docstring (the measurement that justifies the code it sits
+# above) or a usage string shown to a human. They were left blocking by an
+# earlier session, which makes the gate unable to distinguish new breakage from
+# old , the reason to write them down rather than keep stepping over them.
+gb_synapse.py:4168        # _persist_kv_measurement docstring: the measured-vs-formula gap (788 vs 2270 MB) that is why the measurement cache exists
+gb_synapse.py:4182        # same docstring: the front-load incident it records
+gb_synapse.py:4183        # same docstring, continuation
+gb_synapse.py:4184        # same docstring, continuation
+gb_synapse.py:4185        # same docstring, continuation
+gb_synapse.py:5547        # docstring: "free VRAM is not VRAM total" , the measurement that makes the distinction concrete
+gb_synapse.py:5548        # same docstring, continuation
+gb_synapse.py:5551        # same docstring: measured bandwidth figures cited as evidence
+gb_synapse.py:5589        # docstring table of measured serving configurations
+gb_synapse_api.py:~e3b0c442    # docstring: the 2026-08-18 heap census that motivated the bounded SSE telemetry
+greenboost_setup.sh:3407  # user-facing usage string ("e.g. 100GB"), not a value the script reads
+greenboost_setup.sh:3415  # user-facing error message, same
+
+# ── 2026-08-21 ──────────────────────────────────────────────────────────────
+# Four findings that predate this session's work and were blocking the gate.
+# Each was read: all four are prose or UI text, none is a value that reaches a
+# placement/sizing decision.
+gb_synapse_api.py:~9bb7e8aa      # _heap_census docstring recounting the measurement that FOUND the leak (5.4 GB in ~500 MB arenas) , same class as the other historical-fix docstrings above
+greenboost_setup.sh:2621    # info() label naming the box the owner-workstation preset was tuned for; the preset's actual values are the GB_* assignments above this line, not this string
+greenboost_setup.sh:3466    # `greenboost t3-memory` usage text , example sizes in help output
+greenboost_setup.sh:3474    # `greenboost t3-memory` invalid-input error text , example sizes in the message

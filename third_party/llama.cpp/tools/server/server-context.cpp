@@ -433,6 +433,15 @@ struct server_slot {
             n_draft_max = std::min(n_draft_max, n_remaining - 1);
         }
 
+        // GreenBoost patch (2026-08-20): honour this request's own
+        // `speculative.n_max`. Without it the value parsed out of the request
+        // is overwritten here by the context-fit bound on every step, so the
+        // schema field would parse cleanly and change nothing. Clamps DOWN
+        // only , the server's launch value remains the ceiling.
+        if (task->params.speculative.draft.n_max >= 0) {
+            n_draft_max = std::min(n_draft_max, task->params.speculative.draft.n_max);
+        }
+
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
         return n_draft_max;

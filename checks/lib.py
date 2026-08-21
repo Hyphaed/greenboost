@@ -47,11 +47,48 @@ def load_allowlist(path: Path) -> list[str]:
     return [p for p in out if p]
 
 
-def is_allowlisted(rel_path: str, line: int, patterns: list[str]) -> bool:
+def content_anchor(text: str) -> str:
+    """Stable 8-hex fingerprint of one source line, whitespace-normalised.
+
+    The anchor for `path:~<sha8>` allowlist entries. Normalising whitespace
+    means re-indenting a docstring does not invalidate the entry, while
+    changing what it actually says does , which is the distinction that
+    matters, since the thing being sanctioned is the CONTENT.
+    """
+    import hashlib
+    return hashlib.sha256(" ".join(text.split()).encode()).hexdigest()[:8]
+
+
+def is_allowlisted(rel_path: str, line: int, patterns: list[str],
+                   line_text: "str | None" = None) -> bool:
+    """Is this finding sanctioned?
+
+    Three entry forms, in increasing robustness:
+
+      path                 , whole file (also fnmatch globs)
+      path:line            , one exact line, BY NUMBER
+      path:~<sha8>         , one exact line, BY CONTENT (`content_anchor`)
+
+    Prefer the anchored form. Line-numbered entries drift every time anything
+    is inserted above them, and drift here is not a cosmetic problem: the
+    entry keeps matching a line NUMBER that now holds unrelated code, so it
+    silently sanctions something nobody reviewed while the line it was written
+    for goes unguarded. That is not hypothetical , on 2026-08-21 a four-entry
+    group in secrets_reviewed.txt was found pointing at ordinary prose, having
+    been papered over by ADDING a second group rather than repairing the
+    first, and the hardware allowlist drifted four times in one session.
+
+    An anchored entry cannot drift: it matches the content wherever it moved
+    to, and stops matching the moment that content changes , which is exactly
+    when a human should look again.
+    """
     exact = f"{rel_path}:{line}"
     for pat in patterns:
         if pat == exact or pat == rel_path:
             return True
+        if line_text is not None and pat.startswith(f"{rel_path}:~"):
+            if pat.split(":~", 1)[1].strip() == content_anchor(line_text):
+                return True
         if fnmatch.fnmatch(rel_path, pat):
             return True
     return False

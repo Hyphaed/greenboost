@@ -26,13 +26,25 @@
 
 - intent: why_is_it_slow
   triggers: ["slow", "throttl", "stall", "why is generation slow", "performance problem", "tok/s dropped"]
-  metrics: [tok_s_decode, swap_pressure, iowait_pct]
-  segments: [swap_thrash_not_gpu_throttle, kmod_missing_silent_degrade]
+  metrics: [tok_s_decode, inter_token_p95_ms, slow_token_ratio, swap_pressure, iowait_pct]
+  segments: [decode_tail_heavy, swap_thrash_not_gpu_throttle, kmod_missing_silent_degrade]
+
+- intent: decode_latency_shape
+  triggers: ["stutter", "jerky", "uneven output", "pauses while typing", "p95",
+             "tail latency", "inter-token", "time between tokens", "bursty"]
+  metrics: [inter_token_p95_ms, slow_token_ratio, tok_s_decode]
+  segments: [decode_tail_heavy]
 
 - intent: memory_pressure
   triggers: ["t2 pressure", "ddr pressure", "memory pressure", "swap", "oom"]
   metrics: [t2_pressure_level, t2_pressure_fraction, kv_resident_share]
   segments: [rule1_underfilled]
+
+- intent: t3_state
+  triggers: ["is t3 on", "t3 enabled", "tier 3", "why is t3 disabled", "t3 off",
+             "nvme tier", "t3 backing file", "is tier 3 working"]
+  metrics: [t3_enabled, t3_capacity_configured_mb, t3_spill_active_mb]
+  segments: [t3_configured_but_disabled]
 
 - intent: weights_placement
   triggers: ["weights on disk", "t3", "nvme spill", "placement floor"]
@@ -117,6 +129,55 @@
   raw_tool_fallback: >
     dataflux_events(kind="agent_eval_run") and kind="agent_tool_schema_miss".
 
+- intent: kv_in_t2
+  triggers:
+    - "is kv spilling to t2"
+    - "kv in t2"
+    - "kv cache spill"
+    - "is overflow active"
+    - "kv prefetch"
+    - "should we prefetch kv"
+    - "what is in t2"
+  metrics: ["kv_t2_resident_mb", "kv_prefetch_opportunities",
+            "t2_overflow_active_mb", "weights_gb"]
+  segments: ["kv_prefetch_has_no_target", "weights_dont_fit_vram"]
+  raw_tool_fallback: >
+    /run/greenboost/shim_stats , kv_t2_live_mb for KV specifically,
+    t2_overflow_total_mb for ALL of T2 (weights included, and on this box the
+    weights are almost all of it).
+
+- intent: tuner_state
+  triggers:
+    - "should i give clocks back"
+    - "is the gpu wasting power"
+    - "harvest"
+    - "why is nothing being tuned"
+    - "control loop"
+    - "draft depth"
+    - "speculative depth"
+    - "is speculation paying"
+  metrics: ["tuner_harvesting", "draft_accept_pct", "t2_overflow_active_mb",
+            "inter_token_p95_ms"]
+  segments: ["bandwidth_bound_harvestable", "decode_tail_heavy"]
+  raw_tool_fallback: >
+    tuner_tick() on greenboost-orchestrator for the live decision, or
+    dataflux_events(kind="tuner_decision") for the history.
+
+- intent: ctx_budget_fit
+  triggers:
+    - "exceeds the available context size"
+    - "context overflow"
+    - "request too big"
+    - "400 context"
+    - "why did my turn fail"
+    - "ran out of context"
+    - "compaction did not help"
+  metrics: ["ctx_estimate_error_pct", "ctx_hard_trims", "agent_compaction_prefix_kept_pct"]
+  segments: ["ctx_estimate_undercounts"]
+  raw_tool_fallback: >
+    dataflux_events(kind="agent_context_edit") , op=calibrate carries the
+    estimate-vs-server gap, op=hard_trim carries what had to be evicted.
+
 - intent: agent_context_cost
   triggers:
     - "slow after compact"
@@ -130,3 +191,34 @@
   segments: ["agent_compaction_broke_prefix"]
   raw_tool_fallback: >
     dataflux_events(kind="agent_context_edit") correlated with kind="prompt_cache".
+
+- intent: gaming_session_state
+  triggers: ["gaming mode", "is a game running", "game still running", "stuck game",
+             "close the game", "stop the game", "game did not close", "orphan process",
+             "why is inference slow after gaming"]
+  metrics: [gaming_mode_active, gaming_session_orphans]
+  segments: [gaming_mode_stuck]
+
+- intent: is_the_running_module_stale_from_the_boot_image
+  triggers: ["stale module", "initramfs", "initrd", "old module after reboot",
+             "still shows the old version", "version comes back", "reinstalled but still",
+             "module is 3.2", "why is it still the old version", "reboot did not fix"]
+  metrics: [kmod_load_stage, kmod_loaded_version, core_build_version]
+  segments: [kmod_stale_from_initramfs, kmod_version_drift]
+
+- intent: apparmor_and_system_health
+  triggers: ["is the system degraded", "did greenboost break apparmor", "snapd.apparmor",
+             "snaps won't launch", "snap-confine", "apparmor", "failed units",
+             "why is systemctl degraded"]
+  metrics: [system_degraded, apparmor_profiles_contaminated]
+  segments: [apparmor_contaminated_by_greenboost]
+
+- intent: why_will_my_game_not_launch
+  triggers: ["launch", "launching", "game", "not launching", "won't launch",
+             "will not start", "stuck on launching", "launch stuck",
+             "nothing happens when i launch", "steam says launching",
+             "not starting", "why is my game not up", "launch failed",
+             "is the game running", "shaders", "compiling shaders",
+             "shader cache", "proton", "wine", "prefix"]
+  metrics: [game_process_running, game_launch_attempts, proton_tools_installed, shader_cache_mb]
+  segments: [proton_tool_race, game_launch_retry_loop, launch_made_only_wine_infrastructure, gaming_mode_stuck]
