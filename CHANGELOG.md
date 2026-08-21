@@ -3,7 +3,7 @@
 ## v3.5 : in development, not released
 There is no v3.5 release or tag. This is the current state of `main`: it builds and passes its gates, but it is still changing. Use `v3.4` if you want the last stable release.
 
-The biggest fixes are around session caching, persistence, and measurement. Restored sessions no longer lose their prompt cache during the first compaction because memory blocks stay pinned in the prompt prefix. The cache metric was also corrected: only actually retained prefixes count now. This means the reported percentage may drop even though caching is working better. Gated DeltaNet state still has to replay after compaction; that is a separate cost.
+The biggest fixes are around session caching, persistence, and measurement. Restored sessions no longer lose their prompt cache during the first compaction because memory blocks stay pinned in the prompt prefix. The cache metric was also corrected: only actually retained prefixes count now. This means the reported percentage may drop even though caching is working better. 
 
 Checkpoints now save idle slots without stopping the engine, including recurrent state, and restore only when the model and relevant runtime settings match. They make restarts survivable, but they do **not** restore prefill speed. Keeping the engine alive is dramatically faster, so checkpointing should be treated as crash protection, not a performance feature.
 
@@ -11,12 +11,9 @@ Several smaller issues were cleaned up: decode rates now survive tool calls, req
 
 The tuner is now deliberately conservative. It only advises changes unless explicitly allowed to apply them, verifies the result, and rolls back regressions. Speculative decoding uses real traffic instead of benchmark assumptions, while streaming reports p50/p95/max latency and slow-token rates rather than hiding everything behind average tok/s.
 
-Log clearing now covers all GreenBoost logs and archives them first by default. Telemetry distinguishes "no data" from a broken recorder. Memory settings are derived from installed RAM instead of fixed values, and crashed gaming sessions can be diagnosed instead of leaving `gaming_mode` stuck unnoticed.
+Telemetry distinguishes "no data" from a broken recorder. Memory settings are derived from installed RAM instead of fixed values, and crashed gaming sessions can be diagnosed instead of leaving `gaming_mode` stuck unnoticed.
 
-GreenBoost still works on a stock kernel. The Hyphaed kernel adds optional support for prioritising DMA buffers during memory pressure; the other kernel patches are either preparatory, build-related, or documentation-only. None of the kernel patches are upstream yet.
-
-In short: the release fixes several places where GreenBoost looked healthier than it really was, and replaces optimistic metrics with measurements that reflect what the system actually did.
-
+GreenBoost still works on a stock kernel. The Hyphaed kernel adds optional support for prioritising DMA buffers during memory pressure; the other kernel patches are either preparatory or build-related. 
 
 ## v3.4 : 2026-08-18
 
