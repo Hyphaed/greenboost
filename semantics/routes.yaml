@@ -222,3 +222,10 @@
              "shader cache", "proton", "wine", "prefix"]
   metrics: [game_process_running, game_launch_attempts, proton_tools_installed, shader_cache_mb]
   segments: [proton_tool_race, game_launch_retry_loop, launch_made_only_wine_infrastructure, gaming_mode_stuck]
+
+- intent: why_is_there_no_telemetry
+  triggers: ["no telemetry", "no dataflux", "no events", "empty dataflux",
+             "why is there no telemetry", "telemetry is empty", "logs were cleared",
+             "no data", "flight recorder empty", "dataflux reset"]
+  metrics: [dataflux_event_count, kmod_loaded, shim_fresh]
+  segments: [dataflux_history_reset]

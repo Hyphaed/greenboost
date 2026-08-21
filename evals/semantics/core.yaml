@@ -234,6 +234,21 @@
   name: shim_fresh
   source: live
 
+# Both live, not fixture: dataflux_event_count reads the machine's real log,
+# and dataflux_history_reset gates on live kmod_loaded, so neither has a
+# machine-independent ground truth. The structural check is still the one that
+# matters here , it catches a renamed or missing resolver/evaluator, which is
+# how this pair would actually break.
+- id: dataflux_event_count_structural
+  kind: metric
+  name: dataflux_event_count
+  source: live
+
+- id: dataflux_history_reset_structural
+  kind: segment
+  name: dataflux_history_reset
+  source: live
+
 - id: ssm_state_gb_structural
   kind: metric
   name: ssm_state_gb
