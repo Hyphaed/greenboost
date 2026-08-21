@@ -922,8 +922,16 @@ def _res_agent_compaction_prefix_kept_pct(entity_id, window_s):
     if not ev:
         return {"value": None, "unit": "percent",
                 "raw_source": "no agent_context_edit events yet"}
-    kept = sum(1 for e in ev
-               if e.get("extended_prior") is True or (e.get("head_kept") or 0) > 0)
+    # head_kept > 0 is the ONLY thing that means the prefix survived.
+    #
+    # This used to accept `extended_prior is True` as equivalent, and that is
+    # exactly backwards: extended_prior says a prior memory block was absorbed
+    # out of the middle and folded into the new summary, which REWRITES it at a
+    # new position. The prefix-destroying compaction found on 2026-08-21 emitted
+    # {"head_kept": 0, "extended_prior": True} , scored as a success by this
+    # resolver while it was throwing the whole prefix away. The 50% this
+    # reported was therefore an over-estimate of a worse number.
+    kept = sum(1 for e in ev if (e.get("head_kept") or 0) > 0)
     return {"value": round(100.0 * kept / len(ev), 1), "unit": "percent",
             "raw_source": f"agent_context_edit over {len(ev)} compaction(s)"}
 

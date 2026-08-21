@@ -74,14 +74,34 @@ def test_a_clean_tool_surface_does_not_match(monkeypatch):
     assert S.evaluate_segment("agent_hallucinating_tool_names")["matched"] is False
 
 
-def test_prefix_preserved_counts_either_signal(monkeypatch):
-    """extended_prior OR a non-zero head_kept means the prefix survived."""
+def test_prefix_preserved_counts_only_head_kept(monkeypatch):
+    """Only head_kept > 0 means the prefix survived.
+
+    This used to accept `extended_prior` as an equivalent signal and expect
+    66.7% from the events below. That was wrong in the dangerous direction.
+    extended_prior means a prior memory block was absorbed OUT of the middle
+    and folded into a freshly generated summary, which places it at a new
+    offset , the prefix is rewritten, not preserved.
+
+    The compaction bug found on 2026-08-21 emitted exactly
+    {"head_kept": 0, "extended_prior": True} on every restored session, and
+    this resolver scored each one as a success while the whole prefix was being
+    thrown away. The reported 50% was therefore flattering a worse number.
+    """
     _events(monkeypatch, {"agent_context_edit": [
-        {"extended_prior": True, "head_kept": 0},
-        {"extended_prior": False, "head_kept": 12},
-        {"extended_prior": False, "head_kept": 0},      # this one moved it
+        {"extended_prior": True, "head_kept": 0},       # prefix REWRITTEN
+        {"extended_prior": False, "head_kept": 12},     # prefix kept
+        {"extended_prior": False, "head_kept": 0},      # prefix REWRITTEN
     ]})
-    assert S.resolve("agent_compaction_prefix_kept_pct")["value"] == pytest.approx(66.7)
+    assert S.resolve("agent_compaction_prefix_kept_pct")["value"] == pytest.approx(33.3)
+    assert S.evaluate_segment("agent_compaction_broke_prefix")["matched"] is True
+
+
+def test_extended_prior_alone_is_not_prefix_preservation(monkeypatch):
+    """The exact shape the old resolver mis-scored, isolated."""
+    _events(monkeypatch, {"agent_context_edit": [
+        {"extended_prior": True, "head_kept": 0}] * 4})
+    assert S.resolve("agent_compaction_prefix_kept_pct")["value"] == 0.0
     assert S.evaluate_segment("agent_compaction_broke_prefix")["matched"] is True
 
 
