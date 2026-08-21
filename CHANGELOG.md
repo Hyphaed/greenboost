@@ -14,6 +14,101 @@ Take `main` directly, it builds and its gates pass:
 Already have a checkout: `git fetch origin && git checkout main && git pull`.
 Prefer the last stable release: `git checkout v3.4`.
 
+### Restored sessions were throwing away their prompt cache on the first compaction
+
+Every conversation this CLI restores had one compaction that rewrote its own
+prefix, and the cost was paid on the turn after it: the engine re-prefilled the
+whole conversation instead of reusing what it already had.
+
+The compactor keeps a few leading messages pinned so the start of the prompt
+stays byte-identical from turn to turn. If one of those pinned messages was a
+memory block it treated that as a degenerate case and unpinned the lot, which
+pushed the block into the middle, where it gets absorbed into the summary and
+re-emitted at a different position. Every byte after position zero moved, so
+there was nothing left for the engine to match.
+
+That could only happen on a session that had already been compacted once ,
+which is every restored session, and this CLI restores by default. Fresh
+sessions were fine the whole time. That split is the measured 50%: not half of
+compactions degrading a bit, but one group keeping everything and the other
+losing all of it.
+
+A memory block in the head is the good case, not a degenerate one. It is the
+most byte-identical thing in the prompt. It stays pinned now, the prefix grows
+forwards and never rewrites, and a second memory block simply lands after the
+first.
+
+The gauge was also wrong, in the flattering direction. It counted
+`extended_prior` as evidence the prefix survived, and `extended_prior` means a
+memory block was folded into a new summary , the rewrite itself. The exact
+compaction that destroyed the prefix reported `head_kept: 0, extended_prior:
+true` and scored as a success. Only `head_kept > 0` counts now, so the number
+you see may be **lower** than before while describing a strictly better system.
+
+**What this does not fix.** It restores cache reuse for the attention layers
+only. The 48 Gated DeltaNet layers update their state in place, so it exists
+only at the tip of the sequence and cannot be rolled back to a prefix , they
+replay regardless. That is a separate and larger cost, and it has its own
+metric.
+
+    gb semantics resolve agent_compaction_prefix_kept_pct --json
+    gb semantics resolve recurrent_replay_ms --json
+
+### Your conversation survives a restart, and it buys less than it looks like
+
+`gb synapse checkpoint` writes every idle slot to disk without stopping the
+engine. `pause` is the other one , it stops the engine to hand the VRAM back.
+This one leaves it serving, so a crash or a restart is survivable.
+
+It is fast and it is small. A slot holding 12,762 tokens is 392 MB and saves in
+95 ms. 154 MB of that is Gated DeltaNet recurrent state, which no KV cache can
+reconstruct, and it is a fixed cost , the same 154 MB at 500 tokens as at
+24,000. Predicting the size from the model's own GGUF metadata gives 393.0 MB
+against a measured 392.4, so the arithmetic is understood rather than observed.
+
+**Now the part that matters, because it is not what we expected.** Restoring a
+checkpoint brings the bytes back and does **not** give you prefill back on this
+model. Replaying an identical prompt after a restart and a successful restore
+took 62.48 s with `cached=0`, against 4.23 s on a warm live slot. llama.cpp
+picked the right slot and scored it a perfect `sim_best=1.000` , then
+re-prefilled all 11,767 tokens anyway.
+
+So read a restore duration as bytes moved and nothing else. `resume()` has
+reported "537 ms for 54,377 tokens" for a while now and that figure was never
+wrong, it was just never checked against the request that followed it; it is
+labelled accordingly.
+
+What genuinely works is reuse inside one engine that never went away: the same
+prompt went 62.9 s cold to 1.65 s warm, `cached=11763`. **Keeping the engine
+alive is worth far more than checkpointing it.** Checkpoint for survivability.
+Do not checkpoint expecting speed.
+
+A restore is refused unless the model, quantisation, context size, KV type and
+engine all match what the checkpoint was taken under , a slot dump fed to the
+wrong engine does not fail loudly, it feeds the model somebody else's numbers.
+`n_gpu_layers` and `tensor_split` are deliberately not compared: they decide
+where layers live, not how bytes are laid out, and `tensor_split` is recomputed
+from live free VRAM on every serve (10352 on one start, 10267 on the next,
+minutes apart, same model and flags). Comparing it made every checkpoint
+unrestorable for a difference that cannot affect correctness. Slots that are
+mid-generation are skipped and named rather than saved half-written.
+
+    gb semantics resolve recurrent_replay_ms --json
+
+### Every block shows its decode rate, not just the last one
+
+A turn that called three tools printed a token count with no `t/s` on every
+block but the final one. The status line restarts after each tool call and
+cleared the timing it needed to divide by , but the decoding had already
+happened, before the tool ran, so there was nothing left to measure and the
+rate silently vanished.
+
+It now carries the rate the server itself reported for the turn. `gb_synapse`
+measures first-token-to-last, which is the real decode span; this process only
+ever sees totals after the fact and was the outlier. One turn that calls three
+tools is still one turn, and its decode rate did not change because a tool ran
+in the middle of it.
+
 ### Reinstalling actually replaces the module now
 
 If your boot image bundles kernel modules, `greenboost.ko` was going in with
