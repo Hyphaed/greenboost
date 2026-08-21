@@ -136,3 +136,6 @@ gb_synapse_api.py:~9bb7e8aa      # _heap_census docstring recounting the measure
 greenboost_setup.sh:2621    # info() label naming the box the owner-workstation preset was tuned for; the preset's actual values are the GB_* assignments above this line, not this string
 greenboost_setup.sh:3466    # `greenboost t3-memory` usage text , example sizes in help output
 greenboost_setup.sh:3474    # `greenboost t3-memory` invalid-input error text , example sizes in the message
+greenboost_setup.sh:2695    # info() label naming the box the owner-workstation preset was tuned for; the preset's actual values are the GB_* assignments above this line, not this string (was :2621, line drift, the dracut initramfs-exclusion rewrite added 74 lines above it)
+greenboost_setup.sh:3540    # `greenboost t3-memory` usage text , example sizes in help output (was :3466, same line drift)
+greenboost_setup.sh:3548    # `greenboost t3-memory` invalid-input error text , example sizes in the message (was :3474, same line drift)

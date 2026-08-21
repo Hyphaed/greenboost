@@ -1314,3 +1314,31 @@
         without filtering to a real stop event for the appid you care about
         reports a 6-second abort as the play session.
   aliases: [game_session_seconds, last_playtime_s, session_length]
+
+- name: dataflux_event_count
+  entity: node
+  unit: count
+  doc: >
+    Events currently in the dataflux log (live file + rotated archive). Governed
+    because "GreenBoost cannot tell me anything" has two completely different
+    causes that look identical from the outside: telemetry is broken, or the log
+    was deliberately cleared and has not refilled yet. Every metric whose
+    resolver reads recent events , ttft_ms, prompt_cache_hit_pct, tok_s_decode ,
+    goes unresolvable in both cases, and without this count there is no governed
+    way to tell which one you are in. Added 2026-08-21 alongside
+    `greenboost clear logs`, which wipes this to zero by design.
+  resolver: dataflux_event_count
+  source_fields: ["gb_dataflux.read_events"]
+  source_tier: measured
+  direction: higher_is_better
+  owner: Gb-Dataflux
+  never_use:
+    - field: "os.path.getsize(dataflux.jsonl)"
+      class: unit_mismatch
+      why: >
+        File size is not event count and rotation makes it lie in the one
+        direction that matters here: rotation gzips the old log into
+        `dataflux.jsonl.1.gz` and truncates the live file, so a healthy, busy
+        recorder shows a near-zero size seconds after a rotation. Reading the
+        size would report "telemetry is dead" for a recorder that is working
+        perfectly.

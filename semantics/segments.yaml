@@ -450,3 +450,14 @@
   evaluator: launch_made_only_wine_infrastructure
   reads: [game_process_running]
   severity: warning
+
+- name: dataflux_history_reset
+  doc: >
+    The dataflux log holds (almost) nothing, and the reason is that it was
+    cleared, not that recording is broken. Distinguishes a deliberate reset from
+    a dead recorder , the two present identically as every event-reading metric
+    returning None, and the operator's next action is opposite in each case
+    (wait vs. investigate).
+  evaluator: dataflux_history_reset
+  reads: [dataflux_event_count, kmod_loaded]
+  severity: info

@@ -153,40 +153,113 @@ gb_dataflux_emit() {
 # and /var is unmounted that early so T3 fails open on every boot.
 GB_INITRAMFS_HOOK="/etc/initramfs-tools/hooks/zz-greenboost-exclude"
 GB_DRACUT_EXCLUDE="/etc/dracut.conf.d/99-greenboost-exclude.conf"
+GB_DRACUT_MODULE_DIR="/usr/lib/dracut/modules.d/99greenboost-exclude"
 
-# Rebuild the boot image(s) for every installed kernel. Best-effort , a machine
-# whose initramfs tool we don't recognise is not a failed install, it just keeps
-# whatever image it had.
-gb_initramfs_refresh() {
-    if command -v update-initramfs &>/dev/null; then
-        update-initramfs -u -k all &>/dev/null \
-            && gb_ok "initramfs regenerated for all installed kernels" \
-            || gb_warn "update-initramfs failed , the boot image may still hold an old greenboost.ko (run: sudo update-initramfs -u -k all)"
-    elif command -v dracut &>/dev/null; then
-        dracut --force --regenerate-all &>/dev/null \
-            && gb_ok "initramfs regenerated for all installed kernels (dracut)" \
-            || gb_warn "dracut failed , the boot image may still hold an old greenboost.ko (run: sudo dracut --force --regenerate-all)"
-    elif command -v mkinitcpio &>/dev/null; then
-        mkinitcpio -P &>/dev/null \
-            && gb_ok "initramfs regenerated for all installed kernels (mkinitcpio)" \
-            || gb_warn "mkinitcpio failed , the boot image may still hold an old greenboost.ko (run: sudo mkinitcpio -P)"
-    else
-        gb_warn "no known initramfs tool found , if your boot image bundles kernel modules, regenerate it manually"
+# Which tool actually builds this machine's boot image?
+#
+# Do NOT answer this by testing for a directory or a binary (incident
+# 2026-08-21, this box). On Ubuntu 26.04 `initramfs-tools-core` ships
+# /etc/initramfs-tools/hooks/ AND /usr/sbin/update-initramfs while dracut is
+# the generator , so both the old `[[ -d /etc/initramfs-tools/hooks ]]` test
+# and a bare `command -v update-initramfs` pick the wrong one. The exclusion
+# hook then lands somewhere nothing ever reads it, and the boot image keeps
+# whatever it had. Only the initramfs-tools META-package wires that generator
+# into the kernel postinst, and kernel-install hands the job to dracut when
+# 50-dracut.install is present , those are the real signals.
+#
+# Echoes one of: dracut | initramfs-tools | mkinitcpio | unknown
+gb_initramfs_generator() {
+    [[ -n "${_GB_INITRAMFS_GEN:-}" ]] && { printf '%s' "$_GB_INITRAMFS_GEN"; return 0; }
+
+    local gen="unknown" _it_meta=0 _dracut_ki=0
+
+    if command -v dpkg-query &>/dev/null; then
+        dpkg-query -W -f='${db:Status-Status}' initramfs-tools 2>/dev/null \
+            | grep -q '^installed$' && _it_meta=1
+    elif command -v update-initramfs &>/dev/null; then
+        # Non-dpkg distro shipping update-initramfs , nothing better to go on.
+        _it_meta=1
     fi
+
+    [[ -x /usr/lib/kernel/install.d/50-dracut.install || \
+       -x /etc/kernel/install.d/50-dracut.install ]] && _dracut_ki=1
+
+    if command -v dracut &>/dev/null && { [[ $_dracut_ki -eq 1 ]] || [[ $_it_meta -eq 0 ]]; }; then
+        gen="dracut"
+    elif [[ $_it_meta -eq 1 ]] && command -v update-initramfs &>/dev/null; then
+        gen="initramfs-tools"
+    elif command -v mkinitcpio &>/dev/null; then
+        gen="mkinitcpio"
+    fi
+
+    _GB_INITRAMFS_GEN="$gen"
+    printf '%s' "$gen"
 }
 
+# Rebuild the boot image(s) for every installed kernel, using the generator that
+# actually owns them. Best-effort , a machine whose initramfs tool we don't
+# recognise is not a failed install, it just keeps whatever image it had.
+gb_initramfs_refresh() {
+    case "$(gb_initramfs_generator)" in
+        dracut)
+            dracut --force --regenerate-all &>/dev/null \
+                && gb_ok "initramfs regenerated for all installed kernels (dracut)" \
+                || gb_warn "dracut failed , the boot image may still hold an old greenboost.ko (run: sudo dracut --force --regenerate-all)"
+            ;;
+        initramfs-tools)
+            update-initramfs -u -k all &>/dev/null \
+                && gb_ok "initramfs regenerated for all installed kernels (initramfs-tools)" \
+                || gb_warn "update-initramfs failed , the boot image may still hold an old greenboost.ko (run: sudo update-initramfs -u -k all)"
+            ;;
+        mkinitcpio)
+            mkinitcpio -P &>/dev/null \
+                && gb_ok "initramfs regenerated for all installed kernels (mkinitcpio)" \
+                || gb_warn "mkinitcpio failed , the boot image may still hold an old greenboost.ko (run: sudo mkinitcpio -P)"
+            ;;
+        *)
+            gb_warn "no known initramfs tool found , if your boot image bundles kernel modules, regenerate it manually"
+            ;;
+    esac
+}
+
+# Install the exclusion for EVERY generator whose tooling is present, not just
+# the active one. Each is inert under the other (dracut never reads an
+# initramfs-tools hook and vice versa), and installing both means a machine that
+# later switches generators , or that we mis-detect , still boots a clean image.
+# gb_remove_initramfs_exclusion() already removes all of them.
 gb_install_initramfs_exclusion() {
-    local _installed=0
+    local _installed=0 _gen
+    _gen="$(gb_initramfs_generator)"
+
     if [[ -d /etc/initramfs-tools/hooks && -f "$MODULE_DIR/initramfs/zz-greenboost-exclude" ]]; then
         install -m 755 "$MODULE_DIR/initramfs/zz-greenboost-exclude" "$GB_INITRAMFS_HOOK" \
             && { gb_ok "initramfs exclusion installed: $GB_INITRAMFS_HOOK"; _installed=1; }
     fi
-    if [[ $_installed -eq 0 ]] && command -v dracut &>/dev/null && [[ -d /etc/dracut.conf.d ]]; then
-        printf 'omit_drivers+=" greenboost "\n' > "$GB_DRACUT_EXCLUDE" \
-            && { gb_ok "initramfs exclusion installed: $GB_DRACUT_EXCLUDE"; _installed=1; }
+
+    if command -v dracut &>/dev/null; then
+        # omit_drivers keeps greenboost.ko out. It does NOT keep the tmpfiles /
+        # modules-load fragments out , only the module below can do that, which
+        # is why both halves ship together.
+        if [[ -d /etc/dracut.conf.d ]]; then
+            {
+                printf 'omit_drivers+=" greenboost "\n'
+                printf 'add_dracutmodules+=" greenboost-exclude "\n'
+            } > "$GB_DRACUT_EXCLUDE" \
+                && { gb_ok "initramfs exclusion installed: $GB_DRACUT_EXCLUDE"; _installed=1; }
+        fi
+        if [[ -f "$MODULE_DIR/initramfs/dracut/99greenboost-exclude/module-setup.sh" ]]; then
+            install -d -m 755 "$GB_DRACUT_MODULE_DIR" \
+                && install -m 755 "$MODULE_DIR/initramfs/dracut/99greenboost-exclude/module-setup.sh" \
+                        "$GB_DRACUT_MODULE_DIR/module-setup.sh" \
+                && { gb_ok "initramfs exclusion installed: $GB_DRACUT_MODULE_DIR"; _installed=1; }
+        fi
     fi
-    [[ $_installed -eq 0 ]] \
-        && gb_warn "could not install an initramfs exclusion for this distro , check that greenboost.ko is not baked into your boot image"
+
+    if [[ $_installed -eq 0 ]]; then
+        gb_warn "could not install an initramfs exclusion for this distro , check that greenboost.ko is not baked into your boot image"
+    else
+        gb_info "active initramfs generator: $_gen"
+    fi
     gb_initramfs_refresh
     return 0
 }
@@ -199,6 +272,7 @@ gb_remove_initramfs_exclusion() {
     for f in "$GB_INITRAMFS_HOOK" "$GB_DRACUT_EXCLUDE"; do
         [[ -f "$f" ]] && rm -f "$f" && _removed=1
     done
+    [[ -d "$GB_DRACUT_MODULE_DIR" ]] && rm -rf "$GB_DRACUT_MODULE_DIR" && _removed=1
     [[ $_removed -eq 1 ]] && gb_initramfs_refresh
     return 0
 }
@@ -6336,7 +6410,7 @@ case "\$1" in
     diag)            exec "\$GB_SETUP" diag "\${@:2}" ;;
     inference-logs)  exec "\$GB_SETUP" inference-logs "\${@:2}" ;;
     clear)           exec "\$GB_SETUP" clear "\${@:2}" ;;
-    clean-logs)      exec "\$GB_SETUP" clean-logs ;;
+    clean-logs)      exec "\$GB_SETUP" clean-logs "\${@:2}" ;;
     test)            exec "\$GB_SETUP" test "\${@:2}" ;;
     run)          shift
         _gb_vmm="$SHIM_DEST/libgreenboost_vmm_override.so"
@@ -6669,7 +6743,10 @@ cmd_uninstall() {
     info "  - /etc/ld.so.preload entries for GreenBoost"
     info "  - /etc/modprobe.d/greenboost.conf"
     info "  - /etc/modules-load.d/greenboost.conf"
-    info "  - /etc/initramfs-tools/hooks/zz-greenboost-exclude (+ initramfs rebuild)"
+    info "  - initramfs exclusions (+ initramfs rebuild):"
+    info "      /etc/initramfs-tools/hooks/zz-greenboost-exclude"
+    info "      /etc/dracut.conf.d/99-greenboost-exclude.conf"
+    info "      /usr/lib/dracut/modules.d/99greenboost-exclude/"
     info "  - /etc/profile.d/greenboost.sh"
     info "  - /etc/sysctl.d/99-greenboost.conf"
     info "  - /etc/sysfs.d/greenboost-hugepages.conf"
@@ -7378,30 +7455,153 @@ cmd_tune_all() {
     info "Reboot to activate GRUB changes: sudo reboot"
 }
 
+# ── cmd_clear_logs , the whole GreenBoost log surface, not just /var/log ─────
+#
+# Usage: greenboost clear logs [--no-archive] [--keep-journal] [--yes]
+#
+# What "all logs" has to mean (found 2026-08-21): this verb used to clear only
+# dmesg, the journal and /var/log/greenboost/, which left the two biggest
+# stores untouched , dataflux.jsonl (29 MB / 41k events at the time) and the
+# Proton/Vulkan logs under ~/.local/share/greenboost/proton-logs. A "clear all
+# logs" that leaves 32 MB of history in place is worse than no verb at all,
+# because it reports success.
+#
+# What it deliberately does NOT delete, and why , these live in the same trees
+# and are NOT logs:
+#   /var/lib/greenboost/synapse/kv_measurements.json  measured KV sizes; this
+#       cache is what took VRAM fill 67-73% -> 85.1% and decode 2.6-4.3 -> 5.27
+#       tok/s (workflow/known-issues.md, 2026-08-02). Deleting it costs real
+#       throughput until a serve re-measures.
+#   /var/lib/greenboost/synapse/{shim_probe.json,slots,models}
+#   ~/.local/share/greenboost/synapse/                 the built llama.cpp engine
+#   ~/.local/share/greenboost/{dxvk-gplasync,proton-cache,nis}  shader caches
+# Anything added to this function must be checked against that list first.
+GB_LOG_ARCHIVE_DIR="/var/backups"
+
+# Collect every GreenBoost log path that exists right now, one per line.
+# $1 = the invoking user's real home.
+_gb_log_paths() {
+    local _home="$1" p
+    for p in \
+        "$_home/.local/share/greenboost/dataflux.jsonl" \
+        "$_home/.local/share/greenboost/status.log" \
+        "$_home/.local/share/greenboost/sessions.jsonl" \
+        "/var/log/greenboost-boot-guard.log"
+    do
+        [[ -e "$p" ]] && printf '%s\n' "$p"
+    done
+    # Globs, expanded only when they match something.
+    shopt -s nullglob
+    for p in "$_home"/.local/share/greenboost/dataflux.jsonl.*.gz \
+             "$_home"/.local/share/greenboost/dataflux.jsonl.[0-9]* \
+             "$_home"/.local/share/greenboost/proton-logs/* \
+             /var/log/greenboost/* \
+             /tmp/greenboost*.log
+    do
+        [[ -e "$p" ]] && printf '%s\n' "$p"
+    done
+    shopt -u nullglob
+}
+
 cmd_clear_logs() {
     need_root "clear logs"
-    gb_header
-    echo -e "  ${C_CYAN}${C_BOLD}Clear All GreenBoost Logs${C_RESET}"
-    echo -e "  ${C_DIM}Clears kernel ring buffer, journal, and GreenBoost log files.${C_RESET}"
-    echo -e ""
-    local choice
-    read -r -p "  Clear all GreenBoost-related logs now? [Y/n] " choice
-    if [[ "$choice" =~ ^[Nn] ]]; then
-        gb_info "Skipping log cleanup."
-        return
-    fi
+
+    local _archive=1 _keep_journal=0 _assume_yes=0 a
+    for a in "$@"; do
+        case "$a" in
+            --no-archive)   _archive=0 ;;
+            --archive)      _archive=1 ;;
+            --keep-journal) _keep_journal=1 ;;
+            -y|--yes)       _assume_yes=1 ;;
+            *) gb_warn "clear logs: ignoring unknown option '$a'" ;;
+        esac
+    done
 
     local _real_user="${SUDO_USER:-$USER}"
     local _real_home
     _real_home="$(getent passwd "$_real_user" | cut -d: -f6)"
     [[ -z "$_real_home" ]] && _real_home="$HOME"
 
-    dmesg -c > /dev/null 2>&1 || true
-    journalctl --rotate > /dev/null 2>&1 || true
-    journalctl --vacuum-time=1s > /dev/null 2>&1 || true
-    rm -rf /var/log/greenboost/* 2>/dev/null || true
-    rm -f /tmp/greenboost*.log 2>/dev/null || true
-    gb_ok "All GreenBoost logs (dmesg, journal, /var/log/greenboost) cleared."
+    mapfile -t _paths < <(_gb_log_paths "$_real_home" | sort -u)
+    local _bytes=0 _human="0"
+    if (( ${#_paths[@]} )); then
+        _bytes=$(du -cb "${_paths[@]}" 2>/dev/null | tail -1 | cut -f1)
+        _human=$(numfmt --to=iec --suffix=B "${_bytes:-0}" 2>/dev/null || echo "${_bytes}B")
+    fi
+
+    gb_header
+    echo -e "  ${C_CYAN}${C_BOLD}Clear All GreenBoost Logs${C_RESET}"
+    echo -e "  ${C_DIM}${#_paths[@]} file(s), ${_human} , dataflux, Proton/Vulkan, eBPF, boot-guard, NVTX.${C_RESET}"
+    if (( _keep_journal )); then
+        echo -e "  ${C_DIM}Journal and kernel ring buffer kept (--keep-journal).${C_RESET}"
+    else
+        echo -e "  ${C_DIM}Also clears the kernel ring buffer and the WHOLE systemd journal.${C_RESET}"
+    fi
+    if (( _archive )); then
+        echo -e "  ${C_DIM}A tar.zst archive is written to ${GB_LOG_ARCHIVE_DIR} first (--no-archive to skip).${C_RESET}"
+    else
+        echo -e "  ${C_DIM}No archive , nothing is recoverable afterwards (--no-archive).${C_RESET}"
+    fi
+    echo -e ""
+
+    if (( ! _assume_yes )); then
+        local choice
+        read -r -p "  Clear all GreenBoost-related logs now? [Y/n] " choice
+        if [[ "$choice" =~ ^[Nn] ]]; then
+            gb_info "Skipping log cleanup."
+            return
+        fi
+    fi
+
+    # ── archive first ────────────────────────────────────────────────────────
+    if (( _archive )); then
+        local _stamp _tar _jdump _zst
+        _stamp="$(date +%Y-%m-%d-%H%M%S)"
+        _tar="${GB_LOG_ARCHIVE_DIR}/greenboost-logs-${_stamp}.tar"
+        mkdir -p "$GB_LOG_ARCHIVE_DIR"
+        # The current boot's journal goes in BEFORE the vacuum , it is the only
+        # evidence of this boot's errors, and a boot-fix is usually verified by
+        # diffing the next boot against it.
+        _jdump="$(mktemp -t gb-journal-boot.XXXXXX.txt)"
+        journalctl -b --no-pager > "$_jdump" 2>/dev/null || true
+        tar -cf "$_tar" --transform='s#.*/#journal/#' "$_jdump" 2>/dev/null || true
+        rm -f "$_jdump"
+        if (( ${#_paths[@]} )); then
+            tar -rf "$_tar" --ignore-failed-read "${_paths[@]}" 2>/dev/null || true
+        fi
+        _zst="$_tar"
+        if command -v zstd &>/dev/null && zstd -q -19 --rm "$_tar" 2>/dev/null; then
+            _zst="${_tar}.zst"
+        elif gzip -9 "$_tar" 2>/dev/null; then
+            _zst="${_tar}.gz"
+        fi
+        if [[ -f "$_zst" ]]; then
+            chmod 0600 "$_zst"
+            gb_ok "Archived to $_zst ($(du -h "$_zst" | cut -f1))"
+        else
+            gb_warn "Archive failed , logs NOT cleared. Re-run with --no-archive to clear anyway."
+            return 1
+        fi
+    fi
+
+    # ── clear ────────────────────────────────────────────────────────────────
+    if (( ! _keep_journal )); then
+        dmesg -c > /dev/null 2>&1 || true
+        journalctl --rotate > /dev/null 2>&1 || true
+        journalctl --vacuum-time=1s > /dev/null 2>&1 || true
+    fi
+
+    local p _n=0
+    for p in "${_paths[@]}"; do
+        rm -f "$p" 2>/dev/null && (( _n++ ))
+    done
+    # Truncate rather than unlink anything a live process holds open, so the
+    # writer does not keep appending to a deleted inode.
+    : > "$_real_home/.local/share/greenboost/status.log" 2>/dev/null || true
+    cmd_clear_nvtx_logs
+
+    gb_ok "Cleared ${_n} log file(s)$( (( _keep_journal )) || echo ", the kernel ring buffer and the journal")."
+    gb_info "Kept: kv_measurements.json, shim_probe.json, the built engine and the shader caches , those are measurements, not logs."
 }
 
 cmd_clear_inference_logs() {
@@ -8386,7 +8586,7 @@ cmd_clear_host_ram() {
 }
 
 # Backward-compat alias - kept so existing scripts/bookmarks still work.
-cmd_clean_logs() { cmd_clear_logs; }
+cmd_clean_logs() { cmd_clear_logs "$@"; }
 
 # ════════════════════════════════════════════════════════════════════════
 # _logs_llm - compact, token-efficient log output for LLM/AI tools.
@@ -14324,7 +14524,7 @@ case "$COMMAND" in
         ;;
     clear)
         case "${2:-}" in
-            logs)            cmd_clear_logs ;;
+            logs)            cmd_clear_logs "${@:3}" ;;
 
             inference-logs)  cmd_clear_inference_logs ;;
             memory-pool)     cmd_clear_memory_pool "${@:3}" ;;
@@ -14334,7 +14534,7 @@ case "$COMMAND" in
             *) die "Usage: greenboost clear logs|inference-logs|memory-pool|host-ram|cluster-workers|nvtx-logs" ;;
         esac
         ;;
-    clean-logs)          cmd_clean_logs         ;;
+    clean-logs)          cmd_clean_logs "${@:2}" ;;
     show-commands)       cmd_show_commands      ;;
     help|--help|-h)      cmd_help "${@:2}"      ;;
     turboquant)          cmd_turboquant "${@:2}" ;;

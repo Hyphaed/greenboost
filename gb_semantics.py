@@ -1186,6 +1186,37 @@ def _res_unregistered_cached_models(entity_id, window_s):
                 "raw_source": f"could not read model cache: {e}"}
 
 
+def _res_dataflux_event_count(entity_id, window_s):
+    """How many events the flight recorder currently holds.
+
+    Counts the whole retained log , live file plus rotated archive , not a
+    window, because the question this answers ("is there any history at all?")
+    is about the store, not about recent activity.
+
+    Returns None, never 0, when the log cannot be read. A zero inferred from an
+    exception is indistinguishable from a genuinely empty log, and those two
+    demand opposite actions.
+    """
+    try:
+        import gb_dataflux
+        # since_hours large enough to span the retained archive; read_events
+        # already merges the .1.gz archive ahead of the live file.
+        events = gb_dataflux.read_events(since_hours=24 * 3650)
+        n = len(events)
+        newest = None
+        if n:
+            try:
+                newest = max(float(e.get("ts") or 0) for e in events) or None
+            except (TypeError, ValueError):
+                newest = None
+        return {"value": n, "unit": "count",
+                "raw_source": "gb_dataflux.read_events (live log + rotated archive)",
+                "evidence": {"newest_ts": newest}}
+    except Exception as e:
+        return {"value": None, "unit": "count",
+                "raw_source": f"could not read the dataflux log: {e}"}
+
+
 def _res_weights_gb(entity_id, window_s):
     """Weight footprint of the model currently being served.
 
@@ -2305,6 +2336,13 @@ def discover(query: str, k: int = 5) -> list[dict]:
 
 # ── segment evaluators , canonical filters, each {matched, evidence} ────────
 
+# A log this small cannot support any windowed metric , below it, "no data"
+# is the honest answer for every event-reading resolver. Not a tuning knob:
+# it only has to be small enough that a running recorder clears it within
+# seconds (the SnapshotRecorder alone emits every 5s).
+_DATAFLUX_RESET_MAX_EVENTS = 25
+
+
 def _seg_decode_tail_heavy():
     """Decode is dominated by a slow tail rather than a slow average.
 
@@ -2683,6 +2721,40 @@ def _seg_models_wiped_from_manifest():
     ev["examples"] = (n.get("evidence") or {}).get("missing", [])
     ev["fix"] = "greenboost recover-models"
     return count > 0, [ev]
+
+
+def _seg_dataflux_history_reset():
+    """The log is (near) empty because it was cleared, not because it is broken.
+
+    These two states are indistinguishable from any single metric: every
+    resolver that reads recent events returns None either way. The operator's
+    next action is opposite in each case , wait for the log to refill, or go
+    find out why nothing is recording , so the layer has to be able to tell
+    them apart rather than shrugging.
+
+    The discriminator is the kernel module. A cleared log on a machine whose
+    stack is up and loaded is a reset in progress; a near-empty log while the
+    module is NOT loaded is the far more serious `kmod_missing_silent_degrade`
+    case, which owns that verdict and must not be masked by this one.
+
+    Added 2026-08-21 with `greenboost clear logs`, which empties the log by
+    design and would otherwise leave the whole governed layer answering "no
+    data" with no governed explanation for why.
+    """
+    n = resolve("dataflux_event_count")
+    kmod = resolve("kmod_loaded")
+    if n.get("value") is None:
+        # Cannot read the log at all , that is not a reset, that is unknown.
+        return None, [n, kmod]
+    count = int(n["value"])
+    if count > _DATAFLUX_RESET_MAX_EVENTS:
+        return False, [n, kmod]
+    # Near-empty. Only call it a reset when the stack is otherwise healthy;
+    # otherwise defer to kmod_missing_silent_degrade rather than reporting a
+    # reassuring verdict over a broken one.
+    if kmod.get("value") is not True:
+        return None, [n, kmod]
+    return True, [n, kmod]
 
 
 def _seg_vram_headroom_exhausted():
