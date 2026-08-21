@@ -618,10 +618,31 @@ def _compress_context(
     # 50-90% band took ~140s. Where the summary goes is worth minutes.
     head = session.messages[:_HEAD_KEEP]
     prior_memory = ""
-    for m in head:
-        if isinstance(m.get("content"), str) and m["content"].startswith(_MEMORY_MARKER):
-            head = []                     # degenerate: head IS a memory block
-            break
+    # A memory block sitting in the head is NOT a degenerate case, it is the
+    # good case. It is byte-identical from turn to turn, which is the whole
+    # property `head` exists to protect. This used to set `head = []` here,
+    # which pushed that block into `middle`, where it gets absorbed into
+    # prior_memory and re-emitted inside the new summary at a different
+    # position , so every byte after position zero changed and the engine
+    # re-prefilled from scratch.
+    #
+    # It only fired on a session that had already been compacted once, i.e.
+    # every RESTORED session, which this CLI restores by default. That is the
+    # measured agent_compaction_prefix_kept_pct = 50: fresh sessions kept their
+    # prefix, restored ones threw it away on their first compaction.
+    #
+    # Leaving the head pinned makes the prefix grow monotonically and never
+    # rewrite. A second memory block simply lands after the first; the next
+    # compaction absorbs the inner one out of the middle and the pinned head is
+    # still untouched.
+    #
+    # This recovers KV reuse for the attention layers. It does NOT save the
+    # recurrent layers from replaying , their state is updated in place and
+    # exists only at the tip, so it cannot be rolled back to a prefix. See
+    # linux-kernel-inference:docs/research/state-reuse-implementation-plan-2026-08-21.md.
+    head_has_memory = any(
+        isinstance(m.get("content"), str) and m["content"].startswith(_MEMORY_MARKER)
+        for m in head)
     middle = session.messages[len(head):-keep_count]
     # A memory block already in the middle is absorbed verbatim, so its bytes
     # survive into the new block unchanged rather than being re-summarised
@@ -769,6 +790,7 @@ def _compress_context(
             "status": "ok",
             "op": "compact",
             "head_kept": len(head),
+            "head_has_memory": head_has_memory,
             "middle_compacted": len(old_messages),
             "tail_kept": len(tail),
             "extended_prior": bool(prior_memory),
