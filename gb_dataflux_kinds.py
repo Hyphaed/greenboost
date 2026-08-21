@@ -483,6 +483,22 @@ KINDS: dict[str, KindSpec] = {
                 "tokens_restored", "reload_s", "restore_s"),
         incident_when=("error",)),
 
+    "serve_checkpoint": KindSpec(
+        group="health",
+        doc="A serve session's slots were saved without stopping the engine "
+            "(action=checkpoint) or pushed back into a running engine "
+            "(action=restore). Distinct from serve_pause, which stops the "
+            "engine to hand VRAM back; this one leaves it serving so a restart "
+            "or a crash is survivable. Measured 2026-08-21 on the 27B hybrid: "
+            "11,770 tokens is 356 MB, saves in 94 ms and restores in 60 ms. "
+            "Read restore_s as bytes-moved time and nothing more , the same "
+            "measurement showed a request after a successful restore still "
+            "re-prefilled every token (cached=0) at sim_best=1.000, so a "
+            "restore on this architecture does NOT buy back prefill.",
+        fields=("model", "action", "slots", "tokens", "bytes", "skipped_busy",
+                "slots_restored", "tokens_restored", "restore_s", "skipped"),
+        incident_when=("error",)),
+
     # ── agent ──────────────────────────────────────────────────────────
     "actuation": KindSpec(
         group="agent", doc="An orchestrator/MCP-actuation lever move (gated/dry-run status included).",
