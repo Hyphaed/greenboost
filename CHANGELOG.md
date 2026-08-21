@@ -161,6 +161,13 @@ governed answer for which one you are in:
 
     gb semantics answer "why is there no telemetry" --json
 
+The first version of this shipped with a bug worth naming, since it is the
+exact failure the verb existed to stop: the removal loop counted with
+`rm -f "$p" && (( _n++ ))`, and post-increment evaluates to the value before
+the bump, so the first success returned 0 , a non-zero exit status , and
+`set -e` aborted the loop there. It cleared one file, left seventeen, and
+reported success. Four tests now pin the path list and the loop.
+
 ### `vm.min_free_kbytes` was configured at 1 GB and running at 512 MB
 
 GreenBoost's installer wrote `524288` into a file named to sort last and win
