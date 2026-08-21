@@ -7,7 +7,6 @@
 ![Version](https://img.shields.io/badge/version-3.4-6C4FF6?style=flat-square)
 ![License](https://img.shields.io/badge/license-GPLv2%20%2B%20Commercial-blue?style=flat-square)
 ![CUDA](https://img.shields.io/badge/CUDA-12%20%7C%2013-76B900?style=flat-square&logo=nvidia&logoColor=white)
-![Linux](https://img.shields.io/badge/Linux-supported-333333?style=flat-square&logo=linux)
 ![Status](https://img.shields.io/badge/status-daily%20driver-success?style=flat-square)
 
 ## Run bigger models on the GPU you already own.
