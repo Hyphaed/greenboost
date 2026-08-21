@@ -279,3 +279,242 @@ def test_every_native_route_is_registered_on_the_app():
     paths = {getattr(r.resource, "canonical", "") for r in app.router.routes()}
     for route in api._LLAMA_NATIVE_ROUTES:
         assert route in paths, f"{route} not registered"
+
+
+# ---------------------------------------------------------------------------
+# Inter-token latency percentiles (2026-08-20)
+# ---------------------------------------------------------------------------
+# tok_s is a mean, and with MTP speculative decode the real gap distribution is
+# bimodal: near-zero inside an accepted draft batch, a whole forward pass at the
+# boundary. A mean describes no token that actually happened, which is why the
+# p95 exists at all. These tests pin the shape, not a number.
+
+def _content_frame(txt: str = "x") -> bytes:
+    import json as _json
+    return ("data: " + _json.dumps({"choices": [{"delta": {"content": txt}}]})
+            + "\n").encode()
+
+
+def _bimodal_telemetry(batches: int = 12):
+    """A stream shaped like real speculative decode: one slow forward pass,
+    then three near-instant accepted draft tokens."""
+    import gb_synapse_api as api
+    t = api._SSETelemetry()
+    ts = 100.0
+    for _ in range(batches):
+        t.feed(ts, _content_frame())
+        ts += 0.190                      # forward-pass boundary
+        for _ in range(3):
+            t.feed(ts, _content_frame())
+            ts += 0.002                  # inside the accepted draft
+    return t
+
+
+def test_p95_exposes_the_tail_a_mean_hides():
+    stats = _bimodal_telemetry().latency_stats()
+    assert stats is not None
+    # Median sits inside the draft batch; p95 exposes the pass boundary.
+    assert stats["p50_ms"] < 5.0
+    assert stats["p95_ms"] > 100.0
+    # Roughly one gap in four is a boundary.
+    assert 0.20 < stats["slow_token_ratio"] < 0.30
+    assert stats["max_ms"] >= stats["p95_ms"] >= stats["p50_ms"]
+
+
+def test_too_few_gaps_returns_none_not_a_confident_number():
+    """A p95 over three samples is arithmetic, not evidence , the same n=3
+    population problem the 2026-08-18 audit found in tok_s_drop advisories."""
+    import gb_synapse_api as api
+    t = api._SSETelemetry()
+    for i in range(4):
+        t.feed(100.0 + i * 0.1, _content_frame())
+    assert t.latency_stats() is None
+
+
+def test_latency_ring_is_bounded():
+    """This proxy is long-lived and an unbounded per-request buffer already
+    cost 37.5 GB once (2026-08-18). The ring must not grow."""
+    import gb_synapse_api as api
+    t = api._SSETelemetry()
+    for i in range(api._SSETelemetry.LAT_RING + 500):
+        t.feed(100.0 + i * 0.01, _content_frame())
+    stats = t.latency_stats()
+    assert stats["gap_samples"] == api._SSETelemetry.LAT_RING
+    assert len(t._gaps) == api._SSETelemetry.LAT_RING
+
+
+def test_first_gap_excludes_prefill():
+    """The interval before the first token carries the whole prompt-eval and
+    would skew every percentile if counted as an inter-token gap."""
+    import gb_synapse_api as api
+    t = api._SSETelemetry()
+    t.feed(100.0, _content_frame())        # first token, after a long prefill
+    for i in range(1, 40):
+        t.feed(100.0 + i * 0.010, _content_frame())
+    stats = t.latency_stats()
+    assert stats["gap_samples"] == 39
+    assert stats["max_ms"] < 20.0          # no 100-second prefill gap in here
+
+
+def test_latency_block_rides_on_the_tok_s_event(monkeypatch):
+    """The percentiles must land on the SAME event as tok_s , they describe
+    one turn, and splitting them would let a consumer read one without the
+    other."""
+    import gb_synapse
+    seen = {}
+    monkeypatch.setattr(gb_synapse, "_df_emit_tok_s",
+                        lambda *a, **kw: seen.update(kw))
+    monkeypatch.setattr(gb_synapse, "_load_tok_s_samples", lambda: {})
+    monkeypatch.setattr(gb_synapse, "_save_tok_s_samples", lambda s: None)
+    monkeypatch.setattr(gb_synapse, "_read_run_state", lambda m: None)
+    gb_synapse.record_measured_tok_s(
+        "m", 5.0, source="proxy", quant="q", ctx=1, kv_type="f16",
+        completion_tokens=100, prompt_tokens=10,
+        latency={"p50_ms": 2.0, "p95_ms": 190.0, "max_ms": 200.0,
+                 "slow_token_ratio": 0.25, "gap_samples": 99})
+    assert seen.get("latency", {}).get("p95_ms") == 190.0
+
+
+# ── speculative-decode accounting (2026-08-20) ─────────────────────────────
+#
+# The engine has always reported draft_n / draft_n_accepted on every response
+# that drafted anything (llama.cpp server-task.cpp). The proxy dropped both,
+# so acceptance was only ever measurable through gb_bench_spec.py's synthetic
+# prompts , never on the traffic that actually runs. Acceptance is the state
+# the 2026-08-05 depth sweep was missing when it found the tok/s-vs-depth
+# curve non-monotonic.
+
+def _timings_frame(**timings) -> bytes:
+    import json as _json
+    return ("data: " + _json.dumps({"choices": [{"delta": {"content": "x"}}],
+                                    "timings": timings}) + "\n").encode()
+
+
+def test_streaming_captures_the_engines_draft_counters():
+    import gb_synapse_api as api
+    t = api._SSETelemetry()
+    t.feed(100.0, _content_frame())
+    t.feed(100.2, _timings_frame(prompt_ms=50.0, draft_n=40, draft_n_accepted=26))
+    assert t.spec_stats() == {"draft_n": 40, "draft_n_accepted": 26}
+
+
+def test_a_stream_that_drafted_nothing_reports_none_not_zero():
+    """Depth 0 makes the engine report 100% acceptance, because nothing was
+    drafted and so nothing could be rejected. None keeps 'drafting is off'
+    distinguishable from 'drafting is working perfectly'."""
+    import gb_synapse_api as api
+    t = api._SSETelemetry()
+    t.feed(100.0, _content_frame())
+    t.feed(100.2, _timings_frame(prompt_ms=50.0))
+    assert t.spec_stats() is None
+
+
+def test_spec_block_rides_on_the_same_tok_s_event(monkeypatch):
+    import gb_synapse
+    seen = {}
+    monkeypatch.setattr(gb_synapse, "_df_emit_tok_s",
+                        lambda *a, **kw: seen.update(kw))
+    monkeypatch.setattr(gb_synapse, "_load_tok_s_samples", lambda: {})
+    monkeypatch.setattr(gb_synapse, "_save_tok_s_samples", lambda s: None)
+    monkeypatch.setattr(gb_synapse, "_read_run_state", lambda m: None)
+    gb_synapse.record_measured_tok_s(
+        "m", 5.0, source="proxy", quant="q", ctx=1, kv_type="f16",
+        completion_tokens=100, prompt_tokens=10,
+        spec={"draft_n": 40, "draft_n_accepted": 26})
+    assert seen.get("spec") == {"draft_n": 40, "draft_n_accepted": 26}
+
+
+def test_non_streaming_reads_the_counters_out_of_its_timings_block(monkeypatch):
+    """A stream:false request carries the whole timings block in one piece ,
+    the same coverage gap that once left tok/s itself unrecorded here."""
+    import json as _json
+    import gb_synapse
+    import gb_synapse_api as api
+    seen = {}
+    monkeypatch.setattr(gb_synapse, "record_measured_tok_s",
+                        lambda *a, **kw: seen.update(kw))
+    monkeypatch.setattr(gb_synapse, "record_prompt_cache_sample",
+                        lambda *a, **kw: None)
+    body = _json.dumps({
+        "usage": {"completion_tokens": 120, "prompt_tokens": 30},
+        "timings": {"predicted_per_second": 6.1, "predicted_ms": 19000.0,
+                    "prompt_ms": 400.0, "draft_n": 48, "draft_n_accepted": 31},
+    }).encode()
+    api._record_non_stream_telemetry("m", body)
+    assert seen.get("spec") == {"draft_n": 48, "draft_n_accepted": 31}
+
+
+# ── adaptive draft depth (2026-08-20) ──────────────────────────────────────
+
+def test_depth_is_not_stamped_unless_the_feature_is_on(monkeypatch):
+    """Default off: the pinned (4, 0.3) constant is a real measured result on
+    this box, and a controller that cannot beat it should not be running."""
+    import gb_synapse_api as api
+    monkeypatch.setattr(api, "_ADAPTIVE_DRAFT", False)
+    c = api._SpecDepth()
+    c.depth = 2
+    body = {"messages": []}
+    assert c.stamp(body) is False
+    assert "speculative.n_max" not in body
+
+
+def test_a_client_that_set_the_field_itself_wins(monkeypatch):
+    import gb_synapse_api as api
+    monkeypatch.setattr(api, "_ADAPTIVE_DRAFT", True)
+    c = api._SpecDepth()
+    c.depth = 2
+    body = {"messages": [], "speculative.n_max": 6}
+    assert c.stamp(body) is False
+    assert body["speculative.n_max"] == 6
+
+
+def test_depth_is_stamped_once_chosen(monkeypatch):
+    import gb_synapse_api as api
+    monkeypatch.setattr(api, "_ADAPTIVE_DRAFT", True)
+    c = api._SpecDepth()
+    c.depth = 3
+    body = {"messages": []}
+    assert c.stamp(body) is True
+    assert body["speculative.n_max"] == 3
+
+
+def test_a_single_bad_turn_does_not_move_the_depth(monkeypatch):
+    """Depth is non-monotonic in tok/s, so reacting to one sample is the same
+    n=3 mistake the tuner exists to prevent."""
+    import gb_synapse_api as api
+    monkeypatch.setattr(api, "_ADAPTIVE_DRAFT", True)
+    monkeypatch.setattr(api, "_served_draft_depth", lambda: 4)
+    c = api._SpecDepth()
+    c.observe({"draft_n": 20, "draft_n_accepted": 1})
+    assert c.depth is None
+
+
+def test_sustained_low_acceptance_lowers_the_depth(monkeypatch):
+    import gb_synapse_api as api
+    monkeypatch.setattr(api, "_ADAPTIVE_DRAFT", True)
+    monkeypatch.setattr(api, "_served_draft_depth", lambda: 4)
+    monkeypatch.setattr(api, "_emit_spec_depth", lambda *a, **kw: None)
+    c = api._SpecDepth()
+    for _ in range(api._SPEC_WINDOW):
+        c.observe({"draft_n": 20, "draft_n_accepted": 2})
+    assert c.depth == 3
+
+
+def test_stale_shim_stats_are_not_read_as_current(monkeypatch, tmp_path):
+    """The stats file outlives the process that wrote it; a stale one reports
+    the previous serve's overflow as if it were now."""
+    import os
+    import time as _time
+    import gb_synapse_api as api
+    api._t2_cache.update(ts=0.0, mb=None)
+    f = tmp_path / "shim_stats"
+    f.write_text("t2_overflow_total_mb=6687\n")
+    old = _time.time() - 3600
+    os.utime(f, (old, old))
+    monkeypatch.setattr(api, "_T2_STALE_S", 60.0)
+    monkeypatch.setattr("builtins.open", open)
+    real_getmtime = os.path.getmtime
+    monkeypatch.setattr(os.path, "getmtime",
+                        lambda p: old if p == "/run/greenboost/shim_stats"
+                        else real_getmtime(p))
+    assert api._t2_overflow_mb() is None

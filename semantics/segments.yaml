@@ -259,6 +259,60 @@
     system prompt, tool schemas and pinned block byte-identical. Check
     prompt_cache hit_pct across the compaction: a drop is the proof.
 
+- name: kv_prefetch_has_no_target
+  entity: node
+  severity: diagnosis
+  doc: >
+    There is no T2-resident KV, so lookahead KV prefetch has nothing to
+    prefetch. This is the gate on that whole branch, and true is a legitimate
+    branch-ending answer rather than a fault: on this box the T2 spill is
+    weights, and KV fits T1 at every context length actually served. Null when
+    the shim is not reporting , "nobody measured" must stay distinguishable
+    from "measured, and there is nothing there".
+  evaluator: kv_prefetch_has_no_target
+  metrics: ["kv_t2_resident_mb", "kv_prefetch_opportunities"]
+  remediation: >
+    Nothing to fix. If you want the branch re-evaluated at a longer context,
+    serve with a ctx above the reserve figure from
+    gb_synapse.kv_spill_reachability() and GREENBOOST_KV_PREFETCH=stats (it
+    measures only, moves no bytes), then read kv_prefetch_opportunities.
+
+- name: bandwidth_bound_harvestable
+  entity: node
+  severity: advisory
+  doc: >
+    The card is holding power it cannot use: weights are streaming from T2,
+    GPU utilisation is low because the pass is waiting on the link, and the
+    board still draws near its limit. Throughput is exactly what PCIe allows
+    and nothing is broken , the watts are simply being spent waiting, and the
+    control loop can give them back without moving tok/s. Null when the power
+    or overflow reading is missing; "the sensors did not answer" is not "there
+    is nothing to harvest".
+  evaluator: bandwidth_bound_harvestable
+  metrics: ["t2_overflow_active_mb", "tuner_harvesting"]
+  remediation: >
+    Run `tuner_tick()` to see the decision and its reasoning; apply it with
+    tuner_tick(apply=True, confirm=True) under GB_ORCH_ACTUATE=1. The loop
+    verifies after a settle window and restores the lever if throughput moved.
+
+- name: ctx_estimate_undercounts
+  entity: node
+  severity: warning
+  doc: >
+    The CLI is predicting smaller requests than the server actually charges, so
+    its budget checks report headroom that is not there and a turn can be
+    assembled that the server then rejects. Only the under-count direction
+    matches , over-estimating merely compacts early. Returns null, not false,
+    before any turn has been graded against a real usage.prompt_tokens.
+  evaluator: ctx_estimate_undercounts
+  metrics: ["ctx_estimate_error_pct", "ctx_hard_trims"]
+  remediation: >
+    The estimator self-corrects from the next completed turn (it learns
+    chars-per-token from usage.prompt_tokens). If it stays negative, the
+    request carries content the estimate cannot see , check that every
+    injected block (recalled memory, pinned plan, RAG) reaches
+    estimate_request_tokens().
+
 - name: agent_hallucinating_tool_names
   entity: node
   severity: warning
@@ -286,3 +340,113 @@
     Run greenboost_cli.bench.agent_eval twice and confirm the runs agree before
     reading anything into the number , a benchmark that cannot reproduce itself
     cannot measure a 5% change.
+
+- name: gaming_mode_stuck
+  doc: >
+    greenboost.ko's `gaming_mode` is still 1 while no Wine/Proton game is
+    running , the state a hard-killed game session leaves behind. Every
+    inference T2 buffer stays parked at the eviction queue's tail until
+    something clears it, so weights are evicted ahead of gaming buffers that
+    no longer exist. Nothing reported this before; it looked like a generic
+    slowdown. Returns `matched: null` when the flag or /proc cannot be read
+    , "cannot tell" is never reported as healthy.
+  evaluator: gaming_mode_stuck
+  reads: [gaming_mode_active, gaming_session_orphans]
+  severity: warning
+
+- name: decode_tail_heavy
+  doc: >
+    Decode is dominated by a slow TAIL rather than a slow average , at least
+    10% of tokens sit above twice the response's own median gap. The
+    distinction decides the fix: a uniformly slow decode is a bandwidth or
+    placement problem, a heavy tail with a healthy median is a stall (draft
+    batch boundary, slot eviction, or something else competing for the box).
+    Reading mean tok/s alone cannot tell the two apart. Returns
+    `matched: null` when no streamed sample carries percentiles.
+  evaluator: decode_tail_heavy
+  reads: [inter_token_p95_ms, slow_token_ratio]
+  severity: warning
+
+- name: kmod_stale_from_initramfs
+  doc: >
+    Version drift that a reload will NOT durably fix, because the stale module
+    is coming out of the initramfs on every boot. Kept separate from
+    `kmod_version_drift` because the two carry different instructions and
+    handing out the wrong one costs a reboot to discover: plain drift is fixed
+    by `sudo greenboost load`; this one is fixed for exactly one boot by that
+    same command, and durably only by keeping the module out of the boot image
+    (`sudo update-initramfs -u -k all` with initramfs/zz-greenboost-exclude
+    installed). Incident 2026-08-21: v3.2 booted across several reboots while
+    v3.4 was the installed build, and T3 failed open every time because /var
+    was not mounted that early. Returns matched: None when either input is
+    unknown , "cannot tell" is never "no drift".
+  evaluator: kmod_stale_from_initramfs
+  reads: [kmod_load_stage, kmod_loaded_version, core_build_version]
+  severity: violation
+
+- name: t3_configured_but_disabled
+  doc: >
+    Tier 3 has a configured cap and is not actually open. The failure this
+    names is not "T3 is off" , it is that everything an operator would check
+    says T3 is fine: the status page prints the 73 GB cap, `t3_total_mb`
+    reports 74752, and the only place the truth appears is one kernel log line
+    at module init. Matched means no byte will reach T3 for this boot,
+    whatever the capacity readouts say. Usual cause is the module loading
+    before /var is mounted , check `kmod_load_stage`.
+  evaluator: t3_configured_but_disabled
+  reads: [t3_enabled, t3_capacity_configured_mb]
+  severity: violation
+
+- name: apparmor_contaminated_by_greenboost
+  doc: >
+    GreenBoost rules are sitting past a snapd profile's closing brace. Matched
+    means snapd.apparmor.service is already failing and every snap on the
+    machine is one apparmor_parser run away from refusing to launch. The trap
+    this encodes: `grep libgreenboost_audit <profile>` returning a hit reads
+    like "the grant is active" and means the exact opposite , a rule past the
+    closing brace grants nothing and invalidates the whole profile, so the
+    presence of the string IS the failure signal. That misreading is why the
+    same bug shipped twice. Fix:
+    `sudo ~/Dev/kernel_inference/diagnostics/fix-boot-issues.sh --apply`, or
+    `greenboost apparmor-uninstall` on an installed machine.
+  evaluator: apparmor_contaminated_by_greenboost
+  reads: [apparmor_profiles_contaminated]
+  severity: violation
+
+- name: proton_tool_race
+  doc: >
+    Two different GreenBoost Proton compat tools started the same game at
+    once. Measured 2026-08-21: greenboost-proton-experimental at 02:57:48 and
+    greenboost-proton at 02:57:50, each delegating to a different upstream
+    Proton, both into wine prefix compatdata/2909400. One prefix cannot be
+    brought up twice; each run's explorer.exe appeared, the game never did,
+    and both were force-killed about a minute later. Steam's CompatToolMapping
+    named only ONE of the two, so this is invisible in Steam's own UI and
+    needs the wrapper logs to see at all. Fix: keep one GreenBoost Proton tool
+    mapped per game, and restart Steam after changing a mapping , Steam holds
+    config.vdf in memory and will not re-read it mid-session.
+  evaluator: proton_tool_race
+  reads: [game_launch_attempts, proton_tools_installed]
+  severity: violation
+
+- name: game_launch_retry_loop
+  doc: >
+    Repeated wrapper starts with no game process , a launch that is looping
+    rather than loading. Three or more starts inside the window with nothing
+    running means something kills the game and Steam retries. A spinner cannot
+    tell this from a slow first run, which is exactly how it presented on
+    2026-08-21: four minutes that looked like progress and were not.
+  evaluator: game_launch_retry_loop
+  reads: [game_launch_attempts, game_process_running]
+  severity: violation
+
+- name: launch_made_only_wine_infrastructure
+  doc: >
+    Proton came up and the game did not. wine's own helpers (explorer.exe,
+    services.exe, wineboot) start for every launch whether or not the title
+    does, so counting any .exe as "the game is running" reports a dead launch
+    as a live one. Matched precisely when the only wine processes present are
+    Proton's own.
+  evaluator: launch_made_only_wine_infrastructure
+  reads: [game_process_running]
+  severity: warning

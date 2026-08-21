@@ -144,6 +144,65 @@ gb_dataflux_emit() {
     return 0
 }
 
+# ── initramfs: keep greenboost out of early userspace ─────────────────────────
+#
+# greenboost is a CUDA memory/compute orchestrator. It never mounts the root
+# filesystem, so it has no business in the initrd , and being there actively
+# breaks two things (incident 2026-08-21, see initramfs/zz-greenboost-exclude):
+# the initrd copy is frozen at image-build time so reinstalls never reach it,
+# and /var is unmounted that early so T3 fails open on every boot.
+GB_INITRAMFS_HOOK="/etc/initramfs-tools/hooks/zz-greenboost-exclude"
+GB_DRACUT_EXCLUDE="/etc/dracut.conf.d/99-greenboost-exclude.conf"
+
+# Rebuild the boot image(s) for every installed kernel. Best-effort , a machine
+# whose initramfs tool we don't recognise is not a failed install, it just keeps
+# whatever image it had.
+gb_initramfs_refresh() {
+    if command -v update-initramfs &>/dev/null; then
+        update-initramfs -u -k all &>/dev/null \
+            && gb_ok "initramfs regenerated for all installed kernels" \
+            || gb_warn "update-initramfs failed , the boot image may still hold an old greenboost.ko (run: sudo update-initramfs -u -k all)"
+    elif command -v dracut &>/dev/null; then
+        dracut --force --regenerate-all &>/dev/null \
+            && gb_ok "initramfs regenerated for all installed kernels (dracut)" \
+            || gb_warn "dracut failed , the boot image may still hold an old greenboost.ko (run: sudo dracut --force --regenerate-all)"
+    elif command -v mkinitcpio &>/dev/null; then
+        mkinitcpio -P &>/dev/null \
+            && gb_ok "initramfs regenerated for all installed kernels (mkinitcpio)" \
+            || gb_warn "mkinitcpio failed , the boot image may still hold an old greenboost.ko (run: sudo mkinitcpio -P)"
+    else
+        gb_warn "no known initramfs tool found , if your boot image bundles kernel modules, regenerate it manually"
+    fi
+}
+
+gb_install_initramfs_exclusion() {
+    local _installed=0
+    if [[ -d /etc/initramfs-tools/hooks && -f "$MODULE_DIR/initramfs/zz-greenboost-exclude" ]]; then
+        install -m 755 "$MODULE_DIR/initramfs/zz-greenboost-exclude" "$GB_INITRAMFS_HOOK" \
+            && { gb_ok "initramfs exclusion installed: $GB_INITRAMFS_HOOK"; _installed=1; }
+    fi
+    if [[ $_installed -eq 0 ]] && command -v dracut &>/dev/null && [[ -d /etc/dracut.conf.d ]]; then
+        printf 'omit_drivers+=" greenboost "\n' > "$GB_DRACUT_EXCLUDE" \
+            && { gb_ok "initramfs exclusion installed: $GB_DRACUT_EXCLUDE"; _installed=1; }
+    fi
+    [[ $_installed -eq 0 ]] \
+        && gb_warn "could not install an initramfs exclusion for this distro , check that greenboost.ko is not baked into your boot image"
+    gb_initramfs_refresh
+    return 0
+}
+
+# Uninstall counterpart (Installer/Uninstaller Parity Must-Rule): drop the
+# exclusion and rebuild, so a purged machine's boot image matches a machine that
+# never had GreenBoost installed.
+gb_remove_initramfs_exclusion() {
+    local _removed=0
+    for f in "$GB_INITRAMFS_HOOK" "$GB_DRACUT_EXCLUDE"; do
+        [[ -f "$f" ]] && rm -f "$f" && _removed=1
+    done
+    [[ $_removed -eq 1 ]] && gb_initramfs_refresh
+    return 0
+}
+
 # ── Distro / kernel helpers ────────────────────────────────────────────────────
 
 # Semantic kernel version comparison - true when running kernel ≥ want_major.want_minor
@@ -3304,6 +3363,102 @@ HPEOF
 # triggering the OOM guard and crashing the game.  Stopping Ollama releases all T2 pages.
 # prefers Ollama REST API when Ollama is among them, sends SIGTERM to everything else.
 # The kernel's gb_close() → gb_release_pid_buffers() frees T2 DMA-BUF on exit.
+# ── gaming-mode ───────────────────────────────────────────────────────────────
+# Read or clear greenboost.ko's `gaming_mode` flag.
+#
+# The flag is normally owned by the Gaming Suite: set at game launch, cleared
+# at exit. It exists so a running game never loses VRAM to a model , while it
+# is 1, the kernel moves inference T2 buffers to the LRU tail.
+#
+# It becomes a problem only in one situation, and that situation is invisible:
+# a game session that dies hard never clears it. From then on every inference
+# allocation is quietly de-prioritised and the shim keeps doubling its KV
+# reserve, which reads as "the box got slower" and nothing points at the cause.
+# `gb semantics segments gaming_mode_stuck` reports the state; this is the one
+# command that fixes it.
+#
+# Deliberately NOT automatic. The flag is a policy signal owned by another
+# component, and silently flipping someone else's policy is how two owners
+# start fighting over one knob.
+cmd_gaming_mode() {
+    local action="${1:-status}"
+    local path="/sys/module/greenboost/parameters/gaming_mode"
+
+    if [[ ! -e "$path" ]]; then
+        printf "  ${C_AMBER}⚠${C_RESET}  greenboost.ko is not loaded, so there is no gaming_mode to read.\n"
+        printf "     Nothing is wrong with inference; the flag only exists while the module is.\n"
+        printf "     Load it with: ${C_CYAN}sudo greenboost load${C_RESET}\n"
+        return 1
+    fi
+
+    local cur
+    cur=$(cat "$path" 2>/dev/null || echo "?")
+    local game_running="no"
+    if pgrep -x wine64-preloader >/dev/null 2>&1 || pgrep -x wine-preloader >/dev/null 2>&1; then
+        game_running="yes"
+    fi
+
+    case "$action" in
+        status|"")
+            gb_header
+            printf "  gaming_mode: ${C_CYAN}%s${C_RESET}    game running: ${C_CYAN}%s${C_RESET}\n" \
+                   "$cur" "$game_running"
+            if [[ "$cur" != "0" && "$game_running" == "no" ]]; then
+                printf "\n  ${C_AMBER}Gaming priority is still applied and no game is running.${C_RESET}\n"
+                printf "  What that costs you: every model buffer GreenBoost keeps in system RAM\n"
+                printf "  is first in line to be evicted, so a model reloads sooner than it needs\n"
+                printf "  to and generation gets slower. Nothing is broken and nothing is lost.\n"
+                printf "  To clear it: ${C_CYAN}sudo greenboost gaming-mode off${C_RESET}\n"
+            fi
+            ;;
+        off|clear|0)
+            need_root
+            if [[ "$game_running" == "yes" ]]; then
+                printf "  ${C_AMBER}⚠${C_RESET}  A game appears to be running , clearing gaming_mode now would\n"
+                printf "     let inference compete with it for VRAM. Close the game first, or\n"
+                printf "     re-run with ${C_CYAN}--force${C_RESET} if you know it is a leftover process.\n"
+                [[ "${2:-}" == "--force" ]] || return 1
+            fi
+            if printf '0' > "$path" 2>/dev/null; then
+                printf "  ${C_LIME}✓${C_RESET}  gaming_mode cleared , inference memory is back to normal priority.\n"
+                gb_df_emit_gaming_mode "cleared" "$cur"
+            else
+                printf "  ${C_RED}✗${C_RESET}  Could not write %s (need root).\n" "$path"
+                return 1
+            fi
+            ;;
+        on|1)
+            need_root
+            printf '1' > "$path" 2>/dev/null \
+                && printf "  ${C_LIME}✓${C_RESET}  gaming_mode set , game buffers now outrank inference.\n" \
+                || { printf "  ${C_RED}✗${C_RESET}  Could not write %s (need root).\n" "$path"; return 1; }
+            gb_df_emit_gaming_mode "set" "$cur"
+            ;;
+        *)
+            die "Usage: greenboost gaming-mode [status|off|on] [--force]"
+            ;;
+    esac
+}
+
+# Leave a trace: a manual override of another component's policy signal is
+# exactly the kind of thing that is impossible to explain a week later.
+gb_df_emit_gaming_mode() {
+    local action="$1" previous="$2"
+    python3 - "$action" "$previous" <<'PYEOF' 2>/dev/null || true
+import sys
+for p in ("/usr/local/lib/greenboost",):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+try:
+    import gb_dataflux
+    gb_dataflux.emit({"kind": "gaming_session", "action": "mode_override",
+                      "mode_action": sys.argv[1], "previous": sys.argv[2],
+                      "by": "greenboost gaming-mode"})
+except Exception:
+    pass
+PYEOF
+}
+
 cmd_t3_memory() {
     # Usage: greenboost t3-memory <size>   e.g. 100GB, 50GB, 0 (disk-limited)
     local raw="${1:-}"
@@ -4443,6 +4598,10 @@ do_purge() {
         /etc/modprobe.d/99-nvidia-greenboost.conf; do
         [[ -f "$f" ]] && rm -f "$f" && (( _cfg_removed++ )) || true
     done
+    # Undo the initramfs exclusion and rebuild, so a purged machine's boot image
+    # matches one that never had GreenBoost (Installer/Uninstaller Parity).
+    gb_remove_initramfs_exclusion
+
     # Strip greenboost from ai-workstation.conf (nvidia/cpuid still needed - don't delete)
     local _ml_ai="/etc/modules-load.d/ai-workstation.conf"
     if [[ -f "$_ml_ai" ]] && grep -q "^greenboost[[:space:]]*$" "$_ml_ai"; then
@@ -4778,6 +4937,10 @@ cmd_install_python_files() {
         # CLAUDE.md's "never below fp8 without gate evidence" rule needs);
         # gb_bench_spec picks the speculative-decode depth from a sweep.
         gb_bench_turn.py gb_bench_kv.py gb_bench_spec.py gb_bench_codec.py
+        # The control loop's decision half (2026-08-20). gb_mcp.py's
+        # tuner_tick imports it on every call, so a box without it loses the
+        # tuner entirely , quietly, since that import is guarded like the rest.
+        gb_tuner.py
         # Modules that INSTALLED modules import, but which were never in this
         # list (found 2026-08-20 by checks/check_python_manifest.py, the check
         # written after this same class of bug bit twice before):
@@ -6051,6 +6214,38 @@ MODEOF
             || gb_warn "boot-guard enable failed , run: sudo systemctl enable greenboost-boot-guard"
     fi
 
+    # Keep greenboost OUT of the initramfs, and refresh the image so no stale
+    # copy survives this install.
+    #
+    # Incident 2026-08-21: MODULES=most made initramfs-tools bake greenboost.ko
+    # into the initrd, whose systemd-modules-load inserted it before the real
+    # root was mounted. A reinstall rebuilds /lib/modules and never touches the
+    # initrd, so the box kept booting the OLD module , v3.2 across several
+    # reboots while v3.4 was installed , and rebooting was the one action
+    # guaranteed not to fix it. It also meant /var was absent at load time, so
+    # T3 failed open ("T3 backing file unavailable: -2 - T3 disabled") on every
+    # boot while the status page still printed the configured cap.
+    #
+    # greenboost never mounts the root filesystem. Real root is the correct
+    # place for it: greenboost-boot-guard.service (After=local-fs.target) and
+    # the real-root systemd-modules-load.service both load it there.
+    gb_install_initramfs_exclusion
+
+    # The boot guard runs as root; without this it would write its dataflux
+    # events into /root's log, which the MCP (running as the owner) never reads.
+    _gb_df_home=""
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        _gb_df_home=$(eval echo "~${SUDO_USER}" 2>/dev/null)
+    fi
+    if [[ -n "$_gb_df_home" && -d "$_gb_df_home" && -f /etc/systemd/system/greenboost-boot-guard.service ]]; then
+        if ! grep -q '^Environment=GREENBOOST_DATAFLUX_LOG=' /etc/systemd/system/greenboost-boot-guard.service; then
+            sed -i "/^\[Service\]/a Environment=GREENBOOST_DATAFLUX_LOG=${_gb_df_home}/.local/share/greenboost/dataflux.jsonl" \
+                /etc/systemd/system/greenboost-boot-guard.service
+            systemctl daemon-reload 2>/dev/null || true
+        fi
+    fi
+    unset _gb_df_home
+
     # profile.d - auto-activate GreenBoost for all CUDA inference tools launched
     # from a login shell (terminal, SSH).  GREENBOOST_ACTIVE=1 is exported globally
     # so vLLM, PyTorch scripts, TGI, Transformers, etc. all work without any wrapper.
@@ -6474,6 +6669,7 @@ cmd_uninstall() {
     info "  - /etc/ld.so.preload entries for GreenBoost"
     info "  - /etc/modprobe.d/greenboost.conf"
     info "  - /etc/modules-load.d/greenboost.conf"
+    info "  - /etc/initramfs-tools/hooks/zz-greenboost-exclude (+ initramfs rebuild)"
     info "  - /etc/profile.d/greenboost.sh"
     info "  - /etc/sysctl.d/99-greenboost.conf"
     info "  - /etc/sysfs.d/greenboost-hugepages.conf"
@@ -6932,8 +7128,30 @@ vm.overcommit_memory = 1
 # file segments. Default 65530 is too low; 2M covers any realistic case.
 vm.max_map_count = 2147483642
 
-# Always keep 512 MB free - prevents latency spikes under allocation storms.
-vm.min_free_kbytes = 524288
+SYSCTL_EOF
+
+    # Free-memory floor, derived from THIS box's RAM rather than fixed at the
+    # reference machine's 512 MB. Two reasons it stopped being a literal:
+    #
+    #  1. The hardcoded-hardware rule , 512 MB is 0.8% of this box's 64 GB and
+    #     8% of an 8 GB feeder, which is a completely different policy on each.
+    #  2. It silently contradicted linux-kernel-inference's own
+    #     /etc/sysctl.d/95-greenboost-t2.conf, which asks for 1 GB. This file
+    #     sorts LAST and wins every conflict by design, so the T2
+    #     direct-reclaim guard that project ships was running at half strength
+    #     on this box with nothing reporting it (measured 2026-08-20:
+    #     configured 1048576, live 524288). Deriving the same ~1.6% both
+    #     places makes them agree by construction instead of by coincidence.
+    local _memtotal_kb
+    _memtotal_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    local _min_free_kb=$(( _memtotal_kb * 16 / 1000 ))    # ~1.6% of RAM
+    (( _min_free_kb < 65536 )) && _min_free_kb=65536      # floor: 64 MB
+    printf '\n# Free-memory floor: ~1.6%% of this box'"'"'s %s kB of RAM. Keeps kswapd\n' "$_memtotal_kb" >> "$dest"
+    printf '# ahead of the allocator so the T2 pool'"'"'s 2 MB THP faults do not hit\n' >> "$dest"
+    printf '# direct reclaim mid-inference. Derived, not fixed - see greenboost_setup.sh.\n' >> "$dest"
+    printf 'vm.min_free_kbytes = %d\n' "$_min_free_kb" >> "$dest"
+
+    cat >> "$dest" << 'SYSCTL_EOF'
 
 # Proactive compaction: GreenBoost T2 needs contiguous 2 MB hugepage ranges.
 # Value 20 = moderate background compaction (0=off, 100=aggressive).
@@ -13398,6 +13616,7 @@ cmd_help() {
         printf "  ${C_LIME}%-20s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "uninstall"          "Remove module + all config"
         printf "  ${C_LIME}%-20s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "profile"            "Interactive profile wizard (create / activate / diff)"
         printf "  ${C_LIME}%-20s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "clear memory-pool"  "Force-release T1 VRAM + T2 RAM + T3 now (unloads inference models)"
+        printf "  ${C_LIME}%-20s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "gaming-mode"        "Show, or clear, the gaming-priority flag a crashed game can leave set"
         printf "  ${C_LIME}%-20s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "clear host-ram"     "Drop reclaimable page cache + report swap pressure (general host RAM, not GreenBoost's pool)"
         printf "  ${C_LIME}%-20s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "clear cluster-workers" "Kill feeder stage/block workers + host tunnels, remove stage temp files"
         printf "  ${C_LIME}%-20s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "logs"               "Live log TUI (kernel, Ollama, AppArmor)"
@@ -13431,6 +13650,7 @@ cmd_help() {
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "vitals"             "Live TUI: tier usage, GPU telemetry, inference state, diagnostics  [--llm]"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "health-check"       "One-shot PASS/FAIL/WARN across module, VRAM, T2, T3, cluster  [--llm]"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "clear memory-pool"  "Force-release T1 VRAM + T2 RAM + T3 immediately (unloads models)"
+        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "gaming-mode [off]"  "Show, or clear, the gaming-priority flag a crashed game can leave set"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "clear host-ram"     "Drop reclaimable page cache + report swap pressure (general host RAM)"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "clear cluster-workers" "Kill feeder stage/block workers + host tunnels, remove stage temp files"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "benchmark [flags]"  "Memory pool bandwidth benchmark  [--skip-bandwidth] [--llm]"
@@ -14084,6 +14304,7 @@ case "$COMMAND" in
     pilot)               cmd_pilot "${@:2}" ;;
 
     t3-memory)           cmd_t3_memory "${2:-}" ;;
+    gaming-mode)         cmd_gaming_mode "${2:-status}" "${3:-}" ;;
     clean)
         case "${2:-}" in
             memory)  gb_warn_ui "'greenboost clean memory' deprecated - use 'greenboost clear memory-pool'"; cmd_clear_memory_pool ;;

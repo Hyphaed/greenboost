@@ -14,6 +14,234 @@ Take `main` directly, it builds and its gates pass:
 Already have a checkout: `git fetch origin && git checkout main && git pull`.
 Prefer the last stable release: `git checkout v3.4`.
 
+### The machine stopped booting a two-versions-old kernel module
+
+The box ran GreenBoost v3.2 across several reboots while v3.4 was the installed
+build. A reinstall did not fix it, and rebooting , the instinctive fix , was the
+one action guaranteed not to.
+
+`/etc/initramfs-tools/initramfs.conf` carries `MODULES=most`, so initramfs-tools
+copied `greenboost.ko` into the boot image and the systemd hook copied
+`/etc/modules-load.d/greenboost.conf` in alongside it. The initrd's own
+`systemd-modules-load` then inserted the module 7.4 seconds before switch-root.
+Reinstalling rebuilds `/lib/modules/<kver>/updates/dkms/` and never touches the
+initrd, so every boot went back to whatever was frozen into the image , here, a
+build from 16:26 on the day before.
+
+Two costs, not one. The obvious one is that fixes shipped in v3.3 and v3.4 were
+absent while every version banner still looked plausible. The quieter one is
+that `/var` is not mounted that early, so Tier 3 could not open its backing
+file and the module ran with T3 off on every boot:
+
+    greenboost: T3 backing file unavailable (/var/lib/greenboost/t3_store): -2 - T3 disabled
+
+while `/sys/class/greenboost/greenboost/status` kept printing
+`Tier 3  T3 backing file : 73 GB NVMe file [GreenBoost-managed, pre-allocated]`
+and `GbSnapshot.t3_total_mb` kept reporting 74752. Both report the configured
+cap. Neither reports whether the file opened.
+
+`greenboost-boot-guard.service` exists precisely to self-heal a bad module at
+boot, and it reported success throughout, because it gated on presence:
+
+    if lsmod | grep -q '^greenboost\b'; then
+        log "greenboost already loaded , nothing to do"; exit 0
+    fi
+
+A wrong-version module *is* loaded. Presence is not identity.
+
+Three changes:
+
+* `initramfs/zz-greenboost-exclude` keeps the module and its autoload fragment
+  out of the boot image. greenboost never mounts the root filesystem, so real
+  root , after `local-fs.target`, where `/var` exists , is the correct place for
+  it. The installer drops the hook in and regenerates the image; the purge path
+  removes it and regenerates again (Installer/Uninstaller Parity).
+* `greenboost_boot_guard.sh` compares the loaded module's `srcversion` against
+  the installed `.ko`'s and reloads on a mismatch, falling back to the version
+  string when either side publishes no `srcversion`. It refuses to unload while
+  `refcnt > 0` , a version number is never worth killing a live CUDA process
+  for , and says so instead, which is a `deferred_in_use` rather than a silent
+  skip. Every drift emits the new `kmod_version_drift` dataflux kind.
+* Governed, so the next occurrence is answerable rather than found in a GUI
+  banner: `kmod_load_stage` (initramfs vs realroot, decided by comparing the
+  insertion timestamp against `initrd-switch-root.target`), `t3_enabled` (read
+  from the kernel log, the only place the open is reported),
+  `t3_capacity_configured_mb` (named for what it is), and the
+  `kmod_stale_from_initramfs` and `t3_configured_but_disabled` segments.
+  `kmod_stale_from_initramfs` is deliberately separate from the existing
+  `kmod_version_drift` segment because the instructions differ: plain drift is
+  fixed by `sudo greenboost load`; this one is fixed by that command for
+  exactly one boot.
+
+`never_use` traps on `GbSnapshot.loaded` and `t3_total_mb`, both of which read
+healthy while the thing they describe is wrong.
+
+### A turn no longer dies because the client guessed its own size wrong
+
+greenboost-cli estimated request size at four characters per token, the prose
+figure, against a context that is mostly code, JSON and file paths. It read
+low, which is the direction that ends turns: it reports headroom that is not
+there. On 2026-08-20 a turn overflowed, the CLI auto-compacted and retried, and
+the retry overflowed again at 24,654 tokens against a 24,576-token window ,
+because compaction summarises the middle of a conversation and leaves the live
+tail verbatim, and the bytes that did not fit were in that tail.
+
+Three changes, in the order they matter:
+
+* the estimator now learns its own chars-per-token from the server's
+  `usage.prompt_tokens` after every completed turn, and the status line's
+  context percentage uses the same figure;
+* the budget check counts the fixed overhead (system prompt + every connected
+  MCP server's tool schemas), which is the larger half of a local request and
+  was previously invisible to it;
+* a retry is sized against the server's own numbers and evicted into range
+  before it is fired , and when even that cannot fit, the CLI says why, in
+  plain words, instead of spending the one permitted retry on a request known
+  to fail.
+
+    gb semantics answer "why did my turn fail" --json
+    gb semantics segments ctx_estimate_undercounts --json
+
+### GreenBoost has a control loop, and it can be read before it is trusted
+
+`gb_tuner.py` decides; nothing in it touches hardware. One tick is
+`decide(snapshot, state)` , a pure function, so the awkward cases are unit
+tests instead of things discovered live on a busy box: a measurement taken
+before an actuation landed (settle cycles), a threshold crossed by one sample
+(latching hysteresis, enter at one figure and release at a lower one), a
+target this hardware cannot reach at all (an EMA baseline with a minimum
+population, which is what the old n=3 advisories lacked), a lever that made
+things worse (frozen, then re-probed).
+
+The decision it exists for is **harvest**: when decode is bandwidth-bound and
+the bottleneck cannot be moved, whatever the card is holding for compute buys
+nothing. The lever is the **SM clock**, and arriving at that was a correction.
+
+The first implementation harvested the power limit. It could never have fired.
+Classification is power-first by necessity , `utilization.gpu` counts a kernel
+stalled on a PCIe read as fully busy, and mid-decode this box reads **100%
+utilisation while drawing 49.8 W of a 300 W limit** , but that same rule makes
+a card near its board limit compute-bound by definition, so a power harvest
+only becomes eligible on a machine the engine has just called GPU-bound. The
+watts were never the waste here; the card is barely using them. The clock is:
+2685 MHz held at boost, waiting on the link.
+
+Whether trimming it is free is answered by experiment rather than asserted ,
+dequantisation does run on those SMs. The decision carries `verify`, the caller
+re-measures after the settle window, and a regression restores the lever and
+freezes it. Two tests pin the regression that made the old harvest
+unreachable: one asserts a 100%-utilisation snapshot still classifies as
+bandwidth-bound, one asserts no harvest is computed without clock telemetry.
+
+    tuner_tick()                                    # advice, read-only
+    tuner_tick(apply=True, confirm=True)            # + GB_ORCH_ACTUATE=1
+    gb semantics answer "should I give clocks back" --json
+
+Every tick is emitted as `tuner_decision`, including the ones that decided to
+hold , "why did nothing happen" is the question a control loop is usually
+asked.
+
+### Speculative decoding is now measured on real traffic
+
+The engine has always reported `draft_n` / `draft_n_accepted` on every response
+that drafted anything. The proxy dropped both, so acceptance was only ever
+visible through a synthetic sweep. It now rides on the same `tok_s_measured`
+event as the throughput figure it explains, governed as `draft_accept_pct`,
+and the tuner uses it to pick depth instead of trusting a constant found by
+sweeping a different model.
+
+Depth 0 reports `None`, not zero: with nothing drafted, nothing can be
+rejected, and the engine duly reports 100% acceptance , which reads as
+"drafting is working perfectly" when the truth is "drafting is off".
+
+### Decode latency now has a shape, not just an average
+
+`tok_s` is a mean, and with MTP speculative decode the real distribution is
+bimodal , near-zero gaps inside an accepted draft batch, a whole forward pass
+at the boundary. The mean describes no token that actually happened, and the
+boundary is the part you feel.
+
+Streamed replies now carry inter-token percentiles on the same
+`tok_s_measured` event: `p50_ms`, `p95_ms`, `max_ms`, `slow_token_ratio` and
+`gap_samples`.
+
+    gb semantics resolve inter_token_p95_ms --json
+    gb semantics segments decode_tail_heavy --json
+    gb semantics answer "why does output stutter" --json
+
+`decode_tail_heavy` separates two problems a mean cannot: a uniformly slow
+decode is a bandwidth or placement issue, a heavy tail with a healthy median is
+a stall. `slow_token_ratio` is measured against each response's OWN median
+rather than an absolute millisecond figure , what counts as slow depends on the
+model, the quant and how much of it is streaming over PCIe, and a fixed
+millisecond threshold would also be a hardcoded hardware value.
+
+Two traps come with it: `tok_s` must never be read as a latency signal, and
+`max_ms` (one sample) must never be read as a frequency. Percentiles are
+withheld entirely below 16 gaps , a p95 over three samples is arithmetic, not
+evidence.
+
+Streaming only. A non-streaming reply arrives in one piece and carries no
+per-token arrival times, so it has no percentiles by construction; the metric
+says so rather than reporting a zero. The ring is bounded at 4096 gaps because
+this proxy is long-lived and an unbounded per-request buffer already cost
+37.5 GB once.
+
+### `vm.min_free_kbytes` was configured at 1 GB and running at 512 MB
+
+Found by a live audit, and the cause was not what it looked like. GreenBoost's
+installer wrote `vm.min_free_kbytes = 524288` into
+`/etc/sysctl.d/99-zzz-greenboost.conf`, which is deliberately named to sort
+last and win every conflict. linux-kernel-inference ships
+`95-greenboost-t2.conf` asking for `1048576`. 95 loses to 99, silently, so the
+T2 direct-reclaim guard that project ships was running at half strength with
+nothing reporting it.
+
+The literal is gone. Both installers now derive the floor from the box's own
+`MemTotal` (~1.6% of RAM, 64 MB floor), which lands at ~1.01 GB here and agrees
+with the other project by construction instead of by coincidence. 512 MB was
+also a hardcoded-hardware value in the first place: it is 0.8% of this box and
+8% of an 8 GB feeder, which is two different policies wearing one number.
+
+The general fix is in linux-kernel-inference's `workstation-probe.sh`, which
+now prints configured-vs-live for **every** key any `sysctl.d` file sets. It
+found four more drifts on its first run.
+
+### A stuck `gaming_mode` is now something you can ask about
+
+When a game session dies hard, greenboost.ko's `gaming_mode` stays at 1. While
+it does, every inference T2 buffer is parked at the eviction queue's tail , so
+model weights get evicted ahead of gaming buffers for a game that is no longer
+running. Nothing reported that state; it looked like a generic slowdown.
+
+Two governed metrics and a segment now name it:
+
+    gb semantics resolve gaming_mode_active --json
+    gb semantics resolve gaming_session_orphans --json
+    gb semantics segments gaming_mode_stuck --json
+    gb semantics answer "is a game still running" --json
+
+`gaming_mode_stuck` returns `matched: null`, not `false`, when the flag or
+`/proc` cannot be read , a clean bill of health inferred from absent data is
+the failure mode this layer exists to prevent.
+
+Two traps come with them. `gaming_mode` read alone answers "is gaming priority
+applied", not "is a game running", and the two diverge exactly when a session
+crashes. `pids_kill` reads like a failure count and is not one: a game that
+ignores SIGTERM and dies to SIGKILL was still stopped successfully , only
+`orphans` says something survived.
+
+`gaming_session_orphans` resolves through the newest event that actually
+CARRIES the field, because `orphans` is emitted only on
+`action="terminated"`; taking the newest `gaming_session` event of any action
+would let one ordinary `start` hide every real teardown result. That is the
+same defect shape as the 2026-08-18 `ttft_ms` bug, and the eval fixture now
+encodes it.
+
+The emitter is the Gaming Suite (`greenboost_gaming`), whose Proton wrapper
+became a `PR_SET_CHILD_SUBREAPER` owner of the game's process tree in the same
+change , see that repo's changelog.
+
 ### Four contributions to the Linux kernel, and what they buy local inference
 
 The kernel work GreenBoost produced is now its own repository,

@@ -38,3 +38,21 @@ so future contributors can tell upstream code from GreenBoost's own
 changes at a glance.
 
 - 2026-07-24: Initial import, no source modifications yet.
+
+- 2026-08-20: Per-request speculative draft depth.
+  * tools/server/server-schema.cpp , took `speculative.n_max` out of the
+    `#if 0` block upstream uses to disable per-request speculative
+    parameters. Only that one field: `n_min`, `p_min` and `type` are read
+    from the common_speculative object's params, which are fixed at init,
+    so accepting them per request would parse cleanly and do nothing.
+  * tools/server/server-context.cpp , `server_slot::get_n_draft_max()` now
+    clamps by `task->params.speculative.draft.n_max`. Without this the
+    request's value is overwritten by the context-fit bound on every step.
+  Both changes can only LOWER the depth below the server's own
+  `--spec-draft-n-max`; `common_speculative_draft()` already takes
+  `min(params.n_max, dp.n_max)` and the target output buffer is sized from
+  the server-level maximum, so nothing can overrun.
+  Why: draft depth is the only decode lever left on a box whose weights do
+  not fit in VRAM, and the right depth follows live acceptance rather than a
+  constant (2026-08-05 sweep: tok/s non-monotonic in depth). Previously
+  changing it meant restarting the server and discarding every warm slot.

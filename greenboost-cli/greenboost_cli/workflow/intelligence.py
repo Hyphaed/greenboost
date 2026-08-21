@@ -30,9 +30,94 @@ _MAX_SKILL_INJECT_CHARS = 4000
 _MAX_SKILLS_PER_TURN = 3
 
 
+#: Characters per token assumed by the estimator when nothing better is known.
+#: 4.0 is the usual English prose figure. Code, JSON and file paths tokenize
+#: nearer 3, which is why the estimate can pass while the real request 400s ,
+#: see `note_real_prompt_tokens()`, which replaces this guess with the server's
+#: own count as soon as one is available.
+_CHARS_PER_TOKEN_DEFAULT = 4.0
+
+#: Live calibration, learned from `usage.prompt_tokens`. Clamped: a ratio
+#: outside this band means the sample did not describe the same bytes the
+#: estimator counted (a fresh session, a tool-schema change), and trusting it
+#: would make the estimate worse than the fixed guess it replaced.
+_CHARS_PER_TOKEN_MIN = 2.0
+_CHARS_PER_TOKEN_MAX = 6.0
+
+#: EMA weight for a new sample. Low enough that one unusual turn cannot swing
+#: the estimator, high enough that a model or prompt change is tracked within a
+#: handful of turns.
+_CALIBRATION_ALPHA = 0.3
+
+_chars_per_token = _CHARS_PER_TOKEN_DEFAULT
+_calibration_samples = 0
+
+
+def calibration() -> dict:
+    """Current estimator calibration , for /status, tests and telemetry."""
+    return {"chars_per_token": round(_chars_per_token, 3),
+            "samples": _calibration_samples,
+            "source": "server usage.prompt_tokens" if _calibration_samples
+                      else "default (no server sample yet)"}
+
+
+def reset_calibration() -> None:
+    """Forget what was learned. Used by tests, and by anything that changes the
+    tokenizer under us (a model swap)."""
+    global _chars_per_token, _calibration_samples
+    _chars_per_token = _CHARS_PER_TOKEN_DEFAULT
+    _calibration_samples = 0
+
+
+def note_real_prompt_tokens(actual: int, estimated: int) -> "float | None":
+    """Teach the estimator what the server actually counted.
+
+    `actual` is the server's own `usage.prompt_tokens`; `estimated` is what
+    this module predicted for the SAME request (history + fixed overhead).
+    Returns the resulting chars-per-token, or None when the sample was
+    unusable.
+
+    This exists because the estimate is the only thing standing between a turn
+    and a 400, and an estimate that is systematically low is worse than no
+    estimate at all: it reports headroom that is not there. Live 2026-08-20:
+    a compaction retry was fired against a 24576-token window and the real
+    request came back at 24654 , a 78-token miss that ended the turn.
+    """
+    global _chars_per_token, _calibration_samples
+    if actual <= 0 or estimated <= 0:
+        return None
+    # `estimated` was produced at the current ratio, so the implied character
+    # count is estimated * ratio. Dividing by the real token count gives the
+    # ratio that WOULD have been right.
+    implied_chars = estimated * _chars_per_token
+    observed = implied_chars / actual
+    if not (_CHARS_PER_TOKEN_MIN <= observed <= _CHARS_PER_TOKEN_MAX):
+        return None
+    _chars_per_token = ((1.0 - _CALIBRATION_ALPHA) * _chars_per_token
+                        + _CALIBRATION_ALPHA * observed)
+    _calibration_samples += 1
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({
+            "kind": "agent_context_edit", "status": "ok", "op": "calibrate",
+            "actual_prompt_tokens": int(actual),
+            "estimated_prompt_tokens": int(estimated),
+            "estimate_error_pct": round(100.0 * (estimated - actual) / actual, 2),
+            "chars_per_token": round(_chars_per_token, 3),
+            "samples": _calibration_samples,
+        })
+    except Exception:
+        pass
+    return _chars_per_token
+
+
 def _estimate_tokens(session: "ConversationSession") -> int:
-    """Quick token estimate: ~1 token per 4 chars in message text + tool-call
-    payloads.
+    """Token estimate for the session's messages, at the live calibration.
+
+    The chars-per-token divisor is not a constant: it starts at 4.0 and is
+    replaced by whatever the server's own `usage.prompt_tokens` implies (see
+    `note_real_prompt_tokens`), because 4.0 describes prose and this CLI's
+    context is mostly code, JSON and paths.
 
     Previously counted only `content`, so an assistant message carrying a
     tool_calls list and empty text (the common case — the model called a
@@ -47,22 +132,54 @@ def _estimate_tokens(session: "ConversationSession") -> int:
     `extra_tokens` to _compress_context instead, since they aren't part of
     session.messages."""
     import json as _json
-    total = 0
+    chars = 0
     for msg in session.messages:
         content = msg.get("content", "")
         if isinstance(content, str):
-            total += len(content) // 4
+            chars += len(content)
         elif isinstance(content, list):
             for block in content:
                 if isinstance(block, dict):
-                    total += len(block.get("text", "")) // 4
+                    chars += len(block.get("text", ""))
         tool_calls = msg.get("tool_calls")
         if tool_calls:
             try:
-                total += len(_json.dumps(tool_calls)) // 4
+                chars += len(_json.dumps(tool_calls))
             except (TypeError, ValueError):
                 pass
-    return total
+    return int(chars / _chars_per_token)
+
+
+def estimate_request_tokens(system: str, tool_schemas: list, messages: list) -> int:
+    """Estimate the WHOLE request , system prompt, tool schemas and messages.
+
+    `_estimate_tokens()` only sees `session.messages`, but the fixed overhead is
+    most of a local request: ten MCP servers' schemas were measured at ~29.5k
+    tokens on this box. A budget check that ignores them is checking the small
+    half. Uses the same live calibration, so this number can be compared
+    directly against the server's `usage.prompt_tokens`.
+    """
+    import json as _json
+    chars = len(system or "")
+    try:
+        chars += len(_json.dumps(tool_schemas or []))
+    except (TypeError, ValueError):
+        pass
+    for m in messages or []:
+        c = m.get("content", "")
+        if isinstance(c, str):
+            chars += len(c)
+        elif isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict):
+                    chars += len(b.get("text", ""))
+        tc = m.get("tool_calls")
+        if tc:
+            try:
+                chars += len(_json.dumps(tc))
+            except (TypeError, ValueError):
+                pass
+    return int(chars / _chars_per_token)
 
 
 def _auto_rag_inject(user_input: str, settings: dict) -> str:
@@ -327,6 +444,116 @@ def microcompact_if_cold(session, last_turn_ts: float) -> int:
     if not last_turn_ts or (_t.time() - last_turn_ts) < _COLD_CACHE_GAP_S:
         return 0
     return _microcompact(session, keep=1)
+
+
+#: A tool result trimmed by the last-resort path keeps this much of its head.
+#: Enough to see what the command was and how its output started; small enough
+#: that trimming a handful of results actually reaches a hard token target.
+_HARD_TRIM_KEEP_CHARS = 800
+
+#: Marker left behind by the last-resort path. Distinct from `_CLEARED` because
+#: the two mean different things: microcompaction drops a result the run has
+#: moved past, this one truncates a result the run may still want, and the
+#: model needs to be able to tell those apart.
+_HARD_TRIMMED = "\n[… truncated to fit the server's context window , re-run the tool if you need the rest]"
+
+
+def hard_trim_to_fit(session, budget_tokens: int) -> dict:
+    """Last-resort eviction: bring the session under `budget_tokens`.
+
+    Compaction summarises the MIDDLE of a conversation and leaves the last few
+    messages verbatim. That is the right default , the tail is what the model
+    is still reasoning about , but it means a single large tool result sitting
+    in the tail is uncompactable, and no amount of re-compaction moves it.
+    Live 2026-08-20: a turn 400'd, auto-compaction ran, the retry 400'd again
+    at 24654 tokens against a 24576-token window, and the operator got the raw
+    error because the one permitted retry had been spent on a request that
+    could not fit.
+
+    Escalates in cost order, stopping as soon as the budget is met:
+      1. microcompaction with no keep-window (stale results first),
+      2. truncating the largest message bodies, largest first,
+      3. dropping the oldest non-pinned messages.
+
+    The pinned head, any structured-memory block and the final user message are
+    never touched , losing the question the turn is answering would make the
+    retry pointless.
+
+    Returns {"needed", "freed", "met", "steps"} , `met=False` is a real answer
+    and the caller must not fire a request on the back of it.
+    """
+    msgs = getattr(session, "messages", None) or []
+    before = _estimate_tokens(session)
+    if before <= budget_tokens or not msgs:
+        return {"needed": 0, "freed": 0, "met": True, "steps": []}
+
+    steps: list[str] = []
+
+    if _microcompact(session, keep=0):
+        steps.append("microcompact")
+    if _estimate_tokens(session) <= budget_tokens:
+        return _hard_trim_result(session, before, budget_tokens, steps)
+
+    # Protected: the pinned head, any memory block, and the last user message.
+    last_user = max((i for i, m in enumerate(msgs)
+                     if m.get("role") == "user"), default=-1)
+
+    def _protected(i: int, m: dict) -> bool:
+        if i < _HEAD_KEEP or i == last_user:
+            return True
+        c = m.get("content")
+        return isinstance(c, str) and c.startswith(_MEMORY_MARKER)
+
+    while _estimate_tokens(session) > budget_tokens:
+        cand = [(len(m["content"]), i) for i, m in enumerate(msgs)
+                if isinstance(m.get("content"), str)
+                and not _protected(i, m)
+                and len(m["content"]) > _HARD_TRIM_KEEP_CHARS + len(_HARD_TRIMMED)]
+        if not cand:
+            break
+        _, i = max(cand)
+        msgs[i]["content"] = msgs[i]["content"][:_HARD_TRIM_KEEP_CHARS] + _HARD_TRIMMED
+        steps.append(f"truncate[{i}]")
+
+    while _estimate_tokens(session) > budget_tokens:
+        drop = next((i for i, m in enumerate(msgs) if not _protected(i, m)), None)
+        if drop is None:
+            break
+        # A tool result must not outlive the assistant message that called it,
+        # and vice versa , an orphaned tool message is a malformed request on
+        # every backend, which would turn a context problem into a 400 of a
+        # different kind.
+        msgs.pop(drop)
+        while (drop < len(msgs) and msgs[drop].get("role") == "tool"):
+            msgs.pop(drop)
+        steps.append("drop_oldest")
+
+    return _hard_trim_result(session, before, budget_tokens, steps)
+
+
+def _hard_trim_result(session, before: int, budget_tokens: int,
+                      steps: list) -> dict:
+    after = _estimate_tokens(session)
+    out = {"needed": max(0, before - budget_tokens),
+           "freed": max(0, before - after),
+           "met": after <= budget_tokens,
+           "steps": steps}
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({
+            "kind": "agent_context_edit",
+            "status": "ok" if out["met"] else "error",
+            "op": "hard_trim",
+            "budget_tokens": int(budget_tokens),
+            "before_tokens": int(before),
+            "after_tokens": int(after),
+            "freed_tokens": int(out["freed"]),
+            "met": out["met"],
+            "steps": len(steps),
+        })
+    except Exception:
+        pass
+    return out
 
 
 def _compress_context(

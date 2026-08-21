@@ -35189,13 +35189,13 @@ struct Qdisc {
 	struct hlist_node hash;
 	u32 handle;
 	u32 parent;
+	int depth;
 	struct netdev_queue *dev_queue;
 	struct net_rate_estimator *rate_est;
 	struct gnet_stats_basic_sync *cpu_bstats;
 	struct gnet_stats_queue *cpu_qstats;
 	int pad;
 	refcount_t refcnt;
-	long: 64;
 	long: 64;
 	long: 64;
 	__u8 __cacheline_group_begin__Qdisc_read_mostly[0];
@@ -76973,11 +76973,11 @@ struct eventfs_entry {
 };
 
 struct eventfs_inode {
+	struct list_head list;
 	union {
-		struct list_head list;
+		struct list_head children;
 		struct callback_head rcu;
 	};
-	struct list_head children;
 	const struct eventfs_entry *entries;
 	const char *name;
 	struct eventfs_attr *entry_attrs;
@@ -107018,6 +107018,8 @@ struct mm_reply_data {
 };
 
 typedef struct mm_struct *class_mmap_read_lock_t;
+
+typedef class_mmap_read_lock_t class_mmap_read_lock_try_t;
 
 struct xol_area;
 
@@ -141121,20 +141123,23 @@ struct thermal_governor {
 
 struct thermal_hwmon_attr {
 	struct device_attribute attr;
+	char name[16];
+};
+
+struct thermal_hwmon_device {
+	char type[20];
+	struct device *device;
+	int count;
+	struct list_head tz_list;
+	struct list_head node;
 };
 
 struct thermal_hwmon_temp {
+	struct list_head hwmon_node;
 	struct thermal_zone_device *tz;
 	struct thermal_hwmon_attr temp_input;
 	struct thermal_hwmon_attr temp_crit;
 	bool temp_crit_present;
-};
-
-struct thermal_hwmon_device {
-	char name[31];
-	struct device *device;
-	struct list_head node;
-	struct thermal_hwmon_temp tz_temp;
 };
 
 struct thermal_instance {

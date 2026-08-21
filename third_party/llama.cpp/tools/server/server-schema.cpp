@@ -194,13 +194,35 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     // Speculative decoding params
     //
 
-    // TODO: to keep things simple, we disable speculative parameter adjustments for now
-#if 0
-    // TODO: for now, be able to adjust only the draft-model based speculative parameters
+    // GreenBoost patch (2026-08-20): `speculative.n_max` is exposed per request.
+    //
+    // Upstream disables every speculative parameter here "to keep things
+    // simple". We need exactly one of them, because draft depth is the only
+    // decode lever left on a box whose weights do not fit in VRAM, and the
+    // right depth is not a constant: a 2026-08-05 sweep found tok/s
+    // non-monotonic in depth (2:5.15, 3:5.58, 4:6.50, 6:4.40, 8:5.76), i.e.
+    // it depends on live acceptance, which the engine measures and reports.
+    // Without this, changing depth means restarting the server and throwing
+    // away every warm slot.
+    //
+    // Safe because the per-sequence override can only LOWER the depth:
+    // common_speculative_draft() takes min(server params.n_max, dp.n_max)
+    // (common/speculative.cpp), and the target-model output buffer is sized
+    // from the server-level maximum (server-context.cpp's n_outputs_per_seq),
+    // so a smaller per-request value can never overrun anything. Launch the
+    // server at the CEILING you want to allow and clamp downward per request.
+    //
+    // The other fields below stay disabled deliberately, NOT for tidiness:
+    // n_min/p_min/type are read from the common_speculative object's own
+    // stored params, which are fixed at init, so accepting them per request
+    // would silently do nothing. Exposing a knob that is not wired is worse
+    // than not exposing it.
     add((new field_num("speculative.n_max", params.speculative.draft.n_max))
         ->set_hard_limits(0, INT32_MAX)
-        ->set_desc("Maximum number of tokens to draft during speculative decoding"));
+        ->set_desc("Maximum number of tokens to draft during speculative decoding (per request; clamps DOWN from the server's --spec-draft-n-max, never up)"));
 
+#if 0
+    // TODO: for now, be able to adjust only the draft-model based speculative parameters
     add((new field_num("speculative.n_min", params.speculative.draft.n_min))
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Minimum number of draft tokens to use for speculative decoding");

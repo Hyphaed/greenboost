@@ -387,43 +387,88 @@ def _run_recovery() -> str:
 
 
 def _patch_apparmor() -> None:
-    """AppArmor remediation: patch snap-confine profiles for libgreenboost_audit."""
+    """AppArmor remediation: allow snap-confine to mmap the LD_AUDIT stub.
+
+    ONE mechanism only: the `local/` override, which snapd never rewrites and
+    which apparmor includes INSIDE the profile block.
+
+    What is deliberately not here, and must not be re-added: this function used
+    to also append the same two rules to every
+    `/var/lib/snapd/apparmor/profiles/snap-confine.snapd.*`. Those are complete
+    snapd-generated profiles. An append lands PAST the profile's final closing
+    brace, at top level, where apparmor_parser expects `profile NAME {` , so it
+    grants nothing and makes the entire profile unparseable:
+
+        syntax error, unexpected TOK_MODE, expecting TOK_OPEN
+
+    greenboost_setup.sh:3239-3248 already documents this as a confirmed live
+    incident from 2026-07-27 that "took down Firefox, Chromium, snap-store, cups
+    system-wide". The installer was fixed then; this function was not, and
+    reintroduced the identical failure on 2026-08-20 , two contaminated
+    profiles, `snapd.apparmor.service` dead, `systemctl is-system-running`
+    stuck at `degraded`.
+
+    The trap that makes this recur: `grep libgreenboost_audit <profile>`
+    returning a hit reads like "the grant is active". It is the opposite. A rule
+    past the closing brace grants nothing AND invalidates the whole profile, so
+    the presence of the string is the failure signal.
+    """
     local_sc = Path("/etc/apparmor.d/local/usr.lib.snapd.snap-confine.real")
+    header = "# GreenBoost: allow snap-confine to mmap the LD_AUDIT stub"
     libs = [
         "/usr/local/lib/libgreenboost_audit.so mr,",
         "/usr/local/lib/x86_64-linux-gnu/libgreenboost_audit.so mr,",
     ]
-    if local_sc.exists():
-        text = local_sc.read_text()
-        if "libgreenboost_audit" not in text:
-            with local_sc.open("a") as f:
-                f.write("\n" + "\n".join(libs) + "\n")
+    written = False
+    reason = "already present"
     try:
-        subprocess.run(
+        if not local_sc.parent.is_dir():
+            # No local/ directory means no supported injection point. Do NOT
+            # fall back to the snapd profile directory , that fallback is the
+            # bug above.
+            reason = "no /etc/apparmor.d/local directory , nothing supported to patch"
+        else:
+            # Create when absent. The old code skipped entirely unless the file
+            # already existed, which is exactly this box's state on 2026-08-21
+            # and why the supported override was missing while the unsupported
+            # one had been applied twice.
+            text = local_sc.read_text() if local_sc.exists() else ""
+            if "libgreenboost_audit" not in text:
+                with local_sc.open("a") as f:
+                    if text and not text.endswith("\n"):
+                        f.write("\n")
+                    f.write(header + "\n" + "\n".join(libs) + "\n")
+                written = True
+                reason = "local/ override written"
+    except OSError as e:
+        reason = f"local/ override unwritable: {e}"
+
+    parser_ok = None
+    try:
+        r = subprocess.run(
             ["apparmor_parser", "-r",
              "/etc/apparmor.d/usr.lib.snapd.snap-confine.real"],
             capture_output=True, timeout=15,
         )
+        parser_ok = (r.returncode == 0)
     except (Exception, subprocess.TimeoutExpired):
-        pass
+        parser_ok = None
+
+    # Observability Must-Rule: this function modifies system security policy and
+    # used to emit nothing at all, which is why a supervisor re-contaminating
+    # AppArmor could only be found by reading a journal.
     try:
-        result = subprocess.run(
-            ["find", "/var/lib/snapd/apparmor/profiles/",
-             "-name", "snap-confine.*", "-maxdepth", "1"],
-            capture_output=True, text=True, timeout=10,
-        )
-        for sp in result.stdout.splitlines():
-            sp_path = Path(sp.strip())
-            if sp_path.exists() and "libgreenboost_audit" not in sp_path.read_text():
-                with sp_path.open("a") as f:
-                    f.write("\n" + "\n".join(libs) + "\n")
-                try:
-                    subprocess.run(["apparmor_parser", "-r", str(sp_path)],
-                                   capture_output=True, timeout=15)
-                except subprocess.TimeoutExpired:
-                    pass
-    except (Exception, subprocess.TimeoutExpired):
+        import gb_dataflux
+        gb_dataflux.emit({
+            "kind": "apparmor_remediation",
+            "files_written": [str(local_sc)] if written else [],
+            "parser_ok": parser_ok,
+            "snapd_profiles_skipped": True,
+            "reason": reason,
+        })
+    except Exception:
         pass
+
     try:
         subprocess.run(["systemctl", "restart", "apparmor"],
                        capture_output=True, timeout=30)

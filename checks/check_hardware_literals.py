@@ -86,7 +86,7 @@ def run(repo_root: Path) -> list[Finding]:
                 continue
             if not _SIZE_LITERAL_RE.search(line):
                 continue
-            if is_allowlisted(rel, lineno, allow):
+            if is_allowlisted(rel, lineno, allow, line):
                 continue
             findings.append(Finding(
                 check="hardware_literals", severity="blocking", file=rel, line=lineno,

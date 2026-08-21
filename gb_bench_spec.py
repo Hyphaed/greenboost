@@ -51,14 +51,19 @@ PROMPTS = (
 )
 
 
-def _measure_once(base_url: str, model: str, prompt: str, max_tokens: int) -> dict:
+def _measure_once(base_url: str, model: str, prompt: str, max_tokens: int,
+                  draft_n: "int | None" = None) -> dict:
     import gb_bench_turn as bt
     messages = [{"role": "system", "content": "You are a benchmark fixture."},
                 {"role": "user", "content": prompt}]
+    payload = {"model": model, "messages": messages, "stream": False,
+               "max_tokens": max_tokens, "temperature": 0.0}
+    if draft_n is not None:
+        # Per-request depth (GreenBoost engine patch, 2026-08-20). Clamps down
+        # from the served ceiling only , see sweep_per_request().
+        payload["speculative.n_max"] = int(draft_n)
     t0 = time.monotonic()
-    d = bt._post(f"{base_url}/chat/completions", {
-        "model": model, "messages": messages, "stream": False,
-        "max_tokens": max_tokens, "temperature": 0.0})
+    d = bt._post(f"{base_url}/chat/completions", payload)
     wall = time.monotonic() - t0
     usage = d.get("usage") or {}
     tim = d.get("timings") or {}
@@ -125,6 +130,81 @@ def measure_current(base_url: str, model: str = "", max_tokens: int = 96,
         except Exception:
             pass
     return {"summary": summary, "runs": rows}
+
+
+def sweep_per_request(base_url: str, model: str = "", depths=DEFAULT_DEPTHS,
+                      max_tokens: int = 96, repeats: int = 2) -> dict:
+    """Sweep draft depth WITHOUT re-serving, one field per request.
+
+    The vendored engine takes `speculative.n_max` per request as of 2026-08-20
+    (third_party/llama.cpp/NOTICE). That turns this sweep from "a few minutes
+    per point, and every warm slot discarded" into a handful of ordinary
+    requests, which is the difference between a benchmark you run when you
+    suspect something and one you can run to check.
+
+    Two honest limits, because they change how the numbers should be read:
+
+    * the per-request value only clamps DOWN from the depth the server was
+      launched with, so a sweep can never measure a depth ABOVE the launch
+      ceiling , serve with `mtp_draft_n=8` first if you want the top of the
+      range;
+    * every point shares one warm server, so they also share its slot state.
+      That is a fairer comparison than the re-serving sweep in most respects
+      (no cold-prefill differences between points) but it does mean a depth
+      measured first has a colder cache than one measured last, which is why
+      `repeats` defaults above 1.
+    """
+    import gb_synapse
+    if not model:
+        ps = gb_synapse.ps()
+        if not ps:
+            return {"error": "no serve session running; pass --model"}
+        model = ps[0]["model"]
+    ceiling = next((s.get("mtp_draft_n") for s in gb_synapse.ps()
+                    if s.get("model") == model), None)
+
+    rows, results = [], []
+    for d in depths:
+        if ceiling and d > ceiling:
+            results.append({"draft_n": d, "skipped": (
+                f"above the served ceiling ({ceiling}) , the per-request field "
+                f"clamps down only; re-serve with mtp_draft_n>={d} to measure it")})
+            continue
+        per = []
+        for prompt in PROMPTS:
+            for _ in range(repeats):
+                per.append(_measure_once(base_url, model, prompt, max_tokens,
+                                         draft_n=d))
+        rates = [r["decode_tok_s"] for r in per if r.get("decode_tok_s")]
+        accepts = ([] if d == 0
+                   else [r["accept_rate"] for r in per
+                         if r.get("accept_rate") is not None])
+        summary = {
+            "model": model, "draft_n": d,
+            "median_tok_s": round(statistics.median(rates), 2) if rates else None,
+            "mean_tok_s": round(statistics.fmean(rates), 2) if rates else None,
+            "samples": len(rates),
+            "median_accept_rate": round(statistics.median(accepts), 3) if accepts else None,
+            "accept_rate_source": (
+                "engine timings, per-request depth" if accepts else
+                "not applicable at depth 0 (nothing drafted, so nothing rejected)"
+                if d == 0 else "engine reported none (no draft head)"),
+        }
+        results.append(summary)
+        rows.extend(per)
+        try:
+            import gb_dataflux
+            gb_dataflux.emit({"node": "host", "label": "synapse",
+                              "kind": "spec_decode", "per_request": True,
+                              **summary})
+        except Exception:
+            pass
+    measured = [r for r in results if r.get("median_tok_s")]
+    best = max(measured, key=lambda r: r["median_tok_s"], default=None)
+    return {"model": model, "served_ceiling": ceiling, "depths": results,
+            "best": best, "runs": rows,
+            "note": ("no re-serve , every point measured on one warm server "
+                     "via per-request speculative.n_max")}
 
 
 def sweep(base_url: str, model: str = "", depths=DEFAULT_DEPTHS,
@@ -198,12 +278,20 @@ def main() -> None:
                    help="measure the running server only, no re-serve")
     p.add_argument("--depths", default="",
                    help="comma-separated draft depths to sweep (re-serves)")
+    p.add_argument("--per-request", action="store_true",
+                   help="sweep via per-request speculative.n_max , one warm "
+                        "server, no re-serve (needs the 2026-08-20 engine "
+                        "patch; depths above the served ceiling are skipped)")
     p.add_argument("--confirm", action="store_true")
     p.add_argument("--json", action="store_true")
     a = p.parse_args()
 
     if a.current or not a.depths:
         res = measure_current(a.base_url, a.model, a.max_tokens, a.repeats)
+    elif a.per_request:
+        res = sweep_per_request(a.base_url, a.model,
+                                [int(x) for x in a.depths.split(",")],
+                                a.max_tokens, a.repeats)
     else:
         res = sweep(a.base_url, a.model, [int(x) for x in a.depths.split(",")],
                     a.max_tokens, a.repeats, a.confirm)

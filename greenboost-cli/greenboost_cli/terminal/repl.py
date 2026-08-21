@@ -291,9 +291,17 @@ def estimate_ctx_tokens(chars: int, anchor_tokens: "int | None",
     history is still able to pull the estimate down, instead of pinning it to
     a stale pre-compaction anchor forever.
     """
-    est = chars // 4
+    # The divisor is the live calibration, not 4 , code and JSON tokenize
+    # nearer 3 chars/token, and the growth term is almost always tool output.
+    # Live 2026-08-20: the status line read "ctx 53%" on a request the server
+    # then rejected at 100% of the window.
+    try:
+        from greenboost_cli.workflow.intelligence import _chars_per_token as _cpt
+    except Exception:
+        _cpt = 4.0
+    est = int(chars / _cpt)
     if anchor_tokens:
-        grown = max(0, chars - anchor_chars) // 4
+        grown = int(max(0, chars - anchor_chars) / _cpt)
         est = max(est, anchor_tokens + grown)
     return est
 

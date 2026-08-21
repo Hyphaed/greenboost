@@ -1696,8 +1696,20 @@ vm.overcommit_memory = 1
 # file segments. Default 65530 is too low; 2M covers any realistic case.
 vm.max_map_count = 2147483642
 
-# Always keep 512 MB free - prevents latency spikes under allocation storms.
-vm.min_free_kbytes = 524288
+SYSCTL_EOF
+
+    # Derived, not fixed , same reasoning as greenboost_setup.sh: 512 MB is
+    # 0.8% of a 64 GB box and 8% of an 8 GB feeder, and the literal silently
+    # overrode linux-kernel-inference's own 95-greenboost-t2.conf because this
+    # file sorts last and wins every conflict.
+    local _memtotal_kb
+    _memtotal_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    local _min_free_kb=$(( _memtotal_kb * 16 / 1000 ))    # ~1.6% of RAM
+    (( _min_free_kb < 65536 )) && _min_free_kb=65536      # floor: 64 MB
+    printf '\n# Free-memory floor: ~1.6%% of this box'"'"'s %s kB of RAM (derived).\n' "$_memtotal_kb" >> "$dest"
+    printf 'vm.min_free_kbytes = %d\n' "$_min_free_kb" >> "$dest"
+
+    cat >> "$dest" << 'SYSCTL_EOF'
 
 # Proactive compaction: GreenBoost T2 needs contiguous 2 MB hugepage ranges.
 # Value 20 = moderate background compaction (0=off, 100=aggressive).
