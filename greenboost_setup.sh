@@ -7593,7 +7593,15 @@ cmd_clear_logs() {
 
     local p _n=0
     for p in "${_paths[@]}"; do
-        rm -f "$p" 2>/dev/null && (( _n++ ))
+        # NOT `rm ... && (( _n++ ))`. Post-increment evaluates to the value
+        # BEFORE the bump, so the first success returns 0, which is a non-zero
+        # exit status, which `set -e` (line 35) treats as a failed command and
+        # aborts the whole function on. That shipped once: the 2026-08-21 17:26
+        # run cleared the alphabetically-first path (dataflux.jsonl) and left
+        # the other 17 files untouched while reporting success.
+        if rm -f "$p" 2>/dev/null; then
+            _n=$(( _n + 1 ))
+        fi
     done
     # Truncate rather than unlink anything a live process holds open, so the
     # writer does not keep appending to a deleted inode.
