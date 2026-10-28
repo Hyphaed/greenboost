@@ -243,9 +243,11 @@ test:
 
 # Host-only C unit tests (gb_expert_tier.h's LFRU scoring, etc.) - plain C99,
 # no CUDA/kernel headers, no GPU needed. Fast: builds + runs in well under 1s.
-test-c: tests/c/test_gb_expert_tier.c gb_expert_tier.h
+test-c: tests/c/test_gb_expert_tier.c gb_expert_tier.h tests/c/test_gb_thp_verify.c gb_thp_verify.h
 	@$(CC) -std=c99 -Wall -Wextra -o /tmp/gb_test_expert_tier tests/c/test_gb_expert_tier.c
 	@/tmp/gb_test_expert_tier
+	@$(CC) -std=c99 -Wall -Wextra -o /tmp/gb_test_thp_verify tests/c/test_gb_thp_verify.c
+	@/tmp/gb_test_thp_verify
 	@echo "[GreenBoost] C unit tests passed"
 
 # Mechanical invariant checks (golden-principles.md) - hardcoded-hardware-value
@@ -264,7 +266,7 @@ verify:
 module:
 	$(MAKE) -C $(KDIR) M=$(PWD) $(KERNEL_LLVM) modules
 
-shim: greenboost_cuda_shim.c greenboost_cuda_v12.c greenboost_netc.c greenboost_cuda.map
+shim: greenboost_cuda_shim.c greenboost_cuda_v12.c greenboost_netc.c greenboost_cuda.map gb_thp_verify.h
 	$(CC) -c -fPIC $(SHIM_CFLAGS_V12) -o greenboost_cuda_v12.o greenboost_cuda_v12.c
 	$(CC) -shared -fPIC $(SHIM_CFLAGS) -o $(SHIM) \
 		greenboost_cuda_shim.c greenboost_netc.c greenboost_cuda_v12.o \

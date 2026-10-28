@@ -135,6 +135,7 @@
 #include <signal.h>   /* kill(pid, 0) liveness check - same */
 #include "greenboost_ioctl.h"     /* gb_alloc_req, GB_IOCTL_ALLOC - userspace-safe */
 #include "greenboost_netc.h"      /* remote cluster GPU client */
+#include "gb_thp_verify.h"         /* opt-in 2 MiB pages for T2 and a check of what the kernel gave */
 #include "features/net_fabric.h"  /* GB_ALLOC_TIER_* constants */
 #include "features/tq_compress.h" /* K/V int8 compression metadata (Phase 2) */
 
@@ -1598,8 +1599,37 @@ static CUresult gb_vmm_t2_alloc_blackwell_zerocopy(CUdeviceptr *out_ptr, size_t 
     if (!real_cuMemHostRegister || !real_cuMemHostGetDevicePointer)
         return CUDA_ERROR_NOT_SUPPORTED;
 
-    void *h_ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    /* GREENBOOST_T2_HUGEPAGES=1 (opt-in, default off): back the range with 2 MiB pages.
+     * With THP "always" but defrag "defer+madvise", an unmadvised mapping only gets a huge
+     * page when one is free at fault time and otherwise falls back to 4 KiB without
+     * compacting. Aligning the range and calling MADV_HUGEPAGE before cuMemHostRegister
+     * faults it in makes the fault compact instead. The huge page size comes from sysfs. */
+    const size_t gb_pmd = gb_thp_env_enabled(getenv("GREENBOOST_T2_HUGEPAGES"))
+                              ? gb_thp_read_pmd_size(GB_THP_PMD_SIZE_PATH) : 0;
+    void *h_ptr;
+    if (gb_pmd && size >= gb_pmd) {
+        char *raw = mmap(NULL, size + gb_pmd, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (raw == MAP_FAILED) {
+            h_ptr = MAP_FAILED;
+        } else {
+            const long pg = sysconf(_SC_PAGESIZE);
+            const uintptr_t lo = gb_thp_align_up((uintptr_t)raw, gb_pmd);
+            const uintptr_t hi = gb_thp_align_up(lo + size, (size_t)pg);
+            const uintptr_t raw_end = (uintptr_t)raw + size + gb_pmd;
+            if (lo > (uintptr_t)raw)
+                munmap(raw, lo - (uintptr_t)raw);
+            if (raw_end > hi)
+                munmap((void *)hi, raw_end - hi);
+            h_ptr = (void *)lo;
+            if (madvise(h_ptr, size, MADV_HUGEPAGE) != 0)
+                fprintf(stderr, "[GreenBoost] Blackwell ZC T2: madvise(MADV_HUGEPAGE) failed: %m "
+                                "(continuing with default paging)\n");
+        }
+    } else {
+        h_ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
     if (h_ptr == MAP_FAILED) {
         fprintf(stderr, "[GreenBoost] Blackwell ZC T2: mmap FAILED for %zu MB: %m\n", size >> 20);
         return CUDA_ERROR_OUT_OF_MEMORY;
@@ -1622,6 +1652,16 @@ static CUresult gb_vmm_t2_alloc_blackwell_zerocopy(CUdeviceptr *out_ptr, size_t 
         if (real_cuMemHostUnregister) real_cuMemHostUnregister(h_ptr);
         munmap(h_ptr, size);
         return (ret != CUDA_SUCCESS) ? ret : CUDA_ERROR_NOT_SUPPORTED;
+    }
+
+    if (gb_pmd) {
+        /* smaps has no per-range figure: this is the VMA-level share, an estimate. */
+        FILE *sm = fopen("/proc/self/smaps", "r");
+        const int pct = sm ? gb_thp_vma_huge_percent(sm, (uintptr_t)h_ptr) : -1;
+        if (sm)
+            fclose(sm);
+        fprintf(stderr, "[GreenBoost] Blackwell ZC T2: %zu MB, huge-page backing %d%% "
+                        "(VMA-level estimate, -1 = unknown)\n", size >> 20, pct);
     }
 
     /* Store host ptr in handle field (both are uint64 on 64-bit); type=ZEROCOPY
