@@ -4209,7 +4209,7 @@ _rmmod_with_retry() {
             done
             grep -q "^${DRIVER_NAME}.*Unloading" /proc/modules 2>/dev/null || continue
             rmmod -f "$DRIVER_NAME" 2>/dev/null && { gb_ok "Module force-unloaded"; return 0; }
-            gb_warn_ui "Unloading stuck and force failed - reboot required."
+            GB_REBOOT_REASONS+=("the GreenBoost kernel module is stuck unloading and could not be force-removed"); gb_warn_ui "Unloading stuck and force failed - reboot required."
             return 1
         fi
         local refcnt
@@ -4287,7 +4287,7 @@ _schedule_boot_cleanup() {
     rm -f /lib/systemd/system-shutdown/greenboost-stuck.sh
     systemctl daemon-reload 2>/dev/null || true
 
-    gb_warn_ui "Module stuck in Unloading - reboot required."
+    GB_REBOOT_REASONS+=("the GreenBoost kernel module was stuck unloading while it was being replaced"); gb_warn_ui "Module stuck in Unloading - reboot required."
     echo ""
     echo -e "  ${C_BOLD}Force-reboot now (instant, no hang):${C_RESET}"
     echo -e "    sync && echo b | sudo tee /proc/sysrq-trigger"
@@ -14355,11 +14355,57 @@ cmd_full_install() {
     echo -e ""
     gb_ok "${C_BOLD}Full install complete!"
     echo -e ""
-    echo -e "  ${C_AMBER}${C_BOLD}⚠  REBOOT REQUIRED${C_RESET} ${C_GRAY}to activate GRUB params + hugepage pre-allocation${C_RESET}"
-    echo -e ""
+    gb_report_reboot_need
     echo ""
     gb_separator
     echo ""
+}
+
+
+# ---- Reboot verdict (end of Full Install) ---------------------------------
+# A Full Install used to end with "REBOOT REQUIRED to activate GRUB params + hugepage
+# pre-allocation" every time. On 2026-10-28 the GRUB drop-in it had just written matched the
+# running command line exactly, and nothing pre-allocates hugepages (vm.nr_hugepages is held
+# at 0 on purpose, see the sysctl tuning step). Now it only says so when a reboot would change something.
+GB_REBOOT_REASONS=()
+
+# gb_cmdline_missing_params - parameters in the GreenBoost GRUB drop-in that the RUNNING kernel
+# doesn't have yet, one per line. Empty output means a reboot wouldn't change the command line.
+# Whole-word match, so nohz_full=4-77 doesn't satisfy nohz_full=4-7. GB_GRUB_DROPIN and
+# GB_CMDLINE_FILE exist so tests/installer/test_reboot_banner.sh can point it at fixtures.
+gb_cmdline_missing_params() {
+    local dropin="${GB_GRUB_DROPIN:-/etc/default/grub.d/99-greenboost.cfg}"
+    local running="${GB_CMDLINE_FILE:-/proc/cmdline}" line p
+    local -a have=() want=()
+    [[ -r "$dropin" && -r "$running" ]] || return 0
+    line="$(grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' "$dropin" | tail -n 1 || true)"
+    line="${line#*\"}"; line="${line%\"*}"
+    line="${line//\$\{GRUB_CMDLINE_LINUX_DEFAULT\}/}"
+    read -r -a have < "$running" || true
+    read -r -a want <<< "$line" || true
+    for p in "${want[@]}"; do
+        printf '%s\n' "${have[@]}" | grep -qxF -- "$p" || printf '%s\n' "$p"
+    done
+    return 0
+}
+
+# gb_report_reboot_need - the end-of-install verdict: what a reboot would change and why, or that none is needed.
+gb_report_reboot_need() {
+    local missing r
+    missing="$(gb_cmdline_missing_params | paste -sd' ' -)"
+    if [[ -n "$missing" ]]; then
+        GB_REBOOT_REASONS+=("these boot parameters are in GRUB but not on the running kernel yet: ${missing}")
+    fi
+    echo ""
+    if (( ${#GB_REBOOT_REASONS[@]} )); then
+        echo -e "  ${C_AMBER}${C_BOLD}⚠  Reboot needed${C_RESET}"
+        for r in "${GB_REBOOT_REASONS[@]}"; do
+            echo -e "     ${C_GRAY}- ${r}${C_RESET}"
+        done
+        echo -e "     ${C_GRAY}Until then the machine keeps running as before and nothing is broken. When convenient: sudo reboot${C_RESET}"
+    else
+        gb_ok "No reboot needed: the boot parameters this install sets are already active, and no hugepages are reserved (vm.nr_hugepages stays 0 on purpose)."
+    fi
 }
 
 
