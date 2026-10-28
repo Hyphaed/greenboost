@@ -139,3 +139,4 @@ greenboost_setup.sh:3474    # `greenboost t3-memory` invalid-input error text , 
 greenboost_setup.sh:2695    # info() label naming the box the owner-workstation preset was tuned for; the preset's actual values are the GB_* assignments above this line, not this string (was :2621, line drift, the dracut initramfs-exclusion rewrite added 74 lines above it)
 greenboost_setup.sh:3540    # `greenboost t3-memory` usage text , example sizes in help output (was :3466, same line drift)
 greenboost_setup.sh:3548    # `greenboost t3-memory` invalid-input error text , example sizes in the message (was :3474, same line drift)
+greenboost_cuda_shim.c:2180    # vram_headroom_bytes' pre-probe default: rescaled to max(128MB, 2% of the detected VRAM) after the NVML probe and overridable with GREENBOOST_VRAM_HEADROOM_MB, so a floor and not a placed value

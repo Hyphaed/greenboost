@@ -23,8 +23,8 @@ synapse torch engine (synapse-torch-env) | cmd_install_synapse_engine\(\) \{ | r
 gb-synapse llama.cpp engine build | cmd_synapse_build_engine\(\) \{ | rm -rf /usr/local/lib/greenboost
 greenboost-py-root console script | cat > /usr/local/bin/greenboost-py-root | rm -f /usr/local/bin/greenboost-py-root
 conda/mamba .pth fan-out (pth_manifest.txt) | printf '%s\\n' "\$_pth_dir/greenboost\.pth" >> "\$_pth_manifest" | for _pmp_path in "\$\{_pth_manifest_paths\[@\]\}"
-third_party/auto_round/ vendored tree | 2>/tmp/gb_autoround_sync\.log | rm -rf /usr/local/lib/greenboost
-third_party/turboquant/ vendored tree | 2>/tmp/gb_turboquant_sync\.log | rm -rf /usr/local/lib/greenboost
-synapse_engine/ vendored tree | 2>/tmp/gb_synapse_engine_sync\.log | rm -rf /usr/local/lib/greenboost
-semantics/ (GB-Semantics YAML defs) | 2>/tmp/gb_semantics_sync\.log | rm -rf /usr/local/lib/greenboost
-serving/ (serving recipes, NemoClaw audit Phase 5) | 2>/tmp/gb_serving_sync\.log | rm -rf /usr/local/lib/greenboost
+third_party/auto_round/ vendored tree | 2>\$\{GB_LOGDIR\}/autoround_sync\.log | rm -rf /usr/local/lib/greenboost
+third_party/turboquant/ vendored tree | 2>\$\{GB_LOGDIR\}/turboquant_sync\.log | rm -rf /usr/local/lib/greenboost
+synapse_engine/ vendored tree | 2>\$\{GB_LOGDIR\}/synapse_engine_sync\.log | rm -rf /usr/local/lib/greenboost
+semantics/ (GB-Semantics YAML defs) | 2>\$\{GB_LOGDIR\}/semantics_sync\.log | rm -rf /usr/local/lib/greenboost
+serving/ (serving recipes, NemoClaw audit Phase 5) | 2>\$\{GB_LOGDIR\}/serving_sync\.log | rm -rf /usr/local/lib/greenboost
