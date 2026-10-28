@@ -115,6 +115,47 @@ def _module_size_gb(module) -> float:
         return total / 2**30
     except Exception:
         return 0.0
+# Pinned host pages can't be swapped or reclaimed, so pinning must leave the host RAM
+# safety floor free. Same 10% policy as the CUDA shim's floor; GREENBOOST_HOST_RAM_SAFETY_MB
+# overrides it (in MiB), exactly as it does for the shim.
+_PIN_HEADROOM_FRACTION = 0.10
+
+
+def _meminfo_kib(field: str) -> int:
+    """One /proc/meminfo field in KiB, 0 when it can't be read."""
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith(field + ":"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def _pinned_budget_ok(nbytes: int) -> bool:
+    """True when pinning `nbytes` still leaves the host RAM safety floor available.
+    Unknown memory figures count as "no": never pin blind."""
+    total_kib, avail_kib = _meminfo_kib("MemTotal"), _meminfo_kib("MemAvailable")
+    if not total_kib or not avail_kib:
+        return False
+    override = os.environ.get("GREENBOOST_HOST_RAM_SAFETY_MB", "")
+    floor_kib = int(override) * 1024 if override.isdigit() else int(total_kib * _PIN_HEADROOM_FRACTION)
+    return (avail_kib - floor_kib) * 1024 >= nbytes
+
+
+def _demote_to_pinned(t: "torch.Tensor") -> "torch.Tensor":
+    """CUDA tensor -> pinned host tensor, copied asynchronously. A pageable destination
+    turns a "non_blocking" device-to-host copy into a staged, effectively synchronous
+    one, and makes the later promote copy staged as well. Anything that isn't a dense
+    CUDA tensor takes the ordinary path."""
+    if not t.is_cuda or t.layout != torch.strided:
+        return t.to("cpu")
+    dst = torch.empty_like(t, device="cpu", pin_memory=True)
+    dst.copy_(t, non_blocking=True)
+    return dst
+
+
 
 
 def _df_emit_tier(name: str, from_tier: str, to_tier: str, size_gb: float,
@@ -268,6 +309,8 @@ class ModelTierManager:
         Directory for NVMe-evicted model checkpoints.
     async_transfers : bool
         Use gb_stream_sched transfer stream for non-blocking H2D/D2H.
+    pin_host : bool | None
+        Demote into pinned host memory (budget-checked). None reads GB_TIER_PIN_HOST.
     """
 
     def __init__(
@@ -275,6 +318,7 @@ class ModelTierManager:
         hbm_headroom_mb: "int | None" = None,
         t3_dir: str = "/var/lib/greenboost/model_pages",
         async_transfers: bool = True,
+        pin_host: "bool | None" = None,
     ):
         if hbm_headroom_mb is None:
             # %-derived default (10% of VRAM, floor 512) shared with gb_init
@@ -287,6 +331,12 @@ class ModelTierManager:
         self.hbm_headroom_mb = hbm_headroom_mb
         self.t3_dir = t3_dir
         self.async_transfers = async_transfers
+        # Opt-in (GB_TIER_PIN_HOST=1): demote into pinned host memory so the copy is truly
+        # asynchronous and promote() streams from pinned pages. Off by default until it has
+        # been measured on a real diffusion pipeline.
+        if pin_host is None:
+            pin_host = os.environ.get("GB_TIER_PIN_HOST", "") in ("1", "on", "true", "yes")
+        self.pin_host = pin_host
         self._entries: Dict[str, _ModelEntry] = {}
         os.makedirs(t3_dir, exist_ok=True)
         _gb_session(active=True)
@@ -354,6 +404,16 @@ class ModelTierManager:
         print(f"[gb_tier] promoted '{name}' → T1 (GPU)", flush=True)
         _df_emit_tier(name, from_tier, Tier.T1, _module_size_gb(e.module), time.time() - t0)
 
+    def _module_to_host(self, module, *, non_blocking: bool) -> None:
+        """Move a module's tensors to host RAM. With pinning on and the host RAM floor
+        respected, the destinations are pinned; otherwise the plain module.to("cpu")."""
+        if self.pin_host and _pinned_budget_ok(int(_module_size_gb(module) * 2**30)):
+            module._apply(_demote_to_pinned)
+            if not non_blocking:
+                torch.cuda.current_stream().synchronize()
+        else:
+            module.to("cpu", non_blocking=non_blocking)
+
     def demote(self, name: str):
         """
         Move model to T2 (CPU pinned RAM). Frees T1 VRAM immediately.
@@ -367,7 +427,7 @@ class ModelTierManager:
         if self.async_transfers:
             import gb_stream_sched as gs
             with gs.on("transfer"):
-                e.module.to("cpu", non_blocking=True)
+                self._module_to_host(e.module, non_blocking=True)
             # The consumer here is the host (callers read the CPU tensor
             # directly, e.g. evict()'s state_dict() save right after) -
             # a device-side stream wait doesn't block the host, so use
@@ -377,7 +437,7 @@ class ModelTierManager:
             gs.stream("transfer").record_event(ev)
             ev.synchronize()
         else:
-            e.module.to("cpu")
+            self._module_to_host(e.module, non_blocking=False)
 
         e.tier = Tier.T2
         e.last_used = time.time()
