@@ -223,6 +223,8 @@ detail lives in each subsystem's own section below.
 | GGUF and HuggingFace serving | One server for both, with GreenBoost placement underneath | `greenboost pull <repo>`, `greenboost synapse run <model>` |
 | Cluster tensor-split | One model across host + feeder GPUs as a unified device | llama.cpp `--rpc`, or the `rpc-split` preset |
 | Serving recipes | A model's measured ctx/KV/MTP settings pinned, digest-checked | `serving/recipes/*.yaml`, `serving/check_recipes.py --check` |
+| Vision serving that fits the card | The projector's cost is priced from its own metadata and paid for before the engine starts; images of any size are resized to the model's token budget | `serve(vision=, mmproj=)`, `workflow/vision-serving.md` |
+| One heavy GPU phase at a time | A lease over the studio's lock file: Qwen, FLUX, browser raster and encode share one card | `gb_api.gpu_phase`, `gpu_phase_status` (MCP) |
 | Serving presets | Typed host-only vs rpc-split resolution against live facts | `serving/presets/*.yaml`, `synapse_resolve_preset` MCP |
 | Pre-serve probes | A closed-set failure reason instead of a crash log | `serving/probe.py`, `probe_serve_readiness_for()` |
 | MTP speculative decode | ~1.9x decode on the reference model, same output distribution | `synapse_serve(mtp_draft_n=…, spec_draft_p_min=…)` |

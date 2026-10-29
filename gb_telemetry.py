@@ -704,6 +704,27 @@ NVML_CLOCKS_THROTTLE_REASON_REAL_MASK = (
 )
 
 
+def read_phase_file(path: str = "/run/greenboost/phase", proc_root: str = "/proc") -> str:
+    """Phase from the shim's phase file, or "" when it is absent or its writer
+    is gone. The file is rewritten only on a phase change and is never removed,
+    so a process that exits leaves its last phase behind. Measured 2026-10-10:
+    phase=INIT written by a pid that no longer existed, read as live for 1000 s
+    (SVC-04). A dead writer means the phase is unknown, not current."""
+    try:
+        kv = {}
+        with open(path) as f:
+            for line in f:
+                k, sep, v = line.partition("=")
+                if sep:
+                    kv[k.strip()] = v.strip()
+    except OSError:
+        return ""
+    pid = kv.get("pid", "")
+    if pid.isdigit() and int(pid) > 0 and not os.path.exists(f"{proc_root}/{pid}"):
+        return ""
+    return kv.get("phase", "")
+
+
 def is_real_throttle(throttle_reasons: int) -> bool:
     """True iff NVML reports a genuine thermal/power throttle reason , never
     true for GpuIdle/ApplicationsClocksSetting/SyncBoost/DisplayClockSetting,
@@ -966,7 +987,7 @@ def _log_topology(t: GpuTopology) -> None:
         f" {t.pcie_bw_mb_s/1024:.1f}GB/s{degraded}"
         f" CC={t.compute_capability[0]}.{t.compute_capability[1]}"
         f" BDF={t.bdf}{numa}{nvlink}{p2p}",
-        flush=True,
+        file=sys.stderr, flush=True,
     )
 
 
@@ -1212,12 +1233,12 @@ class DCGMProvider(_Provider):
             print(
                 f"[gb_telemetry] DCGM embedded ({_mode}, {_gpu_count} GPU(s))"
                 f"  NVLink={'active' if self._nvlink_active else 'none'}",
-                flush=True,
+                file=sys.stderr, flush=True,
             )
         except Exception as exc:
             # DCGM unavailable , inference continues without it
             print(f"[gb_telemetry] DCGM unavailable ({exc.__class__.__name__}): {exc}",
-                  flush=True)
+                  file=sys.stderr, flush=True)
 
     # ------------------------------------------------------------------
     def available(self) -> bool:
@@ -1396,12 +1417,7 @@ class GreenBoostProvider(_Provider):
         # Read inference phase from /run/greenboost/phase (written by shim on
         # every phase transition; absent when shim is not loaded → leave empty)
         try:
-            phase_path = "/run/greenboost/phase"
-            if os.path.exists(phase_path):
-                for _line in open(phase_path):
-                    if _line.startswith("phase="):
-                        m.shim_phase = _line.split("=", 1)[1].strip()
-                        break
+            m.shim_phase = read_phase_file("/run/greenboost/phase") or m.shim_phase
         except Exception:
             pass
         # Shim-side stats (/run/greenboost/shim_stats , key=value per line,
@@ -1438,6 +1454,15 @@ class GreenBoostProvider(_Provider):
                     # these physical fields for any fill-based decision.
                     _phys_total = int(_sf("physical_vram_mb"))
                     _phys_free  = int(_sf("physical_vram_free_mb"))
+                    if _phys_free == 0:
+                        # The shim's cached free value is 0 until its first
+                        # allocation (phase INIT), which is "unread", not "full".
+                        # Ask the driver; a really full card still reads 0.
+                        try:
+                            from gb_nvml import get_nvml
+                            _phys_free = int(get_nvml(0).mem()[1])
+                        except Exception:
+                            pass
                     if _phys_total:
                         m.fb_phys_total_mb = _phys_total
                         m.fb_phys_free_mb  = _phys_free
@@ -1775,7 +1800,8 @@ class TelemetryManager:
             self._providers.append(sysp)
 
         active = [p.name for p in self._providers]
-        print(f"[gb_telemetry] device={device} providers={active}", flush=True)
+        print(f"[gb_telemetry] device={device} providers={active}",
+              file=sys.stderr, flush=True)
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -1952,7 +1978,7 @@ class ClusterTelemetryManager:
             f"[gb_telemetry] ClusterTelemetryManager: "
             f"{len(self._managers)} device(s) "
             f"({n_devices} local + {n_feeders} feeder)",
-            flush=True,
+            file=sys.stderr, flush=True,
         )
 
     def start(self):

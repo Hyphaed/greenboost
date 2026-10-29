@@ -35,6 +35,7 @@ _SERVE_KWARGS = dict(
     cuda_graph=None, cache_ram=None,
     mtp_draft_n=None, spec_draft_p_min=None, slot_prompt_similarity=None,
     n_gpu_layers_override=None, kv_type_override=None, n_cpu_moe_override=None,
+    batch_override=None, ubatch_override=None,
 )
 
 

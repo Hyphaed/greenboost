@@ -87,6 +87,12 @@ def load_settings() -> dict:
         except Exception:
             pass
 
+    # Per-process override (not persisted): lets a background caller such as a
+    # Stop hook pin a small window without touching the user's settings file.
+    _env_ctx = os.environ.get("GB_LLAMACPP_N_CTX", "").strip()
+    if _env_ctx.isdigit():
+        cfg["llamacpp_n_ctx"] = int(_env_ctx)
+
     return cfg
 
 

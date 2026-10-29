@@ -20,6 +20,50 @@ from __future__ import annotations
 # One import for the whole GB-Tiering surface.
 from gb_model_tier import ModelTierManager, Tier   # noqa: F401  tier moves T1<->T2<->T3
 from gb_mem_pool import MemPoolManager, PoolStats   # noqa: F401  arena pools
+from gb_evict_policy import (  # noqa: F401  prioritized-LRU victim selection
+    PRIORITY_DEFAULT, PRIORITY_MAX, PRIORITY_MIN,
+    PerTierEvictionController,
+)
+
+
+def host_cold_status() -> dict:
+    """Host-side cold-page evidence from the kernel's DAMON_STAT, as
+    republished by gb_supervisor.
+
+    This is the host twin of the GPU-side access-counter work: DAMON already
+    samples which pages are actually touched, for free, and until now nothing
+    read it while tier placement guessed. Returns
+    {'available': False, 'reason': ...} when the supervisor has not published
+    yet or the kernel lacks CONFIG_DAMON_STAT , a box with no DAMON evidence
+    is a valid answer, not an error.
+
+    Observational. Nothing in the tiering path consumes this to make a
+    placement decision yet; wiring it into one is a separate, later change.
+
+    Key fields: hot_pct / idle_pct, cold_pct_above_<N>ms for N in
+    (200000, 400000, 800000), idle_p50_ms, est_bandwidth_bps. A NEGATIVE idle
+    value means actively accessed, not idle , see gb_damon's module docstring.
+    """
+    try:
+        import gb_damon
+        return gb_damon.read_published()
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "reason": f"gb_tiering: DAMON state unavailable: {e}"}
+
+
+def thrash_status() -> dict:
+    """Tier-thrashing counters: components ping-ponging between tiers faster
+    than they are used, per gb_thrash (ported from UVM's thrashing detector).
+
+    Observation only , nothing reads this to make a placement decision. The
+    `params.lapse_calibrated` field is False on purpose: the detection window
+    is a provisional value at module granularity, not a measured one, and any
+    reader should weigh the verdict accordingly."""
+    try:
+        from gb_model_tier import thrash_detector
+        return thrash_detector().stats()
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"gb_tiering: thrash state unavailable: {e}"}
 
 
 def tiering_status(probe_gpu: bool = True) -> dict:
@@ -75,4 +119,8 @@ if __name__ == "__main__":
     import json
     import sys
     s = tiering_status()
+    if "--thrash" in sys.argv:
+        s = {"tiering": s, "thrash": thrash_status()}
+    if "--cold" in sys.argv:
+        s = {"tiering": s, "host_cold": host_cold_status()}
     print(json.dumps(s) if "--llm" in sys.argv else s)

@@ -1353,7 +1353,7 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
         "guidelines_cmds", "convert_cmds", "mcp_cmds",
         "plan_cmds", "agent_cmds", "task_cmds", "skill_cmds",
         "git_cmds", "quant_cmds", "doctor_cmds", "autonomous_cmds",
-        "forge_cmds", "init_cmds",
+        "forge_cmds", "init_cmds", "model_cmds",
     ):
         try:
             __import__(f"greenboost_cli.slash_commands.{_mod}")
@@ -2211,6 +2211,22 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
 
         if ev == "eof":
             print()
+            # An accepted prompt is either consumed or REPORTED, never silently
+            # dropped. A real session on 2026-08-22 queued a folder-name
+            # instruction, ended before turn 1 finished, and the instruction
+            # vanished with it , the work went into the wrong directory and
+            # nothing said so. See prompt_queue.spill_unconsumed.
+            try:
+                from greenboost_cli.terminal.prompt_queue import spill_unconsumed, _SPILL
+                _left = spill_unconsumed(prompt_queue, getattr(session, "name", "") or "")
+                if _left:
+                    console.print(
+                        f"\n  [{AMBER}]◈[/]  [{GRAY}]{len(_left)} queued prompt(s) were "
+                        f"never run , saved to[/] [{VIOLET}]{_SPILL}[/]")
+                    for _t in _left:
+                        console.print(f"      [{GRAY}]·[/] [{VIOLET}]{_t[:96]}[/]")
+            except Exception:
+                pass
             emit_ok("Goodbye.")
             try:
                 from greenboost_cli.instruments.hooks import run_stop_hooks

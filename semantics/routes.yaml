@@ -16,6 +16,27 @@
   metrics: [vram_fill_pct, vram_headroom_pct]
   segments: [rule1_underfilled, vram_headroom_exhausted]
 
+- intent: recipe_serve_readiness
+  triggers: ["can my pinned recipes actually serve", "recipe serve readiness",
+             "recipe resolves", "recipe model missing", "no such model",
+             "does the recipe work", "reference workload serve",
+             "recipes unresolvable", "model wiped from manifest",
+             "manifest missing model", "recover-cache", "recover models"]
+  metrics: [recipes_unresolvable, unregistered_cached_models]
+  segments: [recipe_model_unresolvable, models_wiped_from_manifest]
+
+- intent: greenboost_cli_attention
+  triggers: ["blocked fetch", "web fetch blocked", "ssrf", "why was my fetch refused",
+             "interrupted task", "factory task died", "factory crashed", "unfinished factory tasks",
+             "what needs recovering after the run"]
+  metrics: [web_fetch_blocked_count, factory_tasks_interrupted]
+
+- intent: mtp_head_wiring
+  triggers: ["is mtp on", "mtp head", "speculative decode off", "why is mtp not used",
+             "separate mtp file", "draft-mtp not active", "spec-draft-model"]
+  metrics: [mtp_head_on_disk]
+  segments: [separate_mtp_head_unused]
+
 - intent: core_version_state
   triggers: ["what version", "greenboost version", "core version", "module version",
              "update available", "upgrade now", "am i up to date", "out of date",
@@ -23,6 +44,14 @@
              "version drift"]
   metrics: [core_build_version, kmod_loaded_version, kmod_loaded]
   segments: [kmod_version_drift]
+
+- intent: boot_tuning_survival
+  triggers: ["boot params disappeared", "grub config not found", "grub not found",
+             "why is transparent_hugepage not set", "will my tuning survive a reboot",
+             "will my boot tuning survive", "survive the next reboot",
+             "grub purge", "lost my boot params", "did the grub purge break anything"]
+  metrics: [boot_tuning_active, boot_tuning_persisted]
+  segments: [boot_tuning_lost_next_reboot]
 
 - intent: why_is_it_slow
   triggers: ["slow", "throttl", "stall", "why is generation slow", "performance problem", "tok/s dropped"]

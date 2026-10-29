@@ -64,7 +64,7 @@ MODULE_IMPORT_NS("DMA_BUF");        /* string form    - < 5.16 or ≥ 6.13   */
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Ferran Duarri");
 MODULE_DESCRIPTION("GreenBoost : CUDA Memory & Compute Orchestrator for NVIDIA GPUs");
-MODULE_VERSION("3.4");   /* keep in lockstep with GB_VERSION below — the 2.9/3.2
+MODULE_VERSION("3.5");   /* keep in lockstep with GB_VERSION below — the 2.9/3.2
                           * skew made a stale-build diagnosis ambiguous during
                           * the 2026-07-13 install incident, and the 3.2/3.4
                           * skew (2026-08-20) made the Gaming Suite offer an
@@ -77,7 +77,7 @@ MODULE_VERSION("3.4");   /* keep in lockstep with GB_VERSION below — the 2.9/3
 
 /* Single version string - used in banner, status, and pool_brief.
  * Update this when bumping MODULE_VERSION above. */
-#define GB_VERSION  "v3.4"
+#define GB_VERSION  "v3.5"
 
 /* 2 MiB hugepage constants */
 #define GB_HPAGE_ORDER  9u

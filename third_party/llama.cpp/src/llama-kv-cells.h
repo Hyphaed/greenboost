@@ -15,6 +15,10 @@ struct llama_kv_cell_ext {
     llama_pos x = 0;
     llama_pos y = 0;
 
+    // tok = LLAMA_TOKEN_NULL when the cell is produced by embedding input (i.e. multimodal)
+    // use case: n-gram embeddings hash
+    llama_token tok = LLAMA_TOKEN_NULL;
+
     // return true if the current 2D spatial position is greater than other
     bool is_2d_gt(llama_pos ox, llama_pos oy) const {
         return (y > oy) || (y == oy && x > ox);
@@ -23,7 +27,7 @@ struct llama_kv_cell_ext {
     void reset() {
         static_assert(std::is_trivially_copyable_v<llama_kv_cell_ext>);
 
-        memset(this, 0, sizeof(*this));
+        *this = llama_kv_cell_ext{};
     }
 };
 
@@ -317,6 +321,27 @@ public:
 
     // return the sequence id of this cell
     // note: call only for cells with exactly one sequence
+    // call f(seq_id, pos, tok) for every used cell in [p0, p1) belonging to one of seqs
+    template<typename F>
+    void for_each_token_in(const std::bitset<LLAMA_MAX_SEQ> & seqs, llama_pos p0, llama_pos p1, F && f) const {
+        for (const auto & i : used) {
+            if (pos[i] < p0 || pos[i] >= p1) {
+                continue;
+            }
+
+            const auto m = seq[i] & seqs;
+            if (m.none()) {
+                continue;
+            }
+
+            for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (m.test(s)) {
+                    f(s, pos[i], ext[i].tok);
+                }
+            }
+        }
+    }
+
     llama_seq_id seq_get(uint32_t i) const {
         assert(seq[i].count() == 1);
 

@@ -92,8 +92,32 @@ KINDS: dict[str, KindSpec] = {
         fields=("target", "error_ceiling", "precision_histogram", "bf16_kept", "dry_run", "planner"),
         numeric_fields=("mean_rel_err", "max_rel_err")),
     "turboquant_activate": KindSpec(
-        group="quant", doc="TurboQuant K/V attention compression activated (bits, mode, device).",
-        fields=("k_bits", "v_bits", "mode")),
+        group="quant",
+        doc="TurboQuant K/V attention compression activated. `backend_source` is "
+            "the point of this event beyond the bits: it says whether the backend "
+            "was chosen EXPLICITLY, inherited from GB_ATTN_BACKEND, or fell to the "
+            "default. Those three look identical in every other signal and have "
+            "very different debugging stories when attention quality is wrong , an "
+            "env var an operator forgot they exported reads exactly like a "
+            "deliberate override.",
+        fields=("mode", "backend", "backend_source", "device"),
+        numeric_fields=("k_bits", "v_bits")),
+    "quant_calib_guard": KindSpec(
+        group="quant",
+        doc="Per-layer sensitivity calibration found gb_attn's global SDPA patch "
+            "active and removed it before measuring. Calibration exists to measure "
+            "what quantization costs; under that patch it measures quantized "
+            "attention against quantized attention, and the sensitivities "
+            "plan_quality() spends bits on are wrong , silently, because the run "
+            "still completes and still returns plausible errors. Nothing checked "
+            "this before 2026-08-22. `k_bits`/`v_bits` are what the patch was "
+            "configured with, so a reader can tell which calibration was at risk. "
+            "The patch is NOT restored afterwards: the caller that applied it is "
+            "the one that knows when to apply it again, and this event is how that "
+            "caller finds out it happened.",
+        fields=("reason",),
+        numeric_fields=("k_bits", "v_bits"),
+        incident_when=("calibration_unpatched_sdpa",)),
     "quant_budget_fallback": KindSpec(
         group="quant", doc="gb_quant._auto_budgets() fell back to the 2 GiB sentinel (topology detection failed).",
         incident_when=("warn",)),
@@ -127,6 +151,13 @@ KINDS: dict[str, KindSpec] = {
             "T2. `rule1_underfilled` caught the RESULT; nothing named the CAUSE. "
             "Carries `field`, `recipe_value` and `caller_value`.",
         incident_when=("warn",)),
+    "driver_reset": KindSpec(
+        group="health",
+        doc="gb_supervisor reloaded the NVIDIA kernel modules (rmmod then modprobe) "
+            "after Xid errors. status is ok when both steps finished, error when "
+            "one timed out or failed. Carries the Xid codes that triggered it and "
+            "the modules that were loaded before the reset.",
+        fields=("xid_codes", "modules"), sync_scope="host"),
     "host_mem_pressure": KindSpec(
         group="health",
         doc="gb_supervisor._RamMonitor observed a host RAM/swap pressure "
@@ -179,6 +210,19 @@ KINDS: dict[str, KindSpec] = {
     "model_rotation": KindSpec(
         group="synapse", doc="gb_rotator.py overnight rotation phase event.",
         fields=("model", "phase")),
+    "model_recovery": KindSpec(
+        group="synapse",
+        doc="gb_synapse.recover_from_hf_cache()'s per-file decision while "
+            "re-registering models whose weights are already in the HF cache "
+            "but missing from the manifest (2026-09-01 — the "
+            "models_wiped_from_manifest segment's own recommended fix "
+            "previously had no invocation surface besides a Full Install, "
+            "the MCP Tool Gaps rule's exact target). status=ok is one "
+            "(re-)registered entry; status=skipped is a GGUF found on more "
+            "than one cached snapshot revision under the same resolved name "
+            "— the newer file was kept, this one was deliberately left out "
+            "rather than silently overwritten by filesystem iteration order.",
+        fields=("name", "path", "repo", "reason"), incident_when=()),
     "prompt_cache": KindSpec(
         group="synapse", doc="Proxy-observed llama.cpp host-memory prompt-cache "
                              "outcome for one request (--cache-reuse/--cache-ram): "
@@ -292,8 +336,22 @@ KINDS: dict[str, KindSpec] = {
     "link_transfer": KindSpec(
         group="cluster", doc="A real host<->feeder data transfer (bytes, seconds, derived bandwidth).",
         numeric_fields=("nbytes", "seconds")),
-    "chunk_local": KindSpec(group="cluster", doc="cluster_map/ClusterJobQueue chunk executed on the host."),
-    "chunk_remote": KindSpec(group="cluster", doc="cluster_map/ClusterJobQueue chunk dispatched to a feeder."),
+    "chunk_local": KindSpec(
+        group="cluster",
+        doc="cluster_map/ClusterJobQueue chunk executed on the host. Carries "
+            "item accounting: a worker must return one result per item it was "
+            "given. A short return used to be invisible , the collection loop "
+            "simply wrote fewer results and _mark_done() reported the batch "
+            "complete , which is the soft failure the standing rule tells "
+            "operators to catch by counting files on disk.",
+        numeric_fields=("dispatched_items", "returned_items", "missing_items")),
+    "chunk_remote": KindSpec(
+        group="cluster",
+        doc="cluster_map/ClusterJobQueue chunk dispatched to a feeder. Carries "
+            "the same item accounting as chunk_local , this is the path the "
+            "feeder soft-failure actually travels: the process runs, produces "
+            "nothing, and reported success until the counts were reconciled.",
+        numeric_fields=("dispatched_items", "returned_items", "missing_items")),
     "job_local": KindSpec(group="cluster", doc="ClusterJobQueue single item executed on the host."),
     "job_local_retry": KindSpec(group="cluster", doc="ClusterJobQueue item retried locally after a remote failure."),
     "job_remote": KindSpec(group="cluster", doc="ClusterJobQueue single item dispatched to a feeder."),
@@ -320,11 +378,22 @@ KINDS: dict[str, KindSpec] = {
     "shim_transition": KindSpec(
         group="shim", doc="Discrete shim_phase/t3_spill/t2_pressure/rule1_underfill transition.",
         incident_when=("warn",), sync_scope="host"),
+    "damon_cold": KindSpec(
+        group="shim",
+        doc=("Host cold-page evidence from the kernel's DAMON_STAT, sampled by gb_supervisor "
+             "(root; /sys/module/damon_stat is mode 0400) and republished to "
+             "/var/lib/greenboost/damon_cold for gb_tiering. Emitted only when the 400s-idle "
+             "share moves by >=5 percentage points, so a quiet box does not spam the log. "
+             "Observational: nothing consumes it to make a placement decision yet."),
+        numeric_fields=("hot_pct", "idle_pct", "cold_pct_400s", "est_bandwidth_bps"),
+        sync_scope="host"),
     "tier_move": KindSpec(
         group="shim", doc="Explicit gb_model_tier.py promote/demote/evict call (rare; most placement is shim_decision). evict() may carry KV-cache tier-serde compression fields (missing_features.md item (e)) when the entry was registered with kv_bits.",
-        fields=("from_tier", "to_tier", "kv_codec", "kv_skip_reasons"),
+        fields=("from_tier", "to_tier", "kv_codec", "kv_skip_reasons",
+                "spill_outcome"),
         numeric_fields=("size_gb", "disk_mb", "compress_ratio", "kv_bits", "kv_tensors",
-                        "kv_tensors_skipped", "kv_ratio")),
+                        "kv_tensors_skipped", "kv_ratio", "spill_resident_s",
+                        "spill_returns")),
     "mem_pool_trim": KindSpec(
         group="shim", doc="gb_mem_pool.MemPoolManager.trim()/trim_all() pool-reclaim result.",
         fields=("pool",), numeric_fields=("allocated_before_mb", "allocated_after_mb", "reclaimed_mb")),
@@ -366,6 +435,63 @@ KINDS: dict[str, KindSpec] = {
     "finish_summary": KindSpec(
         group="pipeline", doc="ai-forge tools/conduir_art_jobs/finish_assets.py asset-finishing rollup.",
         planned=True),
+
+    # ── agent harness (optimal-claude-emitted; python/dataflux_emit.py) ──
+    # Puts Claude Code harness activity (task mode, tool calls, retrievals,
+    # eval outcomes) in the same flight recorder as GPU/inference activity,
+    # so a slow task can be correlated against T2 spillover instead of
+    # misdiagnosed from a log line alone.
+    "agent_task": KindSpec(
+        group="pipeline", doc="optimal-claude: one Claude Code task/session outcome — mode "
+                              "(fast/standard/deep), status, duration, files touched, tests run.",
+        fields=("run_id", "mode", "status"),
+        numeric_fields=("duration_s", "files_touched", "tests_run"),
+        incident_when=("failed",),
+        planned=True),
+    "agent_route": KindSpec(
+        group="pipeline", doc="optimal-claude: the agent-router skill's self-declared FAST/"
+                              "STANDARD/DEEP mode for a task, plus any escalation.",
+        fields=("run_id", "declared_mode", "reason", "escalated_from"),
+        planned=True),
+    "agent_tool": KindSpec(
+        group="pipeline", doc="optimal-claude: one tool call's cost inside a Claude Code task.",
+        fields=("run_id", "tool"), numeric_fields=("ms", "bytes_out"),
+        planned=True),
+    "agent_retrieval": KindSpec(
+        group="pipeline", doc="optimal-claude: one retrieval call (contextual_rag/gb_rag/"
+                              "knowledge-rag) — which engine, how many hits, top score, cost.",
+        fields=("run_id", "source", "query_hash"),
+        numeric_fields=("n_hits", "top_score", "ms"),
+        planned=True),
+    "agent_eval": KindSpec(
+        group="pipeline", doc="optimal-claude: one harness-eval paired-trial result "
+                              "(python/harness_eval.py) — with vs without the thing under test.",
+        fields=("suite", "case", "with_skill", "passed"),
+        numeric_fields=("lift",),
+        planned=True),
+
+    "agent_shunt": KindSpec(
+        group="pipeline", doc="optimal-claude: a cheap-worker delegation (bulk-read/code-write/MCP-result "
+                              "summarizer): worker spend and the tokens that never entered the main session.",
+        numeric_fields=("displaced_tokens", "ms"), planned=True),
+    "quant_decision": KindSpec(
+        group="quant", doc="A quantization choice made by a consumer pipeline (which precision, why), "
+                           "seen in the live log without a GreenBoost emit site.",
+        planned=True),
+    "web_fetch": KindSpec(
+        group="agent", doc="greenboost-cli instruments/safe_fetch.py: one WebFetch outcome. status is "
+                           "ok|blocked|error; a blocked fetch carries the refusal `reason` (private or "
+                           "link-local address, redirect hop, content type, size/time cap, GreenBoost "
+                           "control port, credential URL), so a refused request is visible after the fact.",
+        fields=("status", "host", "reason"), numeric_fields=("bytes", "hops", "status_code"),
+        incident_when=("error",)),
+    "factory_task": KindSpec(
+        group="agent", doc="greenboost-cli workflow/factory.py task lifecycle events that need a human: "
+                           "status interrupted (its factory died mid-run; NOT re-run), resumed (a person "
+                           "re-queued it, `forced` says whether the workspace check was overridden), "
+                           "expired (queued past the TTL and dropped).",
+        fields=("status", "task_id"), numeric_fields=("attempt",),
+        incident_when=("interrupted",)),
 
     # ── gaming (emitted by greenboost_gaming, a separate repo, not GreenBoost itself) ──
     # Found live 2026-07-30 alongside qc_summary/finish_summary — same class
@@ -453,8 +579,9 @@ KINDS: dict[str, KindSpec] = {
             "prompt, which this hybrid architecture pays on every turn even at a "
             "99.9% KV hit rate). The replay figure is DERIVED, not read: the "
             "engine reports one prompt_ms and never breaks it down.",
-        fields=("model", "n_turns", "median_prompt_ms", "median_replay_ms_est",
-                "median_decode_tok_s", "median_new_tokens")),
+        fields=("model", "n_turns"),
+        numeric_fields=("median_prompt_ms", "median_replay_ms_est",
+                        "median_decode_tok_s", "median_new_tokens")),
     "semantic_transition": KindSpec(
         group="health",
         doc="A governed GB-Semantics segment changed verdict (matched/clear/"
@@ -482,6 +609,41 @@ KINDS: dict[str, KindSpec] = {
         fields=("model", "action", "tokens_saved", "vram_freed_mb",
                 "tokens_restored", "reload_s", "restore_s"),
         incident_when=("error",)),
+
+    "vision_fit": KindSpec(
+        group="synapse",
+        doc="What a vision projector costs on the card and how the placement pays for it, decided at serve time from the "
+            "projector's own GGUF metadata (weights + the encoder buffers for the image token budget). `source` says which rule "
+            "set the expert placement: auto-fit, a recipe pin plus the layers the projector converts into, recipe.vision.nCpuMoe, "
+            "or an explicit call value. Exists because a recipe pin measured without the projector (nCpuMoe=28 on the 12 GB card) "
+            "left ~0.8 GB free and the first image killed the engine (2026-10-28).",
+        fields=("model", "mmproj", "extra_gb", "weights_gb", "encoder_gb", "extra_cpu_moe_layers", "n_cpu_moe", "source", "image_tokens"),
+        numeric_fields=("extra_gb", "weights_gb", "encoder_gb", "extra_cpu_moe_layers")),
+
+    "serve_recovery": KindSpec(
+        group="health",
+        doc="serve() failed on something a retry can fix (a dead previous engine's stale shim tracker, a transient allocation "
+            "failure), cleaned up and tried once more. `cause` is the engine log's diagnosis (vision_encoder_oom, cuda_oom, segfault, "
+            "load_failed) when the log had one. Seen 2026-10-28: the serve right after a vision-encoder OOM failed on the dead "
+            "engine's bookkeeping, then worked.",
+        fields=("model", "tracker_cleared", "cause", "error"),
+        incident_when=("error",)),
+
+    "proxy_limits": KindSpec(
+        group="synapse",
+        doc="The gb-synapse proxy's memory guard at start: the address-space cap derived from RAM, the slots that can hold an "
+            "image request at once and the malloc-arena bound, against the proxy's idle VmSize. `cap_used_pct` above 60 means "
+            "the second concurrent image request can fail with MemoryError (it did, 2026-10-28: 6.09 GiB idle against a 6.15 GiB cap).",
+        fields=("model", "cap_gb", "vm_idle_gb", "arena_max", "n_slots", "cap_used_pct"),
+        numeric_fields=("cap_gb", "vm_idle_gb", "cap_used_pct")),
+
+    "gpu_phase": KindSpec(
+        group="orchestration",
+        doc="One heavy GPU phase held under the shared lease (gb_phase.py): status start|end, the owner, wall seconds and the "
+            "peak VRAM seen while it ran, and any gb-synapse models paused to make room. The answer to 'where did the GPU time go' "
+            "across Qwen, FLUX, browser raster and encode, which share one 12 GB card and cannot overlap.",
+        fields=("status", "phase", "owner", "class", "seconds", "peak_vram_mib", "need_pct", "free_pct", "paused_models"),
+        numeric_fields=("seconds", "peak_vram_mib")),
 
     "serve_checkpoint": KindSpec(
         group="health",
@@ -546,9 +708,17 @@ KINDS: dict[str, KindSpec] = {
             "`tools` should be rare and is worth chasing, since the 14-day "
             "baseline puts a lost prefix at ~166s time-to-first-token against "
             "~5.5s for a kept one. A shift at `user` is normal and is never "
-            "emitted.",
+            "emitted, and since 2026-08-22 neither is a pure APPEND to "
+            "history: the call site passes history as a list of per-message "
+            "strings and prefix.py compares them as an ordered sequence, so "
+            "adding a turn is not a shift. Before that, history was joined "
+            "into one blob and hashed, so every appended turn warned , "
+            "measured 14 of 14 turns across a real conversation that never "
+            "rewrote anything, then 0 of 7 after the fix (casebook C-15). An "
+            "absence of these events is now meaningful; before, their presence "
+            "was not.",
         fields=("first_changed", "changed", "stable_prefix_chars",
-                "invalidated_chars", "turns"),
+                "invalidated_chars", "turns", "history_appended"),
         numeric_fields=("stable_prefix_chars", "invalidated_chars", "turns"),
         incident_when=("warn",), sync_scope="host"),
     "tuner_decision": KindSpec(
@@ -597,20 +767,41 @@ KINDS: dict[str, KindSpec] = {
             "`hard_trim` is the last-resort eviction that reaches the live "
             "tail compaction leaves verbatim (`met` False means even that "
             "could not fit the budget, so the caller must explain rather than "
-            "retry).",
+            "retry). "
+            "FOUR ops share this one kind, so any consumer that means "
+            "\"a compaction\" MUST filter on op==\"compact\". A reader that "
+            "counts every agent_context_edit as a compaction reports "
+            "calibrations and trims as compactions , which is exactly the "
+            "defect found on 2026-08-22 behind casebook C-09's headline. "
+            "Since that date a `compact` also carries MEASURED prefix "
+            "accounting from gb_prefix_guard, computed before the rewrite is "
+            "applied: prefix_kept_pct is the share of the previous reusable "
+            "prefix that survives (100 = pure append, the cheap case), "
+            "kept_chunks/prev_chunks are that share at chunk granularity, and "
+            "tokens_lost is what must be re-prefilled that the engine's cache "
+            "already held , the actual cost, in tokens, at the CLI's "
+            "server-calibrated chars-per-token. broke_prefix is that share "
+            "against threshold_pct. Events written before that date have none "
+            "of these fields, and their absence means \"not measured\", never "
+            "zero.",
         fields=("op", "head_kept", "middle_compacted", "tail_kept",
                 "extended_prior", "summary_chars", "results_cleared",
                 "results_kept", "chars_freed",
                 "actual_prompt_tokens", "estimated_prompt_tokens",
                 "estimate_error_pct", "chars_per_token", "samples",
                 "budget_tokens", "before_tokens", "after_tokens",
-                "freed_tokens", "met", "steps"),
+                "freed_tokens", "met", "steps",
+                "prefix_kept_pct", "kept_chunks", "prev_chunks",
+                "kept_tokens", "prev_tokens", "tokens_lost",
+                "broke_prefix", "threshold_pct"),
         numeric_fields=("head_kept", "middle_compacted", "tail_kept",
                         "summary_chars", "results_cleared", "chars_freed",
                         "actual_prompt_tokens", "estimated_prompt_tokens",
                         "estimate_error_pct", "chars_per_token", "samples",
                         "budget_tokens", "before_tokens", "after_tokens",
-                        "freed_tokens", "steps"),
+                        "freed_tokens", "steps",
+                        "prefix_kept_pct", "kept_chunks", "prev_chunks",
+                        "kept_tokens", "prev_tokens", "tokens_lost"),
         sync_scope="host"),
     "agent_eval_run": KindSpec(
         group="agent",
@@ -636,7 +827,8 @@ KINDS: dict[str, KindSpec] = {
                             "third_party/nemoclaw_patterns/NOTICE) — depth/size-bounded "
                             "and credential-shaped-value redacted before it ever "
                             "reaches this log.",
-        fields=("name", "decision", "agent", "args"), sync_scope="host"),
+        fields=("name", "decision", "agent", "args"),
+        numeric_fields=("duration_ms", "result_chars", "result_tokens_est"), sync_scope="host"),
 
     # ── eval (model-quality verification gates) ───────────────────────
     "yarn_bake": KindSpec(group="eval", doc="gb_aviary YaRN context-extension bake result."),

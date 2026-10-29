@@ -65,7 +65,7 @@ def test_kinds_in_group():
     shim_kinds = kinds.kinds_in_group("shim")
     assert set(shim_kinds) == {
         "snapshot", "shim_decision", "shim_transition", "tier_move", "mem_pool_trim",
-        "reclaim", "ssm_state"}
+        "reclaim", "ssm_state", "damon_cold"}
 
 
 # ---------------------------------------------------------------------------
@@ -140,3 +140,12 @@ def test_critic_report_not_truncated_when_under_limit(log_path):
 
     assert rep["total_incidents"] == 1
     assert rep["truncated"] is False
+
+
+def test_driver_reset_is_registered():
+    """gb_supervisor emits kind="driver_reset"; an unregistered kind is invisible to schema and rollups."""
+    s = kinds.schema("driver_reset")
+    assert s["group"] == "health"
+    assert set(s["fields"]) == {"xid_codes", "modules"}
+    assert "driver_reset" in kinds.kinds_in_group("health")
+    assert gdf._is_incident({"kind": "driver_reset", "status": "error"})

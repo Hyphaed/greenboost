@@ -394,7 +394,11 @@ def handle_shell(command: str, timeout: int = 120,
         # Same working directory the foreground path would have used ,
         # a factory task scopes its Bash cwd per thread, and a
         # backgrounded command must not escape that scoping.
-        jid = start(command, cwd=getattr(_bash_cwd_tls, "value", None))
+        from greenboost_cli.instruments.shell_sandbox import SandboxUnavailable
+        try:
+            jid = start(command, cwd=getattr(_bash_cwd_tls, "value", None))
+        except SandboxUnavailable as e:
+            return f"Error: {e}"
         return (f"[started in the background as {jid}]\n"
                 f"Carry on with other work. TaskOutput(task_id=\"{jid}\") "
                 f"returns what it has printed since you last looked; "
@@ -412,17 +416,27 @@ def _handle_shell_foreground(command: str, timeout: int = 120) -> str:
     _MARKER = "::CWD::"
     tracked = f"{command}\nprintf '\\n{_MARKER}%s\\n' \"$(pwd)\""
 
+    from greenboost_cli.instruments import shell_sandbox
+    jail = shell_sandbox.active_roots()
     try:
-        r = subprocess.run(
-            tracked,
-            shell=True,
-            executable="/bin/bash",
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=run_cwd,
-            env=os.environ.copy(),
-        )
+        if jail:
+            try:
+                argv = shell_sandbox.bwrap_argv(tracked, jail, run_cwd)
+            except shell_sandbox.SandboxUnavailable as e:
+                return f"Error: {e}"
+            r = subprocess.run(argv, capture_output=True, text=True,
+                               timeout=timeout, cwd=run_cwd, env=os.environ.copy())
+        else:
+            r = subprocess.run(
+                tracked,
+                shell=True,
+                executable="/bin/bash",
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=run_cwd,
+                env=os.environ.copy(),
+            )
         out = r.stdout
 
         # Parse and strip the cwd sentinel line
@@ -552,23 +566,33 @@ def handle_semble(query: str, repo: str = None, top_k: int = 5,
 
 
 def handle_fetch_url(url: str, prompt: str = None) -> str:
-    # WebFetch is in _ALWAYS_APPROVED , it never asks. Over a multi-day
+    # WebFetch is in _ALWAYS_APPROVED, so it never asks. Over a multi-day
     # unattended run that is a lot of unreviewed outbound requests, and the URL
-    # can come from a fetched page or a file rather than from the user. Judge
-    # the destination before going there.
-    try:
-        from greenboost_cli.instruments.url_guard import check_url
-        refusal = check_url(url)
-        if refusal:
-            return refusal
-    except Exception:
-        pass                    # a broken guard must not break fetching
-    from greenboost_cli.instruments.scrapling_utils import fetch_url as _scrapling_fetch
-    return _scrapling_fetch(url)
+    # can come from a fetched page or a file rather than from the user, so the
+    # destination is judged INSIDE the HTTP client (instruments/safe_fetch.py:
+    # one DNS lookup per hop, per-hop redirect checks, byte cap, content-type
+    # allowlist). A guard that errors blocks the fetch; it does not skip it.
+    from greenboost_cli.instruments import safe_fetch
+    result = safe_fetch.fetch(url)
+    # A real browser can be pointed at anything by a page's own JavaScript, and a
+    # redirect it follows can't be checked hop by hop. So the bot-wall fallback
+    # is opt-in, and only after the plain client was refused with an anti-bot status.
+    if (os.environ.get("GB_WEBFETCH_BROWSER") == "1"
+            and any(f"returned HTTP {c}" in result for c in (403, 429, 503))):
+        from greenboost_cli.instruments.scrapling_utils import fetch_url as _scrapling_fetch
+        return _scrapling_fetch(url, use_stealth=True)
+    return result
 
 
 def handle_screenshot(url: str, output_path: str, width: int = 1280,
                        height: int = 800, full_page: bool = False) -> str:
+    # Same destination rules as WebFetch; a headless browser is a fetcher too.
+    # Redirects inside the browser can't be re-checked, so this validates the
+    # URL the agent asked for and refuses on any doubt.
+    from greenboost_cli.instruments import safe_fetch
+    checked = safe_fetch.validate(url)
+    if isinstance(checked, str):
+        return checked
     from greenboost_cli.instruments.screenshot_utils import capture_screenshot
     return capture_screenshot(url, output_path, width=width, height=height,
                                full_page=full_page)

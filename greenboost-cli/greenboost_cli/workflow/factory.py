@@ -70,6 +70,13 @@ GPU_WARN_THRESHOLD   = 0.90  # 90% VRAM used
 MIN_PRIORITY         = 1     # tasks cannot be bumped below this
 MAX_TASK_RETRIES     = 3     # abandon task after this many consecutive failures
 
+#: A running task's owner must refresh its lease this often, and the lease is
+#: considered lost after LEASE_S without one. 90s = three missed beats: long
+#: enough that a GC pause or a busy disk doesn't forfeit a live task, short enough
+#: that a crashed factory's task is recognized on the next start.
+HEARTBEAT_S          = 20.0
+LEASE_S              = 90.0
+
 # How long a queued-but-never-run task stays resumable across process restarts.
 # Rows are only deleted after _run_task() returns, so an interrupted factory
 # leaves its work behind; without a bound, that work re-runs in whatever project
@@ -341,12 +348,46 @@ class VRAMMonitor:
 
 # ── Persistence ───────────────────────────────────────────────────────────────
 
+def _git_head(path: str) -> str:
+    """The commit checked out at `path`, "" when it isn't a git work tree."""
+    if not path or not os.path.isdir(path):
+        return ""
+    try:
+        r = subprocess.run(["git", "-C", path, "rev-parse", "HEAD"], capture_output=True,
+                           text=True, timeout=10)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _git_dirty(path: str) -> bool:
+    try:
+        r = subprocess.run(["git", "-C", path, "status", "--porcelain"], capture_output=True,
+                           text=True, timeout=15)
+        return bool(r.stdout.strip())
+    except Exception:
+        return True                      # can't tell: assume it moved
+
+
+def _owner_alive(owner: str) -> bool:
+    """Owner ids are `<pid>:<token>`; a pid that no longer exists can't hold a lease."""
+    try:
+        os.kill(int(owner.split(":", 1)[0]), 0)
+        return True
+    except (ValueError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True                      # exists, owned by someone else
+
+
 class FactoryDB:
     """Persists tasks and run history to SQLite so the factory survives restarts."""
 
     def __init__(self, path: Path = FACTORY_DB) -> None:
         self.path = path
+        self.interrupted_on_load: list[dict] = []
         self._init()
+        self._migrate_state_columns()
 
     def _init(self) -> None:
         with self._conn() as c:
@@ -397,11 +438,47 @@ class FactoryDB:
         c.row_factory = sqlite3.Row
         return c
 
+    # Task lifecycle, persisted in pending_tasks.state:
+    #   queued       waiting for a worker (the only state that is ever re-queued automatically)
+    #   running      claimed by `lease_owner`, which must keep heartbeating
+    #   interrupted  was running when its owner died; needs a human decision (resume or discard)
+    # A task that finishes (either way) is deleted from this table and recorded in
+    # completed_tasks. Before this, "queued" and "was running when the process
+    # died" were the same row, so a crash silently re-ran the task, in its original
+    # directory, with no check that anything about the workspace was still true.
+    _STATE_COLUMNS = (
+        ("state",       "TEXT NOT NULL DEFAULT 'queued'"),
+        ("attempt",     "INTEGER NOT NULL DEFAULT 0"),
+        ("lease_owner", "TEXT NOT NULL DEFAULT ''"),
+        ("claimed_at",  "REAL"),
+        ("heartbeat",   "REAL"),
+        ("base_commit", "TEXT NOT NULL DEFAULT ''"),
+        ("workspace",   "TEXT NOT NULL DEFAULT ''"),
+    )
+
+    def _migrate_state_columns(self) -> None:
+        with self._conn() as c:
+            have = {r["name"] for r in c.execute("PRAGMA table_info(pending_tasks)")}
+            for name, ddl in self._STATE_COLUMNS:
+                if name not in have:
+                    c.execute(f"ALTER TABLE pending_tasks ADD COLUMN {name} {ddl}")
+
     def save_task(self, task: Task) -> None:
+        """Insert or re-queue a task. Re-saving (a retry) puts it back to
+        `queued` and keeps its attempt count."""
         with self._conn() as c:
             c.execute(
-                """INSERT OR REPLACE INTO pending_tasks
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                """INSERT INTO pending_tasks
+                   (task_id, priority, created_at, prompt, agent_name, autonomous,
+                    delegated_by, delegation_depth, metadata)
+                   VALUES (?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(task_id) DO UPDATE SET
+                     priority=excluded.priority, prompt=excluded.prompt,
+                     agent_name=excluded.agent_name, autonomous=excluded.autonomous,
+                     delegated_by=excluded.delegated_by,
+                     delegation_depth=excluded.delegation_depth,
+                     metadata=excluded.metadata,
+                     state='queued', lease_owner='', claimed_at=NULL, heartbeat=NULL""",
                 (
                     task.task_id, task.priority, task.created_at,
                     task.prompt, task.agent_name, int(task.autonomous),
@@ -409,6 +486,81 @@ class FactoryDB:
                     json.dumps(task.metadata),
                 ),
             )
+
+    def claim(self, task_id: str, owner: str, workspace: str = "") -> int:
+        """Mark a task running under `owner` and record the workspace's starting
+        commit, so a later resume can tell whether the tree moved. Returns the
+        attempt number (1 on the first run)."""
+        now = time.time()
+        with self._conn() as c:
+            c.execute(
+                """UPDATE pending_tasks SET state='running', lease_owner=?, claimed_at=?,
+                   heartbeat=?, attempt=attempt+1, base_commit=?, workspace=?
+                   WHERE task_id=?""",
+                (owner, now, now, _git_head(workspace), workspace, task_id),
+            )
+            row = c.execute("SELECT attempt FROM pending_tasks WHERE task_id=?",
+                            (task_id,)).fetchone()
+        return int(row["attempt"]) if row else 0
+
+    def heartbeat(self, owner: str) -> None:
+        """Refresh the lease on every task `owner` is running."""
+        with self._conn() as c:
+            c.execute("UPDATE pending_tasks SET heartbeat=? WHERE lease_owner=? AND state='running'",
+                      (time.time(), owner))
+
+    def interrupted(self) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT task_id, prompt, attempt, claimed_at, base_commit, workspace
+                   FROM pending_tasks WHERE state='interrupted' ORDER BY created_at""").fetchall()
+        return [dict(r) for r in rows]
+
+    def _reconcile_running(self) -> None:
+        """Startup reconciliation. A `running` row is left alone while its owner is
+        alive and its lease is fresh (another factory in another project shares this
+        database). Otherwise its owner is gone: the task becomes `interrupted` and
+        is reported, never re-queued. Whether it finished, half-finished, or never
+        started its edits is unknown, so rerunning it is a decision for a person."""
+        now = time.time()
+        gone = []
+        with self._conn() as c:
+            for r in c.execute("SELECT task_id, lease_owner, heartbeat FROM pending_tasks "
+                               "WHERE state='running'").fetchall():
+                fresh = r["heartbeat"] is not None and (now - r["heartbeat"]) < LEASE_S
+                if fresh and _owner_alive(r["lease_owner"]):
+                    continue
+                gone.append(r["task_id"])
+            for tid in gone:
+                c.execute("UPDATE pending_tasks SET state='interrupted', lease_owner='' WHERE task_id=?",
+                          (tid,))
+        self.interrupted_on_load = [i for i in self.interrupted() if i["task_id"] in set(gone)]
+
+    def discard_task(self, task_id: str) -> bool:
+        with self._conn() as c:
+            return c.execute("DELETE FROM pending_tasks WHERE task_id=? AND state='interrupted'",
+                             (task_id,)).rowcount > 0
+
+    def requeue_interrupted(self, task_id: str) -> "Task | None":
+        """Flip an interrupted row back to queued and return it as a Task."""
+        with self._conn() as c:
+            c.execute("UPDATE pending_tasks SET state='queued' WHERE task_id=? AND state='interrupted'",
+                      (task_id,))
+            r = c.execute("SELECT * FROM pending_tasks WHERE task_id=? AND state='queued'",
+                          (task_id,)).fetchone()
+        if r is None:
+            return None
+        return Task(priority=r["priority"], created_at=r["created_at"], task_id=r["task_id"],
+                    prompt=r["prompt"], agent_name=r["agent_name"], autonomous=bool(r["autonomous"]),
+                    delegated_by=r["delegated_by"], delegation_depth=r["delegation_depth"],
+                    metadata=json.loads(r["metadata"]))
+
+    def finish_task(self, task_id: str, owner: str) -> None:
+        """Remove a task this owner finished. A task that was re-queued for a retry
+        (state back to `queued`) is NOT removed, so the retry survives a crash too."""
+        with self._conn() as c:
+            c.execute("DELETE FROM pending_tasks WHERE task_id=? AND state='running' AND lease_owner=?",
+                      (task_id, owner))
 
     def delete_task(self, task_id: str) -> None:
         with self._conn() as c:
@@ -435,9 +587,11 @@ class FactoryDB:
         logged rather than silent — a task vanishing without explanation is its
         own debugging problem.
         """
+        self._reconcile_running()
         with self._conn() as c:
             rows = c.execute(
-                "SELECT * FROM pending_tasks ORDER BY priority ASC, created_at ASC"
+                "SELECT * FROM pending_tasks WHERE state='queued' "
+                "ORDER BY priority ASC, created_at ASC"
             ).fetchall()
         if ttl_s and ttl_s > 0:
             cutoff = time.time() - ttl_s
@@ -564,7 +718,22 @@ def register_broadcast(cb: Callable[[dict], None]) -> None:
     _broadcast_callbacks.append(cb)
 
 
+_DATAFLUX_STATUS = {"factory_task_interrupted": "interrupted", "factory_task_resumed": "resumed",
+                    "factory_task_expired": "expired"}
+
+
 def _emit(event: str, data: dict) -> None:
+    # Lifecycle events a person has to act on also go to dataflux (the Observability
+    # Must-Rule): the dashboard broadcast below is invisible to the MCP and to
+    # /session-report. Best-effort, like every dataflux emit.
+    status = _DATAFLUX_STATUS.get(event)
+    if status:
+        try:
+            from greenboost_cli.gb_paths import gb_module
+            gb_module("gb_dataflux").emit({"kind": "factory_task", "status": status,
+                                           **{k: v for k, v in data.items() if k != "status"}})
+        except Exception:
+            pass
     msg = {"event": event, "ts": time.time(), **data}
     for cb in _broadcast_callbacks:
         try:
@@ -615,8 +784,23 @@ class AIFactory:
         # re-running it now would be a surprise rather than a resumption
         # (see TaskDB.load_pending's docstring for the incident).
         self.db.expired_on_load = []
+        #: `<pid>:<token>`: who holds the leases on the tasks this process runs.
+        self._owner = f"{os.getpid()}:{hashlib.sha256(os.urandom(8)).hexdigest()[:8]}"
+        self._heartbeat_thread: Optional[threading.Thread] = None
         for task in self.db.load_pending(ttl_s=PENDING_TASK_TTL_S):
             self._task_q.put(task)
+        # Tasks whose owner died mid-run: reported, never re-queued (see FactoryDB._reconcile_running).
+        for it in self.db.interrupted_on_load:
+            self._log.warning(
+                "task %s was running when its factory died (attempt %s); not re-running it. "
+                "Resume with factory.resume_task(%r) or discard it: %s",
+                it["task_id"][:12], it["attempt"], it["task_id"], (it["prompt"] or "")[:80],
+            )
+            _emit("factory_task_interrupted", {
+                "task_id": it["task_id"], "attempt": it["attempt"],
+                "workspace": it["workspace"], "base_commit": it["base_commit"],
+                "prompt": (it["prompt"] or "")[:80],
+            })
         for exp in getattr(self.db, "expired_on_load", []):
             self._log.warning(
                 "dropped stale pending task %s (age %ss): %s",
@@ -971,9 +1155,11 @@ class AIFactory:
                 self._task_q.task_done()
                 continue
 
+            attempt = self.db.claim(task.task_id, self._owner, task.cwd)
+            task.metadata["_attempt"] = attempt
             self._run_task(agent_name, task)
             self._task_q.task_done()
-            self.db.delete_task(task.task_id)
+            self.db.finish_task(task.task_id, self._owner)
 
     def _run_task(self, agent_name: str, task: Task) -> None:
         agent = self._agents.get(agent_name)
@@ -1474,6 +1660,9 @@ class AIFactory:
             self.add_agent("default", model="claude-sonnet-4-6")
 
         self._active = True
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, name="gb-factory-heartbeat", daemon=True)
+        self._heartbeat_thread.start()
         for i in range(workers):
             t = threading.Thread(
                 target=self._worker_loop,
@@ -1537,6 +1726,51 @@ class AIFactory:
             "recent":       self.db.recent_completions(10),
         }
 
+    # ── Interrupted tasks ─────────────────────────────────────────────────────
+
+    def interrupted_tasks(self) -> list[dict]:
+        return self.db.interrupted()
+
+    def discard_task(self, task_id: str) -> bool:
+        return self.db.discard_task(task_id)
+
+    def resume_task(self, task_id: str, force: bool = False) -> dict:
+        """Re-queue an interrupted task, but only if its workspace is still the one
+        it started in. Refuses when the repository moved to another commit or the
+        tree has uncommitted changes (they may be the task's own half-finished edits
+        or yours, and nothing here can tell which). `force=True` is the explicit
+        decision to run it anyway. Never deletes or resets anything in the workspace."""
+        row = next((i for i in self.db.interrupted() if i["task_id"] == task_id), None)
+        if row is None:
+            return {"status": "error", "error": f"no interrupted task {task_id!r}"}
+        ws = row["workspace"]
+        if ws and not os.path.isdir(ws):
+            return {"status": "refused", "reason": f"workspace {ws} no longer exists"}
+        if not force and ws:
+            head = _git_head(ws)
+            if row["base_commit"] and head != row["base_commit"]:
+                return {"status": "refused",
+                        "reason": f"{ws} is now at {head[:10] or 'no commit'}, the task started at "
+                                  f"{row['base_commit'][:10]}. Check what changed, then resume with force=True."}
+            if _git_dirty(ws):
+                return {"status": "refused",
+                        "reason": f"{ws} has uncommitted changes (the task's partial edits, yours, or both). "
+                                  f"Review `git status`, then resume with force=True."}
+        task = self.db.requeue_interrupted(task_id)
+        if task is None:
+            return {"status": "error", "error": "task changed state while resuming"}
+        self._task_q.put(task)
+        _emit("factory_task_resumed", {"task_id": task_id, "forced": force})
+        return {"status": "queued", "task_id": task_id}
+
+    def _heartbeat_loop(self) -> None:
+        while self._active:
+            try:
+                self.db.heartbeat(self._owner)
+            except Exception:
+                pass                       # a missed beat is recovered by the next one
+            time.sleep(HEARTBEAT_S)
+
     # ── Task listing (for the headless CLI) ──────────────────────────────────
 
     def list_tasks(
@@ -1547,11 +1781,14 @@ class AIFactory:
     ) -> dict:
         """Return tasks across states.
 
-        state ∈ {"pending", "running", "completed", "all"}
+        state ∈ {"pending", "running", "completed", "interrupted", "all"}
         """
         state = state.lower()
         out: dict = {"state": state, "limit": limit, "pending": [],
-                     "running": [], "completed": []}
+                     "running": [], "completed": [], "interrupted": []}
+
+        if state in ("interrupted", "all"):
+            out["interrupted"] = self.db.interrupted()[:limit]
 
         if state in ("pending", "all"):
             # Snapshot the priority queue without disturbing ordering.

@@ -12,7 +12,7 @@
 #   sudo ./greenboost_setup.sh setup             - full install (prompts for mode)
 #   sudo ./greenboost_setup.sh module-only       - kernel module only (safe on any machine)
 #   sudo ./greenboost_setup.sh install           - build + install module + shim
-#   sudo ./greenboost_setup.sh uninstall         - remove module + all config
+#   sudo ./greenboost_setup.sh uninstall         - remove module + all config (--dry-run: print the plan, change nothing)
 #   sudo ./greenboost_setup.sh load              - insmod with default params
 #   sudo ./greenboost_setup.sh unload            - rmmod
 #   sudo ./greenboost_setup.sh tune              - runtime tuning (governor, NVMe, sysctl)
@@ -33,6 +33,7 @@
 #   NVME_POOL_GB   GreenBoost soft cap on T3 allocations
 
 set -euo pipefail
+umask 022   # files installed into /etc and /usr/local must be world-readable whatever the caller's umask (audit R2-06)
 
 DRIVER_NAME="greenboost"
 
@@ -103,10 +104,39 @@ GB_ACTIVE_PROFILE_LINK="/etc/greenboost/active_profile.md"
 
 # Dynamic swapfile - GreenBoost provisions this automatically when no adequate swap exists
 GB_SWAP_FILE="/var/lib/greenboost/swapfile"
+# Root-owned log dir for installer logs (INS-15): a fixed /tmp name can be pre-created by another user.
+GB_LOGDIR="/var/log/greenboost"
 GB_SWAP_MIN_GB=8      # minimum existing swap to consider adequate (skip provisioning)
 GB_SWAP_MAX_GB=120    # cap for auto-provisioned swapfile
+# Owner switches (SP62-02). One swapfile per machine: when the system already has swap, or the owner wrote
+# GB_SWAP_AUTO=0, GreenBoost never creates another. GB_VM_SYSCTL=0 hands vm.swappiness / vm.dirty_* to the
+# resource programme: the installer then writes and resets none of them. Plain KEY=0|1 lines, parsed, never sourced.
+GB_SWAP_CONF="${GB_SWAP_CONF:-/etc/greenboost/gb-swap.conf}"
+GB_PROC_SWAPS="${GB_PROC_SWAPS:-/proc/swaps}"
 
-GB_VERSION="3.4"
+gb_swap_conf_get() {    # gb_swap_conf_get KEY DEFAULT
+    local v=""
+    [[ -r "$GB_SWAP_CONF" ]] && v="$(sed -n "s/^${1}=\([0-9][0-9]*\)[[:space:]]*\$/\1/p" "$GB_SWAP_CONF" | tail -1)"
+    echo "${v:-$2}"
+}
+
+gb_swap_other_gb() {    # GB (rounded: an 8 GB swapfile lists 8388604 KiB) of active swap that is NOT the GreenBoost swapfile
+    awk -v f="$GB_SWAP_FILE" 'NR>1 && $1!=f {s+=$3} END{print int(s/1048576+0.5)}' "$GB_PROC_SWAPS" 2>/dev/null || echo 0
+}
+
+gb_swap_auto_ok() {     # 0 = GreenBoost may provision its own swapfile; prints the reason when not
+    local other
+    if [[ "$(gb_swap_conf_get GB_SWAP_AUTO 1)" == 0 ]]; then
+        info "swap: GB_SWAP_AUTO=0 in $GB_SWAP_CONF, GreenBoost provisions no swapfile"; return 1
+    fi
+    other="$(gb_swap_other_gb)"
+    if (( ${other:-0} >= GB_SWAP_MIN_GB )); then
+        info "swap: system swap of ${other} GB is adequate (>= ${GB_SWAP_MIN_GB} GB), no second swapfile"; return 1
+    fi
+    return 0
+}
+
+GB_VERSION="3.5"
 GB_REPO_API="https://gitlab.com/api/v4/projects/IsolatedOctopi%2Fgreenboost/repository/tags"
 
 # Colours
@@ -120,6 +150,76 @@ info()  { echo -e "${GRN}[GreenBoost]${NC} $*"; }
 warn()  { echo -e "${YLW}[GreenBoost] WARN:${NC} $*"; }
 die()   { echo -e "${RED}[GreenBoost] ERROR:${NC} $*" >&2; exit 1; }
 
+# ── Write primitives (audit INS-02/03/04/05) ─────────────────────────────────
+# Privileged writes that replace a file another process may read at any moment
+# go through these. They are the only place a preview (GB_DRY_RUN=1, used by
+# tests/installer/) hooks in; most other mutating commands in this script do
+# NOT go through them yet (docs/greenboost-audit/installer-audit.md, "plan then
+# apply"), so GB_DRY_RUN is deliberately not a user-facing flag.
+
+# gb_atomic_install <src> <dest> [mode]: copy to a temp file in dest's own
+# directory, then rename(2) over dest. A plain `cp` truncates dest in place: a
+# process that starts mid-copy maps a half-written library and one that already
+# has it mapped gets SIGBUS. rename leaves the old inode intact.
+gb_atomic_install() {
+    local src="$1" dest="$2" mode="${3:-755}" tmp
+    if [[ "${GB_DRY_RUN:-0}" == "1" ]]; then info "[dry-run] would install $src -> $dest ($mode)"; return 0; fi
+    tmp="$(mktemp "${dest}.gbnew.XXXXXX")" || return 1
+    if install -m "$mode" "$src" "$tmp" && mv -f "$tmp" "$dest"; then return 0; fi
+    rm -f "$tmp"; return 1
+}
+
+# gb_ollama_default_ctx: the context length Ollama gives a model that names none (OLLAMA_CONTEXT_LENGTH). One global value cannot suit both classes: an
+# embedding model needs at most 8192 tokens, and at 32768 the 8B embedding model took 8.4 GB of a 12 GiB card (audit GBR-04). So the server-wide default is
+# the embedding cap (GB_OLLAMA_EMBED_CTX, default 8192, never above the ladder value) and the ladder value GB_OLLAMA_CTX is kept for chat models, which pass it
+# per request (num_ctx) or in a Modelfile; it is recorded in /etc/greenboost/ollama-ctx.conf for those clients. GB_OLLAMA_SERVER_CTX overrides the default.
+gb_ollama_default_ctx() {
+    local cap="${GB_OLLAMA_EMBED_CTX:-8192}" ladder="${GB_OLLAMA_CTX:-8192}"
+    if [[ -n "${GB_OLLAMA_SERVER_CTX:-}" ]]; then echo "$GB_OLLAMA_SERVER_CTX"
+    elif (( ladder < cap )); then echo "$ladder"
+    else echo "$cap"; fi
+}
+
+# gb_backup_once <file>: keep the FIRST pre-GreenBoost copy as <file>.gb-orig,
+# never overwritten, so repeated installs cannot replace the user's original
+# with our own earlier output. The suffix keeps systemd, udev and sudo from
+# reading it.
+gb_backup_once() {
+    local f="$1"
+    if [[ -f "$f" && ! -e "$f.gb-orig" && "${GB_DRY_RUN:-0}" != "1" ]]; then cp -p "$f" "$f.gb-orig"; fi
+    return 0
+}
+
+# gb_managed_write <dest> [mode]  (new content on stdin)
+# For generated "managed file, do not edit" files. Writes atomically and ends
+# the file with `# gb-managed-sha256: <hash of everything above>`. Before
+# replacing, it hashes the file on disk: a missing or wrong stamp means a hand
+# edit (or a file from an older installer), so the old copy is kept as
+# <dest>.gb-prev-<timestamp> and a warning names it. Identical content is a
+# no-op: no rewrite, no mtime change.
+gb_managed_write() {
+    local dest="$1" mode="${2:-644}" tmp want have stamp
+    if [[ "${GB_DRY_RUN:-0}" == "1" ]]; then cat >/dev/null; info "[dry-run] would write managed file $dest ($mode)"; return 0; fi
+    tmp="$(mktemp "${dest}.gbnew.XXXXXX")" || return 1
+    cat > "$tmp"
+    want="$(sha256sum < "$tmp" | cut -d' ' -f1)"
+    printf '# gb-managed-sha256: %s\n' "$want" >> "$tmp"
+    if [[ -f "$dest" ]]; then
+        if cmp -s "$tmp" "$dest"; then rm -f "$tmp"; return 0; fi
+        have="$(tail -n 1 "$dest" | sed -n 's/^# gb-managed-sha256: //p')"
+        if [[ -z "$have" || "$have" != "$(head -n -1 "$dest" | sha256sum | cut -d' ' -f1)" ]]; then
+            stamp="$(date +%Y%m%d_%H%M%S)"
+            cp -p "$dest" "${dest}.gb-prev-${stamp}" \
+                && warn "$dest was edited by hand or written by an older installer: old copy kept as ${dest}.gb-prev-${stamp}"
+        fi
+    fi
+    if chmod "$mode" "$tmp" && mv -f "$tmp" "$dest"; then return 0; fi
+    rm -f "$tmp"; return 1
+}
+
+# gb_user_home <user>: home directory without `eval` (a user name is data).
+gb_user_home() { getent passwd "$1" | cut -d: -f6; }
+
 # gb_dataflux_emit <json-object> - append one dataflux event line (best-effort,
 # never fails the caller). Under sudo, resolves the log to the invoking user's
 # home (SUDO_USER) so install-time events land in the log the MCP reads, not
@@ -129,7 +229,7 @@ gb_dataflux_emit() {
     _log="${GREENBOOST_DATAFLUX_LOG:-}"
     if [[ -z "$_log" ]]; then
         if [[ -n "${SUDO_USER:-}" ]]; then
-            _home=$(eval echo "~${SUDO_USER}" 2>/dev/null)
+            _home="$(gb_user_home "${SUDO_USER}")"
         else
             _home="$HOME"
         fi
@@ -196,29 +296,204 @@ gb_initramfs_generator() {
     printf '%s' "$gen"
 }
 
-# Rebuild the boot image(s) for every installed kernel, using the generator that
-# actually owns them. Best-effort , a machine whose initramfs tool we don't
-# recognise is not a failed install, it just keeps whatever image it had.
-gb_initramfs_refresh() {
+# Rebuild the boot image and PROVE the result is clean.
+#
+# The old implementation regenerated every installed kernel in one call
+# (`dracut --force --regenerate-all`, `update-initramfs -u -k all`) and reported
+# a single pass/fail. Two things go wrong with that, both observed on a real box
+# 2026-08-22:
+#
+#   1. A kernel can have a module tree under /lib/modules with NO initrd in
+#      /boot , a half-removed kernel. dracut then falls back to a BLS/ESP path
+#      (/boot/efi/<machine-id>/<kver>) that does not exist, fails, and drags the
+#      whole invocation's exit status down with it. On that box 6 such ghosts
+#      turned a successful regeneration of the RUNNING kernel into a scary
+#      "dracut failed" warning, and the remediation the warning printed was the
+#      same command, so it failed the same way.
+#   2. Nothing ever checked the thing this exists to guarantee: that the new
+#      image does not carry a stale greenboost.ko. A regeneration that "succeeds"
+#      while bundling an old module is exactly the 2026-08-21 incident where v3.4
+#      was built, v3.2 booted, and T3 disabled silently with no error anywhere.
+#
+# So: regenerate the RUNNING kernel first and let that decide pass/fail, do the
+# others best-effort without letting a ghost fail the install, and then VERIFY.
+# Modelled on nvidia-installer's verify-then-report discipline (GPLv2 , pattern
+# only, no code taken).
+
+# Kernels that actually have a boot image. A module tree alone is a ghost.
+gb_initramfs_kernels() {
+    local img kver
+    for img in "${GB_BOOT_DIR:-/boot}"/initrd.img-* "${GB_BOOT_DIR:-/boot}"/initramfs-*.img; do
+        [[ -f "$img" ]] || continue
+        case "$img" in *.gb-prev|*.dpkg-bak|*.old-dkms) continue ;; esac
+        kver="${img##*/}"; kver="${kver#initrd.img-}"
+        kver="${kver#initramfs-}"; kver="${kver%.img}"
+        [[ -d "${GB_MODULES_DIR:-/lib/modules}/$kver" ]] && printf '%s\n' "$kver"
+    done
+    return 0   # under `set -e`, do not inherit the last test's status
+}
+
+gb_initramfs_image_for() {
+    local kver="$1"
+    local b="${GB_BOOT_DIR:-/boot}"
+    [[ -f "$b/initrd.img-$kver" ]] && { printf '%s' "$b/initrd.img-$kver"; return 0; }
+    [[ -f "$b/initramfs-$kver.img" ]] && { printf '%s' "$b/initramfs-$kver.img"; return 0; }
+    return 1
+}
+
+# Is this boot image fit to boot from? Non-empty, and (when a lister exists)
+# readable as an archive with at least one entry. A generator can exit 0 and
+# still leave a truncated file when /boot fills up; this is the check for that.
+gb_initramfs_image_sane() {
+    local img="$1" n
+    [[ -s "$img" ]] || return 1
+    if command -v lsinitrd &>/dev/null; then
+        n="$(lsinitrd "$img" 2>/dev/null | wc -l)" || return 1
+        (( n > 0 ))
+    elif command -v lsinitramfs &>/dev/null; then
+        n="$(lsinitramfs "$img" 2>/dev/null | wc -l)" || return 1
+        (( n > 0 ))
+    else
+        return 0
+    fi
+}
+
+# Regenerate ONE kernel. Returns non-zero on failure.
+# Audit INS-06: the previous image is copied to $GB_INITRD_BACKUP_DIR first
+# (one copy per image name, refreshed each run; kept OFF /boot, which is small
+# and shared with kernel upgrades) and put back when the new image is empty or
+# unreadable, so a failed or half-written regeneration cannot be the only image
+# GRUB can load for that kernel. The generator's output is kept in a log
+# instead of /dev/null.
+gb_initramfs_regen_one() {
+    local kver="$1" img="" bak="" rc=0 avail size log bdir="${GB_INITRD_BACKUP_DIR:-/var/lib/greenboost/initrd-prev}"
+    img="$(gb_initramfs_image_for "$kver" 2>/dev/null)" || img=""
+    if [[ -n "$img" && -s "$img" ]] && mkdir -p "$bdir"; then
+        size="$(stat -c %s "$img")"; avail="$(df --output=avail -B1 "$bdir" | tail -n 1)"
+        if (( avail > size * 2 )); then
+            bak="$bdir/${img##*/}"
+            cp -p "$img" "$bak.new" && mv -f "$bak.new" "$bak" || bak=""
+            # first-only copy of the image as it was before GreenBoost ever regenerated it (audit R2-07)
+            if [[ -n "$bak" && ! -e "$bak.orig" ]]; then cp -p "$bak" "$bak.orig" || true; fi
+        else
+            warn "$bdir has under 2x the image size free: regenerating $kver without a backup copy"
+        fi
+    fi
+    local orig="$img"
+    log="$(mktemp /tmp/gb_initramfs.XXXXXX.log)"
     case "$(gb_initramfs_generator)" in
-        dracut)
-            dracut --force --regenerate-all &>/dev/null \
-                && gb_ok "initramfs regenerated for all installed kernels (dracut)" \
-                || gb_warn "dracut failed , the boot image may still hold an old greenboost.ko (run: sudo dracut --force --regenerate-all)"
-            ;;
-        initramfs-tools)
-            update-initramfs -u -k all &>/dev/null \
-                && gb_ok "initramfs regenerated for all installed kernels (initramfs-tools)" \
-                || gb_warn "update-initramfs failed , the boot image may still hold an old greenboost.ko (run: sudo update-initramfs -u -k all)"
-            ;;
-        mkinitcpio)
-            mkinitcpio -P &>/dev/null \
-                && gb_ok "initramfs regenerated for all installed kernels (mkinitcpio)" \
-                || gb_warn "mkinitcpio failed , the boot image may still hold an old greenboost.ko (run: sudo mkinitcpio -P)"
-            ;;
-        *)
-            gb_warn "no known initramfs tool found , if your boot image bundles kernel modules, regenerate it manually"
-            ;;
+        dracut)          dracut --force --kver "$kver" >"$log" 2>&1 || rc=$? ;;
+        initramfs-tools) update-initramfs -u -k "$kver" >"$log" 2>&1 || rc=$? ;;
+        mkinitcpio)      { mkinitcpio -p "$kver" || mkinitcpio -P; } >"$log" 2>&1 || rc=$? ;;
+        *)               return 2 ;;
+    esac
+    if (( rc == 0 )); then
+        img="$(gb_initramfs_image_for "$kver" 2>/dev/null)" || img=""
+        if [[ -z "$img" ]] || ! gb_initramfs_image_sane "$img"; then rc=3; fi
+    fi
+    if (( rc != 0 )); then
+        if [[ -n "$bak" && -s "$bak" ]]; then
+            cp -p "$bak" "$orig.new" && mv -f "$orig.new" "$orig" \
+                && warn "boot image for $kver was bad after regeneration (rc=$rc): previous image restored (generator log: $log)"
+        else
+            warn "boot image regeneration failed for $kver (rc=$rc), no backup copy to restore (generator log: $log)"
+        fi
+        return 1
+    fi
+    return 0
+}
+
+# Is greenboost.ko absent from this image? 0 = clean, 1 = STALE MODULE PRESENT,
+# 2 = could not inspect (no tool, or not root) , which is reported as unknown,
+# never as clean.
+gb_initramfs_verify_clean() {
+    local img listing=""
+    img="$(gb_initramfs_image_for "$1")" || return 2
+    if command -v lsinitrd &>/dev/null; then
+        listing="$(lsinitrd "$img" 2>/dev/null)" || return 2
+    elif command -v lsinitramfs &>/dev/null; then
+        listing="$(lsinitramfs "$img" 2>/dev/null)" || return 2
+    else
+        return 2
+    fi
+    [[ -z "$listing" ]] && return 2
+    # Match the MODULE FILE, not the bare string. `grep greenboost` matched the
+    # exclusion machinery's own name , dracut records its installed modules in
+    # the image and ours is called `99greenboost-exclude` , so the check
+    # reported "stale module present" on an image it had just successfully
+    # cleaned, on every install. Same shape as C-13 in the casebook: a
+    # verification step failing the thing it exists to protect.
+    #
+    # Anchored on `greenboost.ko` with an optional compression suffix, because
+    # that, and only that, is the artifact whose presence silently disables T3.
+    grep -qE '(^|/)greenboost\.ko(\.(gz|xz|zst))?([[:space:]]|$)' <<<"$listing" && return 1
+    return 0
+}
+
+gb_initramfs_refresh() {
+    local gen running="$(uname -r)" others=() k failed=() ok_count=0
+    gen="$(gb_initramfs_generator)"
+
+    if [[ "$gen" == "unknown" ]]; then
+        gb_warn "no known initramfs tool found , if your boot image bundles kernel modules, regenerate it manually"
+        return 0
+    fi
+
+    # 1. The running kernel is the one that decides whether this step passed.
+    if gb_initramfs_image_for "$running" >/dev/null; then
+        if gb_initramfs_regen_one "$running"; then
+            gb_ok "initramfs regenerated for $running ($gen)"
+        else
+            gb_warn "initramfs regeneration FAILED for the running kernel $running , the boot image may still hold an old greenboost.ko (retry: sudo $(gb_initramfs_retry_cmd "$running"))"
+        fi
+    fi
+
+    # 2. Every other kernel that actually has an image, best-effort. A ghost
+    #    kernel (module tree, no image) is skipped rather than failed.
+    for k in $(gb_initramfs_kernels); do
+        [[ "$k" == "$running" ]] && continue
+        others+=("$k")
+        if gb_initramfs_regen_one "$k"; then ok_count=$((ok_count+1)); else failed+=("$k"); fi
+    done
+    if (( ok_count > 0 )); then
+        gb_ok "initramfs regenerated for $ok_count other kernel(s)"
+    fi
+    if (( ${#failed[@]} > 0 )); then
+        gb_warn "initramfs regeneration failed for: ${failed[*]} (not the running kernel , boot is unaffected)"
+    fi
+
+    # 3. Prove it. This is the check the 2026-08-21 stale-module incident needed.
+    #
+    # `|| vrc=$?` is load-bearing, not style. This script runs under
+    # `set -euo pipefail`, and gb_initramfs_verify_clean returns non-zero as a
+    # NORMAL signal (1 = stale module, 2 = could not inspect). A bare call is
+    # not in a tested context, so `set -e` treats that signal as a fatal error
+    # and aborts the whole install , which is exactly what happened on
+    # 2026-08-22: "Install aborted (exit 1) , restoring pre-install runtime
+    # state" fired immediately after a SUCCESSFUL regeneration.
+    local vrc=0
+    gb_initramfs_verify_clean "$running" || vrc=$?
+    case $vrc in
+        0) gb_ok "verified: $running boot image carries no greenboost.ko (exclusion active)" ;;
+        1) gb_warn "VERIFY FAILED: $running boot image still contains greenboost.ko , a stale module can boot instead of the one just built, silently disabling T3. Check $GB_DRACUT_EXCLUDE / $GB_INITRAMFS_HOOK, then re-run: sudo $(gb_initramfs_retry_cmd "$running")" ;;
+        *) gb_info "boot image contents not inspectable here , skipping the greenboost.ko exclusion check" ;;
+    esac
+
+    # This step reports; it never decides whether the install succeeded. An
+    # unreadable boot image or a failed regeneration of some unrelated kernel
+    # must not abort an otherwise good install.
+    return 0
+}
+
+# The command a human should actually run , targeted at one kernel, because
+# the regenerate-everything forms fail on half-removed kernels.
+gb_initramfs_retry_cmd() {
+    local kver="${1:-$(uname -r)}"
+    case "$(gb_initramfs_generator)" in
+        dracut)          printf 'dracut --force --kver %s' "$kver" ;;
+        initramfs-tools) printf 'update-initramfs -u -k %s' "$kver" ;;
+        mkinitcpio)      printf 'mkinitcpio -p %s' "$kver" ;;
+        *)               printf 'regenerate your initramfs for %s' "$kver" ;;
     esac
 }
 
@@ -439,6 +714,20 @@ _gb_install_cuda_toolkit() {
             local tmp_deb; tmp_deb=$(mktemp --suffix=.deb)
             wget -qO "$tmp_deb" "${base_url}/cuda-keyring_1.1-1_all.deb" \
                 || { gb_warn_ui "Could not download cuda-keyring from ${base_url}"; rm -f "$tmp_deb"; return 1; }
+            # Pin measured 2026-10-10 (sha256 of cuda-keyring_1.1-1_all.deb per repo
+            # directory). A mismatch means the file changed upstream or in flight:
+            # refuse, because this package installs the key apt then trusts.
+            local -A _kr_pin=(
+                [ubuntu2604]=f7f474b5f6a4adf987aa587920df00e713285958ef6a913dda1945a544a3099e
+                [ubuntu2404]=d2a6b11c096396d868758b86dab1823b25e14d70333f1dfa74da5ddaf6a06dba
+                [ubuntu2204]=d93190d50b98ad4699ff40f4f7af50f16a76dac3bb8da1eaaf366d47898ff8df
+                [debian12]=e7f219eab6fe4819cdb5c15b98233dc3420302d9c00883219cd3d896857cf48d )
+            if [[ -n "${_kr_pin[$repo_os]:-}" ]]; then
+                echo "${_kr_pin[$repo_os]}  $tmp_deb" | sha256sum -c --status \
+                    || { gb_warn_ui "cuda-keyring checksum mismatch for ${repo_os} - refusing to install it"; rm -f "$tmp_deb"; return 1; }
+            else
+                gb_warn_ui "no pinned checksum for the ${repo_os} cuda-keyring - installing unverified"
+            fi
             dpkg -i "$tmp_deb" && rm -f "$tmp_deb"
             apt-get update -qq
             apt-get -y install cuda-toolkit
@@ -489,7 +778,7 @@ _gb_install_cuda_toolkit() {
 # matters is whether the module is DKMS-registered, not which package
 # manager thinks it satisfied a dependency.
 _gb_install_nvidia_gds() {
-    if dkms status 2>/dev/null | grep -q '^nvidia-fs'; then
+    if grep -q '^nvidia-fs' <<< "$(dkms status 2>/dev/null)"; then
         gb_ok "nvidia-fs (GDS kernel module) already DKMS-registered - skipping"
         return 0
     fi
@@ -679,6 +968,13 @@ _gb_current_phase_activity_label() {
 # innermost _gb_current_phase_activity_label (if any caller has pushed one)
 # so a long spin shows what's ACTUALLY happening right now, not just the
 # static outer message it was called with.
+#
+# Width-clamped to the terminal: the composed "msg — activity" string is
+# unbounded (activity labels and messages carrying a model/package name have
+# no length limit), and \r only rewinds the terminal's LAST visual row — if
+# a frame wraps, every 0.08s tick leaves a fresh residual row instead of
+# overwriting the previous one. Clamping the displayed text to fit alongside
+# the frame glyph + elapsed-time chrome keeps every frame on one row.
 gb_spin() {
     local pid=$1 msg="$2" i=0 start_time
     start_time=$(date +%s)
@@ -693,6 +989,11 @@ gb_spin() {
         local _activity; _activity="$(_gb_current_phase_activity_label)"
         local _display_msg="$msg"
         [[ -n "$_activity" ]] && _display_msg="$msg — $_activity"
+        local cols; cols=$(tput cols 2>/dev/null || echo 80)
+        # fixed chrome: "  "(2) + frame(1) + "  "(2) + msg + " ["(2) + time_str + "]   "(4) = 11 + time_str
+        local _budget=$(( cols - 11 - ${#time_str} ))
+        (( _budget < 20 )) && _budget=20
+        _display_msg=$(_trunc "$_display_msg" "$_budget")
         printf "\r  ${C_LIME}%s${C_RESET}  ${C_DIM}%s${C_RESET} ${C_GRAY}[%s]${C_RESET}   " \
             "${GB_SPIN_FRAMES[$((i % ${#GB_SPIN_FRAMES[@]}))]}" "$_display_msg" "$time_str"
         sleep 0.08
@@ -1595,7 +1896,7 @@ _resolve_gb_phys() {
     local why="$1" v
     # 1) An explicit operator override always wins.
     if [[ -n "${GB_PHYS_OVERRIDE:-}" && "${GB_PHYS_OVERRIDE}" -gt 0 ]]; then
-        warn "  Using GB_PHYS_OVERRIDE=${GB_PHYS_OVERRIDE} GB"
+        warn "  Using GB_PHYS_OVERRIDE=${GB_PHYS_OVERRIDE} GB" >&2
         echo "$GB_PHYS_OVERRIDE"; return 0
     fi
     # 2) A prior profile holds a REAL nvidia-smi VRAM figure - preferred over the
@@ -1604,13 +1905,13 @@ _resolve_gb_phys() {
     v=$(grep -m1 -E '^\s*vram_gb:' /etc/greenboost/profiles/default.md 2>/dev/null \
         | grep -oE '[0-9]+' | head -1)
     if [[ -n "$v" && "$v" -gt 0 ]]; then
-        warn "  Reusing VRAM from existing profile: ${v} GB"
+        warn "  Reusing VRAM from existing profile: ${v} GB" >&2
         echo "$v"; return 0
     fi
     # 3) Coarse last resort: PCI BAR aperture (power-of-two, may over-report).
     v=$(_probe_vram_gb_sysfs)
     if (( v > 0 )); then
-        warn "  Approximate VRAM from PCI BAR aperture: ${v} GB (rounds up to a power of two; set GB_PHYS_OVERRIDE for the exact size)"
+        warn "  Approximate VRAM from PCI BAR aperture: ${v} GB (rounds up to a power of two; set GB_PHYS_OVERRIDE for the exact size)" >&2
         echo "$v"; return 0
     fi
     echo -e "${RED}[GreenBoost] ERROR:${NC} GPU VRAM undetectable (${why}) and no prior profile / ReBAR sysfs aperture. Fix the driver (${2:-sudo systemctl restart nvidia-persistenced}) or export GB_PHYS_OVERRIDE=<GB> and re-run." >&2
@@ -1656,7 +1957,7 @@ detect_hardware() {
     local total_ram_gb=$(( total_ram_kb / 1024 / 1024 ))
 
     local dmi_mem
-    dmi_mem=$(dmidecode -t memory 2>/dev/null)
+    dmi_mem=$(dmidecode -t memory 2>/dev/null || true)   # absent on minimal images: must not abort under set -e
     # [[:space:]]* not \s - \s is a GNU-awk extension; mawk (Debian/Ubuntu
     # default) silently matches nothing, sending RAM_TYPE/RAM_SPEED_MT down
     # the "unknown" path even when dmidecode output is present and parseable.
@@ -1686,7 +1987,7 @@ detect_hardware() {
     PCIE_GEN=0; PCIE_WIDTH="x?"; PCIE_BW_GBS=0
     PCIE_MAX_GEN=0; PCIE_MAX_BW_GBS=0
     local gpu_pci
-    gpu_pci=$(ls /proc/driver/nvidia/gpus/ 2>/dev/null | head -1)
+    gpu_pci=$(ls /proc/driver/nvidia/gpus/ 2>/dev/null | head -1 || true)
     if [[ -n "$gpu_pci" ]]; then
         local gpu_sysfs parent_sysfs
         gpu_sysfs=$(readlink -f "/sys/bus/pci/devices/$gpu_pci")
@@ -1923,7 +2224,8 @@ detect_hardware() {
     GB_HUGEPAGES=1
 
     # ── Extra fields for profile generation ──────────────────────────────
-    DET_GPU_COUNT=$(timeout 10 nvidia-smi --list-gpus 2>/dev/null | wc -l || echo 1)
+    DET_GPU_COUNT=$(timeout 10 nvidia-smi --list-gpus 2>/dev/null | wc -l || true)   # never `|| echo 1`: under pipefail that appends a 2nd line
+    [[ "$DET_GPU_COUNT" =~ ^[1-9][0-9]*$ ]] || DET_GPU_COUNT=1
     DET_CC=$(timeout 10 nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs || echo "0.0")
     DET_PCIE_GEN_SMI=$(timeout 10 nvidia-smi --query-gpu=pcie.link.gen.max --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs || echo "$PCIE_MAX_GEN")
     DET_PCIE_LANES_SMI=$(timeout 10 nvidia-smi --query-gpu=pcie.link.width.max --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs || echo "16")
@@ -1933,7 +2235,8 @@ detect_hardware() {
     grep -q "NV[0-9]" <<< "$(timeout 10 nvidia-smi topo -m 2>/dev/null)" && DET_NVLINK=true
     DET_RAM_ECC=false
     dmidecode -t memory 2>/dev/null | grep -qi "Error Correction.*Multi" && DET_RAM_ECC=true
-    DET_RAM_CHANNELS=$(dmidecode -t memory 2>/dev/null | grep -c "^\s*Size:.*GB" || echo 2)
+    DET_RAM_CHANNELS=$(dmidecode -t memory 2>/dev/null | grep -c "^\s*Size:.*GB" || true)
+    [[ "$DET_RAM_CHANNELS" =~ ^[1-9][0-9]*$ ]] || DET_RAM_CHANNELS=2
     DET_TOTAL_LOGICAL_CPUS=$(nproc 2>/dev/null || echo 0)
     DET_NUMA=$(lscpu 2>/dev/null | grep "^NUMA node(s):" | awk '{print $3}' || echo 1)
     DET_L3_MB=$(lscpu 2>/dev/null | grep "^L3 cache:" | grep -oP '[0-9]+(?=\s*[MG]iB)' | head -1 || echo 0)
@@ -2699,6 +3002,7 @@ set_owner_workstation_params() {
 
 need_root() {
     [[ $EUID -eq 0 ]] || die "Root required. Use: sudo $0 $1"
+    [[ -d "$GB_LOGDIR" ]] || install -d -m 755 "$GB_LOGDIR"
 }
 
 
@@ -2901,7 +3205,9 @@ Environment=GB_PY_ROOT=/usr/local/lib/greenboost
 #   Environment=GB_A2A_BIND=0.0.0.0:8790
 #   Environment=GB_A2A_TOKEN=<secret>   # refuses non-loopback bind without this
 Environment=GB_A2A_BIND=127.0.0.1:8790
-# Actuation ON by default (real lever moves via A2A/MCP-gated verbs like
+# Actuation OFF by default since the 2026-10 audit (token-gated actuation, SEC findings); the 2026-07-16 incident below
+# explains why it used to be ON. Opt IN with a drop-in: Environment=GB_ORCH_ACTUATE=1 and a token file.
+# (old text) Actuation ON by default (real lever moves via A2A/MCP-gated verbs like
 # serve_and_repoint) — matches greenboost-supervisor.service's own default
 # (Environment=GB_ORCH_ACTUATE=1 above). Real incident, 2026-07-16: this was
 # OFF by default pre-fix, so a fresh install/reinstall silently double-gated
@@ -2914,7 +3220,7 @@ Environment=GB_A2A_BIND=127.0.0.1:8790
 #   systemctl edit greenboost-a2a.service
 #     [Service]
 #     Environment=GB_ORCH_ACTUATE=0
-Environment=GB_ORCH_ACTUATE=1
+Environment=GB_ORCH_ACTUATE=0
 [Install]
 WantedBy=multi-user.target
 A2AEOF
@@ -2946,6 +3252,7 @@ cmd_install_sys_configs() {
     # 1. Ollama service - inject GreenBoost env vars + LD_PRELOAD (always refresh)
     local svc="/etc/systemd/system/ollama.service"
     if [[ -f "$svc" ]]; then
+        gb_backup_once "$svc"
         # Remove any previously injected GreenBoost lines first (idempotent upgrade)
         sed -i '/OLLAMA_FLASH_ATTENTION/d
 /OLLAMA_KV_CACHE_TYPE/d
@@ -2957,10 +3264,10 @@ cmd_install_sys_configs() {
 /GREENBOOST_/d
 /libgreenboost/d' "$svc"
         # Inject fresh v2.7 env vars
-        sed -i "/^\[Service\]/a Environment=\"OLLAMA_FLASH_ATTENTION=1\"\nEnvironment=\"OLLAMA_KV_CACHE_TYPE=q8_0\"\nEnvironment=\"OLLAMA_NUM_CTX=${GB_OLLAMA_CTX}\"\nEnvironment=\"OLLAMA_CONTEXT_LENGTH=${GB_OLLAMA_CTX}\"\nEnvironment=\"OLLAMA_MAX_LOADED_MODELS=1\"\nEnvironment=\"OLLAMA_KEEP_ALIVE=-1\"\nEnvironment=\"GREENBOOST_VIRTUAL_VRAM_MB=$((GB_VIRT * 1024))\"\nEnvironment=\"GREENBOOST_DEBUG=0\"\nEnvironment=\"GREENBOOST_ACTIVE=1\"\nEnvironment=\"LD_PRELOAD=/usr/local/lib/libgreenboost_vmm_override.so:/usr/local/lib/libgreenboost_cuda.so\"" "$svc"
+        sed -i "/^\[Service\]/a Environment=\"OLLAMA_FLASH_ATTENTION=1\"\nEnvironment=\"OLLAMA_KV_CACHE_TYPE=q8_0\"\nEnvironment=\"OLLAMA_NUM_CTX=$(gb_ollama_default_ctx)\"\nEnvironment=\"OLLAMA_CONTEXT_LENGTH=$(gb_ollama_default_ctx)\"\nEnvironment=\"OLLAMA_MAX_LOADED_MODELS=1\"\nEnvironment=\"OLLAMA_KEEP_ALIVE=${GB_OLLAMA_KEEP_ALIVE:-5m}\"\nEnvironment=\"GREENBOOST_VIRTUAL_VRAM_MB=$((GB_VIRT * 1024))\"\nEnvironment=\"GREENBOOST_DEBUG=0\"\nEnvironment=\"GREENBOOST_ACTIVE=1\"\nEnvironment=\"LD_PRELOAD=/usr/local/lib/libgreenboost_vmm_override.so:/usr/local/lib/libgreenboost_cuda.so\"" "$svc"
         systemctl daemon-reload
         info "Ollama service: GreenBoost v3.4 env vars injected (refreshed)"
-        gb_ok "Ollama context cap set to ${GB_OLLAMA_CTX} tokens (T1: ${GB_PHYS} GB, T2: ${GB_VIRT} GB)"
+        gb_ok "Ollama default context set to $(gb_ollama_default_ctx) tokens, chat ladder ${GB_OLLAMA_CTX} (T1: ${GB_PHYS} GB, T2: ${GB_VIRT} GB)"
     else
         warn "Ollama service not found at $svc - skipping"
     fi
@@ -2982,8 +3289,10 @@ cmd_install_sys_configs() {
     for _f in "$dropin_dir"/*.conf; do
         [[ -f "$_f" ]] || continue
         [[ "$(basename "$_f")" == "99-greenboost.conf" ]] && continue
+        [[ "$(basename "$_f")" == "zz-model-slots.conf" ]] && continue   # the owner's memory policy (ops/owner/36); it sorts after 99- and wins on purpose
         for _var in "${gb_vars[@]}"; do
             if grep -q "$_var" "$_f" 2>/dev/null; then
+                gb_backup_once "$_f"
                 sed -i "/[[:space:]]*Environment.*${_var}=/d" "$_f"
                 gb_info "Removed conflicting ${_var} from $(basename "$_f")"
                 _conflict_found=1
@@ -3054,10 +3363,11 @@ Wants=greenboost-supervisor.service
 [Service]
 Environment="OLLAMA_FLASH_ATTENTION=1"
 Environment="OLLAMA_KV_CACHE_TYPE=q8_0"
-Environment="OLLAMA_NUM_CTX=${GB_OLLAMA_CTX}"
-Environment="OLLAMA_CONTEXT_LENGTH=${GB_OLLAMA_CTX}"
+# Default context for a model that names none: the embedding cap. Chat models get ${GB_OLLAMA_CTX} per request (see /etc/greenboost/ollama-ctx.conf).
+Environment="OLLAMA_NUM_CTX=$(gb_ollama_default_ctx)"
+Environment="OLLAMA_CONTEXT_LENGTH=$(gb_ollama_default_ctx)"
 Environment="OLLAMA_MAX_LOADED_MODELS=1"
-Environment="OLLAMA_KEEP_ALIVE=-1"
+Environment="OLLAMA_KEEP_ALIVE=${GB_OLLAMA_KEEP_ALIVE:-5m}"
 Environment="GREENBOOST_VIRTUAL_VRAM_MB=$((GB_VIRT * 1024))"
 Environment="GREENBOOST_DEBUG=0"
 Environment="GREENBOOST_KV_RESERVE_MB=${GB_KV_RESERVE_MB}"
@@ -3080,7 +3390,10 @@ DROPINEOF
         if (( _dropin_cc_major >= 12 )); then
             echo "Environment=\"GREENBOOST_FORCE_CC_MAJOR=${_dropin_cc_major}\""
         fi
-    } > "$dropin_dir/99-greenboost.conf"
+    } | gb_managed_write "$dropin_dir/99-greenboost.conf" 644
+    # Per-class context caps for clients (the unit can only hold one default): embedding models at most 8192, chat models the ladder value.
+    printf '# managed by greenboost_setup.sh: context caps by model class\nembedding=%s\nchat=%s\ndefault=%s\n' \
+        "${GB_OLLAMA_EMBED_CTX:-8192}" "${GB_OLLAMA_CTX}" "$(gb_ollama_default_ctx)" | gb_managed_write /etc/greenboost/ollama-ctx.conf 644
     systemctl daemon-reload
     if [[ $_conflict_found -eq 1 ]]; then
         gb_ok "99-greenboost.conf written - conflicting entries removed from other drop-ins"
@@ -3095,6 +3408,7 @@ DROPINEOF
     for svc in /etc/systemd/system/vllm.service \
                /etc/systemd/system/text-generation-inference.service; do
         [[ -f "$svc" ]] || continue
+        gb_backup_once "$svc"
         sed -i '/GREENBOOST_/d
 /libgreenboost/d' "$svc"
         sed -i "/^\[Service\]/a Environment=\"GREENBOOST_ACTIVE=1\"\nEnvironment=\"LD_PRELOAD=${shim_path}\"" "$svc"
@@ -3104,6 +3418,7 @@ DROPINEOF
     [[ $_reloaded -eq 1 ]] && systemctl daemon-reload
 
     # 2a. GreenBoost device udev rule - allow video group (includes ollama) access
+    mkdir -p /etc/udev/rules.d   # absent on images without udev
     cat > /etc/udev/rules.d/99-greenboost.rules << 'UDEVEOF'
 # GreenBoost kernel module - allow video group (includes ollama) to access /dev/greenboost
 KERNEL=="greenboost", GROUP="video", MODE="0660"
@@ -3148,14 +3463,9 @@ UDEVEOF
     udevadm control --reload-rules && udevadm trigger || true
     info "NVMe udev rule installed: /etc/udev/rules.d/99-nvme-greenboost.rules"
 
-    # 2c. NVIDIA shutdown fix - prevent driver from hanging 10-30s during reboot/shutdown.
-    # NVreg_PreserveVideoMemoryAllocations=1 (default) makes the driver save GPU state to RAM
-    # on suspend/shutdown. With large models loaded this blocks reboot for up to 30s and can
-    # hang indefinitely on RTX 50xx + kernel 6.19. Setting to 0 disables that save/restore.
-    cat > /etc/modprobe.d/99-nvidia-greenboost.conf << 'NVEOF'
-options nvidia NVreg_PreserveVideoMemoryAllocations=0
-NVEOF
-    info "NVIDIA shutdown fix installed: /etc/modprobe.d/99-nvidia-greenboost.conf"
+    # 2c. (removed) NVreg_PreserveVideoMemoryAllocations=0 modprobe file: dead config
+    # on hosts where the distro/kernel cmdline already sets 1, and =0 breaks resume.
+    # uninstall still removes /etc/modprobe.d/99-nvidia-greenboost.conf from older installs.
 
     # 3. CPU governor service - P-cores only (E-cores stay on powersave)
     cat > /etc/systemd/system/cpu-perf.service << CPUEOF
@@ -3212,7 +3522,7 @@ HPEOF
     local audit_src="$MODULE_DIR/$AUDIT_LIB"
     local audit_dest="$SHIM_DEST/$AUDIT_LIB"
     if [[ -f "$audit_src" ]]; then
-        cp "$audit_src" "$audit_dest"
+        gb_atomic_install "$audit_src" "$audit_dest" 755
         ldconfig 2>/dev/null || true
         info "LD_AUDIT library installed: $audit_dest"
     else
@@ -3346,14 +3656,26 @@ HPEOF
             [[ -d "$profile" ]] && continue
             grep -q "greenboost-audit" "$profile" 2>/dev/null && continue
             grep -qE '^\s*profile\s|^\S.*\{$' "$profile" 2>/dev/null || continue
-            # Show progress bar: [N/M] ████████░░░ pct%
+            # Show progress bar: [N/M] ████████░░░ pct% <name>, bar width and
+            # name budget scaled to the terminal (was a hardcoded 50-cell bar
+            # + unclamped %-30s name — wraps and leaves duplicate rows on any
+            # terminal narrower than ~95 cols; see gb_spin's comment above).
             local _pct=$(( _idx * 100 / _total ))
-            local _filled=$(( _pct / 2 )) _empty=$(( 50 - _pct / 2 ))
-            printf "\r  ${C_GRAY}[%d/%d]${C_RESET} ${C_LIME}%s${C_GRAY}%s${C_RESET} %3d%%  ${C_DIM}%-30s${C_RESET}" \
+            local cols; cols=$(tput cols 2>/dev/null || echo 80)
+            local _remaining=$(( cols - 20 )); (( _remaining < 20 )) && _remaining=20
+            local _bar_width=$(( _remaining * 2 / 5 ))
+            (( _bar_width < 10 )) && _bar_width=10
+            (( _bar_width > 50 )) && _bar_width=50
+            local _name_budget=$(( _remaining - _bar_width ))
+            (( _name_budget < 8 )) && _name_budget=8
+            local _filled=$(( _pct * _bar_width / 100 ))
+            local _empty=$(( _bar_width - _filled ))
+            local _bname_t; _bname_t=$(_trunc "$bname" "$_name_budget")
+            printf "\r  ${C_GRAY}[%d/%d]${C_RESET} ${C_LIME}%s${C_GRAY}%s${C_RESET} %3d%%  ${C_DIM}%-${_name_budget}s${C_RESET}" \
                 "$_idx" "$_total" \
                 "$(printf '█%.0s' $(seq 1 $_filled 2>/dev/null || true))" \
                 "$(printf '░%.0s' $(seq 1 $_empty  2>/dev/null || true))" \
-                "$_pct" "$bname"
+                "$_pct" "$_bname_t"
             sed -i '/^}$/i\  #include <abstractions\/greenboost-audit>' "$profile"
             (( _patched++ )) || true
         done
@@ -3406,13 +3728,15 @@ HPEOF
     if [[ -f "${MODULE_DIR}/gb_diag_read.sh" ]]; then
         install -m 755 "${MODULE_DIR}/gb_diag_read.sh" /usr/local/sbin/gb-diag-read
         local _diag_user="${SUDO_USER:-${USER:-root}}"
-        printf '%s ALL=(root) NOPASSWD: /usr/local/sbin/gb-diag-read\n' "$_diag_user" \
-            > /etc/sudoers.d/greenboost-diag-read
-        chmod 440 /etc/sudoers.d/greenboost-diag-read
-        if visudo -c -f /etc/sudoers.d/greenboost-diag-read >/dev/null 2>&1; then
+        # Validate a temp file and only then rename it into place: a file that
+        # fails `visudo -c` must never sit in /etc/sudoers.d, not even briefly.
+        local _sudo_tmp; _sudo_tmp="$(mktemp /etc/sudoers.d/.greenboost-diag-read.XXXXXX)"
+        printf '%s ALL=(root) NOPASSWD: /usr/local/sbin/gb-diag-read\n' "$_diag_user" > "$_sudo_tmp"
+        chmod 440 "$_sudo_tmp"
+        if visudo -c -f "$_sudo_tmp" >/dev/null 2>&1 && mv -f "$_sudo_tmp" /etc/sudoers.d/greenboost-diag-read; then
             gb_ok "gb-diag-read installed - NOPASSWD diagnostics enabled for ${_diag_user}"
         else
-            rm -f /etc/sudoers.d/greenboost-diag-read
+            rm -f "$_sudo_tmp"
             warn "gb-diag-read sudoers rule failed validation - removed, diagnostics need manual sudo"
         fi
     fi
@@ -3868,9 +4192,13 @@ cmd_restore_tune_runtime() {
     gb_ok "PCIe runtime PM → auto (default)"
 
     # VM defaults
-    sysctl -w vm.swappiness=60 vm.dirty_ratio=20 vm.dirty_background_ratio=10 \
-              kernel.numa_balancing=1 >/dev/null 2>&1 && \
-        gb_ok "VM tunables reset to defaults (swappiness=60, dirty_ratio=20)"
+    if [[ "$(gb_swap_conf_get GB_VM_SYSCTL 1)" == 0 ]]; then
+        sysctl -w kernel.numa_balancing=1 >/dev/null 2>&1 || true   # vm.* is owned elsewhere: not reset
+    else
+        sysctl -w vm.swappiness=60 vm.dirty_ratio=20 vm.dirty_background_ratio=10 \
+                  kernel.numa_balancing=1 >/dev/null 2>&1 && \
+            gb_ok "VM tunables reset to defaults (swappiness=60, dirty_ratio=20)"
+    fi
 
     # Remove any runtime-only NVMe tuning persist file written by tune
     local _nvme_conf="/etc/udev/rules.d/99-greenboost-nvme-runtime.rules"
@@ -3901,41 +4229,52 @@ cmd_restore_tune_grub() {
     need_root restore-tune-grub
 
     local _grub="/etc/default/grub"
-    [[ -f "$_grub" ]] || { gb_warn_ui "GRUB config not found: ${_grub}"; return 1; }
+    local _dropin="/etc/default/grub.d/99-greenboost.cfg"
+    local _did_something=0
 
-    gb_info "Removing GreenBoost GRUB parameters from ${_grub}..."
+    # Current persistence path (2026-08-31+): the grub.d drop-in. Just
+    # deleting it is enough - grub-mkconfig stops sourcing it immediately.
+    if [[ -f "$_dropin" ]]; then
+        rm -f "$_dropin"
+        gb_ok "Removed ${_dropin}"
+        _did_something=1
+    fi
 
-    # Backup before touching
-    cp --preserve=all "$_grub" "${_grub}.gb-restore-$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+    # Legacy path: earlier GreenBoost versions sed-edited these flags
+    # straight into the main file. Clean them up too if still present -
+    # reuses the exact param/pattern lists cmd_tune_grub writes with
+    # (_GB_GRUB_STATIC_PARAMS / _GB_GRUB_RANGE_PATTERNS) so the two never
+    # drift apart.
+    if [[ -f "$_grub" ]]; then
+        local _line
+        _line=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$_grub" | head -1 \
+                | sed 's/^GRUB_CMDLINE_LINUX_DEFAULT=//;s/^"//;s/"$//')
 
-    # Parameters added by cmd_tune_grub
-    local _gb_params=(
-        "transparent_hugepage=always"
-        "skew_tick=1"
-        "numa_balancing=disable"
-        "workqueue.power_efficient=0"
-    )
-    # Regex-removable pattern params (value varies per machine)
-    local _gb_patterns=(
-        "rcu_nocbs=[^ \"]*"
-        "nohz_full=[^ \"]*"
-    )
+        local _new="$_line" _had_legacy=0 _p
+        for _p in "${_GB_GRUB_STATIC_PARAMS[@]}"; do
+            if echo "$_new" | grep -qw -- "$_p"; then
+                _new=$(echo "$_new" | sed "s/ *${_p}//g; s/${_p} *//g"); _had_legacy=1
+            fi
+        done
+        for _p in "${_GB_GRUB_RANGE_PATTERNS[@]}"; do
+            if echo "$_new" | grep -Eq -- "$_p"; then
+                _new=$(echo "$_new" | sed -E "s/ *${_p}//g; s/${_p} *//g"); _had_legacy=1
+            fi
+        done
 
-    local _line
-    _line=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$_grub" | head -1 \
-            | sed 's/^GRUB_CMDLINE_LINUX_DEFAULT=//;s/^"//;s/"$//')
+        if [[ $_had_legacy -eq 1 ]]; then
+            _new=$(echo "$_new" | tr -s ' ' | sed 's/^ //;s/ $//')
+            cp --preserve=all "$_grub" "${_grub}.gb-restore-$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+            sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"${_new}\"|" "$_grub"
+            gb_ok "Removed legacy inline GreenBoost params from ${_grub} - new cmdline: ${_new}"
+            _did_something=1
+        fi
+    fi
 
-    local _new="$_line"
-    for _p in "${_gb_params[@]}"; do
-        _new=$(echo "$_new" | sed "s/ *${_p}//g; s/${_p} *//g")
-    done
-    for _re in "${_gb_patterns[@]}"; do
-        _new=$(echo "$_new" | sed "s/ *${_re}//g; s/${_re} *//g")
-    done
-    _new=$(echo "$_new" | tr -s ' ' | sed 's/^ //;s/ $//')
-
-    sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"${_new}\"|" "$_grub"
-    gb_ok "Removed GreenBoost params - new cmdline: ${_new}"
+    if [[ $_did_something -eq 0 ]]; then
+        gb_info "No GreenBoost GRUB parameters found (drop-in or inline) - nothing to remove."
+        return 0
+    fi
 
     # Regenerate GRUB config
     if command -v update-grub &>/dev/null; then
@@ -4242,8 +4581,8 @@ _try_install_fixed_module() {
     gb_info "Attempting to compile + install fixed module (skipping rmmod)…"
 
     # Compile - module target only, not full build
-    if ! make -C "$MODULE_DIR" module > /tmp/gb_fix_build.log 2>&1; then
-        gb_warn_ui "Could not compile fixed module - see /tmp/gb_fix_build.log"
+    if ! make -C "$MODULE_DIR" module > ${GB_LOGDIR}/fix_build.log 2>&1; then
+        gb_warn_ui "Could not compile fixed module - see ${GB_LOGDIR}/fix_build.log"
         return 1
     fi
 
@@ -4305,12 +4644,14 @@ _gb_backup_create() {
     mkdir -p "$bdir" || { gb_warn_ui "Backup: cannot create ${bdir}"; return 1; }
 
     # GRUB config
-    [[ -f /etc/default/grub ]] && cp --preserve=all /etc/default/grub "${bdir}/grub"
+    [[ -f /etc/default/grub ]] && cp --preserve=all /etc/default/grub "${bdir}/grub" || true
     # ld.so.preload
-    [[ -f /etc/ld.so.preload ]] && cp --preserve=all /etc/ld.so.preload "${bdir}/ld.so.preload"
+    [[ -f /etc/ld.so.preload ]] && cp --preserve=all /etc/ld.so.preload "${bdir}/ld.so.preload" || true
     # Kernel tunables (vm/kernel/net subset)
-    sysctl -a --ignore-errors 2>/dev/null \
+    sysctl -a -e 2>/dev/null \
         | grep -E '^(vm\.|kernel\.|net\.)' > "${bdir}/sysctl_state.conf" || true
+    [[ -s "${bdir}/sysctl_state.conf" ]] || gb_warn_ui "Backup: the sysctl snapshot is empty, so a restore cannot bring the old values back"
+
     # CPU governor
     cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null \
         > "${bdir}/cpu_governor.txt" || true
@@ -4329,7 +4670,7 @@ _gb_backup_create() {
 
 # ---- _gb_backup_restore - apply most recent backup -----------------------
 _gb_backup_restore() {
-    local bdir; bdir=$(ls -1d "${_GB_BACKUP_DIR}"/[0-9]* 2>/dev/null | sort | tail -1)
+    local bdir; bdir=$(ls -1d "${_GB_BACKUP_DIR}"/[0-9]* 2>/dev/null | sort | tail -1 || true)
     if [[ -z "$bdir" ]]; then
         gb_warn_ui "No backup found under ${_GB_BACKUP_DIR}"
         return 1
@@ -4337,8 +4678,8 @@ _gb_backup_restore() {
     local stamp; stamp=$(basename "$bdir")
     gb_info "Restoring from backup: ${stamp}"
 
-    [[ -f "${bdir}/grub" ]]        && cp --preserve=all "${bdir}/grub" /etc/default/grub       && gb_ok "Restored /etc/default/grub"
-    [[ -f "${bdir}/ld.so.preload" ]] && cp --preserve=all "${bdir}/ld.so.preload" /etc/ld.so.preload && gb_ok "Restored /etc/ld.so.preload"
+    [[ -f "${bdir}/grub" ]]        && cp --preserve=all "${bdir}/grub" /etc/default/grub       && gb_ok "Restored /etc/default/grub" || true
+    [[ -f "${bdir}/ld.so.preload" ]] && cp --preserve=all "${bdir}/ld.so.preload" /etc/ld.so.preload && gb_ok "Restored /etc/ld.so.preload" || true
     [[ -f "${bdir}/sysctl_state.conf" ]] && sysctl --load "${bdir}/sysctl_state.conf" &>/dev/null && gb_ok "Restored sysctl state"
     if [[ -f "${bdir}/cpu_governor.txt" ]]; then
         local _gov; _gov=$(cat "${bdir}/cpu_governor.txt" | tr -d '[:space:]')
@@ -4672,6 +5013,61 @@ do_purge() {
         /etc/modprobe.d/99-nvidia-greenboost.conf; do
         [[ -f "$f" ]] && rm -f "$f" && (( _cfg_removed++ )) || true
     done
+    # GRUB drop-in (tune-grub's persisted boot params, 2026-08-31+) - remove
+    # and regenerate so a purged machine's GRUB config matches one that
+    # never had GreenBoost (Installer/Uninstaller Parity).
+    if [[ -f /etc/default/grub.d/99-greenboost.cfg ]]; then
+        rm -f /etc/default/grub.d/99-greenboost.cfg
+        (( _cfg_removed++ )) || true
+        if command -v update-grub &>/dev/null; then
+            update-grub &>/dev/null || true
+        elif command -v grub-mkconfig &>/dev/null; then
+            grub-mkconfig -o /boot/grub/grub.cfg &>/dev/null || true
+        fi
+    fi
+    # Audit R2-11 / INS-13: things install wrote that no removal step covered (see tools/manifest coverage).
+    rm -f /etc/systemd/system/ollama.service.d/99-greenboost-feed.conf
+    local _svc_x
+    for _svc_x in /etc/systemd/system/vllm.service /etc/systemd/system/text-generation-inference.service; do
+        if [[ -f "$_svc_x" ]] && grep -qE "GREENBOOST_|libgreenboost" "$_svc_x"; then
+            sed -i '/GREENBOOST_/d;/libgreenboost/d' "$_svc_x"
+        fi
+    done
+    if [[ -f /etc/apparmor.d/local/usr.sbin.unix-chkpwd ]] && grep -q "libgreenboost_audit" /etc/apparmor.d/local/usr.sbin.unix-chkpwd; then
+        sed -i '/GreenBoost: allow unix-chkpwd/d;/libgreenboost_audit/d' /etc/apparmor.d/local/usr.sbin.unix-chkpwd
+        apparmor_parser -r /etc/apparmor.d/usr.sbin.unix-chkpwd 2>/dev/null || true
+    fi
+    if [[ "$preserve_cluster" -eq 0 ]]; then
+        # True uninstall only: a module-only reinstall does not recreate these.
+        rm -f /etc/sudoers.d/greenboost-diag-read /usr/local/sbin/gb-diag-read \
+              /etc/tmpfiles.d/greenboost.conf /usr/local/sbin/greenboost_boot_guard.sh \
+              /usr/local/bin/greenboost-ebpf-trace /usr/local/bin/greenboost-netd \
+              /etc/profile.d/greenboost-vitals.sh /etc/profile.d/greenboost-turboquant.sh
+        if [[ -f "$GB_SWAP_FILE" ]]; then
+            swapoff "$GB_SWAP_FILE" 2>/dev/null || true
+            rm -f "$GB_SWAP_FILE"
+        fi
+        # outside the -f test: an owner script may have deleted the file and left the fstab line (SP62-02)
+        if grep -qF "$GB_SWAP_FILE" /etc/fstab 2>/dev/null; then
+            gb_backup_once /etc/fstab
+            sed -i "\|^${GB_SWAP_FILE}[[:space:]]|d" /etc/fstab
+        fi
+        rm -rf /var/lib/greenboost/initrd-prev
+        # The product's own log dir (installer logs, netd, ebpf) and state dir, and the group that owned
+        # cluster.key (the key is gone on a true uninstall, so the group has no job left). Dataflux event
+        # history in the user's home is user data and is deliberately NOT touched.
+        rm -rf "$GB_LOGDIR"
+        rmdir /var/lib/greenboost 2>/dev/null || true
+        # /etc/sysfs.d was created by the hugepage tuning; drop it when empty and no package owns it
+        dpkg -S /etc/sysfs.d &>/dev/null || rmdir /etc/sysfs.d 2>/dev/null || true
+        if getent group greenboost >/dev/null 2>&1; then
+            groupdel greenboost 2>/dev/null || gb_warn_ui "could not remove group 'greenboost' (still the primary group of a user?)"
+        fi
+        # cmd_install_build_deps wrote this file with exactly "cpuid"; remove it only if it still is that.
+        if [[ -f /etc/modules-load.d/ai-workstation.conf && "$(cat /etc/modules-load.d/ai-workstation.conf)" == "cpuid" ]]; then
+            rm -f /etc/modules-load.d/ai-workstation.conf
+        fi
+    fi
     # Undo the initramfs exclusion and rebuild, so a purged machine's boot image
     # matches one that never had GreenBoost (Installer/Uninstaller Parity).
     gb_remove_initramfs_exclusion
@@ -4697,8 +5093,11 @@ do_purge() {
         # bind must not have it silently wiped by a reinstall.
         local _keep_dir _kf
         _keep_dir=$(mktemp -d /run/greenboost-keep.XXXXXX)
-        for _kf in cluster.key cluster.conf known_hosts turboquant.enabled ggml_2dev.enabled synapse_token; do
-            [[ -f "/etc/greenboost/$_kf" ]] && cp -a "/etc/greenboost/$_kf" "$_keep_dir/" || true
+        # `backup` (a directory) is kept too: _gb_backup_create runs BEFORE this
+        # purge on Full Install, and `rm -rf /etc/greenboost` used to delete the
+        # very snapshot it had just taken (INS-14). Hence -e, not -f.
+        for _kf in cluster.key cluster.conf known_hosts turboquant.enabled ggml_2dev.enabled synapse_token backup a2a.token debug_vitals.enabled synapse; do
+            [[ -e "/etc/greenboost/$_kf" ]] && cp -a "/etc/greenboost/$_kf" "$_keep_dir/" || true
         done
         rm -rf /etc/greenboost
         if compgen -G "$_keep_dir/*" >/dev/null; then
@@ -4777,6 +5176,8 @@ do_purge() {
     rm -rf /usr/local/lib/greenboost/
     rm -f /etc/profile.d/greenboost_pythonpath.sh
     rm -f /usr/local/lib/python3*/dist-packages/greenboost.pth 2>/dev/null || true
+    # python byte-code written when the .pth imported greenboost_sitecustomize
+    rm -f /usr/local/lib/python3*/dist-packages/__pycache__/greenboost_sitecustomize.*.pyc 2>/dev/null || true
     # Remove every .pth/sitecustomize.py pair install-python actually wrote
     # (conda/mamba envs discovered at install time, captured into
     # _pth_manifest_paths above before /usr/local/lib/greenboost was wiped).
@@ -4792,7 +5193,7 @@ do_purge() {
     # uninstall (preserve_cluster=0); a reinstall keeps them and cmd_register_mcp
     # refreshes them. Best-effort, run as the invoking user, never fatal.
     if [[ "$preserve_cluster" -eq 0 ]]; then
-        local _mcp_u="${SUDO_USER:-$USER}"
+        local _mcp_u="${SUDO_USER:-${USER:-$(id -un)}}"
         local -a _mcp_run=()
         if [[ $EUID -eq 0 && -n "$_mcp_u" && "$_mcp_u" != "root" ]]; then
             _mcp_run=(sudo -u "$_mcp_u")
@@ -4899,17 +5300,11 @@ do_purge() {
     #     On full-install (restart_after=0) services stay stopped - cmd_full_install
     #     restarts them once at the very end, after the fresh install completes.
     if [[ $restart_after -eq 1 ]]; then
-        # Offer to restore pre-install system settings if a backup exists
-        local _latest_backup; _latest_backup=$(ls -1d "${_GB_BACKUP_DIR}"/[0-9]* 2>/dev/null | sort | tail -1)
+        # No prompt: an uninstall never asks. The pre-install snapshot is kept
+        # in ${_GB_BACKUP_DIR}; restore it on purpose with `greenboost restore`.
+        local _latest_backup; _latest_backup=$(ls -1d "${_GB_BACKUP_DIR}"/[0-9]* 2>/dev/null | sort | tail -1 || true)
         if [[ -n "$_latest_backup" ]]; then
-            local _bstamp; _bstamp=$(basename "$_latest_backup")
-            if [[ -t 0 ]]; then
-                echo ""
-                echo -e "  ${C_CYAN}Backup from ${_bstamp} found.${C_RESET}"
-                echo -n "  Restore pre-GreenBoost system settings (GRUB, sysctl, CPU governor)? [y/N] "
-                local _ans; read -r _ans
-                [[ "$_ans" =~ ^[Yy] ]] && _gb_backup_restore
-            fi
+            info "Pre-GreenBoost settings backup kept: ${_latest_backup} (restore: sudo greenboost restore)"
         fi
         for svc in $GB_STOPPED_SERVICES; do
             systemctl start "$svc" 2>/dev/null \
@@ -4925,7 +5320,7 @@ cmd_build() {
     # /usr/local/cuda symlink may still point to.
     local _cuda_bin=""
     local _latest_cuda
-    _latest_cuda=$(ls -d /usr/local/cuda-[0-9]* 2>/dev/null | sort -V | tail -1)
+    _latest_cuda=$(ls -d /usr/local/cuda-[0-9]* 2>/dev/null | sort -V | tail -1 || true)
     if [[ -n "$_latest_cuda" && -x "$_latest_cuda/bin/nvcc" ]]; then
         _cuda_bin="$_latest_cuda/bin"
     elif [[ -d /usr/local/cuda/bin ]]; then
@@ -4944,11 +5339,11 @@ cmd_build() {
             gb_warn_ui "nvcc major version ($_nvcc_major) differs from driver's CUDA version ($_drv_ver). Consider reinstalling or adjusting PATH."
         fi
     fi
-    make -C "$MODULE_DIR" clean all &>/tmp/gb_build.log &
+    make -C "$MODULE_DIR" clean all &>${GB_LOGDIR}/build.log &
     gb_spin $! "Clean-building kernel module + CUDA shim..."
     if ! wait $!; then
         gb_fail() { echo -e "  ${RED}✗${C_RESET}  Build failed:"; }
-        cat /tmp/gb_build.log >&2
+        cat ${GB_LOGDIR}/build.log >&2
         die "Build failed - see output above"
     fi
     gb_ok "Build complete  (greenboost.ko · ${SHIM_LIB} · ${AUDIT_LIB} · greenboost-netd)"
@@ -4973,6 +5368,7 @@ cmd_install_python_files() {
         gb_telemetry.py
         gb_stream_sched.py
         gb_model_tier.py gb_tier_kv.py
+        gb_evict_policy.py gb_thrash.py gb_damon.py gb_prefix_guard.py
         gb_mem_pool.py
         gb_diffusion_orch.py
         gb_stability_monitor.py
@@ -4981,6 +5377,7 @@ cmd_install_python_files() {
         # Reactive signal-driven orchestration (v3.3+)
         gb_nvml.py
         gb_nvml_ctypes.py
+        gb_snapshot.py gb_lease.py gb_lease_client.py
         gb_reactive.py
         gb_control.py
         gb_orchestrator.py
@@ -5000,6 +5397,8 @@ cmd_install_python_files() {
         gb_synapse.py
         gb_synapse_api.py
         gb_synapse_backends.py
+        # gb_vision (projector sizing + the proxy's image normaliser: imported by gb_synapse*.py) and gb_phase (the shared GPU phase lease, imported by gb_api/gb_actuation)
+        gb_vision.py gb_phase.py
         gb_diffusion_server.py gb_longlive_server.py
         gb_aviary.py
         gb_session_audit.py
@@ -5149,8 +5548,8 @@ cmd_install_python_files() {
     # partial clone) only warns.
     if [[ -d "$MODULE_DIR/synapse_engine" ]]; then
         if command -v rsync >/dev/null 2>&1; then
-            rsync -a --delete "$MODULE_DIR/synapse_engine/" "$_dest/synapse_engine/" 2>/tmp/gb_synapse_engine_sync.log \
-                || gb_warn "synapse_engine/ sync failed (see /tmp/gb_synapse_engine_sync.log)"
+            rsync -a --no-owner --no-group --delete "$MODULE_DIR/synapse_engine/" "$_dest/synapse_engine/" 2>${GB_LOGDIR}/synapse_engine_sync.log \
+                || gb_warn "synapse_engine/ sync failed (see ${GB_LOGDIR}/synapse_engine_sync.log)"
         else
             rm -rf "$_dest/synapse_engine"
             cp -r "$MODULE_DIR/synapse_engine" "$_dest/synapse_engine"
@@ -5165,8 +5564,8 @@ cmd_install_python_files() {
     # linger on an upgraded install.
     if [[ -d "$MODULE_DIR/semantics" ]]; then
         if command -v rsync >/dev/null 2>&1; then
-            rsync -a --delete "$MODULE_DIR/semantics/" "$_dest/semantics/" 2>/tmp/gb_semantics_sync.log \
-                || gb_warn "semantics/ sync failed (see /tmp/gb_semantics_sync.log)"
+            rsync -a --no-owner --no-group --delete "$MODULE_DIR/semantics/" "$_dest/semantics/" 2>${GB_LOGDIR}/semantics_sync.log \
+                || gb_warn "semantics/ sync failed (see ${GB_LOGDIR}/semantics_sync.log)"
         else
             rm -rf "$_dest/semantics"
             cp -r "$MODULE_DIR/semantics" "$_dest/semantics"
@@ -5185,8 +5584,8 @@ cmd_install_python_files() {
     # this repo's MUST-RULE exists to catch.
     if [[ -d "$MODULE_DIR/serving" ]]; then
         if command -v rsync >/dev/null 2>&1; then
-            rsync -a --delete "$MODULE_DIR/serving/" "$_dest/serving/" 2>/tmp/gb_serving_sync.log \
-                || gb_warn "serving/ sync failed (see /tmp/gb_serving_sync.log)"
+            rsync -a --no-owner --no-group --delete "$MODULE_DIR/serving/" "$_dest/serving/" 2>${GB_LOGDIR}/serving_sync.log \
+                || gb_warn "serving/ sync failed (see ${GB_LOGDIR}/serving_sync.log)"
         else
             rm -rf "$_dest/serving"
             cp -r "$MODULE_DIR/serving" "$_dest/serving"
@@ -5228,9 +5627,9 @@ cmd_install_python_files() {
     # pin from lingering after a version bump.
     if [[ -d "$MODULE_DIR/third_party/llama.cpp" ]]; then
         if command -v rsync >/dev/null 2>&1; then
-            rsync -a --delete --exclude=build-synapse \
-                "$MODULE_DIR/third_party/llama.cpp/" "$_dest/third_party/llama.cpp/" 2>/tmp/gb_llamacpp_sync.log \
-                || gb_warn "third_party/llama.cpp/ sync failed (see /tmp/gb_llamacpp_sync.log)"
+            rsync -a --no-owner --no-group --delete --exclude=build-synapse \
+                "$MODULE_DIR/third_party/llama.cpp/" "$_dest/third_party/llama.cpp/" 2>${GB_LOGDIR}/llamacpp_sync.log \
+                || gb_warn "third_party/llama.cpp/ sync failed (see ${GB_LOGDIR}/llamacpp_sync.log)"
         else
             rm -rf "$_dest/third_party/llama.cpp"
             mkdir -p "$_dest/third_party"
@@ -5248,9 +5647,9 @@ cmd_install_python_files() {
     # gb_quant_calib.py itself runs from $_dest instead of the git checkout.
     if [[ -d "$MODULE_DIR/third_party/auto_round" ]]; then
         if command -v rsync >/dev/null 2>&1; then
-            rsync -a --delete \
-                "$MODULE_DIR/third_party/auto_round/" "$_dest/third_party/auto_round/" 2>/tmp/gb_autoround_sync.log \
-                || gb_warn "third_party/auto_round/ sync failed (see /tmp/gb_autoround_sync.log)"
+            rsync -a --no-owner --no-group --delete \
+                "$MODULE_DIR/third_party/auto_round/" "$_dest/third_party/auto_round/" 2>${GB_LOGDIR}/autoround_sync.log \
+                || gb_warn "third_party/auto_round/ sync failed (see ${GB_LOGDIR}/autoround_sync.log)"
         else
             rm -rf "$_dest/third_party/auto_round"
             mkdir -p "$_dest/third_party"
@@ -5268,9 +5667,9 @@ cmd_install_python_files() {
     # from $_dest instead of the git checkout.
     if [[ -d "$MODULE_DIR/third_party/turboquant" ]]; then
         if command -v rsync >/dev/null 2>&1; then
-            rsync -a --delete \
-                "$MODULE_DIR/third_party/turboquant/" "$_dest/third_party/turboquant/" 2>/tmp/gb_turboquant_sync.log \
-                || gb_warn "third_party/turboquant/ sync failed (see /tmp/gb_turboquant_sync.log)"
+            rsync -a --no-owner --no-group --delete \
+                "$MODULE_DIR/third_party/turboquant/" "$_dest/third_party/turboquant/" 2>${GB_LOGDIR}/turboquant_sync.log \
+                || gb_warn "third_party/turboquant/ sync failed (see ${GB_LOGDIR}/turboquant_sync.log)"
         else
             rm -rf "$_dest/third_party/turboquant"
             mkdir -p "$_dest/third_party"
@@ -5292,9 +5691,9 @@ cmd_install_python_files() {
     # prior version from lingering after an update.
     if [[ -d "$MODULE_DIR/third_party/gemlite" ]]; then
         if command -v rsync >/dev/null 2>&1; then
-            rsync -a --delete \
-                "$MODULE_DIR/third_party/gemlite/" "$_dest/third_party/gemlite/" 2>/tmp/gb_gemlite_sync.log \
-                || gb_warn "third_party/gemlite/ sync failed (see /tmp/gb_gemlite_sync.log)"
+            rsync -a --no-owner --no-group --delete \
+                "$MODULE_DIR/third_party/gemlite/" "$_dest/third_party/gemlite/" 2>${GB_LOGDIR}/gemlite_sync.log \
+                || gb_warn "third_party/gemlite/ sync failed (see ${GB_LOGDIR}/gemlite_sync.log)"
         else
             rm -rf "$_dest/third_party/gemlite"
             mkdir -p "$_dest/third_party"
@@ -5306,9 +5705,9 @@ cmd_install_python_files() {
 
     if [[ -d "$MODULE_DIR/third_party/hqq" ]]; then
         if command -v rsync >/dev/null 2>&1; then
-            rsync -a --delete \
-                "$MODULE_DIR/third_party/hqq/" "$_dest/third_party/hqq/" 2>/tmp/gb_hqq_sync.log \
-                || gb_warn "third_party/hqq/ sync failed (see /tmp/gb_hqq_sync.log)"
+            rsync -a --no-owner --no-group --delete \
+                "$MODULE_DIR/third_party/hqq/" "$_dest/third_party/hqq/" 2>${GB_LOGDIR}/hqq_sync.log \
+                || gb_warn "third_party/hqq/ sync failed (see ${GB_LOGDIR}/hqq_sync.log)"
         else
             rm -rf "$_dest/third_party/hqq"
             mkdir -p "$_dest/third_party"
@@ -5521,16 +5920,23 @@ cmd_install_cli() {
 
     local _venv="$GB_PY_DEST/cli-venv"
     if [[ ! -d "$_venv" ]]; then
-        if ! python3 -m venv "$_venv" &>/tmp/gb_cli_venv.log; then
-            gb_warn "cli-venv creation failed (see /tmp/gb_cli_venv.log) — skipping CLI install"
+        if ! python3 -m venv "$_venv" &>${GB_LOGDIR}/cli_venv.log; then
+            gb_warn "cli-venv creation failed (see ${GB_LOGDIR}/cli_venv.log) — skipping CLI install"
             return 0
         fi
     fi
 
     gb_info "Installing greenboost-cli from $_src into $_venv ..."
-    "$_venv/bin/pip" install --upgrade pip -q &>/tmp/gb_cli_pip.log || true
-    if ! "$_venv/bin/pip" install -q "$_src[mcp]" &>/tmp/gb_cli_pip.log; then
-        gb_warn "greenboost-cli pip install failed (see /tmp/gb_cli_pip.log) — skipping CLI install"
+    "$_venv/bin/pip" install --upgrade pip -q &>${GB_LOGDIR}/cli_pip.log || true
+    # [mcp,rag]: `rag` (sentence-transformers + torch + rank_bm25, multi-GB
+    # download — includes the CUDA stack on Linux) is what rag-search/rag-index
+    # actually import at runtime (greenboost_cli/rag/engine.py). Real incident,
+    # 2026-08-31: installing only `[mcp]` here left every fresh cli-venv with
+    # `gb rag-search` permanently broken (ModuleNotFoundError: torch) since the
+    # extra that ships those deps was defined in pyproject.toml but never
+    # actually installed by this function.
+    if ! "$_venv/bin/pip" install -q ${GB_PIP_CONSTRAINTS:+-c "$GB_PIP_CONSTRAINTS"} "${_src}[mcp,rag]" &>${GB_LOGDIR}/cli_pip.log; then
+        gb_warn "greenboost-cli pip install failed (see ${GB_LOGDIR}/cli_pip.log) — skipping CLI install"
         return 0
     fi
 
@@ -5649,8 +6055,8 @@ cmd_install_synapse_engine() {
     # ran (the install-synapse-engine verb can be invoked standalone).
     if [[ -d "$MODULE_DIR/synapse_engine" ]]; then
         if command -v rsync >/dev/null 2>&1; then
-            rsync -a --delete "$MODULE_DIR/synapse_engine/" "$GB_PY_DEST/synapse_engine/" 2>/tmp/gb_synapse_engine_sync.log \
-                || gb_warn "synapse_engine/ sync failed (see /tmp/gb_synapse_engine_sync.log)"
+            rsync -a --no-owner --no-group --delete "$MODULE_DIR/synapse_engine/" "$GB_PY_DEST/synapse_engine/" 2>${GB_LOGDIR}/synapse_engine_sync.log \
+                || gb_warn "synapse_engine/ sync failed (see ${GB_LOGDIR}/synapse_engine_sync.log)"
         else
             rm -rf "$GB_PY_DEST/synapse_engine"
             cp -r "$MODULE_DIR/synapse_engine" "$GB_PY_DEST/synapse_engine"
@@ -5677,8 +6083,8 @@ cmd_install_synapse_engine() {
 
     local _venv="$GB_PY_DEST/synapse-torch-env"
     if [[ ! -d "$_venv" ]]; then
-        if ! "$_py" -m venv "$_venv" &>/tmp/gb_synapse_engine_venv.log; then
-            gb_warn "synapse-torch-env creation failed (see /tmp/gb_synapse_engine_venv.log) — skipping install"
+        if ! "$_py" -m venv "$_venv" &>${GB_LOGDIR}/synapse_engine_venv.log; then
+            gb_warn "synapse-torch-env creation failed (see ${GB_LOGDIR}/synapse_engine_venv.log) — skipping install"
             return 0
         fi
     fi
@@ -5687,20 +6093,21 @@ cmd_install_synapse_engine() {
     [[ "${GB_INSTALL_BNB:-0}" == "1" ]] && _pip_extra="[bnb]"
     local -a _pip_args=(install -q "$GB_PY_DEST/synapse_engine$_pip_extra")
     [[ -n "${GB_TORCH_INDEX_URL:-}" ]] && _pip_args+=(--extra-index-url "$GB_TORCH_INDEX_URL")
+    [[ -n "${GB_PIP_CONSTRAINTS:-}" ]] && _pip_args+=(-c "$GB_PIP_CONSTRAINTS")   # optional pin file (INS-15)
 
     gb_info "Installing the synapse torch engine into $_venv (multi-GB download) ..."
-    "$_venv/bin/pip" install --upgrade pip -q &>/tmp/gb_synapse_engine_pip.log || true
+    "$_venv/bin/pip" install --upgrade pip -q &>${GB_LOGDIR}/synapse_engine_pip.log || true
     # item 10: this multi-GB torch download used to sit behind a single
     # static "Installing..." message with no progress signal at all until it
     # finished or failed — background it under gb_spin so the phase-activity
     # label (pushed below) is actually visible while it runs.
     _gb_mark_phase_activity_push "downloading torch + gb-synapse engine deps"
-    "$_venv/bin/pip" "${_pip_args[@]}" &>>/tmp/gb_synapse_engine_pip.log &
+    "$_venv/bin/pip" "${_pip_args[@]}" &>>${GB_LOGDIR}/synapse_engine_pip.log &
     local _pip_pid=$!
     gb_spin "$_pip_pid" "Installing synapse torch engine"
     _gb_mark_phase_activity_pop
     if ! wait "$_pip_pid"; then
-        gb_warn "synapse torch engine pip install failed (see /tmp/gb_synapse_engine_pip.log) — skipping; gb-synapse falls back to transformers for safetensors serving"
+        gb_warn "synapse torch engine pip install failed (see ${GB_LOGDIR}/synapse_engine_pip.log) — skipping; gb-synapse falls back to transformers for safetensors serving"
         return 0
     fi
 
@@ -5714,12 +6121,12 @@ cmd_install_synapse_engine() {
     _gb_mark_phase_activity_push "downloading sglang-kernel"
     "$_venv/bin/pip" install -q "sglang_kernel==0.4.5+cu130" \
         --extra-index-url https://sgl-project.github.io/whl/cu130 \
-        &>>/tmp/gb_synapse_engine_pip.log &
+        &>>${GB_LOGDIR}/synapse_engine_pip.log &
     local _sgl_pid=$!
     gb_spin "$_sgl_pid" "Installing sglang-kernel"
     _gb_mark_phase_activity_pop
     if ! wait "$_sgl_pid"; then
-        gb_warn "sglang_kernel install failed (see /tmp/gb_synapse_engine_pip.log) — synapse torch engine will fail to import gllm; retry with 'sudo greenboost install-synapse-engine'"
+        gb_warn "sglang_kernel install failed (see ${GB_LOGDIR}/synapse_engine_pip.log) — synapse torch engine will fail to import gllm; retry with 'sudo greenboost install-synapse-engine'"
         return 0
     fi
 
@@ -5730,11 +6137,21 @@ cmd_install_synapse_engine() {
         [[ -d "$_sp" ]] && echo "$GB_PY_DEST" > "$_sp/greenboost.pth"
     done
 
-    if ! "$_venv/bin/python" -c "
+    # CUDA_HOME: FlashInfer (used by gllm) JIT-compiles Blackwell (SM 12.x)
+    # kernels and requires CUDA >= 12.9 to do it — it finds nvcc via
+    # CUDA_HOME, which defaults to /usr (a stale distro-packaged nvcc, often
+    # < 12.9) when unset. Same root cause gb_synapse_backends.py's
+    # _cuda_home_for_torch() already fixes for the real serve path; without
+    # it here too, this smoke test hits the exact bug the runtime path
+    # avoids and prints a false "GPU too old"-shaped warning on every
+    # Full Install even though the actual install is fine.
+    local -a _smoke_env=()
+    [[ -d /usr/local/cuda ]] && _smoke_env=(env "CUDA_HOME=/usr/local/cuda")
+    if ! "${_smoke_env[@]}" "$_venv/bin/python" -c "
 import torch, gllm, sgl_kernel
 assert torch.cuda.is_available(), 'torch.cuda.is_available() is False'
-" &>/tmp/gb_synapse_engine_smoke.log; then
-        gb_warn "synapse torch engine smoke test failed (see /tmp/gb_synapse_engine_smoke.log) — install may be incomplete"
+" &>${GB_LOGDIR}/synapse_engine_smoke.log; then
+        gb_warn "synapse torch engine smoke test failed (see ${GB_LOGDIR}/synapse_engine_smoke.log) — install may be incomplete"
         return 0
     fi
 
@@ -5836,7 +6253,7 @@ cmd_install_pipelines() {
 # Called from: cmd_install (full-install) and the register-mcp verb.
 # Uninstall symmetry: do_purge removes the same 4 servers on a true uninstall.
 cmd_register_mcp() {
-    local _u="${SUDO_USER:-$USER}"
+    local _u="${SUDO_USER:-${USER:-$(id -un)}}"
     # Run the Claude CLI as the target (non-root) user; -lc loads that user's
     # login PATH so claude is found even under ~/.local/bin, nvm, etc.
     local -a _run=()
@@ -5960,16 +6377,22 @@ _gb_ensure_ollama() {
         gb_info "Installing ollama via official installer…"
     fi
     # Official installer updates the ollama binary + systemd unit in place.
-    if curl -fsSL https://ollama.com/install.sh -o /tmp/gb_ollama_install.sh 2>/dev/null \
-       && sh /tmp/gb_ollama_install.sh >/tmp/gb_ollama_install.log 2>&1; then
+    # Private 0700 directory: the installer runs as root, so it must not sit at
+    # a predictable name in /tmp. GB_OLLAMA_INSTALL_SHA256, when set, pins the
+    # exact script (the URL serves whatever is current, so no default pin).
+    local _ol_dir; _ol_dir="$(mktemp -d /tmp/gb_ollama.XXXXXX)"
+    if curl -fsSL https://ollama.com/install.sh -o "$_ol_dir/install.sh" 2>/dev/null \
+       && { [[ -z "${GB_OLLAMA_INSTALL_SHA256:-}" ]] \
+            || { echo "${GB_OLLAMA_INSTALL_SHA256}  $_ol_dir/install.sh" | sha256sum -c --status; }; } \
+       && sh "$_ol_dir/install.sh" >"$_ol_dir/install.log" 2>&1; then
         local _after; _after=$(ollama --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
         gb_ok "ollama ${_after:-installed}${_before:+ (was ${_before})}"
         [[ -n "$_after" && -f "$GB_CLUSTER_CONF" ]] && \
             gb_info "Match feeders to it:  sudo greenboost feeders sync-ollama"
     else
-        gb_warn "ollama install/update failed (see /tmp/gb_ollama_install.log) , continuing"
+        gb_warn "ollama install/update failed or did not match GB_OLLAMA_INSTALL_SHA256 (log kept in $_ol_dir/install.log) , continuing"
     fi
-    rm -f /tmp/gb_ollama_install.sh
+    rm -f "$_ol_dir/install.sh"
 }
 
 # _gb_install_ebpf_tracer , install greenboost-ebpf-trace if built, (re)start it.
@@ -6080,7 +6503,9 @@ _gb_check_live_gpu_users() {
             gb_confirm "Proceed anyway (kills the jobs above)?" \
                 || die "Install cancelled , wait for GPU jobs to finish, then re-run."
         else
-            gb_warn_ui "Non-interactive run , continuing in 5s (Ctrl+C to abort)…"
+            [[ "${GB_ASSUME_YES:-0}" == "1" ]] \
+                || die "Non-interactive run with live GPU jobs (listed above). Re-run when they finish, or set GB_ASSUME_YES=1 to accept killing them."
+            gb_warn_ui "GB_ASSUME_YES=1 , continuing in 5s (Ctrl+C to abort)…"
             sleep 5
         fi
     fi
@@ -6127,6 +6552,19 @@ _gb_install_abort_recover() {
     return 0
 }
 
+# Prove greenboost.ko compiles for the running kernel BEFORE do_purge removes the installed copy (audit R2-10).
+# Skipped when the toolchain or headers are not there yet (full-install installs them after the purge).
+_gb_preflight_build() {
+    command -v make &>/dev/null && command -v gcc &>/dev/null && [[ -d "/lib/modules/$(uname -r)/build" ]] || return 0
+    local _pf_log; _pf_log="$(mktemp /tmp/gb_preflight.XXXXXX.log)"
+    gb_info "Pre-flight: compiling greenboost.ko before touching the installed copy..."
+    if ! make -C "$MODULE_DIR" module >"$_pf_log" 2>&1; then
+        tail -n 30 "$_pf_log" >&2
+        die "Pre-flight build failed (log: $_pf_log). Nothing was removed: the installed GreenBoost is untouched."
+    fi
+    rm -f "$_pf_log"
+}
+
 cmd_install() {
     need_root install
 
@@ -6157,6 +6595,7 @@ cmd_install() {
         trap '_gb_install_abort_recover $?' EXIT
         trap 'exit 130' INT
         trap 'exit 143' TERM
+        _gb_preflight_build
         _gb_check_live_gpu_users
         gb_step 0 4 "Removing previous GreenBoost installation (if any)..."
         do_purge 0 1
@@ -6183,6 +6622,48 @@ cmd_install() {
             "$MODULE_DIR" 2>/dev/null || true
     fi
     gb_ok "Build complete"
+
+    # `make clean` above removes the opt-in gb_cutlass extension and `all`
+    # deliberately does not rebuild it, so every reinstall silently un-built it:
+    # gb_cutlass.available() went False and every NVFP4 layer fell back to
+    # gemlite with no error, no warning and no log line. Confirmed twice on
+    # 2026-08-22. Same shape as C-04 (a fresh install does not reload the kernel
+    # module) and C-05 (a stale initrd silently disables T3) , the system keeps
+    # working, more slowly, and says nothing.
+    #
+    # Rebuild it ONLY where it had been built before (clean leaves a stamp), so
+    # the opt-in policy is unchanged on a box that never wanted it. Runs as the
+    # developer, not root, so the artifact is not root-owned; never fatal , a
+    # missing CUDA-13 toolchain must not block a working GreenBoost install, it
+    # must say so.
+    local _cutlass_log
+    _cutlass_log=$(mktemp /tmp/gb_cutlass_restore.XXXXX.log)
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        # -H is load-bearing: without it sudo keeps HOME=/root, and the build
+        # tries to write root-owned cache paths as a non-root user , observed
+        # 2026-08-22 as "ccache: error: Failed to create directory
+        # /root/.cache/ccache/lock: Permission denied", which failed the very
+        # rebuild this block exists to perform, on the first reinstall after it
+        # shipped. The log said so; nobody could read it (see below).
+        sudo -H -u "${SUDO_USER}" make -C "$MODULE_DIR" gb_cutlass-restore \
+            >"$_cutlass_log" 2>&1 || true
+        # The warning below names this file, so the person it is addressed to
+        # has to be able to open it. mktemp creates it 0600 root-owned.
+        chown "${SUDO_USER}" "$_cutlass_log" 2>/dev/null || true
+        chmod 0644 "$_cutlass_log" 2>/dev/null || true
+    else
+        make -C "$MODULE_DIR" gb_cutlass-restore >"$_cutlass_log" 2>&1 || true
+    fi
+    if grep -q "rebuilding" "$_cutlass_log" 2>/dev/null; then
+        if grep -q "WARNING: gb_cutlass rebuild FAILED" "$_cutlass_log" 2>/dev/null; then
+            gb_warn "gb_cutlass was built before but could NOT be rebuilt , NVFP4 layers fall back to gemlite (slower, silent). See $_cutlass_log, then: make gb_cutlass"
+        else
+            gb_ok "gb_cutlass extension rebuilt (was present before this install)"
+            rm -f "$_cutlass_log"
+        fi
+    else
+        rm -f "$_cutlass_log"
+    fi
 
     local _install_log
     _install_log=$(mktemp /tmp/gb_install.XXXXX.log)
@@ -6309,7 +6790,7 @@ MODEOF
     # events into /root's log, which the MCP (running as the owner) never reads.
     _gb_df_home=""
     if [[ -n "${SUDO_USER:-}" ]]; then
-        _gb_df_home=$(eval echo "~${SUDO_USER}" 2>/dev/null)
+        _gb_df_home="$(gb_user_home "${SUDO_USER}")"
     fi
     if [[ -n "$_gb_df_home" && -d "$_gb_df_home" && -f /etc/systemd/system/greenboost-boot-guard.service ]]; then
         if ! grep -q '^Environment=GREENBOOST_DATAFLUX_LOG=' /etc/systemd/system/greenboost-boot-guard.service; then
@@ -6570,8 +7051,19 @@ WRAPEOF
     fi
 }
 
+# gb_warn_secure_boot - INS-20. An unsigned module is refused when Secure Boot
+# is enforcing. Warn only: signing (MOK) is the owner's decision, nothing is changed.
+gb_warn_secure_boot() {
+    command -v mokutil &>/dev/null || return 0
+    if grep -q 'SecureBoot enabled' <<< "$(mokutil --sb-state 2>/dev/null)"; then
+        gb_warn_ui "Secure Boot is enabled: the kernel refuses an unsigned greenboost.ko. Sign it with an enrolled MOK key (dkms signs automatically when its key is enrolled) or the load will fail."
+    fi
+    return 0
+}
+
 cmd_load() {
     need_root load
+    gb_warn_secure_boot
     detect_hardware
 
     # Load active profile values (lowest priority - env vars and CLI flags override)
@@ -6649,13 +7141,13 @@ cmd_load() {
         ecores_only="$ecores_only" \
         kv_reserve_mb="${GB_KV_RESERVE_MB:-2048}" \
         active_profile_name="${PROF_NAME:-autodetect}" \
-        2>/tmp/gb_insmod_stderr.$$ || _insmod_rc=$?
+        2>${GB_LOGDIR}/insmod_stderr.$$ || _insmod_rc=$?
     if (( _insmod_rc != 0 )); then
-        local _insmod_err; _insmod_err=$(cat /tmp/gb_insmod_stderr.$$ 2>/dev/null)
-        rm -f /tmp/gb_insmod_stderr.$$
+        local _insmod_err; _insmod_err=$(cat ${GB_LOGDIR}/insmod_stderr.$$ 2>/dev/null)
+        rm -f ${GB_LOGDIR}/insmod_stderr.$$
         die "insmod failed (rc=${_insmod_rc}): ${_insmod_err} - check: dmesg | tail -20  (params this .ko accepts: $(modinfo -F parm "$ko" 2>/dev/null | cut -d: -f1 | tr '\n' ' '))"
     fi
-    rm -f /tmp/gb_insmod_stderr.$$
+    rm -f ${GB_LOGDIR}/insmod_stderr.$$
 
     # Ensure /dev/greenboost has correct group permission immediately after insmod.
     # The .devnode kernel callback sets mode 0660 at creation, but run udevadm
@@ -6717,7 +7209,8 @@ cmd_load() {
     info "Status     : greenboost vitals"
     info "Kernel log : dmesg | grep greenboost"
     echo ""
-    dmesg | grep greenboost | tail -8 | sed 's/^/  /'
+    # best-effort: no greenboost line in the ring buffer (or a restricted dmesg) must not fail a load that worked
+    { dmesg 2>/dev/null | grep greenboost | tail -8 | sed 's/^/  /'; } || true
 }
 
 cmd_unload() {
@@ -6729,7 +7222,43 @@ cmd_unload() {
     fi
 }
 
+# _gb_uninstall_plan - read-only preview of a true uninstall. The list comes
+# from tools/manifest/manifest.json (the same list the install is checked
+# against), so it names exactly what the install wrote. Touches nothing.
+_gb_uninstall_plan() {
+    local _mf="${MODULE_DIR}/tools/manifest/manifest.json"
+    info "[dry-run] uninstall plan (nothing is changed, no service is stopped):"
+    if [[ -f "$_mf" ]] && command -v python3 &>/dev/null; then
+        python3 -I - "$_mf" <<'PYPLAN'
+import json, os, sys
+m = json.load(open(sys.argv[1]))
+n = 0
+for e in m["entries"]:
+    k, p = e["kind"], e.get("path") or e.get("file")
+    if k in ("file", "dir") and p and os.path.lexists(p):
+        print("[dry-run] would remove %s %s" % (k, p)); n += 1
+    elif k == "line_edit" and p and os.path.isfile(p):
+        print("[dry-run] would revert GreenBoost lines in %s" % p); n += 1
+    elif k == "unit_enable" and p and os.path.lexists(p):
+        print("[dry-run] would disable unit %s" % p); n += 1
+print("[dry-run] %d manifest entries present on this system" % n)
+PYPLAN
+    else
+        info "[dry-run] manifest or python3 not available: see the list printed by a real uninstall"
+    fi
+    [[ -f "$GB_SWAP_FILE" ]] && info "[dry-run] would swapoff and remove $GB_SWAP_FILE and its /etc/fstab line"
+    info "[dry-run] would remove /var/lib/greenboost, the module, the shim and the initramfs exclusions"
+    info "[dry-run] would also remove: group greenboost, $GB_LOGDIR. Kept: Ollama, llama-server, NVIDIA/CUDA, models, dataflux history in your home"
+}
+
 cmd_uninstall() {
+    local _a
+    for _a in "$@"; do
+        case "$_a" in
+            --dry-run) _gb_uninstall_plan; return 0 ;;
+            *) die "uninstall: unknown option $_a (only --dry-run)" ;;
+        esac
+    done
     need_root uninstall
     GB_STOPPED_SERVICES=""
 
@@ -6848,7 +7377,7 @@ cmd_tune() {
     # Forcing runtime PM "on" keeps the link at the negotiated gen during
     # inference, preventing latency spikes on the first DMA transfer.
     local gpu_pci_rt
-    gpu_pci_rt=$(ls /proc/driver/nvidia/gpus/ 2>/dev/null | head -1)
+    gpu_pci_rt=$(ls /proc/driver/nvidia/gpus/ 2>/dev/null | head -1 || true)
     if [[ -n "$gpu_pci_rt" ]]; then
         local pm_ctl="/sys/bus/pci/devices/${gpu_pci_rt}/power/control"
         if [[ -w "$pm_ctl" ]]; then
@@ -6865,7 +7394,7 @@ cmd_tune() {
     # Hardware-agnostic: reads CAP_EXP+8.w, clears bits 14:12, sets 101b.
     if command -v setpci &>/dev/null && [[ -n "$gpu_pci_rt" ]]; then
         local mrrs_cur
-        mrrs_cur=$(setpci -s "$gpu_pci_rt" CAP_EXP+8.w 2>/dev/null)
+        mrrs_cur=$(setpci -s "$gpu_pci_rt" CAP_EXP+8.w 2>/dev/null || true)
         if [[ -n "$mrrs_cur" ]]; then
             local mrrs_new
             mrrs_new=$(printf '%04x' $(( (16#${mrrs_cur} & 0x8FFF) | 0x5000 )))
@@ -6880,13 +7409,17 @@ cmd_tune() {
     info "THP               : always"
 
     # ── vm.swappiness → 10 (prefer RAM; only page to NVMe under pressure) ─
-    sysctl -qw vm.swappiness=10
-    info "vm.swappiness     : 10 (was default 60)"
+    if [[ "$(gb_swap_conf_get GB_VM_SYSCTL 1)" == 0 ]]; then
+        info "vm.swappiness / vm.dirty_*: owned elsewhere (GB_VM_SYSCTL=0), left alone"
+    else
+        sysctl -qw vm.swappiness=10
+        info "vm.swappiness     : 10 (was default 60)"
 
-    # ── vm.dirty_ratio / background_ratio (reduce write stalls) ──────────
-    sysctl -qw vm.dirty_ratio=40
-    sysctl -qw vm.dirty_background_ratio=10
-    info "vm.dirty_ratio    : 40 / background: 10"
+        # ── vm.dirty_ratio / background_ratio (reduce write stalls) ──────────
+        sysctl -qw vm.dirty_ratio=40
+        sysctl -qw vm.dirty_background_ratio=10
+        info "vm.dirty_ratio    : 40 / background: 10"
+    fi
 
     # ── USB storage scheduler → none + larger read-ahead ─────────────────
     local _usb_tuned=0
@@ -6907,9 +7440,15 @@ cmd_tune() {
     gb_ok "Settings saved - will apply automatically on every boot"
 }
 
-# Write sysctl tunables to the drop-in file (also called by tune-sysctl)
+# Write sysctl tunables to the drop-in file (single writer: install, tune and tune-sysctl)
 _tune_persist_sysctl() {
     local conf="/etc/sysctl.d/99-zzz-greenboost.conf"
+    if [[ "$(gb_swap_conf_get GB_VM_SYSCTL 1)" == 0 ]]; then
+        printf '# GreenBoost: vm.* tunables are owned by the resource programme (GB_VM_SYSCTL=0 in %s). Nothing set here.\n' \
+            "$GB_SWAP_CONF" > "$conf"
+        gb_ok "sysctl: $conf holds no keys (GB_VM_SYSCTL=0)"
+        return 0
+    fi
     cat > "$conf" << 'SCTL'
 # GreenBoost - persistent sysctl tunables
 # Written by: greenboost_setup.sh tune
@@ -6926,6 +7465,7 @@ _tune_persist_nvme() {
     local ra_kb="${1:-4096}"
 
     # udev rule - fires on every NVMe block device add/change
+    mkdir -p /etc/udev/rules.d   # absent on images without udev
     local udev_rule="/etc/udev/rules.d/99-nvme-greenboost.rules"
     cat > "$udev_rule" << UDEV
 # GreenBoost - NVMe tuning applied at boot via udev
@@ -6982,14 +7522,52 @@ PYEOF
 # Validate each candidate flag against the kernel config, then apply.
 # Strategy: read-only checks first; only write GRUB if all checks pass.
 # Security mitigations are NEVER touched.
+#
+# Persistence target (2026-08-31 incident): GreenBoost used to sed-edit
+# /etc/default/grub directly. That file is not a dpkg conffile - it's
+# ucf-managed and SHARED across every grub-* package flavour. Purging
+# grub-pc (the BIOS bootloader, reasonable to remove on an EFI box) runs
+# grub-pc's postrm, which does `rm -f /etc/default/grub; ucf --purge
+# /etc/default/grub` unconditionally - deleting the file out from under
+# the still-installed grub-efi-amd64. The next update-grub then sources
+# nothing (grub-mkconfig tolerates the missing file, does not error) and
+# silently drops every parameter below. Fixed by persisting through
+# /etc/default/grub.d/99-greenboost.cfg instead: grub-mkconfig sources
+# every grub.d/*.cfg unconditionally, outside its "does the main file
+# exist" check, so a grub package purge cannot take it out. Falls back to
+# the old sed-into-the-main-file approach only on distros with no
+# /etc/default/grub.d (non-Debian).
 
-_grub_has()  { grep -qw "$1" /proc/cmdline; }
+_GB_GRUB_STATIC_PARAMS=(
+    "transparent_hugepage=always"
+    "skew_tick=1"
+    "numa_balancing=disable"
+    "workqueue.power_efficient=0"
+)
+_GB_GRUB_RANGE_PATTERNS=(
+    "rcu_nocbs=[^ \"]*"
+    "nohz_full=[^ \"]*"
+)
+GB_GRUB_DROPIN="/etc/default/grub.d/99-greenboost.cfg"
+
+# What's active THIS boot (reporting only - never gates a write decision;
+# a recreated-empty /etc/default/grub would otherwise make every flag look
+# "already active" here while none of them persist past the next reboot).
+_grub_active_has() { grep -qw "$1" /proc/cmdline; }
+
+# What WILL persist - the actual write-decision source: the main file plus
+# our own drop-in (so a second run sees its own prior output and reports
+# no change).
+_grub_cfg_has() {
+    { [[ -n "${GB_GRUB_MAIN_FILE:-}" && -f "$GB_GRUB_MAIN_FILE" ]] && cat "$GB_GRUB_MAIN_FILE"
+      [[ -f "$GB_GRUB_DROPIN" ]] && cat "$GB_GRUB_DROPIN"; } 2>/dev/null | grep -qw -- "$1"
+}
 _kcfg_has()  { grep -q "^${1}=y" /boot/config-"$(uname -r)" 2>/dev/null; }
 
 _grub_check_flag() {
     local flag="$1" desc="$2" kcfg="$3"
-    if _grub_has "$flag"; then
-        info "  [skip]    $flag  - already active"
+    if _grub_cfg_has "$flag"; then
+        info "  [skip]    $flag  - already in config"
         return 1
     fi
     if [[ -n "$kcfg" ]] && ! _kcfg_has "$kcfg"; then
@@ -7000,39 +7578,126 @@ _grub_check_flag() {
     return 0
 }
 
+# Is this actually a GRUB-booted system at all? (systemd-boot, a container,
+# or WSL2 have neither the tool nor a config to tune - that's not an error.)
+_gb_grub_bootloader_active() {
+    { command -v update-grub || command -v grub-mkconfig; } &>/dev/null || return 1
+    [[ -f /boot/grub/grub.cfg || -f /boot/grub2/grub.cfg ]]
+}
+
+# Recovery ladder for a missing /etc/default/grub: GreenBoost's own sed
+# backups first (most likely to match what's actually running), then the
+# pre-install snapshot from _gb_backup_create, then the distro template.
+_gb_grub_file_recover() {
+    local dest="$1" cand
+    cand=$(ls -1t /etc/default/grub.bak.* 2>/dev/null | head -1 || true)
+    if [[ -n "$cand" ]]; then
+        cp --preserve=all "$cand" "$dest"; gb_ok "Recovered ${dest} from ${cand}"; return 0
+    fi
+    cand=$(ls -1t /etc/greenboost/backup/*/grub 2>/dev/null | head -1 || true)
+    if [[ -n "$cand" ]]; then
+        cp --preserve=all "$cand" "$dest"; gb_ok "Recovered ${dest} from ${cand}"; return 0
+    fi
+    if [[ -f /usr/share/grub/default/grub ]]; then
+        cp --preserve=all /usr/share/grub/default/grub "$dest"
+        gb_ok "Recovered ${dest} from the distro template (/usr/share/grub/default/grub)"
+        return 0
+    fi
+    return 1
+}
+
+_gb_grub_dropin_render() {
+    local flags="$1"
+    cat <<EOF
+# Auto-generated by GreenBoost (greenboost tune-grub). Do not edit by hand -
+# regenerated from live hardware topology every time this command runs.
+#
+# Written as a grub.d drop-in, not a sed edit of /etc/default/grub, because
+# \`apt purge grub-pc\` (or grub-efi-amd64) runs \`ucf --purge
+# /etc/default/grub\`, deleting that file even though a sibling grub
+# package still needs it. grub-mkconfig sources every
+# /etc/default/grub.d/*.cfg unconditionally, outside its "does the main
+# file exist" check - so this survives that failure mode.
+# Incident: 2026-08-31 (see workflow/known-issues.md).
+GRUB_CMDLINE_LINUX_DEFAULT="\${GRUB_CMDLINE_LINUX_DEFAULT} ${flags}"
+EOF
+}
+
 cmd_tune_grub() {
     need_root tune-grub
     detect_hardware
+
+    if ! _gb_grub_bootloader_active; then
+        gb_info "No GRUB bootloader detected (no update-grub/grub-mkconfig, or no grub.cfg present) - skipping boot-parameter tuning."
+        return 0
+    fi
 
     local grub_file="/etc/default/grub"
     local kver; kver="$(uname -r)"
     local kcfg="/boot/config-${kver}"
 
-    [[ -f "$grub_file" ]] || die "GRUB config not found: $grub_file"
+    if [[ ! -f "$grub_file" ]]; then
+        gb_warn_ui "GRUB config file is gone: ${grub_file}"
+        gb_info "This happens when a grub-pc or grub-efi purge runs ucf --purge against the shared /etc/default/grub - distro packaging behavior, not a GreenBoost bug."
+        gb_info "What it costs you: nothing yet. The kernel you're running booted from grub.cfg before this file vanished, so today's boot still has every parameter. But the NEXT update-grub - a kernel update, or this very command - would regenerate grub.cfg from an empty config and silently drop transparent_hugepage=always, rcu_nocbs, nohz_full and the rest."
+        if _gb_grub_file_recover "$grub_file"; then
+            gb_info "Not broken: recovered ${grub_file}, so the next update-grub keeps every parameter."
+        else
+            gb_warn_ui "No backup found to recover ${grub_file} from - continuing anyway; GreenBoost's own parameters below still land in ${GB_GRUB_DROPIN}, which doesn't need this file to exist."
+        fi
+    fi
+    GB_GRUB_MAIN_FILE="$grub_file"
+
+    local dropin_dir; dropin_dir="$(dirname "$GB_GRUB_DROPIN")"
+    local use_dropin=0
+    [[ -d "$dropin_dir" ]] && use_dropin=1
 
     info "Validating GRUB flags for: ${CPU_NAME} | ${GPU_NAME} | ${RAM_TYPE}-${RAM_SPEED_DISPLAY} MT/s | PCIe Gen ${PCIE_GEN} ${PCIE_WIDTH}"
     info "Kernel: $kver"
+    info "Persisting via: $([[ $use_dropin -eq 1 ]] && echo "${GB_GRUB_DROPIN} (survives a grub package purge)" || echo "${grub_file} (this distro has no /etc/default/grub.d)")"
     echo ""
 
-    # Read current GRUB cmdline value
-    local current_line
-    current_line=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$grub_file" | head -1 | sed 's/^GRUB_CMDLINE_LINUX_DEFAULT=//;s/^"//;s/"$//')
+    # One-time migration: an earlier GreenBoost version sed-edited these
+    # flags straight into $grub_file. Strip them so dropin mode doesn't
+    # apply them twice.
+    if [[ $use_dropin -eq 1 && -f "$grub_file" ]]; then
+        local inline_line stripped had_inline=0 p
+        inline_line=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$grub_file" | head -1 | sed 's/^GRUB_CMDLINE_LINUX_DEFAULT=//;s/^"//;s/"$//')
+        stripped="$inline_line"
+        for p in "${_GB_GRUB_STATIC_PARAMS[@]}"; do
+            if echo "$stripped" | grep -qw -- "$p"; then
+                stripped=$(echo "$stripped" | sed "s/ *${p}//g; s/${p} *//g"); had_inline=1
+            fi
+        done
+        for p in "${_GB_GRUB_RANGE_PATTERNS[@]}"; do
+            if echo "$stripped" | grep -Eq -- "$p"; then
+                stripped=$(echo "$stripped" | sed -E "s/ *${p}//g; s/${p} *//g"); had_inline=1
+            fi
+        done
+        if [[ $had_inline -eq 1 ]]; then
+            stripped=$(echo "$stripped" | tr -s ' ' | sed 's/^ //;s/ $//')
+            cp "$grub_file" "${grub_file}.bak.$(date +%Y%m%d_%H%M%S)"
+            sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"${stripped}\"|" "$grub_file"
+            gb_ok "Migrated inline GreenBoost params out of ${grub_file} into ${GB_GRUB_DROPIN}"
+        fi
+    fi
 
+    # ── Compute flags: all_desired (unconditional, for the dropin's full
+    # regen) and new_flags (only what's missing, for the report + the
+    # non-dropin incremental-append fallback) ──────────────────────────
+    local -a all_desired=()
     local new_flags=""
 
     # ── Flag: transparent_hugepage=always ───────────────────────────────
     # GreenBoost T2 pool allocates 2MB compound pages. THP=always ensures
     # the kernel tries to satisfy those allocs from huge pages at boot.
-    # Currently set to 'madvise' in GRUB - change to 'always'.
     if _kcfg_has "CONFIG_TRANSPARENT_HUGEPAGE"; then
-        if echo "$current_line" | grep -q "transparent_hugepage=madvise"; then
+        all_desired+=("transparent_hugepage=always")
+        if [[ -f "$grub_file" ]] && grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$grub_file" | grep -q "transparent_hugepage=madvise"; then
             info "  [fix]     transparent_hugepage=madvise -> always  (GreenBoost T2 hugepage pool)"
-            current_line="${current_line/transparent_hugepage=madvise/transparent_hugepage=always}"
-        elif ! _grub_has "transparent_hugepage=always"; then
-            info "  [add]     transparent_hugepage=always  (GreenBoost T2 hugepage pool)"
+            sed -i 's/transparent_hugepage=madvise/transparent_hugepage=always/' "$grub_file"
+        elif _grub_check_flag "transparent_hugepage=always" "GreenBoost T2 hugepage pool" ""; then
             new_flags="$new_flags transparent_hugepage=always"
-        else
-            info "  [skip]    transparent_hugepage=always  - already active"
         fi
     fi
 
@@ -7040,7 +7705,7 @@ cmd_tune_grub() {
     # Staggers per-CPU timer ticks on the i9-14900KF hybrid topology
     # (8 P-cores + 16 E-cores). Reduces lock contention when all 32 CPUs
     # fire timer interrupts simultaneously.
-    # Runtime test: always safe - no kernel config dependency.
+    all_desired+=("skew_tick=1")
     _grub_check_flag "skew_tick=1" \
         "stagger timer ticks - reduces lock contention on hybrid P/E cores" "" \
         && new_flags="$new_flags skew_tick=1"
@@ -7053,6 +7718,7 @@ cmd_tune_grub() {
         local ecores_start=$(( GB_PCORES_MAX + 1 ))
         local ecores_end=$(( $(nproc) - 1 ))
         if [[ $ecores_start -le $ecores_end ]]; then
+            all_desired+=("rcu_nocbs=${ecores_start}-${ecores_end}")
             _grub_check_flag "rcu_nocbs=${ecores_start}-${ecores_end}" \
                 "offload RCU callbacks to E-cores (CPU ${ecores_start}-${ecores_end}), freeing P-cores for inference" \
                 "CONFIG_RCU_NOCB_CPU" \
@@ -7066,6 +7732,7 @@ cmd_tune_grub() {
     # multiplications - reduces LLM token latency.
     # Range derived from detected golden-core topology (GB_GOLDEN_MIN/MAX).
     if [[ $GB_PCORES_ONLY -eq 1 && $GB_GOLDEN_MIN -lt $GB_GOLDEN_MAX ]]; then
+        all_desired+=("nohz_full=${GB_GOLDEN_MIN}-${GB_GOLDEN_MAX}")
         _grub_check_flag "nohz_full=${GB_GOLDEN_MIN}-${GB_GOLDEN_MAX}" \
             "tick-less golden P-cores (CPU ${GB_GOLDEN_MIN}-${GB_GOLDEN_MAX}) during single-thread inference" \
             "CONFIG_NO_HZ_FULL" \
@@ -7077,6 +7744,7 @@ cmd_tune_grub() {
     # The kernel's automatic NUMA balancing task wastes cycles scanning
     # pages that will never need to move. Already disabled at runtime
     # via sysctl, this makes it persistent across reboots.
+    all_desired+=("numa_balancing=disable")
     _grub_check_flag "numa_balancing=disable" \
         "single NUMA node - disable page-migration scanning overhead" "" \
         && new_flags="$new_flags numa_balancing=disable"
@@ -7086,52 +7754,96 @@ cmd_tune_grub() {
     # mode by default, routing work to whichever CPU happens to be awake.
     # Disabling this routes workqueue items to the fastest available CPU
     # (P-core), which matters for DMA-BUF completion and NVMe IRQ paths.
+    all_desired+=("workqueue.power_efficient=0")
     _grub_check_flag "workqueue.power_efficient=0" \
         "route kernel workqueues to P-cores instead of any-idle CPU" "" \
         && new_flags="$new_flags workqueue.power_efficient=0"
 
-    # ── Fix: deduplicate nvidia-drm.modeset=1 ──────────────────────────
-    # `|| true` is required: under `set -o pipefail`, a zero-match grep (the
-    # common case - most cmdlines have exactly one or zero occurrences) makes
-    # the whole pipeline exit non-zero even though `wc -l` correctly printed
-    # "0", which trips `set -e` and aborts the entire install right here.
-    local count; count=$(echo "$current_line" | grep -o "nvidia-drm.modeset=1" | wc -l || true)
-    if [[ "$count" -gt 1 ]]; then
-        info "  [fix]     nvidia-drm.modeset=1 appears ${count}× - deduplicating"
-        # Remove all occurrences then add one back
-        current_line=$(echo "$current_line" | sed 's/nvidia-drm\.modeset=1//g' | tr -s ' ')
-        current_line="$current_line nvidia-drm.modeset=1"
+    new_flags=$(echo "$new_flags" | tr -s ' ' | sed 's/^ //;s/ $//')
+
+    # ── Fix: deduplicate nvidia-drm.modeset=1 (main file only) ──────────
+    if [[ -f "$grub_file" ]]; then
+        local current_line count
+        current_line=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$grub_file" | head -1 | sed 's/^GRUB_CMDLINE_LINUX_DEFAULT=//;s/^"//;s/"$//')
+        # `|| true` is required: under `set -o pipefail`, a zero-match grep
+        # (the common case) makes the whole pipeline exit non-zero even
+        # though `wc -l` correctly printed "0", which trips `set -e`.
+        count=$(echo "$current_line" | grep -o "nvidia-drm.modeset=1" | wc -l || true)
+        if [[ "$count" -gt 1 ]]; then
+            info "  [fix]     nvidia-drm.modeset=1 appears ${count}× - deduplicating"
+            current_line=$(echo "$current_line" | sed 's/nvidia-drm\.modeset=1//g' | tr -s ' ')
+            current_line="$current_line nvidia-drm.modeset=1"
+            cp "$grub_file" "${grub_file}.bak.$(date +%Y%m%d_%H%M%S)"
+            sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"${current_line}\"|" "$grub_file"
+        fi
     fi
 
-    # ── Build new cmdline ───────────────────────────────────────────────
-    local new_line="${current_line}${new_flags}"
-    # Normalise multiple spaces
-    new_line=$(echo "$new_line" | tr -s ' ' | sed 's/^ //;s/ $//')
+    local _gb_grub_prev=""
+    if [[ $use_dropin -eq 1 ]]; then
+        local rendered
+        rendered=$(echo "${all_desired[*]}" | tr -s ' ')
+        if [[ -f "$GB_GRUB_DROPIN" ]] && diff -q <(_gb_grub_dropin_render "$rendered") <(sed '/^# gb-managed-sha256: /d' "$GB_GRUB_DROPIN") &>/dev/null; then
+            echo ""
+            info "GRUB is already fully optimised - nothing to change."
+            return 0
+        fi
+        echo ""
+        info "Writing ${GB_GRUB_DROPIN}:"
+        echo "  $rendered" | fold -s -w 100 | sed 's/^/  /'
+        echo ""
+        mkdir -p "$dropin_dir"
+        # grub-mkconfig SOURCES every *.cfg here as shell. A syntax error would
+        # make every later update-grub fail (and with it every kernel upgrade),
+        # so check the text before it lands, and remember the old file so a
+        # failed update-grub below can put it back.
+        _gb_grub_dropin_render "$rendered" | bash -n /dev/stdin \
+            || { gb_warn_ui "Refusing to write ${GB_GRUB_DROPIN}: rendered text is not valid shell"; return 1; }
+        _gb_grub_prev="$(mktemp)"
+        if [[ -f "$GB_GRUB_DROPIN" ]]; then cp -p "$GB_GRUB_DROPIN" "$_gb_grub_prev"; else : > "$_gb_grub_prev.absent"; fi
+        _gb_grub_dropin_render "$rendered" | gb_managed_write "$GB_GRUB_DROPIN" 644
+        gb_ok "Wrote ${GB_GRUB_DROPIN}"
+    else
+        if [[ -z "$new_flags" ]]; then
+            echo ""
+            info "GRUB is already fully optimised - nothing to change."
+            return 0
+        fi
+        if [[ ! -f "$grub_file" ]]; then
+            gb_warn_ui "No /etc/default/grub.d on this distro and ${grub_file} could not be recovered - cannot persist these flags this run."
+            return 0
+        fi
+        local base_line combined bak
+        base_line=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$grub_file" | head -1 | sed 's/^GRUB_CMDLINE_LINUX_DEFAULT=//;s/^"//;s/"$//')
+        combined=$(echo "${base_line} ${new_flags}" | tr -s ' ' | sed 's/^ //;s/ $//')
 
-    if [[ "$new_line" == "$current_line" ]] && [[ -z "$new_flags" ]]; then
-        info ""
-        info "GRUB is already fully optimised - nothing to change."
-        return 0
+        echo ""
+        info "Current GRUB cmdline:"
+        echo "  $base_line" | fold -s -w 100 | sed 's/^/  /'
+        echo ""
+        info "New GRUB cmdline:"
+        echo "  $combined" | fold -s -w 100 | sed 's/^/  /'
+        echo ""
+
+        bak="${grub_file}.bak.$(date +%Y%m%d_%H%M%S)"
+        cp "$grub_file" "$bak"
+        info "Backup saved: $bak"
+        sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"${combined}\"|" "$grub_file"
     fi
-
-    echo ""
-    info "Current GRUB cmdline:"
-    echo "  $current_line" | fold -s -w 100 | sed 's/^/  /'
-    echo ""
-    info "New GRUB cmdline:"
-    echo "  $new_line" | fold -s -w 100 | sed 's/^/  /'
-    echo ""
-
-    # ── Backup + write ──────────────────────────────────────────────────
-    local bak="${grub_file}.bak.$(date +%Y%m%d_%H%M%S)"
-    cp "$grub_file" "$bak"
-    info "Backup saved: $bak"
-
-    # Replace the GRUB_CMDLINE_LINUX_DEFAULT line
-    sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"${new_line}\"|" "$grub_file"
 
     info "Running update-grub..."
-    update-grub 2>&1 | grep -v "^$" | sed 's/^/  /'
+    local _ug_log _ug_rc=0
+    _ug_log="$(mktemp)"
+    update-grub >"$_ug_log" 2>&1 || _ug_rc=$?
+    grep -v "^$" "$_ug_log" | sed 's/^/  /' || true
+    if (( _ug_rc != 0 )); then
+        if [[ -n "${_gb_grub_prev:-}" && -e "$_gb_grub_prev.absent" ]]; then
+            rm -f "$GB_GRUB_DROPIN"
+        elif [[ -n "${_gb_grub_prev:-}" && -s "$_gb_grub_prev" ]]; then
+            cp -p "$_gb_grub_prev" "$GB_GRUB_DROPIN"
+        fi
+        gb_warn_ui "update-grub failed (rc=${_ug_rc}); ${GB_GRUB_DROPIN} was put back as it was. Log: ${_ug_log}"
+        return 1
+    fi
 
     echo ""
     info "GRUB updated. Changes take effect on next reboot."
@@ -7140,190 +7852,17 @@ cmd_tune_grub() {
 
 # ---- tune-sysctl -------------------------------------------------------
 # Consolidate conflicting sysctl files and add missing compute settings.
-# Writes /etc/sysctl.d/99-zzz-greenboost.conf - loaded last, wins all
-# conflicts. Previous files are left untouched (history/documentation).
+# Writes /etc/sysctl.d/99-zzz-greenboost.conf through _tune_persist_sysctl, so
+# install, `tune` and `tune-sysctl` all write the same bytes (round 4, INS/R2-02).
 
 cmd_tune_sysctl() {
     need_root tune-sysctl
-    detect_hardware
-
     local dest="/etc/sysctl.d/99-zzz-greenboost.conf"
 
-    info "Writing definitive sysctl config: $dest"
-    info "Hardware: ${CPU_NAME} | ${GPU_NAME} | ${RAM_TYPE}-${RAM_SPEED_DISPLAY} MT/s | PCIe Gen ${PCIE_GEN} ${PCIE_WIDTH} (~${PCIE_BW_GBS} GB/s) | ${NVME_SIZE_GB} GB NVMe"
-    info "This file loads last (99-zzz) and wins over all conflicting files."
-    echo ""
-
-    # Show conflicts found
-    info "Conflicts resolved:"
-    info "  vm.swappiness       : multiple files set 10/20 → final: 10"
-    info "  vm.dirty_ratio      : 15 vs 40 → final: 40"
-    info "  vm.dirty_background_ratio: 5 vs 10 → final: 10"
-    info "  kernel.sched_autogroup_enabled: 1 → 0 (bad for compute, groups by session)"
-    info "New settings added:"
-    if [[ -e /proc/sys/kernel/sched_migration_cost_ns ]]; then
-        info "  kernel.sched_migration_cost_ns: 5000000 (5ms - keep threads on P-cores)"
-        info "  kernel.sched_min_granularity_ns: 10000000 (10ms - better for large tasks)"
-        info "  kernel.sched_wakeup_granularity_ns: 15000000 (reduces spurious wakeups)"
-    else
-        info "  CFS sched knobs: skipped (kernel $(uname -r) uses EEVDF, not CFS)"
-    fi
-    echo ""
-
-    # Write the header line with detected hardware (variables don't expand in 'HEREDOC')
-    printf '# GreenBoost v3.4 - Definitive sysctl config\n' > "$dest"
-    printf '# Hardware: %s | %s | %s-%s MT/s | PCIe Gen %s %s (~%s GB/s) | %s GB NVMe\n' \
-        "${CPU_NAME}" "${GPU_NAME}" "${RAM_TYPE}" "${RAM_SPEED_MT}" \
-        "${PCIE_GEN}" "${PCIE_WIDTH}" "${PCIE_BW_GBS}" "${NVME_SIZE_GB}" >> "$dest"
-    printf '# Loaded last (99-zzz) - wins all conflicts with earlier sysctl.d files.\n' >> "$dest"
-    printf '# Do NOT edit other sysctl.d files; make changes here instead.\n' >> "$dest"
-
-    # vm.nr_overcommit_hugepages: scale to T2 pool size so the kernel can back
-    # the full pool with 2 MB THP pages.  GB_VIRT GB × 512 pages/GB = pages.
-    local overcommit_hp=$(( GB_VIRT * 512 ))
-
-    cat >> "$dest" << 'SYSCTL_EOF'
-
-# ── Swap / memory pressure ───────────────────────────────────────────────
-# Keep LLM weights in system RAM (T2); only spill to NVMe (T3) under real pressure.
-vm.swappiness = 10
-
-# ── Write-back (Samsung 990 EVO Plus sustains 6,300 MB/s writes) ─────────
-# Allow up to 40% dirty pages before throttling writes (~25 GB at 64 GB RAM).
-# Background flush at 10% (~6.4 GB) - keeps NVMe busy without stalling allocs.
-vm.dirty_ratio = 40
-vm.dirty_background_ratio = 10
-vm.dirty_writeback_centisecs = 1500
-vm.dirty_expire_centisecs = 3000
-
-# ── Memory allocation ─────────────────────────────────────────────────────
-# LLM frameworks (llama.cpp, PyTorch, JAX) mmap model files and pre-reserve
-# large virtual address ranges. Without overcommit the kernel rejects these.
-vm.overcommit_memory = 1
-
-# Max VMA regions: transformer models (70B+) split across thousands of mmap
-# file segments. Default 65530 is too low; 2M covers any realistic case.
-vm.max_map_count = 2147483642
-
-SYSCTL_EOF
-
-    # Free-memory floor, derived from THIS box's RAM rather than fixed at the
-    # reference machine's 512 MB. Two reasons it stopped being a literal:
-    #
-    #  1. The hardcoded-hardware rule , 512 MB is 0.8% of this box's 64 GB and
-    #     8% of an 8 GB feeder, which is a completely different policy on each.
-    #  2. It silently contradicted linux-kernel-inference's own
-    #     /etc/sysctl.d/95-greenboost-t2.conf, which asks for 1 GB. This file
-    #     sorts LAST and wins every conflict by design, so the T2
-    #     direct-reclaim guard that project ships was running at half strength
-    #     on this box with nothing reporting it (measured 2026-08-20:
-    #     configured 1048576, live 524288). Deriving the same ~1.6% both
-    #     places makes them agree by construction instead of by coincidence.
-    local _memtotal_kb
-    _memtotal_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
-    local _min_free_kb=$(( _memtotal_kb * 16 / 1000 ))    # ~1.6% of RAM
-    (( _min_free_kb < 65536 )) && _min_free_kb=65536      # floor: 64 MB
-    printf '\n# Free-memory floor: ~1.6%% of this box'"'"'s %s kB of RAM. Keeps kswapd\n' "$_memtotal_kb" >> "$dest"
-    printf '# ahead of the allocator so the T2 pool'"'"'s 2 MB THP faults do not hit\n' >> "$dest"
-    printf '# direct reclaim mid-inference. Derived, not fixed - see greenboost_setup.sh.\n' >> "$dest"
-    printf 'vm.min_free_kbytes = %d\n' "$_min_free_kb" >> "$dest"
-
-    cat >> "$dest" << 'SYSCTL_EOF'
-
-# Proactive compaction: GreenBoost T2 needs contiguous 2 MB hugepage ranges.
-# Value 20 = moderate background compaction (0=off, 100=aggressive).
-vm.compaction_proactiveness = 20
-
-# Keep inode/dentry caches alive - LLM loaders open thousands of weight files.
-vm.vfs_cache_pressure = 50
-SYSCTL_EOF
-
-    # Overcommit hugepage pool: sized to cover the full T2 System DDR pool.
-    # Formula: GB_VIRT × 512 = number of 2 MB pages.  RAM speed ${RAM_SPEED_MT} MT/s.
-    printf '# Overcommit hugepage pool: %d × 2 MB = %d GB - covers T2 pool (%d GB, %s-%s MT/s)\n' \
-        "$overcommit_hp" "$(( overcommit_hp * 2 / 1024 ))" "$GB_VIRT" "$RAM_TYPE" "$RAM_SPEED_MT" >> "$dest"
-    printf 'vm.nr_overcommit_hugepages = %d\n' "$overcommit_hp" >> "$dest"
-
-    cat >> "$dest" << 'SYSCTL_EOF'
-
-# Disable zone reclaim: single NUMA node - cross-zone reclaim wastes cycles.
-vm.zone_reclaim_mode = 0
-
-# ── CPU scheduler (i9-14900KF P-core / E-core hybrid) ────────────────────
-# Disable session-based task grouping. sched_autogroup groups shell tasks
-# together which is good for desktop but HURTS inference: Ollama worker
-# threads (long-running compute) compete with short interactive tasks for
-# scheduler time-slices in the same group.
-kernel.sched_autogroup_enabled = 0
-
-# CFS scheduler knobs below (sched_migration_cost_ns, sched_min_granularity_ns,
-# sched_wakeup_granularity_ns) are appended conditionally after this heredoc:
-# they were removed in kernel 6.6 when EEVDF replaced CFS and do not exist
-# on kernel 7.0+. Attempting to set them produces harmless but noisy errors.
-
-# ── NUMA ──────────────────────────────────────────────────────────────────
-# Single-socket i9-14900KF - all CPUs are on NUMA node 0. Automatic NUMA
-# balancing scans pages and attempts cross-node migrations that will never
-# happen. Disable to remove the page-scanning overhead.
-kernel.numa_balancing = 0
-
-# ── File system ───────────────────────────────────────────────────────────
-# GGUF model files (70B+ = thousands of weight tensors) require many open
-# file descriptors and inotify watches during model loading.
-fs.file-max = 2097152
-fs.inotify.max_user_watches = 524288
-fs.inotify.max_user_instances = 1024
-
-# ── Network (Ollama API / distributed inference) ──────────────────────────
-# Large buffers for Ollama HTTP streaming API and any future multi-GPU setup.
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-net.ipv4.tcp_rmem = 4096 87380 134217728
-net.ipv4.tcp_wmem = 4096 65536 134217728
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 5000
-net.ipv4.tcp_fastopen = 3
-
-# ── Cluster fabric (host <-> feeder, greenboost-netd binary protocol) ──────
-# The fabric link goes idle between bursts (heartbeats every ~2s, then a
-# burst of H2D/D2H chunks or a per-layer activation handoff). Linux resets
-# cwnd after any idle period (RFC 2861), so every burst restarts from a tiny
-# window and slow-starts back up - the dominant added latency for small,
-# frequent transfers. Disabling this is safe on a private LAN link (no
-# outside traffic to protect against a runaway sender).
-net.ipv4.tcp_slow_start_after_idle = 0
-
-# ── Perf / profiling access ───────────────────────────────────────────────
-# Allow nsys / perf / CUDA Nsight without sudo (needed for GPU profiling).
-kernel.perf_event_paranoid = 1
-kernel.kptr_restrict = 0
-SYSCTL_EOF
-
-    # CFS scheduler params: only present on kernels < 6.6 (CFS).
-    # Kernel 6.6+ uses EEVDF - these knobs were removed entirely.
-    _sysctl_if_exists() {
-        local key="$1" val="$2" proc_path="$3"
-        if [[ -e "$proc_path" ]]; then
-            printf '\n# CFS scheduler (kernel < 6.6 only)\n%s = %s\n' "$key" "$val" >> "$dest"
-        fi
-    }
-    _sysctl_if_exists kernel.sched_migration_cost_ns   5000000  /proc/sys/kernel/sched_migration_cost_ns
-    _sysctl_if_exists kernel.sched_min_granularity_ns  10000000 /proc/sys/kernel/sched_min_granularity_ns
-    _sysctl_if_exists kernel.sched_wakeup_granularity_ns 15000000 /proc/sys/kernel/sched_wakeup_granularity_ns
-
-    # BBR congestion control: lower latency + better throughput than the
-    # default CUBIC on the host<->feeder LAN link (bulk weight/KV transfers
-    # mixed with small latency-sensitive control RPCs). Only written if the
-    # running kernel actually has the module - avoids a hard sysctl error on
-    # kernels built without CONFIG_TCP_CONG_BBR.
-    modprobe tcp_bbr 2>/dev/null || true
-    if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
-        printf '\n# BBR congestion control - better latency/throughput than CUBIC for the\n# host<->feeder cluster fabric link.\nnet.ipv4.tcp_congestion_control = bbr\n' >> "$dest"
-    else
-        info "  BBR congestion control: unavailable on this kernel (tcp_bbr module missing) - skipped"
-    fi
-
-    sysctl -p "$dest" 2>&1 | grep -v "^$" | sed 's/^/  /' || true
+    info "Writing sysctl config: $dest (same content as 'tune': swappiness, dirty ratios)"
+    info "vm.overcommit_memory stays at the kernel default and vm.max_map_count at its"
+    info "current value; the supervisor actuates vm.* at run time (GB_OS_TUNE=1)."
+    _tune_persist_sysctl
     echo ""
     info "sysctl applied and persistent (survives reboot via $dest)."
 }
@@ -9189,7 +9728,7 @@ tok_per_sec=${IT_TOK_PER_SEC:-0}  first_token_ms=${IT_FIRST_TOKEN_MS:-0}  total_
 [memory]
 vram_used_mb=${GPU_VRAM_USED_MB:-0}  vram_total_mb=${GPU_VRAM_TOTAL_MB:-0}  t2_alloc_mb=${PI_T2_ALLOC_MB:-0}  t3_alloc_mb=${PI_T3_ALLOC_MB:-0}
 [module]
-loaded=$(lsmod 2>/dev/null | grep -c "^${DRIVER_NAME} " || echo 0)  version=${GB_VERSION}  kv_reserve_mb=${PB_KV_RSV_MB:-0}
+loaded=$(grep -c "^${DRIVER_NAME} " <<< "$(lsmod 2>/dev/null)" || true)  version=${GB_VERSION}  kv_reserve_mb=${PB_KV_RSV_MB:-0}
 [ollama]
 model=${OL_MODEL:--}  ctx_size=${OL_CTX_SIZE:-0}  param_count=${OL_PARAM_COUNT:--}  vram_mb=${OL_VRAM_MB:-0}
 [warnings]
@@ -10161,14 +10700,13 @@ _gb_apply_fabric_net_tuning() {
     gb_ok "Network link tuned (tcp_slow_start_after_idle=0$( [[ $_bbr_ok -eq 1 ]] && echo ', BBR' ))"
 
     # Persisting to /etc/sysctl.d requires root; if not root the live-apply
-    # above still helps this boot, and Full Install's tune-sysctl step
-    # (which writes the full, canonical network block) will persist it
-    # properly the next time it runs as root.
+    # above still helps this boot; the persisted lines below are appended the
+    # next time this runs as root.
     [[ $EUID -eq 0 ]] || return 0
     local dest="/etc/sysctl.d/99-zzz-greenboost.conf"
     mkdir -p /etc/sysctl.d
     if ! grep -q "^net\.ipv4\.tcp_slow_start_after_idle" "$dest" 2>/dev/null; then
-        printf '\n# Cluster fabric (auto-applied by feed/connect - see tune-sysctl for the full network block)\nnet.ipv4.tcp_slow_start_after_idle = 0\n' >> "$dest"
+        printf '\n# Cluster fabric (auto-applied by feed/connect - idempotent append)\nnet.ipv4.tcp_slow_start_after_idle = 0\n' >> "$dest"
     fi
     if [[ $_bbr_ok -eq 1 ]] && ! grep -q "^net\.ipv4\.tcp_congestion_control" "$dest" 2>/dev/null; then
         printf 'net.ipv4.tcp_congestion_control = bbr\n' >> "$dest"
@@ -10213,11 +10751,14 @@ cmd_feed() {
             if [[ -f "$_swap_target" ]]; then
                 _cur_swap_gb=$(( $(stat -c%s "$_swap_target" 2>/dev/null || echo 0) / 1073741824 ))
             fi
-            if [[ $_cur_swap_gb -lt $_t3_min ]]; then
+            if ! gb_swap_auto_ok; then
+                :   # reason already printed: one swapfile per machine
+            elif [[ $_cur_swap_gb -lt $_t3_min ]]; then
                 local _disk_free
                 _disk_free=$(df -BG /var/lib/greenboost 2>/dev/null | awk 'NR==2{gsub("G",""); print $4}')
                 local _disk_cap=$(( ${_disk_free:-0} * 80 / 100 ))
                 [[ $_t3_min -gt $_disk_cap ]] && _t3_min=$_disk_cap
+                [[ $_t3_min -gt $GB_SWAP_MAX_GB ]] && _t3_min=$GB_SWAP_MAX_GB
                 if [[ $_t3_min -gt 0 ]]; then
                     info "Provisioning T3 swap: ${_t3_min} GB (T1=${_t1_gb} GB × 2) → ${_swap_target}"
                     swapoff "$_swap_target" 2>/dev/null || true
@@ -10227,7 +10768,7 @@ cmd_feed() {
                     mkswap "$_swap_target" >/dev/null
                     swapon -p 10 "$_swap_target"
                     if ! grep -qF "$_swap_target" /etc/fstab 2>/dev/null; then
-                        echo "${_swap_target} swap swap defaults,nofail 0 0" >> /etc/fstab
+                        echo "${_swap_target} swap swap defaults,nofail,pri=10 0 0" >> /etc/fstab
                     fi
                     gb_ok "T3 swap: ${_t3_min} GB ready at ${_swap_target}"
                 else
@@ -11008,7 +11549,7 @@ cmd_feeders_setup_sudo() {
         local _setup_rc=0
         "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=30 \
             -o StrictHostKeyChecking=no "${_ssh_user}@${_ip}" \
-            "sudo -S sh -c 'printf \"%s\\n%s\\n\" \"${_ssh_user} ALL=(root) NOPASSWD: /bin/bash\" \"${_ssh_user} ALL=(root) NOPASSWD: /usr/bin/python3\" > /etc/sudoers.d/greenboost && chmod 440 /etc/sudoers.d/greenboost && echo SUDOERS_OK' 2>/dev/null" \
+            "sudo -S sh -c 'printf \"%s\\n%s\\n\" \"${_ssh_user} ALL=(root) NOPASSWD: /bin/bash\" \"${_ssh_user} ALL=(root) NOPASSWD: /usr/bin/python3\" > /etc/sudoers.d/.greenboost.new && chmod 440 /etc/sudoers.d/.greenboost.new && visudo -c -f /etc/sudoers.d/.greenboost.new >/dev/null && mv -f /etc/sudoers.d/.greenboost.new /etc/sudoers.d/greenboost && echo SUDOERS_OK' 2>/dev/null" \
             <<< "$_sudo_pass" | grep -q "SUDOERS_OK" || _setup_rc=$?
         if (( _setup_rc == 0 )); then
             printf "    %b\n" "${C_LIME}✓  sudo configured - upgrade-greenboost will now work${C_RESET}"
@@ -11171,7 +11712,8 @@ cmd_feeders_redeploy_netd() {
 
     # 4. Confirm the fix is in the installed binary (source-level check)
     local _fix_check
-    _fix_check=$(grep -c "client_init(struct client" "$MODULE_DIR/greenboost_netd.c" 2>/dev/null || echo 0)
+    _fix_check=$(grep -c "client_init(struct client" "$MODULE_DIR/greenboost_netd.c" 2>/dev/null || true)
+    _fix_check="${_fix_check:-0}"
     if [[ "$_fix_check" -ge 1 ]]; then
         gb_ok "Heartbeat-underflow fix confirmed in source (client_init takes now_ms)"
     else
@@ -11416,7 +11958,7 @@ cmd_feeders_sync_ollama() {
         local _rc=0
         "${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=30 -o StrictHostKeyChecking=no \
             "${_user}@${_ip}" \
-            "sudo -n bash -c 'curl -fsSL https://ollama.com/install.sh -o /tmp/gb_ollama_install.sh && OLLAMA_VERSION=\"${_hostver}\" bash /tmp/gb_ollama_install.sh; rm -f /tmp/gb_ollama_install.sh'" \
+            "sudo -n bash -c 'd=\$(mktemp -d /tmp/gb_ollama.XXXXXX) && curl -fsSL https://ollama.com/install.sh -o \$d/install.sh && OLLAMA_VERSION=\"${_hostver}\" bash \$d/install.sh; rm -f \$d/install.sh'" \
             2>&1 | sed 's/^/    /' || _rc=$?
         local _newver
         _newver=$("${_ssh_as[@]}" ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
@@ -13040,7 +13582,8 @@ cmd_gen_inference_config() {
     # -- Cluster feeder count
     local cluster_feeders=0
     if [[ -f "/etc/greenboost/cluster.conf" ]]; then
-        cluster_feeders=$(grep -v '^[[:space:]]*#' /etc/greenboost/cluster.conf 2>/dev/null | grep -c '.' || echo 0)
+        cluster_feeders=$(grep -v '^[[:space:]]*#' /etc/greenboost/cluster.conf 2>/dev/null | grep -c '.' || true)
+        cluster_feeders="${cluster_feeders:-0}"
     fi
 
     # -- TurboQuant: if not forced via flag, read the current global flag
@@ -13068,7 +13611,7 @@ cmd_gen_inference_config() {
         out+="OLLAMA_KV_CACHE_TYPE=${kv_type}\n"
         out+="OLLAMA_NUM_PARALLEL=1\n"
         out+="OLLAMA_MAX_LOADED_MODELS=1\n"
-        out+="OLLAMA_KEEP_ALIVE=-1\n"
+        out+="OLLAMA_KEEP_ALIVE=${GB_OLLAMA_KEEP_ALIVE:-5m}\n"
         out+="OLLAMA_NUM_GPU=999\n"
         out+="CUDA_VISIBLE_DEVICES=0\n"
         out+="GREENBOOST_ACTIVE=1\n"
@@ -13449,6 +13992,7 @@ cmd_synapse_pull() {
 cmd_synapse_list()         { _gb_synapse_run list "$@"; }
 cmd_synapse_rm()           { need_root "synapse rm"; [[ -z "${1:-}" ]] && die "Usage: sudo greenboost synapse rm <name>"; _gb_synapse_run rm "$@"; }
 cmd_synapse_index_ollama() { need_root "synapse index-ollama"; _gb_synapse_run index-ollama "$@"; }
+cmd_synapse_recover_cache() { need_root "synapse recover-cache"; _gb_synapse_run recover-cache "$@"; }
 cmd_synapse_build_engine() { need_root "synapse build-engine";  _gb_synapse_run build-engine; }
 cmd_synapse_update_engine(){ need_root "synapse update-engine"; _gb_synapse_run update-engine; }
 
@@ -13491,12 +14035,13 @@ cmd_synapse() {
         list)          shift; cmd_synapse_list "$@" ;;
         rm)            shift; cmd_synapse_rm "$@" ;;
         index-ollama)  shift; cmd_synapse_index_ollama "$@" ;;
+        recover-cache) shift; cmd_synapse_recover_cache "$@" ;;
         build-engine)  cmd_synapse_build_engine ;;
         update-engine) cmd_synapse_update_engine ;;
         run|serve)     shift; cmd_synapse_serve "$@" ;;
         stop)          shift; cmd_synapse_stop "$@" ;;
         ps)            shift; cmd_synapse_ps "$@" ;;
-        *) die "Usage: greenboost synapse [login|pull|list|rm|index-ollama|build-engine|update-engine|run|stop|ps]" ;;
+        *) die "Usage: greenboost synapse [login|pull|list|rm|index-ollama|recover-cache|build-engine|update-engine|run|stop|ps]" ;;
     esac
 }
 
@@ -13851,7 +14396,7 @@ cmd_help() {
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "tune"            "Runtime tuning (governor, NVMe, THP, sysctl)"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "tune-revert"     "Restore continuous OS-tuner levers to pre-tune baseline"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "tune-grub"       "Fix GRUB boot params (THP=always, rcu_nocbs, nohz_full…)"
-        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "tune-sysctl"     "Consolidate sysctl + apply compute-optimized knobs"
+        printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "tune-sysctl"     "Write the sysctl drop-in (swappiness, dirty ratios)"
         printf "  ${C_LIME}%-26s${C_RESET} ${C_GRAY}%s${C_RESET}\n" "tune-all"        "Run tune + tune-grub + tune-sysctl + tune-libs"
         echo -e ""
         echo -e "  ${C_CYAN}${C_BOLD}DIAGNOSTICS:${C_RESET}"
@@ -13978,12 +14523,24 @@ cmd_install_build_deps() {
             if [[ "$_line" == pmstatus:* ]]; then
                 IFS=: read -r _ _pkg _pct _msg <<< "$_line"
                 _pct=${_pct%%.*}
-                local _filled=$(( _pct * 40 / 100 )) _empty=$(( 40 - _pct * 40 / 100 ))
-                printf "\r  ${C_GRAY}[%3d%%]${C_RESET} ${C_LIME}%s${C_GRAY}%s${C_RESET}  ${C_DIM}%-28s${C_RESET}" \
+                # Bar + name budget scaled to the terminal (was a hardcoded
+                # 40-cell bar + unclamped %-28s package name — wraps on any
+                # terminal narrower than ~80 cols; see gb_spin's comment).
+                local cols; cols=$(tput cols 2>/dev/null || echo 80)
+                local _remaining=$(( cols - 12 )); (( _remaining < 20 )) && _remaining=20
+                local _bar_width=$(( _remaining * 2 / 5 ))
+                (( _bar_width < 10 )) && _bar_width=10
+                (( _bar_width > 40 )) && _bar_width=40
+                local _name_budget=$(( _remaining - _bar_width ))
+                (( _name_budget < 8 )) && _name_budget=8
+                local _filled=$(( _pct * _bar_width / 100 ))
+                local _empty=$(( _bar_width - _filled ))
+                local _pkg_t; _pkg_t=$(_trunc "$_pkg" "$_name_budget")
+                printf "\r  ${C_GRAY}[%3d%%]${C_RESET} ${C_LIME}%s${C_GRAY}%s${C_RESET}  ${C_DIM}%-${_name_budget}s${C_RESET}" \
                     "$_pct" \
                     "$(printf '█%.0s' $(seq 1 "$_filled" 2>/dev/null || true))" \
                     "$(printf '░%.0s' $(seq 1 "$_empty"  2>/dev/null || true))" \
-                    "$_pkg"
+                    "$_pkg_t"
             fi
         done < "$_fifo"
 
@@ -13993,7 +14550,7 @@ cmd_install_build_deps() {
     fi
 
     # Ensure cpuid module loads at boot
-    if ! grep -q cpuid /etc/modules-load.d/*.conf 2>/dev/null; then
+    if ! grep -qs cpuid /etc/modules-load.d/*.conf; then
         echo cpuid > /etc/modules-load.d/ai-workstation.conf
     fi
 
@@ -14054,12 +14611,24 @@ cmd_install_optional_pkgs() {
         if [[ "$_line" == pmstatus:* ]]; then
             IFS=: read -r _ _pkg _pct _msg <<< "$_line"
             _pct=${_pct%%.*}
-            local _filled=$(( _pct * 40 / 100 )) _empty=$(( 40 - _pct * 40 / 100 ))
-            printf "\r  ${C_GRAY}[%3d%%]${C_RESET} ${C_LIME}%s${C_GRAY}%s${C_RESET}  ${C_DIM}%-28s${C_RESET}" \
+            # Bar + name budget scaled to the terminal (was a hardcoded
+            # 40-cell bar + unclamped %-28s package name — wraps on any
+            # terminal narrower than ~80 cols; see gb_spin's comment).
+            local cols; cols=$(tput cols 2>/dev/null || echo 80)
+            local _remaining=$(( cols - 12 )); (( _remaining < 20 )) && _remaining=20
+            local _bar_width=$(( _remaining * 2 / 5 ))
+            (( _bar_width < 10 )) && _bar_width=10
+            (( _bar_width > 40 )) && _bar_width=40
+            local _name_budget=$(( _remaining - _bar_width ))
+            (( _name_budget < 8 )) && _name_budget=8
+            local _filled=$(( _pct * _bar_width / 100 ))
+            local _empty=$(( _bar_width - _filled ))
+            local _pkg_t; _pkg_t=$(_trunc "$_pkg" "$_name_budget")
+            printf "\r  ${C_GRAY}[%3d%%]${C_RESET} ${C_LIME}%s${C_GRAY}%s${C_RESET}  ${C_DIM}%-${_name_budget}s${C_RESET}" \
                 "$_pct" \
                 "$(printf '█%.0s' $(seq 1 "$_filled" 2>/dev/null || true))" \
                 "$(printf '░%.0s' $(seq 1 "$_empty"  2>/dev/null || true))" \
-                "$_pkg"
+                "$_pkg_t"
         fi
     done < "$_fifo"
 
@@ -14153,6 +14722,7 @@ cmd_full_install() {
 
     # The purge + lib swap below kill any in-flight GPU inference , surface
     # that BEFORE touching anything (interactive: confirm; scripted: warn).
+    _gb_preflight_build
     _gb_check_live_gpu_users
 
     # 0 - Purge any previous GreenBoost install to guarantee a clean slate
@@ -14277,7 +14847,8 @@ cmd_full_install() {
     # build to target current GPU architectures (e.g. Blackwell sm_120,
     # which requires CUDA >= 12.8 - a distro-packaged nvcc is often older).
     gb_info "Checking CUDA toolkit (gb-synapse's engine build needs a current one)..."
-    _gb_install_cuda_toolkit
+    # Non-fatal like 4c: an unreachable NVIDIA repo must not roll back an otherwise complete install.
+    _gb_install_cuda_toolkit || gb_warn_ui "CUDA toolkit step failed , install it later: https://developer.nvidia.com/cuda-downloads (gb-synapse's engine build needs it)"
 
     # 4c - GPUDirect Storage kernel module (not pulled in by cuda-toolkit -
     # see _gb_install_nvidia_gds's own comment for why). Full install only,
@@ -14293,10 +14864,12 @@ cmd_full_install() {
     cmd_tune
     gb_ok "sysctl and runtime tuning applied"
 
-    # 5b - GRUB boot parameters (requires reboot)
+    # 5b - GRUB boot parameters (requires reboot). Non-fatal: a distro grub
+    # package purge can delete /etc/default/grub out from under a still-
+    # installed sibling grub package (2026-08-31 incident) - that's a
+    # recoverable config gap, not a reason to roll back a completed install.
     gb_info "Applying: GRUB boot parameters (transparent_hugepage, rcu_nocbs, nohz_full)"
-    cmd_tune_grub
-    gb_ok "GRUB updated"
+    cmd_tune_grub || gb_warn_ui "GRUB boot params not applied , run: sudo greenboost tune-grub"
 
     # Always regenerate profile on full-install to ensure it reflects current hardware.
     gb_info "Regenerating hardware profile..."
@@ -14501,7 +15074,7 @@ esac
 case "$COMMAND" in
     # Primary commands
     install)             cmd_install            ;;
-    uninstall)           cmd_uninstall          ;;
+    uninstall)           cmd_uninstall "${@:2}" ;;
     apparmor-uninstall)  cmd_apparmor_uninstall ;;
     backup)              need_root backup; _gb_backup_create ;;
     restore)             need_root restore; _gb_backup_restore ;;

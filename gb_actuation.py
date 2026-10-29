@@ -7,7 +7,9 @@ gateway (gb_a2a). No duplicated actuation logic between control planes.
 Safety model (identical to gb_mcp.optimize_inference): every verb is DRY-RUN
 (returns the plan it *would* apply) unless BOTH:
   - the caller passes confirm=True, AND
-  - the server env has GB_ORCH_ACTUATE=1
+  - the server env has GB_ORCH_ACTUATE=1, AND
+  - the call is authorized out of band (a valid token or a person at a terminal:
+    see "authorization" below; a request field is never authorization)
 When applied, the verb emits a dataflux `actuation` event so it is auditable in
 the flight recorder and correlatable with the snapshot that triggered it.
 
@@ -19,8 +21,12 @@ DO steer the next pipeline run.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
+import hmac
 import os
 import shlex
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -30,16 +36,104 @@ from pathlib import Path
 INFERENCE_ENV = Path(os.environ.get("GB_INFERENCE_ENV", "/etc/greenboost/inference.env"))
 
 
-# ── gate + audit ────────────────────────────────────────────────────────────
+# ── authorization (SEC-01) ──────────────────────────────────────────────────
+#
+# `confirm` is a field the CALLER writes: an HTTP client, a prompt-injected model
+# calling an MCP tool. It states intent, it proves nothing, so it is never an
+# authorization. An actuating verb is applied only when ALL of these hold:
+#   1. the caller asked for it (confirm=True),
+#   2. the server env says actuation is enabled (GB_ORCH_ACTUATE=1),
+#   3. the call runs inside an authorization context that only the TRANSPORT
+#      or a human can open, out of band from the request fields:
+#        a. actuation_auth(token): the presented token equals the one in the
+#           token file (GB_A2A_TOKEN_FILE, default /etc/greenboost/a2a.token;
+#           a regular file, not a symlink, mode 0600/0400, owned by root, the
+#           service user or GB_OWNER_UID), compared in constant time. The A2A
+#           gateway opens it with the request's Bearer token.
+#        b. interactive_auth(verb): a person types a confirmation on the
+#           controlling terminal (/dev/tty). `python3 gb_actuation.py apply
+#           VERB '{json params}'` uses it. A process without a terminal (an
+#           MCP server on stdio, a daemon, a cron job) cannot open it.
+# Default: deny. Without a context every verb is a dry run that says why.
+
+_AUTH: "contextvars.ContextVar[str]" = contextvars.ContextVar("gb_actuation_auth", default="")
+
+
+def _token_file() -> Path:
+    return Path(os.environ.get("GB_A2A_TOKEN_FILE", "/etc/greenboost/a2a.token"))
+
+
+def _expected_token() -> "tuple[str | None, str]":
+    """(token, reason): the token only from a safe file, else (None, why not)."""
+    p = _token_file()
+    try:
+        fd = os.open(str(p), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        return None, f"token file {p} not usable ({exc.strerror or exc})"
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None, f"token file {p} is not a regular file"
+        if st.st_mode & 0o077:
+            return None, f"token file {p} must be mode 0600 (is {oct(st.st_mode & 0o777)})"
+        owners = {0, os.geteuid()}
+        if os.environ.get("GB_OWNER_UID", "").isdigit():
+            owners.add(int(os.environ["GB_OWNER_UID"]))
+        if st.st_uid not in owners:
+            return None, f"token file {p} is owned by uid {st.st_uid}, not the owner"
+        tok = os.read(fd, 4096).decode("utf-8", "replace").strip()
+    finally:
+        os.close(fd)
+    if len(tok) < 16:
+        return None, f"token file {p} holds a token shorter than 16 characters"
+    return tok, ""
+
+
+@contextlib.contextmanager
+def actuation_auth(presented: "str | None"):
+    """Open an authorization context when `presented` equals the file token (constant-time compare); otherwise
+    open nothing (the verbs inside stay dry runs). Yields True when authorized."""
+    expected, _why = _expected_token()
+    ok = bool(expected and presented and hmac.compare_digest(str(presented).encode(), expected.encode()))
+    tok = _AUTH.set("token") if ok else None
+    try:
+        yield ok
+    finally:
+        if tok is not None:
+            _AUTH.reset(tok)
+
+
+@contextlib.contextmanager
+def interactive_auth(verb: str, summary: str = "", tty_path: str = "/dev/tty"):
+    """Authorize `verb` only if a person types `yes` on the controlling terminal. No terminal means no authorization."""
+    ok = False
+    try:
+        with open(tty_path, "a") as out, open(tty_path, "r") as inp:
+            out.write(f"\nGreenBoost will APPLY {verb}: {summary}\nType 'yes' to apply, anything else cancels: ")
+            out.flush()
+            ok = inp.readline().strip().lower() == "yes"
+    except OSError:
+        ok = False
+    tok = _AUTH.set("interactive") if ok else None
+    try:
+        yield ok
+    finally:
+        if tok is not None:
+            _AUTH.reset(tok)
+
 
 def actuation_gate(confirm: bool) -> dict:
-    """Return {"allowed": bool, "reason": str}. Allowed only when confirm=True
-    AND GB_ORCH_ACTUATE=1 (the double gate). A2A cannot bypass either half."""
+    """{"allowed": bool, "reason": str}. Allowed only when confirm=True AND GB_ORCH_ACTUATE=1 AND the call runs in
+    an authorization context (token or interactive, see above). `confirm` alone never authorizes."""
     if not confirm:
         return {"allowed": False, "reason": "dry-run (confirm=False)"}
     if os.environ.get("GB_ORCH_ACTUATE") != "1":
         return {"allowed": False, "reason": "GB_ORCH_ACTUATE!=1 (double gate)"}
-    return {"allowed": True, "reason": "confirm=True and GB_ORCH_ACTUATE=1"}
+    via = _AUTH.get()
+    if not via:
+        return {"allowed": False, "reason": "not authorized: confirm is a caller-supplied flag and proves nothing; "
+                                            "actuation needs a valid A2A token or an interactive confirmation (dry run)"}
+    return {"allowed": True, "reason": f"confirm=True, GB_ORCH_ACTUATE=1 and authorized ({via})"}
 
 
 def _emit(verb: str, gated: bool, *, kind: str = "actuation", **fields) -> None:
@@ -246,7 +340,7 @@ def serve_and_repoint(model: str, port: int = 0,
                            f"FORGE_OLLAMA_URL={target}")
         return plan
     try:
-        state = gb_synapse.serve(model, port=port)
+        state = gb_synapse.serve(model, port=port, explicit=True, trigger="a2a_serve_and_repoint")
         plan["served"] = getattr(state, "as_dict", lambda: str(state))()
         # Never point FORGE_OLLAMA_URL at a proxy that isn't actually
         # answering — every ai-forge pipeline reading that URL would start
@@ -315,13 +409,18 @@ def run_under_greenboost(command: "list[str] | str", workload: str = "llm",
         plan["error"] = f"shim_env failed: {e}"
         return plan
 
-    run_env = {**os.environ, **env_overlay}
     _emit("run_under_greenboost", True, kind="agent_run", run_id=run_id, status="started",
           command=" ".join(argv), workload=workload)
     t0 = time.monotonic()
+    import gb_lease_client
     try:
-        proc = subprocess.run(argv, cwd=cwd or None, env=run_env, shell=False,
-                              capture_output=True, text=True, timeout=timeout_s)
+        # SP41-42: the command may load a model, so it holds the card as an interactive (P0) client for its whole run.
+        # The env is built inside the lease so the child sees GB_LEASE_HELD and does not ask the arbiter again.
+        with gb_lease_client.lease("owner.interactive", purpose=f"run_under_greenboost {workload}: {argv[0] if argv else ''}",
+                                   wait_s=30, max_hold_s=timeout_s + 60):
+            run_env = {**os.environ, **env_overlay}
+            proc = subprocess.run(argv, cwd=cwd or None, env=run_env, shell=False,
+                                  capture_output=True, text=True, timeout=timeout_s)
         duration = time.monotonic() - t0
         plan["exit_code"]   = proc.returncode
         plan["duration_s"]  = round(duration, 2)
@@ -330,6 +429,9 @@ def run_under_greenboost(command: "list[str] | str", workload: str = "llm",
         _emit("run_under_greenboost", True, kind="agent_run", run_id=run_id,
               status="ok" if proc.returncode == 0 else "error",
               exit_code=proc.returncode, duration_s=round(duration, 2))
+    except gb_lease_client.LeaseRefused as e:       # plain sentence; nothing was started
+        plan["error"] = str(e)
+        _emit("run_under_greenboost", True, kind="agent_run", run_id=run_id, status="refused", error=str(e))
     except subprocess.TimeoutExpired:
         duration = time.monotonic() - t0
         plan["error"] = f"timed out after {timeout_s}s"
@@ -369,6 +471,8 @@ def reclaim_run(scope: str = "residue", kill_min_mb: int = 512,
     emits, for the agent-audit trail."""
     import gb_reclaim
     gate = actuation_gate(confirm)
+    if gate["allowed"] and scope == "all" and _is_root() and os.environ.get("GB_ACTUATION_ROOT_ALL") != "1":
+        gate = {"allowed": False, "reason": "scope=all as root is not served over this surface (SEC-01); run it as the owner"}
     plan = gb_reclaim.plan_reclaim(scope=scope, kill_min_mb=kill_min_mb)
     result = {"verb": "reclaim_run", "scope": scope, "gate": gate,
               "targets": plan["targets"]}
@@ -382,6 +486,55 @@ def reclaim_run(scope: str = "residue", kill_min_mb: int = 512,
     result["failed"] = outcome["failed"]
     _emit("reclaim_run", True, scope=scope, n_killed=len(outcome["killed"]),
           n_failed=len(outcome["failed"]))
+    return result
+
+
+_PHASE_LEASES: dict = {}
+
+
+def gpu_phase_acquire(name: str, need_pct: float = 0.0, *, ttl_s: float = 300.0, wait_s: float = 0.0, owner: str = "mcp",
+                      cls: str = "image", confirm: bool = False) -> dict:
+    """Take the shared GPU phase lease (gb_phase.py) on behalf of an agent. DRY-RUN (reports what the phase would meet)
+    unless confirm=True AND GB_ORCH_ACTUATE=1, the same double gate every actuating verb uses: it can pause gb-synapse's served
+    models to make room. The lease is held by the MCP server process, refreshed by a heartbeat, and ends by gpu_phase_release(token)
+    or after ttl_s, whichever comes first, so an agent that forgets cannot hold the card forever. Foreign processes are never touched."""
+    import threading
+    import gb_phase
+    gate = actuation_gate(confirm)
+    status = gb_phase.phase_status(need_pct)
+    result = {"verb": "gpu_phase_acquire", "phase": name, "gate": gate, "status": status}
+    if not gate["allowed"]:
+        result["dry_run"] = ("would take the lease" if status["would_start"] else
+                             "would NOT start now: " + ("another phase holds the card" if status["holder"] and not status["holder_stale"]
+                                                         else "not enough VRAM is free"))
+        return result
+    try:
+        lease = gb_phase.acquire_phase(name, need_pct, wait_s=wait_s, owner=owner, cls=cls)
+    except gb_phase.PhaseBusy as e:
+        result["refused"] = str(e)
+        return result
+    _PHASE_LEASES[lease.token] = lease
+    timer = threading.Timer(ttl_s, lambda: (_PHASE_LEASES.pop(lease.token, None), lease.release()))
+    timer.daemon = True
+    timer.start()
+    result.update(applied=True, token=lease.token, ttl_s=ttl_s, paused_models=lease.paused)
+    _emit("gpu_phase_acquire", True, phase=name, need_pct=need_pct)
+    return result
+
+
+def gpu_phase_release(token: str, *, confirm: bool = False) -> dict:
+    """Release a lease taken with gpu_phase_acquire. Same double gate. Returns the phase's wall seconds and peak VRAM."""
+    gate = actuation_gate(confirm)
+    lease = _PHASE_LEASES.get(token)
+    result = {"verb": "gpu_phase_release", "gate": gate, "known": lease is not None}
+    if not gate["allowed"]:
+        result["dry_run"] = "would release the lease" if lease else "no such lease held by this server"
+        return result
+    if lease is None:
+        return result
+    _PHASE_LEASES.pop(token, None)
+    result.update(applied=True, **lease.release())
+    _emit("gpu_phase_release", True, phase=lease.name)
     return result
 
 
@@ -538,6 +691,19 @@ def agent_card_v03(bind: str = "127.0.0.1:8790") -> dict:
     }
 
 
+def _is_root() -> bool:
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def _served_verbs(table: dict, root: "bool | None" = None) -> dict:
+    """A root process (the A2A unit today) does not serve run_under_greenboost: it would run a caller's argv as
+    root. GB_ACTUATION_ROOT_ALL=1 restores it for a box that has accepted that risk. The MCP copy runs as the owner."""
+    root = _is_root() if root is None else root
+    if root and os.environ.get("GB_ACTUATION_ROOT_ALL") != "1":
+        return {k: v for k, v in table.items() if k != "run_under_greenboost"}
+    return dict(table)
+
+
 # Verb registry , the A2A JSON-RPC method table AND the MCP tool bodies both
 # resolve through this, so the two control planes can never drift.
 VERBS = {
@@ -551,3 +717,21 @@ VERBS = {
     "reclaim_plan": reclaim_plan,
     "reclaim_run": reclaim_run,
 }
+VERBS = _served_verbs(VERBS)
+
+
+if __name__ == "__main__":     # python3 gb_actuation.py apply VERB '{"param": ...}' : the interactive path (a person at a terminal)
+    import json
+    import sys
+    if len(sys.argv) >= 3 and sys.argv[1] == "apply":
+        fn = VERBS.get(sys.argv[2])
+        if fn is None:
+            raise SystemExit(f"unknown verb {sys.argv[2]!r}; one of {sorted(VERBS)}")
+        kw = json.loads(sys.argv[3]) if len(sys.argv) > 3 else {}
+        kw.pop("confirm", None)
+        with interactive_auth(sys.argv[2], json.dumps(kw)) as ok:
+            if not ok:
+                print("not confirmed on the terminal: dry run only", file=sys.stderr)
+            print(json.dumps(fn(confirm=ok, **kw), indent=1, default=str))
+    else:
+        print("usage: python3 gb_actuation.py apply VERB ['{json params}']   (needs GB_ORCH_ACTUATE=1 and a terminal)")

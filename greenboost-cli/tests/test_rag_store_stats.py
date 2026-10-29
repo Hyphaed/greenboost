@@ -20,14 +20,15 @@ from greenboost_cli.rag import engine as E
 @pytest.fixture
 def store(tmp_path, monkeypatch):
     monkeypatch.setattr(E, "RAG_DIR", tmp_path)
-    monkeypatch.setattr(E, "METADATA_FILE", tmp_path / "metadata.json")
-    monkeypatch.setattr(E, "EMBEDDINGS_FILE", tmp_path / "embeddings.npy")
+    (tmp_path / "current").mkdir()          # the live generation (a real dir is as good as the symlink)
+    monkeypatch.setattr(E, "METADATA_FILE", tmp_path / "current" / "metadata.json")
+    monkeypatch.setattr(E, "EMBEDDINGS_FILE", tmp_path / "current" / "embeddings.npy")
     monkeypatch.setattr(E, "STATS_FILE", tmp_path / "stats.json")
     return tmp_path
 
 
 def _write_meta(store, rows):
-    (store / "metadata.json").write_text(json.dumps(rows))
+    (store / "current" / "metadata.json").write_text(json.dumps(rows))
 
 
 def test_no_store_reports_zero_not_an_error(store):
@@ -62,7 +63,7 @@ def test_a_stale_sidecar_is_ignored(store):
     _write_meta(store, [{"file": "a.py"}])
     E.store_stats()
     _write_meta(store, [{"file": "a.py"}, {"file": "b.py"}, {"file": "c.py"}])
-    os.utime(store / "metadata.json", None)          # store is now newer
+    os.utime(store / "current" / "metadata.json", None)          # store is now newer
     assert E.store_stats() == {"chunks": 3, "files": 3}
 
 
@@ -81,7 +82,7 @@ def test_a_sidecar_with_wrong_types_is_rejected(store):
 
 
 def test_an_unparseable_store_reports_zero(store):
-    (store / "metadata.json").write_text("{ not json")
+    (store / "current" / "metadata.json").write_text("{ not json")
     assert E.store_stats() == {"chunks": 0, "files": 0}
 
 

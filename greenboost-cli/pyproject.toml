@@ -38,7 +38,7 @@ diffusion = ["torch>=2.3", "diffusers>=0.30", "transformers>=4.44",
 pdf       = ["pymupdf>=1.24"]
 opencv    = ["opencv-python>=4.10"]
 convert   = ["markitdown[all]>=0.1.0"]
-mcp       = ["mcp>=1.0.0"]
+mcp       = ["mcp>=1.0.0,<2"]
 full      = ["greenboost-cli[rag,diffusion,pdf,opencv,convert,mcp]"]
 dev       = ["pytest>=8.0", "mypy>=1.10", "ruff>=0.5.0"]
 

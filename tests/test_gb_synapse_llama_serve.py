@@ -121,7 +121,7 @@ def _no_shim(monkeypatch):
     monkeypatch.setattr(gb_cluster, "shim_env",
                         lambda workload=None, enabled=None: _shim_env_without_preload())
     monkeypatch.setattr(gb_shim_probe, "shim_works_for_llama",
-                        lambda engine_dir=None: (False, "reproduced known failure"))
+                        lambda engine_dir=None, **kw: (False, "reproduced known failure"))
     monkeypatch.setattr(gsb, "effective_vram_budget_mb",
                         lambda: (10500.0, 10500.0, {"t2_free_mb": 0.0, "t2_fraction": 0.5}))
 
@@ -134,7 +134,7 @@ def _shim_active(monkeypatch):
     monkeypatch.setattr(gb_cluster, "shim_env",
                         lambda workload=None, enabled=None: _shim_env_with_preload())
     monkeypatch.setattr(gb_shim_probe, "shim_works_for_llama",
-                        lambda engine_dir=None: (True, "probe passed"))
+                        lambda engine_dir=None, **kw: (True, "probe passed"))
     # 42 GB T2 pool free, 50% fraction — matches this box's real pool_brief
     # at the time of the incident (T2:0/42GB).
     monkeypatch.setattr(gsb, "effective_vram_budget_mb",
@@ -372,3 +372,107 @@ def test_extra_args_leaves_unrelated_flags_untouched(
     assert cmd.count("--cache-type-v") == 1
     assert "--jinja" in cmd
     assert "--no-webui" in cmd
+
+
+# ── shim defaults ON during a real serve (2026-10-29) ─────────────────────
+
+def test_serve_runs_shim_probe_explicitly_so_shim_defaults_on(
+        backend, entry, _stub_gb_synapse, _stub_gb_cluster, _stub_popen, monkeypatch):
+    """LlamaCppBackend.serve() must call shim_works_for_llama with explicit=True:
+    this path only runs inside a real gated serve, so the probe is allowed to
+    run (and cache) instead of skipping to 'off'. Before this, the probe skipped
+    during serve, LD_PRELOAD got popped, and MoE models fell to the CPU-only
+    arch quirk (~11 tok/s) instead of serving all-GPU."""
+    import gb_cluster, gb_shim_probe, gb_nvml
+    monkeypatch.setattr(gb_nvml, "get_nvml", lambda *_a, **_k: _FakeNvml(10500.0))
+    monkeypatch.setattr(gb_cluster, "shim_env",
+                        lambda workload=None, enabled=None: _shim_env_with_preload())
+    seen = {}
+
+    def _probe(engine_dir=None, **kw):
+        seen.update(kw)
+        return (True, "probe passed")
+
+    monkeypatch.setattr(gb_shim_probe, "shim_works_for_llama", _probe)
+    backend.serve(entry, port=11435)
+
+    assert seen.get("explicit") is True
+    # probe passed → shim stays active → LD_PRELOAD preloaded into llama-server
+    assert "LD_PRELOAD" in (_stub_popen["env"] or {})
+
+
+# ── prefill batch/ubatch override (first-class, 2026-10-29) ───────────────
+
+def test_batch_ubatch_absent_by_default(
+        backend, entry, _stub_gb_synapse, _stub_gb_cluster, _stub_popen, _shim_active, monkeypatch):
+    """No override → llama.cpp keeps its own compiled defaults, so GreenBoost
+    emits neither flag (behaviour unchanged until a recipe/caller opts in)."""
+    import gb_nvml
+    monkeypatch.setattr(gb_nvml, "get_nvml", lambda *_a, **_k: _FakeNvml(10500.0))
+
+    backend.serve(entry, port=11435)
+
+    cmd = _stub_popen["cmd"]
+    assert "--batch-size" not in cmd
+    assert "--ubatch-size" not in cmd
+
+
+def test_batch_ubatch_overrides_reach_cmd(
+        backend, entry, _stub_gb_synapse, _stub_gb_cluster, _stub_popen, _shim_active, monkeypatch):
+    """Explicit batch_override/ubatch_override are emitted as adjacent
+    --batch-size/--ubatch-size pairs."""
+    import gb_nvml
+    monkeypatch.setattr(gb_nvml, "get_nvml", lambda *_a, **_k: _FakeNvml(10500.0))
+
+    backend.serve(entry, port=11435, batch_override=4096, ubatch_override=2048)
+
+    cmd = _stub_popen["cmd"]
+    assert _cmd_value_after(cmd, "--batch-size") == "4096"
+    assert _cmd_value_after(cmd, "--ubatch-size") == "2048"
+
+
+def test_extra_args_batch_override_wins_and_dedupes(
+        backend, entry, _stub_gb_synapse, _stub_gb_cluster, _stub_popen, _shim_active, monkeypatch):
+    """A caller's --batch-size in extra_args must win over the built-in
+    override and appear exactly once (both flags are in _KNOWN_VALUED_FLAGS)."""
+    import gb_nvml
+    monkeypatch.setattr(gb_nvml, "get_nvml", lambda *_a, **_k: _FakeNvml(10500.0))
+
+    backend.serve(entry, port=11435, batch_override=4096,
+                  extra_args="--batch-size 8192")
+
+    cmd = _stub_popen["cmd"]
+    assert cmd.count("--batch-size") == 1
+    assert _cmd_value_after(cmd, "--batch-size") == "8192"
+
+
+# ── default ctx cap (2026-10-11): ctx 0 must never mean the model's maximum ──
+
+def _ctx_arg(cmd):
+    return int(cmd[cmd.index("--ctx-size") + 1])
+
+
+def _big_ctx_entry(entry):
+    import dataclasses
+    return dataclasses.replace(entry, name="big-ctx-test", ctx_length=262144,
+                               n_bytes=int(4.7 * 1024 ** 3), n_layers=36)
+
+
+def test_ctx_zero_is_capped_by_default(
+        backend, entry, _stub_gb_synapse, _stub_gb_cluster, _stub_popen, _shim_active, monkeypatch):
+    monkeypatch.delenv("GB_SYNAPSE_DEFAULT_CTX_CAP", raising=False)
+    import gb_nvml
+    monkeypatch.setattr(gb_nvml, "get_nvml", lambda *_a, **_k: _FakeNvml(10500.0))
+    backend.serve(_big_ctx_entry(entry), port=11435, ctx=0)
+    assert _ctx_arg(_stub_popen["cmd"]) <= 16384
+
+
+def test_ctx_cap_env_is_honoured_and_explicit_ctx_is_not_capped(
+        backend, entry, _stub_gb_synapse, _stub_gb_cluster, _stub_popen, _shim_active, monkeypatch):
+    import gb_nvml
+    monkeypatch.setattr(gb_nvml, "get_nvml", lambda *_a, **_k: _FakeNvml(10500.0))
+    monkeypatch.setenv("GB_SYNAPSE_DEFAULT_CTX_CAP", "8192")
+    backend.serve(_big_ctx_entry(entry), port=11435, ctx=0)
+    assert _ctx_arg(_stub_popen["cmd"]) <= 8192
+    backend.serve(_big_ctx_entry(entry), port=11435, ctx=32768)
+    assert _ctx_arg(_stub_popen["cmd"]) > 8192

@@ -83,6 +83,13 @@ def _gb_session(active: bool):
 
 
 # ── Tier definitions ──────────────────────────────────────────────────────────
+from gb_evict_policy import (  # noqa: E402
+    PRIORITY_DEFAULT as _PRIORITY_DEFAULT,
+    PerTierEvictionController,
+    clamp_priority,
+)
+
+
 class Tier:
     T1 = "T1_HBM"    # GPU VRAM
     T2 = "T2_DDR"    # Pinned RAM (GreenBoost managed)
@@ -105,6 +112,11 @@ class _ModelEntry:
     kv_bits: Optional[int] = None
     kv_keys: Optional[tuple] = None
     kv_codec: Optional[str] = None
+    # Eviction priority (gb_evict_policy: 0..100, LOWER is evicted FIRST).
+    # Every entry defaults to PRIORITY_DEFAULT, which makes prioritized-LRU
+    # degenerate to the plain LRU this manager used before - so leaving it
+    # unset changes nothing.
+    priority: int = _PRIORITY_DEFAULT
 
 
 def _module_size_gb(module) -> float:
@@ -115,6 +127,8 @@ def _module_size_gb(module) -> float:
         return total / 2**30
     except Exception:
         return 0.0
+
+
 # Pinned host pages can't be swapped or reclaimed, so pinning must leave the host RAM
 # safety floor free. Same 10% policy as the CUDA shim's floor; GREENBOOST_HOST_RAM_SAFETY_MB
 # overrides it (in MiB), exactly as it does for the shim.
@@ -156,6 +170,21 @@ def _demote_to_pinned(t: "torch.Tensor") -> "torch.Tensor":
     return dst
 
 
+# Process-wide tier-thrashing detector (gb_thrash). Observation only: it
+# counts T1<->T2 ping-pong and reports, and nothing reads its verdict to make
+# a placement decision. Hooked into _df_emit_tier rather than into each
+# transition so it sees exactly the moves the flight recorder sees, and cannot
+# drift out of step with them.
+_THRASH = None
+
+
+def thrash_detector():
+    """The process-wide ThrashDetector, created on first use."""
+    global _THRASH
+    if _THRASH is None:
+        from gb_thrash import ThrashDetector
+        _THRASH = ThrashDetector()
+    return _THRASH
 
 
 def _df_emit_tier(name: str, from_tier: str, to_tier: str, size_gb: float,
@@ -163,6 +192,15 @@ def _df_emit_tier(name: str, from_tier: str, to_tier: str, size_gb: float,
     """Record a T1/T2/T3 model placement move to the dataflux log , works
     standalone on a single host, no cluster/feeder required. Best-effort,
     never raises."""
+    thrash_extra = {}
+    try:
+        st = thrash_detector().record_move(name, from_tier, to_tier)
+        thrash_extra = {
+            "thrash_events": st.num_thrashing_events,
+            "thrash_active": thrash_detector().is_thrashing(name),
+        }
+    except Exception:  # noqa: BLE001  never let observation break a tier move
+        pass
     try:
         import gb_dataflux
         evt = {
@@ -171,6 +209,12 @@ def _df_emit_tier(name: str, from_tier: str, to_tier: str, size_gb: float,
             "status": "ok", "from_tier": from_tier, "to_tier": to_tier,
             "size_gb": round(size_gb, 3),
         }
+        evt.update(thrash_extra)
+        # Was this spill ever undone? Only the mover knows, and only now:
+        # after the fact "still resident in T2" and "evicted from T2" are
+        # both just "no promotion followed". Hooked here for the same reason
+        # gb_thrash is , it sees exactly the moves the recorder sees.
+        evt.update(gb_dataflux.spill_outcome(name, from_tier, to_tier, size_gb))
         if extra:
             evt.update(extra)
         gb_dataflux.emit(evt)
@@ -338,13 +382,18 @@ class ModelTierManager:
             pin_host = os.environ.get("GB_TIER_PIN_HOST", "") in ("1", "on", "true", "yes")
         self.pin_host = pin_host
         self._entries: Dict[str, _ModelEntry] = {}
+        # Per-tier prioritized-LRU eviction (gb_evict_policy). Tracks the same
+        # entries as _entries, bucketed by tier and priority, so victim
+        # selection stops being a full re-sort of every entry on every call.
+        self._evict_ctl = PerTierEvictionController()
         os.makedirs(t3_dir, exist_ok=True)
         _gb_session(active=True)
 
     def register(self, name: str, module: torch.nn.Module, tier: str = Tier.T1,
                 *, kv_bits: "Optional[int]" = None,
                 kv_keys: "Optional[tuple]" = None,
-                kv_codec: "Optional[str]" = None):
+                kv_codec: "Optional[str]" = None,
+                priority: "Optional[int]" = None):
         """Register a model component for tier management.
 
         kv_bits: opt in to KV-cache tier-serde compression (T3 spill only ,
@@ -359,9 +408,15 @@ class ModelTierManager:
             buffers); None encodes every eligible tensor in the module.
             kv_codec: "polarquant" | "turboquant" | None (env-resolved via
             GB_TIER_KV_PRESET, see gb_tier_kv.resolve_codec)."""
-        self._entries[name] = _ModelEntry(
+        e = _ModelEntry(
             name=name, module=module, tier=tier,
-            kv_bits=kv_bits, kv_keys=kv_keys, kv_codec=kv_codec)
+            kv_bits=kv_bits, kv_keys=kv_keys, kv_codec=kv_codec,
+            priority=clamp_priority(priority))
+        prev = self._entries.get(name)
+        if prev is not None:
+            self._evict_ctl.forget(prev)
+        self._entries[name] = e
+        self._evict_ctl.schedule_for_eviction(e)
 
     # ── tier transitions ──────────────────────────────────────────────────────
 
@@ -399,6 +454,7 @@ class ModelTierManager:
         else:
             e.module.to("cuda")
 
+        self._evict_ctl.retier(e, e.tier, Tier.T1)
         e.tier = Tier.T1
         e.last_used = time.time()
         print(f"[gb_tier] promoted '{name}' → T1 (GPU)", flush=True)
@@ -439,6 +495,7 @@ class ModelTierManager:
         else:
             self._module_to_host(e.module, non_blocking=False)
 
+        self._evict_ctl.retier(e, e.tier, Tier.T2)
         e.tier = Tier.T2
         e.last_used = time.time()
         print(f"[gb_tier] demoted '{name}' → T2 (CPU)", flush=True)
@@ -466,6 +523,7 @@ class ModelTierManager:
         # Move to meta device: frees all parameter memory while preserving shapes
         # so _load_from_t3 can use to_empty()+load_state_dict(assign=True) later.
         e.module.to("meta")
+        self._evict_ctl.retier(e, e.tier, Tier.T3)
         e.tier = Tier.T3
         e.t3_path = t3_path
         compressed = t3_path.endswith(".zst")
@@ -500,6 +558,7 @@ class ModelTierManager:
         # fill from saved state.  assign=True avoids in-place copy size checks.
         e.module.to_empty(device="cpu")
         e.module.load_state_dict(state, assign=True)
+        self._evict_ctl.retier(e, e.tier, Tier.T2)
         e.tier = Tier.T2
         print(f"[gb_tier] restored '{e.name}' from T3 → T2", flush=True)
 
@@ -522,11 +581,15 @@ class ModelTierManager:
                 self.evict(lru)
 
     def _lru_in_tier(self, tier: str) -> Optional[str]:
-        candidates = [(e.last_used, e.name) for e in self._entries.values() if e.tier == tier]
-        if not candidates:
-            return None
-        candidates.sort()
-        return candidates[0][1]
+        """Name of the next entry that would be evicted from `tier`, or None.
+
+        Delegates to the per-tier prioritized-LRU controller. With every entry
+        at the default priority this returns exactly what the previous
+        `sorted(last_used)[0]` scan returned; priorities only start to matter
+        once a caller passes `register(..., priority=...)`.
+        """
+        victim = self._evict_ctl.victim(tier)
+        return victim.name if victim is not None else None
 
     def _evict_for_headroom(self):
         """Demote T1 models until we have hbm_headroom_mb free."""

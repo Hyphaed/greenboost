@@ -61,6 +61,8 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -110,6 +112,22 @@ AGGRESSIVE    = os.environ.get("GB_SUPERVISOR_AGGRESSIVE_RECLAIM", "0") == "1"
 OLLAMA_URL    = os.environ.get("GB_SUPERVISOR_OLLAMA_URL", "http://127.0.0.1:11434")
 _DATAFLUX_COMPACT_INTERVAL_S = int(os.environ.get("GB_DATAFLUX_COMPACT_INTERVAL_S", str(6 * 3600)))
 CONFIRM_POLLS = int(os.environ.get("GB_SUPERVISOR_IDLE_CONFIRM_POLLS", "3"))
+# Boot-recovery driver reload (SVC-01). Off switch, cool-down between reloads
+# and the Xid codes that justify one. The default codes are the ones NVIDIA's
+# Xid catalogue lists with the resolution "reset GPU": 95 (uncontained ECC),
+# 119/120 (GSP RPC timeout/failure). Xid 79 (fell off the bus) is listed as
+# "restart bare metal": a driver reload cannot bring the PCIe link back, so it
+# is not in the default set. Application faults (13, 31, 43, 45) never justify
+# unloading the driver.
+XID_RESET_ENABLED  = os.environ.get("GB_SUPERVISOR_XID_RESET", "1") != "0"
+XID_RESET_COOLDOWN_S = int(os.environ.get("GB_SUPERVISOR_XID_COOLDOWN_S", str(6 * 3600)))
+XID_RESET_CODES = frozenset(
+    int(c) for c in os.environ.get("GB_SUPERVISOR_XID_RESET_CODES", "95,119,120").split(",")
+    if c.strip().isdigit())
+XID_RESET_STAMP = Path("/var/lib/greenboost/xid_reset_ts")
+# Orphan reaper: how many consecutive ticks an engine must be seen without
+# its proxy before it is stopped (SVC-06). One tick is POLL_SECS.
+REAP_CONFIRM_POLLS = int(os.environ.get("GB_SUPERVISOR_REAP_CONFIRM_POLLS", "3"))
 
 # System-RAM pressure thresholds , %-of-node's-own-total, never absolute MB
 # (this box's total RAM varies host vs feeder; see CLAUDE.md "no hardcoded
@@ -131,6 +149,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("gb_supervisor")
 
+# Set by the SIGTERM/SIGINT handler; the poll loop and every long wait sleep on
+# it, so a stop request is honoured at once and an idle tick costs no wakeups.
+_STOP = threading.Event()
+
 
 # ── Systemd sd_notify ─────────────────────────────────────────────────────────
 
@@ -147,6 +169,47 @@ def _sd_notify(msg: str) -> None:
             s.sendall(msg.encode())
     except Exception:
         pass
+
+
+def _watchdog_interval_s() -> float:
+    """Seconds between WATCHDOG=1 pings: half of WatchdogSec (sd_watchdog_enabled
+    contract), 0.0 when the unit has no WatchdogSec or the variable is meant for
+    another pid."""
+    try:
+        usec = int(os.environ.get("WATCHDOG_USEC", "0") or "0")
+        pid = os.environ.get("WATCHDOG_PID", "")
+        if usec <= 0 or (pid and int(pid) != os.getpid()):
+            return 0.0
+        return usec / 2_000_000.0
+    except ValueError:
+        return 0.0
+
+
+def _notify_watchdog() -> None: _sd_notify("WATCHDOG=1\n")
+def _extend_timeout(seconds: int) -> None:
+    """Ask systemd for `seconds` more before it declares start/stop timed out
+    (EXTEND_TIMEOUT_USEC). Boot recovery can run longer than TimeoutStartSec."""
+    _sd_notify(f"EXTEND_TIMEOUT_USEC={int(seconds) * 1_000_000}\n")
+
+
+def _atomic_write(path: Path, text: str, mode: int = 0o644) -> None:
+    """Write `text` so a reader sees the old file or the new one, never half:
+    temp file in the same directory, fsync, rename. Raises OSError on failure."""
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _notify_ready()     -> None: _sd_notify("READY=1\n")
@@ -242,13 +305,139 @@ def _read_ecc_dbe_volatile() -> int:
 def _read_phase() -> str:
     """Return the phase string from /run/greenboost/phase, or '' if absent."""
     try:
-        text = PHASE_FILE.read_text()
-        for line in text.splitlines():
+        phase, pid = "", ""
+        for line in PHASE_FILE.read_text().splitlines():
             if line.startswith("phase="):
-                return line.split("=", 1)[1].strip()
+                phase = line.split("=", 1)[1].strip()
+            elif line.startswith("pid="):
+                pid = line.split("=", 1)[1].strip()
+        # A writer that has exited leaves its last phase behind (SVC-04):
+        # that is "unknown", never evidence for a reclaim.
+        if pid.isdigit() and int(pid) > 0 and not os.path.exists(f"/proc/{pid}"):
+            return ""
+        return phase
     except Exception:
         pass
     return ""
+
+
+# ── Driver reset guard (SVC-01) ───────────────────────────────────────────────
+
+_XID_RE = re.compile(r"NVRM: Xid \(PCI:[^)]*\):\s*(\d+)")
+_NVIDIA_MODULES = ("nvidia_drm", "nvidia_modeset", "nvidia_uvm", "nvidia")
+
+
+def _fatal_xids(kernel_text: str, codes=None) -> list:
+    """Xid codes in kernel-log text that are in the wedged-GPU set. Only
+    `NVRM: Xid (PCI:...): N` lines count, so the supervisor's own log lines and
+    unrelated journal text can never match."""
+    codes = XID_RESET_CODES if codes is None else codes
+    return [int(m) for m in _XID_RE.findall(kernel_text or "") if int(m) in codes]
+
+
+def _nvidia_device_holders(proc_root: str = "/proc") -> list:
+    """Pids (other than ours) holding a /dev/nvidia* node open. Reading other
+    users' fd tables needs root, which the supervisor has."""
+    holders = []
+    try:
+        entries = os.listdir(proc_root)
+    except OSError:
+        return holders
+    me = str(os.getpid())
+    for name in entries:
+        if not name.isdigit() or name == me:
+            continue
+        try:
+            for fd in os.listdir(f"{proc_root}/{name}/fd"):
+                try:
+                    if os.readlink(f"{proc_root}/{name}/fd/{fd}").startswith("/dev/nvidia"):
+                        holders.append(int(name))
+                        break
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return holders
+
+
+def _loaded_nvidia_modules() -> list:
+    try:
+        text = Path("/proc/modules").read_text()
+    except OSError:
+        return []
+    loaded = {line.split()[0] for line in text.splitlines() if line.strip()}
+    return [m for m in _NVIDIA_MODULES if m in loaded]
+
+
+def _reset_nvidia_driver(codes: list, now: "float | None" = None) -> str:
+    """Reload the NVIDIA kernel modules after a wedged-GPU Xid. Returns what
+    happened: "reset", "disabled", "cooldown", "in_use" or "failed".
+
+    Guards, each tested in tests/test_gb_supervisor_xid.py:
+      1. GB_SUPERVISOR_XID_RESET=0 switches it off.
+      2. At most one reload per XID_RESET_COOLDOWN_S (persisted stamp), so a
+         crash loop cannot become a driver-reload loop.
+      3. Nothing holds /dev/nvidia* open (a desktop, a model server, a job).
+         rmmod without -f would refuse anyway, but several modules are removed
+         in one call and a partial unload leaves display modules gone.
+      4. The modules that were loaded are all brought back through modprobe of
+         the top module, so a half-done reload is not left behind.
+    """
+    now = time.time() if now is None else now
+    if not XID_RESET_ENABLED:
+        log.warning("Xid %s seen, driver reload disabled (GB_SUPERVISOR_XID_RESET=0)", codes)
+        return "disabled"
+    try:
+        last = float(XID_RESET_STAMP.read_text().strip())
+    except (OSError, ValueError):
+        last = None
+    if last is not None and 0 <= now - last < XID_RESET_COOLDOWN_S:
+        log.warning("Xid %s seen, driver reloaded %.0f s ago, cool-down %d s: not again",
+                    codes, now - last, XID_RESET_COOLDOWN_S)
+        return "cooldown"
+    holders = _nvidia_device_holders()
+    if holders:
+        log.warning("Xid %s seen, but pids %s hold /dev/nvidia*: driver not reloaded",
+                    codes, holders[:8])
+        return "in_use"
+    was_loaded = _loaded_nvidia_modules()
+    log.warning("Xid %s (wedged GPU): reloading the NVIDIA driver (%s)", codes, was_loaded)
+    try:
+        _atomic_write(XID_RESET_STAMP, str(now))   # stamp first: a crash mid-reload still counts
+    except OSError as exc:
+        log.warning("reset stamp not written (%s): driver not reloaded", exc)
+        return "failed"
+    ok = True
+    try:
+        r = subprocess.run(["rmmod", *[m for m in _NVIDIA_MODULES if m in was_loaded]],
+                           capture_output=True, timeout=20)
+        ok = r.returncode == 0
+    except subprocess.TimeoutExpired:
+        ok = False
+        log.warning("rmmod nvidia timed out , continuing")
+    try:
+        top = "nvidia_drm" if "nvidia_drm" in was_loaded else "nvidia"
+        subprocess.run(["modprobe", top], capture_output=True, timeout=20)
+    except subprocess.TimeoutExpired:
+        ok = False
+        log.warning("modprobe nvidia timed out , continuing")
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({"kind": "driver_reset", "node": "host", "label": "supervisor",
+                          "status": "ok" if ok else "error", "xid_codes": codes,
+                          "modules": was_loaded})
+    except Exception:
+        pass
+    return "reset" if ok else "failed"
+
+
+def _apparmor_denies_stub(journal_text: str) -> bool:
+    """True when ONE journal line is an AppArmor denial that names the
+    GreenBoost audit stub (the only thing _patch_apparmor can fix)."""
+    for line in (journal_text or "").splitlines():
+        if 'apparmor="DENIED"' in line and "libgreenboost_audit" in line:
+            return True
+    return False
 
 
 # ── Boot recovery ─────────────────────────────────────────────────────────────
@@ -259,6 +448,9 @@ def _run_recovery() -> str:
     Mirrors greenboost-recover logic, now as Python so the supervisor owns it.
     """
     fault = "unknown"
+    # Worst case below is ~100 s (lsmod 5 + modprobe 15 + journalctl 3 x 10 +
+    # cooling pause 10 + rmmod 20 + modprobe 20) against TimeoutStartSec=90.
+    _extend_timeout(180)
 
     # 0. Dirty-shutdown detection
     dirty = SENTINEL_FILE.exists() or RUNNING_FILE.exists()
@@ -337,7 +529,12 @@ def _run_recovery() -> str:
     # as literal substrings so ECC/thermal recovery was effectively dead.
     if "Killed process" in jq_kernel and "oom" in jq_kernel.lower():
         fault = "oom_kill"
-    elif "Xid" in jq_all and "GPU" in jq_all:
+    elif _fatal_xids(jq_kernel):
+        # SVC-01: was `"Xid" in jq_all and "GPU" in jq_all` over EVERY journal
+        # line, which also matched this supervisor's own "Xid GPU fault" log
+        # line (a restart inside 30 minutes re-triggered the driver reload) and
+        # any unrelated line containing both words. Now: a kernel `NVRM: Xid`
+        # line whose code is in the wedged-GPU set, nothing else.
         fault = "xid_fault"
     elif any(re.search(k, jq_all, re.I) for k in (
             r"ecc.*double.bit", r"uncorrectable.*ecc",
@@ -347,41 +544,43 @@ def _run_recovery() -> str:
             r"thermal throttl", r"nvidia.*thermal",
             r"gpu.*temp.*critical")):
         fault = "thermal"
-    elif "DENIED" in jq_all and re.search(r"greenboost", jq_all, re.I) and "apparmor" in jq_all.lower():
+    elif _apparmor_denies_stub(jq_all):
+        # SVC-07: was three independent substring tests over the whole journal
+        # ("DENIED", "greenboost", "apparmor" on any lines), so an unrelated
+        # DENIED line plus any greenboost line plus any apparmor line edited
+        # the security policy and restarted apparmor on every start.
         fault = "apparmor"
 
-    RECOVERY_CLASS.write_text(fault)
+    try:
+        _atomic_write(RECOVERY_CLASS, fault)
+    except OSError as exc:
+        log.warning("recovery_class not written: %s", exc)
     log.info("Fault class: %s", fault)
 
     # 2d. Per-fault remediation
     if fault == "ecc_dbe":
         log.warning("ECC double-bit error , setting ecc_dbe_flag to reduce T1 quota")
-        ECC_DBE_FLAG.write_text("1")
+        try:
+            _atomic_write(ECC_DBE_FLAG, "1")
+        except OSError as exc:
+            log.warning("ecc_dbe_flag not written: %s", exc)
     elif fault == "thermal":
         log.warning("Thermal fault , inserting 10 s cooling pause before Ollama restart")
-        time.sleep(10)
+        _STOP.wait(10)
     elif fault == "apparmor":
         log.warning("AppArmor denial , patching snap-confine profiles")
         _patch_apparmor()
     elif fault == "xid_fault":
-        log.warning("Xid GPU fault , forcing NVIDIA driver module reset")
-        try:
-            subprocess.run(["rmmod", "nvidia_drm", "nvidia_modeset", "nvidia"],
-                           capture_output=True, timeout=20)
-        except subprocess.TimeoutExpired:
-            log.warning("rmmod nvidia timed out , continuing")
-        try:
-            subprocess.run(["modprobe", "nvidia"], capture_output=True, timeout=20)
-        except subprocess.TimeoutExpired:
-            log.warning("modprobe nvidia timed out , continuing")
+        _reset_nvidia_driver(sorted(set(_fatal_xids(jq_kernel))))
 
     # 3. Sentinel cleanup
     SENTINEL_FILE.unlink(missing_ok=True)
     RUNNING_FILE.unlink(missing_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    (STATE_DIR / "last_clean_boot").write_text(
-        time.strftime("%Y-%m-%dT%H:%M:%S")
-    )
+    try:
+        _atomic_write(STATE_DIR / "last_clean_boot", time.strftime("%Y-%m-%dT%H:%M:%S"))
+    except OSError as exc:
+        log.warning("last_clean_boot not written: %s", exc)
     log.info("Recovery complete (fault class: %s)", fault)
     return fault
 
@@ -444,15 +643,19 @@ def _patch_apparmor() -> None:
         reason = f"local/ override unwritable: {e}"
 
     parser_ok = None
-    try:
-        r = subprocess.run(
-            ["apparmor_parser", "-r",
-             "/etc/apparmor.d/usr.lib.snapd.snap-confine.real"],
-            capture_output=True, timeout=15,
-        )
-        parser_ok = (r.returncode == 0)
-    except (Exception, subprocess.TimeoutExpired):
-        parser_ok = None
+    # SVC-07: reload policy only when this call changed it. Re-parsing and
+    # restarting apparmor for a rule that was already present reloaded every
+    # profile on the box for nothing.
+    if written:
+        try:
+            r = subprocess.run(
+                ["apparmor_parser", "-r",
+                 "/etc/apparmor.d/usr.lib.snapd.snap-confine.real"],
+                capture_output=True, timeout=15,
+            )
+            parser_ok = (r.returncode == 0)
+        except (Exception, subprocess.TimeoutExpired):
+            parser_ok = None
 
     # Observability Must-Rule: this function modifies system security policy and
     # used to emit nothing at all, which is why a supervisor re-contaminating
@@ -469,11 +672,12 @@ def _patch_apparmor() -> None:
     except Exception:
         pass
 
-    try:
-        subprocess.run(["systemctl", "restart", "apparmor"],
-                       capture_output=True, timeout=30)
-    except subprocess.TimeoutExpired:
-        log.warning("systemctl restart apparmor timed out")
+    if written:
+        try:
+            subprocess.run(["systemctl", "restart", "apparmor"],
+                           capture_output=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            log.warning("systemctl restart apparmor timed out")
 
 
 # ── Idle reclaim ──────────────────────────────────────────────────────────────
@@ -505,6 +709,14 @@ def _ollama_unload_models(ollama_url: str) -> bool:
     for m in models:
         name = m.get("name") or m.get("model", "")
         if not name:
+            continue
+        try:
+            import gb_lease_client
+            _held = gb_lease_client.unload_blocked(name)
+        except Exception:
+            _held = None
+        if _held:
+            log.info("Ollama unload of %s skipped: GPU lease held by %s", name, _held.get("client") or _held.get("job"))
             continue
         try:
             # Real bug, 2026-07-14: ollama's /api/generate model-selector
@@ -632,7 +844,7 @@ class _VramMonitor:
 
         # Always write the pressure file (greenboost vitals/status reads it)
         try:
-            PRESSURE_FILE.write_text(
+            _atomic_write(PRESSURE_FILE,
                 f"state={state}\n"
                 f"used_mib={used_mb}\n"
                 f"free_mib={free_mb}\n"
@@ -750,7 +962,7 @@ class _RamMonitor:
             self._prev_state = state
 
         try:
-            RAM_PRESSURE_FILE.write_text(
+            _atomic_write(RAM_PRESSURE_FILE,
                 f"state={state}\n"
                 f"mem_total_mib={mem_total_mb}\n"
                 f"mem_available_mib={mem_avail_mb}\n"
@@ -764,6 +976,75 @@ class _RamMonitor:
             pass
 
         return state
+
+
+# ── DAMON host cold-page evidence ─────────────────────────────────────────────
+
+class _DamonMonitor:
+    """Republishes the kernel's DAMON_STAT cold-page evidence for the tiering
+    layer, which cannot read it itself.
+
+    DAMON_STAT's parameters are mode 0400 under /sys/module/damon_stat, so only
+    root can read them. The supervisor already runs as root, so it reads and
+    writes a world-readable summary to /var/lib/greenboost/damon_cold - the
+    same publish pattern _RamMonitor and _VramMonitor use. The alternative
+    (running the tiering layer as root, or shelling to sudo) would have been
+    worse for a read-only telemetry signal.
+
+    Purely observational. Nothing here evicts or repositions anything; the
+    point is that placement stops being the only thing in GreenBoost with no
+    measured input. Emits to dataflux only when the cold share moves
+    materially, so a quiet box does not spam the flight recorder.
+    """
+
+    #  Percentage-point change in the 400s-idle share worth recording.
+    _EMIT_DELTA_PP = 5.0
+    _COLD_MS = 400_000
+
+    def __init__(self) -> None:
+        self._prev_cold_pct: "float | None" = None
+        self._warned_unreadable = False
+
+    def poll(self) -> "dict | None":
+        try:
+            import gb_damon
+        except Exception:
+            return None
+
+        if not gb_damon.available():
+            return None            # kernel without CONFIG_DAMON_STAT , not an error
+
+        snap = gb_damon.read_snapshot()
+        if snap.error and not snap.idle_ms:
+            if not self._warned_unreadable:
+                log.warning("DAMON_STAT present but unreadable (%s)", snap.error)
+                self._warned_unreadable = True
+            return None
+
+        try:
+            gb_damon.PUBLISHED_FILE.write_text(gb_damon.render_published(snap))
+            os.chmod(gb_damon.PUBLISHED_FILE, 0o644)
+        except Exception:
+            pass    # publishing is best-effort and must never break the tick
+
+        cold_pct = snap.cold_pct_above(self._COLD_MS)
+        if (self._prev_cold_pct is None
+                or abs(cold_pct - self._prev_cold_pct) >= self._EMIT_DELTA_PP):
+            try:
+                import gb_dataflux
+                gb_dataflux.emit({
+                    "node": "host", "label": "gb_damon", "kind": "damon_cold",
+                    "n_items": 1, "items": [], "duration_s": 0, "status": "ok",
+                    "hot_pct": round(snap.hot_pct, 1),
+                    "idle_pct": round(snap.idle_pct, 1),
+                    "cold_pct_400s": round(cold_pct, 1),
+                    "est_bandwidth_bps": snap.est_bandwidth_bps,
+                })
+            except Exception:
+                pass
+            self._prev_cold_pct = cold_pct
+
+        return snap.as_dict()
 
 
 # ── Main supervisor loop ──────────────────────────────────────────────────────
@@ -810,6 +1091,8 @@ class GreenBoostSupervisor:
         self._vram_mon      = _VramMonitor(self._nvml, WARN_PCT, CRIT_FREE_PCT)
         self._ram_mon       = _RamMonitor(RAM_WARN_AVAIL_PCT, RAM_CRIT_AVAIL_PCT,
                                            RAM_WARN_SWAP_PCT, RAM_CRIT_SWAP_PCT)
+        self._damon_mon     = _DamonMonitor()
+        self._orphan_polls: dict = {}   # model -> consecutive ticks seen proxyless
         self._ecc_dbe_seen  = 0   # last known volatile DBE count (detect new errors)
         # Reactive orchestrator , closes dead feedback loops (ECC, workstation, thermal)
         try:
@@ -871,6 +1154,11 @@ class GreenBoostSupervisor:
         self._last_dataflux_compaction_ts = 0.0
 
     def run(self) -> None:
+        # Handlers first: a stop request during boot recovery is honoured at
+        # the next wait instead of being ignored until READY=1.
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, self._on_stop)
+
         # Phase 0: ensure state directories exist
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         RUN_DIR.mkdir(parents=True, exist_ok=True)
@@ -888,23 +1176,33 @@ class GreenBoostSupervisor:
         log.info("GreenBoost supervisor ready (poll=%ds, warn_pct=%d, crit_free_pct=%d, aggressive=%s)",
                  POLL_SECS, WARN_PCT, CRIT_FREE_PCT, AGGRESSIVE)
 
-        # Install shutdown handlers
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            signal.signal(sig, self._on_stop)
-
-        # Phase 3: steady-state poll loop
+        # Phase 3: steady-state poll loop. One blocking wait per tick (SVC-02:
+        # the old 0.1 s sleep loop woke the process 10 times a second, measured
+        # 623 context switches in 60 s on an idle card). With WatchdogSec set,
+        # ping at half the interval; a tick that hangs stops the pings and
+        # systemd restarts the unit.
+        wd = _watchdog_interval_s()
+        self._wd = wd
         while self._running:
             try:
                 self._tick()
             except Exception as exc:
                 log.exception("Tick error: %s", exc)
-            # Sleep in small increments so SIGTERM is handled promptly
-            for _ in range(POLL_SECS * 10):
-                if not self._running:
-                    break
-                time.sleep(0.1)
+            self._wait_next_tick(wd)
 
         self._shutdown()
+
+    def _wait_next_tick(self, wd_interval: float) -> None:
+        """Sleep POLL_SECS (interruptible), pinging the watchdog on the way."""
+        deadline = time.monotonic() + POLL_SECS
+        while self._running:
+            if wd_interval:
+                _notify_watchdog()
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            if _STOP.wait(min(left, wd_interval) if wd_interval else left):
+                return
 
     def _reap_orphaned_serves(self) -> None:
         """Stop an engine whose proxy has died, so it releases its VRAM.
@@ -930,10 +1228,22 @@ class GreenBoostSupervisor:
             sessions = gb_synapse.ps()
         except Exception:
             return
+        seen_now = set()
         for sess in sessions:
             if not sess.get("proxy_error") or not sess.get("llama_pid"):
                 continue
             model = sess.get("model") or ""
+            # SVC-06: a proxy-only restart (gb_synapse.serve) passes through a
+            # moment with the engine alive and no proxy, and the engine may be
+            # minutes into loading a model. Stop it only when the condition
+            # holds for REAP_CONFIRM_POLLS consecutive ticks.
+            seen_now.add(model)
+            n = self._orphan_polls.get(model, 0) + 1
+            self._orphan_polls[model] = n
+            if n < REAP_CONFIRM_POLLS:
+                log.info("Serve session '%s': engine alive, proxy gone (%d/%d), waiting",
+                         model, n, REAP_CONFIRM_POLLS)
+                continue
             log.warning(
                 "Serve session '%s' has a dead proxy (%s) while its engine "
                 "(pid %s) still holds VRAM , stopping it so the card comes "
@@ -955,10 +1265,21 @@ class GreenBoostSupervisor:
                 gb_synapse.stop(model)
             except Exception as exc:
                 log.warning("could not stop orphaned serve '%s': %s", model, exc)
+            self._orphan_polls.pop(model, None)
+        for gone in [m for m in self._orphan_polls if m not in seen_now]:
+            del self._orphan_polls[gone]
+
+    def _pet(self) -> None:
+        """Watchdog ping from inside a long tick, so a slow but progressing tick
+        (Ollama unloads, archive compaction) is not mistaken for a hang."""
+        if getattr(self, "_wd", 0.0):
+            _notify_watchdog()
 
     def _tick(self) -> None:
+        self._pet()
         # 3-.  Orphaned serve session , engine alive, proxy dead.
         self._reap_orphaned_serves()
+        self._pet()
 
         # 3a. Gaming mode , doubles VRAM reserve thresholds
         gaming = _read_gaming_mode()
@@ -970,6 +1291,10 @@ class GreenBoostSupervisor:
         # pool (see _RamMonitor docstring: CPU-offload streaming bypasses it).
         self._ram_mon.poll()
 
+        # 3b''. DAMON host cold-page evidence , republished for gb_tiering,
+        # which cannot read /sys/module/damon_stat (mode 0400).
+        self._damon_mon.poll()
+
         # 3c. ECC double-bit error monitoring (hardware-critical)
         ecc_dbe = _read_ecc_dbe_volatile()
         if ecc_dbe > self._ecc_dbe_seen:
@@ -980,7 +1305,10 @@ class GreenBoostSupervisor:
                 "Consider rebooting and running memtest/nvidia-smi --ecc-config=1.",
                 new_errors, ecc_dbe,
             )
-            ECC_DBE_FLAG.write_text(str(ecc_dbe))
+            try:
+                _atomic_write(ECC_DBE_FLAG, str(ecc_dbe))
+            except OSError as exc:
+                log.warning("ecc_dbe_flag not written: %s", exc)
             _sd_notify(
                 f"STATUS=ECC DBE error: {ecc_dbe} uncorrectable error(s) , hardware risk\n"
             )
@@ -1016,7 +1344,17 @@ class GreenBoostSupervisor:
             except Exception as exc:
                 log.debug("Orchestrator feed error: %s", exc)
 
+        # 3c''. Read-only telemetry snapshot for other programs (no root needed
+        # to read it; failure here must never disturb the supervisor).
+        try:
+            import gb_snapshot
+            _u, _f, _t, _ = self._nvml._h.mem() if self._nvml._h else (0, 0, 0, 0.0)
+            gb_snapshot.write_snapshot(gb_snapshot.build_snapshot(_t, _f))
+        except Exception as exc:
+            log.debug("snapshot write failed: %s", exc)
+
         # 3d. Phase file idle detection → reclaim
+        self._pet()
         phase = _read_phase()
 
         if phase == "DEEP_IDLE" and _gpu_util < 1.0:
@@ -1038,6 +1376,7 @@ class GreenBoostSupervisor:
                 self._idle_count = 0
 
         # 3e. Periodic dataflux archive compaction (see __init__'s comment).
+        self._pet()
         now = time.time()
         if now - self._last_dataflux_compaction_ts >= _DATAFLUX_COMPACT_INTERVAL_S:
             self._last_dataflux_compaction_ts = now
@@ -1053,6 +1392,7 @@ class GreenBoostSupervisor:
     def _on_stop(self, signum: int, frame) -> None:
         log.info("Received signal %d , shutting down", signum)
         self._running = False
+        _STOP.set()
 
     def _shutdown(self) -> None:
         _notify_stopping()

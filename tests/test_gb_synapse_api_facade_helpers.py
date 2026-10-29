@@ -139,7 +139,7 @@ class _FakeProc:
 def test_serve_gguf_raises_when_engine_not_built(monkeypatch):
     monkeypatch.setattr(gs, "engine_installed", lambda: False)
     with pytest.raises(RuntimeError, match="engine not built"):
-        gs.serve_gguf("/models/x.gguf", 8081)
+        gs.serve_gguf("/models/x.gguf", 8081, explicit=True, trigger="test")
 
 
 def test_serve_gguf_builds_expected_command(monkeypatch, tmp_path):
@@ -153,7 +153,7 @@ def test_serve_gguf_builds_expected_command(monkeypatch, tmp_path):
         return _FakeProc()
     monkeypatch.setattr(gs.subprocess, "Popen", _fake_popen)
 
-    result = gs.serve_gguf("/models/vision.gguf", 8081, mmproj="/models/mmproj.gguf", ctx=4096)
+    result = gs.serve_gguf("/models/vision.gguf", 8081, mmproj="/models/mmproj.gguf", ctx=4096, explicit=True, trigger="test")
 
     assert result == {"pid": 5555, "port": 8081}
     cmd = captured["cmd"]
@@ -171,7 +171,7 @@ def test_serve_gguf_omits_optional_flags_when_not_given(monkeypatch, tmp_path):
     monkeypatch.setattr(gs.subprocess, "Popen",
                         lambda cmd, **kw: captured.update(cmd=cmd) or _FakeProc())
 
-    gs.serve_gguf("/models/x.gguf", 8081)
+    gs.serve_gguf("/models/x.gguf", 8081, explicit=True, trigger="test")
 
     cmd = captured["cmd"]
     assert "--mmproj" not in cmd

@@ -312,7 +312,8 @@ def cmd_llamaserve(args: str, _session, settings) -> bool:
             model,
             ctx=int(settings.get("llamacpp_n_ctx") or 0),
             n_slots=int(settings.get("llamacpp_np") or -1),
-            extra_args=settings.get("llamacpp_extra_args", ""))
+            extra_args=settings.get("llamacpp_extra_args", ""),
+            explicit=True, trigger=("prompt" if settings.get("_prompt_driven") else "serve_cmd"))
     except Exception as e:
         emit_err(f"Could not start gb-synapse: {e}")
         return True

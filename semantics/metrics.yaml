@@ -228,6 +228,60 @@
     - field: kv_gb (as covering recurrent-layer memory too)
       why: "kv_gb only accounts for n_kv_layers (real attention). Recurrent layers' state is a SEPARATE fixed cost this metric carries — omitting it undercounts a hybrid model's real VRAM footprint at the exact placement step (_solve_ctx_and_layers/_fit_gpu_layers) that matters."
 
+- name: mtp_head_on_disk
+  entity: model
+  unit: fraction
+  doc: >
+    1.0 when the model's multi-token-prediction head ships as a SECOND GGUF
+    beside the weights (IsValorum's Qwen3.8-35B-A3B repo: a 1.1 GiB
+    `mtp-*.gguf` holding only `blk.<n_layers>.*`), 0.0 when no such file
+    exists. Governed because GreenBoost's own _has_mtp() only read the main
+    file's tensors, so a model whose head lives elsewhere served with
+    speculation silently off (found 2026-10-02).
+  resolver: mtp_head_on_disk
+  source_fields: ["gb_synapse.ModelEntry.path"]
+  source_tier: measured
+  direction: informational
+  owner: GB-Synapse
+  never_use:
+    - field: n_recurrent_layers
+      why: "Unrelated to head placement, but the same GGUF's recurrent_layers key is a per-layer BOOL mask for qwen35moe: len() of it is n_layers, not the recurrent count. Counting it gave n_kv_layers=0 and under-sized every KV estimate until the 2026-10-02 fix; use ModelEntry.n_kv_layers from a re-summarized entry."
+
+- name: web_fetch_blocked_count
+  entity: node
+  unit: count
+  doc: >
+    WebFetch requests greenboost-cli's client-level guard refused (private or
+    link-local address, redirect into the LAN, non-text content type, size or time
+    cap, credential URL, GreenBoost's own control ports). A rising count with a
+    recurring reason is either a hostile page steering the agent or a legitimate
+    workflow the guard is too strict for; the `reasons` detail says which.
+  resolver: web_fetch_blocked_count
+  source_fields: ["web_fetch.status", "web_fetch.reason"]
+  source_tier: measured
+  direction: lower_is_better
+  owner: GB-CLI
+  never_use:
+    - field: cli_tool_call.decision
+      why: "WebFetch is auto-approved, so a fetch the guard REFUSED is recorded there as decision=allowed with an Error result. Counting denied_policy for WebFetch always reads zero."
+
+- name: factory_tasks_interrupted
+  entity: node
+  unit: count
+  doc: >
+    Factory tasks that were running when their factory died and are still waiting on
+    a person (/factory recover or /factory discard). They are never re-run
+    automatically. A non-zero value after an unattended run is the morning-after
+    to-do list.
+  resolver: factory_tasks_interrupted
+  source_fields: ["factory_task.status", "factory_task.task_id"]
+  source_tier: measured
+  direction: lower_is_better
+  owner: GB-CLI
+  never_use:
+    - field: status
+      why: "status=expired tasks were queued and never ran (TTL); interrupted tasks DID start and may have half-edited a workspace. They need different handling, so they are different statuses."
+
 - name: recurrent_layer_fraction
   entity: model
   unit: fraction
@@ -512,6 +566,57 @@
         two via the `kmod_version_drift` segment.
   aliases: [module_version, running_module_version, sysfs_version]
 
+- name: boot_tuning_active
+  entity: node
+  unit: fraction
+  doc: >
+    Fraction of GreenBoost's GRUB boot parameters (transparent_hugepage,
+    skew_tick, numa_balancing, workqueue.power_efficient, rcu_nocbs,
+    nohz_full) present in THIS boot's /proc/cmdline , what actually took
+    effect at the last boot. Says nothing about whether the config that
+    would reproduce it on the NEXT boot still exists , see
+    boot_tuning_persisted and this metric's own never_use trap.
+  resolver: boot_tuning_active
+  source_fields: ["/proc/cmdline"]
+  source_tier: measured
+  direction: informational
+  owner: Health
+  never_use:
+    - field: /proc/cmdline read alone as "boot tuning is configured"
+      why: >
+        /proc/cmdline describes the RUNNING boot, not the config that will
+        produce the next one. Incident 2026-08-31: `apt purge grub-pc` ran
+        grub-pc's postrm (`rm -f /etc/default/grub; ucf --purge
+        /etc/default/grub`) , that file is ucf-managed and shared across
+        every grub-* package, not dpkg-owned, so purging the BIOS flavour
+        deleted it out from under the still-installed EFI one. cmdline kept
+        showing every GreenBoost flag right up to and after the deletion,
+        because it reflects the boot that already happened; the next
+        `update-grub` (a kernel update, or GreenBoost's own tune-grub) would
+        have silently regenerated grub.cfg from an empty config and dropped
+        every parameter with no error. Pair this metric with
+        boot_tuning_persisted, or read the boot_tuning_lost_next_reboot
+        segment directly, for "will my tuning survive a reboot".
+  aliases: [grub_active, boot_params_active, cmdline_tuning]
+
+- name: boot_tuning_persisted
+  entity: node
+  unit: fraction
+  doc: >
+    Fraction of GreenBoost's GRUB boot parameters present in the EFFECTIVE
+    GRUB config , /etc/default/grub's GRUB_CMDLINE_LINUX_DEFAULT plus every
+    /etc/default/grub.d/*.cfg drop-in (including tune-grub's own
+    99-greenboost.cfg) , i.e. what the NEXT `update-grub` will actually
+    write into grub.cfg. This is the field that answers "will my tuning
+    survive a reboot"; 0.0 is a real, distinct answer from
+    boot_tuning_active reading 1.0.
+  resolver: boot_tuning_persisted
+  source_fields: ["/etc/default/grub", "/etc/default/grub.d/99-greenboost.cfg"]
+  source_tier: measured
+  direction: higher_is_better
+  owner: Health
+  aliases: [grub_persisted, boot_params_persisted, grub_config_survives_reboot]
+
 - name: core_build_version
   entity: node
   unit: version
@@ -689,6 +794,36 @@
         The manifest count alone cannot reveal this: a wiped manifest reports a
         perfectly consistent small number and nothing marks it as wrong. Only
         comparing it against what is on disk shows the gap.
+
+- name: recipes_unresolvable
+  entity: node
+  unit: count
+  doc: >
+    Serving recipes (serving/recipes/*.yaml) whose pinned model.name is absent
+    from the manifest right now , the sharper, operator-visible sibling of
+    unregistered_cached_models: it names WHICH recipe and WHICH model, not
+    just a raw count of orphaned cache entries. Governed because
+    `synapse_doctor`'s own `recipes[].valid` field says nothing about this ,
+    valid means the recipe FILE passed schema+digest, not that the model it
+    names can be served. This box carried exactly this on 2026-09-01: two
+    `valid: true` recipes, one of them the owner-designated reference
+    workload, pinning models the manifest didn't have , and nothing reported
+    it until this metric existed.
+  resolver: recipes_unresolvable
+  source_fields: ["serving/recipes/*.yaml model.name", "gb_synapse._load_manifest"]
+  source_tier: measured
+  direction: lower_is_better
+  owner: GB-Synapse
+  never_use:
+    - field: "valid"
+      class: misleading_proxy
+      why: >
+        `valid` (from synapse_doctor's recipes block / RecipeCoverageEntry)
+        means the recipe file itself parses against recipe.schema.json and its
+        digest matches , it is silent on whether the model it pins exists in
+        the manifest. A recipe can be valid=true and completely unservable at
+        the same time; only comparing model.name against the live manifest
+        (what this metric does) answers "can this recipe actually serve".
 
 - name: host_mem_available_gb
   entity: node
@@ -1342,3 +1477,88 @@
         recorder shows a near-zero size seconds after a rotation. Reading the
         size would report "telemetry is dead" for a recorder that is working
         perfectly.
+
+- name: tier_spill_return_pct
+  entity: node
+  unit: percent
+  doc: >
+    Share of T1 demotions that later had to be undone by promoting the same
+    component back to T1. This is the shape of the workload, not a pathology:
+    a demotion that never returns is the GOOD case (VRAM freed, the component
+    was finished), while a round trip means the spill was premature and cost a
+    demote plus a promote. Distinct from gb_thrash, which counts only
+    reversals FAST enough to be ping-pong (within lapse_s, per component);
+    this counts every round trip regardless of interval, so a slow but
+    repeated bounce shows up here and nowhere else. Null, not zero, when
+    nothing has been demoted.
+  resolver: tier_spill_return_pct
+  source_fields: ["tier_move.from_tier", "tier_move.to_tier", "tier_move.items"]
+  source_tier: measured
+  direction: lower_is_better
+  owner: GB-Tiering
+  never_use:
+    - field: n_items
+      class: wrong_scope
+      why: >
+        It counts components moved in one call, not whether any move was
+        undone. A single call moving five components is one placement
+        decision, not five.
+
+- name: warm_prefill_fixed_ms
+  entity: node
+  unit: milliseconds
+  doc: >
+    Per-request cost paid before the first output token on a WARM turn, after
+    the prompt is already cached. Measured 2026-08-22 on this box at
+    1273-1307 ms and it is FIXED: it did not move across a 9.4x prompt-length
+    range (489 -> 4620 tokens, 1273.1 -> 1283.6 ms) nor across a 16x
+    output-length range (max_tokens 8 -> 128, 1286 -> 1305 ms). On an 8-token
+    reply that is 1.29 s of a 2.96 s turn, 44% of the wall clock, and for an
+    agent making many short tool-calling turns it is the dominant cost.
+    REPLACES recurrent_replay_share, which was withdrawn the same day: that
+    metric divided by gb_bench_turn's `real_prefill_ms_est`, which is a
+    CONSTANT (443.8 in every run), so it reported prompt_ms minus a constant
+    and called the remainder recurrent replay. There is no whole-prompt
+    recurrent replay on this engine - see the retraction in
+    docs/performance-casebook.md.
+  resolver: warm_prefill_fixed_ms
+  source_fields: ["turn_bench.median_prompt_ms"]
+  source_tier: measured
+  direction: lower_is_better
+  owner: GB-Synapse
+  never_use:
+    - field: median_replay_ms_est
+      class: derived_as_measured
+      why: >
+        It is prompt_ms minus a hardcoded constant, not a measurement of
+        replay. Reading it as one produced a 67% "recurrent replay share"
+        that a length sweep disproved in three runs.
+
+
+- name: tool_result_prefill_ms
+  entity: node
+  unit: milliseconds
+  doc: >
+    What the largest recent tool result will cost in prefill once it is in the
+    prompt. The rate is MEASURED per box from prompt_cache events (missed
+    tokens against engine_prompt_ms), not assumed: on this box it is ~23 ms
+    per token at a 14-18k agent context, which is 5x the 4.4 ms/token a 1.6k
+    microbenchmark shows, because the model spills to T2 over PCIe at that
+    size. The asymmetry this exists to surface, measured on a real session
+    2026-08-22: a Read of a 7.7 KB file took 6.3 ms to execute and its result
+    cost ~1,938 tokens, about 45 SECONDS of prefill. The tool is never the
+    cost; carrying its output is, and nothing showed that. Null when no tool
+    call has recorded a result size, or when no prompt_cache event has yet
+    established a rate.
+  resolver: tool_result_prefill_ms
+  source_fields: ["cli_tool_call.result_tokens_est", "prompt_cache.engine_prompt_ms", "prompt_cache.hit_pct"]
+  source_tier: derived
+  direction: lower_is_better
+  owner: GB-CLI
+  never_use:
+    - field: duration_ms
+      class: wrong_scope
+      why: >
+        Tool execution time. On the measured session it was 6.3 ms against a
+        45-second prefill cost for the same call , reading it as the cost of
+        a tool is wrong by three orders of magnitude.

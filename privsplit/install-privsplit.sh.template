@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# OWNER SCRIPT TEMPLATE (SP41-12 / QC1). Copy, read, then run as root yourself.
+# Non-interactive: asks nothing. Usage:
+#   install-privsplit.sh --dry-run     print every step, change nothing (no root needed)
+#   install-privsplit.sh               install the helper units (helper only, brain untouched)
+#   install-privsplit.sh --rollback    restore the backup and remove what this script added
+# Deliberately does NOT switch the supervisor to the brain unit: that is a second,
+# manual step after tests 6 to 10 of docs/greenboost-audit/privsplit-design.md pass.
+set -euo pipefail
+
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB=/usr/local/lib/greenboost/privsplit
+UNITS=/etc/systemd/system
+TMPF=/etc/tmpfiles.d/greenboost-helper.conf
+BK=/var/lib/greenboost-privsplit-backup
+MANIFEST="$BK/installed.list"
+MODE=install
+for a in "$@"; do
+  case "$a" in
+    --dry-run)  MODE=dry ;;
+    --rollback) MODE=rollback ;;
+    *) echo "unknown option: $a" >&2; exit 2 ;;
+  esac
+done
+
+run() { if [ "$MODE" = dry ]; then echo "DRY: $*"; else "$@"; fi; }
+[ "$MODE" = dry ] || [ "$(id -u)" -eq 0 ] || { echo "run as root (or --dry-run)" >&2; exit 1; }
+
+FILES_UNITS=(greenboost-root-helper.socket greenboost-root-helper.service)
+
+if [ "$MODE" = rollback ]; then
+  [ -f "$MANIFEST" ] || { echo "nothing to roll back: $MANIFEST missing" >&2; exit 1; }
+  systemctl disable --now greenboost-root-helper.socket greenboost-root-helper.service 2>/dev/null || true
+  while IFS= read -r f; do
+    if [ -e "$BK$f" ]; then cp -a "$BK$f" "$f"; else rm -f -- "$f"; fi   # restore or remove
+  done < "$MANIFEST"
+  rm -f -- "$MANIFEST"
+  systemctl daemon-reload
+  echo "rolled back. The greenboost system user was left in place."
+  exit 0
+fi
+
+stamp() { # backup an existing file once, record every path we touch
+  local f="$1"
+  run mkdir -p "$BK$(dirname "$f")"
+  [ "$MODE" = dry ] || [ ! -e "$f" ] || [ -e "$BK$f" ] || cp -a "$f" "$BK$f"
+  [ "$MODE" = dry ] && echo "DRY: record $f" || echo "$f" >> "$MANIFEST"
+}
+
+run mkdir -p "$BK" "$LIB"
+[ "$MODE" = dry ] || : > "$MANIFEST"
+if ! getent passwd greenboost >/dev/null 2>&1; then
+  # The installer already creates the group `greenboost` (cluster.key); `--user-group` would then fail with "group exists".
+  if getent group greenboost >/dev/null 2>&1; then _grp=(--gid greenboost); else _grp=(--user-group); fi
+  run useradd --system --no-create-home --shell /usr/sbin/nologin "${_grp[@]}" greenboost
+fi
+for f in gb_root_helper.py gb_helper_client.py; do
+  stamp "$LIB/$f"; run install -o root -g root -m 0644 "$SRC/$f" "$LIB/$f"
+done
+run chmod 0755 "$LIB/gb_root_helper.py"
+for u in "${FILES_UNITS[@]}"; do
+  stamp "$UNITS/$u"; run install -o root -g root -m 0644 "$SRC/units/$u" "$UNITS/$u"
+done
+stamp "$TMPF"; run install -o root -g root -m 0644 "$SRC/units/greenboost-helper.tmpfiles.conf" "$TMPF"
+
+run systemd-tmpfiles --create "$TMPF"
+run systemd-analyze verify "$UNITS/greenboost-root-helper.service" "$UNITS/greenboost-root-helper.socket"
+run systemctl daemon-reload
+run systemctl enable --now greenboost-root-helper.socket
+if [ "$MODE" = dry ]; then echo "(dry run: nothing was changed)"; else echo "helper socket is live. Next: README 'Verify', then the manual brain switch."; fi

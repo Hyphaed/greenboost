@@ -978,8 +978,20 @@ def patch_sdpa(bit_width: Union[int, float] = 3, device: str = "cuda",
         unpatch_sdpa()
     kb = k_bits if k_bits is not None else int(math.ceil(bit_width))
     vb = v_bits if v_bits is not None else max(bit_width - 1, 2)
-    if backend is None:
-        backend = os.environ.get("GB_ATTN_BACKEND", "dequant")
+    # Record WHY, not just what. A backend picked from an env var the operator
+    # forgot they exported looks identical, in every log and every metric, to
+    # one chosen deliberately , and the two have very different debugging
+    # stories when attention quality is wrong. Crosswalk Q1-03, adapted from
+    # unsloth/utils/attention_dispatch.py, which carries its selection reason
+    # in a dataclass for the same reason.
+    if backend is not None:
+        backend_source = "explicit"
+    elif os.environ.get("GB_ATTN_BACKEND"):
+        backend = os.environ["GB_ATTN_BACKEND"]
+        backend_source = "env:GB_ATTN_BACKEND"
+    else:
+        backend = "dequant"
+        backend_source = "default"
     if backend == "packed" and mode != "turboquant":
         raise ValueError(
             f'gb_attn: backend="packed" is only wired for mode="turboquant" so far '
@@ -1080,6 +1092,10 @@ def patch_sdpa(bit_width: Union[int, float] = 3, device: str = "cuda",
             "n_items": 1, "items": [mode], "duration_s": 0.0, "status": "ok",
             "k_bits": kb, "v_bits": vb, "device": device,
             "sparse_v": sparse_v, "mode": mode,
+            # Q1-03: the choice AND its provenance. Without backend_source, an
+            # env-var default and a deliberate override are indistinguishable.
+            "backend": backend, "backend_source": backend_source,
+            "layer_adaptive": bool(layer_adaptive),
         })
     except Exception:
         pass

@@ -237,7 +237,16 @@ def _bootstrap():
     except Exception as exc:
         print(f"[gb_init] orchestrator unavailable: {exc}", file=sys.stderr)
 
-    print("[gb_init] GreenBoost Python layers active", flush=True)
+    # stderr, like every other message in this module. gb_init is imported by
+    # processes whose STDOUT IS DATA: the MCP servers speak JSON-RPC over it,
+    # and any bench or script that prints a table has its output corrupted by a
+    # banner landing mid-stream. Both happened , gb_semantics had to add a
+    # defensive stdout guard because this line reached an MCP stdio channel
+    # (crosswalk P5-11), and on 2026-08-22 it appeared in the middle of
+    # tests/bench/bench_fp8_backends.py's results table. Guarding the consumer
+    # was the right emergency fix and the wrong permanent one: the producer is
+    # here, and a diagnostic has no business on stdout.
+    print("[gb_init] GreenBoost Python layers active", file=sys.stderr, flush=True)
 
 
 def _shutdown():
@@ -430,7 +439,7 @@ def pre_inference_check(run_dcgm_diag: bool = False) -> bool:
 
     if run_dcgm_diag and telemetry is not None:
         result = telemetry.run_diag(level=1)
-        print(f"[gb_init] {result}", flush=True)
+        print(f"[gb_init] {result}", file=sys.stderr, flush=True)
 
     return ok
 

@@ -154,7 +154,8 @@ def _serve(job: RotationJob) -> str:
     """Bring the job's model up; returns the mode used ("synapse"/"ollama")."""
     if _engine_built():
         import gb_synapse
-        gb_synapse.serve(job.model, ctx=job.ctx, use_cluster=True)
+        gb_synapse.serve(job.model, ctx=job.ctx, use_cluster=True,
+                         explicit=True, trigger="rotator_job", keep=True)
         return "synapse"
     _ollama_keep_alive(job.model, "10m")
     return "ollama"

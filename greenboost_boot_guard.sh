@@ -102,7 +102,7 @@ reload_stale_module() {
 }
 
 # ── already loaded: check IDENTITY, not just presence ───────────────────────
-if lsmod 2>/dev/null | grep -q '^greenboost\b'; then
+if [[ -d /sys/module/greenboost ]]; then
     LOADED_VER="$(loaded_field version)"
     LOADED_SRC="$(loaded_field srcversion)"
     ONDISK_VER="$(ondisk_field version)"

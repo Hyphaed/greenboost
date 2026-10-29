@@ -35,6 +35,18 @@ from mcp.types import ToolAnnotations  # noqa: E402
 
 mcp = FastMCP("greenboost-orchestrator")
 
+# When a client registers this server alongside its siblings (dataflux,
+# cluster, synapse) simultaneously, the "one server suffices" re-exports below
+# become pure duplicate schema — same tool name, same gb_mcp_common impl,
+# advertised twice per client. optimal-claude's account sync sets this
+# whenever it detects 2+ greenboost-family servers registered together;
+# unset (default) preserves today's standalone behavior for anyone
+# connecting only this server.
+_NO_MIRROR = os.environ.get("GB_MCP_NO_MIRROR") == "1"
+# No-op decorator swap so the six re-exports below simply don't register
+# with FastMCP when the flag is set, instead of reindenting the whole block.
+_mirror_tool = (lambda *a, **kw: (lambda f: f)) if _NO_MIRROR else mcp.tool
+
 # Per-tool MCP read-only declaration (AE-6). Judged one tool at a time, never
 # swept across the file: this server also carries tools that actuate, serve,
 # stop, dispatch or write policy, and mislabelling one of those as read-only
@@ -137,9 +149,37 @@ def _read_orch_state() -> dict:
         return {}
 
 
+_OVERVIEW_SECTION_CHARS = 2500      # compact mode: a section bigger than this is replaced by its key list
+
+
+def _compact_overview(out: dict) -> dict:
+    """Keep `greenboost_overview()` readable in ONE tool result (the full dump was ~27k chars / 950 lines and overflowed the
+    client's output limit, so agents never read the tool they are told to start from). Small sections pass through; big ones
+    become {"_truncated", "chars", "keys"} (drill in with the owning subsystem MCP, or call with compact=False); a reading list
+    is added so an agent that starts here also learns which docs to open (owner rule, 2026-10-28)."""
+    res: dict = {}
+    for k, v in out.items():
+        try:
+            n = len(json.dumps(v, default=str))
+        except Exception:
+            n = 0
+        if n > _OVERVIEW_SECTION_CHARS:
+            res[k] = {"_truncated": True, "chars": n, "keys": list(v)[:40] if isinstance(v, (dict, list)) else None}
+        else:
+            res[k] = v
+    here = Path(__file__).resolve().parent
+    res["read_first"] = [str(p) for p in (here / "workflow/workflows.md", here / "workflow/gb-quant.md",
+                                          Path.home() / "Dev/ai-forge/docs/GREENBOOST-CONTRACT.md") if p.exists()]
+    res["compact"] = "true: big sections are summarised to their keys; greenboost_overview(compact=False) returns everything"
+    return res
+
+
 @mcp.tool(annotations=_READ_ONLY)
-def greenboost_overview() -> dict:
-    """FULL GreenBoost awareness in one call: capabilities, live status, tier
+def greenboost_overview(compact: bool = True) -> dict:
+    """compact=True (default) returns a readable summary: verdicts, rules, taxonomy, small sections in full, big ones as
+    their key list, plus the docs to read first. compact=False returns the whole dump (~27k chars).
+
+    FULL GreenBoost awareness in one call: capabilities, live status, tier
     state, cluster state, synapse (engine/models/serving), dataflux topline,
     the subsystem taxonomy (which MCP server owns what), the operating rules
     (Rule #1 ~90% VRAM, fp8 quality floor, never-T3 weights, maximize
@@ -196,7 +236,7 @@ def greenboost_overview() -> dict:
     except Exception as e:
         out["dataflux_error"] = str(e)
     out["shim"] = _read_shim_stats()
-    return out
+    return _compact_overview(out) if compact else out
 
 
 @mcp.tool(annotations=_READ_ONLY)
@@ -453,9 +493,38 @@ def gb_plan(model: str, vram_fill_pct: float | None = None) -> dict:
         return {"error": f"gguf_summary failed: {e}"}
     dense_gb = summary.get("dense_bytes", 0) / (1024 ** 3)
     expert_gb = summary.get("expert_bytes", 0) / (1024 ** 3)
-    kv_gb = gb_synapse.estimate_kv_gb(
-        65536, entry.n_bytes, entry.quant, n_layers=summary.get("n_layers", 0),
-        n_kv_heads=summary.get("n_kv_heads", 0), head_dim=summary.get("head_dim", 0))
+    # KV lives ONLY in the full-attention layers, and the recurrent ones carry a
+    # constant-size state instead. Passing n_layers here charged every layer the
+    # attention rate , the exact error casebook C-07 describes, still live on
+    # this path while gb_synapse_backends.py:876 and gb_bench_kv.py:88 both
+    # already did it correctly. gguf_summary() has carried n_kv_layers all along.
+    #
+    # Measured 2026-08-22 on Qwen3.8-27B-Cold-Fusion-MTP-IQ4_XS (65 layers: 17
+    # attention + 48 recurrent) at ctx 65536: 8.125 GiB charged against 2.271
+    # GiB real (2.125 KV + 0.146 SSM), a 3.58x overestimate , 5.85 GiB of
+    # phantom reservation handed to the expert planner on an 11.3 GiB card.
+    #
+    # The SSM term is added rather than dropped: excluding 48 layers from KV
+    # without counting the state they DO hold would swing the estimate from
+    # over- to under-counting, and that state is VRAM-resident under Rule #1.
+    # A recurrent-only stack is SKIPPED rather than asked for 0 layers.
+    # estimate_kv_gb's `n_layers > 0` guard means "geometry unknown, use the
+    # param-count bucket", so passing 0 to mean "no KV at all" gets a bucketed
+    # charge instead of zero , measured 0.0406 GiB of phantom KV at ctx 65536.
+    # Latent today (no recurrent-only model in the manifest), and the two
+    # meanings of 0 cannot be told apart inside the estimator, so the call site
+    # is where it has to be decided.
+    if summary.get("is_recurrent_only"):
+        kv_gb = 0.0
+    else:
+        kv_gb = gb_synapse.estimate_kv_gb(
+            65536, entry.n_bytes, entry.quant,
+            n_layers=summary.get("n_kv_layers") or summary.get("n_layers", 0),
+            n_kv_heads=summary.get("n_kv_heads", 0),
+            head_dim=summary.get("head_dim", 0))
+    kv_gb += gb_synapse.estimate_ssm_state_gb(
+        summary.get("n_recurrent_layers", 0), summary.get("ssm_d_conv", 0),
+        summary.get("ssm_conv_width", 0), summary.get("ssm_state_elems", 0))
     plan = gb_placement.plan_experts_and_emit(dense_gb=dense_gb, expert_gb=expert_gb,
                                               kv_gb=kv_gb, vram_fill_pct=vram_fill_pct)
     plan["model_name"] = entry.name
@@ -698,6 +767,35 @@ def run_under_greenboost(command: "list[str] | str", workload: str = "llm",
 
 
 @mcp.tool(annotations=_READ_ONLY)
+def gpu_phase_status(need_pct: float = 0.0) -> dict:
+    """QUERY (no gate): the shared GPU phase lease right now: who holds it (and whether that lease is stale), the card's
+    physical VRAM used/total/free %, the processes on the card, and whether a phase needing `need_pct` of the card
+    (% of physical VRAM, derive it from the model's real footprint) could start. One heavy model at a time: Qwen vision
+    ~10.6 GB, a FLUX batch ~9.9 GiB peak, browser raster and NVENC are small but not free. Same lock file as the studio's
+    packages/art/src/lock.ts (SVG_STUDIO_GPU_LOCK)."""
+    import gb_phase
+    return gb_phase.phase_status(need_pct)
+
+
+@mcp.tool()
+def gpu_phase_acquire(name: str, need_pct: float = 0.0, ttl_s: float = 300.0, wait_s: float = 0.0,
+                      owner: str = "mcp", cls: str = "image", confirm: bool = False) -> dict:
+    """ACTUATE (double-gated): take the shared GPU phase lease for `name`, waiting up to wait_s. When VRAM is short and cls is
+    not llm/vlm, gb-synapse's served models are PAUSED (KV saved, VRAM returned; never stopped, foreign processes never
+    touched). DRY-RUN unless confirm=True AND GB_ORCH_ACTUATE=1. The lease ends at gpu_phase_release(token) or after ttl_s."""
+    import gb_actuation
+    return gb_actuation.gpu_phase_acquire(name, need_pct, ttl_s=ttl_s, wait_s=wait_s, owner=owner, cls=cls, confirm=confirm)
+
+
+@mcp.tool()
+def gpu_phase_release(token: str, confirm: bool = False) -> dict:
+    """ACTUATE (double-gated): release a lease taken with gpu_phase_acquire; returns the phase's wall seconds and peak VRAM
+    (also emitted as dataflux kind gpu_phase). DRY-RUN unless confirm=True AND GB_ORCH_ACTUATE=1."""
+    import gb_actuation
+    return gb_actuation.gpu_phase_release(token, confirm=confirm)
+
+
+@mcp.tool(annotations=_READ_ONLY)
 def reclaim_plan(scope: str = "residue", kill_min_mb: int = 512) -> dict:
     """QUERY (no gate): classify every GreenBoost-held GPU/T2/T3 process into
     live/ambiguous/residue and report what scope ("residue"|"ambiguous"|
@@ -799,7 +897,7 @@ def a2a_gateway(action: str = "status", confirm: bool = False) -> dict:
 
 # ── selective re-exports: one server suffices day-to-day ────────────────────
 
-@mcp.tool(annotations=_READ_ONLY)
+@_mirror_tool(annotations=_READ_ONLY)
 def greenboost_status() -> dict:
     """Live GreenBoost snapshot (kmod, GPU, T1/T2/T3 pools, pressure, phase) —
     same data as `greenboost status --llm`. Canonical: greenboost-dataflux.
@@ -809,7 +907,7 @@ def greenboost_status() -> dict:
     return gb_mcp_common.greenboost_status()
 
 
-@mcp.tool(annotations=_READ_ONLY)
+@_mirror_tool(annotations=_READ_ONLY)
 def greenboost_capabilities() -> dict:
     """Installed/running shim capability manifest (features the deployed
     GreenBoost actually supports). Canonical: greenboost-dataflux. Mirrored
@@ -818,7 +916,7 @@ def greenboost_capabilities() -> dict:
     return gb_mcp_common.greenboost_capabilities()
 
 
-@mcp.tool(annotations=_READ_ONLY)
+@_mirror_tool(annotations=_READ_ONLY)
 def greenboost_pilot(days: float = 5.0) -> dict:
     """Pilot instrument panel: per-stage wall-time trends, measured tok/s per
     model, pressure picture, and evidence-backed advice (levers quoted, never
@@ -828,7 +926,7 @@ def greenboost_pilot(days: float = 5.0) -> dict:
     return gb_mcp_common.greenboost_pilot(days=days)
 
 
-@mcp.tool(annotations=_READ_ONLY)
+@_mirror_tool(annotations=_READ_ONLY)
 def cluster_status(probe: bool = True) -> dict:
     """Gb-Cluster headline: feeders online, per-node T1/T2/T3 + GPU telemetry.
     Canonical: greenboost-cluster. Mirrored here (shared impl in
@@ -837,7 +935,7 @@ def cluster_status(probe: bool = True) -> dict:
     return gb_mcp_common.cluster_status(probe=probe)
 
 
-@mcp.tool(annotations=_READ_ONLY)
+@_mirror_tool(annotations=_READ_ONLY)
 def dataflux_summary(days: float = 5.0) -> dict:
     """GB-Dataflux headline rollup (events, per-node throughput, errors,
     tok/s). Canonical: greenboost-dataflux. Mirrored here (shared impl in
@@ -846,7 +944,7 @@ def dataflux_summary(days: float = 5.0) -> dict:
     return gb_mcp_common.dataflux_summary(days=days)
 
 
-@mcp.tool(annotations=_READ_ONLY)
+@_mirror_tool(annotations=_READ_ONLY)
 def synapse_status() -> dict:
     """Gb-Synapse engine/proxy status (built?, version, server + :11434 proxy
     running?). Canonical: greenboost-synapse. Mirrored here (shared impl in

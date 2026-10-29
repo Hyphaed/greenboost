@@ -42,6 +42,7 @@ Run standalone (stdio transport, for `.mcp.json` registration):
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -53,6 +54,14 @@ from mcp.server.fastmcp import FastMCP  # noqa: E402
 from mcp.types import ToolAnnotations  # noqa: E402
 
 mcp = FastMCP("greenboost-dataflux")
+
+# See gb_mcp.py's matching flag — set by optimal-claude's account sync when
+# 2+ greenboost-family servers are registered together, so the four
+# convenience mirrors below (identical shape, shared impl in
+# gb_mcp_common.py) aren't advertised twice. Unset (default) preserves
+# standalone "one server suffices" behavior.
+_NO_MIRROR = os.environ.get("GB_MCP_NO_MIRROR") == "1"
+_mirror_tool = (lambda *a, **kw: (lambda f: f)) if _NO_MIRROR else mcp.tool
 
 # Every tool on this server answers a question and changes nothing , this is
 # the telemetry/query surface, the flight recorder's read head. Declaring that
@@ -384,8 +393,12 @@ def dataflux_models(days: float = 5.0) -> dict:
 
 
 @mcp.tool(annotations=_READ_ONLY)
-def dataflux_critic(days: float = 1.0) -> dict:
-    """Critic report: snapshot-correlated diagnosis of what was happening
+def dataflux_critic(days: float = 1.0, compact: bool = True, max_incidents: int = 8) -> dict:
+    """compact=True (default): a readable summary (counts by kind and by diagnosis hint, the last `max_incidents` incidents,
+    the top recommendations); the full report of a busy day is ~57k characters and overflows the client. compact=False returns
+    the full report with every snapshot.
+
+    Critic report: snapshot-correlated diagnosis of what was happening
     during cluster inference. Every incident (error events, shim_transition
     warns) in the last `days` days is returned with the nearest flight-recorder
     snapshots within ±60s before/after (VRAM used/free %, GPU util, shim
@@ -396,7 +409,8 @@ def dataflux_critic(days: float = 1.0) -> dict:
     quality-floor breaches). Ends with merged `recommendations` (incident
     hints + gb_pilot advice) toward best cluster inference at ≥fp8 gb-quant
     quality. Use after any failed/slow run before tuning anything."""
-    return gdf.critic_report(days=days)
+    rep = gdf.critic_report(days=days)
+    return gdf.compact_critic(rep, max_incidents=max_incidents) if compact else rep
 
 
 @mcp.tool(annotations=_READ_ONLY)
@@ -442,7 +456,7 @@ def dataflux_candidates(days: float = 5.0) -> dict:
                                  key=lambda kv: -kv[1]["last_ts"]))}
 
 
-@mcp.tool(annotations=_READ_ONLY)
+@_mirror_tool(annotations=_READ_ONLY)
 def greenboost_pilot(days: float = 5.0) -> dict:
     """The pilot's instrument panel (gb_pilot): per-stage wall-time trends
     (stage_profile events from ai-forge's jobqueue/seedlog), measured tok/s
@@ -456,7 +470,7 @@ def greenboost_pilot(days: float = 5.0) -> dict:
     return gb_mcp_common.greenboost_pilot(days=days)
 
 
-@mcp.tool(annotations=_READ_ONLY)
+@_mirror_tool(annotations=_READ_ONLY)
 def greenboost_capabilities() -> dict:
     """What the installed/running GreenBoost shim supports, via gb_monitor's
     capability manifest (runtime /run/greenboost/capabilities.json written by
@@ -469,7 +483,7 @@ def greenboost_capabilities() -> dict:
     return gb_mcp_common.greenboost_capabilities()
 
 
-@mcp.tool(annotations=_READ_ONLY)
+@_mirror_tool(annotations=_READ_ONLY)
 def greenboost_status() -> dict:
     """Live read-only GreenBoost snapshot via gb_monitor: whether the kmod is
     loaded, GPU, the T1/T2/T3 tier pool (MB) + combined GB, pressure labels,
@@ -481,7 +495,7 @@ def greenboost_status() -> dict:
     return gb_mcp_common.greenboost_status()
 
 
-@mcp.tool(annotations=_READ_ONLY)
+@_mirror_tool(annotations=_READ_ONLY)
 def synapse_status() -> dict:
     """Gb-Synapse status: whether the llama.cpp `--rpc` engine is BUILT
     (llama-server + rpc-server present in ENGINE_DIR), its version, and whether

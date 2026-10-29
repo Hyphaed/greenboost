@@ -1,19 +1,25 @@
 # GreenBoost Changelog
 
-## v3.5 : in development, not released
-There is no v3.5 release or tag. This is the current state of `main`: it builds and passes its gates, but it is still changing. Use `v3.4` if you want the last stable release.
+## v3.5 : 2026-10-29
+Stable release (use `v3.4` for the previous one). Every item below is a fix for a real failure on the 12 GB RTX 5070 workstation.
 
-The biggest fixes are around session caching, persistence, and measurement. Restored sessions no longer lose their prompt cache during the first compaction because memory blocks stay pinned in the prompt prefix. The cache metric was also corrected: only actually retained prefixes count now. This means the reported percentage may drop even though caching is working better. 
+**Faster prompt processing (prefill).** llama.cpp's `--batch-size`/`--ubatch-size` were never set, so prompts ran at the engine default and left the GPU half-idle. They are now real knobs (recipe `batch`/`ubatch`, `serve()`, the `synapse_serve` MCP tool, and `gb_synapse.py serve`). On `qwen38-35b-a3b-apex-miniplus`, `ubatch: 2048` gives **1.81x cold prefill** (1363 -> 2470 tok/s), decode unchanged, and is pinned in that recipe. Decode is limited by memory bandwidth, so this knob does not change it.
 
-Checkpoints now save idle slots without stopping the engine, including recurrent state, and restore only when the model and relevant runtime settings match. They make restarts survivable, but they do **not** restore prefill speed. Keeping the engine alive is dramatically faster, so checkpointing should be treated as crash protection, not a performance feature.
+**The memory shim is now on by default when serving.** The shim lets a model spill overflow from VRAM into system RAM. A safety probe decides whether to use it, but during a serve the probe was skipping and defaulting to "off", which forced large MoE models onto CPU-only at ~11 tok/s. The probe now actually runs during a serve and caches its result, so the shim stays on whenever it works (and off, with a stated reason, on a build where it breaks).
 
-Several smaller issues were cleaned up: decode rates now survive tool calls, request sizing learns from real token counts and includes tool-schema overhead, and retries are checked against the server's actual limits.
+**Sessions survive restarts and compaction.** Restored chats keep their prompt cache (the prefix blocks stay pinned). Checkpoints save and restore idle slots without stopping the engine; treat them as crash protection, not a speedup (they do not restore prefill speed). The cache-hit metric now counts only prefixes actually kept, so the number can look lower while caching is genuinely better.
 
-The tuner is now deliberately conservative. It only advises changes unless explicitly allowed to apply them, verifies the result, and rolls back regressions. Speculative decoding uses real traffic instead of benchmark assumptions, while streaming reports p50/p95/max latency and slow-token rates rather than hiding everything behind average tok/s.
+**Vision models stopped crashing on images.** `serve()` now reserves the vision projector's extra VRAM before launch (or `vision=False` frees ~1.8 GiB); the proxy resizes incoming images to the model's token budget and accepts request bodies up to 32 MB (was 1 MB); a paused-then-resumed server keeps its projector; and after an out-of-memory crash the dead engine is cleaned up and the serve retried once with a clear reason.
 
-Telemetry distinguishes "no data" from a broken recorder. Memory settings are derived from installed RAM instead of fixed values, and crashed gaming sessions can be diagnosed instead of leaving `gaming_mode` stuck unnoticed.
+**One 12 GB card shared by many GPU jobs.** A lease (`gb_phase`) makes the LLM, image generation, browser and video encoder take turns instead of two colliding and dying; GreenBoost's own models pause (never get killed) when a phase needs room. Image load/quantise is pinned to the fast P-cores. Proxy memory is sized per serve, so a second concurrent image request no longer hits MemoryError.
 
-GreenBoost still works on a stock kernel. The Hyphaed kernel adds optional support for prioritising DMA buffers during memory pressure; the other kernel patches are either preparatory or build-related. 
+**MoE model handling.** Recurrent-layer and KV-cache sizes are now computed correctly, and the separate multi-token-prediction (MTP) head is loaded. Best measured setting: `n_cpu_moe 28` + MTP = **49.7 tok/s** decode, about 10x the dense 27B model. Known rough edge: the auto-fit can pick 24, which is 3.5x slower, so pin 28.
+
+**Install and recovery.** Models already on disk are re-registered under their recipe-pinned names (the cache scan now recurses and collapses multi-shard files). Boot tuning moved to a `/etc/default/grub.d` drop-in so removing `grub-pc` can no longer wipe it, and `tune-grub` degrades instead of aborting the install.
+
+**Observability.** `dataflux_critic` and `greenboost_overview` now default to `compact=True` so agents can read them in one call; telemetry tells "no data" apart from a broken recorder; memory settings come from the machine's installed RAM instead of hardcoded numbers.
+
+**Version** bumped 3.4 -> 3.5 across every site (kernel module, shim, DKMS, the three installers, and this file).
 
 ## v3.4 : 2026-08-18
 

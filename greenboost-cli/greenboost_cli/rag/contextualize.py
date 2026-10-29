@@ -185,9 +185,9 @@ def cmd_contextualize(argv: list[str]) -> int:
             _emit_json({"error": msg, "contexts": []})
         return 1
 
+    n = len(chunks)
     if not args.json:
         print(f"  \033[2m·\033[0m  contextualizer: {model}  [gb-synapse]")
-        n = len(chunks)
         # progress ticker — contextualize_chunks doesn't print; mimic it
         print(f"  contextualizing {n} chunks…", end="\r", flush=True)
 

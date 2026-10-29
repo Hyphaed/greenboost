@@ -187,7 +187,10 @@ def main() -> None:
         sys.exit(1)
 
     # Auto-start gb-synapse if the configured model isn't already being served.
-    _model = settings.get("model", "")
+    # Only when a prompt was given: with no prompt nothing may be loaded
+    # (owner rule 2026-10-10; the loader itself also refuses, see
+    # gb_synapse.serve's explicit/trigger gate).
+    _model = settings.get("model", "") if initial else ""
     if _model:
         try:
             from greenboost_cli.slash_commands.backend_cmds import _llamacpp_running_pid, cmd_llamaserve
@@ -195,7 +198,11 @@ def main() -> None:
                 from greenboost_cli.terminal.theme import emit_info, emit_warn, VIOLET
                 _mid = _model.split("/", 1)[1] if "/" in _model else _model
                 emit_info(f"Starting gb-synapse for [{VIOLET}]{_mid}[/] …")
-                cmd_llamaserve("start", None, settings)
+                settings["_prompt_driven"] = True
+                try:
+                    cmd_llamaserve("start", None, settings)
+                finally:
+                    settings.pop("_prompt_driven", None)
         except Exception as _e:
             from greenboost_cli.terminal.theme import emit_warn
             emit_warn(f"gb-synapse auto-start error: {_e}")

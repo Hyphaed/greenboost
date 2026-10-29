@@ -17,10 +17,42 @@ Usage:
 """
 from __future__ import annotations
 
+import os
+import re
 import sys
 from pathlib import Path
 
 _VENDORED_GGUF_PY = Path(__file__).parent.parent / "greenboost-sources" / "llama.cpp" / "gguf-py"
+
+# llama.cpp's own split-shard naming (gguf-py/gguf/gguf_writer.py,
+# SHARD_NAME_FORMAT). Canonical home for this regex + shard_paths(): this
+# module has no dependency on gb_synapse.py, while gb_synapse.py already
+# imports FROM this module (_load_gguf_reader) — so gb_synapse.py imports
+# shard_paths() from HERE rather than each keeping its own copy. Real
+# incident, 2026-08-28: this module's tensor_map() (used by
+# _fit_cpu_moe_layers() to size MoE --n-cpu-moe offload) summed only the one
+# file it was handed, exactly the same blind spot gb_synapse.gguf_summary()
+# had before its split-aware fix — for Qwen3.8-Flash-Next-UD-Q2_K_XL that
+# meant `expert_bytes: 0` from this function specifically, `_fit_cpu_moe_
+# layers()` returning 0 (nothing to offload), no `--n-cpu-moe` flag emitted
+# at all, and llama.cpp requesting one ~46 GiB CUDA buffer for the experts
+# — a real cudaMalloc OOM the shim's front-load split was never given a
+# chance to handle, because llama.cpp never asked it to.
+_GGUF_SPLIT_RE = re.compile(r'^(.+)-(\d{5})-of-(\d{5})\.gguf$')
+
+
+def shard_paths(path: str) -> list[str]:
+    """Every sibling shard of a split GGUF, in shard order, derived from the
+    `-%05d-of-%05d.gguf` filename convention -- `[path]` unchanged for a
+    non-split file. Never a directory glob: a glob would pick up an
+    unrelated second quant sitting in the same cache folder."""
+    m = _GGUF_SPLIT_RE.match(os.path.basename(path))
+    if not m:
+        return [path]
+    stem, _, total = m.groups()
+    d = os.path.dirname(path)
+    return [os.path.join(d, f"{stem}-{i:05d}-of-{total}.gguf")
+            for i in range(1, int(total) + 1)]
 
 
 def _load_gguf_reader():
@@ -31,10 +63,25 @@ def _load_gguf_reader():
 
 
 def tensor_map(gguf_path: str) -> list[tuple[str, int]]:
-    """Return [(tensor_name, n_bytes), ...] in on-disk declaration order."""
+    """Return [(tensor_name, n_bytes), ...] in on-disk declaration order,
+    across every shard of a split GGUF (see shard_paths()'s incident note
+    above for why this matters). A missing sibling shard raises rather than
+    silently returning a partial tensor list — the same fail-loud contract
+    gb_synapse.gguf_summary() uses for the identical failure mode."""
+    paths = shard_paths(gguf_path)
+    if len(paths) > 1:
+        missing = [p for p in paths if not os.path.exists(p)]
+        if missing:
+            raise RuntimeError(
+                f"tensor_map: split GGUF {gguf_path!r} is missing "
+                f"{len(missing)}/{len(paths)} sibling shard(s): "
+                f"{', '.join(missing)}")
     GGUFReader = _load_gguf_reader()
-    reader = GGUFReader(gguf_path, mode="r")
-    return [(t.name, int(t.n_bytes)) for t in reader.tensors]
+    out: list[tuple[str, int]] = []
+    for p in paths:
+        reader = GGUFReader(p, mode="r")
+        out.extend((t.name, int(t.n_bytes)) for t in reader.tensors)
+    return out
 
 
 def main() -> int:

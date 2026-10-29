@@ -1,0 +1,73 @@
+# Qwen3.8-35B-A3B Distill APEX-I-MiniPlus (MoE, 256 experts, 8 active), the fast agent tier.
+#
+# Measured 2026-10-02 on this workstation (12 GB card, no feeder, shim on, f16 KV,
+# ctx 32768, greedy, 256 tokens, 3 runs, median). --n-cpu-moe is the number of
+# layers whose experts stay on the CPU:
+#
+#     40  38.3 tok/s   6.9 GB VRAM (56%)
+#     32  46.8         9.5 GB (78%)
+#     28  49.7        10.8 GB (88.5%)   <- pinned here
+#     26  46.0        11.5 GB (94%)
+#     24  14.1        10.9 GB           <- what _fit_cpu_moe_layers picks on its own
+#     22  13.8        11.6 GB (95%)
+#
+# 24 and 22 fall off a cliff and the cause is not yet known (workflow/known-issues.md
+# item 5). Until it is, nCpuMoe is pinned to 28 so the auto-fit's own pick can't
+# reach the slow side. MTP (separate head file, wired by gb_synapse._mtp_head_path)
+# is worth +18% at 28 (49.7 vs 42.0).
+#
+# PREFILL batch sizing (ubatch) measured 2026-10-29, shim forced on
+# (GB_SYNAPSE_SHIM=1), text-only, host-only, n_cpu_moe 28, ctx 32768, f16 KV,
+# ~9.1k-token UNIQUE prompts (zero cache reuse = real cold prefill), 3 runs median
+# via scratchpad/measure_prefill.py reading llama.cpp timings.prompt_per_second:
+#
+#     --ubatch-size   cold prefill    VRAM used
+#     512 (default)   1363 tok/s      10.5 GB (86%)
+#     1024            2045 tok/s      10.8 GB (88%)   1.50x
+#     2048            2470 tok/s      11.2 GB (92%)   1.81x   <- pinned here
+#
+# ubatch 2048 is the knee: 1.81x cold-prefill over the engine default, decode
+# unchanged (83 tok/s at ub2048 on a countable-sequence MTP run, vs the 49.7
+# baseline above — no regression; ubatch sizes only the prompt-processing GEMM,
+# not single-token decode), VRAM still inside Rule #1's 85-92% band. Going higher
+# (ub4096) would need batch>2048 and more VRAM than the 92%-full card has with the
+# desktop resident, for diminishing returns (512->1024 +682, 1024->2048 +425).
+# This is the GGUF/llama.cpp fp16-path utilisation win; the fp8-e4m3 tensor path
+# (238 TFLOP/s) is NOT reachable from GGUF — see workflow/fp8-prefill-blackwell-scope.md.
+#
+# Native tool calling: 5 of 5 valid calls on a one-tool prompt, 2026-10-02. That is a
+# smoke test, not a tool-use evaluation.
+#
+# NOT measured: agentic or long-context quality, a thinking-token A/B against the
+# dense 27B, niah_certify(), smoke_gate(). The vendor admits repetition loops and
+# degraded long context, and publishes no coding or agent evals. A 700-token coding
+# answer finished cleanly, which is all this recipe's quality claim rests on.
+#
+# kvCache f16, not q4_0: KV for this model is ~0.31 GB at 32K because only 10 of 40
+# layers hold KV, so quantizing it frees almost nothing and costs quality.
+#
+# `check_recipes.py --fix` re-serializes this file and drops comments. Re-add this
+# block after running it; the digest covers parsed content, not comments.
+schemaVersion: '1'
+model:
+  name: qwen38-35b-a3b-apex-miniplus
+  revision: 39690e1ceb0aac74cc835c375be5fb7fe1e60873
+  files:
+  - path: Qwen3.8-35B-A3B-Distill.APEX-I-MiniPlus-V2.1.gguf
+    sha256: 58f70141bc735cf54e6d14ede0d294efbe2450c401184f5eda0662120bf7481d
+capabilities:
+  toolCalls: true
+  streaming: true
+  mtpDraftHead: true
+  visionProjector: false
+  recurrentState: false
+kvCache:
+  key: f16
+  value: f16
+ctx: 32768
+nGpuLayers: all
+nCpuMoe: 28
+ubatch: 2048
+tierIntent: t2Spill
+mtpDraftN: 4
+contentDigest: sha256:fb85cffd8f50569259d13dd7ffbe8089556dd953efb2b19370e74bdf45a349ac

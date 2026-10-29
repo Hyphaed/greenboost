@@ -1,0 +1,3975 @@
+{
+ "version": 2,
+ "generated_from": {
+  "file": "greenboost_setup.sh",
+  "sha256": "3460b223a895b34767e8d4796f1743745a2f096314ae24cec33587306341cbf4",
+  "lines": 15161
+ },
+ "entries": [
+  {
+   "kind": "dir",
+   "path": "/var/lib/greenboost/initrd-prev",
+   "mode": "755",
+   "steps": [
+    "gb_initramfs_regen_one:371"
+   ],
+   "id": "dir:/var/lib/greenboost/initrd-prev"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/initramfs-tools/hooks/zz-greenboost-exclude",
+   "mode": "755",
+   "source": "initramfs/zz-greenboost-exclude",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "gb_install_initramfs_exclusion:510"
+   ],
+   "id": "file:/etc/initramfs-tools/hooks/zz-greenboost-exclude",
+   "source_sha256": "5cfc9eb94cb014ebd9469abed8de5678fb2a60cb59ad21a097434532bb301c5f"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/dracut.conf.d/99-greenboost-exclude.conf",
+   "mode": "644",
+   "content": "omit_drivers+=\" greenboost \"\nadd_dracutmodules+=\" greenboost-exclude \"\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "gb_install_initramfs_exclusion:522"
+   ],
+   "id": "file:/etc/dracut.conf.d/99-greenboost-exclude.conf",
+   "sha256": "7b5a1d50e39fcdaa9eb048c7e0825ccb5f1989b44a96daeda2741e03b1b4d1c5"
+  },
+  {
+   "kind": "dir",
+   "path": "/usr/lib/dracut/modules.d/99greenboost-exclude",
+   "mode": "755",
+   "steps": [
+    "gb_install_initramfs_exclusion:526"
+   ],
+   "id": "dir:/usr/lib/dracut/modules.d/99greenboost-exclude"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/lib/dracut/modules.d/99greenboost-exclude/module-setup.sh",
+   "mode": "755",
+   "source": "initramfs/dracut/99greenboost-exclude/module-setup.sh",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "gb_install_initramfs_exclusion:526"
+   ],
+   "id": "file:/usr/lib/dracut/modules.d/99greenboost-exclude/module-setup.sh",
+   "source_sha256": "89f4a8748b4af099952e02fa6179ef95e8266a102b459932fa83f89483285e8e"
+  },
+  {
+   "kind": "dir",
+   "path": "/etc/greenboost/profiles",
+   "mode": "755",
+   "steps": [
+    "resolve_profile:2648",
+    "cmd_profile_create:2680",
+    "cmd_profile_activate:2722"
+   ],
+   "id": "dir:/etc/greenboost/profiles"
+  },
+  {
+   "kind": "dir",
+   "path": "/var/log/greenboost",
+   "mode": "755",
+   "steps": [
+    "need_root:3005",
+    "_gb_install_ebpf_tracer:6421",
+    "cmd_feed:10851",
+    "cmd_feed:10915",
+    "cmd_feeders_redeploy_netd:11723",
+    "cmd_benchmark:14200"
+   ],
+   "id": "dir:/var/log/greenboost"
+  },
+  {
+   "kind": "dir",
+   "path": "/var/lib/greenboost",
+   "mode": "755",
+   "steps": [
+    "cmd_install_supervisor:3094",
+    "cmd_install:6697",
+    "cmd_feed:10746"
+   ],
+   "id": "dir:/var/lib/greenboost"
+  },
+  {
+   "kind": "dir",
+   "path": "/usr/local/lib/greenboost",
+   "mode": "755",
+   "steps": [
+    "cmd_install_supervisor:3094",
+    "cmd_install_python_files:5359"
+   ],
+   "id": "dir:/usr/local/lib/greenboost"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_supervisor.py",
+   "mode": "755",
+   "source": "gb_supervisor.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_supervisor:3101"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_supervisor.py",
+   "source_sha256": "37f528cd47813b19ee16193adeb7f2a515c947a10b4ce682c608f2b6369cae46"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_vitals_helper.py",
+   "mode": "755",
+   "source": "gb_vitals_helper.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_supervisor:3105"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_vitals_helper.py",
+   "source_sha256": "d8a00d9f0f7e85b38868193ebdc336155ef028816e00eed9ee910e1fe7ef1f86"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_monitor.py",
+   "mode": "755",
+   "source": "gb_monitor.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_supervisor:3110",
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_monitor.py",
+   "source_sha256": "8bf0b3fa93fb2b0101acac74fd00ef96c98a417e38a96af38bd1f0fffafb6f09"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_pilot.py",
+   "mode": "755",
+   "source": "gb_pilot.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_supervisor:3115",
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_pilot.py",
+   "source_sha256": "d3bad3e9f9e119792e640677c1b1d35560bfc1a33c54474abee80fa7688dd557"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/systemd/system/greenboost-supervisor.service",
+   "mode": "644",
+   "content": "[Unit]\nDescription=GreenBoost Unified Supervisor (VRAM watchdog + idle reclaim + boot recovery)\nDocumentation=https://gitlab.com/IsolatedOctopi/greenboost\nAfter=network.target nvidia-persistenced.service\n# Recovery completes before Ollama starts (sd_notify READY=1 only after recovery)\nBefore=ollama.service\n\n[Service]\nType=notify\nExecStart=/usr/local/lib/greenboost/gb_supervisor.py\nExecStop=/bin/kill -TERM $MAINPID\nKillMode=process\nRestart=on-failure\nRestartSec=10\nTimeoutStartSec=90\nTimeoutStopSec=30\nStandardOutput=journal\nStandardError=journal\nSyslogIdentifier=gb-supervisor\n# Continuous reactive control: actuate ReactiveOrchestrator levers (Loops A-S),\n# including the continuous OS tuner (Loops O-S: CPU governor/EPP, GPU\n# clocks/power, vm.* tunables). Disable with override.conf if you want\n# observe-only (dry-run) mode instead.\nEnvironment=GB_ORCH_ACTUATE=1\nEnvironment=GB_OS_TUNE=1\n# Optional tuning (set in /etc/systemd/system/greenboost-supervisor.service.d/override.conf):\n#   Environment=GB_SUPERVISOR_POLL_SECS=10\n#   Environment=GB_SUPERVISOR_VRAM_WARN_PCT=10\n#   Environment=GB_SUPERVISOR_VRAM_CRIT_FREE_PCT=8\n#   Environment=GB_SUPERVISOR_OLLAMA_URL=http://127.0.0.1:11434\n#   Environment=GB_SUPERVISOR_AGGRESSIVE_RECLAIM=0\n#   Environment=GB_ORCH_ACTUATE=0   # observe-only / dry-run\n#   Environment=GB_OS_TUNE=0        # disable continuous OS tuning\n\n[Install]\nWantedBy=multi-user.target\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_supervisor:3138"
+   ],
+   "id": "file:/etc/systemd/system/greenboost-supervisor.service",
+   "sha256": "be73b2e376966417cdbeae953df3261bf3f1284ba5f6da248bc4f70a3f6bef6a"
+  },
+  {
+   "kind": "unit_enable",
+   "name": "greenboost-supervisor.service",
+   "wanted_by": "multi-user.target",
+   "steps": [
+    "cmd_install_supervisor:3179"
+   ],
+   "id": "unit_enable:greenboost-supervisor.service"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/systemd/system/greenboost-a2a.service",
+   "mode": "644",
+   "content": "[Unit]\nDescription=GreenBoost A2A gateway (AgentCard + JSON-RPC agent surface)\nDocumentation=https://gitlab.com/IsolatedOctopi/greenboost\nAfter=network.target greenboost-supervisor.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/env python3 /usr/local/lib/greenboost/gb_a2a.py serve\nRestart=on-failure\nRestartSec=10\nStandardOutput=journal\nStandardError=journal\nSyslogIdentifier=gb-a2a\nEnvironment=GB_PY_ROOT=/usr/local/lib/greenboost\n# Loopback by default. For LAN access set a bind + a REQUIRED token:\n#   Environment=GB_A2A_BIND=0.0.0.0:8790\n#   Environment=GB_A2A_TOKEN=<secret>   # refuses non-loopback bind without this\nEnvironment=GB_A2A_BIND=127.0.0.1:8790\n# Actuation OFF by default since the 2026-10 audit (token-gated actuation, SEC findings); the 2026-07-16 incident below\n# explains why it used to be ON. Opt IN with a drop-in: Environment=GB_ORCH_ACTUATE=1 and a token file.\n# (old text) Actuation ON by default (real lever moves via A2A/MCP-gated verbs like\n# serve_and_repoint) \u2014 matches greenboost-supervisor.service's own default\n# (Environment=GB_ORCH_ACTUATE=1 above). Real incident, 2026-07-16: this was\n# OFF by default pre-fix, so a fresh install/reinstall silently double-gated\n# every actuation-verb MCP tool call (serve_and_repoint etc. always returned\n# \"GB_ORCH_ACTUATE!=1 (double gate)\") until a human found and manually wrote\n# this exact override.conf \u2014 the loopback bind (GB_A2A_BIND=127.0.0.1:8790,\n# above) is what actually keeps this safe, not the actuation gate; the gate\n# is a second belt-and-braces layer on top of that, not the network boundary.\n# Opt OUT to observe/dry-run instead via override.conf:\n#   systemctl edit greenboost-a2a.service\n#     [Service]\n#     Environment=GB_ORCH_ACTUATE=0\nEnvironment=GB_ORCH_ACTUATE=0\n[Install]\nWantedBy=multi-user.target\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_supervisor:3189"
+   ],
+   "id": "file:/etc/systemd/system/greenboost-a2a.service",
+   "sha256": "497cd538f1fe581ca43b19efdf458fe979b4c8f8e100e86aa7020aa4a24cf36e"
+  },
+  {
+   "kind": "unit_enable",
+   "name": "greenboost-a2a.service",
+   "wanted_by": "multi-user.target",
+   "steps": [
+    "cmd_install_supervisor:3228"
+   ],
+   "id": "unit_enable:greenboost-a2a.service"
+  },
+  {
+   "kind": "line_edit",
+   "path": "/etc/systemd/system/ollama.service",
+   "ops": [
+    {
+     "op": "sed",
+     "script": "/OLLAMA_FLASH_ATTENTION/d\n/OLLAMA_KV_CACHE_TYPE/d\n/OLLAMA_NUM_CTX/d\n/OLLAMA_CONTEXT_LENGTH/d\n/OLLAMA_MAX_LOADED_MODELS/d\n/OLLAMA_KEEP_ALIVE/d\n/OLLAMA_NUM_GPU/d\n/GREENBOOST_/d\n/libgreenboost/d"
+    }
+   ],
+   "only_if_exists": true,
+   "revert": "none",
+   "steps": [
+    "cmd_install_sys_configs:3257"
+   ],
+   "id": "line_edit:/etc/systemd/system/ollama.service",
+   "incomplete": "a later edit inserts runtime values ($(...)); not applied by this tool"
+  },
+  {
+   "kind": "dir",
+   "path": "/etc/systemd/system/ollama.service.d",
+   "mode": "755",
+   "steps": [
+    "cmd_install_sys_configs:3279",
+    "cmd_feed:10783"
+   ],
+   "id": "dir:/etc/systemd/system/ollama.service.d"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/systemd/system/ollama.service.d/99-greenboost.conf",
+   "mode": "644",
+   "content": null,
+   "opaque": true,
+   "managed": true,
+   "why_opaque": "generated by a function and stamped with a content hash (gb_managed_write)",
+   "static_fragments": [
+    "[Unit]",
+    "After=greenboost-supervisor.service",
+    "Wants=greenboost-supervisor.service",
+    "[Service]",
+    "Environment=\"OLLAMA_FLASH_ATTENTION=1\"",
+    "Environment=\"OLLAMA_KV_CACHE_TYPE=q8_0\"",
+    "Environment=\"OLLAMA_MAX_LOADED_MODELS=1\"",
+    "Environment=\"OLLAMA_KEEP_ALIVE=5m\"",
+    "Environment=\"GREENBOOST_DEBUG=0\"",
+    "Environment=\"GREENBOOST_KV_RESERVE_MB=2048\"",
+    "Environment=\"GREENBOOST_ACTIVE=1\"",
+    "Environment=\"LD_PRELOAD=/usr/local/lib/libgreenboost_vmm_override.so:/usr/local/lib/libgreenboost_cuda.so\"",
+    "Environment=\"OMP_NUM_THREADS=4\"",
+    "Environment=\"GREENBOOST_INFERENCE_THREADS=4\""
+   ],
+   "steps": [
+    "cmd_install_sys_configs:3393"
+   ],
+   "id": "file:/etc/systemd/system/ollama.service.d/99-greenboost.conf",
+   "runtime_vars": [
+    "$(...)",
+    "<conditional lines>",
+    "GB_OLLAMA_CTX",
+    "GB_OLLAMA_KEEP_ALIVE",
+    "_dropin_cc_major",
+    "_gomp_affinity"
+   ]
+  },
+  {
+   "kind": "file",
+   "path": "/etc/greenboost/ollama-ctx.conf",
+   "mode": "644",
+   "content": null,
+   "opaque": true,
+   "managed": true,
+   "why_opaque": "generated by a function and stamped with a content hash (gb_managed_write)",
+   "static_fragments": [
+    "[Unit]",
+    "After=greenboost-supervisor.service",
+    "Wants=greenboost-supervisor.service",
+    "[Service]",
+    "Environment=\"OLLAMA_FLASH_ATTENTION=1\"",
+    "Environment=\"OLLAMA_KV_CACHE_TYPE=q8_0\"",
+    "Environment=\"OLLAMA_MAX_LOADED_MODELS=1\"",
+    "Environment=\"OLLAMA_KEEP_ALIVE=5m\"",
+    "Environment=\"GREENBOOST_DEBUG=0\"",
+    "Environment=\"GREENBOOST_KV_RESERVE_MB=2048\"",
+    "Environment=\"GREENBOOST_ACTIVE=1\"",
+    "Environment=\"LD_PRELOAD=/usr/local/lib/libgreenboost_vmm_override.so:/usr/local/lib/libgreenboost_cuda.so\"",
+    "Environment=\"OMP_NUM_THREADS=4\"",
+    "Environment=\"GREENBOOST_INFERENCE_THREADS=4\""
+   ],
+   "steps": [
+    "cmd_install_sys_configs:3395"
+   ],
+   "id": "file:/etc/greenboost/ollama-ctx.conf"
+  },
+  {
+   "kind": "line_edit",
+   "path": "/etc/systemd/system/vllm.service",
+   "ops": [
+    {
+     "op": "sed",
+     "script": "/GREENBOOST_/d\n/libgreenboost/d"
+    },
+    {
+     "op": "sed",
+     "script": "/^\\[Service\\]/a Environment=\"GREENBOOST_ACTIVE=1\"\\nEnvironment=\"LD_PRELOAD=/usr/local/lib/libgreenboost_cuda.so\""
+    }
+   ],
+   "only_if_exists": true,
+   "revert": "restore_original",
+   "steps": [
+    "cmd_install_sys_configs:3412",
+    "cmd_install_sys_configs:3414"
+   ],
+   "id": "line_edit:/etc/systemd/system/vllm.service"
+  },
+  {
+   "kind": "line_edit",
+   "path": "/etc/systemd/system/text-generation-inference.service",
+   "ops": [
+    {
+     "op": "sed",
+     "script": "/GREENBOOST_/d\n/libgreenboost/d"
+    },
+    {
+     "op": "sed",
+     "script": "/^\\[Service\\]/a Environment=\"GREENBOOST_ACTIVE=1\"\\nEnvironment=\"LD_PRELOAD=/usr/local/lib/libgreenboost_cuda.so\""
+    }
+   ],
+   "only_if_exists": true,
+   "revert": "restore_original",
+   "steps": [
+    "cmd_install_sys_configs:3412",
+    "cmd_install_sys_configs:3414"
+   ],
+   "id": "line_edit:/etc/systemd/system/text-generation-inference.service"
+  },
+  {
+   "kind": "dir",
+   "path": "/etc/udev/rules.d",
+   "mode": "755",
+   "steps": [
+    "cmd_install_sys_configs:3421",
+    "_tune_persist_nvme:7466"
+   ],
+   "id": "dir:/etc/udev/rules.d"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/udev/rules.d/99-greenboost.rules",
+   "mode": "644",
+   "content": "# GreenBoost kernel module - allow video group (includes ollama) to access /dev/greenboost\nKERNEL==\"greenboost\", GROUP=\"video\", MODE=\"0660\"\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_sys_configs:3422"
+   ],
+   "id": "file:/etc/udev/rules.d/99-greenboost.rules",
+   "sha256": "725b32aad5f5deb93fe5fe8a663b5474a76a7815c4feb3c64ace521c626bf44a"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/udev/rules.d/99-nvme-greenboost.rules",
+   "mode": "644",
+   "content": "# GreenBoost v3.4 - NVMe tuning for T3 swap performance\nACTION==\"add|change\", KERNEL==\"nvme[0-9]n[0-9]\", ENV{DEVTYPE}==\"disk\", ATTR{queue/scheduler}=\"none\"\nACTION==\"add|change\", KERNEL==\"nvme[0-9]n[0-9]\", ENV{DEVTYPE}==\"disk\", ATTR{queue/read_ahead_kb}=\"4096\"\nACTION==\"add|change\", KERNEL==\"nvme[0-9]n[0-9]\", ENV{DEVTYPE}==\"disk\", ATTR{queue/nr_requests}=\"1023\"\n",
+   "opaque": true,
+   "why_opaque": "written with different content by more than one function (last writer wins by command order): cmd_install_sys_configs:3457, _tune_persist_nvme:7468",
+   "steps": [
+    "cmd_install_sys_configs:3457",
+    "_tune_persist_nvme:7468"
+   ],
+   "id": "file:/etc/udev/rules.d/99-nvme-greenboost.rules",
+   "conflicting_writers": [
+    "_tune_persist_nvme:7468"
+   ],
+   "sha256": "9bbb7ea335b4225574087b79352fc2f3ee599e66ba2ef0f1599e9c28577b9c5f"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/systemd/system/cpu-perf.service",
+   "mode": "644",
+   "content": null,
+   "opaque": true,
+   "why_opaque": "depends on runtime value(s): GB_GOLDEN_MAX, GB_GOLDEN_MIN, GB_PCORES_MAX",
+   "template_body": "[Unit]\nDescription=GreenBoost CPU performance governor (P-cores 0-${GB_PCORES_MAX})\nAfter=multi-user.target\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/bash -c 'for cpu in $(seq 0 ${GB_PCORES_MAX}); do echo performance > /sys/devices/system/cpu/cpu${cpu}/cpufreq/scaling_governor; done; cset set -c ${GB_GOLDEN_MIN}-${GB_GOLDEN_MAX} -s inference_set || true; cset proc -m -f root -t inference_set -k || true'\nExecStop=/bin/bash  -c 'for cpu in $(seq 0 ${GB_PCORES_MAX}); do echo powersave  > /sys/devices/system/cpu/cpu${cpu}/cpufreq/scaling_governor; done; cset set -d inference_set || true'\nTimeoutStopSec=10\n\n[Install]\nWantedBy=multi-user.target\n",
+   "runtime_vars": [
+    "GB_GOLDEN_MAX",
+    "GB_GOLDEN_MIN",
+    "GB_PCORES_MAX"
+   ],
+   "static_fragments": [
+    "[Unit]",
+    "After=multi-user.target",
+    "[Service]",
+    "Type=oneshot",
+    "RemainAfterExit=yes",
+    "TimeoutStopSec=10",
+    "[Install]",
+    "WantedBy=multi-user.target"
+   ],
+   "steps": [
+    "cmd_install_sys_configs:3471"
+   ],
+   "id": "file:/etc/systemd/system/cpu-perf.service"
+  },
+  {
+   "kind": "dir",
+   "path": "/etc/sysfs.d",
+   "mode": "755",
+   "steps": [
+    "cmd_install_sys_configs:3495"
+   ],
+   "id": "dir:/etc/sysfs.d"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/sysfs.d/greenboost-hugepages.conf",
+   "mode": "644",
+   "content": "# GreenBoost v3.4 - THP config (no HugeTLB pre-allocation: gb_alloc_buf uses buddy allocator)\nkernel/mm/transparent_hugepage/enabled = always\n",
+   "opaque": true,
+   "why_opaque": "written with different content by more than one function (last writer wins by command order): cmd_install_sys_configs:3496, _tune_persist_nvme:7483",
+   "steps": [
+    "cmd_install_sys_configs:3496",
+    "_tune_persist_nvme:7483"
+   ],
+   "id": "file:/etc/sysfs.d/greenboost-hugepages.conf",
+   "conflicting_writers": [
+    "_tune_persist_nvme:7483"
+   ],
+   "sha256": "2e1711f0eb981c6741de53abd945548bb571984198f820dddbc7147294fbb102"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/libgreenboost_audit.so",
+   "mode": "755",
+   "source": "libgreenboost_audit.so",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "source_kind": "build-output",
+   "steps": [
+    "cmd_install_sys_configs:3525",
+    "cmd_install:6688"
+   ],
+   "id": "file:/usr/local/lib/libgreenboost_audit.so"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/apparmor.d/abstractions/greenboost-audit",
+   "mode": "644",
+   "source": "apparmor/abstractions/greenboost-audit",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_sys_configs:3557",
+    "cmd_install_sys_configs:3594"
+   ],
+   "id": "file:/etc/apparmor.d/abstractions/greenboost-audit",
+   "source_sha256": "8717a138a78dd75817f651daf29101561dbc1934646ad8ce35c395734d004a9a"
+  },
+  {
+   "kind": "line_edit",
+   "path": "/etc/apparmor.d/local/usr.sbin.unix-chkpwd",
+   "ops": [
+    {
+     "op": "append_lines",
+     "lines": [
+      "# GreenBoost: allow unix-chkpwd to open ld.so.preload audit stub",
+      "/usr/local/lib/libgreenboost_audit.so mr,",
+      "/usr/local/lib/x86_64-linux-gnu/libgreenboost_audit.so mr,",
+      "/usr/local/lib/i386-linux-gnu/libgreenboost_audit.so mr,"
+     ],
+     "unless_re": "libgreenboost_audit"
+    }
+   ],
+   "only_if_exists": false,
+   "revert": "restore_original",
+   "steps": [
+    "cmd_install_sys_configs:3576"
+   ],
+   "id": "line_edit:/etc/apparmor.d/local/usr.sbin.unix-chkpwd"
+  },
+  {
+   "kind": "line_edit",
+   "path": "/etc/apparmor.d/abstractions/base",
+   "ops": [
+    {
+     "op": "sed",
+     "script": "/^  abi <abi\\//a\\  #include <abstractions\\/greenboost-audit>",
+     "unless_re": "greenboost-audit"
+    }
+   ],
+   "only_if_exists": true,
+   "revert": "restore_original",
+   "steps": [
+    "cmd_install_sys_configs:3600"
+   ],
+   "id": "line_edit:/etc/apparmor.d/abstractions/base"
+  },
+  {
+   "kind": "line_edit",
+   "path": "/etc/apparmor.d/local/usr.lib.snapd.snap-confine.real",
+   "ops": [
+    {
+     "op": "append_lines",
+     "lines": [
+      "# GreenBoost: allow snap-confine to mmap the LD_AUDIT stub",
+      "/usr/local/lib/libgreenboost_audit.so mr,",
+      "/usr/local/lib/x86_64-linux-gnu/libgreenboost_audit.so mr,"
+     ],
+     "unless_re": "libgreenboost_audit"
+    }
+   ],
+   "only_if_exists": false,
+   "revert": "restore_original",
+   "steps": [
+    "cmd_install_sys_configs:3617"
+   ],
+   "id": "line_edit:/etc/apparmor.d/local/usr.lib.snapd.snap-confine.real"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/tmpfiles.d/greenboost.conf",
+   "mode": "644",
+   "content": null,
+   "opaque": true,
+   "why_opaque": "depends on runtime value(s): _tmpfiles_group",
+   "template_body": "d /run/greenboost 0775 root $_tmpfiles_group -\n",
+   "runtime_vars": [
+    "_tmpfiles_group"
+   ],
+   "static_fragments": [],
+   "steps": [
+    "cmd_install_sys_configs:3718"
+   ],
+   "id": "file:/etc/tmpfiles.d/greenboost.conf"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/sbin/gb-diag-read",
+   "mode": "755",
+   "source": "gb_diag_read.sh",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_sys_configs:3729"
+   ],
+   "id": "file:/usr/local/sbin/gb-diag-read",
+   "source_sha256": "7c2c7ff95d91c6dd71329967bda493cbf086fd7d8c528ffda19bb83cef499e18"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/sudoers.d/greenboost-diag-read",
+   "mode": "440",
+   "content": null,
+   "opaque": true,
+   "why_opaque": "depends on runtime value(s): _diag_user",
+   "template_body": "$_diag_user ALL=(root) NOPASSWD: /usr/local/sbin/gb-diag-read\n",
+   "via": "tmp+mv",
+   "steps": [
+    "cmd_install_sys_configs:3736"
+   ],
+   "id": "file:/etc/sudoers.d/greenboost-diag-read"
+  },
+  {
+   "kind": "group",
+   "name": "greenboost",
+   "steps": [
+    "gb_ensure_greenboost_group:3938",
+    "gb_ensure_greenboost_group:3938"
+   ],
+   "id": "group:greenboost"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost_capabilities.json",
+   "mode": "644",
+   "content": "{\n  \"shim_version\": \"3.4\",\n  \"abi\": 1,\n  \"source\": \"install\",\n  \"features\": {\n    \"gb_quant_cudart_rebind\": true,\n    \"expert_pool\": true,\n    \"cluster_fabric\": true,\n    \"gds\": false,\n    \"kv_compress\": false,\n    \"report_physical_vram\": false\n  }\n}\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_llama_configs:4060"
+   ],
+   "id": "file:/usr/local/lib/greenboost_capabilities.json",
+   "sha256": "78ee5a2265997d2f54c6e56dcc3a0df54c6a00594fe663b900e98e9800b07427"
+  },
+  {
+   "kind": "line_edit",
+   "path": "/etc/ld.so.preload",
+   "ops": [
+    {
+     "op": "sed",
+     "script": "/libgreenboost/d;/greenboost/d"
+    },
+    {
+     "op": "sed",
+     "script": "/libgreenboost/d"
+    }
+   ],
+   "only_if_exists": true,
+   "revert": "none",
+   "steps": [
+    "cmd_install_llama_configs:4089",
+    "cmd_install:6576",
+    "cmd_full_install:14667"
+   ],
+   "id": "line_edit:/etc/ld.so.preload"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/modules-load.d/greenboost.conf",
+   "mode": "644",
+   "content": "greenboost\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "_try_install_fixed_module:4596",
+    "cmd_install:6746"
+   ],
+   "id": "file:/etc/modules-load.d/greenboost.conf",
+   "sha256": "7df124cf66613ce88aa23af64d8bcbbc16fba55bd59f9338b81bc876ec8aac64"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_init.py",
+   "mode": "644",
+   "source": "gb_init.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_init.py",
+   "source_sha256": "02002b044476c3df23daa2fb3050795519ceb43f5808a2974d4bdd791c63a852"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_quant.py",
+   "mode": "644",
+   "source": "gb_quant.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_quant.py",
+   "source_sha256": "ed99b3958114a5809c18c8b647f0e6a348d89e37977a3d04e6d2635ddac364b3"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_quant_tq.py",
+   "mode": "644",
+   "source": "gb_quant_tq.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_quant_tq.py",
+   "source_sha256": "628bdb8ad1789836a33ce83bfd38f8bc16904d66c55de59654984ca35fe24804"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_quant_calib.py",
+   "mode": "644",
+   "source": "gb_quant_calib.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_quant_calib.py",
+   "source_sha256": "a1a1e530a4df03b452b9b8bd272c0b56f1d42eafd15cb98853a52f13e70fdadb"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_quant_dp.py",
+   "mode": "644",
+   "source": "gb_quant_dp.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_quant_dp.py",
+   "source_sha256": "458e114457c486755a5704f424e9cf7a5504b27ece72d03b3ce36ac1e44bca1e"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_kernel_backends.py",
+   "mode": "644",
+   "source": "gb_kernel_backends.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_kernel_backends.py",
+   "source_sha256": "a6b971485b0509131222888cf86dfe1e544669fb356c24671ef22ce5b61fe256"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_placement.py",
+   "mode": "644",
+   "source": "gb_placement.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_placement.py",
+   "source_sha256": "be71229d111045ac962432c2d014b51d08cf8da2fe0ce6ea8bfbb1ff67e9a07b"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_attn.py",
+   "mode": "644",
+   "source": "gb_attn.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_attn.py",
+   "source_sha256": "bdcd7285a1b425d772bb2f196c68ddb3bb2ce7758c8f41cc722d93c36cf1d234"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_telemetry.py",
+   "mode": "644",
+   "source": "gb_telemetry.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_telemetry.py",
+   "source_sha256": "ba0864ba24a6ea0db8fda17176f413ea39cdd53ed8fb726af289c61249bce887"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_stream_sched.py",
+   "mode": "644",
+   "source": "gb_stream_sched.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_stream_sched.py",
+   "source_sha256": "2c0968f906d6335b3033fb8907e16e67168486ec9392fdc322feebe9dfa7da49"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_model_tier.py",
+   "mode": "644",
+   "source": "gb_model_tier.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_model_tier.py",
+   "source_sha256": "c549c79dc73575abc406a11ec53f0f6f9e06193f42e11458d6007b70686794f4"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_tier_kv.py",
+   "mode": "644",
+   "source": "gb_tier_kv.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_tier_kv.py",
+   "source_sha256": "3a6c3427be842442d0dafce513d1a318e54395c985d8028857b04ac2d15b553e"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_evict_policy.py",
+   "mode": "644",
+   "source": "gb_evict_policy.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_evict_policy.py",
+   "source_sha256": "5cf9ab278b59795fd62827da8c617b295f757dfe8ec365e09e443dfef93a264c"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_thrash.py",
+   "mode": "644",
+   "source": "gb_thrash.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_thrash.py",
+   "source_sha256": "aefe48a886532e3ee2d351c2f6f0b11c3e7c968a550ac52154212ed4df765acc"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_damon.py",
+   "mode": "644",
+   "source": "gb_damon.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_damon.py",
+   "source_sha256": "d9c02399ed0f78815fba7b1618cd53933a8945cbcc8b37be1e3e9864f53973f1"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_prefix_guard.py",
+   "mode": "644",
+   "source": "gb_prefix_guard.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_prefix_guard.py",
+   "source_sha256": "b66e1604b75a26847e00b1c7d3654cf0a9d4fda8daf9abfd4cd37f984f850053"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_mem_pool.py",
+   "mode": "644",
+   "source": "gb_mem_pool.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_mem_pool.py",
+   "source_sha256": "039b2c9c7a4c329555806aa062cb547a3671fa13ebacd62d4a740d631df7728e"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_diffusion_orch.py",
+   "mode": "644",
+   "source": "gb_diffusion_orch.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_diffusion_orch.py",
+   "source_sha256": "da697cc8039bb51a6f982eb736602eafadb6058d6dfd626555227714c508016b"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_stability_monitor.py",
+   "mode": "644",
+   "source": "gb_stability_monitor.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_stability_monitor.py",
+   "source_sha256": "f0e3046ff552153cf12a09bf4e24e7e01dbd1095f43ba844967c74d7cc437da5"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_feeder_diag.py",
+   "mode": "644",
+   "source": "gb_feeder_diag.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_feeder_diag.py",
+   "source_sha256": "861b3eed0a86bd3377bd40f5f36b20f44df2d6c6839d2f0bc36beaa6138214f7"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_gguf_tensor_map.py",
+   "mode": "644",
+   "source": "gb_gguf_tensor_map.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_gguf_tensor_map.py",
+   "source_sha256": "bf1a405634ad87c8d5b793f7ec3936c7668182ca67295103ed582d5329db1158"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_nvml.py",
+   "mode": "644",
+   "source": "gb_nvml.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_nvml.py",
+   "source_sha256": "1234e9571bebeb964234cb41eec2b58b401d847b0138a0c4a7844a70edf5b5e8"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_nvml_ctypes.py",
+   "mode": "644",
+   "source": "gb_nvml_ctypes.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_nvml_ctypes.py",
+   "source_sha256": "c1cd6ea455ab7367f4d1104ccddae6618731e349fc119baf68608ed57fa77feb"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_snapshot.py",
+   "mode": "644",
+   "source": "gb_snapshot.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_snapshot.py",
+   "source_sha256": "b2ea5ea56d0d2c80dcc4e43fff60e64059dc9958a924f43a28d936d47ec4d7b5"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_lease.py",
+   "mode": "644",
+   "source": "gb_lease.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_lease.py",
+   "source_sha256": "695b6ddd36ffccd7d27fa3330f93ee37425c64d21ee3363e84fd152f821ebca2"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_lease_client.py",
+   "mode": "644",
+   "source": "gb_lease_client.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_lease_client.py",
+   "source_sha256": "2ce93e5236daeeaab093b0b446352318cfa82ad620d22255a2fef85dd884f785"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_reactive.py",
+   "mode": "644",
+   "source": "gb_reactive.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_reactive.py",
+   "source_sha256": "a68193aa63f01b594b59d515cf4144d775668222b08add2f632c047d9ad28897"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_control.py",
+   "mode": "644",
+   "source": "gb_control.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_control.py",
+   "source_sha256": "0341eeaed4bf9f11d87418c44fd7d489fd402ed6478e7cf68267c17ceb95210b"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_orchestrator.py",
+   "mode": "644",
+   "source": "gb_orchestrator.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_orchestrator.py",
+   "source_sha256": "7393047ad71c978e49c38de001fcc09920ec92069cb4f5f37ea7a93423474ee4"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_dataflux.py",
+   "mode": "644",
+   "source": "gb_dataflux.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_dataflux.py",
+   "source_sha256": "20547a38ad796287cff7e8f445aa83222cd402a197c42599decb9d52dc35dcd8"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_dataflux_kinds.py",
+   "mode": "644",
+   "source": "gb_dataflux_kinds.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_dataflux_kinds.py",
+   "source_sha256": "902b2ebcf16576afb881219c17591dc7738fb666a99e1d6a313ee2a89b5ad094"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_memwatch.py",
+   "mode": "644",
+   "source": "gb_memwatch.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_memwatch.py",
+   "source_sha256": "bf9bfdc04d62bb1d10d986d13ea9c6186dc4c89a4197408fe734bab00b0119d0"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_tiering.py",
+   "mode": "644",
+   "source": "gb_tiering.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_tiering.py",
+   "source_sha256": "25314325b0a5d2616e6255af420edc754a0396d88199ac1886a6ed2fae80ec34"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_state_io.py",
+   "mode": "644",
+   "source": "gb_state_io.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_state_io.py",
+   "source_sha256": "63229d7f9e7666b95e08ee9c5109415c0b24f6d32d56a6f9259ae7365b8354e8"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_synapse.py",
+   "mode": "644",
+   "source": "gb_synapse.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_synapse.py",
+   "source_sha256": "a740edf294aad51935cde34c0191db08a34aa821cd52d8a9f0f800a2e80d9697"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_synapse_api.py",
+   "mode": "644",
+   "source": "gb_synapse_api.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_synapse_api.py",
+   "source_sha256": "e110386ad0cd57816e5dc9e4ad6ceaf974ed6f4d27313c2700ce34aa08dfd484"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_synapse_backends.py",
+   "mode": "644",
+   "source": "gb_synapse_backends.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_synapse_backends.py",
+   "source_sha256": "f5bcff807626eb368bf2401c2eea0e760a15fe55cddc5e6b19bd2f6fffe09933"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_diffusion_server.py",
+   "mode": "644",
+   "source": "gb_diffusion_server.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_diffusion_server.py",
+   "source_sha256": "756c371ee5a6e8b7377fa655ee8ad7ac7e452bfe5fd7cb6c09f620b25572220c"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_longlive_server.py",
+   "mode": "644",
+   "source": "gb_longlive_server.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_longlive_server.py",
+   "source_sha256": "4e76a79cc404421635bc4ca46b0dbe2bfdfb7ebe2436243afb752710972adda2"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_aviary.py",
+   "mode": "644",
+   "source": "gb_aviary.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_aviary.py",
+   "source_sha256": "e72674ae4d96cfd037773b37895e4b8d1fa09d06ad43a70ed15204e4d8be4b44"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_session_audit.py",
+   "mode": "644",
+   "source": "gb_session_audit.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_session_audit.py",
+   "source_sha256": "3909e2766a9517c6791719bd1ee50b1ca39bdc2d65f8c26334d60196660fddff"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_bench_turn.py",
+   "mode": "644",
+   "source": "gb_bench_turn.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_bench_turn.py",
+   "source_sha256": "07b763df59507d92e2c0e802c036a9a4ee561875a2af8d04dc14f365505b47e9"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_bench_kv.py",
+   "mode": "644",
+   "source": "gb_bench_kv.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_bench_kv.py",
+   "source_sha256": "6330a757e9b5ca4c1e6635e82210e293cd391fbff1c7b786f0073025ea890c6f"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_bench_spec.py",
+   "mode": "644",
+   "source": "gb_bench_spec.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_bench_spec.py",
+   "source_sha256": "cbe24546d63579346dbffe56634f671b38d28b9fe981ecf3facfe9e2c0ecc1f4"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_bench_codec.py",
+   "mode": "644",
+   "source": "gb_bench_codec.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_bench_codec.py",
+   "source_sha256": "3c6ee8ca753b10a6f23be67aaca313237a1f1daf617ee8f714bbba427c03a994"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_tuner.py",
+   "mode": "644",
+   "source": "gb_tuner.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_tuner.py",
+   "source_sha256": "659fa1622781ec5d3875ca1fbe91f791447c0edcd3f706b40238caa8da08729e"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_quant_roles.py",
+   "mode": "644",
+   "source": "gb_quant_roles.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_quant_roles.py",
+   "source_sha256": "1fe61537078a56a929ab515a39783cf2863e7c8661162b469d7b241cfc82146e"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_prompt_index.py",
+   "mode": "644",
+   "source": "gb_prompt_index.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_prompt_index.py",
+   "source_sha256": "0b7e79baf5d3a3f0081ab831f611c53a9a645458757e07db9328aa2944118990"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_gguf_plan.py",
+   "mode": "644",
+   "source": "gb_gguf_plan.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_gguf_plan.py",
+   "source_sha256": "b157cf2fd03bd491cbc3dba2c4b2083bde50f290dbc9571af8dea9762133f4b8"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_semantics_watch.py",
+   "mode": "644",
+   "source": "gb_semantics_watch.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_semantics_watch.py",
+   "source_sha256": "d7d2f1c27f0905f409e88b63a26805d0d3cba215bc377d354ec6c18973b0c178"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_router.py",
+   "mode": "644",
+   "source": "gb_router.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_router.py",
+   "source_sha256": "92891aabff0e9b50e91392d92ed9c9e3adc866d3c5851cb6ee4a91521430d975"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_pcie_tune.py",
+   "mode": "644",
+   "source": "gb_pcie_tune.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_pcie_tune.py",
+   "source_sha256": "d4335ea585a33a187c9dcc99edba8820773a123084efe6c906b46cc4340f4f78"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_cluster.py",
+   "mode": "644",
+   "source": "gb_cluster.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_cluster.py",
+   "source_sha256": "9022c3f4a41e315e2450b4f620d77b3cae222f1eff06955625052aa32a6f8105"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_mcp.py",
+   "mode": "644",
+   "source": "gb_mcp.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_mcp.py",
+   "source_sha256": "37bc8e54b2f1bae16a5706c02ef07e0f4118e5126a5cb64ffeedc728e40b2188"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_synapse_mcp.py",
+   "mode": "644",
+   "source": "gb_synapse_mcp.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_synapse_mcp.py",
+   "source_sha256": "444d9c861fea14e1f119ce4543b0bd73bede32d81401b72c8391130056a5a734"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_synapse_tools.py",
+   "mode": "644",
+   "source": "gb_synapse_tools.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_synapse_tools.py",
+   "source_sha256": "c02e1cd80aacf8057578a3fd3a91f59dfca191e09360ab2e9f16de462d485bd1"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_dataflux_mcp.py",
+   "mode": "644",
+   "source": "gb_dataflux_mcp.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_dataflux_mcp.py",
+   "source_sha256": "971858da3efa5888b200f228cab30711be1e61a4c0d179c47dcd7b9695f89bd1"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_cluster_mcp.py",
+   "mode": "644",
+   "source": "gb_cluster_mcp.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_cluster_mcp.py",
+   "source_sha256": "03f9b598b6dd96f9b481c691290cef937c5e882458ab8953ff8b906e1ccb429d"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_mcp_common.py",
+   "mode": "644",
+   "source": "gb_mcp_common.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_mcp_common.py",
+   "source_sha256": "fe2378ebfb22692ba3cb521526d1d0f9553ce4646865d257a56e4c05f579f122"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_semantics.py",
+   "mode": "644",
+   "source": "gb_semantics.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_semantics.py",
+   "source_sha256": "ddab44e4fc86aecd77c86c2016563b4ab89a1fa42d64c75b68dba45f001bc16d"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_actuation.py",
+   "mode": "644",
+   "source": "gb_actuation.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_actuation.py",
+   "source_sha256": "a3440fd087869b6bd94c672813eff6ee623a8bcc744697eb2e80070d161592e9"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_a2a.py",
+   "mode": "644",
+   "source": "gb_a2a.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_a2a.py",
+   "source_sha256": "312a08da39168b00d4e7cfe1491825cdf752df6af389cd4fd4b6004e328df346"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_prefetch.py",
+   "mode": "644",
+   "source": "gb_prefetch.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_prefetch.py",
+   "source_sha256": "4e0bcc91107902f3d881c50aa8e0bf7be4e32b1b6da0a2e3b8650428e7d45236"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_topology.py",
+   "mode": "644",
+   "source": "gb_topology.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_topology.py",
+   "source_sha256": "df7f534857b2341e649a9ca70c4425cd6ab4178f2aeaf772058168eba6f9dbba"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_diffcache.py",
+   "mode": "644",
+   "source": "gb_diffcache.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_diffcache.py",
+   "source_sha256": "5f03011f23c47743e087908b70cb3984e29360feb5ccd6124060f76a3453c412"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_remote_blocks.py",
+   "mode": "644",
+   "source": "gb_remote_blocks.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_remote_blocks.py",
+   "source_sha256": "dc6141ad4351a909c52b3802f9119cd42d737fa9f1776ce1686b1bca48f88434"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_moe.py",
+   "mode": "644",
+   "source": "gb_moe.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_moe.py",
+   "source_sha256": "32282d08552347fc04f0e76df34c822e6c853d1bb4a47742804c9751d9e7e293"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_synapse_fallback.py",
+   "mode": "644",
+   "source": "gb_synapse_fallback.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_synapse_fallback.py",
+   "source_sha256": "7d3668937fbcc394099d15afca02c3ee496f8d24136db06688a77d4a278c35ba"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_rotator.py",
+   "mode": "644",
+   "source": "gb_rotator.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_rotator.py",
+   "source_sha256": "128844bb84076b3cb03b7470ea05f6dc4a53eeed3804e62fb675c0b3a79fe178"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_paths.py",
+   "mode": "644",
+   "source": "gb_paths.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_paths.py",
+   "source_sha256": "5ae82cf47f4d175c342a4335e6eb5d9434435c9c1f79bb756585d88d54812048"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/greenboost_bootstrap.py",
+   "mode": "644",
+   "source": "greenboost_bootstrap.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/greenboost_bootstrap.py",
+   "source_sha256": "fca4bedd94a2eb8c5aa5f15be1621a0adb66c87cf8ad1ede6358ee84ade0789a"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_api.py",
+   "mode": "644",
+   "source": "gb_api.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_api.py",
+   "source_sha256": "175768afbd98c717c411c650a6b12a560cb9341fb3654b1aef947a081bcb0663"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_bench.py",
+   "mode": "644",
+   "source": "gb_bench.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_bench.py",
+   "source_sha256": "4722c7e41b7e5954d1792ac2da84f95e19ce5e4b50b1fdf138ca501c1ecf1609"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_shim_probe.py",
+   "mode": "644",
+   "source": "gb_shim_probe.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_shim_probe.py",
+   "source_sha256": "3acad0040b88819bb05cfadd03f467516979834ba3949b3818fbb967514e1fa4"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_reclaim.py",
+   "mode": "644",
+   "source": "gb_reclaim.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_reclaim.py",
+   "source_sha256": "f7d2f0b9eb5c57bfac4403c483c92d515af6f7f3bb17ba6647de04a2b661573b"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_readiness.py",
+   "mode": "644",
+   "source": "gb_readiness.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_readiness.py",
+   "source_sha256": "2e5e62e97e24904ee8d6bbd5848698b168a3c50b214723e4eeb0948d1c18f376"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_ports.py",
+   "mode": "644",
+   "source": "gb_ports.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_ports.py",
+   "source_sha256": "01b3815fb17c69a0e7824859ec9cfa09271e4298390745736254ff0e453216d8"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_advisories.py",
+   "mode": "644",
+   "source": "gb_advisories.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_advisories.py",
+   "source_sha256": "519d16ec76ce17018d5915cc285cd96782a4e1b59a82aa34af5539b07f59e11f"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_failures.py",
+   "mode": "644",
+   "source": "gb_failures.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_failures.py",
+   "source_sha256": "dc7059204028b1ea7be19bb26346111737b0f274dbaf2a3192e06921cf23c4bb"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_wait.py",
+   "mode": "644",
+   "source": "gb_wait.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_wait.py",
+   "source_sha256": "11bde6bb71306c2f544d59ac806f4abf90bec320b09f3524fc080aa6873ee44b"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_phase_activity.py",
+   "mode": "644",
+   "source": "gb_phase_activity.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_phase_activity.py",
+   "source_sha256": "063bf859c3325083745f7000bbf23d2d8461e42e7eeecb5e0e14c686f22808e7"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/gb_debug_bundle.py",
+   "mode": "644",
+   "source": "gb_debug_bundle.py",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5523"
+   ],
+   "id": "file:/usr/local/lib/greenboost/gb_debug_bundle.py",
+   "source_sha256": "5cd6780b5ddb5d6d2bb42918f5941cbd2b6147c286ab54fcf7e5f1e0f501fc57"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/greenboost/__init__.py",
+   "mode": "644",
+   "content": "# GreenBoost Python orchestration package\n",
+   "opaque": false,
+   "why_opaque": null,
+   "create_only": true,
+   "steps": [
+    "cmd_install_python_files:5535"
+   ],
+   "id": "file:/usr/local/lib/greenboost/__init__.py",
+   "sha256": "a0d3b2733feff0eed580367735bb486a8b71d01a4962aa17d3feef6e0d5913d0"
+  },
+  {
+   "kind": "dir",
+   "path": "/usr/local/lib/greenboost/third_party",
+   "mode": "755",
+   "steps": [
+    "cmd_install_python_files:5616",
+    "cmd_install_python_files:5633",
+    "cmd_install_python_files:5653",
+    "cmd_install_python_files:5673",
+    "cmd_install_python_files:5697",
+    "cmd_install_python_files:5711"
+   ],
+   "id": "dir:/usr/local/lib/greenboost/third_party"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/profile.d/greenboost_pythonpath.sh",
+   "mode": "644",
+   "content": "# GreenBoost Python orchestration modules (gb_quant, gb_telemetry, etc.)\nexport PYTHONPATH=\"/usr/local/lib/greenboost${PYTHONPATH:+:$PYTHONPATH}\"\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5720"
+   ],
+   "id": "file:/etc/profile.d/greenboost_pythonpath.sh",
+   "sha256": "a129d2b09f126e4d76b8f314dddcc2e5577e00efc272d33d431014e4f04f5d39"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/python3/dist-packages/greenboost_sitecustomize.py",
+   "mode": "644",
+   "content": "# GreenBoost auto-bootstrap , generated by install-python\nimport os as _os\nif _os.environ.get(\"GREENBOOST_ACTIVE\") == \"1\":\n    try:\n        import gb_init  # noqa: F401\n    except Exception:\n        pass\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5796"
+   ],
+   "id": "file:/usr/local/lib/python3/dist-packages/greenboost_sitecustomize.py",
+   "sha256": "89f51e9d67dfcdaf644e27eb5052666c3fa73ffc50c30ff11667da04140a84d3"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/python3/dist-packages/greenboost.pth",
+   "mode": "644",
+   "content": "/usr/local/lib/greenboost\nimport greenboost_sitecustomize\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5797"
+   ],
+   "id": "file:/usr/local/lib/python3/dist-packages/greenboost.pth",
+   "sha256": "11e27d6bfeef4f19d52c8fbb059ecb514e5138f527d359b2daf3c17e84c26460"
+  },
+  {
+   "kind": "line_edit",
+   "path": "/usr/local/lib/greenboost/pth_manifest.txt",
+   "ops": [
+    {
+     "op": "append_lines",
+     "lines": [
+      "/usr/local/lib/python3/dist-packages/greenboost.pth"
+     ]
+    },
+    {
+     "op": "append_lines",
+     "lines": [
+      "/usr/local/lib/python3/dist-packages/greenboost_sitecustomize.py"
+     ]
+    },
+    {
+     "op": "append_lines",
+     "lines": [
+      "/usr/local/lib/python3.12/dist-packages/greenboost.pth"
+     ]
+    },
+    {
+     "op": "append_lines",
+     "lines": [
+      "/usr/local/lib/python3.12/dist-packages/greenboost_sitecustomize.py"
+     ]
+    },
+    {
+     "op": "append_lines",
+     "lines": [
+      "/usr/local/lib/python3.11/dist-packages/greenboost.pth"
+     ]
+    },
+    {
+     "op": "append_lines",
+     "lines": [
+      "/usr/local/lib/python3.11/dist-packages/greenboost_sitecustomize.py"
+     ]
+    },
+    {
+     "op": "append_lines",
+     "lines": [
+      "/usr/local/lib/python3.10/dist-packages/greenboost.pth"
+     ]
+    },
+    {
+     "op": "append_lines",
+     "lines": [
+      "/usr/local/lib/python3.10/dist-packages/greenboost_sitecustomize.py"
+     ]
+    }
+   ],
+   "only_if_exists": false,
+   "revert": "restore_original",
+   "steps": [
+    "cmd_install_python_files:5799",
+    "cmd_install_python_files:5800",
+    "cmd_install_python_files:5799",
+    "cmd_install_python_files:5800",
+    "cmd_install_python_files:5799",
+    "cmd_install_python_files:5800",
+    "cmd_install_python_files:5799",
+    "cmd_install_python_files:5800"
+   ],
+   "id": "line_edit:/usr/local/lib/greenboost/pth_manifest.txt"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/python3.12/dist-packages/greenboost_sitecustomize.py",
+   "mode": "644",
+   "content": "# GreenBoost auto-bootstrap , generated by install-python\nimport os as _os\nif _os.environ.get(\"GREENBOOST_ACTIVE\") == \"1\":\n    try:\n        import gb_init  # noqa: F401\n    except Exception:\n        pass\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5796"
+   ],
+   "id": "file:/usr/local/lib/python3.12/dist-packages/greenboost_sitecustomize.py",
+   "sha256": "89f51e9d67dfcdaf644e27eb5052666c3fa73ffc50c30ff11667da04140a84d3"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/python3.12/dist-packages/greenboost.pth",
+   "mode": "644",
+   "content": "/usr/local/lib/greenboost\nimport greenboost_sitecustomize\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5797"
+   ],
+   "id": "file:/usr/local/lib/python3.12/dist-packages/greenboost.pth",
+   "sha256": "11e27d6bfeef4f19d52c8fbb059ecb514e5138f527d359b2daf3c17e84c26460"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/python3.11/dist-packages/greenboost_sitecustomize.py",
+   "mode": "644",
+   "content": "# GreenBoost auto-bootstrap , generated by install-python\nimport os as _os\nif _os.environ.get(\"GREENBOOST_ACTIVE\") == \"1\":\n    try:\n        import gb_init  # noqa: F401\n    except Exception:\n        pass\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5796"
+   ],
+   "id": "file:/usr/local/lib/python3.11/dist-packages/greenboost_sitecustomize.py",
+   "sha256": "89f51e9d67dfcdaf644e27eb5052666c3fa73ffc50c30ff11667da04140a84d3"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/python3.11/dist-packages/greenboost.pth",
+   "mode": "644",
+   "content": "/usr/local/lib/greenboost\nimport greenboost_sitecustomize\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5797"
+   ],
+   "id": "file:/usr/local/lib/python3.11/dist-packages/greenboost.pth",
+   "sha256": "11e27d6bfeef4f19d52c8fbb059ecb514e5138f527d359b2daf3c17e84c26460"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/python3.10/dist-packages/greenboost_sitecustomize.py",
+   "mode": "644",
+   "content": "# GreenBoost auto-bootstrap , generated by install-python\nimport os as _os\nif _os.environ.get(\"GREENBOOST_ACTIVE\") == \"1\":\n    try:\n        import gb_init  # noqa: F401\n    except Exception:\n        pass\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5796"
+   ],
+   "id": "file:/usr/local/lib/python3.10/dist-packages/greenboost_sitecustomize.py",
+   "sha256": "89f51e9d67dfcdaf644e27eb5052666c3fa73ffc50c30ff11667da04140a84d3"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/python3.10/dist-packages/greenboost.pth",
+   "mode": "644",
+   "content": "/usr/local/lib/greenboost\nimport greenboost_sitecustomize\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5797"
+   ],
+   "id": "file:/usr/local/lib/python3.10/dist-packages/greenboost.pth",
+   "sha256": "11e27d6bfeef4f19d52c8fbb059ecb514e5138f527d359b2daf3c17e84c26460"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/bin/greenboost-py-root",
+   "mode": "755",
+   "content": "#!/usr/bin/env bash\nexec python3 -c \"import sys; sys.path.insert(0, '/usr/local/lib/greenboost'); import gb_paths; print(gb_paths.gb_py_root())\"\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_python_files:5806"
+   ],
+   "id": "file:/usr/local/bin/greenboost-py-root",
+   "sha256": "daa5fd7a16766b713c654c5c4089e15a83b6d73955365e446b2df55fd34d6d4d"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/bin/gb",
+   "mode": "755",
+   "content": "#!/usr/bin/env bash\n# GreenBoost CLI wrapper - generated by greenboost_setup.sh (install-cli)\nexport GB_PY_ROOT=\"${GB_PY_ROOT:-/usr/local/lib/greenboost}\"\nexec \"/usr/local/lib/greenboost/cli-venv/bin/gb\" \"$@\"\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_cli:5960"
+   ],
+   "id": "file:/usr/local/bin/gb",
+   "sha256": "1c09e4865fa00c928dd254ce68bf97ba5662ca1deff0fd93f3af19bc3a61f2f4"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/bin/greenboost-cli",
+   "mode": "755",
+   "content": "#!/usr/bin/env bash\n# GreenBoost CLI wrapper - generated by greenboost_setup.sh (install-cli)\nexport GB_PY_ROOT=\"${GB_PY_ROOT:-/usr/local/lib/greenboost}\"\nexec \"/usr/local/lib/greenboost/cli-venv/bin/greenboost-cli\" \"$@\"\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_cli:5960"
+   ],
+   "id": "file:/usr/local/bin/greenboost-cli",
+   "sha256": "4aa7d372a7dd7167b3d17ee1ec0b31fbce5defc661dd3a19668bb8039180d6b3"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/bin/greenboost-ebpf-trace",
+   "mode": "755",
+   "source": "greenboost-ebpf-trace",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "source_kind": "build-output",
+   "steps": [
+    "_gb_install_ebpf_tracer:6416"
+   ],
+   "id": "file:/usr/local/bin/greenboost-ebpf-trace"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/libgreenboost_cuda.so",
+   "mode": "755",
+   "source": "libgreenboost_cuda.so",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "source_kind": "build-output",
+   "steps": [
+    "cmd_install:6688"
+   ],
+   "id": "file:/usr/local/lib/libgreenboost_cuda.so"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/lib/libgreenboost_vmm_override.so",
+   "mode": "755",
+   "source": "libgreenboost_vmm_override.so",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "source_kind": "build-output",
+   "steps": [
+    "cmd_install:6688"
+   ],
+   "id": "file:/usr/local/lib/libgreenboost_vmm_override.so"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/modprobe.d/greenboost.conf",
+   "mode": "644",
+   "content": null,
+   "opaque": true,
+   "why_opaque": "depends on runtime value(s): GB_GOLDEN_MAX, GB_GOLDEN_MIN, GB_NVME_POOL, GB_PCORES_MAX, GB_PCORES_ONLY, GB_PHYS, GB_RESERVE, GB_VIRT, GPU_NAME, RAM_SPEED_DISPLAY, RAM_TYPE",
+   "template_body": "# GreenBoost - cuda memory pool (auto-configured for detected hardware)\n# GPU   : ${GPU_NAME}  (${GB_PHYS} GB VRAM)\n# RAM   : ${RAM_TYPE}-${RAM_SPEED_DISPLAY}  (pool ${GB_VIRT} GB, reserve ${GB_RESERVE} GB)\n# T3    : file-backed (/var/lib/greenboost/t3_store, cap ${GB_NVME_POOL} GB)\noptions greenboost physical_vram_gb=${GB_PHYS} virtual_vram_gb=${GB_VIRT} safety_reserve_gb=${GB_RESERVE} nvme_pool_gb=${GB_NVME_POOL} t3_max_gb=${GB_NVME_POOL} t3_file_path=/var/lib/greenboost/t3_store pcores_max_cpu=${GB_PCORES_MAX} golden_cpu_min=${GB_GOLDEN_MIN} golden_cpu_max=${GB_GOLDEN_MAX} ecores_only=${GB_PCORES_ONLY}\n",
+   "runtime_vars": [
+    "GB_GOLDEN_MAX",
+    "GB_GOLDEN_MIN",
+    "GB_NVME_POOL",
+    "GB_PCORES_MAX",
+    "GB_PCORES_ONLY",
+    "GB_PHYS",
+    "GB_RESERVE",
+    "GB_VIRT",
+    "GPU_NAME",
+    "RAM_SPEED_DISPLAY",
+    "RAM_TYPE"
+   ],
+   "static_fragments": [],
+   "steps": [
+    "cmd_install:6699"
+   ],
+   "id": "file:/etc/modprobe.d/greenboost.conf"
+  },
+  {
+   "kind": "kernel_module",
+   "name": "greenboost",
+   "steps": [
+    "cmd_install:6730"
+   ],
+   "id": "kernel_module:greenboost"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/sbin/greenboost_boot_guard.sh",
+   "mode": "755",
+   "source": "greenboost_boot_guard.sh",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install:6758"
+   ],
+   "id": "file:/usr/local/sbin/greenboost_boot_guard.sh",
+   "source_sha256": "a710574e29ec31544285c34c984b76f1539092f9c3e1781722c5b1dceee77e95"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/systemd/system/greenboost-boot-guard.service",
+   "mode": "644",
+   "source": "greenboost-boot-guard.service",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install:6759",
+    "cmd_install:6763"
+   ],
+   "id": "file:/etc/systemd/system/greenboost-boot-guard.service",
+   "transforms": [
+    {
+     "op": "sed",
+     "script": "s/^TimeoutStartSec=60$/TimeoutStartSec=300/"
+    }
+   ],
+   "source_sha256": "822794ddc8f4a005e21a3ce79ecb77133e37ba78f5d3bff41e6806db9dbac359"
+  },
+  {
+   "kind": "unit_enable",
+   "name": "greenboost-boot-guard.service",
+   "wanted_by": "sysinit.target",
+   "steps": [
+    "cmd_install:6765"
+   ],
+   "id": "unit_enable:greenboost-boot-guard.service"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/profile.d/greenboost.sh",
+   "mode": "644",
+   "content": "# GreenBoost v3.4 - auto-activation for CUDA inference tools\nexport GREENBOOST_ACTIVE=1\nexport GREENBOOST_SHIM=\"/usr/local/lib/libgreenboost_cuda.so\"\nexport GREENBOOST_VMM_OVERRIDE=\"/usr/local/lib/libgreenboost_vmm_override.so\"\n# 'greenboost run' is a fallback for non-login contexts (cron, Docker entrypoints)\ngreenboost() {\n    case \"$1\" in\n        run) shift\n            _gb_preload=\"${GREENBOOST_VMM_OVERRIDE}:${GREENBOOST_SHIM}\"\n            [[ ! -f \"${GREENBOOST_VMM_OVERRIDE}\" ]] && _gb_preload=\"${GREENBOOST_SHIM}\"\n            # GGML_CUDA_PDL=0: ggml's PDL kernel-attribute probe aborts under\n            # this shim (split-brain libcudart, see gb_cluster.py's \"llm\"\n            # profile comment) - confirmed on Blackwell AND Ada. Caller's own\n            # export still wins (parameter-expansion default, not an\n            # unconditional set).\n            GREENBOOST_ACTIVE=1 GGML_CUDA_PDL=\"${GGML_CUDA_PDL:-0}\" LD_PRELOAD=\"${_gb_preload}\" \"$@\"\n            unset _gb_preload\n            ;;\n        # Fall through to the CLI wrapper , without this the exported function\n        # shadows /usr/local/bin/greenboost in every login shell and breaks\n        # all other subcommands (cluster, vitals, connect, ...).\n        *) command /usr/local/bin/greenboost \"$@\" ;;\n    esac\n}\nexport -f greenboost\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install:6806"
+   ],
+   "id": "file:/etc/profile.d/greenboost.sh",
+   "sha256": "2c1241fff09e94eb72051d54dbf02bc729ee47ed447ebb91e8bb786cd088d07f"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/bin/greenboost",
+   "mode": "755",
+   "content": "#!/usr/bin/env bash\n# GreenBoost CLI wrapper\n# Usage: greenboost <command> [args...]\n# Run 'greenboost help' for the full command reference.\nGB_SETUP=\"@@MODULE_DIR@@/greenboost_setup.sh\"\ncase \"$1\" in\n    clean)        exec \"$GB_SETUP\" clean \"${@:2}\" ;;\n    clean-memory) exec \"$GB_SETUP\" clean-memory ;;\n    benchmark)    exec \"$GB_SETUP\" benchmark \"${@:2}\" ;;\n    profile)      exec \"$GB_SETUP\" profile \"${@:2}\" ;;\n    build|build-info) exec \"$GB_SETUP\" build-info \"${@:2}\" ;;\n    compile)      exec \"$GB_SETUP\" compile \"${@:2}\" ;;\n    feed)         exec \"$GB_SETUP\" feed \"${@:2}\" ;;\n    connect)         exec \"$GB_SETUP\" connect \"${@:2}\" ;;\n    disconnect)      exec \"$GB_SETUP\" disconnect \"${@:2}\" ;;\n    cluster)         exec \"$GB_SETUP\" cluster ;;\n    dataflux-ui)     exec \"$GB_SETUP\" dataflux-ui \"${@:2}\" ;;\n    update)          exec \"$GB_SETUP\" update \"${@:2}\" ;;\n    update-feeders)  exec \"$GB_SETUP\" update-feeders ;;\n    feeders)         exec \"$GB_SETUP\" feeders \"${@:2}\" ;;\n    built-stamp)     exec \"$GB_SETUP\" built-stamp \"${@:2}\" ;;\n    load)         exec \"$GB_SETUP\" load \"${@:2}\" ;;\n    unload)       exec \"$GB_SETUP\" unload ;;\n    tune)         exec \"$GB_SETUP\" tune \"${@:2}\" ;;\n    tune-grub)    exec \"$GB_SETUP\" tune-grub ;;\n    tune-sysctl)  exec \"$GB_SETUP\" tune-sysctl ;;\n    tune-libs)    exec \"$GB_SETUP\" tune-libs ;;\n    tune-all)     exec \"$GB_SETUP\" tune-all ;;\n    turboquant)   exec \"$GB_SETUP\" turboquant \"${@:2}\" ;;\n    ggml-2dev)    exec \"$GB_SETUP\" ggml-2dev \"${@:2}\" ;;\n    vitals)       exec \"$GB_SETUP\" vitals \"${@:2}\" ;;\n    faults)       exec \"$GB_SETUP\" faults \"${@:2}\" ;;\n    top)          exec \"$GB_SETUP\" top \"${@:2}\" ;;\n    residency)    exec \"$GB_SETUP\" residency \"${@:2}\" ;;\n    debug)        exec \"$GB_SETUP\" debug \"${@:2}\" ;;\n    gen-inference-config) exec \"$GB_SETUP\" gen-inference-config \"${@:2}\" ;;\n    doctor)          exec \"$GB_SETUP\" doctor \"${@:2}\" ;;\n    recommend)       exec \"$GB_SETUP\" recommend \"${@:2}\" ;;\n    pull)            exec \"$GB_SETUP\" pull \"${@:2}\" ;;\n    synapse)         exec \"$GB_SETUP\" synapse \"${@:2}\" ;;\n    setup|install|full-install) exec \"$GB_SETUP\" \"$@\" ;;\n    install-python)          exec \"$GB_SETUP\" install-python ;;\n    recover-models)          exec \"$GB_SETUP\" recover-models ;;\n    memwatch)                exec \"$GB_SETUP\" memwatch \"${@:2}\" ;;\n    install-cli)             exec \"$GB_SETUP\" install-cli ;;\n    install-synapse-engine)  exec \"$GB_SETUP\" install-synapse-engine ;;\n    install-pipelines)  exec \"$GB_SETUP\" install-pipelines ;;\n    register-mcp)       exec \"$GB_SETUP\" register-mcp ;;\n    uninstall)          exec \"$GB_SETUP\" uninstall ;;\n    apparmor-uninstall) exec \"$GB_SETUP\" apparmor-uninstall ;;\n    logs)            exec \"$GB_SETUP\" logs \"${@:2}\" ;;\n    nvtx-logs)       exec \"$GB_SETUP\" nvtx-logs \"${@:2}\" ;;\n    nvtx)            exec \"$GB_SETUP\" nvtx \"${@:2}\" ;;\n    diag)            exec \"$GB_SETUP\" diag \"${@:2}\" ;;\n    inference-logs)  exec \"$GB_SETUP\" inference-logs \"${@:2}\" ;;\n    clear)           exec \"$GB_SETUP\" clear \"${@:2}\" ;;\n    clean-logs)      exec \"$GB_SETUP\" clean-logs \"${@:2}\" ;;\n    test)            exec \"$GB_SETUP\" test \"${@:2}\" ;;\n    run)          shift\n        _gb_vmm=\"/usr/local/lib/libgreenboost_vmm_override.so\"\n        _gb_preload=\"${_gb_vmm}:/usr/local/lib/libgreenboost_cuda.so\"\n        [[ ! -f \"${_gb_vmm}\" ]] && _gb_preload=\"/usr/local/lib/libgreenboost_cuda.so\"\n        # GGML_CUDA_PDL=0: see the matching comment in /etc/profile.d/greenboost.sh's\n        # 'run' path above - same shim/PDL incompatibility, same override escape hatch.\n        GREENBOOST_ACTIVE=1 GGML_CUDA_PDL=\"${GGML_CUDA_PDL:-0}\" LD_PRELOAD=\"${_gb_preload}\" \"$@\"\n        ;;\n    help|--help|-h|\"\") exec \"$GB_SETUP\" show-commands ;;\n    *)            echo \"Unknown command: '$1'  - run: greenboost help\" >&2; exit 1 ;;\nesac\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install:6835"
+   ],
+   "id": "file:/usr/local/bin/greenboost"
+  },
+  {
+   "kind": "dir",
+   "path": "/usr/local/share/greenboost",
+   "mode": "755",
+   "steps": [
+    "cmd_install:6909"
+   ],
+   "id": "dir:/usr/local/share/greenboost"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/share/greenboost/GREENBOOST_COMMANDS.md",
+   "mode": "644",
+   "source": "GREENBOOST_COMMANDS.md",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install:6911"
+   ],
+   "id": "file:/usr/local/share/greenboost/GREENBOOST_COMMANDS.md",
+   "source_sha256": "d5a42cabbdd4a8978ec8366a1a270a17d246b2ecbf14020733bd0921bd248c2e"
+  },
+  {
+   "kind": "dir",
+   "path": "/usr/local/share/greenboost/lib",
+   "mode": "755",
+   "steps": [
+    "cmd_install:6922"
+   ],
+   "id": "dir:/usr/local/share/greenboost/lib"
+  },
+  {
+   "kind": "dir",
+   "path": "/etc/greenboost/synapse",
+   "mode": "755",
+   "steps": [
+    "cmd_install:6971"
+   ],
+   "id": "dir:/etc/greenboost/synapse"
+  },
+  {
+   "kind": "dir",
+   "path": "/etc/greenboost",
+   "mode": "755",
+   "steps": [
+    "cmd_install:6975",
+    "cmd_debug_vitals:8615",
+    "cmd_connect:11159",
+    "cmd_turboquant:13693",
+    "cmd_ggml_2dev:13815"
+   ],
+   "id": "dir:/etc/greenboost"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/greenboost/build_info",
+   "mode": "644",
+   "content": null,
+   "opaque": true,
+   "why_opaque": "depends on runtime value(s): $(...), _git_hash",
+   "template_body": "BUILD_ID=$(date +%d%m-%H%M)\nBUILD_VERSION=3.4\nBUILD_HOST=$(hostname)\nBUILD_GIT=$_git_hash\nBUILD_EPOCH=$(date +%s)\n",
+   "runtime_vars": [
+    "$(...)",
+    "_git_hash"
+   ],
+   "static_fragments": [
+    "BUILD_VERSION=3.4"
+   ],
+   "steps": [
+    "cmd_install:6978"
+   ],
+   "id": "file:/etc/greenboost/build_info"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/sysctl.d/99-zzz-greenboost.conf",
+   "mode": "644",
+   "content": "# GreenBoost: vm.* tunables are owned by the resource programme (GB_VM_SYSCTL=0 in ${GB_SWAP_CONF:-/etc/greenboost/gb-swap.conf}). Nothing set here.\n",
+   "opaque": true,
+   "why_opaque": "written with different content by more than one function (last writer wins by command order): _tune_persist_sysctl:7445, _tune_persist_sysctl:7450",
+   "steps": [
+    "_tune_persist_sysctl:7445",
+    "_tune_persist_sysctl:7450"
+   ],
+   "id": "file:/etc/sysctl.d/99-zzz-greenboost.conf",
+   "conflicting_writers": [
+    "_tune_persist_sysctl:7450"
+   ],
+   "sha256": "dcebd0d9fdda598e8d1184b3d2d06e8a7d9a8b9153993b9969a22f2848439249"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/udev/rules.d/99-usb-greenboost.rules",
+   "mode": "644",
+   "content": "# GreenBoost - USB storage tuning applied at boot via udev\nACTION==\"add|change\", KERNEL==\"sd[a-z]\", SUBSYSTEMS==\"usb\", ATTR{queue/scheduler}=\"none\", ATTR{queue/read_ahead_kb}=\"2048\"\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "_tune_persist_nvme:7474"
+   ],
+   "id": "file:/etc/udev/rules.d/99-usb-greenboost.rules",
+   "sha256": "b3af944603176ce5898589d877009197481e5f8e944a1414099de1e7b2479f9f"
+  },
+  {
+   "kind": "line_edit",
+   "path": "/etc/default/grub",
+   "ops": [
+    {
+     "op": "sed",
+     "script": "s/transparent_hugepage=madvise/transparent_hugepage=always/"
+    }
+   ],
+   "only_if_exists": true,
+   "revert": "restore_original",
+   "steps": [
+    "cmd_tune_grub:7696"
+   ],
+   "id": "line_edit:/etc/default/grub",
+   "incomplete": "a later edit inserts runtime values (combined); not applied by this tool"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/default/grub.d/99-greenboost.cfg",
+   "mode": "644",
+   "content": null,
+   "opaque": true,
+   "managed": true,
+   "why_opaque": "generated by a function and stamped with a content hash (gb_managed_write)",
+   "steps": [
+    "cmd_tune_grub:7801"
+   ],
+   "id": "file:/etc/default/grub.d/99-greenboost.cfg"
+  },
+  {
+   "kind": "kernel_module",
+   "name": "cpuid",
+   "steps": [
+    "cmd_tune_libs:7943"
+   ],
+   "id": "kernel_module:cpuid"
+  },
+  {
+   "kind": "dir",
+   "path": "/var/backups",
+   "mode": "755",
+   "steps": [
+    "cmd_clear_logs:8098"
+   ],
+   "id": "dir:/var/backups"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/profile.d/greenboost-vitals.sh",
+   "mode": "644",
+   "content": "# GreenBoost Debug Vitals - set when /etc/greenboost/debug_vitals.enabled exists\n[ -f /etc/greenboost/debug_vitals.enabled ] && export GREENBOOST_NVTX_VERBOSE=1\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "_vitals_write_profiled:8574"
+   ],
+   "id": "file:/etc/profile.d/greenboost-vitals.sh",
+   "sha256": "bafc6a61683b9ead13d65597c1d9daf8e36d4f0a12f97c6ca7e29ab60171e7e2"
+  },
+  {
+   "kind": "kernel_module",
+   "name": "tcp_bbr",
+   "steps": [
+    "_gb_apply_fabric_net_tuning:10694"
+   ],
+   "id": "kernel_module:tcp_bbr"
+  },
+  {
+   "kind": "dir",
+   "path": "/etc/sysctl.d",
+   "mode": "755",
+   "steps": [
+    "_gb_apply_fabric_net_tuning:10705"
+   ],
+   "id": "dir:/etc/sysctl.d"
+  },
+  {
+   "kind": "line_edit",
+   "path": "/etc/sysctl.d/99-zzz-greenboost.conf",
+   "ops": [
+    {
+     "op": "append_lines",
+     "lines": [
+      "# Cluster fabric (auto-applied by feed/connect - idempotent append)",
+      "net.ipv4.tcp_slow_start_after_idle = 0"
+     ],
+     "unless_re": "^net\\.ipv4\\.tcp_slow_start_after_idle"
+    },
+    {
+     "op": "append_lines",
+     "lines": [
+      "net.ipv4.tcp_congestion_control = bbr"
+     ],
+     "unless_re": "^net\\.ipv4\\.tcp_congestion_control"
+    }
+   ],
+   "only_if_exists": false,
+   "revert": "restore_original",
+   "steps": [
+    "_gb_apply_fabric_net_tuning:10707",
+    "_gb_apply_fabric_net_tuning:10710"
+   ],
+   "id": "line_edit:/etc/sysctl.d/99-zzz-greenboost.conf"
+  },
+  {
+   "kind": "line_edit",
+   "path": "/etc/fstab",
+   "ops": [
+    {
+     "op": "append_lines",
+     "lines": [
+      "/var/lib/greenboost/swapfile swap swap defaults,nofail,pri=10 0 0"
+     ]
+    }
+   ],
+   "only_if_exists": false,
+   "revert": "restore_original",
+   "steps": [
+    "cmd_feed:10769"
+   ],
+   "id": "line_edit:/etc/fstab"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/systemd/system/ollama.service.d/99-greenboost-feed.conf",
+   "mode": "644",
+   "content": "[Service]\nEnvironment=NVCUFILE_DISABLE=1\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_feed:10784"
+   ],
+   "id": "file:/etc/systemd/system/ollama.service.d/99-greenboost-feed.conf",
+   "sha256": "2feaef7fabebeaa849415d6bda2be811246eda4441fe14ae92ea3418da85e43b"
+  },
+  {
+   "kind": "dir",
+   "path": "/var/log/greenboost/mps",
+   "mode": "755",
+   "steps": [
+    "cmd_feed:10832"
+   ],
+   "id": "dir:/var/log/greenboost/mps"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/greenboost/cluster.key",
+   "mode": "644",
+   "content": null,
+   "opaque": true,
+   "why_opaque": "depends on runtime value(s): _hex",
+   "template_body": "$_hex",
+   "runtime_vars": [
+    "_hex"
+   ],
+   "static_fragments": [],
+   "steps": [
+    "cmd_feeders_genkey:11606",
+    "cmd_feeders_import_key:11663"
+   ],
+   "id": "file:/etc/greenboost/cluster.key"
+  },
+  {
+   "kind": "file",
+   "path": "/usr/local/bin/greenboost-netd",
+   "mode": "755",
+   "source": "greenboost-netd",
+   "content": null,
+   "opaque": false,
+   "why_opaque": null,
+   "source_kind": "build-output",
+   "steps": [
+    "cmd_feeders_redeploy_netd:11708"
+   ],
+   "id": "file:/usr/local/bin/greenboost-netd"
+  },
+  {
+   "kind": "line_edit",
+   "path": "/etc/systemd/system/ollama.service.d/99-greenboost.conf",
+   "ops": [
+    {
+     "op": "sed",
+     "script": "s/OLLAMA_KV_CACHE_TYPE=q8_0/OLLAMA_KV_CACHE_TYPE=q4_0/"
+    },
+    {
+     "op": "sed",
+     "script": "/GREENBOOST_ACTIVE=1/a Environment=\"GREENBOOST_TURBOQUANT=1\"",
+     "unless_re": "GREENBOOST_TURBOQUANT"
+    },
+    {
+     "op": "sed",
+     "script": "s/OLLAMA_KV_CACHE_TYPE=q4_0/OLLAMA_KV_CACHE_TYPE=q8_0/"
+    },
+    {
+     "op": "sed",
+     "script": "/GREENBOOST_TURBOQUANT/d"
+    },
+    {
+     "op": "sed",
+     "script": "/GREENBOOST_ACTIVE=1/a Environment=\"GREENBOOST_GGML_2DEV=1\"",
+     "unless_re": "GREENBOOST_GGML_2DEV"
+    },
+    {
+     "op": "sed",
+     "script": "/GREENBOOST_GGML_2DEV/d"
+    }
+   ],
+   "only_if_exists": true,
+   "revert": "restore_original",
+   "steps": [
+    "cmd_turboquant:13698",
+    "cmd_turboquant:13700",
+    "cmd_turboquant:13733",
+    "cmd_turboquant:13734",
+    "cmd_ggml_2dev:13820",
+    "cmd_ggml_2dev:13845"
+   ],
+   "id": "line_edit:/etc/systemd/system/ollama.service.d/99-greenboost.conf"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/profile.d/greenboost-turboquant.sh",
+   "mode": "644",
+   "content": "# GreenBoost TurboQuant - set when /etc/greenboost/turboquant.enabled exists\n[ -f /etc/greenboost/turboquant.enabled ] && export GREENBOOST_TURBOQUANT=1\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_turboquant:13715"
+   ],
+   "id": "file:/etc/profile.d/greenboost-turboquant.sh",
+   "sha256": "6004e6ec321c7f2913ea6caacc7ed8ca3a0adf3794ecd2bffe325f9fb245aea7"
+  },
+  {
+   "kind": "file",
+   "path": "/etc/modules-load.d/ai-workstation.conf",
+   "mode": "644",
+   "content": "cpuid\n",
+   "opaque": false,
+   "why_opaque": null,
+   "steps": [
+    "cmd_install_build_deps:14552",
+    "cmd_tune_libs:7949"
+   ],
+   "id": "file:/etc/modules-load.d/ai-workstation.conf",
+   "transforms": [
+    {
+     "op": "append_lines",
+     "lines": [
+      "cpuid"
+     ],
+     "unless_re": "^cpuid"
+    }
+   ]
+  }
+ ],
+ "unresolved": [
+  {
+   "what": "rewrite",
+   "target": "/etc/ld.so.preload",
+   "step": "gb_module_loaded:69",
+   "why": "rewrites the file without stale GreenBoost lines (runs for any root invocation)",
+   "category": "runtime-value"
+  },
+  {
+   "what": "install",
+   "target": "$tmp",
+   "step": "gb_atomic_install:168",
+   "why": "destination var:tmp",
+   "category": "runtime-path"
+  },
+  {
+   "what": "heredoc-write",
+   "target": "$out",
+   "step": "write_profile:2398",
+   "why": "path var:out",
+   "category": "runtime-path"
+  },
+  {
+   "what": "heredoc-append",
+   "target": "$out",
+   "step": "write_profile:2480",
+   "why": "path var:out",
+   "category": "runtime-path"
+  },
+  {
+   "what": "heredoc-append",
+   "target": "$resolved_file",
+   "step": "resolve_profile:2657",
+   "why": "path var:resolved_file",
+   "category": "runtime-path"
+  },
+  {
+   "what": "sed-edit",
+   "target": "/etc/systemd/system/ollama.service",
+   "step": "cmd_install_sys_configs:3267",
+   "why": "script uses runtime value(s): $(...)",
+   "category": "runtime-value"
+  },
+  {
+   "what": "sed-edit",
+   "target": "$_f",
+   "step": "cmd_install_sys_configs:3296",
+   "why": "file var:_f",
+   "category": "runtime-path"
+  },
+  {
+   "what": "group-membership",
+   "target": "-aGvideo$SUDO_USER",
+   "step": "cmd_install_sys_configs:3439",
+   "why": "adds the invoking user to a group: the user is known only at run time",
+   "category": "runtime-user"
+  },
+  {
+   "what": "sed-edit",
+   "target": "$profile",
+   "step": "cmd_install_sys_configs:3679",
+   "why": "file var:profile",
+   "category": "runtime-path"
+  },
+  {
+   "what": "sed-edit",
+   "target": "/etc/systemd/system/ollama.service.d/99-greenboost.conf",
+   "step": "cmd_t3_memory:3914",
+   "why": "script uses runtime value(s): total_virtual_mb",
+   "category": "runtime-value"
+  },
+  {
+   "what": "group-membership",
+   "target": "-aGgreenboost$_user",
+   "step": "gb_ensure_greenboost_group:3947",
+   "why": "adds the invoking user to a group: the user is known only at run time",
+   "category": "runtime-user"
+  },
+  {
+   "what": "group-membership",
+   "target": "-a$_usergreenboost",
+   "step": "gb_ensure_greenboost_group:3947",
+   "why": "adds the invoking user to a group: the user is known only at run time",
+   "category": "runtime-user"
+  },
+  {
+   "what": "loop",
+   "target": "_pth_targets",
+   "step": "cmd_install_python_files:5794",
+   "why": "array is extended at run time (+=); only its static defaults are modelled",
+   "category": "dynamic-set"
+  },
+  {
+   "what": "sed-edit",
+   "target": "/etc/systemd/system/greenboost-boot-guard.service",
+   "step": "cmd_install:6795",
+   "why": "script uses runtime value(s): _gb_df_home",
+   "category": "runtime-value"
+  },
+  {
+   "what": "group-membership",
+   "target": "-aGvideo$SUDO_USER",
+   "step": "cmd_load:7183",
+   "why": "adds the invoking user to a group: the user is known only at run time",
+   "category": "runtime-user"
+  },
+  {
+   "what": "sed-edit",
+   "target": "/etc/default/grub",
+   "step": "cmd_tune_grub:7678",
+   "why": "script uses runtime value(s): stripped",
+   "category": "runtime-value"
+  },
+  {
+   "what": "sed-edit",
+   "target": "/etc/default/grub",
+   "step": "cmd_tune_grub:7775",
+   "why": "script uses runtime value(s): current_line",
+   "category": "runtime-value"
+  },
+  {
+   "what": "sed-edit",
+   "target": "/etc/default/grub",
+   "step": "cmd_tune_grub:7828",
+   "why": "script uses runtime value(s): combined",
+   "category": "runtime-value"
+  },
+  {
+   "what": "loop",
+   "target": "pkgs",
+   "step": "cmd_tune_libs:7916",
+   "why": "array is extended at run time (+=); only its static defaults are modelled",
+   "category": "dynamic-set"
+  },
+  {
+   "what": "heredoc-append",
+   "target": "$_outfile",
+   "step": "cmd_logs_start:9374",
+   "why": "path var:_outfile",
+   "category": "runtime-path"
+  },
+  {
+   "what": "statement",
+   "target": "python3 -c \"",
+   "step": "_gb_net_handshake:10931",
+   "why": "unbalanced quotes",
+   "category": "unsupported"
+  },
+  {
+   "what": "statement",
+   "target": "\" \"$ip\" \"$port\" 2>&1",
+   "step": "_gb_net_handshake:11092",
+   "why": "unbalanced quotes",
+   "category": "unsupported"
+  },
+  {
+   "what": "append",
+   "target": "/etc/greenboost/cluster.conf",
+   "step": "cmd_connect:11178",
+   "why": "appended text depends on runtime value(s): entry",
+   "category": "runtime-value"
+  },
+  {
+   "what": "loop",
+   "target": "_pkgs",
+   "step": "cmd_install_build_deps:14493",
+   "why": "array is extended at run time (+=); only its static defaults are modelled",
+   "category": "dynamic-set"
+  },
+  {
+   "what": "loop",
+   "target": "_pkgs",
+   "step": "cmd_install_optional_pkgs:14578",
+   "why": "array is extended at run time (+=); only its static defaults are modelled",
+   "category": "dynamic-set"
+  }
+ ],
+ "unresolved_by_category": {
+  "runtime-value": 8,
+  "runtime-path": 7,
+  "runtime-user": 4,
+  "dynamic-set": 4,
+  "unsupported": 2
+ },
+ "removals": [
+  {
+   "target": "/etc/initramfs-tools/hooks/zz-greenboost-exclude",
+   "recursive": false,
+   "step": "gb_remove_initramfs_exclusion:548",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/dracut.conf.d/99-greenboost-exclude.conf",
+   "recursive": false,
+   "step": "gb_remove_initramfs_exclusion:548",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/lib/dracut/modules.d/99greenboost-exclude",
+   "recursive": true,
+   "step": "gb_remove_initramfs_exclusion:550",
+   "removal_ctx": true
+  },
+  {
+   "target": "unit:greenboost-recovery.service",
+   "recursive": false,
+   "step": "cmd_install_supervisor:3132",
+   "removal_ctx": false
+  },
+  {
+   "target": "/etc/systemd/system/greenboost-recovery.service",
+   "recursive": false,
+   "step": "cmd_install_supervisor:3133",
+   "removal_ctx": false
+  },
+  {
+   "target": "unit:greenboost-sentinel.service",
+   "recursive": false,
+   "step": "cmd_install_supervisor:3132",
+   "removal_ctx": false
+  },
+  {
+   "target": "/etc/systemd/system/greenboost-sentinel.service",
+   "recursive": false,
+   "step": "cmd_install_supervisor:3133",
+   "removal_ctx": false
+  },
+  {
+   "target": "unit:greenboost-vram-watchdog.service",
+   "recursive": false,
+   "step": "cmd_install_supervisor:3132",
+   "removal_ctx": false
+  },
+  {
+   "target": "/etc/systemd/system/greenboost-vram-watchdog.service",
+   "recursive": false,
+   "step": "cmd_install_supervisor:3133",
+   "removal_ctx": false
+  },
+  {
+   "target": "unit:greenboost-idle-reclaim.service",
+   "recursive": false,
+   "step": "cmd_install_supervisor:3132",
+   "removal_ctx": false
+  },
+  {
+   "target": "/etc/systemd/system/greenboost-idle-reclaim.service",
+   "recursive": false,
+   "step": "cmd_install_supervisor:3133",
+   "removal_ctx": false
+  },
+  {
+   "target": "/etc/ld.so.preload",
+   "recursive": false,
+   "step": "cmd_install_llama_configs:4090",
+   "removal_ctx": false
+  },
+  {
+   "target": "/etc/systemd/system/ollama.service.d/99-greenboost.conf",
+   "recursive": false,
+   "step": "cmd_restore_sys_configs:4110",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/ollama.service",
+   "recursive": false,
+   "step": "cmd_restore_sys_configs:4116",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "/etc/ld.so.preload",
+   "recursive": false,
+   "step": "cmd_restore_sys_configs:4125",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "/etc/ld.so.preload",
+   "recursive": false,
+   "step": "cmd_restore_sys_configs:4126",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/udev/rules.d/99-greenboost.rules",
+   "recursive": false,
+   "step": "cmd_restore_sys_configs:4134",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/udev/rules.d/99-nvme-greenboost.rules",
+   "recursive": false,
+   "step": "cmd_restore_sys_configs:4134",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/modprobe.d/99-nvidia-greenboost.conf",
+   "recursive": false,
+   "step": "cmd_restore_sys_configs:4140",
+   "removal_ctx": true
+  },
+  {
+   "target": "unit:cpu-perf.service",
+   "recursive": false,
+   "step": "cmd_restore_sys_configs:4146",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/cpu-perf.service",
+   "recursive": false,
+   "step": "cmd_restore_sys_configs:4148",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/sysfs.d/greenboost-hugepages.conf",
+   "recursive": false,
+   "step": "cmd_restore_sys_configs:4154",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/apparmor.d/abstractions/greenboost-audit",
+   "recursive": false,
+   "step": "cmd_restore_sys_configs:4160",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/apparmor.d/abstractions/base",
+   "recursive": false,
+   "step": "cmd_restore_sys_configs:4162",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "/etc/udev/rules.d/99-greenboost-nvme-runtime.rules",
+   "recursive": false,
+   "step": "cmd_restore_tune_runtime:4205",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/sysctl.d/99-zzz-greenboost.conf",
+   "recursive": false,
+   "step": "cmd_restore_tune_sysctl:4217",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/default/grub.d/99-greenboost.cfg",
+   "recursive": false,
+   "step": "cmd_restore_tune_grub:4238",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/default/grub",
+   "recursive": false,
+   "step": "cmd_restore_tune_grub:4268",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "/etc/modprobe.d/99-greenboost-blacklist.conf",
+   "recursive": false,
+   "step": "_try_install_fixed_module:4600",
+   "removal_ctx": false
+  },
+  {
+   "target": "unit:greenboost-boot-cleanup.service",
+   "recursive": false,
+   "step": "_schedule_boot_cleanup:4620",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/greenboost-boot-cleanup.service",
+   "recursive": false,
+   "step": "_schedule_boot_cleanup:4621",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/sysinit.target.wants/greenboost-boot-cleanup.service",
+   "recursive": false,
+   "step": "_schedule_boot_cleanup:4622",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/rescue.target.wants/greenboost-boot-cleanup.service",
+   "recursive": false,
+   "step": "_schedule_boot_cleanup:4623",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/emergency.target.wants/greenboost-boot-cleanup.service",
+   "recursive": false,
+   "step": "_schedule_boot_cleanup:4624",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/sbin/greenboost-boot-cleanup",
+   "recursive": false,
+   "step": "_schedule_boot_cleanup:4625",
+   "removal_ctx": true
+  },
+  {
+   "target": "/lib/systemd/system-shutdown/greenboost-stuck.sh",
+   "recursive": false,
+   "step": "_schedule_boot_cleanup:4626",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/apparmor.d/abstractions/greenboost-audit",
+   "recursive": false,
+   "step": "_do_purge_apparmor:4730",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/apparmor.d/abstractions/base",
+   "recursive": false,
+   "step": "_do_purge_apparmor:4737",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "$pf",
+   "recursive": false,
+   "step": "_do_purge_apparmor:4749",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "-e",
+   "recursive": false,
+   "step": "_do_purge_apparmor:4761",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "/libgreenboost_audit/d",
+   "recursive": false,
+   "step": "_do_purge_apparmor:4761",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "/etc/apparmor.d/local/usr.lib.snapd.snap-confine.real",
+   "recursive": false,
+   "step": "_do_purge_apparmor:4761",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "/etc/apparmor.d/local/usr.lib.snapd.snap-confine.real",
+   "recursive": false,
+   "step": "_do_purge_apparmor:4766",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "/etc/apparmor.d/local/usr.lib.snapd.snap-confine.real",
+   "recursive": false,
+   "step": "_do_purge_apparmor:4767",
+   "removal_ctx": true
+  },
+  {
+   "target": "-e",
+   "recursive": false,
+   "step": "_do_purge_apparmor:4776",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "/libgreenboost_audit/d",
+   "recursive": false,
+   "step": "_do_purge_apparmor:4776",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "$snapd_profile",
+   "recursive": false,
+   "step": "_do_purge_apparmor:4776",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "unit:greenboost-boot-cleanup.service",
+   "recursive": false,
+   "step": "do_purge:4917",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/greenboost-boot-cleanup.service",
+   "recursive": false,
+   "step": "do_purge:4918",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/sysinit.target.wants/greenboost-boot-cleanup.service",
+   "recursive": false,
+   "step": "do_purge:4919",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/rescue.target.wants/greenboost-boot-cleanup.service",
+   "recursive": false,
+   "step": "do_purge:4920",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/emergency.target.wants/greenboost-boot-cleanup.service",
+   "recursive": false,
+   "step": "do_purge:4921",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/sbin/greenboost-boot-cleanup",
+   "recursive": false,
+   "step": "do_purge:4922",
+   "removal_ctx": true
+  },
+  {
+   "target": "/lib/systemd/system-shutdown/greenboost-stuck.sh",
+   "recursive": false,
+   "step": "do_purge:4923",
+   "removal_ctx": true
+  },
+  {
+   "target": "/var/lib/dkms/greenboost",
+   "recursive": true,
+   "step": "do_purge:4961",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/src/greenboost-*",
+   "recursive": true,
+   "step": "do_purge:4962",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/ld.so.preload",
+   "recursive": false,
+   "step": "do_purge:4969",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "/etc/ld.so.preload",
+   "recursive": false,
+   "step": "do_purge:4970",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/lib/libgreenboost_cuda.so",
+   "recursive": false,
+   "step": "do_purge:4983",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/lib/libgreenboost_audit.so",
+   "recursive": false,
+   "step": "do_purge:4983",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/lib/libgreenboost_vmm_override.so",
+   "recursive": false,
+   "step": "do_purge:4983",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/lib/greenboost_capabilities.json",
+   "recursive": false,
+   "step": "do_purge:4983",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/modprobe.d/greenboost.conf",
+   "recursive": false,
+   "step": "do_purge:5014",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/modprobe.d/greenboost.conf.bak",
+   "recursive": false,
+   "step": "do_purge:5014",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/modprobe.d/99-greenboost-blacklist.conf",
+   "recursive": false,
+   "step": "do_purge:5014",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/profile.d/greenboost.sh",
+   "recursive": false,
+   "step": "do_purge:5014",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/bin/greenboost",
+   "recursive": false,
+   "step": "do_purge:5014",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/bin/gb",
+   "recursive": false,
+   "step": "do_purge:5014",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/bin/greenboost-cli",
+   "recursive": false,
+   "step": "do_purge:5014",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/modules-load.d/greenboost.conf",
+   "recursive": false,
+   "step": "do_purge:5014",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/udev/rules.d/99-greenboost.rules",
+   "recursive": false,
+   "step": "do_purge:5014",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/udev/rules.d/99-nvme-greenboost.rules",
+   "recursive": false,
+   "step": "do_purge:5014",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/udev/rules.d/99-usb-greenboost.rules",
+   "recursive": false,
+   "step": "do_purge:5014",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/sysctl.d/99-greenboost.conf",
+   "recursive": false,
+   "step": "do_purge:5014",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/sysctl.d/99-zzz-greenboost.conf",
+   "recursive": false,
+   "step": "do_purge:5014",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/sysfs.d/greenboost-hugepages.conf",
+   "recursive": false,
+   "step": "do_purge:5014",
+   "removal_ctx": true
+  },
+  {
+   "target": "/lib/systemd/system-shutdown/greenboost-stuck.sh",
+   "recursive": false,
+   "step": "do_purge:5014",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/modprobe.d/99-nvidia-greenboost.conf",
+   "recursive": false,
+   "step": "do_purge:5014",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/default/grub.d/99-greenboost.cfg",
+   "recursive": false,
+   "step": "do_purge:5020",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/ollama.service.d/99-greenboost-feed.conf",
+   "recursive": false,
+   "step": "do_purge:5029",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/vllm.service",
+   "recursive": false,
+   "step": "do_purge:5033",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "/etc/systemd/system/text-generation-inference.service",
+   "recursive": false,
+   "step": "do_purge:5033",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "/etc/apparmor.d/local/usr.sbin.unix-chkpwd",
+   "recursive": false,
+   "step": "do_purge:5037",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "/etc/sudoers.d/greenboost-diag-read",
+   "recursive": false,
+   "step": "do_purge:5042",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/sbin/gb-diag-read",
+   "recursive": false,
+   "step": "do_purge:5042",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/tmpfiles.d/greenboost.conf",
+   "recursive": false,
+   "step": "do_purge:5042",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/sbin/greenboost_boot_guard.sh",
+   "recursive": false,
+   "step": "do_purge:5042",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/bin/greenboost-ebpf-trace",
+   "recursive": false,
+   "step": "do_purge:5042",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/bin/greenboost-netd",
+   "recursive": false,
+   "step": "do_purge:5042",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/profile.d/greenboost-vitals.sh",
+   "recursive": false,
+   "step": "do_purge:5042",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/profile.d/greenboost-turboquant.sh",
+   "recursive": false,
+   "step": "do_purge:5042",
+   "removal_ctx": true
+  },
+  {
+   "target": "/var/lib/greenboost/swapfile",
+   "recursive": false,
+   "step": "do_purge:5048",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/fstab",
+   "recursive": false,
+   "step": "do_purge:5053",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "/var/lib/greenboost/initrd-prev",
+   "recursive": true,
+   "step": "do_purge:5055",
+   "removal_ctx": true
+  },
+  {
+   "target": "/var/log/greenboost",
+   "recursive": true,
+   "step": "do_purge:5059",
+   "removal_ctx": true
+  },
+  {
+   "target": "group:greenboost",
+   "recursive": false,
+   "step": "do_purge:5064",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/modules-load.d/ai-workstation.conf",
+   "recursive": false,
+   "step": "do_purge:5068",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/modules-load.d/ai-workstation.conf",
+   "recursive": false,
+   "step": "do_purge:5078",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "/etc/greenboost",
+   "recursive": true,
+   "step": "do_purge:5102",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/greenboost",
+   "recursive": true,
+   "step": "do_purge:5114",
+   "removal_ctx": true
+  },
+  {
+   "target": "unit:$_svc_name",
+   "recursive": false,
+   "step": "do_purge:5130",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/greenboost*.service",
+   "recursive": false,
+   "step": "do_purge:5131",
+   "removal_ctx": true
+  },
+  {
+   "target": "unit:$_svc_name",
+   "recursive": false,
+   "step": "do_purge:5130",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/greenboostd.service",
+   "recursive": false,
+   "step": "do_purge:5131",
+   "removal_ctx": true
+  },
+  {
+   "target": "unit:$_svc_name",
+   "recursive": false,
+   "step": "do_purge:5130",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/cpu-perf.service",
+   "recursive": false,
+   "step": "do_purge:5131",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/ollama.service.d/99-greenboost.conf",
+   "recursive": false,
+   "step": "do_purge:5136",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/ollama.service.d/zz-speculative.conf",
+   "recursive": false,
+   "step": "do_purge:5138",
+   "removal_ctx": true
+  },
+  {
+   "target": "unit:greenboost-turboquant.service",
+   "recursive": false,
+   "step": "do_purge:5141",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/bin/greenboost-turboquant",
+   "recursive": false,
+   "step": "do_purge:5142",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/lib/libgreenboost_tq.so",
+   "recursive": false,
+   "step": "do_purge:5142",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/greenboost-turboquant.service",
+   "recursive": false,
+   "step": "do_purge:5142",
+   "removal_ctx": true
+  },
+  {
+   "target": "unit:greenboost-supervisor.service",
+   "recursive": false,
+   "step": "do_purge:5146",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/greenboost-supervisor.service",
+   "recursive": false,
+   "step": "do_purge:5147",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/greenboost-recovery.service",
+   "recursive": false,
+   "step": "do_purge:5147",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/greenboost-sentinel.service",
+   "recursive": false,
+   "step": "do_purge:5147",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/greenboost-vram-watchdog.service",
+   "recursive": false,
+   "step": "do_purge:5147",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/greenboost-idle-reclaim.service",
+   "recursive": false,
+   "step": "do_purge:5147",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/lib/greenboost",
+   "recursive": true,
+   "step": "do_purge:5159",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/sbin/greenboost-recover",
+   "recursive": false,
+   "step": "do_purge:5162",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/sbin/greenboost-vram-watchdog",
+   "recursive": false,
+   "step": "do_purge:5162",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/sbin/greenboostd",
+   "recursive": false,
+   "step": "do_purge:5162",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/bin/greenboost-idle-reclaim",
+   "recursive": false,
+   "step": "do_purge:5162",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/bin/greenboost-run",
+   "recursive": false,
+   "step": "do_purge:5162",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/bin/greenboost-run-tgi",
+   "recursive": false,
+   "step": "do_purge:5162",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/bin/greenboost-run-unsloth",
+   "recursive": false,
+   "step": "do_purge:5162",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/bin/greenboost-run-vllm",
+   "recursive": false,
+   "step": "do_purge:5162",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/bin/gb",
+   "recursive": false,
+   "step": "do_purge:5171",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/bin/greenboost-cli",
+   "recursive": false,
+   "step": "do_purge:5171",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/bin/greenboost-py-root",
+   "recursive": false,
+   "step": "do_purge:5172",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/share/greenboost/",
+   "recursive": true,
+   "step": "do_purge:5174",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/lib/greenboost_*.py",
+   "recursive": false,
+   "step": "do_purge:5175",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/lib/greenboost/",
+   "recursive": true,
+   "step": "do_purge:5176",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/profile.d/greenboost_pythonpath.sh",
+   "recursive": false,
+   "step": "do_purge:5177",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/lib/python3*/dist-packages/greenboost.pth",
+   "recursive": false,
+   "step": "do_purge:5178",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/lib/python3*/dist-packages/__pycache__/greenboost_sitecustomize.*.pyc",
+   "recursive": false,
+   "step": "do_purge:5180",
+   "removal_ctx": true
+  },
+  {
+   "target": "/var/lib/greenboost/sentinel",
+   "recursive": false,
+   "step": "do_purge:5212",
+   "removal_ctx": true
+  },
+  {
+   "target": "/var/lib/greenboost/running",
+   "recursive": false,
+   "step": "do_purge:5212",
+   "removal_ctx": true
+  },
+  {
+   "target": "/var/lib/greenboost/last_clean_boot",
+   "recursive": false,
+   "step": "do_purge:5212",
+   "removal_ctx": true
+  },
+  {
+   "target": "/var/lib/greenboost/vram_pressure",
+   "recursive": false,
+   "step": "do_purge:5212",
+   "removal_ctx": true
+  },
+  {
+   "target": "/var/lib/greenboost/ram_pressure",
+   "recursive": false,
+   "step": "do_purge:5212",
+   "removal_ctx": true
+  },
+  {
+   "target": "/run/greenboost/cluster_topology.json",
+   "recursive": false,
+   "step": "do_purge:5219",
+   "removal_ctx": true
+  },
+  {
+   "target": "/run/greenboost/synapse",
+   "recursive": true,
+   "step": "do_purge:5224",
+   "removal_ctx": true
+  },
+  {
+   "target": "/var/lib/greenboost/synapse/slots",
+   "recursive": true,
+   "step": "do_purge:5230",
+   "removal_ctx": true
+  },
+  {
+   "target": "/var/lib/greenboost/synapse/models/measured_tok_s.json",
+   "recursive": false,
+   "step": "do_purge:5231",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/systemd/system/ollama.service",
+   "recursive": false,
+   "step": "do_purge:5238",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "/etc/systemd/system/llama-server.service",
+   "recursive": false,
+   "step": "do_purge:5250",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "/opt/greenboost",
+   "recursive": true,
+   "step": "do_purge:5259",
+   "removal_ctx": true
+  },
+  {
+   "target": "/swap_nvme.img",
+   "recursive": false,
+   "step": "do_purge:5268",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/fstab",
+   "recursive": false,
+   "step": "do_purge:5271",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "/var/lib/greenboost/greenboost_swap.img",
+   "recursive": false,
+   "step": "do_purge:5282",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/fstab",
+   "recursive": false,
+   "step": "do_purge:5283",
+   "removal_ctx": true,
+   "sed": true
+  },
+  {
+   "target": "/var/lib/greenboost/t3_store",
+   "recursive": false,
+   "step": "do_purge:5290",
+   "removal_ctx": true
+  },
+  {
+   "target": "/usr/local/lib/greenboost/synapse_engine",
+   "recursive": true,
+   "step": "cmd_install_python_files:5552",
+   "removal_ctx": false
+  },
+  {
+   "target": "/usr/local/lib/greenboost/semantics",
+   "recursive": true,
+   "step": "cmd_install_python_files:5568",
+   "removal_ctx": false
+  },
+  {
+   "target": "/usr/local/lib/greenboost/serving",
+   "recursive": true,
+   "step": "cmd_install_python_files:5588",
+   "removal_ctx": false
+  },
+  {
+   "target": "/usr/local/lib/greenboost/third_party/llama.cpp",
+   "recursive": true,
+   "step": "cmd_install_python_files:5632",
+   "removal_ctx": false
+  },
+  {
+   "target": "/usr/local/lib/greenboost/third_party/auto_round",
+   "recursive": true,
+   "step": "cmd_install_python_files:5652",
+   "removal_ctx": false
+  },
+  {
+   "target": "/usr/local/lib/greenboost/third_party/turboquant",
+   "recursive": true,
+   "step": "cmd_install_python_files:5672",
+   "removal_ctx": false
+  },
+  {
+   "target": "/usr/local/lib/greenboost/third_party/gemlite",
+   "recursive": true,
+   "step": "cmd_install_python_files:5696",
+   "removal_ctx": false
+  },
+  {
+   "target": "/usr/local/lib/greenboost/third_party/hqq",
+   "recursive": true,
+   "step": "cmd_install_python_files:5710",
+   "removal_ctx": false
+  },
+  {
+   "target": "/usr/local/lib/greenboost/synapse_engine",
+   "recursive": true,
+   "step": "cmd_install_synapse_engine:6059",
+   "removal_ctx": false
+  },
+  {
+   "target": "/etc/ld.so.preload",
+   "recursive": false,
+   "step": "cmd_install:6577",
+   "removal_ctx": false
+  },
+  {
+   "target": "/etc/sysctl.d/99-zzz-greenboost-dynamic.conf",
+   "recursive": false,
+   "step": "cmd_tune_revert:7515",
+   "removal_ctx": true
+  },
+  {
+   "target": "/etc/default/grub.d/99-greenboost.cfg",
+   "recursive": false,
+   "step": "cmd_tune_grub:7838",
+   "removal_ctx": false
+  },
+  {
+   "target": "/var/log/greenboost/*",
+   "recursive": true,
+   "step": "cmd_clear_inference_logs:8167",
+   "removal_ctx": false
+  },
+  {
+   "target": "/tmp/greenboost*.log",
+   "recursive": false,
+   "step": "cmd_clear_inference_logs:8168",
+   "removal_ctx": false
+  },
+  {
+   "target": "/run/greenboost/nvtx_events.log.1",
+   "recursive": false,
+   "step": "cmd_clear_nvtx_logs:8183",
+   "removal_ctx": false
+  },
+  {
+   "target": "/etc/profile.d/greenboost-vitals.sh",
+   "recursive": false,
+   "step": "_vitals_write_profiled:8580",
+   "removal_ctx": false
+  },
+  {
+   "target": "/etc/greenboost/debug_vitals.enabled",
+   "recursive": false,
+   "step": "cmd_debug_vitals:8690",
+   "removal_ctx": false
+  },
+  {
+   "target": "/tmp/gb_feeder_te_*",
+   "recursive": false,
+   "step": "cmd_clear_cluster_workers:8848",
+   "removal_ctx": false
+  },
+  {
+   "target": "/tmp/gb_feeder_render_*",
+   "recursive": false,
+   "step": "cmd_clear_cluster_workers:8848",
+   "removal_ctx": false
+  },
+  {
+   "target": "/tmp/greenboost_log_capture.pid",
+   "recursive": false,
+   "step": "cmd_logs_stop:9393",
+   "removal_ctx": false
+  },
+  {
+   "target": "/tmp/greenboost_log_capture.pid",
+   "recursive": false,
+   "step": "cmd_logs_stop:9402",
+   "removal_ctx": false
+  },
+  {
+   "target": "/run/greenboost/netd.pid",
+   "recursive": false,
+   "step": "cmd_feed:10898",
+   "removal_ctx": false
+  },
+  {
+   "target": "/run/greenboost/mps_owned",
+   "recursive": false,
+   "step": "cmd_feed:10906",
+   "removal_ctx": false
+  },
+  {
+   "target": "/run/greenboost/netd.pid",
+   "recursive": false,
+   "step": "cmd_feeders_redeploy_netd:11702",
+   "removal_ctx": false
+  },
+  {
+   "target": "/etc/greenboost/turboquant.enabled",
+   "recursive": false,
+   "step": "cmd_turboquant:13730",
+   "removal_ctx": false
+  },
+  {
+   "target": "/etc/profile.d/greenboost-turboquant.sh",
+   "recursive": false,
+   "step": "cmd_turboquant:13744",
+   "removal_ctx": false
+  },
+  {
+   "target": "/etc/greenboost/ggml_2dev.enabled",
+   "recursive": false,
+   "step": "cmd_ggml_2dev:13842",
+   "removal_ctx": false
+  },
+  {
+   "target": "/etc/ld.so.preload",
+   "recursive": false,
+   "step": "cmd_full_install:14668",
+   "removal_ctx": false
+  }
+ ],
+ "module_unloads": [
+  "-f",
+  "greenboost"
+ ],
+ "remote_blocks": [
+  {
+   "step": "_gb_feeders_upgrade_from_source:12044",
+   "note": "script run on a feeder over ssh; not modelled"
+  },
+  {
+   "step": "cmd_feeders_upgrade_greenboost:12210",
+   "note": "script run on a feeder over ssh; not modelled"
+  }
+ ],
+ "scratch_writes": 28,
+ "runtime_target_echo_writes": 20,
+ "multi_writer_files": [
+  {
+   "path": "/etc/udev/rules.d/99-nvme-greenboost.rules",
+   "steps": [
+    "cmd_install_sys_configs:3457",
+    "_tune_persist_nvme:7468"
+   ]
+  },
+  {
+   "path": "/etc/sysfs.d/greenboost-hugepages.conf",
+   "steps": [
+    "cmd_install_sys_configs:3496",
+    "_tune_persist_nvme:7483"
+   ]
+  },
+  {
+   "path": "/etc/sysctl.d/99-zzz-greenboost.conf",
+   "steps": [
+    "_tune_persist_sysctl:7445",
+    "_tune_persist_sysctl:7450"
+   ]
+  }
+ ],
+ "permission_changes": [
+  {
+   "op": "chown",
+   "path": "$_log",
+   "owner": "${SUDO_USER}:",
+   "step": "gb_dataflux_emit:242"
+  },
+  {
+   "op": "chown",
+   "path": "$_kf",
+   "owner": "root:greenboost",
+   "step": "_gb_set_keyfile_perms:3961"
+  },
+  {
+   "op": "chown",
+   "path": "$_kf",
+   "owner": "root:root",
+   "step": "_gb_set_keyfile_perms:3964"
+  },
+  {
+   "op": "chown",
+   "path": "$MODULE_DIR",
+   "owner": "${SUDO_USER}:$(id -gn \"${SUDO_USER}\" 2>/dev/null || echo users)",
+   "step": "gb_ensure_shim_libs:4012"
+  },
+  {
+   "op": "chmod",
+   "path": "/etc/greenboost",
+   "mode": "0755",
+   "step": "do_purge:5109"
+  },
+  {
+   "op": "chown",
+   "path": "$MODULE_DIR",
+   "owner": "${SUDO_USER}:$(id -gn \"${SUDO_USER}\" 2>/dev/null || echo users)",
+   "step": "cmd_install:6619"
+  },
+  {
+   "op": "chown",
+   "path": "$_cutlass_log",
+   "owner": "${SUDO_USER}",
+   "step": "cmd_install:6650"
+  },
+  {
+   "op": "chown",
+   "path": "/etc/greenboost/synapse",
+   "owner": "$(id -un)",
+   "step": "cmd_install:6972"
+  },
+  {
+   "op": "chmod",
+   "path": "/var/lib/greenboost/swapfile",
+   "mode": "600",
+   "step": "cmd_feed:10765"
+  },
+  {
+   "op": "chmod",
+   "path": "/var/log/greenboost/mps",
+   "mode": "o-rwx",
+   "step": "cmd_feed:10833"
+  },
+  {
+   "op": "chmod",
+   "path": "/etc/greenboost/cluster.conf",
+   "mode": "0644",
+   "step": "cmd_connect:11185"
+  }
+ ],
+ "side_effect_commands": {
+  "apparmor_parser": 6,
+  "apt-get": 6,
+  "depmod": 3,
+  "dkms": 2,
+  "dnf": 8,
+  "dpkg": 2,
+  "dracut": 2,
+  "firewall-cmd": 3,
+  "grub-mkconfig": 2,
+  "iptables": 2,
+  "ldconfig": 4,
+  "mkinitcpio": 3,
+  "mkswap": 1,
+  "modprobe": 5,
+  "pacman": 2,
+  "rmmod": 3,
+  "setfacl": 2,
+  "swapoff": 4,
+  "swapon": 1,
+  "sysctl": 11,
+  "systemctl": 77,
+  "systemd-tmpfiles": 1,
+  "udevadm": 15,
+  "ufw": 2,
+  "update-grub": 3,
+  "usermod": 3,
+  "visudo": 1,
+  "zypper": 5
+ }
+}

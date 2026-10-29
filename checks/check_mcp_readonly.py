@@ -50,6 +50,7 @@ _KNOWINGLY_UNDECLARED: dict = {
     "cli_run": "shells out",
     "cli_prompt": "runs a generation",
     "quality_gate": "runs a generation",
+    "synapse_recover_cache": "adds entries to the manifest (never removes/rewrites one)",
 }
 
 

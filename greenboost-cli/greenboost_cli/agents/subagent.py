@@ -61,6 +61,7 @@ def run_subagent(
     label: str = "subagent",
     timeout_s: float = 600.0,
     settings: Optional[dict] = None,
+    parent_policy=None,
 ) -> SubagentResult:
     """Run `prompt` in a fresh session and return a structured result.
 
@@ -103,7 +104,10 @@ def run_subagent(
         # comment there. build_policy(None) returns PERMISSIVE, so a
         # caller that doesn't pass `tools` gets byte-identical behavior.
         from greenboost_cli.instruments.policy import build_policy
-        run_settings["_tool_policy"] = build_policy(tools)
+        _child = build_policy(tools)
+        # A delegated subagent never gets more authority than its caller.
+        run_settings["_tool_policy"] = (parent_policy.narrowed(_child)
+                                        if parent_policy is not None else _child)
         run_settings["_agent_label"] = label
     except Exception as e:
         return SubagentResult(
@@ -189,7 +193,7 @@ def current_depth() -> int:
 
 def delegate(prompt: str, *, label: str = "delegate",
              tools: "list | None" = None, timeout_s: float = 600.0,
-             settings: "dict | None" = None) -> str:
+             settings: "dict | None" = None, parent_policy=None) -> str:
     """Run a subtask in its own context and return only its conclusion.
 
     This is context folding: the subtask's reads, greps and dead ends stay in
@@ -208,7 +212,8 @@ def delegate(prompt: str, *, label: str = "delegate",
     os.environ[DEPTH_ENV] = str(depth + 1)
     try:
         r = run_subagent(prompt, label=label, tools=tools,
-                         timeout_s=timeout_s, settings=settings)
+                         timeout_s=timeout_s, settings=settings,
+                         parent_policy=parent_policy)
     finally:
         if prev is None:
             os.environ.pop(DEPTH_ENV, None)

@@ -2,6 +2,7 @@
 """Dispatches AI tool calls to the appropriate handler."""
 from __future__ import annotations
 
+import threading
 import time
 
 from typing import Callable, Optional
@@ -15,6 +16,15 @@ from greenboost_cli.instruments.handlers import (
 )
 from greenboost_cli.instruments.policy import PERMISSIVE, ToolPolicy
 from greenboost_cli.instruments.safety import is_readonly_command
+
+class _CallContext(threading.local):
+    """The policy of the dispatch() call currently running on this thread, so a
+    handler that spawns work (Delegate) can hand its child no more authority
+    than the caller has. Handlers only receive their params."""
+    policy: ToolPolicy = PERMISSIVE
+
+
+_CALL = _CallContext()
 
 # Dict-based dispatch table — no if/elif chain.
 _DISPATCH: dict[str, Callable] = {
@@ -51,9 +61,10 @@ _DISPATCH: dict[str, Callable] = {
     "TodoWrite":   lambda p: handle_todo_write(p.get("todos", [])),
     "MemoryRead":  lambda p: handle_memory_read(p.get("file")),
     "Skill": handle_skill,
-    "Delegate": lambda prompt, label="delegate", **_: __import__(
+    "Delegate": lambda p: __import__(
         "greenboost_cli.agents.subagent", fromlist=["delegate"]
-    ).delegate(prompt, label=str(label)[:40]),
+    ).delegate(str(p["prompt"]), label=str(p.get("label") or "delegate")[:40],
+               parent_policy=_CALL.policy),
     "MemoryWrite": lambda p: handle_memory_write(p["key"], p["content"], p.get("scope", "project")),
 }
 
@@ -77,7 +88,8 @@ def set_turn_id(turn_id: str) -> None:
 def _emit_cli_tool_call(name: str, decision: str, agent: str,
                         params: Optional[dict] = None,
                         duration_ms: Optional[float] = None,
-                        outcome: str = "") -> None:
+                        outcome: str = "",
+                        result: Optional[str] = None) -> None:
     """Best-effort dataflux `cli_tool_call` emit (NemoClaw audit, Phase 3d,
     Observability Must-Rule) — never raises, matching gb_dataflux.emit()'s
     own never-raise contract. `params`, when given, is passed through
@@ -109,6 +121,20 @@ def _emit_cli_tool_call(name: str, decision: str, agent: str,
             event["outcome"] = outcome
         if params is not None:
             event["args"] = bounded_capture(params)
+        # What this result will COST once it enters the prompt. Measured on a
+        # real session 2026-08-22: a Read of an 7.7 KB file took 6.3 ms and its
+        # result cost ~1,938 tokens of prefill , about 45 SECONDS at the 23
+        # ms/token this box charges at a 14-18k context (casebook C-20). The
+        # tool is not the cost; carrying its output is, and nothing surfaced
+        # that asymmetry. Only the SIZE is recorded here: the ms/token rate is
+        # measured per box and belongs in the resolver, not baked in beside it.
+        if result is not None:
+            try:
+                _chars = len(result)
+                event["result_chars"] = _chars
+                event["result_tokens_est"] = max(0, round(_chars / 4.0))
+            except Exception:
+                pass
         gb_dataflux.emit(event)
     except Exception:
         pass
@@ -169,12 +195,17 @@ def dispatch(
     # Pre-tool hooks (Claude Code compatible)
     try:
         from greenboost_cli.instruments.hooks import run_pre_tool_hooks
-        ok, reason = run_pre_tool_hooks(name, params)
+    except ImportError:
+        run_pre_tool_hooks = None       # no hook support installed: nothing to gate on
+    if run_pre_tool_hooks is not None:
+        try:
+            ok, reason = run_pre_tool_hooks(name, params)
+        except Exception as e:
+            # A blocking gate that crashed has not said yes. Fail closed.
+            ok, reason = False, f"hook machinery failed ({type(e).__name__}: {e})"
         if not ok:
             _emit_cli_tool_call(name, "blocked_hook", agent, params)
             return f"Blocked by hook: {reason}"
-    except Exception:
-        pass
 
     # Tool policy gate (NemoClaw audit, Phase 3b) — checked BEFORE the
     # approval gate below, so an out-of-policy tool never reaches an
@@ -228,7 +259,15 @@ def dispatch(
         return _msg
 
     try:
-        result = handler(params)
+        # Bash is jailed to the policy's workspace roots (bubblewrap) when it has
+        # any; the call context lets Delegate inherit this policy as its ceiling.
+        from greenboost_cli.instruments import shell_sandbox
+        _prev_policy, _CALL.policy = _CALL.policy, active_policy
+        try:
+            with shell_sandbox.sandbox(active_policy.workspace_roots if name == "Bash" else ()):
+                result = handler(params)
+        finally:
+            _CALL.policy = _prev_policy
     except (KeyError, TypeError) as e:
         # Malformed tool call (missing/wrong-type required param) — common
         # with local GGUF models' native function-calling, which is far less
@@ -249,7 +288,8 @@ def dispatch(
         _outcome = ""
     _emit_cli_tool_call(name, "allowed", agent, params,
                         duration_ms=(time.monotonic() - _t0) * 1000.0,
-                        outcome=_outcome)
+                        outcome=_outcome,
+                        result=result if isinstance(result, str) else None)
 
     # Post-tool hooks (informational, non-blocking)
     try:
@@ -259,6 +299,66 @@ def dispatch(
         pass
 
     return result
+
+
+def dispatch_mcp(
+    call: Callable[[str, dict], str],
+    name: str,
+    params: dict,
+    policy: Optional[ToolPolicy] = None,
+    agent: str = "main",
+) -> str:
+    """Run an MCP tool call through the same gates as a built-in instrument.
+
+    MCP calls used to go straight to the registry, so a subagent or Factory
+    worker whose ToolPolicy was deny-by-default could still call any MCP tool,
+    and nothing reached the pre/post hooks or the `cli_tool_call` audit trail.
+    Approval stays where it was (the orchestrator asks before this is called);
+    what this adds is the execution-time authorization the policy exists for.
+    A closed-world allow-list admits an MCP tool only by name or by pattern
+    (`mcp__server__*`), same as any instrument.
+    """
+    active_policy = policy or PERMISSIVE
+    try:
+        from greenboost_cli.instruments.hooks import run_pre_tool_hooks
+    except ImportError:
+        run_pre_tool_hooks = None
+    if run_pre_tool_hooks is not None:
+        try:
+            ok, reason = run_pre_tool_hooks(name, params)
+        except Exception as e:
+            ok, reason = False, f"hook machinery failed ({type(e).__name__}: {e})"
+        if not ok:
+            _emit_cli_tool_call(name, "blocked_hook", agent, params)
+            return f"Blocked by hook: {reason}"
+
+    if not active_policy.permits_tool(name):
+        _emit_cli_tool_call(name, "denied_policy", agent, params)
+        return f"Error: MCP tool '{name}' is not in this agent's tool policy"
+
+    _t0 = time.monotonic()
+    try:
+        result = call(name, params)
+    except Exception as e:
+        _emit_cli_tool_call(name, "allowed", agent, params,
+                            duration_ms=(time.monotonic() - _t0) * 1000.0,
+                            outcome="error")
+        return f"Error: MCP tool '{name}' failed ({type(e).__name__}: {e})"
+    text = result if isinstance(result, str) else str(result)
+    try:
+        from greenboost_cli.instruments.handlers import classify_tool_failure
+        _outcome, _ = classify_tool_failure(text)
+    except Exception:
+        _outcome = ""
+    _emit_cli_tool_call(name, "allowed", agent, params,
+                        duration_ms=(time.monotonic() - _t0) * 1000.0,
+                        outcome=_outcome, result=text)
+    try:
+        from greenboost_cli.instruments.hooks import run_post_tool_hooks
+        run_post_tool_hooks(name, params, text)
+    except Exception:
+        pass
+    return text
 
 
 def _auto_approve(name: str, params: dict) -> bool:

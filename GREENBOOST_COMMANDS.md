@@ -76,6 +76,7 @@ for what this actually delivers today.
 | Command | Description |
 |---|---|
 | `greenboost vitals` | Live TUI: T1/T2/T3 pool gauges, GPU metrics, cluster status, pressure alerts (5 s refresh) |
+| `python3 gb_vitals_helper.py --json` | Machine-readable vitals; includes `host_memory` (MemAvailable, SwapFree, PSI) and `shim_pid_peaks` (per-process T1/T2/T3 peak MB), see docs/reclaim.md |
 | `greenboost top [--llm]` | Live per-buffer residency view, sorted hottest-first (VRAM by tier and by heat: hot/warm/cold) |
 | `greenboost residency [--llm]` | Aggregate hot/warm/cold byte breakdown + churn across all live buffers |
 | `greenboost faults [--llm]` | Tier-migration and memory-fault activity (eBPF tracer when running, kernel counters otherwise) |
@@ -143,6 +144,7 @@ shim owns the tiers *within* each one.
 | `greenboost synapse list [--llm]` | List all known models (HuggingFace-pulled + indexed Ollama blobs) |
 | `sudo greenboost synapse rm <name>` | Remove an HF-pulled model (refuses Ollama-managed blobs - use `ollama rm`) |
 | `sudo greenboost synapse index-ollama` | Register every GGUF Ollama has already downloaded so `synapse list`/`recommend` see them |
+| `sudo greenboost synapse recover-cache [--llm]` | Re-register models whose weights are already in the HuggingFace cache but missing from the manifest (e.g. after a purge that reset it) - no download, adopts a matching serving recipe's pinned name when one exists |
 | `sudo greenboost synapse build-engine` | Build llama-server/llama-cli/rpc-server from the vendored `greenboost-sources/llama.cpp` (CUDA+RPC). Must run on every cluster node - binaries are not portable across CPU vendors |
 | `sudo greenboost synapse update-engine` | Fetch the latest `ggml-org/llama.cpp` and rebuild |
 | `greenboost synapse run <model> [port]` | Serve a model: starts feeder `rpc-server`(s) if online, computes `--tensor-split` from real free VRAM, launches `llama-server --rpc` + the API proxy (Ollama + OpenAI + HuggingFace TGI endpoints) on `:11369` |

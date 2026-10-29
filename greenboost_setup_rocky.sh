@@ -38,7 +38,7 @@ VULKAN_IMPLICIT_LAYER_DIR="/etc/vulkan/implicit_layer.d"
 SHIM_DEST="/usr/local/lib"
 MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-GB_VERSION="3.4"
+GB_VERSION="3.5"
 GB_PROFILES_DIR="/etc/greenboost/profiles"
 GB_ACTIVE_PROFILE_LINK="/etc/greenboost/active_profile.md"
 
@@ -793,13 +793,13 @@ check_deps() {
     Install with: sudo apt install kernel-headers-$(uname -r)"
     info "Kernel headers : $kdir  ✓"
 
-    if lsmod | grep -q "^nvidia "; then
+    if grep -q "^nvidia " <<< "$(lsmod)"; then
         info "NVIDIA driver  : loaded  ✓"
     else
         warn "NVIDIA driver not loaded - run: sudo modprobe nvidia"
     fi
 
-    if lsmod | grep -q "^nvidia_uvm "; then
+    if grep -q "^nvidia_uvm " <<< "$(lsmod)"; then
         info "NVIDIA UVM     : loaded  ✓  (managed memory / System DDR overflow ready)"
     else
         warn "nvidia_uvm not loaded - CUDA UVM overflow unavailable"
@@ -944,7 +944,7 @@ LIMITSEOF
         install -m 644 "$_tq_src/greenboost-turboquant.service" /etc/systemd/system/greenboost-turboquant.service
         systemctl daemon-reload
         systemctl enable greenboost-turboquant.service 2>/dev/null || true
-        if lsmod | grep -q "^greenboost "; then
+        if grep -q "^greenboost " <<< "$(lsmod)"; then
             systemctl restart greenboost-turboquant.service 2>/dev/null || true
         fi
         gb_ok "TurboQuant daemon installed + enabled"
@@ -1149,7 +1149,7 @@ cmd_load() {
     local golden_max="${GB_GOLDEN_MAX}"
     local ecores_only="${GB_PCORES_ONLY}"
 
-    if lsmod | grep -q "^${DRIVER_NAME} "; then
+    if grep -q "^${DRIVER_NAME} " <<< "$(lsmod)"; then
         warn "Module already loaded - reloading..."
         # Stop consumers before rmmod to avoid EBUSY
         for svc in ollama llama-server; do
@@ -1192,7 +1192,7 @@ cmd_load() {
 
 cmd_unload() {
     need_root unload
-    if lsmod | grep -q "^${DRIVER_NAME} "; then
+    if grep -q "^${DRIVER_NAME} " <<< "$(lsmod)"; then
         rmmod "$DRIVER_NAME" && info "GreenBoost unloaded" \
             || die "rmmod failed - check: dmesg | tail -5"
     else
@@ -1385,7 +1385,7 @@ do_purge() {
     rmdir /var/lib/greenboost 2>/dev/null || true
 
     # 9. Unload kernel module - done last so all consumers are gone.
-    if lsmod | grep -q "^${DRIVER_NAME} "; then
+    if grep -q "^${DRIVER_NAME} " <<< "$(lsmod)"; then
         if rmmod "$DRIVER_NAME" 2>/dev/null; then
             gb_ok "Kernel module unloaded"
         else
@@ -1413,15 +1413,11 @@ do_purge() {
     fi
 }
 
+# Removal is not distro-specific: hand over to the main script so this one
+# cannot drift from it (INS-11). It removes exactly what its install wrote,
+# supports --dry-run and never prompts.
 cmd_uninstall() {
-    need_root uninstall
-    gb_header
-    gb_info "Removing all GreenBoost artifacts from this system..."
-    echo ""
-    GB_STOPPED_SERVICES=""
-    do_purge 1
-    echo ""
-    gb_ok "GreenBoost uninstalled cleanly."
+    exec "$MODULE_DIR/greenboost_setup.sh" --skip-update-check uninstall "$@"
 }
 
 cmd_tune() {
@@ -1853,7 +1849,7 @@ cmd_tune_libs() {
 
     # cpuid - lets userspace read CPUID leaves directly. Used by turbostat,
     # CUDA diagnostics, and microcode_ctl update verification.
-    if lsmod | grep -q "^cpuid "; then
+    if grep -q "^cpuid " <<< "$(lsmod)"; then
         info "  [ok]      cpuid  (loaded)"
     else
         modprobe cpuid && info "  [loaded]  cpuid" || warn "  cpuid: modprobe failed"
@@ -1915,7 +1911,7 @@ cmd_status() {
     # Fallback: raw sysfs output when Ubuntu script is unavailable
     gb_header
     local pool_f="/sys/class/greenboost/greenboost/status"
-    if lsmod | grep -q "^${DRIVER_NAME} "; then
+    if grep -q "^${DRIVER_NAME} " <<< "$(lsmod)"; then
         gb_ok "Kernel module loaded"
     else
         gb_fail "Kernel module not loaded"
@@ -2690,7 +2686,7 @@ unset _ARGS _arg _expect_profile
 COMMAND="${1:-wizard}"
 case "$COMMAND" in
     install)             cmd_install            ;;
-    uninstall)           cmd_uninstall          ;;
+    uninstall)           cmd_uninstall "${@:2}" ;;
     build)               cmd_build              ;;
     load)                cmd_load               ;;
     unload)              cmd_unload             ;;

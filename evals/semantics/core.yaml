@@ -234,6 +234,26 @@
   name: shim_fresh
   source: live
 
+# boot_tuning_{active,persisted} read this box's real /proc/cmdline and
+# /etc/default/grub[.d/*.cfg] — no fixture ground truth, same as kmod_loaded
+# above. Added 2026-08-31 with the grub-pc-purge-deletes-the-config incident
+# (workflow/known-issues.md); boot_tuning_lost_next_reboot is the segment
+# built on top of them.
+- id: boot_tuning_active_structural
+  kind: metric
+  name: boot_tuning_active
+  source: live
+
+- id: boot_tuning_persisted_structural
+  kind: metric
+  name: boot_tuning_persisted
+  source: live
+
+- id: boot_tuning_lost_next_reboot_structural
+  kind: segment
+  name: boot_tuning_lost_next_reboot
+  source: live
+
 # Both live, not fixture: dataflux_event_count reads the machine's real log,
 # and dataflux_history_reset gates on live kmod_loaded, so neither has a
 # machine-independent ground truth. The structural check is still the one that
@@ -252,6 +272,21 @@
 - id: ssm_state_gb_structural
   kind: metric
   name: ssm_state_gb
+  source: live
+
+- id: web_fetch_blocked_count_structural
+  kind: metric
+  name: web_fetch_blocked_count
+  source: live
+
+- id: factory_tasks_interrupted_structural
+  kind: metric
+  name: factory_tasks_interrupted
+  source: live
+
+- id: mtp_head_on_disk_structural
+  kind: metric
+  name: mtp_head_on_disk
   source: live
 
 - id: recurrent_layer_fraction_structural
@@ -312,6 +347,11 @@
 # verdict is legitimately true, false, or None depending on the machine. What
 # must hold everywhere is that it answers in the right SHAPE and never
 # fabricates "no drift" out of a missing file.
+- id: separate_mtp_head_unused_structural
+  kind: segment
+  name: separate_mtp_head_unused
+  source: live
+
 - id: kmod_version_drift_structural
   kind: segment
   name: kmod_version_drift
@@ -486,6 +526,24 @@
 - id: models_wiped_from_manifest_structural
   kind: segment
   name: models_wiped_from_manifest
+  source: live
+
+# ── 2026-09-01 recipe-resolvability additions ───────────────────────────────
+# Two serving recipes on this box reported `valid: true` (schema+digest passed)
+# while pinning models absent from the manifest — one of them the reference
+# workload. `valid` never checked resolvability; these make that reachable
+# through the governed layer instead of only through a `no such model` failure
+# at serve time. `source: live` — structural only, same as the sibling pair
+# above (both read the real serving/recipes/*.yaml + manifest).
+
+- id: recipes_unresolvable_structural
+  kind: metric
+  name: recipes_unresolvable
+  source: live
+
+- id: recipe_model_unresolvable_structural
+  kind: segment
+  name: recipe_model_unresolvable
   source: live
 
 # ── 2026-08-18 host-OOM additions ───────────────────────────────────────────
@@ -784,4 +842,38 @@
 - id: last_game_session_s_structural
   kind: metric
   name: last_game_session_s
+  source: live
+
+# ── tier spill outcome (crosswalk P5-01) ─────────────────────────────────
+- id: tier_spill_return_pct_structural
+  kind: metric
+  name: tier_spill_return_pct
+  source: live
+
+- id: tier_spill_returns_often_structural
+  kind: segment
+  name: tier_spill_returns_often
+  source: live
+
+# ── warm prefill fixed cost (crosswalk Q7-04; replaced the withdrawn
+#    recurrent_replay_share, see casebook) ────────────────────────────────
+- id: warm_prefill_fixed_ms_structural
+  kind: metric
+  name: warm_prefill_fixed_ms
+  source: live
+
+- id: warm_prefill_dominates_turn_structural
+  kind: segment
+  name: warm_prefill_dominates_turn
+  source: live
+
+# ── tool result prefill cost (crosswalk Q7-05) ───────────────────────────
+- id: tool_result_prefill_ms_structural
+  kind: metric
+  name: tool_result_prefill_ms
+  source: live
+
+- id: tool_result_dominates_turn_structural
+  kind: segment
+  name: tool_result_dominates_turn
   source: live

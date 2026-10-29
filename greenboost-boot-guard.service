@@ -11,7 +11,7 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/sbin/greenboost_boot_guard.sh
 # Best-effort by design (see script) , never let this hold up boot.
-TimeoutStartSec=60
+TimeoutStartSec=300
 SuccessExitStatus=0
 
 [Install]

@@ -797,6 +797,35 @@ static int netc_recv_response(struct netc_feeder *nf, struct gb_net_header *out_
 /*  Feeder connection                                                  */
 /* ------------------------------------------------------------------ */
 
+/* Arbiter round 2 (GA7): a cluster peer that is down must not cost every process start 3 s (EHOSTUNREACH after the ARP timeout).
+ * Connect non-blocking and give up after GB_NET_CONNECT_TIMEOUT_MS (default 300 ms, 0 = old blocking behaviour); the socket goes back
+ * to blocking mode on success. The heartbeat/reconnect thread retries later with its own backoff, so a peer that is only slow is not lost. */
+static int connect_with_timeout(int fd, const struct sockaddr *sa, socklen_t len)
+{
+    long ms = 300;
+    const char *e = getenv("GB_NET_CONNECT_TIMEOUT_MS");
+    if (e && *e) ms = strtol(e, NULL, 10);
+    if (ms <= 0) return connect(fd, sa, len);
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) return connect(fd, sa, len);
+    int rc = connect(fd, sa, len);
+    if (rc < 0 && errno == EINPROGRESS) {
+        struct pollfd p = { .fd = fd, .events = POLLOUT };
+        int n;
+        do { n = poll(&p, 1, (int)ms); } while (n < 0 && errno == EINTR);
+        if (n == 0) { errno = ETIMEDOUT; rc = -1; }
+        else if (n < 0) { rc = -1; }
+        else {
+            int soerr = 0; socklen_t sl = sizeof(soerr);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) < 0) rc = -1;
+            else if (soerr) { errno = soerr; rc = -1; }
+            else rc = 0;
+        }
+    }
+    if (rc == 0) fcntl(fd, F_SETFL, fl);
+    return rc;
+}
+
 static int connect_feeder(struct netc_feeder *f)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -825,7 +854,7 @@ static int connect_feeder(struct netc_feeder *f)
         return -1;
     }
 
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    if (connect_with_timeout(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         netc_log("connect to %s:%d failed: %s", f->addr, f->port, strerror(errno));
         close(fd);
         return -1;

@@ -1,0 +1,17 @@
+# PROPOSAL (SP41-12 / QC1). Not installed by anything in the repo.
+[Unit]
+Description=GreenBoost root helper socket (closed verb list)
+
+[Socket]
+ListenStream=/run/greenboost-helper/root-helper.sock
+SocketUser=greenboost
+SocketGroup=greenboost
+SocketMode=0660
+DirectoryMode=0750
+# Accept=no: one long-lived helper process serves connections one at a time.
+Accept=no
+Backlog=8
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

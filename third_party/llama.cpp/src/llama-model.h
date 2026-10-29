@@ -127,6 +127,7 @@ enum llm_type {
     LLM_TYPE_35B_A3B, // Qwen3.5
     LLM_TYPE_48B_A3B, // Kimi Linear
     LLM_TYPE_80B_A3B, // Qwen3 Next
+    LLM_TYPE_A3B,     // Qwen3.8 Flash Next
     LLM_TYPE_100B_A6B,
     LLM_TYPE_102B_A12B, // Solar-Open
     LLM_TYPE_106B_A12B, // GLM-4.5-Air
@@ -515,6 +516,30 @@ struct llama_layer {
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
 
+    // qwen4exp / QSA indexer projections and norms
+    struct ggml_tensor * index_q_proj = nullptr;
+    struct ggml_tensor * index_k_proj = nullptr;
+    struct ggml_tensor * index_q_norm = nullptr;
+    struct ggml_tensor * index_k_norm = nullptr;
+
+    // qwen4exp: hyper-connections (hc_count = 4)
+    struct ggml_tensor * hc_attn_norm   = nullptr;
+    struct ggml_tensor * hc_attn_down   = nullptr;
+    struct ggml_tensor * hc_attn_up     = nullptr;
+    struct ggml_tensor * hc_attn_inject = nullptr;
+    struct ggml_tensor * hc_ffn_norm    = nullptr;
+    struct ggml_tensor * hc_ffn_down    = nullptr;
+    struct ggml_tensor * hc_ffn_up      = nullptr;
+    struct ggml_tensor * hc_ffn_inject  = nullptr;
+
+    // qwen4exp: per-layer n-gram embeddings
+    struct ggml_tensor * ple_key        = nullptr;
+    struct ggml_tensor * ple_value      = nullptr;
+    struct ggml_tensor * ple_norm_key   = nullptr;
+    struct ggml_tensor * ple_norm_query = nullptr;
+    struct ggml_tensor * ple_norm_conv  = nullptr;
+    struct ggml_tensor * ple_conv1d     = nullptr;
+
     // gemma4 layer output scale, reused for talkie embedding skip scale
     struct ggml_tensor * out_scale = nullptr;
 
@@ -592,6 +617,10 @@ struct llama_model {
     struct ggml_tensor * altup_proj           = nullptr;
     struct ggml_tensor * altup_unembd_proj    = nullptr;
     struct ggml_tensor * per_layer_tok_embd   = nullptr;
+
+    struct ggml_tensor * hc_head_norm = nullptr;
+    struct ggml_tensor * hc_head_down = nullptr;
+    struct ggml_tensor * hc_head_up   = nullptr;
     struct ggml_tensor * per_layer_model_proj = nullptr;
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
 
@@ -662,6 +691,19 @@ struct llama_model {
     bool has_tensor_overrides() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
+
+    // ask the kernel to start reading the rows a gather is about to take from a host-mapped tensor
+    // the faults then overlap instead of paying one NVMe latency at a time
+    //
+    // does nothing unless gather_tables() named the tensor and it really is read from a mapping
+    // for anything else this is one empty-vector test
+    void prefetch_rows(const struct ggml_tensor * t, const int32_t * rows, size_t n_rows) const;
+
+    // tensors that stay host-resident and are read by sparse row gathers, not streamed once
+    // under LLAMA_MMAP_RANDOM these get the random advice and the batched readahead of prefetch_rows()
+    //
+    // named by the model, not guessed from size: a big tensor read in full, like token_embd on CPU, still wants readahead
+    virtual std::vector<const struct ggml_tensor *> gather_tables() const { return {}; }
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

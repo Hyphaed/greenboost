@@ -1,0 +1,97 @@
+--- a/gb_supervisor.py
++++ b/gb_supervisor.py
+@@ -66,6 +66,18 @@
+ import time
+ from pathlib import Path
+ 
++# Root actions go through the privsplit helper when GB_ROOT_HELPER=1. With the
++# flag on and the helper down, nothing falls back to running rmmod/modprobe here.
++_USE_HELPER = os.environ.get("GB_ROOT_HELPER", "0") == "1"
++_helper = None
++def _helper_client():
++    global _helper
++    if _helper is None:
++        sys.path.insert(0, "/usr/local/lib/greenboost/privsplit")
++        from gb_helper_client import HelperClient
++        _helper = HelperClient()
++    return _helper
++
+ # Lazy imports at runtime to avoid heavy init at module load time
+ def _import_orchestrator():
+     from gb_orchestrator import ReactiveOrchestrator
+@@ -409,15 +421,21 @@
+         return "failed"
+     ok = True
+     try:
+-        r = subprocess.run(["rmmod", *[m for m in _NVIDIA_MODULES if m in was_loaded]],
+-                           capture_output=True, timeout=20)
+-        ok = r.returncode == 0
++        names = [m for m in _NVIDIA_MODULES if m in was_loaded]
++        if _USE_HELPER:
++            ok = bool(_helper_client().module_unload(names).get("ok"))
++        else:
++            r = subprocess.run(["rmmod", *names], capture_output=True, timeout=20)
++            ok = r.returncode == 0
+     except subprocess.TimeoutExpired:
+         ok = False
+         log.warning("rmmod nvidia timed out , continuing")
+     try:
+         top = "nvidia_drm" if "nvidia_drm" in was_loaded else "nvidia"
+-        subprocess.run(["modprobe", top], capture_output=True, timeout=20)
++        if _USE_HELPER:
++            ok = bool(_helper_client().module_load(top).get("ok")) and ok
++        else:
++            subprocess.run(["modprobe", top], capture_output=True, timeout=20)
+     except subprocess.TimeoutExpired:
+         ok = False
+         log.warning("modprobe nvidia timed out , continuing")
+@@ -468,8 +486,12 @@
+         else:
+             log.warning("greenboost.ko not loaded , attempting modprobe")
+             try:
+-                r = subprocess.run(["modprobe", "greenboost"],
+-                                    capture_output=True, text=True, timeout=15)
++                if _USE_HELPER:
++                    hr = _helper_client().module_load("greenboost")
++                    r = subprocess.CompletedProcess([], 0 if hr.get("ok") else 1, "", str(hr.get("detail", "")))
++                else:
++                    r = subprocess.run(["modprobe", "greenboost"],
++                                        capture_output=True, text=True, timeout=15)
+                 if r.returncode == 0:
+                     log.info("greenboost.ko loaded via modprobe")
+                 else:
+@@ -647,13 +669,19 @@
+     # restarting apparmor for a rule that was already present reloaded every
+     # profile on the box for nothing.
+     if written:
++        # With the helper, parse and restart happen in one verb below.
++        # NOTE: writing /etc/apparmor.d/local/* above still needs root and is not
++        # a helper verb yet (see privsplit/README.md, open risks).
+         try:
+-            r = subprocess.run(
+-                ["apparmor_parser", "-r",
+-                 "/etc/apparmor.d/usr.lib.snapd.snap-confine.real"],
+-                capture_output=True, timeout=15,
+-            )
+-            parser_ok = (r.returncode == 0)
++            if _USE_HELPER:
++                parser_ok = bool(_helper_client().apparmor_reload().get("ok"))
++            else:
++                r = subprocess.run(
++                    ["apparmor_parser", "-r",
++                     "/etc/apparmor.d/usr.lib.snapd.snap-confine.real"],
++                    capture_output=True, timeout=15,
++                )
++                parser_ok = (r.returncode == 0)
+         except (Exception, subprocess.TimeoutExpired):
+             parser_ok = None
+ 
+@@ -672,7 +700,7 @@
+     except Exception:
+         pass
+ 
+-    if written:
++    if written and not _USE_HELPER:
+         try:
+             subprocess.run(["systemctl", "restart", "apparmor"],
+                            capture_output=True, timeout=30)

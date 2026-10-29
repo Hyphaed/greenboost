@@ -143,6 +143,35 @@
       "minimum": 0,
       "description": "--n-cpu-moe override \u2014 measured, deliberate MoE-expert CPU placement (CLAUDE.md's 2026-07-26 amendment), never a silent fallback. Optional \u2014 omit for a dense model or a MoE model not using this placement."
     },
+    "batch": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "--batch-size override \u2014 llama.cpp's logical prefill batch (compiled default 2048). Optional; omit to keep the engine default. A MEASURED prefill-throughput pin, never assumed \u2014 same evidence gate as nCpuMoe. Reaches LlamaCppBackend.serve()'s cmd via gb_synapse.serve()'s batch_size override param."
+    },
+    "ubatch": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "--ubatch-size override \u2014 llama.cpp's physical prompt-processing micro-batch (compiled default 512). This is the knob that sizes the prefill GEMM on the GPU, i.e. prefill tensor-core utilisation. Optional; omit to keep the engine default. MEASURED per model (larger ubatch raises cold-prefill tok/s until the prefill compute buffer eats VRAM headroom), never assumed."
+    },
+    "vision": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional overrides for serving a model WITH its vision projector. Without this block gb-synapse sizes the placement from the projector's own metadata (gb_vision.py). nCpuMoe is the expert-layer count measured WITH the projector loaded (the top-level nCpuMoe is the text-only baseline; the auto-fit adds the layers the projector costs on top of it). imageMinTokens/imageMaxTokens override the projector's image token range (Qwen-VL needs >= 1024 to be accurate).",
+      "properties": {
+        "nCpuMoe": {"type": "integer", "minimum": 0, "description": "--n-cpu-moe measured with the projector attached; wins over the auto-fit."},
+        "imageMinTokens": {"type": "integer", "minimum": 1, "description": "--image-min-tokens override."},
+        "imageMaxTokens": {"type": "integer", "minimum": 1, "description": "--image-max-tokens override."}
+      }
+    },
+    "proxy": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional overrides for the gb-synapse proxy's memory guard. Defaults are derived from RAM, the engine's slot count and the request body cap (gb_synapse._proxy_limit_plan).",
+      "properties": {
+        "addressSpacePct": {"type": "number", "exclusiveMinimum": 0, "maximum": 100, "description": "Percent of total RAM allowed as the proxy's address space (RLIMIT_AS) before the per-slot allowance and arena reserve are added."},
+        "mallocArenaMax": {"type": "integer", "minimum": 1, "description": "MALLOC_ARENA_MAX for the proxy process (glibc reserves ~128 MiB of address space per arena)."}
+      }
+    },
     "kvReserveMb": {
       "type": "integer",
       "minimum": 0,

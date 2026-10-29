@@ -37,6 +37,43 @@ def _h(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8", "replace")).hexdigest()[:16]
 
 
+def _parts(value) -> list:
+    """A chunk as an ordered list of independently-aging pieces.
+
+    A plain string is one piece, which is the original behaviour for every
+    chunk that really is atomic (the system block, the tool schemas). `history`
+    is not atomic , see `_history_verdict`.
+    """
+    if isinstance(value, (list, tuple)):
+        return [str(v or "") for v in value]
+    return [str(value or "")]
+
+
+def _history_verdict(prev: list, new: list) -> tuple:
+    """Did history MOVE, or was it merely appended to? Returns (moved, kept_chars).
+
+    This distinction is the whole of GB-1 for the chunk that changes most
+    often, and getting it wrong made this module report a violation on every
+    healthy turn. Measured 2026-08-22 over a real 11-turn conversation: 14
+    consecutive `agent_prefix_shift` warns, every one `first_changed=history`,
+    on a conversation that was a pure append from start to finish. `history`
+    was hashed as one blob, so appending turn N flipped its fingerprint and the
+    module read that as the prefix moving , the exact per-turn noise its own
+    docstring says would bury the real signal.
+
+    An append leaves every earlier message byte-identical, which is precisely
+    what the engine reuses. So history has moved only when the previous
+    messages are NOT a prefix of the current ones.
+    """
+    n = 0
+    for a, b in zip(prev, new):
+        if a != b:
+            break
+        n += 1
+    moved = n < len(prev)          # something earlier was rewritten or dropped
+    return moved, n
+
+
 @dataclass
 class PrefixState:
     """Last turn's chunk fingerprints, and what changed since."""
@@ -49,23 +86,44 @@ class PrefixState:
         Returns a verdict dict; `first_changed` is None on the first turn (no
         previous request to compare against , not the same thing as "nothing
         changed") and on a turn where the prefix held.
+
+        `history` may be passed as a LIST of per-message strings, in which case
+        an append is correctly read as no shift. Passing it as a single string
+        still works and still treats any change as a shift , correct for a
+        chunk that really is atomic, wrong for a growing conversation.
         """
-        new = {name: _h(chunks.get(name, "")) for name in CHUNK_ORDER}
-        sizes = {name: len(chunks.get(name, "") or "") for name in CHUNK_ORDER}
+        new = {name: [_h(t) for t in _parts(chunks.get(name, ""))]
+               for name in CHUNK_ORDER}
+        sizes = {name: sum(len(t) for t in _parts(chunks.get(name, "")))
+                 for name in CHUNK_ORDER}
+        part_sizes = {name: [len(t) for t in _parts(chunks.get(name, ""))]
+                      for name in CHUNK_ORDER}
         prev, self.chunks = self.chunks, new
         self.turns += 1
         if not prev:
             return {"first_turn": True, "first_changed": None,
                     "stable_prefix_chars": 0, "invalidated_chars": 0,
+                    "history_appended": False,
                     "chunks": list(CHUNK_ORDER)}
 
         first = None
         stable = 0
+        history_appended = False
         for name in CHUNK_ORDER:
-            if prev.get(name) != new[name]:
-                first = name
-                break
-            stable += sizes[name]
+            if prev.get(name) == new[name]:
+                stable += sizes[name]
+                continue
+            if name == "history":
+                moved, kept = _history_verdict(prev.get(name, []), new[name])
+                if not moved:
+                    # Appended, not rewritten. Every earlier message is still
+                    # byte-identical, so the engine reuses all of it.
+                    history_appended = True
+                    stable += sum(part_sizes[name][:kept])
+                    continue
+                stable += sum(part_sizes[name][:kept])
+            first = name
+            break
         # "Invalidated" means chars that WERE reusable and now are not. A
         # changed trailing user turn is new content that was never in the cache
         # , counting it here would report a cost on every healthy turn and make
@@ -74,13 +132,18 @@ class PrefixState:
             invalidated = 0
         else:
             invalidated = sum(sizes[n] for n in CHUNK_ORDER) - stable - sizes[CHUNK_ORDER[-1]]
-        changed = [n for n in CHUNK_ORDER if prev.get(n) != new[n]]
+        # An appended history is NOT a changed chunk for this purpose, however
+        # different its blob hash is , the whole point of the check above.
+        changed = [n for n in CHUNK_ORDER
+                   if prev.get(n) != new[n]
+                   and not (n == "history" and history_appended)]
         return {
             "first_turn": False,
             "first_changed": first,
             "changed": changed,
             "stable_prefix_chars": stable,
             "invalidated_chars": max(0, invalidated) if first else 0,
+            "history_appended": history_appended,
             "chunks": list(CHUNK_ORDER),
         }
 
@@ -107,6 +170,11 @@ def observe(chunks: dict, emit: bool = True) -> dict:
                 "changed": ",".join(verdict.get("changed", [])),
                 "stable_prefix_chars": verdict["stable_prefix_chars"],
                 "invalidated_chars": verdict["invalidated_chars"],
+                # True when history grew by appending AND something earlier
+                # (system, tools) moved anyway , so a reader can tell "the
+                # conversation is fine, the system block moved" from "the
+                # conversation itself was rewritten".
+                "history_appended": verdict.get("history_appended", False),
                 "turns": _state.turns,
             })
         except Exception:

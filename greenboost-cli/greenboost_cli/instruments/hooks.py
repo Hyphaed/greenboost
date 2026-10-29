@@ -51,10 +51,16 @@ def _matches(pattern: str, tool_name: str) -> bool:
     return pattern == "*" or pattern.lower() == tool_name.lower()
 
 
-def _run_hook(command: str, payload: dict) -> tuple[bool, str]:
+def _run_hook(command: str, payload: dict, fail_closed: bool = False) -> tuple[bool, str]:
     """Run a hook command with payload on stdin.
 
     Returns (should_continue, reason_if_blocked).
+
+    `fail_closed` is for hooks whose job is to BLOCK (PreToolUse): a hook that
+    times out or crashes then blocks the call instead of waving it through. A
+    gate that stops gating the moment it breaks is not a gate. Observers (post,
+    prompt, stop hooks) keep failing open, since a broken logger shouldn't halt
+    the agent.
     """
     try:
         r = subprocess.run(
@@ -80,8 +86,12 @@ def _run_hook(command: str, payload: dict) -> tuple[bool, str]:
             pass   # non-JSON stdout = allow
         return True, ""
     except subprocess.TimeoutExpired:
-        return True, ""   # timeout = don't block
-    except Exception:
+        if fail_closed:
+            return False, "a blocking hook timed out after 10s, so the call was not allowed (blocking hooks fail closed)"
+        return True, ""   # observer hook: a timeout doesn't block
+    except Exception as e:
+        if fail_closed:
+            return False, f"a blocking hook failed to run ({type(e).__name__}), so the call was not allowed (blocking hooks fail closed)"
         return True, ""
 
 
@@ -91,7 +101,7 @@ def run_pre_tool_hooks(tool_name: str, tool_inputs: dict) -> tuple[bool, str]:
     payload = {"hook_event_name": "PreToolUse", "tool_name": tool_name, "tool_input": tool_inputs}
     for hook in hooks:
         if _matches(hook.get("matcher", "*"), tool_name):
-            ok, reason = _run_hook(hook["command"], payload)
+            ok, reason = _run_hook(hook["command"], payload, fail_closed=True)
             if not ok:
                 return False, reason
     return True, ""

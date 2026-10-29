@@ -278,6 +278,67 @@ def layer_roles(
 # Main calibration entry point
 # ---------------------------------------------------------------------------
 
+def reference_attention():
+    """Context manager guaranteeing calibration measures the REFERENCE attention.
+
+    The hazard, and it is specific rather than theoretical. `gb_attn.patch_sdpa()`
+    replaces `torch.nn.functional.scaled_dot_product_attention` GLOBALLY with a
+    quantized implementation. Calibration exists to measure how much quantization
+    costs; if it runs while that patch is active it measures quantized attention
+    against quantized attention, and the per-layer sensitivities it produces , the
+    numbers `plan_quality()` uses to decide where to spend bits , are quietly wrong.
+    Nothing checked this before: `gb_quant_calib` never consulted the patch state,
+    and the failure is silent because the calibration still completes and still
+    returns plausible errors.
+
+    Adapted from unsloth's `_compressed_quantize.py` (study2 crosswalk Q3-02),
+    which launches llm-compressor as a SUBPROCESS by file path so its own
+    transformers patches cannot be imported into it. The pattern transfers; the
+    mechanism does not have to. unsloth needs a subprocess because its patches are
+    applied at import time and cannot be undone. GreenBoost's can:
+    `gb_attn.unpatch_sdpa()` exists and restores the original. So the guarantee is
+    the same and the cost is a context manager rather than a process boundary.
+
+    Records the intervention rather than performing it silently , a calibration
+    that had to unpatch is a calibration whose caller believed something untrue.
+    """
+    import contextlib
+
+    @contextlib.contextmanager
+    def _ctx():
+        try:
+            import gb_attn
+        except Exception:
+            yield False
+            return
+        was_patched = getattr(gb_attn, "_original_sdpa", None) is not None
+        if not was_patched:
+            yield False
+            return
+        k = getattr(gb_attn, "_active_k_bits", None)
+        v = getattr(gb_attn, "_active_v_bits", None)
+        gb_attn.unpatch_sdpa()
+        try:
+            import gb_dataflux
+            gb_dataflux.emit({
+                "node": "host", "label": "gb_quant_calib", "kind": "quant_calib_guard",
+                "status": "warn", "reason": "calibration_unpatched_sdpa",
+                "k_bits": k, "v_bits": v,
+            })
+        except Exception:
+            pass
+        try:
+            yield True
+        finally:
+            # Deliberately NOT re-patched. Re-applying mid-flight would restore a
+            # global the caller may no longer expect, and the caller that patched
+            # it is the one that knows when to do so again. Saying it happened is
+            # the contract; guessing the caller's intent is not.
+            pass
+
+    return _ctx()
+
+
 def calibrate_sensitivity(
     module: nn.Module,
     precisions: Union[Tuple, list] = ("fp8", 4, "tq3"),
@@ -309,6 +370,20 @@ def calibrate_sensitivity(
         verbose:         print progress to stdout.
         force_recompute: ignore disk cache, always recompute.
     """
+    # Calibration measures what quantization costs. If gb_attn's global SDPA
+    # patch is live, it measures quantized attention against quantized
+    # attention and the sensitivities that drive bit allocation are silently
+    # wrong. See reference_attention()'s docstring.
+    with reference_attention():
+        return _calibrate_sensitivity_inner(
+            module, precisions, model_id, group_size, n_tokens, skip_modules,
+            verbose, force_recompute)
+
+
+def _calibrate_sensitivity_inner(
+    module, precisions, model_id, group_size, n_tokens, skip_modules,
+    verbose, force_recompute,
+):
     precisions = tuple(precisions)
     cache_hash = _model_hash(module, precisions, n_tokens)
     cpath = _cache_path(model_id, cache_hash)

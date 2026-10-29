@@ -194,7 +194,7 @@ def sweep(model: str = "", kv_types=DEFAULT_KV_TYPES,
     try:
         for kv in kv_types:
             gb_synapse.stop(name)
-            gb_synapse.serve(name, kv_type=kv)
+            gb_synapse.serve(name, kv_type=kv, explicit=True, trigger="bench")
             time.sleep(2)
             r = measure_current(name, niah_tokens, needles, emit=True)
             row = r.get("summary", {"error": r.get("error")})
@@ -224,7 +224,7 @@ def sweep(model: str = "", kv_types=DEFAULT_KV_TYPES,
     try:
         if failed or (rows and rows[-1].get("kv_type") != "f16"):
             gb_synapse.stop(name)
-            gb_synapse.serve(name, kv_type="f16")
+            gb_synapse.serve(name, kv_type="f16", explicit=True, trigger="bench")
             restored = "f16"
     except Exception as e:
         restored = f"FAILED: {type(e).__name__}: {e}"    # say so, never silently

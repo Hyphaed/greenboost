@@ -67,6 +67,48 @@ _SKIP_DIR_SUBSTR = ("third_party/", "greenboost-cli/", "nvidia_markdowns/",
                                                     # placement decisions
 
 
+
+def _strip_non_code(path, lines: "list[str]") -> "list[str]":
+    """Blank out string and comment CONTENT, keeping line numbering intact.
+
+    Python is tokenized, so the answer is exact. Everything else (shell, C) gets
+    a quote-stripping heuristic: good enough to drop `info "...12GB..."` and a
+    usage message, and it never removes a bare literal, which is the only thing
+    this check is looking for.
+    """
+    if path.suffix == ".py":
+        try:
+            import io
+            import tokenize
+            out = list(lines)
+            src = "\n".join(lines)
+            for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+                if tok.type not in (tokenize.STRING, tokenize.COMMENT):
+                    continue
+                (r1, c1), (r2, c2) = tok.start, tok.end
+                for r in range(r1, r2 + 1):
+                    if r - 1 >= len(out):
+                        break
+                    text = out[r - 1]
+                    a = c1 if r == r1 else 0
+                    b = c2 if r == r2 else len(text)
+                    out[r - 1] = text[:a] + " " * max(0, b - a) + text[b:]
+            return out
+        except Exception:
+            # A file that will not tokenize (partial edit, py2 syntax) falls
+            # back to the heuristic rather than being skipped silently.
+            pass
+    stripped = []
+    for line in lines:
+        for q in ('"', "'"):
+            parts = line.split(q)
+            if len(parts) > 2:            # at least one closed quote pair
+                line = parts[0] + "".join(
+                    ("" if i % 2 else p) for i, p in enumerate(parts[1:], 1))
+        stripped.append(line)
+    return stripped
+
+
 def run(repo_root: Path) -> list[Finding]:
     findings: list[Finding] = []
     allow = load_allowlist(repo_root / "checks" / "allowlists" / "hardware.txt")
@@ -78,10 +120,25 @@ def run(repo_root: Path) -> list[Finding]:
             lines = path.read_text(errors="ignore").splitlines()
         except OSError:
             continue
+        # Prose is not a constant. The line-start comment test below only ever
+        # caught the FIRST line of a comment block; a measured figure written
+        # into a docstring continuation, a KindSpec doc= string, or a shell
+        # usage message looked exactly like a hardcoded literal. On 2026-08-22
+        # all 11 findings this check produced were prose , measured numbers in
+        # comments, a `info "...RTX 5070 12GB..."` preset message, and the
+        # usage text of `t3-memory <size>` , and it exited non-zero on every
+        # run while nothing in the suite invoked it. A blocking gate that is
+        # 100% false positives is a gate everyone learns to skip, which is how
+        # a real hardcoded constant would get through.
+        code_only = _strip_non_code(path, lines)
         for lineno, line in enumerate(lines, 1):
             stripped = line.strip()
             if stripped.startswith(("#", "//", "*", "/*")):
                 continue  # comments (incl. this check's own docstring examples)
+            # Match only what survives with strings and comments removed.
+            line = code_only[lineno - 1]
+            if not line.strip():
+                continue
             if _FRACTION_CONTEXT_RE.search(line):
                 continue
             if not _SIZE_LITERAL_RE.search(line):

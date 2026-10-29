@@ -37,6 +37,11 @@ CLI:
         fallback — one interface, gb-synapse picks the runtime; see
         workflow/gb-synapse.md).
     python3 gb_synapse.py index-ollama
+    python3 gb_synapse.py recover-cache [--llm]
+        re-registers models whose weights are on disk (HuggingFace cache)
+        but missing from the manifest — the Full Install path already runs
+        this once automatically; run it by hand after any other event that
+        can desync the two (see recover_from_hf_cache()'s docstring).
     python3 gb_synapse.py list|rm <name>
     python3 gb_synapse.py doctor [--llm]
     python3 gb_synapse.py recommend [ctx] [--llm]
@@ -53,8 +58,10 @@ import shlex
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field, asdict
@@ -66,9 +73,10 @@ sys.path.insert(0, str(_REPO_DIR))
 import gb_cluster
 import gb_ports
 import gb_synapse_backends
+import gb_vision
 import gb_wait
 from gb_phase_activity import mark_phase_activity
-from gb_gguf_tensor_map import _load_gguf_reader
+from gb_gguf_tensor_map import _load_gguf_reader, shard_paths
 from gb_state_io import atomic_write_json, update_json_locked
 
 # ---------------------------------------------------------------------------
@@ -566,6 +574,24 @@ class ModelEntry:
     ssm_d_conv: int = 0
     ssm_conv_width: int = 0
     ssm_state_elems: int = 0
+    # Flash-Next-class (qwen4_exp) tensor classes — see gguf_summary()'s and
+    # safetensors_summary()'s own comments for how each is identified and
+    # summed. 0 on any non-qwen4_exp checkpoint (these tensor classes don't
+    # exist there); same TypeError trap as dense_bytes/expert_bytes above if
+    # this field is ever added to the summary functions' returned dict
+    # without a matching field here.
+    #   n_ngram_bytes             — the n-gram/PLE lookup table (~50 GB on
+    #                                the reference checkpoint), designed by
+    #                                the model's own authors for host-memory
+    #                                residency — a T2 budget line, not T1.
+    #   n_qsa_indexer_bytes       — the QSA sparse-attention indexer, present
+    #                                only on full-attention layers.
+    #   n_hyper_connection_bytes  — the per-layer Gated-Residual hyper-
+    #                                connection mixers — small but dense and
+    #                                hot (every layer, every token).
+    n_ngram_bytes: int = 0
+    n_qsa_indexer_bytes: int = 0
+    n_hyper_connection_bytes: int = 0
     added_ts: float = 0.0
 
 
@@ -1149,34 +1175,51 @@ def pull(repo_spec: str, name: str | None = None, engine: str = "") -> ModelEntr
             raise RuntimeError(f"no GGUF matching quant {quant!r} in {repo}; "
                                 f"available: {', '.join(available) or 'unknown'}")
         if len(matches) > 1:
-            # Refuse to guess. Quant matching is a plain substring test, and
-            # this repo family ships names where one request matches several
-            # files: "MTP-IQ4_XS" matches BOTH
-            # "...NEO-MAX-NEO-MTP-IQ4_XS.gguf" (15.85 GiB, the full quant) and
-            # "...NEO-MAX-NEO-LOW-MTP-IQ4_XS.gguf" (14.25 GiB, the reduced
-            # "LOW" build the model card describes as without the MTP/OT mods).
-            #
-            # This used to take matches[0] silently. On 2026-08-18 that
-            # downgraded the reference workload to the LOW build during a
-            # manifest rebuild, with nothing in the output to say a different
-            # model had been selected than the one asked for. _resolve_manifest_
-            # entry() already raises on exactly this ambiguity; pull() simply
-            # never got the same guard.
-            #
-            # An exact quant-token match still wins outright, so unambiguous
-            # requests are unaffected.
-            exact = [f for f in matches
-                     if _quant_from_filename(f["filename"]).upper() == quant.upper()]
-            if len(exact) == 1:
-                matches = exact
+            # Multiple shards of the SAME quant (Unsloth-style per-quant
+            # subfolder + numbered "<stem>-NNNNN-of-NNNNN.gguf" split, e.g.
+            # unsloth/Qwen3.8-Flash-Next-GGUF's UD-Q2_K_XL ships 3 shards)
+            # are not an ambiguity — group by logical quant (shard stem)
+            # first. Only >1 DISTINCT quant sharing this substring is real
+            # ambiguity. Confirmed live 2026-08-27: without this grouping,
+            # every split-GGUF quant on this repo family raised the
+            # false-positive "matches 3 files" error below, on every quant.
+            def _shard_group(fname: str) -> str:
+                m = re.match(r'(.+)-\d{5}-of-\d{5}\.gguf$', fname)
+                return m.group(1) if m else fname
+            groups: dict[str, list] = {}
+            for f in matches:
+                groups.setdefault(_shard_group(f["filename"]), []).append(f)
+            if len(groups) == 1:
+                matches = next(iter(groups.values()))
             else:
-                listing = "\n  ".join(
-                    f'{f["filename"]}  ({(f.get("size") or 0) / 1024 ** 3:.2f} GiB)'
-                    for f in sorted(matches, key=lambda f: f["filename"]))
-                raise RuntimeError(
-                    f"quant {quant!r} matches {len(matches)} files in {repo} , "
-                    f"refusing to guess which one you meant:\n  {listing}\n"
-                    f"Pass a longer quant string that appears in only one of them.")
+                # Refuse to guess. Quant matching is a plain substring test, and
+                # this repo family ships names where one request matches several
+                # files: "MTP-IQ4_XS" matches BOTH
+                # "...NEO-MAX-NEO-MTP-IQ4_XS.gguf" (15.85 GiB, the full quant) and
+                # "...NEO-MAX-NEO-LOW-MTP-IQ4_XS.gguf" (14.25 GiB, the reduced
+                # "LOW" build the model card describes as without the MTP/OT mods).
+                #
+                # This used to take matches[0] silently. On 2026-08-18 that
+                # downgraded the reference workload to the LOW build during a
+                # manifest rebuild, with nothing in the output to say a different
+                # model had been selected than the one asked for. _resolve_manifest_
+                # entry() already raises on exactly this ambiguity; pull() simply
+                # never got the same guard.
+                #
+                # An exact quant-token match still wins outright, so unambiguous
+                # requests are unaffected.
+                exact = [f for f in matches
+                         if _quant_from_filename(f["filename"]).upper() == quant.upper()]
+                if len(exact) == 1:
+                    matches = exact
+                else:
+                    listing = "\n  ".join(
+                        f'{f["filename"]}  ({(f.get("size") or 0) / 1024 ** 3:.2f} GiB)'
+                        for f in sorted(matches, key=lambda f: f["filename"]))
+                    raise RuntimeError(
+                        f"quant {quant!r} matches {len(matches)} files in {repo} , "
+                        f"refusing to guess which one you meant:\n  {listing}\n"
+                        f"Pass a longer quant string that appears in only one of them.")
     else:
         # Choose for ZERO SPILL, not for "largest that fits VRAM total".
         #
@@ -1284,7 +1327,7 @@ def wait_ready(url: str, *, path: str = "/health", timeout_s: float = 120.0,
 
 
 def serve_gguf(model_path: str, port: int, mmproj: "str | None" = None,
-               ctx: int = 0) -> dict:
+               ctx: int = 0, *, explicit: bool = False, trigger: str = "") -> dict:
     """Serve an arbitrary GGUF file directly via llama-server on `port` ,
     no gb-synapse Ollama-compatible proxy, no manifest resolution, no
     cluster split. The gap behind ai-forge's forge/ocr_vl.py: it
@@ -1297,7 +1340,8 @@ def serve_gguf(model_path: str, port: int, mmproj: "str | None" = None,
     Returns {"pid", "port"} , the raw process handle, not a full
     ServerState (no proxy, no run-state persistence): this is a
     standalone serve and the caller owns its own lifecycle (stop it by
-    killing "pid")."""
+    killing "pid"). Gated like serve(): needs explicit=True and a trigger."""
+    _require_explicit(model_path, explicit, trigger)
     if not engine_installed():
         raise RuntimeError("engine not built — run: greenboost synapse build-engine")
     cmd = [str(ENGINE_DIR / "llama-server"), "-m", model_path,
@@ -1501,7 +1545,14 @@ def _field_str(reader, key: str) -> str:
         return ""
 
 
-_GGUF_SUMMARY_CACHE: dict[str, tuple[float, int, dict]] = {}
+_GGUF_SUMMARY_CACHE: dict[str, tuple[tuple, dict]] = {}
+
+# shard_paths() lives in gb_gguf_tensor_map.py (imported above) — that module
+# has no dependency on this one, while this module already imports FROM it,
+# so it is the correct place for the single shared implementation. See its
+# docstring there for why one implementation matters (gb_gguf_tensor_map's
+# own tensor_map() had the identical split-GGUF blind spot this function's
+# fix removes, and the two must never disagree about what "expert" means).
 
 
 def gguf_summary(path: str) -> dict:
@@ -1509,48 +1560,121 @@ def gguf_summary(path: str) -> dict:
     total weight bytes from a GGUF file. Reuses the vendored llama.cpp
     GGUFReader via gb_gguf_tensor_map.
 
-    Cached by (path, mtime, size) — real incident, 2026-07-15: list_models()
-    calls this for EVERY Ollama-sourced GGUF on EVERY call (it's a full
-    tensor-list scan, summing every tensor's n_bytes, not a cheap header
-    peek), and with several 20+ GB models indexed this made gb_synapse_api.py's
-    /api/tags handler block the single-threaded aiohttp event loop for 30+
-    seconds — every OTHER concurrent request (health, chat) queued behind it,
-    looking exactly like a hang. The file only needs re-summarizing when it
-    actually changes."""
+    Split-aware (2026-08-28 fix): llama.cpp shards a large model across
+    several `-%05d-of-%05d.gguf` files, and the byte total is NOT the sum
+    of tensors in whichever one file the caller happens to hand in — a
+    split's metadata-only shard can hold zero tensors of its own. Verified
+    on Qwen3.8-Flash-Next-UD-Q2_K_XL: shard 1 of 3 (`split.no=0`,
+    `split.tensors.count=1224`) has `len(reader.tensors) == 0`, so summing
+    only that file silently reported `n_bytes: 0` for a 78.9 GB model and
+    every downstream placement decision (`recommend()`, `_solve_ctx_and_
+    layers`, the KV reserve, gb_expert_tier's budgets) read that zero as
+    real. shard_paths() walks every sibling via the shard-naming regex
+    (never a directory glob), and the summed tensor count is checked
+    against the split's own `split.tensors.count` field -- a mismatch
+    (missing shard, partial download) raises rather than returning a
+    smaller, still-plausible number.
+
+    Cached by (path, mtime, size) of every shard — real incident,
+    2026-07-15: list_models() calls this for EVERY Ollama-sourced GGUF on
+    EVERY call (it's a full tensor-list scan, summing every tensor's
+    n_bytes, not a cheap header peek), and with several 20+ GB models
+    indexed this made gb_synapse_api.py's /api/tags handler block the
+    single-threaded aiohttp event loop for 30+ seconds — every OTHER
+    concurrent request (health, chat) queued behind it, looking exactly
+    like a hang. The whole shard set only needs re-summarizing when any
+    shard actually changes (e.g. a resumed download replacing one file)."""
+    paths = shard_paths(path)
+    if len(paths) > 1:
+        # A missing sibling shard is exactly the "partial download that
+        # looks plausible" failure this whole fix exists to remove — raise
+        # a clear, named error here rather than letting GGUFReader's memmap
+        # fail deep inside with a bare FileNotFoundError.
+        missing = [p for p in paths if not os.path.exists(p)]
+        if missing:
+            raise RuntimeError(
+                f"gguf_summary: split GGUF {path!r} is missing "
+                f"{len(missing)}/{len(paths)} sibling shard(s): "
+                f"{', '.join(missing)} — a partial download would look "
+                f"exactly like this; refusing to summarize a partial set.")
     try:
-        st = os.stat(path)
-        cache_key = (st.st_mtime, st.st_size)
+        cache_key = tuple((st.st_mtime, st.st_size)
+                           for st in (os.stat(p) for p in paths))
     except OSError:
         cache_key = None
     if cache_key is not None:
         cached = _GGUF_SUMMARY_CACHE.get(path)
-        if cached is not None and cached[:2] == cache_key:
-            return dict(cached[2])
+        if cached is not None and cached[0] == cache_key:
+            return dict(cached[1])
 
     GGUFReader = _load_gguf_reader()
-    reader = GGUFReader(path, mode="r")
-    n_bytes = sum(int(t.n_bytes) for t in reader.tensors)
+    readers = [GGUFReader(p, mode="r") for p in paths]
+
+    # Metadata scalars (arch, layer count, ctx length, ssm geometry, ...)
+    # live on whichever shard's own `split.no` field reads 0 -- for this
+    # model that's shard 1 (the metadata-only, zero-tensor shard), not
+    # necessarily the file the caller handed in. Falls back to the handed-in
+    # file when there's no split (the common, non-sharded case) or no shard
+    # resolves split.no==0 (an old/foreign split without the field) — never
+    # guesses past that.
+    meta_reader = readers[0]
+    if len(readers) > 1:
+        for r in readers:
+            if r.get_field("split.no") is not None and _field_scalar(r, "split.no") == 0:
+                meta_reader = r
+                break
+
+        expected = None
+        for r in readers:
+            if r.get_field("split.tensors.count") is not None:
+                expected = int(_field_scalar(r, "split.tensors.count") or 0)
+                break
+        if expected:
+            actual = sum(len(r.tensors) for r in readers)
+            if actual != expected:
+                raise RuntimeError(
+                    f"gguf_summary: split GGUF tensor-count mismatch for {path!r} "
+                    f"({len(paths)} shard(s) on disk) — split.tensors.count says "
+                    f"{expected}, found {actual} across all shards. A missing "
+                    f"sibling shard or a partial download looks exactly like "
+                    f"this; refusing to report a partial byte total as if it "
+                    f"were the real weight size.")
+
+    all_tensors = [t for r in readers for t in r.tensors]
+    n_bytes = sum(int(t.n_bytes) for t in all_tensors)
     # dense (attention/shared/embedding) vs routed-expert byte split — same
     # "_exps" tensor-name convention llama.cpp/ggml uses for MoE expert
     # tensors, mirrors colibri's EXPERT_RE (c/resource_plan.py). Feeds
     # gb_placement.plan_experts()'s tier-plan (CB-3): only the routed-expert
     # bytes are eligible for T2/T3 overflow under Rule #1 — dense stays T1.
-    expert_bytes = sum(int(t.n_bytes) for t in reader.tensors if "_exps" in t.name)
+    expert_bytes = sum(int(t.n_bytes) for t in all_tensors if "_exps" in t.name)
     dense_bytes = n_bytes - expert_bytes
-    arch = _field_str(reader, "general.architecture") or "llama"
-    n_layers = int(_field_scalar(reader, f"{arch}.block_count") or 0)
-    ctx_length = int(_field_scalar(reader, f"{arch}.context_length") or 0)
-    n_experts = int(_field_scalar(reader, f"{arch}.expert_count") or 0)
-    n_experts_used = int(_field_scalar(reader, f"{arch}.expert_used_count") or 0)
+    # Same qwen4_exp tensor classes as safetensors_summary() (see its
+    # comment) -- GGUF uses llama.cpp's own naming instead of the HF
+    # checkpoint's: the giant n-gram table is a single "per_layer_token_embd"
+    # tensor (repurposed from gemma3n's per-layer-embedding slot, no
+    # blk.{bid}. prefix -- it's one global tensor, not per-layer) plus the
+    # small per-layer "ple_*" tensors (norm/conv/key/value); the QSA indexer
+    # is "blk.{bid}.indexer*"; hyper-connection is "blk.{bid}.hc_*"
+    # (conversion/qwen4exp.py, gguf-py/gguf/constants.py TENSOR_NAMES).
+    n_ngram_bytes = sum(int(t.n_bytes) for t in all_tensors
+                        if "ple_" in t.name or "per_layer_token_embd" in t.name)
+    n_qsa_indexer_bytes = sum(int(t.n_bytes) for t in all_tensors if "indexer" in t.name)
+    n_hyper_connection_bytes = sum(int(t.n_bytes) for t in all_tensors if ".hc_" in t.name)
+    arch = _field_str(meta_reader, "general.architecture") or "llama"
+    n_layers = int(_field_scalar(meta_reader, f"{arch}.block_count") or 0)
+    ctx_length = int(_field_scalar(meta_reader, f"{arch}.context_length") or 0)
+    n_experts = int(_field_scalar(meta_reader, f"{arch}.expert_count") or 0)
+    n_experts_used = int(_field_scalar(meta_reader, f"{arch}.expert_used_count") or 0)
     is_moe = n_experts > 0 or expert_bytes > 0
     # KV geometry: real GGUF attention metadata, so estimate_kv_gb doesn't rely
     # on the param-count bucket heuristic (wrong by ~100x on some GQA archs —
     # verified live OOM on Qwable-9B). head_count_kv falls back to head_count
     # (MHA); head_dim from key_length if present, else embedding/head_count.
-    head_count = int(_field_scalar(reader, f"{arch}.attention.head_count") or 0)
-    head_count_kv = int(_field_scalar(reader, f"{arch}.attention.head_count_kv") or head_count)
-    emb_len = int(_field_scalar(reader, f"{arch}.embedding_length") or 0)
-    key_len = int(_field_scalar(reader, f"{arch}.attention.key_length") or 0)
+    head_count = int(_field_scalar(meta_reader, f"{arch}.attention.head_count") or 0)
+    head_count_kv = int(_field_scalar(meta_reader, f"{arch}.attention.head_count_kv") or head_count)
+    emb_len = int(_field_scalar(meta_reader, f"{arch}.embedding_length") or 0)
+    key_len = int(_field_scalar(meta_reader, f"{arch}.attention.key_length") or 0)
     head_dim = key_len or (emb_len // head_count if head_count else 0)
     # Hybrid recurrent/attention architectures (qwen35's Gated DeltaNet +
     # Gated Attention mix) only give a real, context-length-scaling KV cache
@@ -1559,19 +1683,31 @@ def gguf_summary(path: str) -> dict:
     # real attention layer, matching llama.cpp's own default in
     # src/models/qwen35.cpp (`full_attn_interval = 4` there is qwen35-
     # specific; the GENERIC GGUF key read here is 1 for a plain transformer).
-    full_attn_interval = int(_field_scalar(reader, f"{arch}.full_attention_interval") or 1)
+    full_attn_interval = int(_field_scalar(meta_reader, f"{arch}.full_attention_interval") or 1)
     # Some hybrids (falcon-h1, granitehybrid, nemotron_h) list recurrent layer
     # indices explicitly instead of a uniform interval (llama-arch.cpp:260,
     # `%s.attention.recurrent_layers`) — prefer it over the interval math when
     # present, since an explicit list can be non-uniform in a way an interval
     # can't express.
-    recurrent_layers_field = reader.get_field(f"{arch}.attention.recurrent_layers")
+    recurrent_layers_field = meta_reader.get_field(f"{arch}.attention.recurrent_layers")
     n_recurrent_layers = 0
     if recurrent_layers_field is not None and recurrent_layers_field.data:
         # GGUFReader array fields: `.data` holds one index per element (see
         # gguf_reader.py's _get_field_parts — `.parts` additionally carries a
         # 2-entry [type, length] header, so `.data` is the correct count).
-        n_recurrent_layers = len(recurrent_layers_field.data)
+        # The element type decides the meaning: llama.cpp's own loader reads
+        # this key as a per-layer BOOL mask (true = recurrent) for qwen35moe,
+        # where len(data) is just n_layers (40) and counting it made
+        # n_kv_layers 0 and every KV estimate too low (found 2026-10-02 on
+        # the Qwen3.8-35B-A3B file: 30 true, 10 false). Other writers store
+        # the recurrent layer indices instead, where the length is the count.
+        from gguf.constants import GGUFValueType  # sys.path set by _load_gguf_reader()
+        if recurrent_layers_field.types and recurrent_layers_field.types[-1] == GGUFValueType.BOOL:
+            n_recurrent_layers = sum(
+                1 for i in recurrent_layers_field.data
+                if int(recurrent_layers_field.parts[i][0]))
+        else:
+            n_recurrent_layers = len(recurrent_layers_field.data)
     elif full_attn_interval > 1:
         n_recurrent_layers = n_layers - math.ceil(n_layers / full_attn_interval)
     is_recurrent_only = arch in _engine_recurrent_archs()
@@ -1587,16 +1723,44 @@ def gguf_summary(path: str) -> dict:
     # d_state*d_inner), the formula this engine's own recurrent-memory
     # allocator actually uses. Absent on a plain transformer GGUF — 0 is
     # correct there (no recurrent state to size), not a metadata gap.
-    ssm_d_conv = int(_field_scalar(reader, f"{arch}.ssm.conv_kernel") or 0)
-    _ssm_d_inner = int(_field_scalar(reader, f"{arch}.ssm.inner_size") or 0)
-    _ssm_d_state = int(_field_scalar(reader, f"{arch}.ssm.state_size") or 0)
-    _ssm_n_group = int(_field_scalar(reader, f"{arch}.ssm.group_count") or 1)
+    ssm_d_conv = int(_field_scalar(meta_reader, f"{arch}.ssm.conv_kernel") or 0)
+    _ssm_d_inner = int(_field_scalar(meta_reader, f"{arch}.ssm.inner_size") or 0)
+    _ssm_d_state = int(_field_scalar(meta_reader, f"{arch}.ssm.state_size") or 0)
+    _ssm_n_group = int(_field_scalar(meta_reader, f"{arch}.ssm.group_count") or 1)
     ssm_conv_width = _ssm_d_inner + 2 * _ssm_n_group * _ssm_d_state
     ssm_state_elems = _ssm_d_state * _ssm_d_inner
+    # Quant label (2026-08-28 fix): prefer the file's own declared overall
+    # quant (general.file_type, llama.cpp's LlamaFileType enum) over a
+    # per-tensor-name vote. The vote alone is wrong on any real quantized
+    # model, not just a split one: RMSNorm/LayerNorm weight tensors stay
+    # F32 (unquantized) by convention, and there are one or more per layer,
+    # so a plain COUNT vote is dominated by them regardless of how much of
+    # the model's actual bytes they hold. Verified on this checkpoint (3-
+    # shard Qwen3.8-Flash-Next-UD-Q2_K_XL): 485 F32 norm tensors outvoted
+    # 244 real Q8_0 tensors, while the two byte-heaviest real quant types
+    # (IQ4_NL at 51.4 GB, IQ2_XS at 22.8 GB) never appeared as the
+    # most-common name at all — the manifest recorded quant="F32" for an
+    # I-quant model, feeding the fp8-floor advisory and recipe selection a
+    # plausible-looking lie. general.file_type=10 (MOSTLY_Q2_K) is what the
+    # file actually declares itself to be, matching the "UD-Q2_K_XL"
+    # filename. Falls back to a byte-weighted (not count-weighted) vote
+    # when file_type is absent or unrecognized — still never a bare count.
     quant = ""
-    weight_types = Counter(t.tensor_type.name for t in reader.tensors if "weight" in t.name)
-    if weight_types:
-        quant = weight_types.most_common(1)[0][0]
+    file_type_val = _field_scalar(meta_reader, "general.file_type")
+    if file_type_val is not None:
+        try:
+            from gguf.constants import LlamaFileType
+            quant = (LlamaFileType(int(file_type_val)).name
+                     .removeprefix("MOSTLY_").removeprefix("ALL_"))
+        except (ValueError, ImportError):
+            quant = ""
+    if not quant:
+        weight_bytes = Counter()
+        for t in all_tensors:
+            if "weight" in t.name:
+                weight_bytes[t.tensor_type.name] += int(t.n_bytes)
+        if weight_bytes:
+            quant = weight_bytes.most_common(1)[0][0]
     result = {
         "n_bytes": n_bytes, "n_layers": n_layers, "is_moe": is_moe,
         "n_experts": n_experts, "n_experts_used": n_experts_used,
@@ -1608,9 +1772,12 @@ def gguf_summary(path: str) -> dict:
         "is_recurrent_only": is_recurrent_only,
         "ssm_d_conv": ssm_d_conv, "ssm_conv_width": ssm_conv_width,
         "ssm_state_elems": ssm_state_elems,
+        "n_ngram_bytes": n_ngram_bytes,
+        "n_qsa_indexer_bytes": n_qsa_indexer_bytes,
+        "n_hyper_connection_bytes": n_hyper_connection_bytes,
     }
     if cache_key is not None:
-        _GGUF_SUMMARY_CACHE[path] = (cache_key[0], cache_key[1], result)
+        _GGUF_SUMMARY_CACHE[path] = (cache_key, result)
     return result
 
 
@@ -1687,6 +1854,52 @@ def read_quant_config(path_or_repo: str) -> dict:
         return {}
 
 
+def _safetensors_header(path: Path) -> dict:
+    """Read just a .safetensors file's JSON header (tensor name -> {dtype,
+    shape, data_offsets}) without loading any tensor data. The header is a
+    length-prefixed JSON blob at the start of the file (8-byte LE length,
+    then that many bytes of JSON) -- reading it is a two-`read()` operation
+    regardless of file size, unlike parsing the file through torch/safetensors
+    itself. Best-effort: returns {} on any read/parse failure."""
+    try:
+        size = os.path.getsize(path)
+        if size < 8:
+            return {}
+        with open(path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            # Sanity-bound n against the actual file size before allocating
+            # a read of that length -- a non-safetensors or truncated/fake
+            # file (test fixtures, a still-downloading shard) has an
+            # arbitrary first 8 bytes, which as a length prefix can demand
+            # a multi-exabyte read and MemoryError before the length even
+            # gets compared against real content.
+            if n <= 0 or n > size - 8:
+                return {}
+            return json.loads(f.read(n))
+    except (OSError, ValueError, struct.error):
+        return {}
+
+
+def _sum_tensor_bytes_by_name(root: Path, predicate) -> int:
+    """Sum exact byte sizes (data_offsets[1] - data_offsets[0], the real
+    on-disk span -- no shape*dtype-size guess needed) of every tensor across
+    every local *.safetensors shard whose name matches `predicate`. Only
+    counts shards actually present in `root` -- on a partial pull (a
+    snapshot_download still in progress) this undercounts rather than
+    raising, same best-effort contract as the rest of this function; it
+    reaches its true value once every shard has landed."""
+    total = 0
+    for shard in root.glob("*.safetensors"):
+        hdr = _safetensors_header(shard)
+        for name, meta in hdr.items():
+            if name == "__metadata__":
+                continue
+            if predicate(name):
+                offsets = meta.get("data_offsets") or [0, 0]
+                total += offsets[1] - offsets[0]
+    return total
+
+
 # HF's `model_type` (a short lowercase config identifier, e.g. "mamba2")
 # and `architectures` (the real PyTorch class name, e.g. "Mamba2ForCausalLM")
 # are NOT the same string -- falling back to model_type verbatim when
@@ -1722,7 +1935,8 @@ def safetensors_summary(local_dir: str) -> dict:
               "ctx_length": 0, "arch": "", "n_kv_heads": 0, "head_dim": 0,
               "quant_method": "", "quant_bits": 0,
               "n_kv_layers": 0, "n_recurrent_layers": 0, "is_recurrent_only": False,
-              "ssm_d_conv": 0, "ssm_conv_width": 0, "ssm_state_elems": 0}
+              "ssm_d_conv": 0, "ssm_conv_width": 0, "ssm_state_elems": 0,
+              "n_ngram_bytes": 0, "n_qsa_indexer_bytes": 0, "n_hyper_connection_bytes": 0}
     try:
         n_bytes = sum(f.stat().st_size for f in root.glob("*.safetensors"))
         n_bytes += sum(f.stat().st_size for f in root.glob("*.bin")
@@ -1797,6 +2011,23 @@ def safetensors_summary(local_dir: str) -> dict:
         ssm_d_conv = d_conv
         ssm_conv_width = d_inner + 2 * n_group * d_state
         ssm_state_elems = d_state * d_inner
+    # Flash-Next-class hybrid checkpoints (Qwen3.8's qwen4_exp architecture)
+    # carry three more tensor classes a plain hybrid-attention model doesn't:
+    # a giant n-gram/PLE lookup table designed for host-memory residency
+    # (`model.language_model.*.ple.*`, ~50 GB on the reference checkpoint),
+    # a QSA sparse-attention indexer per full-attention layer
+    # (`*.self_attn.indexer.*`), and per-layer hyper-connection mixers
+    # (`*hyper_connection*`). Each is a real, separate placement input (T2
+    # vs T1, promote-worthy vs not) that estimate_kv_gb()-style KV-only
+    # accounting has no term for — byte-exact from the safetensors headers'
+    # own data_offsets, not guessed from config field arithmetic (the ngram
+    # vocab size formula involves several config fields whose exact
+    # combination isn't worth reverse-engineering when the checkpoint's own
+    # header already states the true byte span). 0 on a non-qwen4_exp
+    # checkpoint — these tensor-name substrings don't occur there.
+    n_ngram_bytes = _sum_tensor_bytes_by_name(root, lambda n: ".ple." in n)
+    n_qsa_indexer_bytes = _sum_tensor_bytes_by_name(root, lambda n: ".indexer." in n)
+    n_hyper_connection_bytes = _sum_tensor_bytes_by_name(root, lambda n: "hyper_connection" in n)
     result.update({
         "n_bytes": n_bytes,
         "n_layers": n_layers,
@@ -1813,6 +2044,9 @@ def safetensors_summary(local_dir: str) -> dict:
         "is_recurrent_only": is_recurrent_only,
         "ssm_d_conv": ssm_d_conv, "ssm_conv_width": ssm_conv_width,
         "ssm_state_elems": ssm_state_elems,
+        "n_ngram_bytes": n_ngram_bytes,
+        "n_qsa_indexer_bytes": n_qsa_indexer_bytes,
+        "n_hyper_connection_bytes": n_hyper_connection_bytes,
         # No per-tensor expert/dense split available without opening the
         # safetensors headers (unlike GGUF's per-tensor names) — a real,
         # accepted granularity gap, not guessed: dense_bytes/expert_bytes
@@ -2007,6 +2241,33 @@ _DEFAULT_BITS_PER_PARAM = 4.83  # Q4_K_M-ish fallback for unrecognized quant lab
 def _approx_param_count_b(n_bytes: int, quant: str) -> float:
     bits = _BITS_PER_PARAM.get(quant.upper(), _DEFAULT_BITS_PER_PARAM)
     return (n_bytes * 8) / bits / 1e9
+
+
+def effective_kv_layers(entry, n_layers: "int | None" = None) -> int:
+    """How many of a model's layers actually hold a KV cache.
+
+    ONE definition, because it had five copies. `n_kv_layers - n_recurrent_layers`
+    is computed twice during GGUF parsing (that part is the source), and this
+    fallback rule , the tricky half , was written out three times: twice here and
+    once in gb_semantics._res_kv_bits_by_layer, each carrying its own near-verbatim
+    copy of the warning comment below. Someone re-derived the reasoning every time
+    because there was nothing to call.
+
+    That duplication is exactly how casebook C-07 happened: every caller of
+    estimate_kv_gb was corrected to charge n_kv_layers except one, and gb_mcp.py
+    kept overestimating by 3.58x , 5.85 GiB of phantom reservation on an 11.3 GB
+    card , until 2026-08-22. A rule in five places is a rule that will be fixed in
+    four.
+
+    The trap this encodes: for a recurrent-only model `n_kv_layers == 0` is the
+    CORRECT count, not a missing value. `or n_layers` must not paper over it with
+    "unknown, assume every layer is real attention" , that is the ~4x overestimate
+    that clamped ctx far below what the hardware holds.
+    """
+    if getattr(entry, "is_recurrent_only", False):
+        return 0
+    fallback = n_layers if n_layers is not None else getattr(entry, "n_layers", 0)
+    return getattr(entry, "n_kv_layers", 0) or fallback or 0
 
 
 def estimate_kv_gb(ctx: int, n_bytes: int, quant: str,
@@ -2535,10 +2796,7 @@ def recommend(ctx: int = 65536, probe_feeders: bool = True) -> list[FitReport]:
     reports = []
     for entry in list_models():
         weights_gb = entry.n_bytes / (1024 ** 3)
-        # is_recurrent_only: n_kv_layers==0 is the CORRECT count (no real
-        # attention layer at all) — `or entry.n_layers` must not paper over
-        # that with "unknown, assume every layer is real attention".
-        kv_layers = 0 if entry.is_recurrent_only else (entry.n_kv_layers or entry.n_layers)
+        kv_layers = effective_kv_layers(entry)   # one definition, see its docstring
         kv_gb = estimate_kv_gb(ctx, entry.n_bytes, entry.quant,
                                n_layers=kv_layers,
                                n_kv_heads=entry.n_kv_heads,
@@ -2665,6 +2923,13 @@ class ServerState:
     # for backends with no draft head.
     mtp_draft_n: int = 0
     spec_draft_p_min: float = 0.0
+    # What pause()/resume() and the proxy need to put this exact server back (2026-10-28: resume re-served
+    # WITHOUT the projector because none of this was recorded, and every image answered HTTP 500 "image input
+    # is not supported"). -1/""/{}/0 for old persisted run-state JSON and for engines that report none of it.
+    n_cpu_moe: int = -1
+    mmproj: str = ""
+    vision: dict = field(default_factory=dict)      # {"profile": ..., "budget": ..., "extra_gb": ...} (gb_vision)
+    n_slots: int = 0
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -3210,7 +3475,7 @@ def _pick_kv_type(ctx: int, entry: ModelEntry, budget_gb: float) -> str:
     if pin:
         return pin
     weights_gb = entry.n_bytes / (1024 ** 3)
-    kv_layers = 0 if entry.is_recurrent_only else (entry.n_kv_layers or entry.n_layers)
+    kv_layers = effective_kv_layers(entry)   # one definition, see its docstring
     kv_f16_gb = estimate_kv_gb(ctx, entry.n_bytes, entry.quant,
                                n_layers=kv_layers,
                                n_kv_heads=entry.n_kv_heads,
@@ -3219,12 +3484,33 @@ def _pick_kv_type(ctx: int, entry: ModelEntry, budget_gb: float) -> str:
     return "f16" if weights_gb + kv_f16_gb <= budget_gb else "q8_0"
 
 
+class _VisionOff(threading.local):
+    """serve(vision=False): text-only for this serve, carried like the other per-serve context."""
+    value = False
+
+
+_VISION_OFF = _VisionOff()
+
+
 def _find_mmproj(entry: ModelEntry) -> "Path | None":
     """The multimodal projector of a vision GGUF is a SEPARATE file, and
     llama-server serves the model text-only without it — images are dropped in
     silence and the model answers about a picture it never received. Look for
     it beside the weights (how both HF repos and our own pulls lay it out).
-    GB_SYNAPSE_MMPROJ overrides for a projector kept somewhere else."""
+    GB_SYNAPSE_MMPROJ overrides for a projector kept somewhere else.
+
+    Lookup order: an explicit path handed to serve() (gb_vision.VISION_FIT), then
+    the env override, then Ollama's manifest layer, then beside the weights, then
+    the OTHER snapshots of the same Hugging Face repo (an HF repo often ships the
+    projector in a different revision than the GGUF it belongs to: Qwen3.8-35B-A3B
+    MiniPlus keeps mmproj-Q8_0.gguf in snapshot 5a42fc5 and the weights in 39690e1,
+    so a caller used to have to find it and pass GB_SYNAPSE_MMPROJ itself).
+    serve(vision=False) / GB_SYNAPSE_VISION=0 serves text-only and returns None."""
+    if os.environ.get("GB_SYNAPSE_VISION") == "0" or _VISION_OFF.value:
+        return None
+    explicit = gb_vision.VISION_FIT.mmproj
+    if explicit:
+        return Path(explicit) if Path(explicit).is_file() else None
     override = os.environ.get("GB_SYNAPSE_MMPROJ")
     if override:
         return Path(override) if Path(override).is_file() else None
@@ -3240,6 +3526,13 @@ def _find_mmproj(entry: ModelEntry) -> "Path | None":
     for pat in ("mmproj*.gguf", "*mmproj*.gguf"):
         for p in sorted(d.glob(pat)):
             return p
+    # Another snapshot of the same HF repo: <cache>/models--ORG--REPO/snapshots/<rev>/file.gguf
+    if d.parent.name == "snapshots":
+        for sib in sorted(d.parent.iterdir()):
+            if sib != d and sib.is_dir():
+                for pat in ("mmproj*.gguf", "*mmproj*.gguf"):
+                    for p in sorted(sib.glob(pat)):
+                        return p
     return None
 
 
@@ -3256,9 +3549,50 @@ def _has_mtp(entry: ModelEntry) -> bool:
     try:
         GGUFReader = _load_gguf_reader()
         names = (t.name.lower() for t in GGUFReader(entry.path, mode="r").tensors)
-        return any("mtp" in n or "nextn" in n for n in names)
+        if any("mtp" in n or "nextn" in n for n in names):
+            return True
     except Exception:
         return False
+    return _mtp_head_path(entry) is not None
+
+
+#: A separate MTP head is the main model's own grafted layer(s) split out into
+#: its own file (IsValorum's Qwen3.8-35B-A3B repo ships 1.1 GiB beside a 13.7
+#: GiB model). Anything bigger than this fraction of the main file is a second
+#: model, not a head, and must never be passed as --spec-draft-model.
+_MTP_HEAD_MAX_FRACTION = 0.25
+
+
+def _mtp_head_path(entry: ModelEntry) -> str | None:
+    """Path of a sibling GGUF holding ONLY the model's MTP head, else None.
+    The in-file check in _has_mtp() can't see it: the tensors live in a second
+    file, so GreenBoost served the model without speculation and nothing said
+    so. llama-server takes it as `--spec-draft-model <head> --spec-type
+    draft-mtp`. The head file names its layer by index, not by "nextn": the
+    Qwen3.8-35B-A3B head holds `blk.40.*` (the block just past the main
+    model's 40) plus a copy of token_embd/output. So a candidate counts only
+    when it has a block at index >= entry.n_layers and none below it, which
+    keeps an unrelated GGUF (mmproj, another quant) from being picked up."""
+    if os.environ.get("GB_SYNAPSE_MTP") == "0":
+        return None
+    n_main = int(getattr(entry, "n_layers", 0) or 0)
+    if n_main <= 0:
+        return None
+    try:
+        main = os.path.realpath(entry.path)
+        main_size = os.path.getsize(main)
+        GGUFReader = _load_gguf_reader()
+        for cand in sorted(Path(os.path.dirname(entry.path)).glob("*.gguf")):
+            real = os.path.realpath(cand)
+            if real == main or os.path.getsize(real) > main_size * _MTP_HEAD_MAX_FRACTION:
+                continue
+            blks = [int(m.group(1)) for t in GGUFReader(str(cand), mode="r").tensors
+                    if (m := re.match(r"blk\.(\d+)\.", t.name))]
+            if blks and min(blks) >= n_main:
+                return str(cand)
+    except Exception:
+        return None
+    return None
 
 
 def _clamp_ctx_to_budget(requested_ctx: int, entry: ModelEntry, budget_gb: float) -> int:
@@ -3268,7 +3602,7 @@ def _clamp_ctx_to_budget(requested_ctx: int, entry: ModelEntry, budget_gb: float
     in the hundreds of thousands, and requesting that much KV cache OOMs
     before generation ever starts."""
     weights_gb = entry.n_bytes / (1024 ** 3)
-    kv_layers = 0 if entry.is_recurrent_only else (entry.n_kv_layers or entry.n_layers)
+    kv_layers = effective_kv_layers(entry)   # one definition, see its docstring
     # Recurrent state is fixed-size (constant in ctx, unlike KV) — subtract it
     # alongside weights, once, never scaled by requested_ctx.
     kv_budget_gb = max(budget_gb - weights_gb - _entry_ssm_gb(entry), 0.25)
@@ -3335,7 +3669,7 @@ def _solve_ctx_and_layers(entry: ModelEntry, vram_gb: float, requested_ctx: int,
     # is_recurrent_only: n_kv_layers==0 is the CORRECT count (no real
     # attention layer at all, arXiv:2312.00752's whole thesis) — `or
     # n_layers` must not paper over that with "unknown, assume attention".
-    n_kv_layers = 0 if entry.is_recurrent_only else (entry.n_kv_layers or n_layers)
+    n_kv_layers = effective_kv_layers(entry, n_layers)
     per_layer_gb = (entry.n_bytes / (1024 ** 3)) / n_layers
     bytes_per_tok = 2 * n_kv_layers * (entry.n_kv_heads or 0) * (entry.head_dim or 0) * kv_bytes_per_elem
     # Recurrent state is FIXED-size, never scaled by ctx (the paper's O(1)
@@ -3786,9 +4120,13 @@ def failure_report(model: str) -> str:
         return ("the engine is alive but closed the connection mid-response — most often it is "
                 "still loading the model, or the request exceeded its context window.\n"
                 f"    log: {_run_log_path(model)}")
-    tail = _upstream_log_tail(model)
-    return (f"the engine (pid {st.llama_pid}) is gone — it died while serving this request.\n"
-            f"    log: {_run_log_path(model)}" + (f"\n{tail}" if tail else ""))
+    tail = _upstream_log_tail(model, n=60)
+    diag = diagnose_engine_log(tail)
+    head = f"the engine (pid {st.llama_pid}) is gone — it died while serving this request."
+    if diag["explain"]:
+        head += f"\n    Likely cause ({diag['cause']}): {diag['explain']}"
+    short = "\n".join(tail.splitlines()[-8:])
+    return head + f"\n    log: {_run_log_path(model)}" + (f"\n{short}" if short else "")
 
 
 def _emit_serve(entry: ModelEntry, status: str, **fields) -> None:
@@ -3817,6 +4155,59 @@ _PROXY_MEM_FRACTION = float(os.environ.get("GB_SYNAPSE_PROXY_MEM_FRACTION", "0.1
 _PROXY_MEM_FLOOR_GB = 2.0
 
 
+#: One request carrying images transiently holds: the raw body, its JSON parse (~2x), the base64 decode (~0.75x),
+#: the decoded pixels while Pillow resizes, and the re-encoded JPEG. ~6x the body cap is the working figure.
+_PROXY_INFLIGHT_FACTOR = 6.0
+#: glibc reserves ~2 x HEAP_MAX_SIZE (128 MiB on 64-bit) of VIRTUAL address space per malloc arena. RLIMIT_AS counts
+#: virtual space, so every extra arena eats the cap without using RAM. A libc property, not a hardware one.
+_GLIBC_ARENA_RESERVE = 128 * 1024 ** 2
+
+
+def _engine_total_slots(internal_port: int, timeout: float = 2.0) -> int:
+    """How many concurrent requests the engine really serves (llama-server /props total_slots); 1 when unknown."""
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"http://127.0.0.1:{internal_port}/props", timeout=timeout) as r:
+            return max(1, int(json.loads(r.read().decode("utf-8", "replace")).get("total_slots") or 1))
+    except Exception:
+        return 1
+
+
+def _proxy_limit_plan(n_slots: int = 1, recipe_proxy: "dict | None" = None) -> dict:
+    """Address-space cap and malloc-arena bound for the proxy, derived from THIS node and THIS serve.
+
+    cap = total RAM x fraction   (the standing runaway guard: GB_SYNAPSE_PROXY_MEM_FRACTION or recipe.proxy.addressSpacePct)
+        + n_slots x body cap x _PROXY_INFLIGHT_FACTOR   (every slot may be holding an image request at once)
+        + arena_max x 128 MiB                            (virtual reserve of the arenas we allow)
+    arena_max = recipe.proxy.mallocArenaMax, else GB_SYNAPSE_PROXY_ARENA_MAX, else n_slots + 1 (the event loop plus one
+    allocating thread per slot). Why: the 10%-of-RAM cap (6.15 GiB here) was already used up at idle (VmSize 6.09 GiB,
+    mostly arenas: glibc allows 8 x cores of them), so the SECOND concurrent image request raised MemoryError (2026-10-28).
+    The guard keeps its purpose (the 39 GB runaway of 2026-08-19 still ends in a failed request, not a dead box)."""
+    rp = recipe_proxy or {}
+    total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    fraction = float(rp.get("addressSpacePct") or 0) / 100.0 if rp.get("addressSpacePct") else _PROXY_MEM_FRACTION
+    slots = max(1, int(n_slots))
+    env_arena = os.environ.get("GB_SYNAPSE_PROXY_ARENA_MAX")
+    arena_max = int(rp.get("mallocArenaMax") or (env_arena if env_arena and env_arena.isdigit() else 0) or (slots + 1))
+    inflight = int(slots * gb_vision.max_body_bytes() * _PROXY_INFLIGHT_FACTOR)
+    cap = max(int(_PROXY_MEM_FLOOR_GB * 1024 ** 3),
+              int(total * fraction) + inflight + arena_max * _GLIBC_ARENA_RESERVE)
+    return {"cap_bytes": cap, "arena_max": arena_max, "n_slots": slots, "fraction": fraction,
+            "inflight_bytes": inflight, "ram_bytes": total}
+
+
+def _apply_proxy_limit(cap: "int | None" = None) -> None:
+    """Cap the proxy's address space, in the child, before exec (preexec_fn). cap=None: the default plan for one slot."""
+    try:
+        import resource
+
+        if cap is None:
+            cap = _proxy_limit_plan(1)["cap_bytes"]
+        resource.setrlimit(resource.RLIMIT_AS, (cap, cap))
+    except Exception:
+        pass        # a cap that cannot be applied must not stop the serve
+
+
 def _proxy_resource_limits() -> None:
     """Cap the proxy's address space, in the child, before exec.
 
@@ -3832,17 +4223,10 @@ def _proxy_resource_limits() -> None:
     is a far smaller loss than the whole box, and it leaves the engine (and its
     KV cache) untouched.
 
-    Percentage-derived, never a literal size: the hardcoded-hardware rule.
+    Percentage-derived, never a literal size: the hardcoded-hardware rule. The size now also covers the slots
+    that can hold an image request at once and bounds glibc's arenas: see _proxy_limit_plan().
     """
-    try:
-        import resource
-
-        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-        cap = max(int(_PROXY_MEM_FLOOR_GB * 1024 ** 3),
-                  int(total * _PROXY_MEM_FRACTION))
-        resource.setrlimit(resource.RLIMIT_AS, (cap, cap))
-    except Exception:
-        pass        # a cap that cannot be applied must not stop the serve
+    _apply_proxy_limit(None)
 
 
 def _start_proxy(entry: ModelEntry, port: int, internal_port: int,
@@ -3857,17 +4241,50 @@ def _start_proxy(entry: ModelEntry, port: int, internal_port: int,
     proxy_cmd = [sys.executable, str(_REPO_DIR / "gb_synapse_api.py"),
                  "--port", str(port), "--upstream-port", str(internal_port),
                  "--model-name", entry.name, "--engine", engine,
-                 "--bind", bind]
+                 "--bind", bind,
+                 "--idle-ttl-s", str(getattr(_LOAD_CTX, "idle_ttl_s", 0.0))]
     proxy_log = open(_run_log_path(proxy_label), "ab")
-    # Token, if any, reaches the child via inherited environment (Popen with
-    # no env= kwarg passes os.environ through) — never on argv, which
-    # /proc/<pid>/cmdline makes world-readable.
-    proxy_proc = subprocess.Popen(proxy_cmd, stdout=proxy_log, stderr=subprocess.STDOUT,
+    # Size the proxy's memory guard for THIS serve (slots that may hold an image at once, recipe override) and bound its
+    # malloc arenas. Token, if any, reaches the child via the inherited environment (never on argv, which
+    # /proc/<pid>/cmdline makes world-readable); only MALLOC_ARENA_MAX is added.
+    try:
+        recipe_proxy = (load_recipe(entry.name) or {}).get("proxy")
+    except Exception:
+        recipe_proxy = None
+    plan = _proxy_limit_plan(_engine_total_slots(internal_port), recipe_proxy)
+    child_env = dict(os.environ)
+    child_env.setdefault("MALLOC_ARENA_MAX", str(plan["arena_max"]))
+    import functools
+    proxy_proc = subprocess.Popen(proxy_cmd, stdout=proxy_log, stderr=subprocess.STDOUT, env=child_env,
                                    start_new_session=True,
-                                   preexec_fn=_proxy_resource_limits)
+                                   preexec_fn=functools.partial(_apply_proxy_limit, plan["cap_bytes"]))
     proxy_error = _wait_proxy_ready(proxy_proc, port, proxy_label,
                                      token=_synapse_proxy_token())
+    _report_proxy_memory(entry, getattr(proxy_proc, "pid", 0), plan)
     return proxy_proc, proxy_error
+
+
+def _report_proxy_memory(entry: ModelEntry, pid: int, plan: dict) -> None:
+    """Idle VmSize of the fresh proxy against its cap, to dataflux; a warning when the headroom is thin so a cap that is
+    too tight is seen BEFORE the second concurrent request fails with MemoryError."""
+    try:
+        if not pid:
+            return
+        vm = 0
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith("VmSize:"):
+                vm = int(line.split()[1]) * 1024
+        used = vm / plan["cap_bytes"] if plan["cap_bytes"] else 0.0
+        if used > 0.6:
+            print(f"  [gb-synapse] WARNING: the proxy's idle address space is {vm / 1024 ** 3:.2f} GiB of its "
+                  f"{plan['cap_bytes'] / 1024 ** 3:.2f} GiB cap ({used:.0%}); concurrent image requests may fail with "
+                  f"MemoryError. Raise it: GB_SYNAPSE_PROXY_MEM_FRACTION or recipe proxy.addressSpacePct.", flush=True)
+        import gb_dataflux
+        gb_dataflux.emit({"kind": "proxy_limits", "node": "host", "label": "gb_synapse", "model": entry.name,
+                          "cap_gb": round(plan["cap_bytes"] / 1024 ** 3, 2), "vm_idle_gb": round(vm / 1024 ** 3, 2),
+                          "arena_max": plan["arena_max"], "n_slots": plan["n_slots"], "cap_used_pct": round(100 * used, 1)})
+    except Exception:
+        pass
 
 
 _CACHE_REUSE_REJECT = "cache_reuse is not supported by this context, it will be disabled"
@@ -4290,7 +4707,8 @@ def _launch_proxy_and_record(entry: ModelEntry, upstream: subprocess.Popen, port
                          bind=os.environ.get("GB_SYNAPSE_BIND", "127.0.0.1"),
                          auth_enabled=bool(_synapse_proxy_token()),
                          mtp_draft_n=int(serve_facts.get("mtp_draft_n") or 0),
-                         spec_draft_p_min=float(serve_facts.get("spec_draft_p_min") or 0.0))
+                         spec_draft_p_min=float(serve_facts.get("spec_draft_p_min") or 0.0),
+                         **_vision_state(upstream))
     _write_run_state(state)
     if proxy_error:
         # The engine loaded a real model into memory (upstream.pid is alive);
@@ -4305,6 +4723,87 @@ def _launch_proxy_and_record(entry: ModelEntry, upstream: subprocess.Popen, port
         _emit_serve(entry, "ok" if ready else "loading",
                     load_s=round(time.time() - t0, 1), **common)
     return state
+
+
+def _vision_prepare(entry: ModelEntry, recipe: "dict | None", *, mmproj: "str | None", vision: "bool | None",
+                    image_min: "int | None", image_max: "int | None", n_cpu_moe_explicit: bool,
+                    n_cpu_moe_override: "int | None") -> "tuple[int | None, dict | None]":
+    """Decide what the vision projector costs and how the placement pays for it.
+
+    Returns (n_cpu_moe_override, plan). plan is None for a text-only serve (no projector, or vision=False).
+
+    * auto-fit (no pin anywhere): the plan's extra_gb goes on gb_vision.VISION_FIT and the backend subtracts it
+      from the host VRAM budget, so _fit_cpu_moe_layers/-ngl/ctx all see the VRAM that is really left.
+    * a recipe pin (nCpuMoe) was measured WITHOUT the projector: it is kept as the text baseline and the layers
+      the projector's cost converts into are added on top (Qwen3.8-35B-A3B: 28 -> 32 on this card).
+    * recipe.vision.nCpuMoe is an explicit vision pin and wins over the arithmetic; an explicit call value wins over all.
+    Evidence, 2026-10-28: pin 28 left ~0.8 GB free with the projector and the first image killed the engine.
+    """
+    gb_vision.clear_fit()
+    _VISION_OFF.value = vision is False
+    if vision is False:
+        return n_cpu_moe_override, None
+    if mmproj:
+        gb_vision.VISION_FIT.mmproj = str(mmproj)
+    mm = _find_mmproj(entry)
+    if mm is None:
+        gb_vision.clear_fit()
+        return n_cpu_moe_override, None
+    prof = gb_vision.vision_profile(mm)
+    rv = (recipe or {}).get("vision") or {}
+    floor = image_min or rv.get("imageMinTokens")
+    cap = image_max or rv.get("imageMaxTokens")
+    if prof.dynamic and (floor or cap):
+        prof.min_tokens = int(floor or prof.min_tokens)
+        prof.max_tokens = max(int(cap or prof.max_tokens), prof.min_tokens)
+        prof.target_tokens = min(max(prof.target_tokens, prof.min_tokens), prof.max_tokens)
+    extra = gb_vision.extra_vram_gb(prof)
+    per_layer = _moe_expert_gb_per_layer(entry) if getattr(entry, "is_moe", False) else 0.0
+    layers = gb_vision.extra_cpu_moe_layers(extra, per_layer)
+    source = "auto-fit"
+    if getattr(entry, "is_moe", False):
+        if n_cpu_moe_explicit:
+            source = "explicit call value"
+        elif rv.get("nCpuMoe") is not None:
+            n_cpu_moe_override, source = int(rv["nCpuMoe"]), "recipe.vision.nCpuMoe"
+        elif n_cpu_moe_override is not None:
+            n_cpu_moe_override, source = int(n_cpu_moe_override) + layers, f"recipe pin + {layers} for the projector"
+    gb_vision.set_fit(str(mm), prof, extra)
+    plan = {"mmproj": str(mm), "extra_gb": round(extra, 2), "weights_gb": round(prof.weights_gb, 2),
+            "encoder_gb": round(gb_vision.encoder_compute_gb(prof), 2), "extra_cpu_moe_layers": layers,
+            "n_cpu_moe": n_cpu_moe_override, "source": source, "profile_source": prof.source,
+            "image_tokens": [prof.min_tokens, prof.target_tokens, prof.max_tokens]}
+    print(f"  [gb-synapse] {entry.name}: vision projector {mm.name} costs ~{extra:.1f} GiB "
+          f"(weights {prof.weights_gb:.2f} + encoder buffers for {prof.max_tokens} image tokens); placement: {source}", flush=True)
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({"kind": "vision_fit", "node": "host", "label": "gb_synapse", "model": entry.name, **plan})
+    except Exception:
+        pass
+    return n_cpu_moe_override, plan
+
+
+def _argv_flag(argv: list, flag: str, default: str = "") -> str:
+    """Value following `flag` in an engine argv (list of str), else default."""
+    try:
+        i = list(argv).index(flag)
+        return str(argv[i + 1])
+    except (ValueError, IndexError):
+        return default
+
+
+def _vision_state(upstream) -> dict:
+    """Run-state facts about the projector this engine was started with, read from its OWN argv so pause()/resume()
+    and the proxy see what is really running (not what a caller meant to ask for)."""
+    argv = list(getattr(upstream, "args", None) or [])
+    fit = gb_vision.VISION_FIT
+    out: dict = {"mmproj": _argv_flag(argv, "--mmproj"), "n_cpu_moe": int(_argv_flag(argv, "--n-cpu-moe", "-1") or -1),
+                 "n_slots": int(_argv_flag(argv, "-np", "0") or 0)}
+    if out["mmproj"] and fit.profile is not None:
+        budget = gb_vision.budget_from_profile(fit.profile)
+        out["vision"] = {"profile": fit.profile.as_dict(), "budget": budget.as_dict() if budget else None,
+                         "extra_gb": round(fit.extra_gb, 2)}
+    return out
 
 
 # ---- serving recipes (NemoClaw audit, Phase 5e; placement wiring Phase
@@ -4621,14 +5120,199 @@ def resolve_serving_preset() -> dict:
         return {"selected": None, "error": str(e)}
 
 
-def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
+# ---------------------------------------------------------------------------
+# The load gate (owner rule 2026-10-10): GreenBoost never loads a model by
+# itself. serve() and serve_gguf() are the ONLY functions that start an engine,
+# and both refuse unless the caller says it is acting on a prompt or on an
+# explicit, named serve/run request (`explicit=True`). Status, ps, doctor,
+# recommend, validate, warm-style helpers, health endpoints and tool listings
+# never pass it, so they cannot load anything. There is no default model.
+# ---------------------------------------------------------------------------
+
+class LoadRefused(RuntimeError):
+    """A model load was requested without a prompt or an explicit serve/run."""
+
+
+#: Seconds a model that a client served on demand stays loaded with nobody
+#: asking for it. 0 = never unload. Env GB_SYNAPSE_IDLE_TTL_S, CLI --idle-ttl-s.
+DEFAULT_IDLE_TTL_S = 300.0
+
+_LOAD_CTX = threading.local()
+
+
+def default_ctx_cap() -> int:
+    """Upper bound for a serve that did not name a context (ctx 0). Env
+    GB_SYNAPSE_DEFAULT_CTX_CAP, default 16384; an explicit ctx is never capped."""
+    try:
+        return max(512, int(os.environ.get("GB_SYNAPSE_DEFAULT_CTX_CAP", "16384")))
+    except ValueError:
+        return 16384
+
+
+def load_in_progress() -> bool:
+    """True only while a gated serve()/serve_gguf() call is on this thread."""
+    return bool(getattr(_LOAD_CTX, "trigger", ""))
+
+
+def _require_explicit(what: str, explicit: bool, trigger: str) -> None:
+    if explicit and trigger:
+        return
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({"kind": "synapse_serve", "status": "load_refused",
+                          "model": what, "trigger": trigger or "none"})
+    except Exception:
+        pass
+    raise LoadRefused(
+        f"refusing to load {what!r}: no prompt and no explicit serve/run request "
+        f"(trigger={trigger or 'none'}). GreenBoost never loads a model by itself.")
+
+
+def resolve_idle_ttl_s(idle_ttl_s: "float | None" = None, keep: bool = False) -> float:
+    """--keep or a TTL of 0 pins the model (returns 0). None -> env -> default."""
+    if keep:
+        return 0.0
+    if idle_ttl_s is None:
+        try:
+            idle_ttl_s = float(os.environ.get("GB_SYNAPSE_IDLE_TTL_S", DEFAULT_IDLE_TTL_S))
+        except ValueError:
+            idle_ttl_s = DEFAULT_IDLE_TTL_S
+    return max(0.0, float(idle_ttl_s))
+
+
+def serve(model: str, *args, explicit: bool = False, trigger: str = "",
+          keep: bool = False, idle_ttl_s: "float | None" = None, **kw) -> "ServerState":
+    """Gated entry point; see _serve_impl for every other parameter. `explicit`
+    must be True and `trigger` named ("prompt", "serve_cmd", "mcp_serve", ...)
+    or LoadRefused is raised before anything is resolved or started. The proxy
+    unloads the model after the idle TTL unless keep=True / TTL 0."""
+    _require_explicit(model, explicit, trigger)
+    prev = (getattr(_LOAD_CTX, "trigger", ""), getattr(_LOAD_CTX, "idle_ttl_s", 0.0))
+    _LOAD_CTX.trigger = trigger
+    _LOAD_CTX.idle_ttl_s = resolve_idle_ttl_s(idle_ttl_s, keep)
+    try:
+        with _serve_lease(model, trigger):
+            _preflight_stale_tracker(model)
+            try:
+                return _serve_impl(model, *args, **kw)
+            except RuntimeError as first:
+                if not _transient_serve_failure(first):
+                    raise
+                # The previous engine died (typically a CUDA OOM) and left a stale shim tracker behind: the next
+                # serve then fails on the dead engine's bookkeeping, not on its own merits (2026-10-28: "Ensure the
+                # shim is working" right after the vision-encoder OOM; the very next attempt worked). Clean up, say
+                # why, retry exactly once.
+                note = _recovery_note(model, first)
+                try:
+                    return _serve_impl(model, *args, **kw)
+                except RuntimeError as second:
+                    raise RuntimeError(f"{second}\n  (gb-synapse retried once after: {note})") from second
+    finally:
+        _LOAD_CTX.trigger, _LOAD_CTX.idle_ttl_s = prev
+        gb_vision.clear_fit()
+        _VISION_OFF.value = False
+
+
+#: Words in a serve failure that mean "the previous engine's leftovers, or a transient allocation failure", not
+#: "this model cannot run here". A retry after cleaning the tracker is cheap and bounded to one.
+_TRANSIENT_SERVE_MARKERS = ("out of memory", "failed to allocate", "shim is working", "tracker", "cudamalloc",
+                            "engine exited", "exited before", "died while loading")
+
+
+def _transient_serve_failure(e: BaseException) -> bool:
+    msg = str(e).lower()
+    return any(m in msg for m in _TRANSIENT_SERVE_MARKERS)
+
+
+def _preflight_stale_tracker(model: str) -> bool:
+    """Drop the shim's stats/metrics files when the process that wrote them is dead. Never raises; True if removed."""
+    try:
+        import gb_monitor
+        return bool(gb_monitor.reset_stale_tracker())
+    except Exception:
+        return False
+
+
+def _recovery_note(model: str, err: BaseException) -> str:
+    removed = _preflight_stale_tracker(model)
+    diag = diagnose_engine_log(_upstream_log_tail(model, n=60))
+    note = f"{str(err).splitlines()[0][:160]}; stale tracker {'cleared' if removed else 'not found'}"
+    if diag["cause"]:
+        note += f"; engine log says: {diag['cause']}"
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({"kind": "serve_recovery", "node": "host", "label": "gb_synapse", "model": model,
+                          "tracker_cleared": removed, "cause": diag["cause"], "error": str(err).splitlines()[0][:200]})
+    except Exception:
+        pass
+    return note
+
+
+#: (regex, cause id, plain-words explanation in the cost-first shape: what happened, what it costs, what is fine, the fix)
+_ENGINE_DEATH_PATTERNS = (
+    (r"out of memory[^\n]*\n(?:.*\n){0,40}?.*clip_image_batch_encode|clip_image_batch_encode[^\n]*\n(?:.*\n){0,3}?.*out of memory"
+     r"|CUDA error: out of memory(?:.*\n){0,40}?.*(?:mtmd|clip_image)",
+     "vision_encoder_oom",
+     "the vision encoder ran out of GPU memory while reading an image. That request failed and the engine had to restart, "
+     "so the next one waits for a model reload (about a minute). Nothing is broken: the model and your settings are fine. "
+     "Send smaller images (about 1 megapixel) or serve with more experts on the CPU: gb synapse serve <model> --n-cpu-moe <current+4>."),
+    (r"CUDA error: out of memory|cudaMalloc failed: out of memory|OOM in smart_alloc",
+     "cuda_oom",
+     "the engine ran out of GPU memory. That request failed and the engine restarted. The model files are fine. Free VRAM "
+     "(close GPU apps or lower the context) and serve again: gb synapse serve <model> --ctx <smaller>."),
+    (r"Segmentation fault|SIGSEGV|segfault at",
+     "segfault",
+     "the engine crashed hard (a segmentation fault). Its log has the backtrace. Serving the same model again usually works; "
+     "if it repeats, run: gb synapse doctor."),
+    (r"failed to load model|error loading model|unable to allocate",
+     "load_failed",
+     "the model did not load into the memory it was given. Nothing was changed on disk. Try a smaller context or quant: gb synapse recommend."),
+)
+
+
+def diagnose_engine_log(tail: str) -> dict:
+    """Likely cause of an engine death from its log tail: {"cause": id or "", "explain": plain words or "", "tail": last lines}."""
+    tail = tail or ""
+    for pat, cid, why in _ENGINE_DEATH_PATTERNS:
+        if re.search(pat, tail, re.I):
+            return {"cause": cid, "explain": why, "tail": tail}
+    return {"cause": "", "explain": "", "tail": tail}
+
+
+# trigger -> (arbiter client, seconds to wait for the card). 0 = background: skip with BUSY_HOLDER instead of queueing. docs/arbiter-clients.md
+_SERVE_CLIENTS = {
+    "bench": ("greenboost.bench", 0.0),
+    "rotator_job": ("greenboost.rotator", 600.0),
+}
+_SERVE_CLIENT_DEFAULT = ("greenboost.synapse.serve", 60.0)      # a user-typed or tool-requested serve
+_SERVE_NO_LEASE = {"resume"}                                    # the arbiter's own give-back after a lease: leasing it would wait on the lease being released
+
+
+def _serve_lease(model: str, trigger: str):
+    """The arbiter lease around one load: refused with a plain LeaseRefused message when the card is busy. Held only for the load, released on exit."""
+    import contextlib
+    if trigger in _SERVE_NO_LEASE:
+        return contextlib.nullcontext()
+    import gb_lease_client
+    client, wait_s = _SERVE_CLIENTS.get(trigger, _SERVE_CLIENT_DEFAULT)
+    return gb_lease_client.lease(client, f"serve {model} ({trigger})", wait_s=wait_s, model=model)
+
+
+def _serve_impl(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
           use_cluster: bool = True, n_slots: int = -1, extra_args: str = "",
           cuda_graph: "bool | None" = None, cache_ram: "int | None" = None,
           mtp_draft_n: "int | None" = None,
           spec_draft_p_min: "float | None" = None,
           slot_prompt_similarity: "float | None" = None,
           kv_type: "str | None" = None,
-          use_preset: bool = False) -> ServerState:
+          n_cpu_moe: "int | None" = None,
+          batch_size: "int | None" = None,
+          ubatch_size: "int | None" = None,
+          use_preset: bool = False,
+          mmproj: "str | None" = None,
+          vision: "bool | None" = None,
+          image_min_tokens: "int | None" = None,
+          image_max_tokens: "int | None" = None) -> ServerState:
     """Resolve `model` (manifest name, "org/repo[:quant]", or a bare Ollama
     model name) and hand it to whichever engine backend its manifest entry
     calls for (gb_synapse_backends.select_backend) — llama.cpp (default,
@@ -4756,6 +5440,8 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
     _kv_type_override = None
     _n_cpu_moe_override = None
     _sampling_override = None
+    _batch_override = None
+    _ubatch_override = None
     if _recipe is not None:
         if ctx == 0:
             ctx = int(_recipe["ctx"])
@@ -4797,6 +5483,10 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
         # the heuristic picks a single symmetric type instead.
         if "nCpuMoe" in _recipe:
             _n_cpu_moe_override = int(_recipe["nCpuMoe"])
+        if "batch" in _recipe:
+            _batch_override = int(_recipe["batch"])
+        if "ubatch" in _recipe:
+            _ubatch_override = int(_recipe["ubatch"])
         # Model-card sampling defaults. Before this, a recipe could pin ctx and
         # KV type but had no way to carry the values the model's own card
         # publishes, so a card specifying top_k 20 / min_p 0.0 silently ran on
@@ -4806,6 +5496,31 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
         # Explicit caller value always wins over a recipe , same precedence
         # every other override param in this function already follows.
         _kv_type_override = kv_type
+    if n_cpu_moe is not None:
+        # Same precedence: an explicit call value beats a recipe's nCpuMoe.
+        # Lets the -ncmoe sweep (spark-parity roadmap measurement 5) run
+        # through the tool instead of an env var or a hand-built command.
+        _n_cpu_moe_override = int(n_cpu_moe)
+        if getattr(entry, "is_moe", False) and _n_gpu_layers_override is None:
+            # LlamaCppBackend only reads n_cpu_moe_override inside its
+            # -ngl override branch; for a MoE model the placement it means
+            # is "every layer on GPU, N layers' experts on CPU".
+            _n_gpu_layers_override = "all"
+    if batch_size is not None:
+        # Same precedence as every override above: an explicit call value beats
+        # the recipe's batch. Lets the prefill batch/ubatch sweep run through
+        # the tool instead of --extra-args or a hand-built command.
+        _batch_override = int(batch_size)
+    if ubatch_size is not None:
+        _ubatch_override = int(ubatch_size)
+
+    # Vision: size the projector's cost into the placement BEFORE the engine command is built, so callers never
+    # pass n_cpu_moe (workflow/vision-serving.md).
+    _n_cpu_moe_override, _vision_plan = _vision_prepare(
+        entry, _recipe, mmproj=mmproj, vision=vision, image_min=image_min_tokens, image_max=image_max_tokens,
+        n_cpu_moe_explicit=n_cpu_moe is not None, n_cpu_moe_override=_n_cpu_moe_override)
+    if _vision_plan and _n_cpu_moe_override is not None and getattr(entry, "is_moe", False) and _n_gpu_layers_override is None:
+        _n_gpu_layers_override = "all"          # same meaning as the explicit-n_cpu_moe branch above
 
     for st in _read_run_states():
         if st.model != entry.name:
@@ -4841,7 +5556,9 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
                               n_gpu_layers_override=_n_gpu_layers_override,
                               kv_type_override=_kv_type_override,
                               n_cpu_moe_override=_n_cpu_moe_override,
-                              sampling_override=_sampling_override)
+                              sampling_override=_sampling_override,
+                              batch_override=_batch_override,
+                              ubatch_override=_ubatch_override)
     except RuntimeError:
         # A cluster/RPC load can fail for reasons that have nothing to do with
         # whether the model can run at all — a feeder's engine build gap, a
@@ -4874,7 +5591,9 @@ def serve(model: str, port: int = DEFAULT_PORT, ctx: int = 0,
                               mtp_draft_n=mtp_draft_n,
                               spec_draft_p_min=spec_draft_p_min,
                               slot_prompt_similarity=slot_prompt_similarity,
-                              kv_type_override=_kv_type_override)
+                              kv_type_override=_kv_type_override,
+                              batch_override=_batch_override,
+                              ubatch_override=_ubatch_override)
     return _maybe_serve_embedding(state)
 
 
@@ -5134,6 +5853,19 @@ def _cli_main(argv: list[str]) -> int:
         found = index_ollama_models()
         print(json.dumps([asdict(e) for e in found]) if llm
               else f"indexed {len(found)} Ollama model(s)")
+    elif verb == "recover-cache":
+        result = recover_from_hf_cache()
+        if llm:
+            print(json.dumps({"recovered": [asdict(e) for e in result],
+                              "skipped": result.skipped}))
+        else:
+            print(f"recovered {len(result)} model(s) found on disk but "
+                  f"missing from the manifest" if result
+                  else "nothing to recover — manifest already matches the HF cache")
+            for e in result:
+                print(f"  {e.name}")
+            for s in result.skipped:
+                print(f"  (skipped {s['path']} — {s['reason']})")
     elif verb == "list":
         models = list_models()
         if llm:
@@ -5177,7 +5909,8 @@ def _cli_main(argv: list[str]) -> int:
     elif verb == "serve":
         if not rest:
             print("usage: gb_synapse.py serve <model> [port] [--ctx N] [--n-slots N] "
-                  "[--extra-args '...'] [--no-cluster]", file=sys.stderr)
+                  "[--batch N] [--ubatch N] "
+                  "[--extra-args '...'] [--no-cluster] [--keep] [--idle-ttl-s N]", file=sys.stderr)
             return 2
         # serve()'s own signature already takes ctx/n_slots/extra_args/
         # use_cluster — this CLI verb only ever exposed model+port. Parse
@@ -5186,7 +5919,10 @@ def _cli_main(argv: list[str]) -> int:
         n_slots = -1
         extra_args = ""
         use_cluster = True
+        batch_size = None
+        ubatch_size = None
         for flag, attr in (("--ctx", "ctx"), ("--n-slots", "n_slots"),
+                           ("--batch", "batch_size"), ("--ubatch", "ubatch_size"),
                            ("--extra-args", "extra_args")):
             if flag in rest:
                 i = rest.index(flag)
@@ -5196,14 +5932,27 @@ def _cli_main(argv: list[str]) -> int:
                     ctx = int(val)
                 elif attr == "n_slots":
                     n_slots = int(val)
+                elif attr == "batch_size":
+                    batch_size = int(val)
+                elif attr == "ubatch_size":
+                    ubatch_size = int(val)
                 else:
                     extra_args = val
         if "--no-cluster" in rest:
             rest = [a for a in rest if a != "--no-cluster"]
             use_cluster = False
+        keep = "--keep" in rest
+        rest = [a for a in rest if a != "--keep"]
+        idle_ttl = None
+        if "--idle-ttl-s" in rest:
+            i = rest.index("--idle-ttl-s")
+            idle_ttl = float(rest[i + 1]) if i + 1 < len(rest) else None
+            rest = rest[:i] + rest[i + 2:]
         port = int(rest[1]) if len(rest) > 1 else DEFAULT_PORT
         st = serve(rest[0], port=port, ctx=ctx, use_cluster=use_cluster,
-                  n_slots=n_slots, extra_args=extra_args)
+                  n_slots=n_slots, extra_args=extra_args,
+                  batch_size=batch_size, ubatch_size=ubatch_size,
+                  explicit=True, trigger="serve_cmd", keep=keep, idle_ttl_s=idle_ttl)
         print(json.dumps(asdict(st)) if llm
               else f"serving {st.model} on :{st.port}  (tensor-split {st.tensor_split})")
     elif verb == "stop":
@@ -5374,6 +6123,9 @@ def pause(model: str, force: bool = False) -> dict:
             "model": st.model, "quant": st.quant, "port": st.port,
             "ctx": st.ctx, "kv_type": st.kv_type, "n_gpu_layers": st.n_gpu_layers,
             "engine": st.engine, "tensor_split": st.tensor_split,
+            # Everything resume() needs to re-serve THIS server and not a default one (a resumed server used to come
+            # back without its projector: every image request then answered HTTP 500).
+            "n_cpu_moe": st.n_cpu_moe, "mmproj": st.mmproj, "vision": st.vision, "n_slots": st.n_slots,
             "slots": saved, "paused_ts": time.time(),
             "forced_over_inflight": bool(busy),
         }
@@ -5402,6 +6154,26 @@ def pause(model: str, force: bool = False) -> dict:
     return {"ok": False, "model": model, "error": "no running session for that model"}
 
 
+def _resume_serve_kwargs(state: dict) -> dict:
+    """serve() keyword arguments that put a paused server back exactly as it was: its projector (or text-only), its
+    expert placement and its image token range. A state file from before these were recorded has none of the keys
+    and resumes the way it always did (vision auto, placement auto)."""
+    kw: dict = {}
+    if "mmproj" in state:
+        if state.get("mmproj"):
+            kw["mmproj"] = state["mmproj"]
+        else:
+            kw["vision"] = False                     # it was text-only; do not attach a projector the owner never had
+    if isinstance(state.get("n_cpu_moe"), int) and state["n_cpu_moe"] >= 0:
+        kw["n_cpu_moe"] = state["n_cpu_moe"]
+    prof = ((state.get("vision") or {}).get("profile") or {})
+    if prof.get("min_tokens"):
+        kw["image_min_tokens"] = int(prof["min_tokens"])
+    if prof.get("max_tokens"):
+        kw["image_max_tokens"] = int(prof["max_tokens"])
+    return kw
+
+
 def resume(model: str) -> dict:
     """Re-serve a paused session and restore its KV state.
 
@@ -5421,9 +6193,11 @@ def resume(model: str) -> dict:
     state = json.loads(p.read_text())
 
     t0 = time.monotonic()
+    restore_kw = _resume_serve_kwargs(state)
     st = serve(model, port=state.get("port") or DEFAULT_PORT,
                ctx=state.get("ctx") or 0,
-               kv_type=state.get("kv_type") or None)
+               kv_type=state.get("kv_type") or None,
+               explicit=True, trigger="resume", **restore_kw)
     serve_s = time.monotonic() - t0
 
     restored, tokens, errors = [], 0, []
@@ -5700,7 +6474,57 @@ _DRAFT_ACCEPT_RE = re.compile(
 MTP_ACCEPTANCE_FLOOR = 0.50
 
 
-def recover_from_hf_cache() -> list:
+_SHARD_RE = re.compile(r'(.+)-(\d{5})-of-(\d{5})\.gguf$')
+
+
+class RecoveryResult(list):
+    """`list[ModelEntry]` of what was actually (re)registered, plus `.skipped`
+    naming any duplicate-revision GGUF that was found on disk but NOT
+    registered (see `recover_from_hf_cache`'s docstring, point 3). Subclassing
+    `list` keeps every existing caller — `greenboost_setup.sh`'s Full Install
+    step does `len(r)` / `r[:12]` / `for e in r` — working unchanged; a caller
+    that wants to know about a dropped duplicate reads `.skipped`."""
+    def __init__(self, recovered, skipped):
+        super().__init__(recovered)
+        self.skipped = skipped
+
+
+def _recipe_name_for(rev: str, fname: str) -> "str | None":
+    """A recipe (`serving/recipes/*.yaml`) pins an exact `model.revision`
+    (the HF snapshot hash) and `model.files[].path` (the filename) to an
+    operator-chosen `model.name` — see `recipe.schema.json`. When a recovered
+    file matches both, adopt that name instead of the filename stem: the
+    stem is what's LEFT when nobody deliberately named the model, and it is
+    routinely uglier and longer than the name every recipe/serve() call
+    actually expects (e.g. this box's Cold-Fusion GGUF recovers as
+    `Qwen3.8-27B-Cold-Fusion-GAIN-V1.1-NM-DAU-NEO-MAX-NEO-MTP-IQ4_XS` by
+    filename alone, while the pinned recipe — and every doc that references
+    this reference workload — calls it `Qwen3.8-27B-Cold-Fusion-MTP-IQ4_XS`).
+    Does not hash the file (recovery is meant to stay a cheap header read);
+    revision + filename is already a specific match, since a revision hash
+    can't silently move under a recipe (schema-enforced).
+    Returns None when no recipe claims this exact (revision, file)."""
+    try:
+        sys.path.insert(0, str(_REPO_DIR / "serving"))
+        import yaml
+        import check_recipes as _cr
+    except ImportError:
+        return None
+    for path in _cr.find_recipe_files():
+        try:
+            with open(path, encoding="utf-8") as f:
+                recipe = yaml.safe_load(f)
+        except Exception:
+            continue
+        model = (recipe or {}).get("model") or {}
+        if model.get("revision") != rev:
+            continue
+        if fname in {f.get("path") for f in model.get("files", [])}:
+            return model.get("name")
+    return None
+
+
+def recover_from_hf_cache() -> "RecoveryResult":
     """Re-register models whose weights are on disk but missing from the manifest.
 
     A Full Install's purge resets the manifest while leaving the HuggingFace
@@ -5714,16 +6538,44 @@ def recover_from_hf_cache() -> list:
     only ADDS entries for files that genuinely exist, never removes or rewrites
     one. Nothing here downloads.
 
-    Returns the entries recovered, so a caller can report what it healed rather
-    than silently changing state.
+    Three fixes to the original (2026-09-01, this box's own manifest — 4
+    registered vs. 8 GGUFs actually on disk, 2 of them invisible to any of the
+    three bugs below at once):
+
+    1. **Recurse under the snapshot dir**, not one fixed level. Unsloth's
+       UD-* repos (e.g. `unsloth/Qwen3.8-Flash-Next-GGUF`) store shards one
+       level deeper, in a per-quant subfolder
+       (`snapshots/<rev>/UD-Q2_K_XL/<file>.gguf`) — a single-level glob never
+       sees them at all.
+    2. **Collapse a shard set to ONE entry** (only the first
+       `-00001-of-NNNNN.gguf`, matching `pull()`'s own download-and-name
+       convention), named by the shared stem. Registering every shard as its
+       own "model" would offer two-thirds of them for serving when they are
+       not independently loadable.
+    3. **Resolve name collisions deterministically.** Two snapshot revisions
+       of the same repo can hold an identically-named file (this box has
+       exactly this for the Cold-Fusion GGUF) — recovering both would leave
+       "which one actually got served" decided by filesystem iteration order.
+       The newer snapshot (by the winning file's own mtime) wins; the other
+       is named in `.skipped`, never silently dropped without a trace.
+
+    Returns a `RecoveryResult`: the entries actually (re)registered, plus
+    `.skipped` — so a caller can report what it healed AND what it found but
+    intentionally left out, rather than only ever reporting success.
     """
     import glob as _glob
     cache = MODEL_STORE_DIR / "_hf_cache"
     if not cache.exists():
-        return []
+        return RecoveryResult([], [])
     known_paths = {e.path for e in _load_manifest().values()}
-    recovered = []
-    for path in _glob.glob(str(cache / "models--*" / "snapshots" / "*" / "*.gguf")):
+    # recursive=True makes a trailing "**" match zero-or-more directories, so
+    # this one pattern covers both a file directly under snapshots/<rev>/ and
+    # one nested in a per-quant subfolder (Unsloth's UD-* layout) — see fix 1.
+    candidates = _glob.glob(
+        str(cache / "models--*" / "snapshots" / "*" / "**" / "*.gguf"), recursive=True)
+    by_name: dict[str, ModelEntry] = {}
+    skipped: list[dict] = []
+    for path in candidates:
         if path in known_paths:
             continue
         real = os.path.realpath(path)
@@ -5732,24 +6584,56 @@ def recover_from_hf_cache() -> list:
         fname = os.path.basename(path)
         if fname.startswith("mmproj"):
             continue        # a projector is not a servable model on its own
-        # Repo name back out of HF's cache layout: models--org--repo
+        shard_m = _SHARD_RE.match(fname)
+        if shard_m and shard_m.group(2) != "00001":
+            continue        # fix 2: only the first shard becomes an entry
+        # Repo name + revision back out of HF's cache layout:
+        # models--org--repo/snapshots/<rev>/...
         try:
-            repo_dir = path.split("/_hf_cache/")[1].split("/snapshots/")[0]
+            after = path.split("/_hf_cache/")[1]
+            repo_dir, _, rest = after.partition("/snapshots/")
+            rev = rest.split("/")[0]
             repo = repo_dir.replace("models--", "", 1).replace("--", "/", 1)
         except (IndexError, AttributeError):
-            repo = ""
+            repo, rev = "", ""
         try:
             meta = gguf_summary(real)
         except Exception:
             continue        # unreadable GGUF — leave it out rather than guess
-        name = fname[:-5] if fname.endswith(".gguf") else fname
+        stem = shard_m.group(1) if shard_m else (fname[:-5] if fname.endswith(".gguf") else fname)
+        name = (_recipe_name_for(rev, fname) if rev else None) or stem
         entry = ModelEntry(name=name, path=path, source="hf", repo=repo,
                            added_ts=time.time(),
                            **{k: v for k, v in meta.items()})
-        recovered.append(entry)
+        prior = by_name.get(name)
+        if prior is None:
+            by_name[name] = entry
+            continue
+        # fix 3: same name, two files (different snapshot revisions) — keep
+        # whichever file is newer on disk, name the other in `.skipped`.
+        prior_mtime = os.path.getmtime(os.path.realpath(prior.path))
+        this_mtime = os.path.getmtime(real)
+        winner, loser = (entry, prior) if this_mtime > prior_mtime else (prior, entry)
+        by_name[name] = winner
+        skipped.append({"name": name, "path": loser.path, "reason":
+                         "duplicate snapshot revision, kept the newer file"})
+        print(f"[gb-synapse] recover-cache: {name!r} found on multiple "
+              f"snapshot revisions; kept {winner.path} (newer), "
+              f"skipped {loser.path}", file=sys.stderr)
+    recovered = list(by_name.values())
     if recovered:
         update_manifest(lambda m: m.update({e.name: e for e in recovered}))
-    return recovered
+    try:
+        import gb_dataflux
+        for e in recovered:
+            gb_dataflux.emit({"kind": "model_recovery", "status": "ok",
+                              "name": e.name, "path": e.path, "repo": e.repo})
+        for s in skipped:
+            gb_dataflux.emit({"kind": "model_recovery", "status": "skipped",
+                              **s})
+    except Exception:
+        pass
+    return RecoveryResult(recovered, skipped)
 
 
 def zero_spill_weight_budget_gb(ctx: int = 0, kv_gb: float = 0.0,

@@ -376,3 +376,73 @@ def test_read_quant_config_distinguishes_nvfp4_from_real_fp8(tmp_path):
         "quant_method": "compressed-tensors",
         "config_groups": {"group_0": {"weights": {"type": "float", "num_bits": 8}}}})
     assert gs.read_quant_config(str(fp8_dir)) == {"quant_method": "fp8", "quant_bits": 8}
+
+
+def _stub_pull_common(monkeypatch, tmp_path):
+    """Shared plumbing for the shard-grouping tests below: a fake single-part
+    hf_hub_download that just returns a distinct empty file per filename, and
+    the usual gguf_summary/manifest stubs."""
+    import huggingface_hub
+
+    def _fake_download(repo_id, filename, token=None, cache_dir=None):
+        p = tmp_path / Path(filename).name
+        p.write_bytes(b"")
+        return str(p)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", _fake_download)
+    monkeypatch.setattr(gs, "gguf_summary", lambda path: {
+        "n_bytes": 1, "n_layers": 1, "is_moe": False, "n_experts": 0,
+        "n_experts_used": 0, "dense_bytes": 0, "expert_bytes": 0,
+        "ctx_length": 0, "quant": "", "arch": "", "n_kv_heads": 0, "head_dim": 0})
+    monkeypatch.setattr(gs, "_load_manifest", lambda: {})
+    monkeypatch.setattr(gs, "_save_manifest", lambda m: None)
+
+
+def test_pull_sharded_gguf_same_quant_is_not_ambiguous(monkeypatch, tmp_path):
+    """Regression, 2026-08-27: unsloth/Qwen3.8-Flash-Next-GGUF (and any other
+    repo using a per-quant-subfolder + numbered "-NNNNN-of-NNNNN.gguf" split
+    layout) shipped every quant as 3 shards. Before the shard-grouping fix,
+    pull("repo:UD-Q2_K_XL") raised "matches 3 files ... refusing to guess" on
+    EVERY quant of this repo family, live-reproduced this session — the
+    ambiguity guard treated 3 shards of the SAME quant as 3 different quants.
+    All 3 shards must download and no RuntimeError should be raised."""
+    files = [
+        {"filename": "UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf", "size": 1},
+        {"filename": "UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00003.gguf", "size": 2},
+        {"filename": "UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00003.gguf", "size": 3},
+    ]
+    monkeypatch.setattr(gs, "list_repo_gguf", lambda repo: files)
+    _stub_pull_common(monkeypatch, tmp_path)
+
+    downloaded = []
+    import huggingface_hub
+    real_fake = huggingface_hub.hf_hub_download
+
+    def _tracking_download(repo_id, filename, token=None, cache_dir=None):
+        downloaded.append(filename)
+        return real_fake(repo_id, filename, token=token, cache_dir=cache_dir)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", _tracking_download)
+
+    entry = gs.pull("unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q2_K_XL")
+    assert entry.engine == "llama.cpp"
+    assert downloaded == [
+        "UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf",
+        "UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00003.gguf",
+        "UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00003.gguf",
+    ]
+
+
+def test_pull_cross_quant_substring_collision_still_raises(monkeypatch, tmp_path):
+    """The shard-grouping fix must not weaken the original 2026-08-18 guard:
+    two genuinely DIFFERENT quants that happen to share a substring (the
+    documented "MTP-IQ4_XS" matches both the full and "LOW" build case) are
+    still a real ambiguity, not shards of one quant, and must still raise."""
+    files = [
+        {"filename": "model-NEO-MAX-NEO-MTP-IQ4_XS.gguf", "size": 1},
+        {"filename": "model-NEO-MAX-NEO-LOW-MTP-IQ4_XS.gguf", "size": 2},
+    ]
+    monkeypatch.setattr(gs, "list_repo_gguf", lambda repo: files)
+    _stub_pull_common(monkeypatch, tmp_path)
+
+    with pytest.raises(RuntimeError, match="refusing to guess"):
+        gs.pull("org/repo:MTP-IQ4_XS")

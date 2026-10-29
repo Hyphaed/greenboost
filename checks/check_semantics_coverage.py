@@ -58,6 +58,12 @@ _KNOWN_CLASSES = {
     # field an operator reaches for when the proxy stops responding, and it is
     # the wrong scope — registering the class makes that trap validated.
     ("gb_telemetry", "SystemMetrics"),
+    # Added 2026-09-01 with the recipe_model_unresolvable segment. `valid`
+    # (schema+digest passed) looks like the field that answers "can this
+    # recipe's model actually serve" and does not — this box had two
+    # `valid: true` recipes pinning models absent from the manifest.
+    # Registering RecipeCoverageEntry makes that never_use trap validated.
+    ("gb_synapse_mcp", "RecipeCoverageEntry"),
 }
 
 

@@ -9,6 +9,9 @@ import json
 import os
 import re
 import threading
+import time
+import uuid
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -25,8 +28,19 @@ _store_lock = threading.RLock()
 _model_lock = threading.Lock()
 
 RAG_DIR          = GB_HOME / "rag"
-EMBEDDINGS_FILE  = RAG_DIR / "embeddings.npy"
-METADATA_FILE    = RAG_DIR / "metadata.json"
+# The live index is ONE directory per generation (rag/generations/<id>/ holding
+# embeddings.npy, metadata.json, manifest.json) and rag/current is a symlink to the
+# active one. Switching generations is a single atomic rename, so vectors and chunk
+# text can never come from different writes (they used to be two os.replace calls,
+# and a crash between them left new vectors paired with old text). These two names
+# are kept for the callers that stat or delete them; the engine itself derives the
+# live paths from RAG_DIR at call time via _emb_path()/_meta_path().
+EMBEDDINGS_FILE  = RAG_DIR / "current" / "embeddings.npy"
+METADATA_FILE    = RAG_DIR / "current" / "metadata.json"
+CHUNKER_VERSION  = "1"          # bump when _chunk_* output changes: old vectors then no longer match new chunks
+#: Generations kept on disk: the active one plus one previous, for recovery.
+#: A full store is ~850 MB here, so this bounds the cost at ~1.7 GB, not "one per save".
+KEEP_GENERATIONS = 2
 FOLDERS_FILE     = RAG_DIR / "indexed_folders.yaml"
 WEB_SOURCES_FILE = RAG_DIR / "web_sources.json"   # registry of fetchable web URLs
 
@@ -84,7 +98,7 @@ def _resolve_device() -> str:
 
 
 def _get_model():
-    global _model
+    global _model, _active_embed_model
     if _model is not None:
         return _model
     with _model_lock:
@@ -119,9 +133,11 @@ def _get_model():
         try:
             _model = SentenceTransformer(EMBED_MODEL, trust_remote_code=True,
                                          device=device, token=hf_token)
+            _active_embed_model = EMBED_MODEL
         except Exception:
             # Fallback model, still on CUDA — never drop to CPU silently.
             _model = SentenceTransformer(EMBED_FALLBACK, device=device, token=hf_token)
+            _active_embed_model = EMBED_FALLBACK       # recorded in the manifest, so it can't pass as the primary
     return _model
 
 
@@ -241,13 +257,123 @@ def _chunk_markdown(content: str) -> list[tuple[int, int, str]]:
 
 # ── Storage helpers ───────────────────────────────────────────────────────────
 
+class RagIndexMismatch(RuntimeError):
+    """The index on disk can't be trusted to match what's being asked of it
+    (different embedding model, different dimensions, vectors and chunks that
+    disagree). Raised instead of quietly returning wrong neighbours."""
+
+
+#: The model that actually produced the vectors written in this process. Set by
+#: _get_model(): the fallback model has a different dimension, and writing its
+#: vectors under the primary model's name is how an index gets silently mixed.
+_active_embed_model: str = EMBED_MODEL
+
+
+def _live_dir() -> Path:
+    return RAG_DIR / "current"
+
+
+def _emb_path() -> Path:
+    return _live_dir() / "embeddings.npy"
+
+
+def _meta_path() -> Path:
+    return _live_dir() / "metadata.json"
+
+
+def _manifest_path() -> Path:
+    return _live_dir() / "manifest.json"
+
+
+def read_manifest() -> dict:
+    """The active generation's manifest, or {} (no store, or an unreadable one)."""
+    try:
+        return json.loads(_manifest_path().read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _switch_current(gid: str) -> None:
+    """Point rag/current at generation `gid` with one atomic rename."""
+    tmp = RAG_DIR / "current.tmp"
+    if tmp.is_symlink() or tmp.exists():
+        tmp.unlink()
+    tmp.symlink_to(Path("generations") / gid)       # relative: the rag dir stays relocatable
+    cur = RAG_DIR / "current"
+    if cur.exists() and not cur.is_symlink():
+        # A real directory where the symlink belongs (made by hand, or by a tool
+        # that predates it). A rename can't replace a directory with a symlink, so
+        # move it aside as a generation; the next prune removes it.
+        os.rename(cur, RAG_DIR / "generations" / f"g-adopted-{uuid.uuid4().hex[:6]}")
+    os.replace(tmp, cur)
+
+
+def _migrate_legacy() -> None:
+    """Adopt a pre-generations store (rag/embeddings.npy + rag/metadata.json) as
+    the first generation. Hard links, not copies: no second 850 MB, and every step
+    is idempotent, so a crash part-way is finished by the next call."""
+    legacy_e, legacy_m = RAG_DIR / "embeddings.npy", RAG_DIR / "metadata.json"
+    if (RAG_DIR / "current").exists() or not (legacy_e.exists() and legacy_m.exists()):
+        return
+    gid = "g-legacy"
+    gdir = RAG_DIR / "generations" / gid
+    gdir.mkdir(parents=True, exist_ok=True)
+    for src, name in ((legacy_e, "embeddings.npy"), (legacy_m, "metadata.json")):
+        dst = gdir / name
+        if not dst.exists():
+            try:
+                os.link(src, dst)
+            except OSError:
+                import shutil
+                shutil.copy2(src, dst)
+    try:
+        arr = np.load(str(gdir / "embeddings.npy"), mmap_mode="r")       # header only
+        rows, dims = int(arr.shape[0]), int(arr.shape[1]) if arr.ndim == 2 else 0
+    except Exception:
+        rows, dims = None, None
+    (gdir / "manifest.json").write_text(json.dumps({
+        "generation": gid, "created_at": time.time(), "legacy": True,
+        "n_chunks": rows, "dims": dims, "dtype": "float32",
+        "embed_model": None,            # unknown: it predates the manifest
+        "chunker_version": None, "metadata_sha256": None,
+    }, indent=2))
+    _switch_current(gid)
+    for src in (legacy_e, legacy_m):
+        try:
+            src.unlink()
+        except OSError:
+            pass
+
+
 def _load_store() -> tuple[np.ndarray | None, list[dict]]:
-    if EMBEDDINGS_FILE.exists() and METADATA_FILE.exists():
-        embeddings = np.load(str(EMBEDDINGS_FILE))
-        with open(METADATA_FILE) as f:
+    _migrate_legacy()
+    if _emb_path().exists() and _meta_path().exists():
+        embeddings = np.load(str(_emb_path()))
+        with open(_meta_path()) as f:
             metadata = json.load(f)
+        if embeddings.ndim == 2 and len(metadata) != embeddings.shape[0] and embeddings.size:
+            raise RagIndexMismatch(
+                f"the index is inconsistent: {embeddings.shape[0]} vectors but "
+                f"{len(metadata)} chunks. Rebuild it with /rag clear, then re-index.")
         return embeddings, metadata
     return None, []
+
+
+def _guard_append(existing_emb, new_emb) -> None:
+    """Refuse to mix vectors from a different model or dimension into this index.
+    Same-dimension models would otherwise combine without any error at all."""
+    if existing_emb is None or new_emb is None or not getattr(existing_emb, "size", 0):
+        return
+    if existing_emb.shape[1] != new_emb.shape[1]:
+        raise RagIndexMismatch(
+            f"the index holds {existing_emb.shape[1]}-dim vectors but the embedding model "
+            f"'{_active_embed_model}' produces {new_emb.shape[1]}. Rebuild with /rag clear.")
+    built_with = read_manifest().get("embed_model")
+    if built_with and built_with != _active_embed_model:
+        raise RagIndexMismatch(
+            f"the index was built with '{built_with}' but this process is embedding with "
+            f"'{_active_embed_model}'. Mixing them would return wrong neighbours. "
+            f"Rebuild with /rag clear, or switch back to '{built_with}'.")
 
 
 #: Tiny sidecar holding only what count-only callers need. Written beside the
@@ -270,7 +396,8 @@ def store_stats() -> dict:
     Returns {"chunks": int, "files": int} — zeros when there is no store at all,
     which is a real answer, not a failure.
     """
-    if not METADATA_FILE.exists():
+    _migrate_legacy()
+    if not _meta_path().exists():
         return {"chunks": 0, "files": 0}
     fp = _store_fingerprint()
     try:
@@ -283,7 +410,7 @@ def store_stats() -> dict:
     except (OSError, ValueError):
         pass    # unreadable or malformed sidecar — fall through and rebuild it
     try:
-        with open(METADATA_FILE) as f:
+        with open(_meta_path()) as f:
             metadata = json.load(f)
     except (OSError, ValueError):
         return {"chunks": 0, "files": 0}
@@ -306,7 +433,7 @@ def _store_fingerprint() -> "str | None":
     and costs one stat() to check.
     """
     try:
-        st = METADATA_FILE.stat()
+        st = _meta_path().stat()
         return f"{st.st_size}:{int(st.st_mtime_ns)}"
     except OSError:
         return None
@@ -329,21 +456,78 @@ def _write_stats(stats: dict) -> None:
         pass
 
 
+def _prune_generations(keep: "set[str]") -> None:
+    """Bound disk use: the active generation plus the newest others, up to
+    KEEP_GENERATIONS. Also sweeps a generation a crashed save left behind."""
+    gens = RAG_DIR / "generations"
+    import shutil
+    try:
+        all_dirs = [d for d in gens.iterdir() if d.is_dir()]
+    except OSError:
+        return
+    # A generation without a manifest is a save that crashed before finishing.
+    # It must never count as a "previous" generation, or it would evict the real one.
+    complete = sorted((d for d in all_dirs if (d / "manifest.json").exists()),
+                      key=lambda d: d.stat().st_mtime, reverse=True)
+    survivors = set(keep) | {d.name for d in complete[:KEEP_GENERATIONS]}
+    for d in all_dirs:
+        if d.name not in survivors:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 def _save_store(embeddings: np.ndarray, metadata: list[dict]) -> None:
+    """Write a complete new generation, verify it, then switch to it atomically.
+
+    Nothing live is touched until the new generation is whole: a crash at any
+    point before the final rename leaves the previous generation active and
+    untouched (the half-written one is swept up on the next save). Readers
+    that already hold `current` keep a consistent pair for as long as they need.
+    """
     RAG_DIR.mkdir(parents=True, exist_ok=True)
-    # Atomic writes: a concurrent reader (e.g. standalone `gb web` process) never
-    # observes a torn file, and a crash mid-write leaves the old store intact.
-    emb_tmp  = EMBEDDINGS_FILE.with_name(EMBEDDINGS_FILE.name + ".tmp")
-    meta_tmp = METADATA_FILE.with_name(METADATA_FILE.name + ".tmp")
-    # Pass a file object so numpy does not append ".npy" to the temp name.
-    with open(emb_tmp, "wb") as f:
-        np.save(f, embeddings)
-    os.replace(emb_tmp, EMBEDDINGS_FILE)
-    with open(meta_tmp, "w") as f:
-        json.dump(metadata, f, indent=2)
-    os.replace(meta_tmp, METADATA_FILE)
+    with _store_lock:
+        _migrate_legacy()
+        gid = f"g-{time.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        gdir = RAG_DIR / "generations" / gid
+        gdir.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(gdir / "embeddings.npy", "wb") as f:
+                np.save(f, embeddings)
+            sha = hashlib.sha256()
+            with open(gdir / "metadata.json", "w") as f:
+                for piece in json.JSONEncoder(indent=2).iterencode(metadata):
+                    f.write(piece)
+                    sha.update(piece.encode())
+            rows = int(np.load(str(gdir / "embeddings.npy"), mmap_mode="r").shape[0]) if embeddings.size else 0
+            if embeddings.size and rows != len(metadata):
+                raise RagIndexMismatch(
+                    f"refusing to save an inconsistent index: {rows} vectors for {len(metadata)} chunks")
+            (gdir / "manifest.json").write_text(json.dumps({
+                "generation": gid, "created_at": time.time(),
+                "n_chunks": len(metadata),
+                "dims": int(embeddings.shape[1]) if embeddings.ndim == 2 else 0,
+                "dtype": str(embeddings.dtype),
+                "embed_model": _active_embed_model,
+                "chunker_version": CHUNKER_VERSION,
+                "metadata_sha256": sha.hexdigest(),
+                "embeddings_bytes": (gdir / "embeddings.npy").stat().st_size,
+            }, indent=2))
+        except BaseException:
+            import shutil
+            shutil.rmtree(gdir, ignore_errors=True)         # never leave a half generation behind
+            raise
+        try:
+            previous = os.readlink(RAG_DIR / "current").rsplit("/", 1)[-1]
+        except OSError:
+            previous = ""
+        try:
+            _switch_current(gid)                             # the one atomic step
+        except BaseException:
+            import shutil
+            shutil.rmtree(gdir, ignore_errors=True)          # finished, but never became live
+            raise
+        _prune_generations(keep={gid, previous})
     # Refresh the count sidecar in the same breath, so the cheap path is never
-    # stale after a write. Written AFTER the replace: a sidecar describing a
+    # stale after a write. Written AFTER the switch: a sidecar describing a
     # store that failed to land would be worse than none.
     _write_stats({
         "chunks": len(metadata),
@@ -445,6 +629,7 @@ def index_folder(
     prefix = str(folder) + os.sep
     with _store_lock:
         existing_emb, existing_meta = _load_store()
+        _guard_append(existing_emb, new_embeddings)
         if existing_emb is not None and len(existing_meta) > 0:
             keep_idx = [
                 i for i, m in enumerate(existing_meta)
@@ -517,6 +702,7 @@ def index_text(
 
     with _store_lock:
         existing_emb, existing_meta = _load_store()
+        _guard_append(existing_emb, new_embeddings)
         if existing_emb is not None and len(existing_meta) > 0:
             keep_idx = [i for i, m in enumerate(existing_meta) if m["file"] != source_name]
             if keep_idx:
@@ -651,6 +837,7 @@ def update_folder(
 
     with _store_lock:
         emb, meta = _load_store()           # re-load: a Q&A turn may have written
+        _guard_append(emb, new_embeddings)
         stale = {str(f) for f in changed} | removed
         keep_idx = [i for i, m in enumerate(meta) if m["file"] not in stale]
         chunks_removed = len(meta) - len(keep_idx)
@@ -758,14 +945,27 @@ def search(
     import os
     import torch
 
-    embeddings, metadata = _load_store()
-    if embeddings is None or len(metadata) == 0:
+    _migrate_legacy()
+    if not (_emb_path().exists() and _meta_path().exists()):
         return []
+    # mmap: the matrix stays on disk and is paged in as the matmul reads it,
+    # instead of being parsed into RAM and then copied again by torch.tensor().
+    embeddings = np.load(str(_emb_path()), mmap_mode="r")
+    with open(_meta_path()) as f:
+        metadata = json.load(f)
+    if embeddings.ndim != 2 or len(metadata) == 0:
+        return []
+    if len(metadata) != embeddings.shape[0]:
+        raise RagIndexMismatch(
+            f"the index is inconsistent: {embeddings.shape[0]} vectors but {len(metadata)} chunks. "
+            f"Rebuild it with /rag clear, then re-index.")
 
     query_vec = _embed([query])[0]
-    emb_tensor = torch.tensor(embeddings, dtype=torch.float32)
-    q_tensor   = torch.tensor(query_vec,  dtype=torch.float32)
-    scores     = torch.mv(emb_tensor, q_tensor)
+    if query_vec.shape[0] != embeddings.shape[1]:
+        raise RagIndexMismatch(
+            f"the index holds {embeddings.shape[1]}-dim vectors but '{_active_embed_model}' "
+            f"produces {query_vec.shape[0]}. Rebuild with /rag clear.")
+    scores = torch.from_numpy(np.ascontiguousarray(embeddings @ np.asarray(query_vec, dtype=np.float32)))
 
     if project:
         mask = torch.tensor(
