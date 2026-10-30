@@ -56,6 +56,60 @@ def test_synapse_doctor_reports_recipe_coverage(tmp_path, monkeypatch):
     assert out["recipes"][0]["valid"] is True
 
 
+def test_synapse_doctor_flags_recipe_pinning_missing_model(tmp_path, monkeypatch):
+    """valid != resolvable: a recipe can pass schema+digest validation while
+    pinning a model absent from the manifest (this box's real 2026-09-01
+    state — two `valid: true` recipes, including the reference workload,
+    pinned models the manifest didn't have). `model_resolves` must say so
+    even though `valid` correctly stays True."""
+    recipes_dir = tmp_path / "recipes"
+    recipes_dir.mkdir()
+    monkeypatch.setattr(cr, "RECIPES_DIR", recipes_dir)
+    _write_recipe(recipes_dir / "orphan.yaml", model_name="ghost-model")
+
+    monkeypatch.setattr(gb_synapse, "MANIFEST_FILE",
+                        type("P", (), {"exists": lambda self: True})())
+    monkeypatch.setattr(gb_synapse, "_load_manifest", lambda: {})
+    monkeypatch.setattr("gb_synapse.doctor", lambda probe_feeders=True: {})
+
+    out = gb_synapse_mcp.synapse_doctor()
+    assert out["recipes"][0]["valid"] is True
+    assert out["recipes"][0]["model_resolves"] is False
+
+
+def test_synapse_doctor_reports_model_resolves_true_when_manifest_has_it(tmp_path, monkeypatch):
+    recipes_dir = tmp_path / "recipes"
+    recipes_dir.mkdir()
+    monkeypatch.setattr(cr, "RECIPES_DIR", recipes_dir)
+    _write_recipe(recipes_dir / "present.yaml", model_name="present-model")
+
+    monkeypatch.setattr(gb_synapse, "MANIFEST_FILE",
+                        type("P", (), {"exists": lambda self: True})())
+    fake_entry = gb_synapse.ModelEntry(name="present-model", path="/x", source="hf")
+    monkeypatch.setattr(gb_synapse, "_load_manifest", lambda: {"present-model": fake_entry})
+    monkeypatch.setattr("gb_synapse.doctor", lambda probe_feeders=True: {})
+
+    out = gb_synapse_mcp.synapse_doctor()
+    assert out["recipes"][0]["model_resolves"] is True
+
+
+def test_synapse_doctor_model_resolves_is_none_not_false_when_manifest_unreadable(tmp_path, monkeypatch):
+    """Tri-state per the GB-Semantics Must-Rule: 'can't tell' must never
+    collapse into 'false' — a recipe pinning a genuinely resolvable model
+    must not look identical to one this check simply couldn't verify."""
+    recipes_dir = tmp_path / "recipes"
+    recipes_dir.mkdir()
+    monkeypatch.setattr(cr, "RECIPES_DIR", recipes_dir)
+    _write_recipe(recipes_dir / "unknown.yaml", model_name="unknown-model")
+
+    monkeypatch.setattr(gb_synapse, "MANIFEST_FILE",
+                        type("P", (), {"exists": lambda self: False})())
+    monkeypatch.setattr("gb_synapse.doctor", lambda probe_feeders=True: {})
+
+    out = gb_synapse_mcp.synapse_doctor()
+    assert out["recipes"][0]["model_resolves"] is None
+
+
 def test_synapse_doctor_flags_invalid_recipe(tmp_path, monkeypatch):
     recipes_dir = tmp_path / "recipes"
     recipes_dir.mkdir()

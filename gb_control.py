@@ -106,13 +106,19 @@ _SYSFS_DEBUG_MODE        = f"{_SYSFS_PREFIX}/debug_mode"
 
 # ── control file path ─────────────────────────────────────────────────────────
 _CONTROL_FILE = Path("/run/greenboost/control")
-_CONTROL_TMP  = Path("/run/greenboost/.control.tmp")
+_CONTROL_TMP  = Path("/run/greenboost/.control.tmp")   # legacy name, no longer written (random temp names now)
 
 # ── OS tunable paths (continuous OS tuning , Loops O-S, supervisor mode only) ──
 _CPUFREQ_GLOB     = "/sys/devices/system/cpu/cpu[0-9]*/cpufreq"
 _PROC_SYS_VM       = "/proc/sys/vm"
 _PROC_SYS_KERNEL   = "/proc/sys/kernel"
 _OS_BASELINE_FILE  = Path("/run/greenboost/os_tune_baseline.json")
+
+
+def _safe():
+    """gb_lease holds the shared symlink-safe writer (no dependencies, always importable)."""
+    import gb_lease
+    return gb_lease
 
 
 # ── result type ───────────────────────────────────────────────────────────────
@@ -191,8 +197,9 @@ class GbControl:
         """
         existing: dict[str, str] = {}
         try:
-            if _CONTROL_FILE.exists():
-                for line in _CONTROL_FILE.read_text().splitlines():
+            _old = _safe().safe_read_text(_CONTROL_FILE)      # a symlink planted at `control` reads as absent
+            if _old is not None:
+                for line in _old.splitlines():
                     if "=" in line:
                         k, _, v = line.partition("=")
                         existing[k.strip()] = v.strip()
@@ -204,9 +211,8 @@ class GbControl:
 
         content = "".join(f"{k}={v}\n" for k, v in sorted(existing.items()))
         try:
-            _CONTROL_TMP.parent.mkdir(parents=True, exist_ok=True)
-            _CONTROL_TMP.write_text(content)
-            _CONTROL_TMP.rename(_CONTROL_FILE)
+            _CONTROL_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _safe().safe_atomic_write(_CONTROL_FILE, content, 0o644)      # random O_EXCL|O_NOFOLLOW temp; refuses a symlinked target
             return True
         except Exception as exc:
             log.warning("[gb_control] control file write failed: %s", exc)
@@ -271,13 +277,14 @@ class GbControl:
         """
         try:
             baseline: dict = {}
-            if _OS_BASELINE_FILE.exists():
-                baseline = json.loads(_OS_BASELINE_FILE.read_text())
+            _old = _safe().safe_read_text(_OS_BASELINE_FILE)
+            if _old is not None:
+                baseline = json.loads(_old)
             if key in baseline:
                 return
             baseline[key] = current
             _OS_BASELINE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            _OS_BASELINE_FILE.write_text(json.dumps(baseline))
+            _safe().safe_atomic_write(_OS_BASELINE_FILE, json.dumps(baseline), 0o644)
         except Exception as exc:
             log.debug("[gb_control] baseline capture %s failed: %s", key, exc)
 
@@ -287,11 +294,12 @@ class GbControl:
         tune --revert`). Best-effort per key; returns {key: applied(bool)}.
         """
         results: dict = {}
-        if not _OS_BASELINE_FILE.exists():
+        _raw = _safe().safe_read_text(_OS_BASELINE_FILE)
+        if _raw is None:
             log.info("[gb_control] no OS-tune baseline file , nothing to restore")
             return results
         try:
-            baseline = json.loads(_OS_BASELINE_FILE.read_text())
+            baseline = json.loads(_raw)
         except Exception as exc:
             log.warning("[gb_control] baseline read failed: %s", exc)
             return results

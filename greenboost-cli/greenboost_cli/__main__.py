@@ -14,6 +14,9 @@ Commands:
 Options:
   -p, --print          Non-interactive: run prompt and exit
   -m, --model MODEL    Override model for this session (gb-synapse manifest name)
+  -c, --continue       Resume the last session (default is a fresh start)
+  -r, --resume         Pick a saved session to resume from a list
+  --once               With a slash command argument: run it and exit
   --accept-all         Never ask permission (dangerous)
   --verbose            Show reasoning tokens and tool details
   --setup              Run the interactive setup wizard
@@ -24,7 +27,9 @@ Examples:
   greenboost-cli web                    # open web dashboard
   gb "fix the bug in main.py"           # run a one-shot prompt
   gb -m qwen3-coder "list files"        # use a specific gb-synapse model
-  gb                                    # start interactive REPL
+  gb                                    # start interactive REPL (fresh session)
+  gb -c                                 # continue the last session
+  gb /llamaserve load                   # run a slash command, then stay in the REPL
 
 Every model runs through gb-synapse — GreenBoost's HuggingFace-pull +
 Ollama-index + cluster-distributed llama.cpp serving layer. No cloud
@@ -83,6 +88,12 @@ def main() -> None:
         help="Non-interactive mode: run prompt and exit",
     )
     parser.add_argument("-m", "--model", help="Override model (gb-synapse manifest name)")
+    parser.add_argument("-c", "--continue", dest="cont", action="store_true",
+                        help="Resume the last session")
+    parser.add_argument("-r", "--resume", dest="resume_pick", action="store_true",
+                        help="Pick a saved session to resume")
+    parser.add_argument("--once", action="store_true",
+                        help="Run a slash-command argument and exit")
     parser.add_argument(
         "--accept-all", action="store_true",
         help="Never ask permission (accept all operations)",
@@ -127,10 +138,19 @@ def main() -> None:
         settings["model"] = _m
     if args.accept_all:
         settings["permission_mode"] = "accept-all"
+    elif settings.get("permission_mode") in ("accept-all", "autonomous"):
+        # Modes that act without asking never survive a restart by themselves.
+        settings.pop("permission_mode", None)
     if args.verbose:
         settings["verbose"] = True
 
     initial = " ".join(args.prompt) if args.prompt else None
+
+    # `greenboost-cli /cmd args`: a slash command, not a chat message. It runs
+    # inside the REPL and the REPL stays open (--once: run it and exit).
+    initial_command = None
+    if initial and initial.lstrip().startswith("/") and not args.print_mode:
+        initial_command, initial = initial.strip(), None
 
     # Intercept bare meta-subcommands passed as positional args
     # e.g. "gb help", "gb version", "gb setup" — don't send to AI
@@ -187,7 +207,10 @@ def main() -> None:
         sys.exit(1)
 
     # Auto-start gb-synapse if the configured model isn't already being served.
-    _model = settings.get("model", "")
+    # Only when a prompt was given: with no prompt nothing may be loaded
+    # (owner rule 2026-10-10; the loader itself also refuses, see
+    # gb_synapse.serve's explicit/trigger gate).
+    _model = settings.get("model", "") if initial else ""
     if _model:
         try:
             from greenboost_cli.slash_commands.backend_cmds import _llamacpp_running_pid, cmd_llamaserve
@@ -195,13 +218,26 @@ def main() -> None:
                 from greenboost_cli.terminal.theme import emit_info, emit_warn, VIOLET
                 _mid = _model.split("/", 1)[1] if "/" in _model else _model
                 emit_info(f"Starting gb-synapse for [{VIOLET}]{_mid}[/] …")
-                cmd_llamaserve("start", None, settings)
+                settings["_prompt_driven"] = True
+                try:
+                    cmd_llamaserve("start", None, settings)
+                finally:
+                    settings.pop("_prompt_driven", None)
         except Exception as _e:
             from greenboost_cli.terminal.theme import emit_warn
             emit_warn(f"gb-synapse auto-start error: {_e}")
 
     from greenboost_cli.terminal.repl import run_interactive
-    run_interactive(settings, initial_prompt=initial)
+    if initial_command and args.once:
+        from greenboost_cli.terminal.commands import dispatch_command
+        from greenboost_cli.core.session import ConversationSession
+        import greenboost_cli.slash_commands.backend_cmds  # noqa: F401
+        import greenboost_cli.slash_commands.greenboost_cmds  # noqa: F401
+        dispatch_command(initial_command, ConversationSession(), settings)
+        return
+    resume = "pick" if args.resume_pick else ("last" if args.cont else None)
+    run_interactive(settings, initial_prompt=initial,
+                    initial_command=initial_command, resume=resume)
 
 
 if __name__ == "__main__":

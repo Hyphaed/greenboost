@@ -66,7 +66,7 @@ def _stub_gb_shim_probe(monkeypatch):
     explicitly testing shim-stripping."""
     import gb_shim_probe
     monkeypatch.setattr(gb_shim_probe, "shim_works_for_llama",
-                        lambda engine_dir=None: (False, "test-default: probe not run"))
+                        lambda engine_dir=None, **kw: (False, "test-default: probe not run"))
 
 
 def test_serve_embedding_port_is_primary_plus_2000(backend, entry, _stub_gb_synapse,
@@ -134,7 +134,7 @@ def test_serve_embedding_strips_shim_when_disabled(backend, entry, _stub_gb_syna
     monkeypatch.delenv("GB_SYNAPSE_SHIM", raising=False)
     import gb_shim_probe
     monkeypatch.setattr(gb_shim_probe, "shim_works_for_llama",
-                        lambda engine_dir=None: (False, "incompatible"))
+                        lambda engine_dir=None, **kw: (False, "incompatible"))
     captured = {}
     monkeypatch.setattr(gsb.subprocess, "Popen",
                         lambda cmd, **kw: captured.update(env=kw.get("env")) or _FakeProc())
@@ -150,7 +150,7 @@ def test_serve_embedding_keeps_shim_when_probe_reports_working(backend, entry, _
     monkeypatch.delenv("GB_SYNAPSE_SHIM", raising=False)
     import gb_shim_probe
     monkeypatch.setattr(gb_shim_probe, "shim_works_for_llama",
-                        lambda engine_dir=None: (True, "cached: compatible"))
+                        lambda engine_dir=None, **kw: (True, "cached: compatible"))
     captured = {}
     monkeypatch.setattr(gsb.subprocess, "Popen",
                         lambda cmd, **kw: captured.update(env=kw.get("env")) or _FakeProc())

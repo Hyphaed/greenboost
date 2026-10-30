@@ -265,9 +265,13 @@ def _latest_event(kind: str, node: "str | None" = None,
     except Exception:
         return None
     try:
-        events = gb_dataflux.read_events(since_hours=days * 24)
+        events = _read_events(since_hours=days * 24)
     except Exception:
         return None
+    # Exclude events a benchmark or A/B harness invented. They drive the real
+    # code paths (that is the point of them) and therefore emit real-looking
+    # events; on 2026-08-22 ten such events made a governed metric describe a
+    # session that had not happened. See gb_dataflux.emit and casebook C-20.
     cand = [e for e in events if e.get("kind") == kind]
     if node:
         cand = [e for e in cand if gb_dataflux.canonical_node(e.get("node")) == node]
@@ -277,6 +281,24 @@ def _latest_event(kind: str, node: "str | None" = None,
     if max_age_s is not None and (time.time() - ev.get("ts", 0)) > max_age_s:
         return None
     return ev
+
+
+def _read_events(**kw) -> "list[dict]":
+    """gb_dataflux.read_events with benchmark-authored events removed.
+
+    Every governed number in this module reads through here, and that is the
+    point: there are eight read sites, and filtering seven of them is the same
+    as filtering none. On 2026-08-22 an A/B harness drove the real
+    _compress_context (which is what makes an A/B worth running) and wrote ten
+    compaction events; agent_compaction_prefix_kept_pct then reported "28.7%
+    over 10 of 10 compactions" during a live session that had performed zero.
+    The metric was right about its inputs and wrong about the world.
+
+    Events are tagged at the emit site by GB_DATAFLUX_SYNTHETIC=1, so a harness
+    opts in once and every resolver is protected. See casebook C-20.
+    """
+    import gb_dataflux
+    return [e for e in gb_dataflux.read_events(**kw) if not e.get("synthetic")]
 
 
 def _events_in_window(kind: str, node: "str | None" = None,
@@ -293,7 +315,7 @@ def _events_in_window(kind: str, node: "str | None" = None,
     except Exception:
         return []
     try:
-        events = gb_dataflux.read_events(since_hours=days * 24)
+        events = _read_events(since_hours=days * 24)
     except Exception:
         return []
     cand = [e for e in events if e.get("kind") == kind]
@@ -346,7 +368,7 @@ def _latest_event_with_field(kind: str, field: str, node: "str | None" = None,
     except Exception:
         return None
     try:
-        events = gb_dataflux.read_events(since_hours=days * 24)
+        events = _read_events(since_hours=days * 24)
     except Exception:
         return None
     cand = [e for e in events if e.get("kind") == kind and e.get(field) is not None]
@@ -585,12 +607,10 @@ def _res_kv_bits_by_layer(entity_id, window_s):
         import gb_synapse
         for e in gb_synapse.list_models():
             if entity_id in (None, e.name):
-                # is_recurrent_only: n_kv_layers==0 is the CORRECT count (no
-                # real attention layer at all) — `or e.n_layers` must not
-                # paper over that with "unknown, assume every layer is real
-                # attention" (the same trap this metric's own never_use entry
-                # already warns about for n_layers itself).
-                n_kv_layers = 0 if e.is_recurrent_only else (e.n_kv_layers or e.n_layers)
+                # One definition, owned by gb_synapse.effective_kv_layers , this
+                # rule had five copies and C-07 is what happens when one of them
+                # is missed.
+                n_kv_layers = gb_synapse.effective_kv_layers(e)
                 break
     except Exception:
         pass
@@ -618,6 +638,23 @@ def _res_ssm_state_gb(entity_id, window_s):
     return {"value": None, "unit": "gigabytes", "raw_source": "no matching model in manifest"}
 
 
+def _res_mtp_head_on_disk(entity_id, window_s):
+    """1.0 when a separate MTP head file sits beside the named model's
+    weights (gb_synapse._mtp_head_path), 0.0 when none does. Disk fact only:
+    whether the running server actually loaded it is the segment
+    separate_mtp_head_unused, read off the synapse_serve event."""
+    try:
+        import gb_synapse
+        for e in gb_synapse.list_models():
+            if entity_id in (None, e.name):
+                found = gb_synapse._mtp_head_path(e)
+                return {"value": 1.0 if found else 0.0, "unit": "fraction",
+                        "raw_source": "gb_synapse._mtp_head_path(ModelEntry): sibling GGUF whose blocks all sit at index >= n_layers"}
+    except Exception:
+        pass
+    return {"value": None, "unit": "fraction", "raw_source": "no matching model in manifest"}
+
+
 def _res_recurrent_layer_fraction(entity_id, window_s):
     """n_recurrent_layers / n_layers for the named model — 0.0 for a plain
     transformer, 1.0 for a pure-Mamba/Mamba2 architecture (is_recurrent_only),
@@ -637,7 +674,7 @@ def _res_recurrent_layer_fraction(entity_id, window_s):
 def _res_tok_s_decode(entity_id, window_s):
     try:
         import gb_dataflux
-        events = gb_dataflux.read_events(since_hours=(window_s / 3600.0) if window_s else 48)
+        events = _read_events(since_hours=(window_s / 3600.0) if window_s else 48)
         summary = gb_dataflux.summarize(events)
         tok_s = summary.get("tok_s", {})
         if entity_id and entity_id in tok_s:
@@ -865,7 +902,7 @@ def _agent_events(kind: str, window_s=None, days: float = 2.0) -> list:
     try:
         import gb_dataflux
         hours = (window_s / 3600.0) if window_s else days * 24
-        return [e for e in gb_dataflux.read_events(since_hours=hours)
+        return [e for e in _read_events(since_hours=hours)
                 if e.get("kind") == kind]
     except Exception:
         return []
@@ -910,6 +947,257 @@ def _res_agent_hallucinated_tool_pct(entity_id, window_s):
             "raw_source": f"agent_tool_schema_miss over {len(ev)} call(s)"}
 
 
+#: Minimum missed tokens before a prompt_cache event may set the per-token
+#: rate. Below this the fixed per-request cost dominates and the implied rate
+#: is overhead, not marginal cost. 100 is ~2.3 s of real prefill at the
+#: measured rate, i.e. comfortably above the ~1.3 s fixed term.
+_MIN_MISS_FOR_RATE = 100
+
+#: How many recent qualifying turns set the rate. Small on purpose: the rate
+#: tracks context size, so old turns at a different size are not evidence
+#: about the current one.
+_RATE_SAMPLE = 5
+
+
+def _res_web_fetch_blocked_count(entity_id, window_s):
+    """WebFetch requests the client-level guard refused in the window.
+    cli_tool_call can't answer this: WebFetch is auto-approved, so a refused
+    fetch is recorded there as decision=allowed with an Error result."""
+    ev = _events_in_window("web_fetch", max_age_s=window_s)
+    if not ev:
+        return {"value": None, "unit": "count",
+                "raw_source": "no web_fetch event yet (no WebFetch has run since the guard shipped)"}
+    blocked = [e for e in ev if e.get("status") == "blocked"]
+    return {"value": len(blocked), "unit": "count",
+            "raw_source": "dataflux web_fetch events with status=blocked",
+            "details": {"fetches": len(ev), "reasons": sorted({str(e.get("reason", ""))[:60] for e in blocked})[:5]}}
+
+
+def _res_factory_tasks_interrupted(entity_id, window_s):
+    """Factory tasks whose factory died mid-run and that nobody has resumed or
+    discarded-and-recorded since. 0 is a real answer once any factory_task event exists."""
+    ev = _events_in_window("factory_task", max_age_s=window_s or 7 * 86400)
+    if not ev:
+        return {"value": None, "unit": "count",
+                "raw_source": "no factory_task event yet (no task has been interrupted or resumed)"}
+    resumed = {e.get("task_id") for e in ev if e.get("status") == "resumed"}
+    open_ = {e.get("task_id") for e in ev if e.get("status") == "interrupted"} - resumed
+    return {"value": len(open_), "unit": "count",
+            "raw_source": "dataflux factory_task events: interrupted minus resumed",
+            "details": {"task_ids": sorted(str(t)[:12] for t in open_)[:10]}}
+
+
+def _res_tool_result_prefill_ms(entity_id, window_s):
+    """Prefill cost of the largest recent tool result, at this box's own rate.
+
+    Two measured inputs, neither assumed:
+
+      tokens  , cli_tool_call.result_tokens_est, recorded at the dispatcher.
+      ms/token, derived from prompt_cache: engine_prompt_ms divided by the
+                tokens that MISSED the cache (reused / hit_pct gives the total,
+                total - reused gives the miss). On this box that lands at ~23
+                ms/token at a 14-18k agent context.
+
+    Why this metric exists. On a real session 2026-08-22 a Read of a 7.7 KB
+    file executed in 6.3 ms and its result was ~1,938 tokens , about 45 seconds
+    of prefill. Nothing in the system connected those two numbers, so the
+    expensive part of a tool call was invisible while the cheap part was
+    timed to the millisecond.
+    """
+    tc = [e for e in _events_in_window("cli_tool_call", max_age_s=window_s)
+          if isinstance(e.get("result_tokens_est"), (int, float))
+          and e["result_tokens_est"] > 0]
+    if not tc:
+        return {"value": None, "unit": "milliseconds",
+                "raw_source": "no cli_tool_call event has recorded a result size yet",
+                "details": {"basis": "none", "calls": 0}}
+
+    # RECENT events only, and the reason is not tidiness. The per-token rate is
+    # a function of CONTEXT SIZE on this box: ~4.4 ms/token at a 1.6k prompt and
+    # ~23 ms/token at the 14-18k an agent actually runs at, because the model
+    # spills to T2 across PCIe at that size. A median over a long window mixes
+    # both and describes neither , it produced 6.7 ms/token from a window
+    # holding both a microbenchmark and a real session. The last few turns are
+    # the only ones that answer "what will this cost me now".
+    rates = []
+    _pc = sorted(_events_in_window("prompt_cache", max_age_s=window_s),
+                 key=lambda e: e.get("ts") or 0, reverse=True)
+    for e in _pc:
+        hit, reused, ms = e.get("hit_pct"), e.get("reused_tokens"), e.get("engine_prompt_ms")
+        if not all(isinstance(x, (int, float)) for x in (hit, reused, ms)):
+            continue
+        if not (0 < hit < 100) or ms <= 0 or reused <= 0:
+            continue
+        total = reused / (hit / 100.0)
+        missed = total - reused
+        # A turn that missed only a handful of tokens divides this box's ~1.3 s
+        # FIXED per-request cost (C-19) over those few tokens and reports an
+        # absurd marginal rate , one real event missed 29 tokens for 2,732 ms
+        # and implied 93 ms/token, four times the true marginal cost. Requiring
+        # a real miss makes the rate marginal rather than mostly overhead.
+        if missed >= _MIN_MISS_FOR_RATE:
+            rates.append(ms / missed)
+        if len(rates) >= _RATE_SAMPLE:
+            break
+    if not rates:
+        return {"value": None, "unit": "milliseconds",
+                "raw_source": ("tool result sizes recorded but no prompt_cache event "
+                               "establishes a ms/token rate for this box yet"),
+                "details": {"basis": "none", "calls": len(tc)}}
+
+    rates.sort()
+    rate = rates[len(rates) // 2]
+    worst = max(tc, key=lambda e: e["result_tokens_est"])
+    return {"value": round(worst["result_tokens_est"] * rate, 1),
+            "unit": "milliseconds",
+            "raw_source": (f"largest of {len(tc)} tool result(s) "
+                           f"({worst.get('name')}, {worst['result_tokens_est']} tokens) "
+                           f"x {rate:.1f} ms/token measured from {len(rates)} prompt_cache event(s)"),
+            "details": {"basis": "derived", "calls": len(tc),
+                        "tool": worst.get("name"),
+                        "tokens": worst["result_tokens_est"],
+                        "ms_per_token": round(rate, 1)}}
+
+
+def _res_warm_prefill_fixed_ms(entity_id, window_s):
+    """Per-request cost before the first output token, on an already-warm turn.
+
+    WHAT THIS REPLACED, because the mistake is the useful part. This slot held
+    `recurrent_replay_share` for about an hour on 2026-08-22. That metric divided
+    `turn_bench.median_replay_ms_est` by `median_prompt_ms` and reported 66.7% as
+    "the share of prefill spent re-running the recurrent layers". It was an
+    artifact: `real_prefill_ms_est` is a CONSTANT (443.8 in every run on record),
+    so `replay_ms_est` is just `prompt_ms - 443.8`, and the ratio was arithmetic
+    dressed as a measurement.
+
+    A length sweep disproved it in three runs. Across a 9.4x prompt-length range
+    (489 -> 4620 tokens) prompt_ms moved 1273.1 -> 1283.6, i.e. not at all. Whole-
+    prompt recurrent replay would scale nearly linearly. It does not happen on
+    this engine: after a deliberate prefix invalidation the engine reprocessed
+    only the changed suffix (4056 reused, 592 new) at the same cost as a much
+    shorter prompt with the same 592 new tokens.
+
+    What IS real is this number: a fixed ~1.3 s paid per request regardless of
+    prompt length AND regardless of output length (max_tokens 8/32/128 -> 1286/
+    1307/1305 ms). On an 8-token reply that is 44% of the turn. For an agent
+    whose turns are mostly short tool calls, it is the dominant cost and neither
+    a smaller context nor a shorter reply touches it.
+    """
+    ev = _events_in_window("turn_bench", max_age_s=window_s)
+    if not ev:
+        return {"value": None, "unit": "milliseconds",
+                "raw_source": "no turn_bench events , run gb_bench_turn.py",
+                "details": {"basis": "none", "runs": 0}}
+    usable = [e for e in ev if isinstance(e.get("median_prompt_ms"), (int, float))
+              and e["median_prompt_ms"] > 0]
+    if not usable:
+        return {"value": None, "unit": "milliseconds",
+                "raw_source": (f"{len(ev)} turn_bench event(s), none carrying "
+                               f"median_prompt_ms"),
+                "details": {"basis": "none", "runs": len(ev)}}
+    latest = max(usable, key=lambda e: e.get("ts") or 0)
+    return {"value": round(float(latest["median_prompt_ms"]), 1),
+            "unit": "milliseconds",
+            "raw_source": (f"turn_bench.median_prompt_ms on warm turns "
+                           f"({latest.get('model') or 'unknown model'})"),
+            "details": {"basis": "measured", "runs": len(usable),
+                        "model": latest.get("model")}}
+
+
+def _res_tier_spill_return_pct(entity_id, window_s):
+    """Share of T1 demotions later undone by promoting the same component back.
+
+    Ported from TensorRT-LLM's KV-cache stats schema (crosswalk P5-01), which
+    counts `iter_host_dropped_blocks` -- pages offloaded to the host tier and
+    dropped without ever being onboarded again. The GreenBoost equivalent
+    INVERTS which side is the loss, and that inversion is the point.
+
+    Upstream, an offload that is never onboarded is wasted work: you paid to
+    move a block to host memory and then threw it away. Here, a demotion that
+    never returns is exactly what tiering is FOR -- the component was finished
+    (a VAE after decode, a text encoder after encode), the VRAM was freed, and
+    nothing had to be moved back. The loss is the opposite case: a demotion
+    that has to be undone paid a demote AND a promote for memory that was
+    still live.
+
+    Distinct from gb_thrash: that counts reversals fast enough to be ping-pong
+    (within lapse_s, per component, with a threshold). This counts every round
+    trip regardless of how slow, so a component that bounces once per minute --
+    far too slow to trip thrash detection, and still pure overhead -- is
+    visible here and nowhere else.
+
+    Measured on this box 2026-08-22 over the whole tier_move history: 12
+    demotions, 3 returned (25%), and only `transformer` ever round-tripped;
+    `vae` and `text_encoder` were demoted three times each and never came back,
+    which is the healthy pattern for a diffusion pipeline.
+    """
+    ev = sorted([e for e in _events_in_window("tier_move", max_age_s=window_s)
+                 if e.get("items")], key=lambda e: e.get("ts") or 0)
+    if not ev:
+        return {"value": None, "unit": "percent",
+                "raw_source": "no tier_move events in the window",
+                "details": {"basis": "none", "demotions": 0}}
+
+    # Match each demotion to the NEXT promotion of the same component in the
+    # same process. Keyed by pid because two processes can hold same-named
+    # components independently, and a promotion in one says nothing about a
+    # demotion in the other.
+    pending: dict = {}
+    returned, gb_returned = 0, 0.0
+    for e in ev:
+        ft, tt = e.get("from_tier"), e.get("to_tier")
+        for item in (e.get("items") or []):
+            key = (e.get("pid"), item)
+            if ft == "T1_HBM" and tt != "T1_HBM":
+                pending.setdefault(key, []).append(e)
+            elif tt == "T1_HBM" and pending.get(key):
+                origin = pending[key].pop(0)
+                returned += 1
+                gb_returned += float(origin.get("size_gb") or 0.0)
+
+    never = sum(len(v) for v in pending.values())
+    total = returned + never
+
+    # PREFERRED basis: the outcome gb_dataflux recorded on the event itself
+    # (2026-08-22 onward). Inference above cannot separate "still resident in
+    # T2" from "evicted from T2" -- both are simply "no promotion followed" --
+    # so where the mover recorded what actually happened, use that instead.
+    tagged = [e for e in ev if e.get("spill_outcome") in ("returned", "dropped")]
+    if tagged:
+        ret = [e for e in tagged if e["spill_outcome"] == "returned"]
+        drop = [e for e in tagged if e["spill_outcome"] == "dropped"]
+        resident = [float(e["spill_resident_s"]) for e in ret
+                    if isinstance(e.get("spill_resident_s"), (int, float))]
+        return {"value": round(100.0 * len(ret) / len(tagged), 1), "unit": "percent",
+                "raw_source": (f"tier_move.spill_outcome: {len(ret)} of {len(tagged)} "
+                               f"resolved spill(s) were undone by a promotion back to T1"),
+                "details": {"basis": "measured", "demotions": len(tagged),
+                            "returned": len(ret), "dropped": len(drop),
+                            "median_resident_s": (round(sorted(resident)[len(resident)//2], 1)
+                                                  if resident else None),
+                            "inferred_demotions": total}}
+
+    if not total:
+        return {"value": None, "unit": "percent",
+                "raw_source": (f"{len(ev)} tier_move event(s) in the window but no T1 "
+                               f"demotion among them -- nothing has been spilled, which "
+                               f"is not the same as spilling that never returns"),
+                "details": {"basis": "none", "demotions": 0, "tier_moves": len(ev)}}
+
+    gb_never = sum(float(e.get("size_gb") or 0.0)
+                   for v in pending.values() for e in v)
+    return {"value": round(100.0 * returned / total, 1), "unit": "percent",
+            "raw_source": (f"tier_move: {returned} of {total} T1 demotion(s) were "
+                           f"undone by a later promotion of the same component "
+                           f"(INFERRED -- these events predate spill_outcome, so a "
+                           f"demotion still resident in T2 is counted the same as one "
+                           f"that was evicted)"),
+            "details": {"basis": "inferred", "demotions": total,
+                        "returned": returned, "never_returned": never,
+                        "gb_returned": round(gb_returned, 2),
+                        "gb_never_returned": round(gb_never, 2)}}
+
+
 def _res_agent_compaction_prefix_kept_pct(entity_id, window_s):
     """Share of compactions that preserved the reusable prompt prefix (AE-2).
 
@@ -919,21 +1207,66 @@ def _res_agent_compaction_prefix_kept_pct(entity_id, window_s):
     that is minutes of wall time per event.
     """
     ev = _agent_events("agent_context_edit", window_s)
-    if not ev:
-        return {"value": None, "unit": "percent",
-                "raw_source": "no agent_context_edit events yet"}
-    # head_kept > 0 is the ONLY thing that means the prefix survived.
+
+    # FOUR ops share the agent_context_edit kind: compact, microcompact,
+    # calibrate and hard_trim. Only `compact` rewrites history, and only a
+    # rewrite can move the prefix.
+    #
+    # This filter was missing until 2026-08-22, and it is the whole of casebook
+    # C-09's headline finding. The window C-09 measured contained exactly ONE
+    # agent_context_edit event: an `op=calibrate`, which carries no head_kept
+    # because a calibration edits nothing. This resolver counted it as a
+    # compaction, found no head_kept, scored it 0.0%, and
+    # `agent_compaction_broke_prefix` fired as a VIOLATION. No compaction had
+    # happened at all. The 0.0% was an artifact of the missing filter, not a
+    # destroyed prefix , and the segment's own "None, never False" contract had
+    # been written precisely to say so, then defeated here.
+    comp = [e for e in ev if e.get("op") == "compact"]
+    if not comp:
+        if not ev:
+            why = "no agent_context_edit events yet"
+        else:
+            ops = ", ".join(sorted({str(e.get("op") or "?") for e in ev}))
+            why = (f"{len(ev)} agent_context_edit event(s) in the window but no "
+                   f"compaction among them (ops seen: {ops}) , nothing has been "
+                   f"compacted, which is not the same as a compaction going badly")
+        return {"value": None, "unit": "percent", "raw_source": why,
+                "details": {"basis": "none", "compactions": 0,
+                            "context_edits": len(ev)}}
+
+    # Preferred: the share gb_prefix_guard measured BEFORE the rewrite was
+    # applied, carried on the event that caused it (2026-08-22 onward).
+    measured = [e["prefix_kept_pct"] for e in comp
+                if isinstance(e.get("prefix_kept_pct"), (int, float))]
+    if measured:
+        v = sum(measured) / len(measured)
+        return {"value": round(v, 1), "unit": "percent",
+                "raw_source": (f"measured prefix_kept_pct (gb_prefix_guard) over "
+                               f"{len(measured)} of {len(comp)} compaction(s)"),
+                "details": {"basis": "measured", "compactions": len(comp),
+                            "measured": len(measured),
+                            "tokens_lost": sum(int(e.get("tokens_lost") or 0)
+                                               for e in comp)}}
+
+    # Fallback for events written before the guard was wired: head_kept > 0 is
+    # the ONLY thing that means the prefix survived.
     #
     # This used to accept `extended_prior is True` as equivalent, and that is
     # exactly backwards: extended_prior says a prior memory block was absorbed
     # out of the middle and folded into the new summary, which REWRITES it at a
-    # new position. The prefix-destroying compaction found on 2026-08-21 emitted
-    # {"head_kept": 0, "extended_prior": True} , scored as a success by this
-    # resolver while it was throwing the whole prefix away. The 50% this
-    # reported was therefore an over-estimate of a worse number.
-    kept = sum(1 for e in ev if (e.get("head_kept") or 0) > 0)
-    return {"value": round(100.0 * kept / len(ev), 1), "unit": "percent",
-            "raw_source": f"agent_context_edit over {len(ev)} compaction(s)"}
+    # new position.
+    #
+    # Note what this number IS: the share of compactions that preserved
+    # ANYTHING, not the share of prefix preserved. A proportion standing in for
+    # a percentage. It is kept only so old events still answer, and `raw_source`
+    # says PROXY so a reader can tell the two apart.
+    kept = sum(1 for e in comp if (e.get("head_kept") or 0) > 0)
+    return {"value": round(100.0 * kept / len(comp), 1), "unit": "percent",
+            "raw_source": (f"PROXY: share of {len(comp)} compaction(s) with "
+                           f"head_kept>0 , these events predate gb_prefix_guard "
+                           f"and carry no measured prefix_kept_pct"),
+            "details": {"basis": "proxy", "compactions": len(comp),
+                        "measured": 0}}
 
 
 def _res_kv_t2_resident_mb(entity_id, window_s):
@@ -1178,12 +1511,22 @@ def _res_unregistered_cached_models(entity_id, window_s):
                     "raw_source": "no _hf_cache directory (nothing pulled from HF)"}
         known = {e.path for e in gb_synapse.list_models()}
         missing = []
-        for path in _glob.glob(str(cache / "models--*" / "snapshots" / "*" / "*.gguf")):
+        # Recursive (2026-09-01, same fix as gb_synapse.recover_from_hf_cache):
+        # a single fixed level misses Unsloth's UD-* layout, which nests
+        # shards one level deeper in a per-quant subfolder
+        # (snapshots/<rev>/UD-Q2_K_XL/<file>.gguf) — this metric undercounted
+        # on exactly the repo family this box actually has cached.
+        for path in _glob.glob(str(cache / "models--*" / "snapshots" / "*" / "**" / "*.gguf"),
+                               recursive=True):
             if path in known or _os.path.basename(path).startswith("mmproj"):
                 continue
+            fname = _os.path.basename(path)
+            shard_m = gb_synapse._SHARD_RE.match(fname)
+            if shard_m and shard_m.group(2) != "00001":
+                continue  # not its own servable model — see recover_from_hf_cache
             real = _os.path.realpath(path)
             if _os.path.exists(real) and _os.path.getsize(real) >= 1_000_000:
-                missing.append(_os.path.basename(path))
+                missing.append(fname)
         return {"value": len(missing), "unit": "count",
                 "raw_source": "_hf_cache/*.gguf vs gb_synapse.list_models()",
                 "evidence": {"missing": sorted(missing)[:8]}}
@@ -1192,6 +1535,64 @@ def _res_unregistered_cached_models(entity_id, window_s):
         # error, the exact pattern the GB-Semantics rule forbids.
         return {"value": None, "unit": "count",
                 "raw_source": f"could not read model cache: {e}"}
+
+
+def _res_recipes_unresolvable(entity_id, window_s):
+    """Serving recipes (serving/recipes/*.yaml) whose pinned model.name is
+    absent from the manifest right now.
+
+    A recipe file passing `check_recipes.check_recipe` (schema + digest ,
+    the `valid` field `synapse_doctor` already reports) says nothing about
+    this: `valid` is about the FILE, this is about whether the model it
+    names can actually be served. Real incident this closes (2026-09-01,
+    live on this box): two `valid: true` recipes, one the owner-designated
+    reference workload, pinned models the manifest didn't have, and nothing
+    governed reported it until this resolver existed.
+    """
+    try:
+        import os as _os
+        import sys as _sys
+        import gb_synapse
+        if not gb_synapse.MANIFEST_FILE.exists():
+            return {"value": None, "unit": "count",
+                    "raw_source": "manifest file does not exist , cannot check "
+                                   "whether any recipe's model resolves"}
+        serving_dir = _os.path.join(_os.path.dirname(gb_synapse.__file__), "serving")
+        if serving_dir not in _sys.path:
+            _sys.path.insert(0, serving_dir)
+        import check_recipes as _cr
+        import yaml as _yaml
+        manifest = gb_synapse._load_manifest()
+        unresolvable = []
+        for path in _cr.find_recipe_files():
+            # serving/recipes/example.yaml is a documented TEMPLATE (its own
+            # header: "safe by construction, not by policy") — its model.name
+            # is a placeholder that is DESIGNED to never resolve, so it isn't
+            # an operational recipe this metric should ever flag. Confirmed
+            # live 2026-09-22: without this exclusion, `recipes_unresolvable`
+            # permanently read 1 on a box where every real recipe resolved
+            # fine, the same "always-on false signal" shape the
+            # boot_tuning_persisted quote-boundary bug had.
+            if path.name == "example.yaml":
+                continue
+            try:
+                with open(path, encoding="utf-8") as f:
+                    recipe = _yaml.safe_load(f) or {}
+            except Exception:
+                continue
+            model_name = (recipe.get("model") or {}).get("name", "")
+            if not model_name:
+                continue
+            if gb_synapse._manifest_lookup(model_name, manifest) is None:
+                unresolvable.append({"path": str(path), "model": model_name})
+        return {"value": len(unresolvable), "unit": "count",
+                "raw_source": "serving/recipes/*.yaml model.name vs gb_synapse._load_manifest()",
+                "evidence": {"unresolvable": unresolvable}}
+    except Exception as e:
+        # Never report 0 on failure — a clean bill inferred from an error is
+        # exactly the pattern the GB-Semantics rule forbids.
+        return {"value": None, "unit": "count",
+                "raw_source": f"could not check recipe resolvability: {e}"}
 
 
 def _res_dataflux_event_count(entity_id, window_s):
@@ -1209,7 +1610,7 @@ def _res_dataflux_event_count(entity_id, window_s):
         import gb_dataflux
         # since_hours large enough to span the retained archive; read_events
         # already merges the .1.gz archive ahead of the live file.
-        events = gb_dataflux.read_events(since_hours=24 * 3650)
+        events = _read_events(since_hours=24 * 3650)
         n = len(events)
         newest = None
         if n:
@@ -1446,7 +1847,7 @@ def _res_cluster_vram_fill_pct(entity_id, window_s):
 def _res_feeder_items(entity_id, window_s):
     try:
         import gb_dataflux
-        events = gb_dataflux.read_events(since_hours=(window_s / 3600.0) if window_s else 24)
+        events = _read_events(since_hours=(window_s / 3600.0) if window_s else 24)
         summary = gb_dataflux.summarize(events)
         nodes = summary.get("nodes", {})
         if entity_id:
@@ -1503,7 +1904,7 @@ def _res_quant_rel_error(entity_id, window_s):
     going through `_latest_event`'s node-only filter."""
     try:
         import gb_dataflux
-        events = gb_dataflux.read_events(since_hours=(window_s / 3600.0) if window_s else 48)
+        events = _read_events(since_hours=(window_s / 3600.0) if window_s else 48)
     except Exception as e:
         return {"value": None, "unit": "fraction", "raw_source": "unavailable", "error": str(e)}
     cand = [e for e in events if e.get("kind") == "quant_plan"]
@@ -1669,6 +2070,186 @@ def _res_kmod_load_stage(entity_id, window_s):
                        f"first was at {blocks[0][0]:.3f} "
                        f"({'initramfs' if blocks[0][0] < switch_ts else 'realroot'}).")
     return out
+
+
+# ── Boot tuning (GRUB) persistence ─────────────────────────────────────────
+#
+# Added 2026-08-31 after `apt purge grub-pc` deleted /etc/default/grub (a
+# ucf-managed file shared across every grub-* package, not owned by
+# GreenBoost) and cmd_tune_grub's own `die` turned that into a Full Install
+# abort. Nothing in the governed layer could answer the question this
+# incident is made of: "will my boot tuning survive the next reboot?" See
+# workflow/known-issues.md's 2026-08-31 entry and CHANGELOG.md for the full
+# incident and fix.
+
+_GB_SETUP_SH_CANDIDATES = (
+    Path("/usr/local/bin/greenboost_setup.sh"),
+    Path(__file__).resolve().parent / "greenboost_setup.sh",
+)
+
+
+def _gb_grub_param_lists():
+    """(static_params, range_patterns, source_path) , GreenBoost's own
+    tune-grub boot parameters, read directly from greenboost_setup.sh's
+    `_GB_GRUB_STATIC_PARAMS` / `_GB_GRUB_RANGE_PATTERNS` arrays so this
+    governed layer can never drift from what `cmd_tune_grub` /
+    `cmd_restore_tune_grub` actually apply , those two functions already
+    share these exact arrays as their one source of truth; reading them
+    here (rather than re-typing a third copy) keeps it that way.
+    """
+    for p in _GB_SETUP_SH_CANDIDATES:
+        try:
+            if not p.is_file():
+                continue
+            text = p.read_text(errors="replace")
+        except OSError:
+            continue
+        static_m = _re.search(r'_GB_GRUB_STATIC_PARAMS=\((.*?)\)', text, _re.S)
+        range_m = _re.search(r'_GB_GRUB_RANGE_PATTERNS=\((.*?)\)', text, _re.S)
+        if not (static_m and range_m):
+            continue
+        # Bash double-quoted strings here can contain an escaped `\"` (the
+        # range patterns do, to match GRUB_CMDLINE_LINUX_DEFAULT's own
+        # quoting: "rcu_nocbs=[^ \"]*"). A naive `"([^"]+)"` stops at that
+        # escaped quote and truncates the pattern mid-character-class,
+        # producing a regex that fails with "unterminated character set" the
+        # first time a resolver actually runs it , caught by exercising this
+        # against the real box rather than trusting the extraction unread.
+        _str_re = _re.compile(r'"((?:[^"\\]|\\.)*)"')
+        static_params = [m.replace('\\"', '"') for m in _str_re.findall(static_m.group(1))]
+        range_patterns = [m.replace('\\"', '"') for m in _str_re.findall(range_m.group(1))]
+        if static_params and range_patterns:
+            return static_params, range_patterns, str(p)
+    # Fallback for a box where neither the installed nor the source-tree copy
+    # of greenboost_setup.sh is reachable , kept only as a last resort, NOT
+    # the source of truth (that's always the script above when present).
+    return (
+        ["transparent_hugepage=always", "skew_tick=1", "numa_balancing=disable",
+         "workqueue.power_efficient=0"],
+        ['rcu_nocbs=[^ "]*', 'nohz_full=[^ "]*'],
+        "hardcoded fallback (greenboost_setup.sh not found on this box)",
+    )
+
+
+def _gb_boot_param_presence(text: str, static_params, range_patterns):
+    """(present, total, missing) , how many of GreenBoost's boot params
+    appear as a whole word/token in `text` (a cmdline or a
+    GRUB_CMDLINE_LINUX_DEFAULT value).
+
+    Boundary is "whitespace, a quote character, or start/end of string" ,
+    NOT plain "\\S", because `text` for the persisted side is the literal
+    contents of a bash double-quoted assignment
+    (GRUB_CMDLINE_LINUX_DEFAULT="... workqueue.power_efficient=0"), and the
+    last param before the closing `"` has no trailing space. `(?!\\S)`
+    treats that `"` as part of the token and reports the param missing even
+    though it is genuinely present and will genuinely survive `update-grub`
+    , confirmed live 2026-09-22 on this box: 99-greenboost.cfg's last param
+    is exactly this shape, and the old boundary made boot_tuning_persisted
+    read 0.83 (5/6) every single boot, permanently, not just on a real
+    regression. Real 6/6 requires quotes to count as boundaries too.
+    """
+    total = len(static_params) + len(range_patterns)
+    missing = []
+    present = 0
+    boundary_before = r'(?<![^\s"\'])'
+    boundary_after = r'(?![^\s"\'])'
+    for p in static_params:
+        if _re.search(boundary_before + _re.escape(p) + boundary_after, text):
+            present += 1
+        else:
+            missing.append(p)
+    for pat in range_patterns:
+        if _re.search(boundary_before + pat + boundary_after, text):
+            present += 1
+        else:
+            missing.append(pat)
+    return present, total, missing
+
+
+def _res_boot_tuning_active(entity_id, window_s):
+    """Fraction of GreenBoost's GRUB boot parameters present in THIS boot's
+    /proc/cmdline , i.e. what actually took effect at the last boot.
+
+    This describes the RUNNING boot only. It says nothing about whether the
+    config that would reproduce it on the NEXT boot still exists , see
+    boot_tuning_persisted and this metric's own never_use trap. Incident
+    2026-08-31: /proc/cmdline showed every GreenBoost flag while
+    /etc/default/grub had just been deleted out from under GRUB by a
+    `grub-pc` package purge; reading cmdline alone would have said
+    everything was fine.
+    """
+    try:
+        cmdline = Path("/proc/cmdline").read_text()
+    except OSError as e:
+        return {"value": None, "unit": "fraction", "raw_source": "unavailable", "error": str(e)}
+    static_params, range_patterns, src = _gb_grub_param_lists()
+    present, total, missing = _gb_boot_param_presence(cmdline, static_params, range_patterns)
+    return {"value": round(present / total, 2) if total else None, "unit": "fraction",
+            "raw_source": "/proc/cmdline", "param_source": src,
+            "present": present, "total": total, "missing": missing}
+
+
+def _res_boot_tuning_persisted(entity_id, window_s):
+    """Fraction of GreenBoost's GRUB boot parameters present in the
+    EFFECTIVE GRUB config , /etc/default/grub's GRUB_CMDLINE_LINUX_DEFAULT
+    plus every /etc/default/grub.d/*.cfg drop-in (including
+    99-greenboost.cfg) , i.e. what the NEXT `update-grub` will actually
+    write into grub.cfg. This is the field that answers "will my tuning
+    survive a reboot", which boot_tuning_active alone cannot.
+
+    A genuinely absent config (both the main file and the drop-in
+    directory missing , this incident's exact shape) resolves to 0.0, a
+    real answer, not None. None is reserved for an actual read failure
+    (e.g. permission denied on a file that does exist).
+    """
+    static_params, range_patterns, src = _gb_grub_param_lists()
+    chunks = []
+    grub_main = Path("/etc/default/grub")
+    dropin_dir = Path("/etc/default/grub.d")
+    saw_any_path = False
+    read_error = None
+    if grub_main.is_file():
+        saw_any_path = True
+        try:
+            chunks.append(grub_main.read_text(errors="replace"))
+        except OSError as e:
+            read_error = str(e)
+    if dropin_dir.is_dir():
+        for f in sorted(dropin_dir.glob("*.cfg")):
+            saw_any_path = True
+            try:
+                chunks.append(f.read_text(errors="replace"))
+            except OSError as e:
+                read_error = str(e)
+    if not saw_any_path:
+        total = len(static_params) + len(range_patterns)
+        return {"value": 0.0, "unit": "fraction",
+                "raw_source": "/etc/default/grub and /etc/default/grub.d/ both absent",
+                "param_source": src, "present": 0, "total": total,
+                "missing": static_params + range_patterns}
+    if not chunks and read_error:
+        return {"value": None, "unit": "fraction",
+                "raw_source": "unavailable", "error": read_error}
+    present, total, missing = _gb_boot_param_presence("\n".join(chunks), static_params, range_patterns)
+    return {"value": round(present / total, 2) if total else None, "unit": "fraction",
+            "raw_source": "/etc/default/grub + /etc/default/grub.d/*.cfg",
+            "param_source": src, "present": present, "total": total, "missing": missing}
+
+
+def _seg_boot_tuning_lost_next_reboot():
+    """Matched: GreenBoost's boot tuning is active THIS boot but the config
+    that would reproduce it on the NEXT boot has regressed , the exact
+    shape of the 2026-08-31 incident (grub-pc purge deleted
+    /etc/default/grub; /proc/cmdline still showed every flag). `matched` is
+    None, never False, when either side can't be read , an unknown state
+    is not a clean bill of health.
+    """
+    active = resolve("boot_tuning_active")
+    persisted = resolve("boot_tuning_persisted")
+    a, p = active.get("value"), persisted.get("value")
+    if a is None or p is None:
+        return None, [active, persisted]
+    return (a > 0 and p < a), [active, persisted]
 
 
 # ── Gaming Suite: the launch path ──────────────────────────────────────────
@@ -2315,6 +2896,21 @@ def resolve(metric_name: str, entity_id: "str | None" = None,
     # resolver's own structured evidence, never a second place to put `value`.
     if raw.get("details") is not None:
         out["details"] = raw["details"]
+    # Same passthrough, other key name (2026-09-01 fix): several resolvers
+    # predate `details` and were already returning structured evidence under
+    # `evidence` (_res_unregistered_cached_models's `missing` list,
+    # _res_recipes_unresolvable's `unresolvable` list, _res_shim_probe's
+    # `pool_brief`, at minimum) — resolve()'s fixed schema silently dropped
+    # it, so every segment built on `resolve(...).get("evidence")` (e.g.
+    # _seg_models_wiped_from_manifest, _seg_recipe_model_unresolvable) always
+    # reported an empty `examples` list through the real public API, even
+    # though the underlying resolver had computed exactly the detail an
+    # operator needed (which file, which model). Caught testing the new
+    # recipes_unresolvable metric against this box's real manifest, not by
+    # a synthetic call to the `_res_*` function directly — that path never
+    # goes through resolve() and hid the drop.
+    if raw.get("evidence") is not None:
+        out["evidence"] = raw["evidence"]
     if "error" in raw:
         out["error"] = raw["error"]
     return out
@@ -2551,6 +3147,42 @@ def _seg_proxy_memory_near_cap(entity_id=None, window_s=None):
     return hv <= 20.0, [rss, head]
 
 
+def _seg_tool_result_dominates_turn(entity_id=None, window_s=None):
+    """One tool result costs over ten seconds of prefill."""
+    m = resolve("tool_result_prefill_ms")
+    v = m.get("value")
+    if v is None:
+        return None, [m]
+    return v > 10000.0, [m]
+
+
+def _seg_warm_prefill_dominates_turn(entity_id=None, window_s=None):
+    """Over a second goes by before the first output token, on a warm turn.
+
+    Warning rather than info: unlike the architectural cost this replaced, this
+    one is not something the model has to pay. It is independent of prompt and
+    output length, so it is setup, and setup can be cut.
+    """
+    m = resolve("warm_prefill_fixed_ms")
+    v = m.get("value")
+    if v is None:
+        return None, [m]
+    return v > 1000.0, [m]
+
+
+def _seg_tier_spill_returns_often(entity_id=None, window_s=None):
+    """More than half of all demotions had to be undone.
+
+    Null, not False, when nothing has been demoted -- "nothing was spilled" is
+    not "spilling is healthy", the same contract every segment here uses.
+    """
+    m = resolve("tier_spill_return_pct")
+    v = m.get("value")
+    if v is None:
+        return None, [m]
+    return v > 50.0, [m]
+
+
 def _seg_agent_compaction_broke_prefix(entity_id=None, window_s=None):
     """A compaction rewrote the prefix instead of appending to it.
 
@@ -2563,6 +3195,22 @@ def _seg_agent_compaction_broke_prefix(entity_id=None, window_s=None):
     v = kept.get("value")
     if v is None:
         return None, [kept]
+    basis = (kept.get("details") or {}).get("basis")
+    if basis == "measured":
+        # A real share of the prefix. Every compaction moves SOMETHING - the
+        # summary has to go somewhere - so `< 100` would fire on the normal,
+        # cheap case and mean nothing. The line is gb_prefix_guard's own
+        # BROKE_PREFIX_PCT, which is where the threshold is defined and
+        # justified; importing it keeps one number in one place rather than a
+        # second constant here that could drift away from it.
+        try:
+            from gb_prefix_guard import BROKE_PREFIX_PCT as _line
+        except Exception:
+            _line = 50.0
+        return v < _line, [kept]
+    # Proxy basis: v is the share of compactions that kept ANY head. Anything
+    # under 100 means at least one compaction threw the whole prefix away,
+    # which is a violation at any rate above zero.
     return v < 100.0, [kept]
 
 
@@ -2728,6 +3376,29 @@ def _seg_models_wiped_from_manifest():
     ev = dict(n)
     ev["examples"] = (n.get("evidence") or {}).get("missing", [])
     ev["fix"] = "greenboost recover-models"
+    return count > 0, [ev]
+
+
+def _seg_recipe_model_unresolvable():
+    """A pinned serving recipe's model does not exist in the manifest.
+
+    Severity `violation`, matching `_seg_models_wiped_from_manifest`: nothing
+    about the hardware makes this true, and it is fixed in seconds by
+    `greenboost synapse recover-cache` (added 2026-09-01) without downloading
+    anything. This segment starts from the RECIPE side rather than the raw
+    disk-cache side, so its evidence names the exact recipe path and model an
+    operator would otherwise only discover from a `no such model` failure at
+    serve time.
+    """
+    n = resolve("recipes_unresolvable")
+    if n.get("value") is None:
+        # Cannot tell — never False. A clean bill inferred from an unreadable
+        # manifest is the failure mode this layer exists to prevent.
+        return None, [n]
+    count = int(n["value"])
+    ev = dict(n)
+    ev["examples"] = (n.get("evidence") or {}).get("unresolvable", [])
+    ev["fix"] = "greenboost synapse recover-cache"
     return count > 0, [ev]
 
 
@@ -2981,6 +3652,18 @@ def _seg_kmod_missing_silent_degrade():
     fresh = resolve("shim_fresh")
     matched = kmod.get("value") is False and fresh.get("value") is True
     return matched, [kmod, fresh]
+
+
+def _seg_separate_mtp_head_unused():
+    """A separate MTP head file sits beside the weights but the last serve of
+    it did not load it. matched None (never False) when the serve event
+    predates the `mtp_head` field, since a clean verdict from an event that
+    can't say is the failure this layer exists to prevent."""
+    head = resolve("mtp_head_on_disk")
+    ev = _latest_event("synapse_serve")
+    if head.get("value") is None or ev is None or "mtp_head" not in ev:
+        return None, [head]
+    return (head["value"] == 1.0 and not ev.get("mtp_head")), [head, {"metric": "synapse_serve.mtp_head", "value": ev.get("mtp_head")}]
 
 
 def _seg_kmod_version_drift():

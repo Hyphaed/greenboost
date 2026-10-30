@@ -383,6 +383,98 @@ def handle_edit(
         return f"Error: {e}"
 
 
+def handle_multi_edit(file_path: str, edits: list) -> str:
+    """Apply several exact-text edits to ONE file, all or nothing.
+
+    Each edit sees the result of the one before it. If any edit fails the file
+    is left exactly as it was, so a half-applied refactor can't happen."""
+    p = Path(file_path)
+    if not isinstance(edits, list) or not edits:
+        return "Error: edits must be a non-empty list of {old_string, new_string[, replace_all]}"
+    if not p.exists():
+        return f"Error: file not found: {file_path}"
+    stale = _changed_since_read(p)
+    if stale:
+        return stale
+    try:
+        original = p.read_text()
+    except Exception as e:
+        return f"Error: {e}"
+    content = original
+    for i, e in enumerate(edits, 1):
+        old, new = e.get("old_string", ""), e.get("new_string", "")
+        if not old:
+            return f"Error: edit {i}: old_string is empty. Nothing was changed."
+        n = content.count(old)
+        if n == 0:
+            return (f"Error: edit {i}: old_string not found (after edits 1-{i - 1}). "
+                    f"Nothing was changed.\n  Next: Read(file_path=\"{file_path}\") and retry.")
+        if n > 1 and not e.get("replace_all"):
+            return (f"Error: edit {i}: old_string appears {n} times. Add context or set "
+                    "replace_all. Nothing was changed.")
+        content = content.replace(old, new) if e.get("replace_all") else content.replace(old, new, 1)
+    _snapshot_before_write(p)
+    try:
+        p.write_text(content)
+    except Exception as e:
+        return f"Error: {e}"
+    return f"Applied {len(edits)} edit(s) to {file_path}"
+
+
+def handle_notebook_edit(notebook_path: str, cell_id=None, cell_index=None,
+                         new_source: str = "", cell_type=None, edit_mode: str = "replace") -> str:
+    """Replace, insert or delete one cell of a Jupyter notebook, keeping the rest verbatim."""
+    import json as _json
+    p = Path(notebook_path)
+    if p.suffix != ".ipynb":
+        return "Error: NotebookEdit only edits .ipynb files; use Edit for other files."
+    if not p.exists():
+        return f"Error: file not found: {notebook_path}"
+    try:
+        nb = _json.loads(p.read_text())
+        cells = nb["cells"]
+    except Exception as e:
+        return f"Error: not a readable notebook: {e}"
+    idx = None
+    if cell_id is not None:
+        idx = next((i for i, c in enumerate(cells) if c.get("id") == cell_id), None)
+        if idx is None:
+            return f"Error: no cell with id {cell_id!r}"
+    elif cell_index is not None:
+        idx = int(cell_index)
+        if not (0 <= idx < len(cells) + (1 if edit_mode == "insert" else 0)):
+            return f"Error: cell_index {idx} out of range (0..{len(cells) - 1})"
+    src = new_source.splitlines(keepends=True)
+    _snapshot_before_write(p)
+    if edit_mode == "delete":
+        if idx is None:
+            return "Error: delete needs cell_id or cell_index"
+        del cells[idx]
+        msg = f"Deleted cell {idx}"
+    elif edit_mode == "insert":
+        ct = cell_type or "code"
+        cell = {"cell_type": ct, "metadata": {}, "source": src}
+        if ct == "code":
+            cell.update(execution_count=None, outputs=[])
+        cells.insert(len(cells) if idx is None else idx + (1 if cell_id is not None else 0), cell)
+        msg = f"Inserted a {ct} cell"
+    else:
+        if idx is None:
+            return "Error: replace needs cell_id or cell_index"
+        cells[idx]["source"] = src
+        if cell_type and cell_type != cells[idx].get("cell_type"):
+            cells[idx]["cell_type"] = cell_type
+        if cells[idx].get("cell_type") == "code":
+            cells[idx]["outputs"] = []
+            cells[idx]["execution_count"] = None
+        msg = f"Replaced cell {idx}"
+    try:
+        p.write_text(_json.dumps(nb, indent=1, ensure_ascii=False) + "\n")
+    except Exception as e:
+        return f"Error: {e}"
+    return f"{msg} in {notebook_path}"
+
+
 def handle_shell(command: str, timeout: int = 120,
                  run_in_background: bool = False) -> str:
     if run_in_background:
@@ -394,7 +486,11 @@ def handle_shell(command: str, timeout: int = 120,
         # Same working directory the foreground path would have used ,
         # a factory task scopes its Bash cwd per thread, and a
         # backgrounded command must not escape that scoping.
-        jid = start(command, cwd=getattr(_bash_cwd_tls, "value", None))
+        from greenboost_cli.instruments.shell_sandbox import SandboxUnavailable
+        try:
+            jid = start(command, cwd=getattr(_bash_cwd_tls, "value", None))
+        except SandboxUnavailable as e:
+            return f"Error: {e}"
         return (f"[started in the background as {jid}]\n"
                 f"Carry on with other work. TaskOutput(task_id=\"{jid}\") "
                 f"returns what it has printed since you last looked; "
@@ -412,17 +508,27 @@ def _handle_shell_foreground(command: str, timeout: int = 120) -> str:
     _MARKER = "::CWD::"
     tracked = f"{command}\nprintf '\\n{_MARKER}%s\\n' \"$(pwd)\""
 
+    from greenboost_cli.instruments import shell_sandbox
+    jail = shell_sandbox.active_roots()
     try:
-        r = subprocess.run(
-            tracked,
-            shell=True,
-            executable="/bin/bash",
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=run_cwd,
-            env=os.environ.copy(),
-        )
+        if jail:
+            try:
+                argv = shell_sandbox.bwrap_argv(tracked, jail, run_cwd)
+            except shell_sandbox.SandboxUnavailable as e:
+                return f"Error: {e}"
+            r = subprocess.run(argv, capture_output=True, text=True,
+                               timeout=timeout, cwd=run_cwd, env=os.environ.copy())
+        else:
+            r = subprocess.run(
+                tracked,
+                shell=True,
+                executable="/bin/bash",
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=run_cwd,
+                env=os.environ.copy(),
+            )
         out = r.stdout
 
         # Parse and strip the cwd sentinel line
@@ -552,23 +658,33 @@ def handle_semble(query: str, repo: str = None, top_k: int = 5,
 
 
 def handle_fetch_url(url: str, prompt: str = None) -> str:
-    # WebFetch is in _ALWAYS_APPROVED , it never asks. Over a multi-day
+    # WebFetch is in _ALWAYS_APPROVED, so it never asks. Over a multi-day
     # unattended run that is a lot of unreviewed outbound requests, and the URL
-    # can come from a fetched page or a file rather than from the user. Judge
-    # the destination before going there.
-    try:
-        from greenboost_cli.instruments.url_guard import check_url
-        refusal = check_url(url)
-        if refusal:
-            return refusal
-    except Exception:
-        pass                    # a broken guard must not break fetching
-    from greenboost_cli.instruments.scrapling_utils import fetch_url as _scrapling_fetch
-    return _scrapling_fetch(url)
+    # can come from a fetched page or a file rather than from the user, so the
+    # destination is judged INSIDE the HTTP client (instruments/safe_fetch.py:
+    # one DNS lookup per hop, per-hop redirect checks, byte cap, content-type
+    # allowlist). A guard that errors blocks the fetch; it does not skip it.
+    from greenboost_cli.instruments import safe_fetch
+    result = safe_fetch.fetch(url)
+    # A real browser can be pointed at anything by a page's own JavaScript, and a
+    # redirect it follows can't be checked hop by hop. So the bot-wall fallback
+    # is opt-in, and only after the plain client was refused with an anti-bot status.
+    if (os.environ.get("GB_WEBFETCH_BROWSER") == "1"
+            and any(f"returned HTTP {c}" in result for c in (403, 429, 503))):
+        from greenboost_cli.instruments.scrapling_utils import fetch_url as _scrapling_fetch
+        return _scrapling_fetch(url, use_stealth=True)
+    return result
 
 
 def handle_screenshot(url: str, output_path: str, width: int = 1280,
                        height: int = 800, full_page: bool = False) -> str:
+    # Same destination rules as WebFetch; a headless browser is a fetcher too.
+    # Redirects inside the browser can't be re-checked, so this validates the
+    # URL the agent asked for and refuses on any doubt.
+    from greenboost_cli.instruments import safe_fetch
+    checked = safe_fetch.validate(url)
+    if isinstance(checked, str):
+        return checked
     from greenboost_cli.instruments.screenshot_utils import capture_screenshot
     return capture_screenshot(url, output_path, width=width, height=height,
                                full_page=full_page)

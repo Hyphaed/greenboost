@@ -66,6 +66,41 @@
  */
 extern __attribute__((weak)) void *__libc_dlsym(void *map, const char *name);
 
+/* Real dlsym, resolved without going through our own dlsym() wrapper below.
+ * dlvsym() is not wrapped, so it reaches the genuine glibc symbol. Shared by
+ * the dlsym wrapper and by every internal lookup of a libcuda symbol: an
+ * internal lookup that calls plain dlsym() would be answered by our own
+ * wrapper (which returns our hooks), cache our own function as "the real
+ * one", and then answer every attribute query with 0 (see the recursion guard
+ * in cuDeviceGetAttribute; this was the Triton "shared memory Hardware
+ * limit: 0" failure under LD_PRELOAD on glibc where __libc_dlsym is absent). */
+static void *(*gb_real_dlsym_fn(void))(void *, const char *)
+{
+    static void *(*real_dlsym)(void *, const char *) = NULL;
+    if (!real_dlsym) {
+        real_dlsym = (void *(*)(void *, const char *))
+            dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");
+        if (!real_dlsym)
+            real_dlsym = (void *(*)(void *, const char *))
+                dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
+        if (!real_dlsym)
+            real_dlsym = (void *(*)(void *, const char *))
+                dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.17");
+        if (!real_dlsym && __libc_dlsym)
+            real_dlsym = (void *(*)(void *, const char *))
+                __libc_dlsym(RTLD_NEXT, "dlsym");
+    }
+    return real_dlsym;
+}
+
+/* Look a symbol up in an explicit handle using the real dlsym. */
+static void *gb_real_sym(void *h, const char *name)
+{
+    void *(*d)(void *, const char *) = gb_real_dlsym_fn();
+    if (d) return d(h, name);
+    return __libc_dlsym ? __libc_dlsym(h, name) : NULL;
+}
+
 /* CUDA error codes used here */
 #define CUDA_SUCCESS                    0
 #define CUDA_ERROR_NOT_SUPPORTED      801
@@ -94,6 +129,7 @@ typedef int (*pfn_cuMAR_t)(unsigned long long *, size_t, size_t,
  * IMPORTANT: use __libc_dlsym, NOT dlsym(), to avoid recursing through our
  * own dlsym wrapper below.  __libc_dlsym resolves against the actual link-map
  * handle and is immune to PLT interception. */
+int cuDeviceGetAttribute(int *value, int attrib, int dev);
 static pfn_cuDGA_t gb_real_cuDGA(void)
 {
     static pfn_cuDGA_t fn = NULL;
@@ -101,12 +137,9 @@ static pfn_cuDGA_t gb_real_cuDGA(void)
     void *h = dlopen("libcuda.so.1", RTLD_NOLOAD | RTLD_NOW | RTLD_GLOBAL);
     if (!h) h = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL | RTLD_NODELETE);
     if (h) {
-        /* Prefer __libc_dlsym (bypasses our wrapper); fall back to real_dlsym
-         * set in the dlsym wrapper's constructor path when __libc_dlsym is absent */
-        if (__libc_dlsym)
-            fn = (pfn_cuDGA_t)__libc_dlsym(h, "cuDeviceGetAttribute");
-        else
-            fn = (pfn_cuDGA_t)dlsym(h, "cuDeviceGetAttribute");
+        fn = (pfn_cuDGA_t)gb_real_sym(h, "cuDeviceGetAttribute");
+        if (fn == (pfn_cuDGA_t)cuDeviceGetAttribute)
+            fn = NULL;  /* never cache ourselves as the real function */
     }
     return fn;
 }
@@ -165,6 +198,11 @@ int cuDeviceGetAttribute(int *value, int attrib, int dev)
      */
     static _Thread_local int gb_cuDGA_depth = 0;
     if (gb_cuDGA_depth > 0) {
+        /* Only the VMM attribute has a correct "0" answer. Any other
+         * attribute must not be faked as 0 (Triton reads shared memory per
+         * block through here): report unsupported instead. */
+        if (attrib != GB_ATTR_VMM_SUPPORTED)
+            return CUDA_ERROR_NOT_SUPPORTED;
         if (value) *value = 0;
         return CUDA_SUCCESS;
     }
@@ -202,11 +240,9 @@ int cuMemAddressReserve(unsigned long long *ptr, size_t size, size_t alignment,
     void *h = dlopen("libcuda.so.1", RTLD_NOLOAD | RTLD_NOW | RTLD_GLOBAL);
     real_t real = NULL;
     if (h) {
-        /* Use __libc_dlsym to avoid recursing through our dlsym wrapper */
-        if (__libc_dlsym)
-            real = (real_t)__libc_dlsym(h, "cuMemAddressReserve");
-        else
-            real = (real_t)dlsym(h, "cuMemAddressReserve");
+        real = (real_t)gb_real_sym(h, "cuMemAddressReserve");
+        if (real == (real_t)cuMemAddressReserve)
+            real = NULL;
     }
     if (!real) return CUDA_ERROR_NOT_SUPPORTED;
     return real(ptr, size, alignment, addr, flags);
@@ -240,34 +276,9 @@ void *dlsym(void *handle, const char *name)
 {
     /* Bootstrap: initialise the real dlsym pointer exactly once.
      * __libc_dlsym lives in ld.so and is immune to PLT interception. */
-    static void *(*real_dlsym)(void *, const char *) = NULL;
-    if (!real_dlsym) {
-        /* Use dlvsym with an explicit glibc version to find the real dlsym.
-         * __libc_dlsym(map, name) is a glibc-private function that expects a
-         * real link-map pointer , passing RTLD_NEXT (a pseudo-handle) to it
-         * returns a broken wrapper that cannot perform handle-scoped lookups.
-         * Ollama 0.30.8 registers ggml backends dynamically via
-         * dlsym(real_handle, entrypoint) , if real_dlsym is broken those
-         * lookups return NULL and ggml registers zero backends, crashing every
-         * model load with "no backends are loaded".
-         * dlvsym with a versioned glibc symbol safely resolves the correct
-         * implementation regardless of our unversioned dlsym export. */
-        real_dlsym = (void *(*)(void *, const char *))
-            dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");
-        if (!real_dlsym)
-            real_dlsym = (void *(*)(void *, const char *))
-                dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
-        if (!real_dlsym)
-            real_dlsym = (void *(*)(void *, const char *))
-                dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.17");
-        if (!real_dlsym && __libc_dlsym)
-            /* musl / non-glibc last resort , RTLD_NEXT is accepted here on
-             * some implementations even though it is not a link-map. */
-            real_dlsym = (void *(*)(void *, const char *))
-                __libc_dlsym(RTLD_NEXT, "dlsym");
-        if (!real_dlsym)
-            return NULL;
-    }
+    void *(*real_dlsym)(void *, const char *) = gb_real_dlsym_fn();
+    if (!real_dlsym)
+        return NULL;
 
     /* Intercept requests for the CUDA symbols we need to override. */
     if (name) {

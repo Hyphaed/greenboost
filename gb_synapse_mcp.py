@@ -28,7 +28,7 @@ import json
 import shutil
 import subprocess
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -66,9 +66,12 @@ def _gb_bin() -> str | None:
 def synapse_status() -> dict:
     """GB-Synapse status: engine built (llama-server + rpc-server) + version,
     and whether the server and the gb-synapse Ollama/OpenAI proxy (default
-    port 11369, GB_SYNAPSE_PORT) are running. Canonical owner (shared impl
-    in gb_mcp_common.py — also mirrored on greenboost-orchestrator and
-    greenboost-dataflux)."""
+    port 11369, GB_SYNAPSE_PORT) are running. The `engine` block says which
+    llama.cpp engine is active (vendored | moecache + version), whether it
+    accepts --moe-cache-mib, the saved choice, the last serve's expert-cache
+    size / n_cpu_moe / MTP on-off with the reason, and a pointer to the
+    fp8_paths advice. Canonical owner (shared impl in gb_mcp_common.py — also
+    mirrored on greenboost-orchestrator and greenboost-dataflux)."""
     import gb_mcp_common
     return gb_mcp_common.synapse_status()
 
@@ -91,6 +94,32 @@ def synapse_models() -> list[dict]:
         return out
     except Exception as e:
         return [{"error": str(e)}]
+
+
+@mcp.tool()
+def synapse_recover_cache() -> dict:
+    """Re-register models whose weights are already in the HuggingFace cache
+    (`_hf_cache/`) but missing from the manifest, without downloading
+    anything — this is the MCP surface for `gb_synapse.recover_from_hf_cache`,
+    which until 2026-09-01 had no invocation path besides a Full Install
+    (the MCP Tool Gaps rule's exact target: `models_wiped_from_manifest`'s
+    own dataflux recommendation named this as a "seconds-long fix" that
+    nothing could actually run).
+
+    Not `_READ_ONLY`: it can ADD entries to the manifest. It never removes or
+    rewrites an existing one, so it's safe to call speculatively — an empty
+    `recovered` list means the manifest already matches the cache.
+
+    Returns `{"recovered": [...ModelEntry dicts...], "skipped": [...]}`.
+    `skipped` names any GGUF found on more than one cached snapshot revision
+    under the same resolved name — the newer file is kept automatically, the
+    older one is named here rather than silently dropped."""
+    try:
+        import gb_synapse
+        result = gb_synapse.recover_from_hf_cache()
+        return {"recovered": [asdict(e) for e in result], "skipped": result.skipped}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @mcp.tool(annotations=_READ_ONLY)
@@ -138,9 +167,12 @@ def synapse_doctor(probe_feeders: bool = True) -> dict:
     manifest health, plus `torch_engine_ready`/`torch_engine_env` (the
     synapse torch engine's venv, if installed), and a `recipes` block
     (NemoClaw audit, Phase 5e MCP surface) listing every serving recipe
-    found under serving/recipes/ with its target model name and whether it
-    currently validates (schema + digest) — "which models have a pinned
-    recipe" without grepping the directory by hand."""
+    found under serving/recipes/ with its target model name, whether it
+    currently validates (schema + digest, `valid`), and separately whether
+    that model actually resolves in the manifest right now (`model_resolves`,
+    tri-state — see `_recipe_coverage_report`'s docstring) — "which models
+    have a pinned recipe, and can any of them actually serve" without
+    grepping the directory by hand."""
     try:
         import gb_synapse
         result = gb_synapse.doctor(probe_feeders=probe_feeders)
@@ -150,13 +182,52 @@ def synapse_doctor(probe_feeders: bool = True) -> dict:
         return {"error": str(e)}
 
 
+@dataclass
+class RecipeCoverageEntry:
+    """One row of `synapse_doctor`'s `recipes` block. A real dataclass
+    (not an ad-hoc dict) so `valid` and `model_resolves` are enumerable
+    fields — the GB-Semantics Must-Rule's `never_use` trap on `valid`
+    (semantics/segments.yaml's `recipe_model_unresolvable`) is registered
+    against THIS class in checks/check_semantics_coverage.py's
+    `_KNOWN_CLASSES`, so the trap is validated rather than waved through
+    as advisory."""
+    path: str
+    model: str
+    valid: bool
+    # Tri-state per the GB-Semantics Must-Rule: None means "the manifest
+    # couldn't be read", never a bare False standing in for "don't know" —
+    # a recipe pinning a real, resolvable model must never look identical
+    # to one this function simply failed to check.
+    model_resolves: "bool | None" = None
+    error: str = ""
+
+
 def _recipe_coverage_report() -> list[dict]:
+    """Per-recipe schema/digest validity (`valid`) PLUS whether the model it
+    pins actually exists in the manifest right now (`model_resolves`) —
+    deliberately two separate fields, never folded into one. `valid` only
+    means the recipe FILE parses against `recipe.schema.json` and its digest
+    matches; it says nothing about whether `synapse serve` on that model
+    would find anything to load. Real incident this closes (2026-09-01, live
+    on this box): two recipes reported `valid: true` while pinning models
+    absent from the manifest — one of them the reference workload — and
+    nothing in `synapse_doctor`'s output said so, exactly the "confidently
+    wrong, not merely quiet" failure mode the GB-Semantics Must-Rule names.
+    See `RecipeCoverageEntry` for why `model_resolves` is a real field, not
+    just a dict key."""
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent / "serving"))
         import check_recipes as cr
     except ImportError:
         return []
     schema = cr._load_schema()
+
+    try:
+        import gb_synapse
+        manifest = gb_synapse._load_manifest() if gb_synapse.MANIFEST_FILE.exists() else None
+    except Exception:
+        manifest = None
+
     report = []
     for path in cr.find_recipe_files():
         model_name = ""
@@ -166,9 +237,14 @@ def _recipe_coverage_report() -> list[dict]:
                 recipe = yaml.safe_load(f)
             model_name = (recipe or {}).get("model", {}).get("name", "")
             cr.check_recipe(path, schema)
-            report.append({"path": str(path), "model": model_name, "valid": True})
+            entry = RecipeCoverageEntry(path=str(path), model=model_name, valid=True)
         except Exception as e:
-            report.append({"path": str(path), "model": model_name, "valid": False, "error": str(e)})
+            entry = RecipeCoverageEntry(path=str(path), model=model_name, valid=False, error=str(e))
+        if manifest is None:
+            entry.model_resolves = None
+        else:
+            entry.model_resolves = gb_synapse._manifest_lookup(model_name, manifest) is not None
+        report.append(asdict(entry))
     return report
 
 
@@ -182,7 +258,15 @@ def synapse_serve(model: str, ctx: int = 65536, use_cluster: bool = True,
                   slot_prompt_similarity: "float | None" = None,
                   kv_type: "str | None" = None,
                   recipe: "str | None" = None,
-                  use_preset: bool = False) -> dict:
+                  n_cpu_moe: "int | None" = None,
+                  batch: "int | None" = None,
+                  ubatch: "int | None" = None,
+                  use_preset: bool = False,
+                  keep: bool = False,
+                  vision: "bool | None" = None,
+                  mmproj: "str | None" = None,
+                  image_min_tokens: "int | None" = None,
+                  image_max_tokens: "int | None" = None) -> dict:
     """Serve a model through gb-synapse (engine backend + the gb-synapse
     proxy, default port 11369, GB_SYNAPSE_PORT; tensor-split across the
     cluster when use_cluster and feeders are up for the llama.cpp backend).
@@ -238,6 +322,22 @@ def synapse_serve(model: str, ctx: int = 65536, use_cluster: bool = True,
     history (measured: 93% cached tokens on a natural turn 2) instead of
     silently losing that reuse to slot round-robin every single turn.
 
+    vision / mmproj / image_min_tokens / image_max_tokens: llama.cpp backend, models with a vision projector. None (default) =
+    attach the projector when one is found (beside the weights or in another snapshot of the same Hugging Face repo) and size
+    the placement for it: the projector's weights plus the vision encoder's buffers for the image token budget are paid for
+    BEFORE the engine starts (a recipe's measured nCpuMoe gets the layers that cost converts into added on top), so callers
+    never pass n_cpu_moe for vision. vision=False serves text-only (frees ~1.8 GiB on the 12 GB card); mmproj= an explicit
+    projector file; image_min/max_tokens override the projector's own range (Qwen-VL needs >= 1024 image tokens to be
+    accurate, the engine flags are passed from the projector's metadata). The proxy then resizes every incoming image to
+    that budget (small crops UP, big sheets DOWN) so clients send pictures as they are. See workflow/vision-serving.md.
+
+    n_cpu_moe: llama.cpp backend, MoE models only — --n-cpu-moe N, the
+    number of layers whose expert tensors stay on the CPU (a measured,
+    deliberate placement, see CLAUDE.md's 2026-07-26 amendment). None
+    (default) keeps the live auto-fit (_fit_cpu_moe_layers) or a recipe's
+    nCpuMoe; an explicit value wins over both. Added 2026-10-02 so the
+    -ncmoe sweep runs through this tool rather than a hand-built command.
+
     kv_type: llama.cpp backend only — --cache-type-k/-v (e.g. "f16"/"q8_0"/
     "q4_0"). None (default) leaves KV precision to the live budget-driven
     choice (_pick_kv_type()) or a recipe's kvCache field. An explicit value
@@ -247,6 +347,16 @@ def synapse_serve(model: str, ctx: int = 65536, use_cluster: bool = True,
     FIRST occurrence of a duplicate flag, and LlamaCppBackend.serve() always
     emits its own --cache-type-k/-v before appending extra_args) — exactly
     the MCP-Tool-Gaps rule's "fix the tool, don't work around it" case.
+
+    batch / ubatch: llama.cpp backend only — --batch-size (logical prefill
+    batch, default 2048) and --ubatch-size (physical GPU micro-batch, default
+    512). None (default) leaves llama.cpp's compiled defaults or a recipe's
+    batch/ubatch field; an explicit value here wins over both. --ubatch is the
+    knob that sizes the prompt-processing GEMM, i.e. prefill tensor-core
+    utilisation — raising it can speed cold prefill until the prefill compute
+    buffer eats VRAM headroom (measured per model, never assumed; same evidence
+    gate as n_cpu_moe). Added so the prefill batch/ubatch sweep runs through
+    this tool rather than a raw extra_args flag the engine would de-dupe.
 
     recipe: an explicit serving recipe filename (looked up under
     serving/recipes/) or absolute path (NemoClaw audit, Phase 5e MCP
@@ -273,6 +383,11 @@ def synapse_serve(model: str, ctx: int = 65536, use_cluster: bool = True,
     (not falls back silently) on an ambiguous-selection tie or no eligible
     preset — an explicit ask for preset-driven dispatch that can't resolve
     is a real error, not a reason to guess.
+
+    Output carries a compact `engine` block (active engine vendored|moecache +
+    version, --moe-cache-mib support); after a confirmed serve also `expert_cache`
+    (the sized cache MiB, n_cpu_moe, MTP on/off and why, from the moe_cache_plan
+    event) and `fp8_paths` (pointer to quant_advisor / gpu_advice).
 
     DRY-RUN unless confirm=True: without it, returns the resolved model entry,
     which backend would serve it, and a warning about whatever is currently
@@ -305,6 +420,10 @@ def synapse_serve(model: str, ctx: int = 65536, use_cluster: bool = True,
             ctx = int(recipe_used["ctx"])
             if "mtpDraftN" in recipe_used:
                 mtp_draft_n = int(recipe_used["mtpDraftN"])
+            if batch is None and "batch" in recipe_used:
+                batch = int(recipe_used["batch"])
+            if ubatch is None and "ubatch" in recipe_used:
+                ubatch = int(recipe_used["ubatch"])
 
         current = gb_synapse.ps()
         preview_engine = engine or entry.engine
@@ -321,7 +440,10 @@ def synapse_serve(model: str, ctx: int = 65536, use_cluster: bool = True,
                     "cache_ram": cache_ram, "mtp_draft_n": mtp_draft_n,
                     "spec_draft_p_min": spec_draft_p_min,
                     "slot_prompt_similarity": slot_prompt_similarity, "kv_type": kv_type,
-                    "currently_serving": current,
+                    "n_cpu_moe": n_cpu_moe, "batch": batch, "ubatch": ubatch,
+                    "vision": vision, "mmproj": mmproj,
+                    "image_min_tokens": image_min_tokens, "image_max_tokens": image_max_tokens,
+                    "currently_serving": current, "engine": gb_synapse.engine_summary(),
                     "recipe_applied": recipe_used, "preset_preview": preset_preview,
                     "warning": f"the gb-synapse port ({gb_synapse.DEFAULT_PORT}) may "
                                "have live consumers (ai-forge FORGE_OLLAMA_URL, ollama "
@@ -332,8 +454,16 @@ def synapse_serve(model: str, ctx: int = 65536, use_cluster: bool = True,
                               spec_draft_p_min=spec_draft_p_min,
                               slot_prompt_similarity=slot_prompt_similarity,
                               kv_type=kv_type,
-                              use_preset=use_preset)
-        return {"serving": asdict(st)}
+                              n_cpu_moe=n_cpu_moe,
+                              batch_size=batch,
+                              ubatch_size=ubatch,
+                              use_preset=use_preset,
+                              vision=vision, mmproj=mmproj,
+                              image_min_tokens=image_min_tokens, image_max_tokens=image_max_tokens,
+                              explicit=True, trigger="mcp_serve", keep=keep)
+        eng = gb_synapse.engine_summary()
+        return {"serving": asdict(st), "engine": {k: eng[k] for k in ("active", "version", "moe_cache_flag")},
+                "expert_cache": eng["last_cache"], "fp8_paths": eng["fp8_paths"]}
     except Exception as e:
         return {"error": str(e)}
 
@@ -464,10 +594,15 @@ def cli_prompt(prompt: str, model: str | None = None, timeout: int = 300) -> dic
     if not gb:
         return {"error": "gb / greenboost-cli not on PATH"}
     cmd = [gb, "-p", prompt] + (["-m", model] if model else [])
+    import gb_lease_client
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        # interactive lease for the whole prompt; the child sees GB_LEASE_HELD (set while held) and does not ask again for its own serve
+        with gb_lease_client.lease("greenboost.cli.prompt", "cli_prompt", wait_s=30, model=model):
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return {"rc": r.returncode, "answer": r.stdout.strip()[-8000:],
                 "stderr": r.stderr.strip()[-1000:] if r.returncode else ""}
+    except gb_lease_client.LeaseRefused as e:
+        return {"error": str(e), "code": e.code, "retry_after_s": e.retry_after_s}
     except subprocess.TimeoutExpired:
         return {"error": f"gb -p timed out after {timeout}s"}
 

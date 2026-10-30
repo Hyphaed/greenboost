@@ -21,6 +21,10 @@ import pytest
 import yaml
 
 import gb_synapse as gs
+
+
+def _gated_serve(*a, **k):
+    return gs.serve(*a, explicit=True, trigger="test", **k)
 import resolver as rs
 
 
@@ -75,11 +79,11 @@ def test_use_preset_false_is_byte_identical_to_before(captured_backend_call):
     """Regression guard: no use_preset argument at all, use_cluster passed
     explicitly — must reach backend.serve() completely unmodified."""
     with pytest.raises(_StopServe):
-        gs.serve("test-model", use_cluster=True)
+        _gated_serve("test-model", use_cluster=True)
     assert captured_backend_call[0]["use_cluster"] is True
 
     with pytest.raises(_StopServe):
-        gs.serve("test-model", use_cluster=False)
+        _gated_serve("test-model", use_cluster=False)
     assert captured_backend_call[-1]["use_cluster"] is False
 
 
@@ -88,7 +92,7 @@ def test_use_preset_true_rpcsplit_forces_use_cluster_true(
 ):
     resolved_preset("rpcSplit")
     with pytest.raises(_StopServe):
-        gs.serve("test-model", use_cluster=False, use_preset=True)  # caller says False
+        _gated_serve("test-model", use_cluster=False, use_preset=True)  # caller says False
     assert captured_backend_call[0]["use_cluster"] is True  # preset overrides it
 
 
@@ -97,7 +101,7 @@ def test_use_preset_true_t1only_forces_use_cluster_false(
 ):
     resolved_preset("t1Only")
     with pytest.raises(_StopServe):
-        gs.serve("test-model", use_cluster=True, use_preset=True)  # caller says True
+        _gated_serve("test-model", use_cluster=True, use_preset=True)  # caller says True
     assert captured_backend_call[0]["use_cluster"] is False  # preset overrides it
 
 
@@ -106,7 +110,7 @@ def test_use_preset_true_t2spill_forces_use_cluster_false(
 ):
     resolved_preset("t2Spill")
     with pytest.raises(_StopServe):
-        gs.serve("test-model", use_cluster=True, use_preset=True)
+        _gated_serve("test-model", use_cluster=True, use_preset=True)
     assert captured_backend_call[0]["use_cluster"] is False
 
 
@@ -122,7 +126,7 @@ def test_use_preset_true_raises_on_ambiguous_selection(monkeypatch, captured_bac
     monkeypatch.setattr(rs, "resolve", _raise_ambiguous)
 
     with pytest.raises(rs.AmbiguousSelectionError):
-        gs.serve("test-model", use_preset=True)
+        _gated_serve("test-model", use_preset=True)
     assert captured_backend_call == []  # never reached backend.serve()
 
 
@@ -136,5 +140,5 @@ def test_use_preset_true_raises_on_no_eligible_preset(monkeypatch, captured_back
     monkeypatch.setattr(rs, "resolve", _raise_none)
 
     with pytest.raises(ValueError, match="no eligible preset"):
-        gs.serve("test-model", use_preset=True)
+        _gated_serve("test-model", use_preset=True)
     assert captured_backend_call == []

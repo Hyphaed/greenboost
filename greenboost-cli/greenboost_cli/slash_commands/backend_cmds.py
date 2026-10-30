@@ -220,18 +220,47 @@ def llamacpp_server_status(settings: dict) -> str:
         return "starting"
 
 
+def _start_load_watch(gb_synapse, model: str, settings: dict, serve_kw: dict) -> None:
+    """Background: if the engine dies of an out-of-VRAM load, retry lighter (inference/load_fallback.py)."""
+    import threading
+    from greenboost_cli.inference import load_fallback as LF
+
+    def say(msg: str) -> None:
+        emit_warn(msg)
+
+    def relaunch(ubatch: int, moe) -> None:
+        gb_synapse.stop(model)
+        kw = {k: v for k, v in serve_kw.items() if k not in ("explicit", "trigger")}
+        kw["ubatch_size"] = ubatch
+        if moe:
+            kw["n_cpu_moe"] = moe
+        gb_synapse.serve(model, explicit=True, trigger=serve_kw.get("trigger", "serve_cmd"), **kw)
+
+    def run() -> None:
+        outcome = LF.watch_and_retry(
+            status_fn=lambda: llamacpp_server_status(settings),
+            log_file=gb_synapse.log_path(model), relaunch=relaunch, say=say)
+        if outcome == "running":
+            emit_ok("Model loaded and answering.")
+
+    threading.Thread(target=run, daemon=True, name="gb-load-watch").start()
+
+
 def cmd_llamaserve(args: str, _session, settings) -> bool:
     """Start, stop, or show status of gb-synapse.
 
     Usage:
       /llamaserve            — start with configured model (background)
       /llamaserve start      — same as above
+      /llamaserve load       — same as above (the name the startup banner suggests)
       /llamaserve stop       — stop the running server
       /llamaserve status     — show whether it's running
       /llamaserve logs [N]   — tail last N lines of the log (default 40)
       /llamaserve restart    — stop then start
       /llamaserve <model_id> — start with a specific model (manifest name,
                                 org/repo[:quant], or an Ollama model name)
+      /llamaserve [model] text|vision — skip the prompt: no projector / with projector.
+                                On a terminal, a model that has a projector asks which.
 
     gb-synapse is the only backend — this talks to it directly, giving you
     disk-persisted prompt-cache reuse (see /llamacache) and cluster
@@ -255,7 +284,7 @@ def cmd_llamaserve(args: str, _session, settings) -> bool:
             console.print(f"  [{GRAY}]slots:[/]  {_LLAMACPP_SLOT_DIR}")
         else:
             emit_warn("gb-synapse is not running.")
-            emit_info("Start it:  /llamaserve")
+            emit_info("Load the model:  /llamaserve load")
         return True
 
     if subcmd.startswith("logs"):
@@ -297,22 +326,64 @@ def cmd_llamaserve(args: str, _session, settings) -> bool:
         emit_warn("gb-synapse is already running.  Use /llamaserve stop first.")
         return True
 
+    words = subcmd.split()
+    mode = words.pop() if words and words[-1] in ("text", "vision") else None
+    subcmd = " ".join(words)
+
     model = model_for_status
-    if subcmd and subcmd not in ("start",):
+    if subcmd and subcmd not in ("start", "load"):
         model = subcmd
     if not model:
         emit_err("No model configured. Run /model <name> first, or /setup.")
         return True
 
+    # None = serve()'s own default (projector loaded when the model has one), kept for scripts/MCP.
+    vision = None if mode is None else mode == "vision"
+    if mode is None and sys.stdin.isatty():
+        try:
+            has_projector = bool(gb_synapse.model_projector(model))
+        except Exception:
+            has_projector = False
+        if has_projector:
+            from greenboost_cli.terminal.wizard_prompt import run_picker
+            picked = run_picker([
+                {"label": "Text only", "description": "no projector: ~1.7 GiB less VRAM, faster decode"},
+                {"label": "Vision", "description": "loads the mmproj so images work (~1.7 GiB)"},
+                {"label": "Cancel", "description": ""},
+            ], title="Start mode")
+            if not picked or picked[0] == 3:
+                emit_warn("Cancelled, nothing started.")
+                return True
+            vision = picked[0] == 2
+
+    # One heavy model on the 12 GB card at a time: say who holds it BEFORE the
+    # load, so a failed or spilled load is not a surprise. Warns, never kills.
+    try:
+        from greenboost_cli.terminal.cc_features import gpu_snapshot, gpu_verdict
+        _snap = gpu_snapshot()
+        _v = gpu_verdict(_snap) if _snap else "ok"
+        if _v != "ok":
+            emit_warn(f"GPU: {_v}")
+            emit_info("/gpu shows the card; continuing, gb-synapse sizes the load to what is free.")
+    except Exception:
+        pass
+
     # Free VRAM held by Ollama before gb-synapse's llama-server claims it.
     ollama_suspend_for_gpu_task(reason="llama-server")
 
     try:
-        state = gb_synapse.serve(
-            model,
+        import contextlib
+        from greenboost_cli.terminal.width import WrapLines
+        _wrapped = WrapLines()
+        _serve_kw = dict(
             ctx=int(settings.get("llamacpp_n_ctx") or 0),
             n_slots=int(settings.get("llamacpp_np") or -1),
-            extra_args=settings.get("llamacpp_extra_args", ""))
+            extra_args=settings.get("llamacpp_extra_args", ""),
+            vision=vision,
+            trigger=("prompt" if settings.get("_prompt_driven") else "serve_cmd"))
+        with contextlib.redirect_stdout(_wrapped):
+            state = gb_synapse.serve(model, explicit=True, trigger=_serve_kw["trigger"], **{k: v for k, v in _serve_kw.items() if k != "trigger"})
+        _wrapped.flush()
     except Exception as e:
         emit_err(f"Could not start gb-synapse: {e}")
         return True
@@ -333,6 +404,7 @@ def cmd_llamaserve(args: str, _session, settings) -> bool:
         console.print(f"  [{GRAY}]log:  [/]  [{GRAY}]{gb_synapse.log_path(state.model + '_proxy')}[/]")
         return True
 
+    _start_load_watch(gb_synapse, model, settings, _serve_kw)
     emit_ok(f"gb-synapse started (pid {state.llama_pid})")
     console.print(f"  [{GRAY}]model:[/]  [{VIOLET}]{state.model}[/]")
     if state.ctx:

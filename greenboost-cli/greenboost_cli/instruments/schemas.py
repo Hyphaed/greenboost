@@ -51,6 +51,52 @@ INSTRUMENT_DEFINITIONS = [
         },
     },
     {
+        "name": "MultiEdit",
+        "description": (
+            "Several exact-text edits to ONE file in a single call, applied in order and "
+            "all-or-nothing: if any edit fails the file is untouched. Prefer this over "
+            "repeated Edit calls on the same file."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "edits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string":  {"type": "string"},
+                            "new_string":  {"type": "string"},
+                            "replace_all": {"type": "boolean"},
+                        },
+                        "required": ["old_string", "new_string"],
+                    },
+                },
+            },
+            "required": ["file_path", "edits"],
+        },
+    },
+    {
+        "name": "NotebookEdit",
+        "description": (
+            "Replace, insert or delete one cell of a Jupyter notebook (.ipynb). Identify the cell "
+            "by cell_id or cell_index. edit_mode: replace (default), insert, delete."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "notebook_path": {"type": "string"},
+                "cell_id":       {"type": "string"},
+                "cell_index":    {"type": "integer"},
+                "new_source":    {"type": "string"},
+                "cell_type":     {"type": "string", "enum": ["code", "markdown"]},
+                "edit_mode":     {"type": "string", "enum": ["replace", "insert", "delete"]},
+            },
+            "required": ["notebook_path"],
+        },
+    },
+    {
         "name": "Bash",
         "description": (
             "Execute a shell command. Returns stdout+stderr. "
@@ -240,6 +286,13 @@ INSTRUMENT_DEFINITIONS = [
                 "label": {
                     "type": "string",
                     "description": "Short name for this subtask, for the audit trail",
+                },
+                "agent": {
+                    "type": "string",
+                    "description": (
+                        "Optional: name of a user-defined agent (a .md file in .greenboost/agents). "
+                        "It brings its own instructions and tool limits."
+                    ),
                 },
             },
             "required": ["prompt"],

@@ -190,7 +190,8 @@ def _run_probe(engine_dir: Path, shim: Path) -> tuple[bool, str]:
     return False, "probe never answered /health within timeout — treating as unsupported"
 
 
-def shim_works_for_llama(engine_dir: "Path | None" = None) -> tuple[bool, str]:
+def shim_works_for_llama(engine_dir: "Path | None" = None, *,
+                         explicit: bool = False) -> tuple[bool, str]:
     """(works, reason) — the single decision point `gb_synapse_backends.py`
     consults before deciding whether to LD_PRELOAD the shim into a
     llama-server child. Cached; only re-probes when the cache key
@@ -217,6 +218,17 @@ def shim_works_for_llama(engine_dir: "Path | None" = None) -> tuple[bool, str]:
     if cached is not None and cached.get("key") == key:
         return bool(cached["works"]), f"cached: {cached['reason']}"
 
+    # The probe loads the smallest local GGUF. Never do that unless a gated
+    # serve()/serve_gguf() is in progress or the caller is this module's own CLI.
+    if not explicit:
+        try:
+            import gb_synapse
+            in_load = gb_synapse.load_in_progress()
+        except Exception:
+            in_load = False
+        if not in_load:
+            return False, "probe skipped: no prompt or explicit serve in progress (not cached)"
+
     works, reason = _run_probe(engine_dir, shim)
     _write_cache(key, works, reason)
     return works, reason
@@ -240,6 +252,6 @@ def _write_cache(key: dict, works: bool, reason: str) -> None:
 
 
 if __name__ == "__main__":
-    ok, why = shim_works_for_llama()
+    ok, why = shim_works_for_llama(explicit=True)
     print(json.dumps({"shim_works_for_llama": ok, "reason": why}, indent=2))
     sys.exit(0 if ok else 1)

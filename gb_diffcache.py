@@ -32,6 +32,10 @@ Usage:
     print(gb_diffcache.status(pipe.transformer))
     # {"calls": 28, "skipped": 9, "skip_rate": 0.32, "cache_key": "..."}
 
+CALIBRATION (2026-10-30, `tools/calib_diffcache.py`, FLUX.1-dev nf4, 768x768, 28 steps, 6 seeds): `threshold=0.01, max_skip=1` skips 7% of the steps for a 1.075x speedup
+and keeps every image at PSNR >= 37.8 dB / SSIM >= 0.986 against its uncached twin; `0.02` already skips 32% and drops to ~20 dB / 0.78. The default signal (mean |latent|) has no gentle
+middle, so the cache is opt-in and the number is per model, step count and size: recalibrate with the tool before using another model.
+
 A skipped call returns the previous call's *output* unchanged , this only
 makes sense for modules whose API returns the predicted noise/velocity
 tensor directly (the common Diffusers UNet/Transformer2DModel contract).

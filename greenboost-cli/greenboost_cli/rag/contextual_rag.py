@@ -259,6 +259,17 @@ def contextualize(
 
 # ── Ollama embedding ──────────────────────────────────────────────────────────
 
+def _arbiter_lease(client: str, purpose: str, wait_s: float):
+    """GPU arbiter lease around an embedding call (the maintainer notes in the GreenBoost repo). A refusal raises gb_lease_client.LeaseRefused (a RuntimeError)
+    with a plain message. An arbiter that cannot be imported never blocks the call: it runs unleased, as before."""
+    import contextlib  # noqa: PLC0415
+    try:
+        from greenboost_cli.gb_paths import gb_module  # noqa: PLC0415
+        return gb_module("gb_lease_client").lease(client, purpose, wait_s=wait_s)
+    except ImportError:
+        return contextlib.nullcontext()
+
+
 def _ollama_embed(
     texts: list[str],
     model: str = _EMBED_MODEL,
@@ -365,8 +376,9 @@ def _build_index(project: str, chunks: list[dict]) -> None:
 
     _info(f"embedding {len(chunks)} chunks via {_EMBED_MODEL} (dim={_EMBED_DIM}) …")
     try:
-        embeddings = _ollama_embed(enriched_texts)
-    except RuntimeError as exc:
+        with _arbiter_lease("greenboost.rag.index", f"embed {len(chunks)} chunks", wait_s=120):
+            embeddings = _ollama_embed(enriched_texts)
+    except RuntimeError as exc:                 # includes LeaseRefused: plain message, nothing embedded
         _err(str(exc))
         _err("Hint: ollama pull qwen3-embedding:4b")
         return
@@ -498,7 +510,8 @@ def search(
 
     embed_model = index["meta"].get("model", _EMBED_MODEL)
     embed_dim   = index["meta"].get("dims",  _EMBED_DIM)
-    q_mat = _ollama_embed([query], model=embed_model, dim=embed_dim)
+    with _arbiter_lease("greenboost.rag.query", "embed a search query", wait_s=30):
+        q_mat = _ollama_embed([query], model=embed_model, dim=embed_dim)
     q_vec = q_mat[0]
 
     sem_scores = embeddings @ q_vec

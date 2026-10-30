@@ -79,3 +79,51 @@ class PromptQueue:
 
     def __bool__(self) -> bool:
         return len(self) > 0
+
+
+# ── Unconsumed prompts must not vanish ──────────────────────────────────────
+# Measured 2026-08-22: a real session queued "build it inside a folder named
+# pinball_aug22_1530" while turn 1 was still exploring, then ended before that
+# turn finished. The queue is in-memory, so the instruction was discarded with
+# no message, and the work went into the wrong folder. The drain logic was
+# never at fault , it dequeues correctly after every turn. The turn simply
+# never finished, because TTFT on that session ran 20-107 s per turn
+# (the maintainer notes C-20).
+#
+# So the queue's contract needs one more guarantee: an item that was accepted
+# is either consumed or REPORTED, never silently dropped.
+import json
+import os
+from pathlib import Path
+
+_SPILL = Path(os.environ.get(
+    "GB_CLI_QUEUE_SPILL",
+    os.path.expanduser("~/.greenboost_cli/sessions/unconsumed_prompts.json")))
+
+
+def spill_unconsumed(queue: "PromptQueue", session_name: str = "") -> "list[str]":
+    """Persist anything still queued at exit and return it for reporting.
+
+    Best-effort and never raises: losing the spill file must not also break the
+    exit path. Returns [] when the queue is empty, which is the normal case.
+    """
+    try:
+        texts = [i.text for i in queue.snapshot()]
+    except Exception:
+        return []
+    if not texts:
+        return []
+    try:
+        import time
+        _SPILL.parent.mkdir(parents=True, exist_ok=True)
+        prev = []
+        if _SPILL.exists():
+            try:
+                prev = json.loads(_SPILL.read_text()) or []
+            except Exception:
+                prev = []
+        prev.append({"ts": time.time(), "session": session_name, "prompts": texts})
+        _SPILL.write_text(json.dumps(prev[-20:], indent=1))
+    except Exception:
+        pass
+    return texts

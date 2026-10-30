@@ -19,6 +19,7 @@ import sys
 import os
 import queue
 import readline
+import re
 import atexit
 import shutil
 import threading
@@ -176,7 +177,115 @@ def _gb_stats_updater() -> None:
                     _gb_stats_segs = segs
         except Exception:
             pass
+        _reap_zombie_children()
         _t.sleep(5)
+
+
+#: gb-synapse state for the idle toolbar: "running" | "starting" | "stopped".
+#: Polled off the UI thread (the probe can block ~2 s on a loading model), so
+#: the bar flips from "not loaded" to "loading" to "running" without a keypress.
+_server_state = "unknown"
+_gpu_owner = ""          # "FLUX generation 8.1G" when another heavy job holds the card
+_statusline = ""         # first line of the user's statusline_command
+
+
+_TITLE_WORDS = {"running": "● model running", "starting": "◌ loading model…",
+                "stopped": "○ model not loaded · /llamaserve load"}
+_title_pushed = False
+
+
+def _set_window_title(settings: dict) -> None:
+    """Mirror the model state into the terminal's title bar.
+
+    The banner at the top of the screen is scrollback and cannot change once it
+    has scrolled; the title bar is always visible. Written to /dev/tty, not
+    stdout: prompt_toolkit's stdout proxy would queue it and splice it into the
+    prompt. Pushes the old title once (xterm title stack) and pops it on exit."""
+    global _title_pushed
+    words = _TITLE_WORDS.get(_server_state)
+    if not words:
+        return
+    model = str(settings.get("model", "") or "")
+    title = f"GreenBoost · {model} · {words}" if model else f"GreenBoost · {words}"
+    try:
+        with open("/dev/tty", "w") as tty:
+            if not _title_pushed:
+                tty.write("\033[22;0t")
+                _title_pushed = True
+                import atexit
+                atexit.register(_restore_window_title)
+            tty.write(f"\033]2;{title}\007")
+    except OSError:
+        pass
+
+
+def _restore_window_title() -> None:
+    try:
+        with open("/dev/tty", "w") as tty:
+            tty.write("\033[23;0t")
+    except OSError:
+        pass
+
+
+def _server_state_poller(settings: dict) -> None:
+    global _server_state
+    import time as _t
+    from greenboost_cli.slash_commands.backend_cmds import llamacpp_server_status
+    global _gpu_owner, _statusline
+    from greenboost_cli.terminal import cc_features as _ccf
+    _last = None
+    _n = 0
+    while True:
+        try:
+            if _n % 4 == 0:
+                _snap = _ccf.gpu_snapshot()
+                _heavy = [a for a in (_snap or {}).get("apps", [])
+                          if "gb-synapse" not in a[1] and a[2] >= 1024]
+                _gpu_owner = ", ".join(f"{l} {m / 1024:.1f}G" for _, l, m in
+                                       sorted(_heavy, key=lambda a: -a[2])[:2])
+                _statusline = _ccf.statusline_text(settings)
+            _n += 1
+            _server_state = llamacpp_server_status(settings)
+            if _server_state != _last:
+                _last = _server_state
+                _set_window_title(settings)
+        except Exception:
+            pass
+        _t.sleep(1.5 if _server_state != "running" else 4.0)
+
+
+def _server_state_frag() -> "tuple[str, str] | None":
+    if _server_state == "running":
+        return (f"fg:{LIME}", "● model running")
+    if _server_state == "starting":
+        return (f"fg:{AMBER}", "◌ loading model…")
+    if _server_state == "stopped":
+        return (f"bold fg:{AMBER}", "○ model not loaded · /llamaserve load")
+    return None
+
+
+def _reap_zombie_children() -> int:
+    """Collect exited children nobody wait()ed on (a dead llama-server stays a
+    `<defunct>` entry for the life of the CLI otherwise). Only touches PIDs the
+    kernel already reports as zombies, so it cannot steal the exit status of a
+    child some subprocess.Popen is still waiting for."""
+    me, n = os.getpid(), 0
+    try:
+        for ent in os.listdir("/proc"):
+            if not ent.isdigit():
+                continue
+            try:
+                with open(f"/proc/{ent}/stat", "rb") as f:
+                    raw = f.read().decode("utf-8", "replace")
+                rest = raw[raw.rindex(")") + 2:].split()
+                if rest[0] == "Z" and int(rest[1]) == me:
+                    os.waitpid(int(ent), os.WNOHANG)
+                    n += 1
+            except (OSError, ValueError, IndexError):
+                continue
+    except OSError:
+        pass
+    return n
 
 
 def _host_mem_warning_seg() -> "tuple[str, str] | None":
@@ -247,6 +356,15 @@ from greenboost_cli.environment.settings import GB_HOME, SESSIONS_PATH
 # the live prompt() call to exit (releasing the fd) before any wizard runs.
 _pt_suspend_hook = None   # type: ignore  # callable() -> None, set by run_interactive
 
+#: Set while no wizard (approval picker / AskUserQuestion) owns the terminal.
+#: The input prompt stays live DURING a model turn (type to queue the next
+#: prompt, slash commands run immediately), so the reader only has to stand
+#: down while a wizard needs the raw terminal, not for the whole turn.
+_wizard_free = threading.Event()
+_wizard_free.set()
+_wizard_depth = 0                 # nested wizards (a command opening a picker inside a wizard)
+_wizard_lock = threading.Lock()
+
 # Set by request_shutdown() (e.g. /exit, /quit) so the stdin-reader daemon
 # stops looping back into prompt() instead of re-rendering the bottom box
 # after the live app has already been torn down.
@@ -260,6 +378,15 @@ _shutdown_evt = threading.Event()
 # only makes the live prompt() call release stdin and loop back to wait, it
 # never terminates the thread, so joining there would hang forever.
 _stdin_thread_ref: "threading.Thread | None" = None
+
+
+_dock_state_provider = None
+
+
+def set_dock_state_provider(fn) -> None:
+    """Register the callable that snapshots what the bottom dock shows."""
+    global _dock_state_provider
+    _dock_state_provider = fn
 
 
 def set_pt_suspend_hook(hook) -> None:
@@ -538,6 +665,38 @@ def request_shutdown() -> None:
     restore_terminal()
 
 
+def _drain_terminal_replies(fd: int, timeout: float = 1.2) -> None:
+    """Swallow terminal replies still in flight (prompt_toolkit's cursor-position
+    query, answered after the prompt closed) so the shell never echoes them as
+    "^[[1;1R". The terminal answers in order, so a fence query of our own works
+    as a barrier: once its reply arrives, every earlier reply has been read.
+    Bounded; a terminal that never answers costs `timeout` once."""
+    import select
+    import termios
+    import time
+    old = termios.tcgetattr(fd)
+    raw = termios.tcgetattr(fd)
+    raw[3] &= ~(termios.ICANON | termios.ECHO)
+    raw[6][termios.VMIN], raw[6][termios.VTIME] = 0, 0
+    termios.tcsetattr(fd, termios.TCSANOW, raw)
+    try:
+        sys.stdout.write("\033[6n")
+        sys.stdout.flush()
+        buf = b""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            r, _, _ = select.select([fd], [], [], max(0.0, end - time.monotonic()))
+            if not r:
+                break
+            buf += os.read(fd, 256)
+            if buf.count(b"R") and buf.rstrip().endswith(b"R") and buf.count(b"\x1b[") <= buf.count(b"R"):
+                # one reply per query sent: pt's pending ones plus ours; stop once a short quiet gap follows
+                if not select.select([fd], [], [], 0.05)[0]:
+                    break
+    finally:
+        termios.tcsetattr(fd, termios.TCSANOW, old)
+
+
 def restore_terminal(clear: bool = True) -> None:
     """Put the terminal back in a plain, usable state on the way out.
 
@@ -585,9 +744,13 @@ def restore_terminal(clear: bool = True) -> None:
         import termios
         fd = sys.stdin.fileno()
         attrs = termios.tcgetattr(fd)
-        attrs[3] |= termios.ECHO | termios.ICANON | termios.ISIG | termios.IEXTEN
+        attrs[3] |= termios.ICANON | termios.ISIG | termios.IEXTEN
+        attrs[3] &= ~termios.ECHO      # echo stays OFF until in-flight terminal replies are drained below
         termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
         termios.tcflush(fd, termios.TCIFLUSH)
+        _drain_terminal_replies(fd)
+        attrs[3] |= termios.ECHO
+        termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
     except Exception:
         pass   # not a real tty, or stdin already closed — the escapes below still apply
 
@@ -618,15 +781,51 @@ def _suspend_pt_for_wizard() -> None:
     doubled/garbled option list. Callers must pair this with
     _resume_pt_after_wizard() once the wizard returns."""
     from greenboost_cli.terminal.statusline import set_wizard_active
+    from greenboost_cli.terminal.footer import get_footer
+    global _wizard_depth
+    if _dock_state_provider is None:
+        get_footer().deactivate()     # no dock (readline fallback): the old footer path
+    with _wizard_lock:
+        _wizard_depth += 1
+        _wizard_free.clear()
     set_wizard_active(True)
     if _pt_suspend_hook is not None:
         _pt_suspend_hook()
+        if _dock_state_provider is not None and _wizard_depth == 1:
+            # The input app is stopped; fence the last rows and paint a static dock
+            # there so the wizard renders ABOVE it. _resume_pt_after_wizard restores.
+            from greenboost_cli.terminal.dock import get_hold
+            try:
+                get_hold().hold(_dock_state_provider())
+            except Exception:
+                get_hold().force_reset()
+    # The input box asks the terminal where the cursor is (ESC[6n) and the reply
+    # (ESC[row;colR) can still be in flight when the box closes. A wizard reading
+    # stdin would take it for an Escape key and cancel itself, and the leftovers
+    # print as "3;1R" in the next prompt. Drop whatever is pending.
+    try:
+        import termios
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except Exception:
+        pass
 
 
 def _resume_pt_after_wizard() -> None:
     """Companion to _suspend_pt_for_wizard() — call once the wizard returns."""
+    global _wizard_depth
     from greenboost_cli.terminal.statusline import set_wizard_active
+    with _wizard_lock:
+        _wizard_depth = max(0, _wizard_depth - 1)
+        if _wizard_depth:
+            return          # an outer wizard still owns the terminal
     set_wizard_active(False)
+    if _dock_state_provider is not None:
+        from greenboost_cli.terminal.dock import get_hold
+        try:
+            get_hold().release()
+        except Exception:
+            get_hold().force_reset()
+    _wizard_free.set()
 
 
 # ── Readline setup ─────────────────────────────────────────────────────────────
@@ -691,6 +890,28 @@ _CMD_META: dict[str, list[str]] = {
 
 
 class _GBCompleter(Completer):
+    def _complete_path(self, frag: str):
+        """`@path` completion, relative to the shell's working directory."""
+        from greenboost_cli.terminal.cc_features import _cwd
+        base = Path(_cwd())
+        d, _, stem = os.path.expanduser(frag).rpartition("/")
+        root = (Path(d) if d.startswith("/") else base / d) if d else base
+        try:
+            entries = sorted(root.iterdir(), key=lambda e: (not e.is_dir(), e.name))
+        except OSError:
+            return
+        n = 0
+        for e in entries:
+            if e.name.startswith(".") and not stem.startswith("."):
+                continue
+            if e.name.startswith(stem):
+                yield Completion(e.name + ("/" if e.is_dir() else ""),
+                                 start_position=-len(stem),
+                                 display=e.name + ("/" if e.is_dir() else ""))
+                n += 1
+                if n >= 40:
+                    return
+
     """Two-level slash-command completer for prompt_toolkit."""
 
     def __init__(self, cmd_meta: dict, command_table_fn) -> None:
@@ -699,6 +920,10 @@ class _GBCompleter(Completer):
 
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor
+        _at = re.search(r"(?<!\S)@([\w./~+\-]*)$", text)
+        if _at:
+            yield from self._complete_path(_at.group(1))
+            return
         if not text.startswith("/"):
             return
         rest = text[1:]
@@ -821,6 +1046,8 @@ def process_query(user_input: str, session: ConversationSession,
     verbose = settings.get("verbose", False)
     from greenboost_cli.environment.context_builder import assemble_system_context
     system_context = assemble_system_context(settings.get("model", ""))
+    from greenboost_cli.output_styles import style_text as _style_text
+    system_context += _style_text(settings)
 
     # Capture what the user actually typed BEFORE pre_process_query mutates
     # user_input (RAG injection, /note prepend, attachment merge, ...) — the
@@ -828,6 +1055,16 @@ def process_query(user_input: str, session: ConversationSession,
     # that got silently prepended onto it.
     _echo_text        = user_input if isinstance(user_input, str) else ""
     _echo_attachments = len(session.pending_attachments)
+
+    if isinstance(user_input, str) and "@" in user_input:
+        try:
+            from greenboost_cli.terminal.cc_features import expand_file_mentions
+            from greenboost_cli.terminal.theme import console as _c, DIM as _D
+            user_input, _seen = expand_file_mentions(user_input)
+            for _line in _seen:
+                _c.print(f"  [{_D}]⎿ {_line}[/]")
+        except Exception:
+            pass
 
     try:
         from greenboost_cli.workflow.intelligence import pre_process_query
@@ -959,6 +1196,12 @@ def process_query(user_input: str, session: ConversationSession,
         loaded_skills=_loaded_skills,
     )
 
+    from greenboost_cli.terminal.footer import get_footer
+    from greenboost_cli.terminal import renderer as _rend_mod
+    _ft = get_footer()
+    _ft.agent = str(settings.get("model", "") or "")
+    _ft.tool_label = lambda: _rend_mod._tool_label
+    _ft.vitals = lambda: list(_gb_stats_segs)
     sl = StatusLine()
     sl.start("Thinking")
     sl.update(ctx_pct=_ctx_pct)
@@ -1001,7 +1244,20 @@ def process_query(user_input: str, session: ConversationSession,
             _sl_running = True
 
     try:
-        for event in execute_turn(user_input, session, settings, system_context):
+        # A prompt sent while the model is still loading used to fail with HTTP
+        # 502. Wait for the load instead (Esc / Ctrl-C cancels the wait).
+        from greenboost_cli.terminal.cc_features import await_model_ready
+        from greenboost_cli.terminal.theme import console as _wc, DIM as _wd
+        if await_model_ready(
+                settings,
+                on_wait=lambda: (sl.update(phase="Loading model"),
+                                 _wc.print(f"  [{_wd}]◌ the model is still loading; your prompt will run when it's ready (esc to cancel)[/]")),
+                cancelled=lambda: bool(_cancel and _cancel.is_set())):
+            _events = execute_turn(user_input, session, settings, system_context)
+        else:
+            _interrupted = True
+            _events = iter(())
+        for event in _events:
             # Check for cancel signal from Ctrl-C (set by the stdin thread)
             if _cancel and _cancel.is_set():
                 _interrupted = True
@@ -1058,6 +1314,7 @@ def process_query(user_input: str, session: ConversationSession,
                     event.granted = prompt_approval(event.description, settings)
                 finally:
                     _resume_pt_after_wizard()
+                _restart_sl("Running")
 
             elif isinstance(event, QuestionsAsked):
                 _stop_sl(commit=False)
@@ -1104,6 +1361,7 @@ def process_query(user_input: str, session: ConversationSession,
                         _st.record("skill", name=str(event.result)[:60])
                     else:
                         _st.record("tool", name=event.name)
+                    _st.note_tool_result(event.name, event.result)
                     _st.note_progress()   # real work resets the runaway brake
                 except Exception:
                     pass
@@ -1151,6 +1409,8 @@ def process_query(user_input: str, session: ConversationSession,
                     )
     finally:
         _stop_sl()
+        sl.end_turn(summary=not _interrupted and sys.exc_info()[0] is None)
+        _ft.deactivate()      # idempotent: also covers the interrupt / loop-guard exits
 
     if _interrupted:
         # Roll session back to pre-query state — keeps context clean for next turn
@@ -1326,11 +1586,58 @@ def _record_measured_tok_s(tok_s: float, settings: dict,
 
 # ── REPL ───────────────────────────────────────────────────────────────────────
 
-def run_interactive(settings: dict, initial_prompt: str = None) -> None:
+def _previous_session_hint(path, now: float) -> str:
+    """One dim line telling a fresh start that an older session exists."""
+    import json as _json
+    msgs = _json.loads(path.read_text()).get("messages", [])
+    if not msgs:
+        return ""
+    age = max(0, int(now - path.stat().st_mtime))
+    ago = (f"{age // 86400}d" if age >= 86400 else f"{age // 3600}h" if age >= 3600
+           else f"{max(1, age // 60)}m")
+    return f"Previous session available: /resume ({len(msgs)} messages, {ago} ago)"
+
+
+def _restore_session_file(session, last_path, pick: bool, _time) -> None:
+    """Load a saved session into `session` (explicit --continue / --resume)."""
+    import json as _json
+    path = last_path
+    if pick:
+        files = sorted(SESSIONS_PATH.glob("*.json"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)[:15]
+        if not files:
+            return
+        for i, f in enumerate(files, 1):
+            console.print(f"  [{DIM}]{i:>2}. {f.stem}[/]")
+        try:
+            raw = input("  resume which? [1] ").strip() or "1"
+            path = files[int(raw) - 1]
+        except (ValueError, IndexError, EOFError):
+            return
+    _data = _json.loads(path.read_text())
+    _msgs = _data.get("messages", [])
+    if not _msgs:
+        return
+    session.messages            = _msgs
+    session.turn_count          = _data.get("turn_count", 0)
+    session.total_input_tokens  = _data.get("total_input_tokens", 0)
+    session.total_output_tokens = _data.get("total_output_tokens", 0)
+    session._start_time         = _time.time()
+    emit_ok(
+        f"Resumed session  [{len(_msgs)} messages  "
+        f"·  {session.total_input_tokens:,}↑ {session.total_output_tokens:,}↓]"
+        f"  — /clear to start fresh"
+    )
+
+
+def run_interactive(settings: dict, initial_prompt: str = None,
+                    initial_command: str = None, resume: str = None) -> None:
     """
     Launch the interactive REPL.
 
     If initial_prompt is provided, run it once and exit (non-interactive mode).
+    initial_command (a slash command from argv) is run first, then the REPL
+    stays open.  resume: None (fresh) | "last" (--continue) | "pick" (--resume).
 
     Threading model (interactive mode only)
     ----------------------------------------
@@ -1353,7 +1660,7 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
         "guidelines_cmds", "convert_cmds", "mcp_cmds",
         "plan_cmds", "agent_cmds", "task_cmds", "skill_cmds",
         "git_cmds", "quant_cmds", "doctor_cmds", "autonomous_cmds",
-        "forge_cmds", "init_cmds",
+        "forge_cmds", "init_cmds", "model_cmds",
     ):
         try:
             __import__(f"greenboost_cli.slash_commands.{_mod}")
@@ -1380,26 +1687,28 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
     prompt_queue = PromptQueue()
     session.prompt_queue = prompt_queue   # accessible from /queue command
 
-    # ── Auto-restore last session ──────────────────────────────────────────
+    # ── Session resume: explicit only (default is a FRESH start) ───────────
     _last_session_path = SESSIONS_PATH / "_last.json"
-    if not initial_prompt and _last_session_path.exists():
+    # Modes that act without asking never carry over from an earlier run.
+    try:
+        from greenboost_cli.core.autonomy import get_state as _gs_reset
+        _gs_reset().auto_answer = False
+    except Exception:
+        pass
+    if resume is None and settings.get("resume_last_session") is True:
+        resume = "last"
+    if resume and _last_session_path.exists():
         try:
-            import json as _json
-            _data = _json.loads(_last_session_path.read_text())
-            _msgs = _data.get("messages", [])
-            if _msgs:
-                session.messages            = _msgs
-                session.turn_count          = _data.get("turn_count", 0)
-                session.total_input_tokens  = _data.get("total_input_tokens", 0)
-                session.total_output_tokens = _data.get("total_output_tokens", 0)
-                session._start_time         = _time.time()   # fresh start time for restored session
-                emit_ok(
-                    f"Restored last session  [{len(_msgs)} messages  "
-                    f"·  {session.total_input_tokens:,}↑ {session.total_output_tokens:,}↓]"
-                    f"  — /clear to start fresh"
-                )
+            _restore_session_file(session, _last_session_path, resume == "pick", _time)
         except Exception as _e:
             emit_warn(f"Could not restore last session: {_e}")
+    elif _last_session_path.exists() and not initial_prompt:
+        try:
+            _hint = _previous_session_hint(_last_session_path, _time.time())
+            if _hint:
+                console.print(f"  [{DIM}]{_hint}[/]")
+        except Exception:
+            pass
 
     def _autosave_session() -> None:
         try:
@@ -1541,8 +1850,12 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
                 # Not a problem: both tools remain callable under their
                 # prefixed names, so this is muted information rather than a
                 # warning the reader cannot act on.
-                for dup in getattr(registry, "duplicate_names", []):
-                    emit_muted(f"MCP: {dup}")
+                # One line, not one per tool: with five servers that was seven
+                # wrapped lines at every startup, none of them actionable.
+                _dups = getattr(registry, "duplicate_names", [])
+                if _dups:
+                    emit_muted(f"MCP: {len(_dups)} tool names exist on more than one server; "
+                               f"all stay callable as mcp__<server>__<tool> (/mcp-servers lists them)")
         except Exception:
             pass
 
@@ -1551,6 +1864,8 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
 
     threading.Thread(target=_gb_stats_updater, daemon=True,
                      name="gb-mem-stats").start()
+    threading.Thread(target=_server_state_poller, args=(settings,), daemon=True,
+                     name="gb-server-state").start()
 
     # Feed the same cached tier stats to the running-action line. A callback,
     # not a direct import: renderer.py cannot import repl.py, and reading the
@@ -1664,13 +1979,27 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
             event.current_buffer.insert_text("\n")
 
         # Escape → dismiss completion popup, else clear the input line.
+        _esc_last = [0.0]
+
         @_pt_kb.add("escape", eager=True)
         def _esc_clear(event):
             buf = event.current_buffer
             if buf.complete_state:
                 buf.cancel_completion()
-            else:
+            elif buf.text:
                 buf.reset()
+            elif _is_processing.is_set():
+                # The dock hint says "esc interrupt": same path as Ctrl+C.
+                event.app.exit(exception=KeyboardInterrupt, style="class:aborting")
+            else:
+                # Esc twice on an empty prompt opens the rewind picker, like Claude Code.
+                # Never while a turn runs: that Esc means interrupt, not rewind.
+                import time as _tm
+                _now = _tm.monotonic()
+                if _now - _esc_last[0] < 0.6 and not _is_processing.is_set():
+                    buf.text = "/rewind"
+                    buf.validate_and_handle()
+                _esc_last[0] = _now
 
         # Ctrl+O → expand the last truncated tool result. The truncation hint
         # itself ("… +N lines (ctrl+o to expand)") has always said this, but
@@ -1685,7 +2014,9 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
                 _renderer_mod.expand_last_result()
             run_in_terminal(_do_print)
 
-        # Ctrl+I → the counterpart to Ctrl+O, as far as a terminal allows one.
+        # Ctrl+Q (was Ctrl+I, which IS Tab in every terminal: the binding silently
+        # replaced completion, so Tab never completed a slash command or @path).
+        # Ctrl+Q → the counterpart to Ctrl+O, as far as a terminal allows one.
         #
         # Be honest about what this can and cannot be. Ctrl+O prints the
         # withheld lines into the scrollback, and a terminal cannot un-print
@@ -1698,7 +2029,7 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
         # flips , tool tally and footer only, no cards. Ctrl+O then still
         # expands any individual result on demand, so the pair reads as
         # "show me less by default / show me this one in full".
-        @_pt_kb.add("c-i")
+        @_pt_kb.add("c-q")
         def _collapse_output(event):
             def _do():
                 settings["quiet"] = not settings.get("quiet", False)
@@ -1757,6 +2088,18 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
         #
         # This overrides emacs' Ctrl+P (previous-history). Up-arrow still does
         # history, which is what a reader of this footer will reach for anyway.
+        @_pt_kb.add("c-t")
+        def _show_todos(event):
+            """Print the task board (the same output as /todo) without losing the prompt."""
+            def _do():
+                COMMAND_TABLE["todo"]("", session, settings)
+            run_in_terminal(_do)
+
+        @_pt_kb.add("c-g")
+        def _edit_in_editor(event):
+            """Open the current prompt in $EDITOR (long prompts, pasted blocks)."""
+            event.current_buffer.open_in_editor()
+
         @_pt_kb.add("c-p")
         def _toggle_pause(event):
             def _do():
@@ -1791,15 +2134,31 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
                 settings.pop("permission_mode", None)
             event.app.invalidate()
 
-        _pt_compl = _GBCompleter(_CMD_META, lambda: COMMAND_TABLE)
+        def _pt_app_text() -> str:
+            try:
+                from prompt_toolkit.application import get_app
+                return get_app().current_buffer.document.text_before_cursor
+            except Exception:
+                return ""
 
-        _pt_session = PromptSession(
+        def _all_command_names():
+            from greenboost_cli import custom_commands as _cc_md
+            return {**{n: None for n in _cc_md.discover()}, **COMMAND_TABLE}
+        _pt_compl = _GBCompleter(_CMD_META, _all_command_names)
+
+        from prompt_toolkit.filters import Condition
+        from greenboost_cli.terminal.dock import DockSession
+        _pt_session = DockSession(
             history=FileHistory(str(HISTORY_PATH)),
             completer=_pt_compl,
-            complete_while_typing=False,
+            # Suggest while typing only where it helps: a `/command` or an `@path`.
+            # Everywhere else the menu would pop up over ordinary prose.
+            complete_while_typing=Condition(lambda: bool(
+                re.match(r"/\S*$", _pt_app_text()) or re.search(r"(?<!\S)@[\w./~+\-]*$", _pt_app_text()))),
             key_bindings=_pt_kb,
             style=_pt_style,
-            enable_history_search=True,
+            get_state=lambda: _dock_state(),
+            refresh_interval=1.0,   # re-render the dock so the model state updates live
         )
 
         # The persistent bottom box now owns the screen for the whole session —
@@ -1821,16 +2180,16 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
         _statusline_mod.set_pt_mode(_pt_invalidate)
 
         def _pt_is_live() -> bool:
-            """True only when the PromptSession app is actively running (user is at
-            the idle input prompt). Returns False during every model turn because
-            _stdin_reader blocks on _model_idle.wait() while _model_worker runs.
-            This lets statusline/renderer use raw \\r animation during turns without
-            interference from patch_stdout (which is only installed inside prompt())."""
-            try:
-                app = _pt_session.app
-                return app is not None and app.is_running
-            except Exception:
-                return False
+            """True while the prompt_toolkit input box owns the bottom of the screen.
+
+            That is now the whole session, turns included (type to queue, slash
+            commands run at once), except while a wizard holds the raw terminal.
+            It used to be `app.is_running`, which flickers False for a few ms
+            every time a prompt() call returns and the next one has not started
+            yet. A turn begins in exactly that gap, so its status line picked
+            the raw painter while the input box then came up underneath it:
+            two things fighting over the bottom rows."""
+            return _pt_session is not None and _wizard_free.is_set()
 
         _statusline_mod.set_pt_live_probe(_pt_is_live)
         _renderer_mod.set_pt_live_probe(_pt_is_live)
@@ -1872,6 +2231,7 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
                 return
             if app is None or not app.is_running:
                 return
+            _pt_session.ghost_exit()     # no echoed input line: the wizard takes the rows
             loop = _pt_running_loop
             try:
                 if loop is not None and loop.is_running():
@@ -1892,87 +2252,60 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
 
         set_pt_suspend_hook(_pt_suspend)
 
-    def _get_pt_prompt() -> "FormattedText":
-        """Dynamic formatted prompt — no top rule (single dim rule lives in the
-        toolbar below), no side borders."""
-        frags = []
-        if getattr(session, "plan_mode", False):
-            frags.append((f"bold fg:{VIOLET}", "[PLAN] "))
-        if settings.get("permission_mode") == "autonomous":
-            frags.append((f"fg:{AMBER}", "[AUTO] "))
-        q_len = len(prompt_queue)
-        if q_len:
-            frags.append((f"fg:{AMBER}", f"[{q_len}q] "))
-        frags.append((f"fg:{VIOLET}", "› "))
-        return FormattedText(frags)
+    _ctx_cache = [0.0, None]
 
-    def _get_pt_toolbar() -> "FormattedText":
-        """Dynamic bottom toolbar — single dim full-width rule, live status + mode hint."""
-        from greenboost_cli.terminal.statusline import toolbar_status_fragments
-        w = max(20, shutil.get_terminal_size((80, 24)).columns)
-        bottom_border = BOX_H * w
-
-        q_len = len(prompt_queue)
-        q_hint = f"  ·  {q_len}q" if q_len else ""
-
-        # Context window % estimate
-        ctx_str = ""
+    def _ctx_pct_now() -> "float | None":
+        """Context window fill %, cached for 2 s (the dock repaints ~4x/s)."""
+        import time as _t
+        now = _t.monotonic()
+        if now - _ctx_cache[0] < 2.0:
+            return _ctx_cache[1]
+        val = None
         try:
             from greenboost_cli.workflow.intelligence import _estimate_tokens
             from greenboost_cli.environment.settings import gb_synapse_ctx
             ctx_est = _estimate_tokens(session)
             ctx_max = int(settings.get("context_window", 0)) or gb_synapse_ctx(settings)
-            ctx_pct = ctx_est / ctx_max * 100 if ctx_max else 0
-            ctx_str = f"  ·  ctx {ctx_pct:.0f}%"
+            val = ctx_est / ctx_max * 100 if ctx_max else None
         except Exception:
             pass
+        _ctx_cache[0], _ctx_cache[1] = now, val
+        return val
 
-        # ctrl+p is listed because a lever nobody can see is a lever nobody
-        # uses — the whole point of pause/resume is reaching for it in the
-        # moment you want the GPU back.
+    def _dock_state():
+        """Snapshot of everything the permanent bottom dock shows (see dock.py)."""
+        from greenboost_cli.terminal.dock import DockState
+        from greenboost_cli.terminal.statusline import activity_fragments
+        from greenboost_cli.terminal import renderer as _rend_hdr
         try:
             from greenboost_cli.core.autonomy import get_state
             _st = get_state()
-            _auto = (f"ctrl+n=nonstop:{'ON' if _st.nonstop else 'off'}"
-                     f" · ctrl+y=autoanswer:{'ON' if _st.auto_answer else 'off'}")
+            nonstop, autoans = bool(_st.nonstop), bool(_st.auto_answer)
+            _h_nonstop = f"ctrl+n=nonstop:{'ON' if _st.nonstop else 'off'}"
+            _h_autoans = f"ctrl+y=autoanswer:{'ON' if _st.auto_answer else 'off'}"
         except Exception:
-            _auto = "ctrl+n=nonstop · ctrl+y=autoanswer"
-        shift_hint = ("shift+tab · ctrl+j=newline · esc=clear · "
-                      "ctrl+p=pause/resume · ctrl+i=compact · " + _auto)
-
-        # Build line 2 (mode hints) and track plain-text width for right-alignment
-        line2_frags: list[tuple[str, str]] = []
-        status_frags = toolbar_status_fragments()
-        if status_frags:
-            line2_frags.extend(status_frags)
-            line2_frags.append((f"fg:{DIM}", "  "))
-
-        if getattr(session, "plan_mode", False):
-            line2_frags.append((f"bold fg:{VIOLET}", "⏸ plan mode on (shift+tab to cycle)"))
-            line2_frags.append((f"fg:{DIM}", f"  ·  esc to interrupt · ctrl+p=pause/resume{q_hint}{ctx_str}"))
-        elif settings.get("permission_mode") == "autonomous":
-            line2_frags.append((f"fg:{AMBER}", "auto-accept on"))
-            line2_frags.append((f"fg:{DIM}", f"  ·  {shift_hint}{q_hint}{ctx_str}"))
-        else:
-            line2_frags.append((f"fg:{DIM}", f"  {shift_hint}{q_hint}{ctx_str}"))
-
-        # Right-align T1+T2+T3 tier usage stats
+            nonstop = autoans = None
+            _h_nonstop, _h_autoans = "ctrl+n=nonstop", "ctrl+y=autoanswer"
         with _gb_stats_lock:
-            gb_segs = list(_gb_stats_segs)
-        if gb_segs:
-            # Build plain-text form (for width accounting)
-            sep = " · "
-            gb_plain = sep.join(txt for txt, _ in gb_segs)
-            left_len = sum(len(t) for _, t in line2_frags)
-            pad = max(2, w - left_len - len(gb_plain))
-            line2_frags.append(("", " " * pad))
-            for i, (txt, style) in enumerate(gb_segs):
-                if i > 0:
-                    line2_frags.append((f"fg:{DIM}", sep))
-                line2_frags.append((style, txt))
+            tiers = list(_gb_stats_segs)
+        _act = activity_fragments(_rend_hdr._tool_label)
+        if _act:       # a turn is running: the levers that matter now
+            hints = ["esc interrupt", "ctrl+p pause", "ctrl+q compact", "type to queue"]
+        else:
+            hints = ["/ commands · @ files · ! shell", "shift+tab mode", "ctrl+p=pause/resume",
+                     _h_nonstop, "ctrl+q=compact", _h_autoans, "ctrl+j=newline", "esc=clear"]
+        return DockState(
+            name=(getattr(session, "name", "") or "").strip(),
+            activity=_act,
+            plan_mode=bool(getattr(session, "plan_mode", False)),
+            autonomous=settings.get("permission_mode") == "autonomous",
+            nonstop=nonstop, auto_answer=autoans,
+            server=_server_state_frag(), gpu_owner=_gpu_owner or "",
+            statusline=_statusline or "", queued=len(prompt_queue),
+            ctx_pct=_ctx_pct_now(), tiers=tiers, hints=hints,
+        )
 
-        frags = [(f"fg:{DIM}", bottom_border + "\n")] + line2_frags
-        return FormattedText(frags)
+    set_dock_state_provider(_dock_state)
 
     def _build_prompt() -> str:
         """Readline fallback prompt (used when prompt_toolkit is unavailable)."""
@@ -2016,7 +2349,7 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
             # _model_idle is the inverse of _is_processing: set at startup,
             # cleared when a turn begins, re-set when the turn completes.
             # Event.wait() releases the GIL while blocking — zero CPU spin.
-            _model_idle.wait()
+            _wizard_free.wait()
             if _shutdown_evt.is_set():
                 return
             try:
@@ -2030,16 +2363,8 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
                         # raw=False every \x1b the renderer writes shows up as
                         # literal "?[38;2;...m" text on screen.
                         with _pt_patch_stdout(raw=True):
-                            if first:
-                                raw = _pt_session.prompt(
-                                    _get_pt_prompt,
-                                    bottom_toolbar=_get_pt_toolbar,
-                                    pre_run=_pt_capture_loop,
-                                )
-                            else:
-                                raw = _pt_session.prompt(
-                                    _CONT_PROMPT_PT, pre_run=_pt_capture_loop
-                                )
+                            raw = _pt_session.prompt(
+                                continuation=not first, pre_run=_pt_capture_loop)
                     else:
                         raw = input(_build_prompt() if first else _CONT_PROMPT_RL)
                     if _shutdown_evt.is_set():
@@ -2203,6 +2528,9 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
     _stdin_thread.start()
     set_stdin_thread_ref(_stdin_thread)
 
+    if initial_command:
+        _stdin_q.put(("line", initial_command))
+
     # ── Main event loop ────────────────────────────────────────────────────
     while True:
         ev, data = next_stdin_event(_stdin_q)
@@ -2211,6 +2539,22 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
 
         if ev == "eof":
             print()
+            # An accepted prompt is either consumed or REPORTED, never silently
+            # dropped. A real session on 2026-08-22 queued a folder-name
+            # instruction, ended before turn 1 finished, and the instruction
+            # vanished with it , the work went into the wrong directory and
+            # nothing said so. See prompt_queue.spill_unconsumed.
+            try:
+                from greenboost_cli.terminal.prompt_queue import spill_unconsumed, _SPILL
+                _left = spill_unconsumed(prompt_queue, getattr(session, "name", "") or "")
+                if _left:
+                    console.print(
+                        f"\n  [{AMBER}]◈[/]  [{GRAY}]{len(_left)} queued prompt(s) were "
+                        f"never run , saved to[/] [{VIOLET}]{_SPILL}[/]")
+                    for _t in _left:
+                        console.print(f"      [{GRAY}]·[/] [{VIOLET}]{_t[:96]}[/]")
+            except Exception:
+                pass
             emit_ok("Goodbye.")
             try:
                 from greenboost_cli.instruments.hooks import run_stop_hooks
@@ -2266,8 +2610,30 @@ def run_interactive(settings: dict, initial_prompt: str = None) -> None:
             if not user_input:
                 continue
 
+            # `/name` with no built-in handler but a name.md on disk becomes a prompt.
+            if user_input.startswith("/") and not user_input.startswith("//"):
+                _p = user_input[1:].split(None, 1)
+                if _p and _p[0].lower() not in COMMAND_TABLE:
+                    from greenboost_cli import custom_commands as _cc_md
+                    _exp = _cc_md.expand(_p[0], _p[1] if len(_p) > 1 else "")
+                    if _exp:
+                        console.print(f"  [{DIM}]↳ /{_p[0].lower()}[/]")
+                        user_input = _exp
+            # `# note` saves a one-line memory, like Claude Code. Only a single short
+            # line, so a pasted markdown heading block is left alone.
+            if (user_input.startswith("# ") and "\n" not in user_input
+                    and 3 < len(user_input) <= 200 and "remember" in COMMAND_TABLE):
+                COMMAND_TABLE["remember"](user_input[2:].strip(), session, settings)
+                continue
+
             # Slash commands run immediately regardless of model state.
             if dispatch_command(user_input, session, settings):
+                continue
+            if user_input.startswith("!") and len(user_input) > 1:
+                from greenboost_cli.terminal.cc_features import run_bash_line
+                from greenboost_cli.terminal.width import suspend_live
+                with suspend_live():
+                    run_bash_line(user_input, session)
                 continue
 
             if _is_processing.is_set():
@@ -2340,6 +2706,12 @@ def _run_turn_chain(user_input: str, session: ConversationSession,
                 may_stop, hook_reason = True, ""
             if may_stop:
                 st.record("stop", reason=why)
+                # A stop the user did not ask for must say why. It used to be
+                # journalled only, so a guard ending the run looked like a hang.
+                if st.nonstop and why != "the model reported the work finished":
+                    console.print(
+                        f"  [{AMBER}]■ stopped:[/] [{DIM}]{why} "
+                        f"(type to continue, ctrl+n toggles non-stop)[/]")
                 return
             st.record("hook_continue", reason=hook_reason)
             go, why = True, f"a Stop hook refused the stop , {hook_reason}"
@@ -2363,7 +2735,8 @@ def _run_once_safe(user_input: str, session: ConversationSession, settings: dict
     except Exception as _err:
         err_msg = str(_err)
         if isinstance(_err, RuntimeError):
-            emit_err(err_msg)
+            from greenboost_cli.terminal.cc_features import print_turn_error
+            print_turn_error(err_msg)
         else:
             # Unexpected non-RuntimeError — log full traceback so it can be diagnosed
             try:

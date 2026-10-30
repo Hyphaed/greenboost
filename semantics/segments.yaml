@@ -97,6 +97,29 @@
   reads: [kmod_loaded, shim_fresh]
   severity: violation
 
+- name: separate_mtp_head_unused
+  doc: >
+    The model ships its MTP head as a separate file (mtp_head_on_disk=1.0)
+    but the latest synapse_serve recorded no `mtp_head`, i.e. the server ran
+    without --spec-draft-model and decode lost the speculative speedup with
+    nothing in the logs saying so. `matched` is None when the serve event
+    predates the field. Fix: re-serve; GB_SYNAPSE_MTP=0 forces it off on purpose.
+  evaluator: separate_mtp_head_unused
+  reads: [mtp_head_on_disk]
+  severity: warning
+
+- name: boot_tuning_lost_next_reboot
+  doc: >
+    GreenBoost's boot tuning is active THIS boot (boot_tuning_active > 0)
+    but the config that would reproduce it on the NEXT boot has regressed
+    (boot_tuning_persisted < boot_tuning_active) , the 2026-08-31 incident
+    shape: a grub-pc package purge deleted /etc/default/grub while
+    /proc/cmdline still showed every GreenBoost flag. `matched` is None,
+    never False, when either side can't be read.
+  evaluator: boot_tuning_lost_next_reboot
+  reads: [boot_tuning_active, boot_tuning_persisted]
+  severity: warning
+
 - name: prompt_cache_cold
   doc: prompt_cache_hit_pct is near zero across recent serve requests despite --cache-reuse/--cache-ram being active , usually an unstable prefix (system prompt or tool schema changed between turns).
   evaluator: prompt_cache_cold
@@ -213,6 +236,24 @@
     cannot be read, never false , absence of evidence is not a clean bill.
   evaluator: models_wiped_from_manifest
   reads: [unregistered_cached_models]
+  severity: violation
+
+- name: recipe_model_unresolvable
+  doc: >
+    A pinned serving recipe's model does not exist in the manifest right now.
+    Distinct from models_wiped_from_manifest by direction: that one starts
+    from disk and asks "what's on disk but unregistered"; this one starts from
+    the recipe (the thing an operator actually reads to know what should
+    serve) and asks "does the model this recipe promises actually exist" ,
+    closer to the operator's real next question, and it catches the case
+    where the recipe's OWN validity check (schema+digest) reports healthy
+    while the model itself is missing. Severity violation, not diagnosis:
+    nothing about the hardware makes this true, and it is fixed in seconds by
+    `greenboost synapse recover-cache` without downloading anything. Returns
+    matched=None when the manifest cannot be read , absence of evidence is
+    never reported as a clean bill.
+  evaluator: recipe_model_unresolvable
+  reads: [recipes_unresolvable]
   severity: violation
 
 - name: host_oom_imminent
@@ -461,3 +502,37 @@
   evaluator: dataflux_history_reset
   reads: [dataflux_event_count, kmod_loaded]
   severity: info
+
+- name: tier_spill_returns_often
+  doc: >
+    More than half of all T1 demotions had to be undone by promoting the same
+    component back. Every round trip pays a demote and a promote for memory
+    that was still needed, which means the eviction policy is releasing the
+    wrong component, not that there is too little VRAM. Returns null, not
+    false, when nothing has been demoted yet.
+  evaluator: tier_spill_returns_often
+  reads: ["tier_spill_return_pct"]
+  severity: warning
+
+- name: warm_prefill_dominates_turn
+  doc: >
+    The fixed per-request cost before the first output token exceeds one
+    second, so a short agent turn spends most of its wall clock before
+    producing anything. Independent of prompt length and output length, so
+    neither a shorter context nor a shorter reply will help; only reducing
+    the per-request setup will. Null, not false, before any benchmark.
+  evaluator: warm_prefill_dominates_turn
+  reads: ["warm_prefill_fixed_ms"]
+  severity: warning
+
+
+- name: tool_result_dominates_turn
+  doc: >
+    A single tool result will cost more than ten seconds of prefill. Not a
+    fault in the tool , it ran in milliseconds , but the turn that carries its
+    output pays for every token of it, and an agent that reads several large
+    files pays repeatedly. Null, not false, before any tool result has been
+    sized.
+  evaluator: tool_result_dominates_turn
+  reads: ["tool_result_prefill_ms"]
+  severity: warning

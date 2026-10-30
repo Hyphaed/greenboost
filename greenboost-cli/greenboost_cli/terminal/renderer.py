@@ -288,7 +288,7 @@ _tool_label = ""
 
 
 def set_quiet_mode(on: bool) -> None:
-    """Toggle compact tool output (ctrl+i, /quiet).
+    """Toggle compact tool output (ctrl+q, /quiet).
 
     The renderer keeps its own `_quiet_mode` because it is consulted on the
     hot path for every tool card; this keeps it in step with the settings dict
@@ -338,6 +338,9 @@ def set_tool_label(label: str) -> None:
 def _start_tool_spinner() -> None:
     global _tool_t0, _tool_stop_evt, _tool_thread
     _tool_t0 = time.monotonic()
+    from greenboost_cli.terminal.footer import get_footer
+    if get_footer().is_active():
+        return      # the pinned footer shows the running tool; no second painter
     if not sys.stdout.isatty():
         # Non-TTY: `gb -p ...` piped into a file, a CI job, a log. An animation
         # repainting a row 12 times a second has nothing to repaint there — it
@@ -379,7 +382,8 @@ def halt_tool_spinner() -> None:
     if _tool_stop_evt is None:
         return
     _stop_tool_spinner()
-    if _pt_live():
+    from greenboost_cli.terminal.footer import get_footer
+    if _pt_live() or get_footer().is_active():
         return
     w = _w()
     tty_write(f"\r{' ' * w}\r")
@@ -700,7 +704,8 @@ def show_instrument_result(name: str, result: str, verbose: bool) -> None:
 
     # Erase spinner line — during turns (pt app not live) a raw \r spinner was
     # drawn; clear it before printing the result. No-op if nothing was drawn.
-    if not _pt_live():
+    from greenboost_cli.terminal.footer import get_footer
+    if not _pt_live() and not get_footer().is_active():
         tty_write(f"\r{' ' * safe_w}\r")
 
     # ── Grep/Glob group: condensed child rows + in-place header count update ───
@@ -1106,7 +1111,10 @@ def prompt_approval(description: str, settings: dict) -> bool:
             inner = w - 4
             console.print(f"  [{DIM}]{BOX_TL}{BOX_H * inner}{BOX_TR}[/]")
             console.print(f"  [{DIM}]{BOX_V}[/]  [{AMBER}]⚠  Permission required[/]")
-            console.print(f"  [{DIM}]{BOX_V}[/]  [{GRAY}]{description[:inner - 4]}[/]")
+            from rich.markup import escape as _esc
+            from greenboost_cli.terminal.wizard_prompt import verbatim_lines as _vl
+            for _ln in _vl(description, inner - 4, 4)[0]:
+                console.print(f"  [{DIM}]{BOX_V}[/]  [{GRAY}]{_esc(_ln)}[/]")
             console.print(f"  [{DIM}]{BOX_ML}{BOX_H * inner}{BOX_MR}[/]")
             console.print(f"  [{DIM}]{BOX_V}[/]  [{LIME}][1][/]  [{GRAY}]Allow once[/]")
             console.print(f"  [{DIM}]{BOX_V}[/]  [{AMBER}][2][/]  [{AMBER}]Allow for session[/]")
@@ -1300,7 +1308,7 @@ def show_session_banner(settings: dict, session=None) -> None:
         elif _vs == "starting":
             _row("gb-synapse", "◌ loading model…  ·  /llamaserve logs", AMBER)
         else:
-            _row("gb-synapse", "○ stopped  ·  /llamaserve", GRAY)
+            _row("gb-synapse", "○ model not loaded  ·  use '/llamaserve load' to load the model", AMBER)
     except Exception:
         pass
 

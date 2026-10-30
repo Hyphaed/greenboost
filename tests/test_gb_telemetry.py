@@ -818,3 +818,20 @@ def test_gpumetrics_swap_used_pct_zero_when_no_swap_configured():
     m.sys = SystemMetrics(mem_total_mb=10000, mem_available_mb=2000,
                            swap_total_mb=0, swap_used_mb=0)
     assert m.swap_used_pct == 0.0
+
+
+def test_shim_zero_free_vram_falls_back_to_driver(monkeypatch):
+    """shim_stats physical_vram_free_mb=0 before first allocation is 'unread'."""
+    import time, types, gb_telemetry, gb_nvml
+    stats = "physical_vram_mb=12227\nphysical_vram_free_mb=0\ntimestamp=%d\n" % int(time.time())
+    real_exists, real_open = gb_telemetry.os.path.exists, open
+    monkeypatch.setattr(gb_telemetry.os.path, "exists",
+                        lambda p: True if p == "/run/greenboost/shim_stats" else real_exists(p))
+    import io
+    monkeypatch.setattr("builtins.open",
+                        lambda p, *a, **k: io.StringIO(stats) if p == "/run/greenboost/shim_stats" else real_open(p, *a, **k))
+    monkeypatch.setattr(gb_nvml, "get_nvml",
+                        lambda d=0: types.SimpleNamespace(mem=lambda: (3000, 9191, 12227, 0.0)))
+    m = gb_telemetry.GpuMetrics()
+    gb_telemetry.GreenBoostProvider().fill(m)
+    assert (m.fb_phys_total_mb, m.fb_phys_free_mb, m.fb_phys_used_mb) == (12227, 9191, 3036)

@@ -53,15 +53,15 @@ def test_dataflux_group_shim_returns_previously_orphaned_kinds(log_path):
     assert "quantize" not in result["by_kind"]
 
 
-def test_dataflux_group_placement_returns_all_four_kinds(log_path):
-    for k in ("placement", "tensor_split", "capacity_fit", "synapse_engine_placement"):
+def test_dataflux_group_placement_returns_every_registered_kind(log_path):
+    kinds = ("placement", "tensor_split", "capacity_fit", "synapse_engine_placement", "moe_cache_plan")
+    for k in kinds:
         gdf.emit({"kind": k, "status": "ok"})
 
     result = mcp.dataflux_group("placement", days=1)
 
-    assert result["event_count"] == 4
-    assert set(result["kinds"]) == {
-        "placement", "tensor_split", "capacity_fit", "synapse_engine_placement"}
+    assert result["event_count"] == len(kinds)
+    assert set(result["kinds"]) == set(kinds)
 
 
 def test_dataflux_group_unknown_group_returns_empty():

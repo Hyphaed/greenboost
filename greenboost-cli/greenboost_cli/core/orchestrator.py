@@ -20,7 +20,7 @@ from typing import Generator
 
 from greenboost_cli.core.session import ConversationSession
 from greenboost_cli.instruments.schemas import INSTRUMENT_DEFINITIONS
-from greenboost_cli.instruments.dispatcher import dispatch, _describe_operation
+from greenboost_cli.instruments.dispatcher import dispatch, dispatch_mcp, _describe_operation
 from greenboost_cli.instruments.safety import is_readonly_command, is_autonomous_safe
 from greenboost_cli.inference.router import generate, StreamFragment, ReasoningFragment, CompletedResponse
 
@@ -580,8 +580,14 @@ def execute_turn(
                 _observe_prefix({
                     "system": system_context,
                     "tools": "".join(str(t.get("name", "")) for t in tool_schemas),
-                    "history": "".join(str(m.get("content", ""))
-                                       for m in session.messages[:-1]),
+                    # A LIST, one entry per message, not a joined blob. Joined,
+                    # every appended turn flipped the chunk's hash and was read
+                    # as the prefix moving: measured 2026-08-22, 14 consecutive
+                    # `first_changed=history` warns across an 11-turn
+                    # conversation that never rewrote anything. Per-message
+                    # entries let prefix.py tell an append from a rewrite.
+                    "history": [str(m.get("content", ""))
+                                for m in session.messages[:-1]],
                     "memory": "".join(str(m.get("content", "")) for m in _sent
                                       if str(m.get("content", "")).startswith("<recalled-memory>")),
                     "plan": "".join(str(m.get("content", "")) for m in _sent
@@ -997,18 +1003,31 @@ def execute_turn(
                 result, permitted = _plan_violation, False
             else:
                 _is_mcp = bool(session.mcp_registry and session.mcp_registry.has_tool(tc["name"]))
-                permitted = _is_auto_approved(tc, settings, is_mcp=_is_mcp)
-                if not permitted:
+                from greenboost_cli.core.permission_rules import decide as _rule_decide
+                _rule = _rule_decide(tc["name"], tc["input"])
+                if _rule == "deny":
+                    permitted = False
+                    result = "Denied: blocked by a permission rule (/permissions rules)"
+                else:
+                    permitted = True if _rule == "allow" else _is_auto_approved(tc, settings, is_mcp=_is_mcp)
+                if not permitted and _rule != "deny":
                     request = ApprovalNeeded(description=_describe_operation(tc["name"], tc["input"]))
                     yield request
                     permitted = request.granted
 
                 if not permitted:
-                    result = "Denied: user rejected this operation"
+                    if _rule != "deny":
+                        result = "Denied: user rejected this operation"
                 elif _tc_idx in _prefetched:
                     result = _prefetched[_tc_idx]      # already ran, concurrently
                 elif session.mcp_registry and session.mcp_registry.has_tool(tc["name"]):
-                    result = session.mcp_registry.call_tool(tc["name"], tc["input"])
+                    # Through the same policy/hook/audit gate as built-in tools;
+                    # a bare registry call skipped all three.
+                    result = dispatch_mcp(
+                        session.mcp_registry.call_tool, tc["name"], tc["input"],
+                        policy=settings.get("_tool_policy"),
+                        agent=settings.get("_agent_label", "main"),
+                    )
                 else:
                     result = dispatch(
                         tc["name"],
@@ -1159,7 +1178,7 @@ def _plan_mode_block(tc: dict, session: ConversationSession) -> str | None:
         )
 
     plan_file = getattr(session, "plan_file", None)
-    if name in ("Write", "Edit"):
+    if name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
         if plan_file and str(plan_file) == tc["input"].get("file_path"):
             return None
         return (
@@ -1199,7 +1218,8 @@ def _is_auto_approved(tc: dict, settings: dict, is_mcp: bool = False) -> bool:
 
     if perm_mode == "autonomous":
         # Reads, writes, edits all auto-approved in autonomous mode
-        if name in ("Read", "Glob", "Grep", "WebFetch", "WebSearch", "Screenshot", "Write", "Edit"):
+        if name in ("Read", "Glob", "Grep", "WebFetch", "WebSearch", "Screenshot", "Write", "Edit",
+                    "MultiEdit", "NotebookEdit"):
             return True
         if name == "Bash":
             return is_autonomous_safe(tc["input"].get("command", ""))

@@ -32,6 +32,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import gb_vision
+
 _REPO_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_REPO_DIR))
 
@@ -476,8 +478,10 @@ _KNOWN_VALUED_FLAGS = {
     "--host", "--port", "--ctx-size", "--slot-save-path", "--flash-attn",
     "--cache-reuse", "--cache-ram", "--slot-prompt-similarity", "--threads",
     "-np", "--cache-type-k", "--cache-type-v", "-fit", "--mmproj",
+    "--image-min-tokens", "--image-max-tokens",
     "--spec-type", "--spec-draft-n-max", "--spec-draft-p-min", "--rpc",
     "--tensor-split", "-ngl", "--n-cpu-moe", "--maxp",
+    "--batch-size", "--ubatch-size",
 }
 
 
@@ -591,7 +595,7 @@ class EngineBackend:
     def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None,
               mtp_draft_n=None, spec_draft_p_min=None, slot_prompt_similarity=None,
               n_gpu_layers_override=None, kv_type_override=None, n_cpu_moe_override=None,
-              sampling_override=None):
+              sampling_override=None, batch_override=None, ubatch_override=None):
         """n_slots=-1 (default) means "let the engine decide" — for
         LlamaCppBackend this passes straight through to llama.cpp's own
         `-np -1` auto mode (n_parallel=4, kv_unified=true, a single shared
@@ -664,7 +668,7 @@ class LlamaCppBackend(EngineBackend):
     def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None,
               mtp_draft_n=None, spec_draft_p_min=None, slot_prompt_similarity=None,
               n_gpu_layers_override=None, kv_type_override=None, n_cpu_moe_override=None,
-              sampling_override=None):
+              sampling_override=None, batch_override=None, ubatch_override=None):
         """n_gpu_layers_override/kv_type_override/n_cpu_moe_override (NemoClaw
         audit, Phase 5/7 follow-up): a serving/ recipe's nGpuLayers/kvCache/
         nCpuMoe fields, threaded through to skip the heuristic -ngl/KV-type/
@@ -712,7 +716,11 @@ class LlamaCppBackend(EngineBackend):
                     continue
                 rpc_args.append(f"{f.ip}:{rpc_port}")
                 online_feeders.append(f)
-        budget_gb = host_free_mb / 1024 + sum(f.t1_free_mb for f in online_feeders) / 1024
+        # The projector (weights + vision-encoder buffers for the image token budget) lives on THIS card:
+        # take it off the host's share before any fit decision, so ngl, ctx and --n-cpu-moe all see the
+        # VRAM that is really left (workflow/vision-serving.md; gb_vision.VISION_FIT is set by serve()).
+        budget_gb = (max(0.0, host_free_mb / 1024 - gb_vision.VISION_FIT.extra_gb)
+                     + sum(f.t1_free_mb for f in online_feeders) / 1024)
 
         internal_port = port + 1000
         env = gb_cluster.shim_env(workload="llm", enabled=True)
@@ -735,7 +743,17 @@ class LlamaCppBackend(EngineBackend):
         # serving without it: RPC still splits across the cluster and
         # gb-quant still holds quality, we only lose per-node T2/T3 spill.
         import gb_shim_probe
-        shim_works, shim_reason = gb_shim_probe.shim_works_for_llama(gs.ENGINE_DIR)
+        # explicit=True: this code path runs ONLY inside a real (gated) serve,
+        # so the probe is allowed to run and cache its verdict instead of
+        # skipping to "off". That makes the shim default ON whenever it
+        # actually works on this engine build (the verdict is cached per
+        # shim/engine/cudart build, so the one-time probe cost is paid once).
+        # A build where the shim kills llama-server still caches "off" with a
+        # reason — the safety the probe exists for is preserved. Before this,
+        # the probe skipped during serve (load_in_progress() False at this
+        # point) → LD_PRELOAD popped → MoE models fell to the CPU-only arch
+        # quirk (ARCH_CPU_SPLIT_BROKEN) at ~11 tok/s instead of serving all-GPU.
+        shim_works, shim_reason = gb_shim_probe.shim_works_for_llama(gs.ENGINE_DIR, explicit=True)
         if not shim_works:
             for k in ("LD_PRELOAD", "GREENBOOST_ACTIVE"):
                 env.pop(k, None)
@@ -810,6 +828,10 @@ class LlamaCppBackend(EngineBackend):
         _model_default = gs.MODEL_CTX_KV_DEFAULTS.get(entry.name)
         if ctx <= 0:
             ctx = (_model_default[0] if _model_default else None) or entry.ctx_length or 65536
+            # Never let "no ctx given" mean the model's own maximum (262,144 on a
+            # Qwen3-VL: ~22 GiB of host RAM, 2026-10-11). A caller that wants more
+            # passes ctx explicitly or raises GB_SYNAPSE_DEFAULT_CTX_CAP.
+            ctx = min(ctx, gs.default_ctx_cap())
 
         # T2 KV/weights extension: whenever the shim is actually active, its
         # T2 DDR pool is real extra capacity for both weight overflow and KV
@@ -873,12 +895,21 @@ class LlamaCppBackend(EngineBackend):
         else:
             kv_type = gs._pick_kv_type(ctx, entry, ctx_kv_budget_gb + t2_kv_extra_gb)
 
-        kv_layers = 0 if entry.is_recurrent_only else (entry.n_kv_layers or entry.n_layers)
-        kv_total_gb = gs.estimate_kv_gb(ctx, entry.n_bytes, entry.quant,
-                                        n_layers=kv_layers,
-                                        n_kv_heads=entry.n_kv_heads,
-                                        head_dim=entry.head_dim,
-                                        kv_bytes_per_elem=2.0 if kv_type == "f16" else 1.0)
+        # Skip the estimator entirely for a recurrent-only stack rather than
+        # asking it for 0 layers. Its `n_layers > 0` guard means "geometry
+        # unknown, fall back to the param-count bucket", so 0 meaning "no KV at
+        # all" came back as a bucketed charge instead of zero , measured 0.0406
+        # GiB of phantom KV at ctx 65536 on a 17 GB model. Latent (no
+        # recurrent-only entry in the manifest today) and found 2026-08-22 while
+        # fixing the same C-07 sizing bug on gb_mcp's gb_plan path.
+        if entry.is_recurrent_only:
+            kv_total_gb = 0.0
+        else:
+            kv_total_gb = gs.estimate_kv_gb(ctx, entry.n_bytes, entry.quant,
+                                            n_layers=entry.n_kv_layers or entry.n_layers,
+                                            n_kv_heads=entry.n_kv_heads,
+                                            head_dim=entry.head_dim,
+                                            kv_bytes_per_elem=2.0 if kv_type == "f16" else 1.0)
         # Recurrent state is VRAM-resident too (Rule #1 — pin in T1, see
         # GREENBOOST_SSM_STATE_MB) and must be counted alongside KV when
         # sizing the tensor split, or a hybrid/Mamba GGUF's real footprint
@@ -1073,6 +1104,23 @@ class LlamaCppBackend(EngineBackend):
                 n_gpu_layers_reported = entry.n_layers or 999
                 if entry.is_moe and n_cpu_moe_override is not None:
                     n_cpu_moe = n_cpu_moe_override
+                    # A recipe's nCpuMoe was measured on a near-empty card. When the
+                    # live free VRAM (desktop and other jobs resident) cannot hold that
+                    # placement plus the compute buffers, the load dies with
+                    # "failed to allocate compute pp buffers". Offloading MORE expert
+                    # layers is always safe (only the slower side), so raise it to the
+                    # live fit; never lower the recipe's pin.
+                    # The plain fit ignores the prompt-batch compute buffers and shim
+                    # overhead (measured 2026-10-29: pin 28 + ubatch 2048 needs ~9 GB free,
+                    # fit said 26 at 8.1 GB and the load OOMed), so keep 1 GB back.
+                    _live_fit = gs._fit_cpu_moe_layers(
+                        entry, max(0.0, budget_gb - 1.0), kv_total_gb,
+                        n_devices=max(1, 1 + len(online_feeders))) if not cpu_quirk else 0
+                    if _live_fit > n_cpu_moe:
+                        print(f"  [gb-synapse] {entry.name}: recipe n_cpu_moe={n_cpu_moe} was measured on a "
+                              f"free card; only {budget_gb:.1f} GB VRAM is free now, raising to "
+                              f"{_live_fit} so the compute buffers fit.", flush=True)
+                        n_cpu_moe = _live_fit
                     cmd += ["--n-cpu-moe", str(n_cpu_moe)]
             else:
                 cmd += ["-ngl", str(n_gpu_layers_override)]
@@ -1128,6 +1176,9 @@ class LlamaCppBackend(EngineBackend):
         mmproj = gs._find_mmproj(entry)
         if mmproj:
             cmd += ["--mmproj", str(mmproj)]
+            # Qwen-VL class projectors need >= 1024 image tokens to be accurate (the engine warns about it);
+            # the flags come from the projector's own metadata, not from the caller.
+            cmd += gb_vision.cmd_flags(gb_vision.VISION_FIT.profile)
 
         # MTP: models carrying a grafted multi-token-prediction layer decode ~34%
         # faster through llama.cpp's speculative path, with identical output —
@@ -1147,6 +1198,42 @@ class LlamaCppBackend(EngineBackend):
         # today (-ngl 65/65, mtp=true) is unaffected — confirmed live via a
         # direct benchmark request (100% SM util, 4.86 tok/s, no crash).
         mtp_active = gs._has_mtp(entry) and (fits_vram or entry.is_moe)
+        _mtp_reason = ("on" if mtp_active else ("no_mtp_head" if not gs._has_mtp(entry) else "dense_model_does_not_fit"))
+
+        _moe_inputs: dict = {}      # the last sizing inputs, for the moe_cache_plan dataflux event
+
+        def _plan_moe_cache(_mtp: bool):
+            """gb_moe_cache plan for this serve (None: keep the placement), or None when the engine has no --moe-cache-mib / the model is not a MoE with experts on the host."""
+            if not (entry.is_moe and n_cpu_moe and not cpu_quirk and "--n-cpu-moe" in cmd):
+                return None
+            try:
+                import gb_moe_cache
+                if not gb_moe_cache.engine_supports(gs.ENGINE_DIR / "llama-server"):
+                    return None
+                _exp_gb = (getattr(entry, "expert_bytes", 0) or 0) / 2**30
+                _moe_inputs.update(budget_gb=budget_gb, dense_gb=(getattr(entry, "dense_bytes", 0) or 0) / 2**30, expert_gb=_exp_gb, kv_gb=kv_total_gb,
+                                   vision_gb=(gb_vision.VISION_FIT.extra_gb if mmproj else 0.0), ubatch=ubatch_override or 512)
+                return gb_moe_cache.plan(
+                    n_layers=entry.n_layers or 0, n_cpu_moe=n_cpu_moe, dense_gb=(getattr(entry, "dense_bytes", 0) or 0) / 2**30,
+                    expert_gb_total=_exp_gb or (gs._moe_expert_gb_per_layer(entry) * (entry.n_layers or 0)), kv_gb=kv_total_gb,
+                    vision_gb=(gb_vision.VISION_FIT.extra_gb if mmproj else 0.0), budget_gb=budget_gb, ubatch=ubatch_override, mtp=_mtp)
+            except Exception as _e:  # noqa: BLE001  - an optimisation: never stops a serve
+                print(f"  [gb-synapse] moe cache skipped: {type(_e).__name__}: {_e}", flush=True)
+                return None
+
+        # MTP and the expert cache stack (measured 2026-10-30, Qwen3.8-35B-A3B on the 5070, cache auto-sized, ubatch 512): cache only 128 tok/s, cache + MTP at draft depth 2 = 181 tok/s.
+        # (The 2026-10-29 note that MTP loses came from a draft context sized at 0.6 GB, which really costs 1.5 GB, and the default depth 4, which does not fit and verifies more experts than
+        # the cache holds.) With the cache in use the depth defaults to gb_moe_cache.MTP_DRAFT_N unless the caller set one; GB_MOE_CACHE_MTP=0 drops MTP in favour of a bigger cache.
+        if mtp_active and os.environ.get("GB_MOE_CACHE_MTP", "1") == "0" and _plan_moe_cache(False) is not None:
+            mtp_active = False
+            _mtp_reason = "off_for_bigger_cache (GB_MOE_CACHE_MTP=0)"
+            print(f"  [gb-synapse] {entry.name}: MTP off while the GPU expert cache is in use (GB_MOE_CACHE_MTP=0)", flush=True)
+        elif mtp_active and _plan_moe_cache(True) is not None:
+            # Cap, not default: the certified recipe pins mtpDraftN 4 (digest-protected), which does not fit with the cache. GB_MOE_CACHE_DRAFT_N overrides the cap.
+            import gb_moe_cache
+            _cap = int(os.environ.get("GB_MOE_CACHE_DRAFT_N", gb_moe_cache.MTP_DRAFT_N))
+            mtp_draft_n = min(mtp_draft_n if mtp_draft_n is not None else gs.MTP_DRAFT_N, _cap)
+            _mtp_reason = f"on_with_cache (draft depth capped at {_cap})"
         # Speculation is stackable: --spec-type takes a comma-separated list, and
         # the ngram modes need no draft model and no extra VRAM (they predict
         # from text already in the context). On a bandwidth-bound decode a
@@ -1172,9 +1259,55 @@ class LlamaCppBackend(EngineBackend):
                 _p_min = spec_draft_p_min if spec_draft_p_min is not None else gs.MTP_P_MIN
                 cmd += ["--spec-draft-n-max", str(_draft_n),
                         "--spec-draft-p-min", str(_p_min)]
+                # Head shipped as a separate file (not in the main GGUF).
+                _head = gs._mtp_head_path(entry)
+                if _head:
+                    cmd += ["--spec-draft-model", _head]
 
         if rpc_args:
             cmd += ["--rpc", ",".join(rpc_args), "--tensor-split", tensor_split]
+        # GPU expert cache (upstream llama.cpp PR 29887, --moe-cache-mib): for a MoE model whose experts do not all fit, keep ALL experts on the host and give the free VRAM
+        # to a cache of the hot ones. Measured on the 5070: 54 -> 93..101 tok/s with less VRAM than the layer-split placement (workflow/gb-moe-cache.md). Only when this engine
+        # accepts the flag, the model is MoE with experts on the host, and the card has room; GB_MOE_CACHE=0 disables it.
+        _moe_cache = _plan_moe_cache(bool(mtp_active))
+        if _moe_cache is not None:
+            _i = cmd.index("--n-cpu-moe")
+            cmd[_i + 1] = str(_moe_cache.n_cpu_moe)
+            cmd += ["--moe-cache-mib", str(_moe_cache.cache_mib)]
+            n_cpu_moe = _moe_cache.n_cpu_moe
+            print(f"  [gb-synapse] {entry.name}: all experts on the host + {_moe_cache.cache_mib} MiB GPU expert cache ({_moe_cache.detail})", flush=True)
+        try:                                                                  # telemetry: why this cache size / no cache (read by dataflux_critic and synapse_status)
+            import gb_moe_cache
+            gb_moe_cache.emit_decision(
+                model=entry.name, plan_=_moe_cache, inputs=_moe_inputs, mtp_reason=_mtp_reason, is_moe=bool(entry.is_moe), n_cpu_moe=n_cpu_moe, mtp=bool(mtp_active),
+                mtp_draft_n=(mtp_draft_n if mtp_draft_n is not None else gs.MTP_DRAFT_N) if mtp_active else 0,
+                engine=gb_moe_cache.engine_info(gs.ENGINE_DIR / "llama-server", gs.MOECACHE_ENGINE_DIR, gs.VENDORED_ENGINE_DIR))
+        except Exception:  # noqa: BLE001  - telemetry never stops a serve
+            pass
+        try:
+            import gb_moe_cache
+            cmd = gb_moe_cache.compat_flags(cmd, gs.ENGINE_DIR / "llama-server")        # flags a newer upstream engine renamed (--no-mmap -> --load-mode none)
+        except Exception:  # noqa: BLE001
+            pass
+        # One thread per physical P-core, pinned: opt-in (GB_SYNAPSE_CPU_PIN=1|auto), off until the A/B in workflow/round2-improvements.md says it wins.
+        try:
+            import gb_cpu_pin
+            if gb_cpu_pin.apply_to_cmd(cmd):
+                print(f"  [gb-synapse] CPU pin: --threads {cmd[cmd.index('--threads') + 1]} -C {cmd[cmd.index('-C') + 1]} --cpu-strict 1 (GB_SYNAPSE_CPU_PIN={gb_cpu_pin.mode()})", flush=True)
+        except Exception:  # noqa: BLE001  - an opt-in tuning flag never stops a serve
+            pass
+        # Prefill batch sizing. Left unset by default so llama.cpp keeps its own
+        # compiled defaults (n_batch 2048 / n_ubatch 512) — behaviour is
+        # unchanged until a recipe or caller opts in. --ubatch-size is the one
+        # that sizes the physical prompt-processing GEMM on the GPU, so it is
+        # the lever for prefill tensor-core utilisation (measured per model,
+        # never assumed — same evidence gate as --n-cpu-moe). Appended BEFORE
+        # the extra_args block so a caller's --extra-args copy still wins via
+        # _dedupe_extra_args_overrides (both flags are in _KNOWN_VALUED_FLAGS).
+        if batch_override is not None:
+            cmd += ["--batch-size", str(int(batch_override))]
+        if ubatch_override is not None:
+            cmd += ["--ubatch-size", str(int(ubatch_override))]
         if extra_args:
             cmd = _dedupe_extra_args_overrides(cmd, extra_args)
             cmd += shlex.split(extra_args)
@@ -1189,10 +1322,13 @@ class LlamaCppBackend(EngineBackend):
             placement = "all-GPU"
         else:
             placement = "PARTIAL CPU OFFLOAD (slow)"
+        _batch_note = (f" b={int(batch_override)}" if batch_override is not None else "") + \
+                      (f" ub={int(ubatch_override)}" if ubatch_override is not None else "")
         print(f"  [gb-synapse] {entry.name}: ctx={ctx} kv={kv_type} ({kv_grade}) "
               f"weights={weights_gb:.1f}GB/{budget_gb:.1f}GB budget → {placement}, "
               f"shim={shim_note}"
               f"{' +mtp' if mtp_active else ''}{' +vision' if mmproj else ''}"
+              f"{_batch_note}"
               f"{' rpc=' + ','.join(rpc_args) if rpc_args else ''}", flush=True)
         if cpu_quirk:
             print(f"  [gb-synapse] {weights_gb:.1f} GB of weights vs {budget_gb:.1f} GB VRAM "
@@ -1420,12 +1556,13 @@ class SynapseTorchBackend(EngineBackend):
         # hybrid case this makes visible.
         facts["ssm_state_gb"] = round(gs._entry_ssm_gb(entry), 3)
         facts["n_recurrent_layers"] = entry.n_recurrent_layers
+        facts["mtp_head"] = gs._mtp_head_path(entry)
         return facts
 
     def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None,
               mtp_draft_n=None, spec_draft_p_min=None, slot_prompt_similarity=None,
               n_gpu_layers_override=None, kv_type_override=None, n_cpu_moe_override=None,
-              sampling_override=None):
+              sampling_override=None, batch_override=None, ubatch_override=None):
         import gb_synapse as gs
         import gb_cluster
 
@@ -1696,7 +1833,7 @@ class TransformersBackend(EngineBackend):
     def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None,
               mtp_draft_n=None, spec_draft_p_min=None, slot_prompt_similarity=None,
               n_gpu_layers_override=None, kv_type_override=None, n_cpu_moe_override=None,
-              sampling_override=None):
+              sampling_override=None, batch_override=None, ubatch_override=None):
         import gb_synapse as gs
 
         internal_port = port + 1000
@@ -1736,7 +1873,7 @@ class DiffusersBackend(EngineBackend):
     def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None,
               mtp_draft_n=None, spec_draft_p_min=None, slot_prompt_similarity=None,
               n_gpu_layers_override=None, kv_type_override=None, n_cpu_moe_override=None,
-              sampling_override=None):
+              sampling_override=None, batch_override=None, ubatch_override=None):
         import gb_synapse as gs
         import gb_cluster
 
@@ -1786,7 +1923,7 @@ class VideoBackend(EngineBackend):
     def serve(self, entry, port, ctx=0, use_cluster=True, n_slots=-1, extra_args="", cuda_graph=None, cache_ram=None,
               mtp_draft_n=None, spec_draft_p_min=None, slot_prompt_similarity=None,
               n_gpu_layers_override=None, kv_type_override=None, n_cpu_moe_override=None,
-              sampling_override=None):
+              sampling_override=None, batch_override=None, ubatch_override=None):
         import gb_synapse as gs
         import gb_cluster
 

@@ -83,15 +83,24 @@ def start(command: str, cwd: str | None = None) -> str:
     """Launch `command` detached. Returns the job id."""
     jid = uuid.uuid4().hex[:8]
     log = Path(tempfile.gettempdir()) / f"gb_bg_{jid}.log"
+    from greenboost_cli.instruments import shell_sandbox
+    jail = shell_sandbox.active_roots()
+    if jail:
+        # Refuse before opening the log or spawning anything; SandboxUnavailable
+        # reaches handle_shell's caller as an ordinary tool error.
+        argv = shell_sandbox.bwrap_argv(command, jail, cwd or os.getcwd())
     fh = open(log, "wb")
-    proc = subprocess.Popen(
-        command, shell=True, executable="/bin/bash",
+    popen_kw = dict(
         stdout=fh, stderr=subprocess.STDOUT,
         cwd=cwd or os.getcwd(),
         # Own process group, so stop() can kill the whole pipeline rather than
         # just the shell that spawned it and leaving orphans behind.
         start_new_session=True,
     )
+    if jail:
+        proc = subprocess.Popen(argv, **popen_kw)
+    else:
+        proc = subprocess.Popen(command, shell=True, executable="/bin/bash", **popen_kw)
     _JOBS[jid] = Job(id=jid, command=command, proc=proc, log=log)
     _reap()
     return jid

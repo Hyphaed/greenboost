@@ -152,16 +152,32 @@ def build_scaled_mm_processor(bits, device: str, dtype):
 def build_cutlass_nvfp4_processor(bits, device: str, dtype):
     """Stage-A2 processor for the sm_120a CUTLASS NVFP4 GEMM (gb_cutlass).
 
-    Returns None until the weight-packing reconciliation + numeric bench are
-    done: a real processor must repack the nvfp4 weight into CUTLASS's
-    interleaved block-scale layout and route forward() through
-    gb_cutlass.gemm_nvfp4. gb_quant._build_processor falls back to the nvfp4
-    gemlite path on None, and resolve_backend only names "cutlass" when
-    gb_cutlass.available() is True (built + GB_CUTLASS_ENABLE=1), so returning
-    None here is a safe no-op in the default configuration.
+    Still returns None, but the reason CHANGED on 2026-08-22 and the old one is
+    closed. The weight-packing reconciliation is DONE: gb_cutlass.pack_sfa/
+    pack_sfb apply CUTLASS's interleaved scale-factor layout by evaluating the
+    same tile_atom_to_shape_SF* object the GEMM uses, and the kernel verifies at
+    cosine 0.999999 against a reference over the same dequantized operands
+    (RTX 5070, M in {1,16,512,2048}, N=K=4096).
 
-    See tests/bench/bench_cutlass_nvfp4.py — flip this to construct the real
-    processor only after that bench passes on the target GPU."""
+    The speed objection is also closed. It was real -- end to end this path was a
+    2.5x-5x REGRESSION, because quantizing the activation in PyTorch cost
+    0.13-3.74 ms against a 0.017-0.164 ms GEMM -- and it was fixed by
+    gb_cutlass.quantize_act_nvfp4(), a fused CUDA kernel doing amax, E2M1
+    encode, nibble pack and scale-factor scatter in one pass. End to end is now
+    0.99x/1.20x/3.89x/4.64x of bf16 at M=1/16/512/2048.
+
+    What still blocks a real processor is QUALITY, not speed: NVFP4 measures
+    cosine 0.9905-0.9910 against the true bf16 reference. That is below the fp8
+    floor, so routing production traffic needs the model-level gate
+    (niah_certify / smoke_gate) on a real model. A microbenchmark cannot grant
+    that, and C-01 already found fp8 beating NVFP4 on this hardware.
+
+    gb_quant._build_processor falls back to the nvfp4 gemlite path on None, and
+    resolve_backend only names "cutlass" when gb_cutlass.available() is True
+    (built + GB_CUTLASS_ENABLE=1), so returning None stays a safe no-op.
+
+    See tests/bench/bench_cutlass_nvfp4.py for the gate that produced these
+    numbers, and the maintainer notes"""
     return None
 
 

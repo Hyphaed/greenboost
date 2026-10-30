@@ -77,6 +77,7 @@ class ModelBase:
         ModelType.TEXT: {},
         ModelType.MMPROJ: {},
     }
+    _model_examples: dict[type[ModelBase], str] = {}
 
     dir_model: Path
     ftype: gguf.LlamaFileType
@@ -1081,6 +1082,29 @@ class ModelBase:
             model_type = ModelType.MMPROJ if modelcls.model_arch == gguf.MODEL_ARCH.MMPROJ else ModelType.TEXT
             for name in names:
                 cls._model_classes[model_type][name] = modelcls
+            return modelcls
+        return func
+
+    @classmethod
+    def example(cls, repo_id: str) -> Callable[[AnyModel], AnyModel]:
+        """Record a canonical HF repo id this model class was written and
+        verified against, for docs/test tooling — mirrors register()'s
+        decorator-factory shape.
+
+        Added 2026-08-28: the qwen4exp backport (conversion/qwen4exp.py)
+        used this decorator on both its classes, but the classmethod itself
+        was never added to ModelBase, so `@ModelBase.example(...)` raised
+        AttributeError at class-definition time — silently breaking BOTH
+        Qwen4Exp classes' registration (a decorator raising aborts the class
+        body before @ModelBase.register()'s wrapper ever runs). This was
+        invisible under `--print-supported-models` (it lists the static
+        TEXT_MODEL_MAP, not the actually-registered _model_classes), but a
+        real `get_model_class("Qwen4ExpForCausalLM")` raised
+        `NotImplementedError: Architecture 'Qwen4ExpForCausalLM' not
+        supported!` — the qwen4exp GGUF conversion path was completely
+        unusable, not just missing this repo's separate MODEL_TENSOR fix."""
+        def func(modelcls: AnyModel) -> AnyModel:
+            cls._model_examples[modelcls] = repo_id
             return modelcls
         return func
 

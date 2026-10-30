@@ -32,11 +32,15 @@ import hmac
 import json
 import os
 import stat
+import subprocess
+import sys
 import time
 from pathlib import Path
 
 import aiohttp
 from aiohttp import web
+
+import gb_vision
 
 UPSTREAM = ""
 MODEL_NAME = ""
@@ -1180,6 +1184,57 @@ def _ollama_format_to_response_format(fmt) -> "dict | None":
     return None
 
 
+_BUDGET_CACHE: dict = {"mtime": None, "budget": None}
+
+
+def _vision_budget() -> "gb_vision.ImageBudget | None":
+    """Image token budget of the served model, read from its run state (written at serve time from the projector's
+    own metadata). None = text-only or a fixed-size projector: images then reach the engine untouched."""
+    try:
+        import gb_synapse
+        path = gb_synapse._run_state_path(MODEL_NAME)
+        mt = path.stat().st_mtime
+        if _BUDGET_CACHE["mtime"] != mt:
+            st = json.loads(path.read_text())
+            _BUDGET_CACHE.update(mtime=mt, budget=gb_vision.budget_from_dict((st.get("vision") or {}).get("budget")))
+        return _BUDGET_CACHE["budget"]
+    except Exception:
+        return None
+
+
+async def _normalize_images(messages: list) -> list:
+    """Bring every image of a request to the model's token budget: small crops UP, big sheets DOWN, as a JPEG under the
+    body limit. Clients no longer need their own resize (they used to, and got it wrong: 575 tokens made the model deny
+    features that were in the picture). Runs in a worker thread: decoding and resizing is tens of milliseconds a frame,
+    which must not stall the event loop that is streaming other requests."""
+    budget = _vision_budget()
+    if budget is None or not any(isinstance(m, dict) and isinstance(m.get("content"), list) for m in messages or []):
+        return messages
+    out, infos = await asyncio.get_running_loop().run_in_executor(None, gb_vision.normalize_openai_messages, messages, budget)
+    done = [i for i in infos if "to" in i]
+    if done:
+        print("[gb-synapse] images normalised: " + ", ".join(
+            f"{i['from'][0]}x{i['from'][1]} -> {i['to'][0]}x{i['to'][1]} ({i['tokens']} tokens)" for i in done), flush=True)
+    for i in infos:
+        if "skipped" in i and "Pillow" in i["skipped"]:
+            print(f"[gb-synapse] WARNING: images were NOT normalised: {i['skipped']}", flush=True)
+            break
+    return out if done else messages
+
+
+@web.middleware
+async def _body_limit_middleware(request: web.Request, handler):
+    """HTTP 413 with the consequence in words, not aiohttp's bare 'Maximum request body size 1048576 exceeded'."""
+    try:
+        return await handler(request)
+    except web.HTTPRequestEntityTooLarge as e:
+        limit_mb = gb_vision.max_body_bytes() // (1 << 20)
+        return web.json_response({"error": {"code": 413, "message": (
+            f"that request is bigger than the {limit_mb} MiB this server accepts, so it was not read. Nothing was sent to the "
+            f"model and nothing is broken. Send fewer or smaller images (they are resized to the model's size anyway), or "
+            f"raise the limit: GB_SYNAPSE_MAX_BODY_MB=<MiB> and restart the server."), "detail": str(e)}}, status=413)
+
+
 def _ollama_messages_to_openai(messages: list) -> list:
     """Translate Ollama's per-message `images: [b64, ...]` into OpenAI's
     multimodal content parts.
@@ -1229,8 +1284,8 @@ async def ollama_generate(request: web.Request) -> web.StreamResponse:
         # messages-based translation /api/chat uses, then read the
         # resulting content back out of the /v1/chat/completions shape.
         upstream_req = {"model": model,
-                         "messages": _ollama_messages_to_openai(
-                             [{"content": body.get("prompt", ""), "images": images}]),
+                         "messages": await _normalize_images(_ollama_messages_to_openai(
+                             [{"content": body.get("prompt", ""), "images": images}])),
                          "stream": stream, **_ollama_opts(body.get("options", {}) or {})}
         url = f"{UPSTREAM}/v1/chat/completions"
         text_key = ("choices", 0, "message", "content")
@@ -1302,7 +1357,7 @@ async def ollama_chat(request: web.Request) -> web.StreamResponse:
     stream = body.get("stream", True)
     tools = body.get("tools")
     mode = _tools_mode() if tools else "none"
-    messages = _ollama_messages_to_openai(body.get("messages", []))
+    messages = await _normalize_images(_ollama_messages_to_openai(body.get("messages", [])))
     tool_schemas: list = []
     if mode == "emulate":
         tool_schemas = _openai_tools_to_schemas(tools)
@@ -1649,6 +1704,14 @@ async def openai_passthrough(request: web.Request) -> web.StreamResponse:
 
     is_completions_path = path in ("chat/completions", "completions")
 
+    # Vision input: normalise every image to the model's token budget before the engine sees it (and before the engine's
+    # own request limit can reject it). The only edit to the body on this route besides the slot id below.
+    if path == "chat/completions" and isinstance(parsed.get("messages"), list):
+        _norm = await _normalize_images(parsed["messages"])
+        if _norm is not parsed["messages"]:
+            parsed["messages"] = _norm
+            body = json.dumps(parsed).encode()
+
     # GB-1: route this conversation back to the slot that still holds its KV.
     # Only on the chat path (a bare /v1/completions has no message structure to
     # identify), only when the caller has not already chosen a slot itself, and
@@ -1808,7 +1871,11 @@ async def health(request: web.Request) -> web.Response:
     except (aiohttp.ClientError, TimeoutError):
         ok = False
     return web.json_response({"status": "ok" if ok else "degraded",
-                               "model": MODEL_NAME, "upstream": UPSTREAM})
+                               "model": MODEL_NAME, "upstream": UPSTREAM,
+                               "inflight": _IDLE["inflight"],
+                               "requests": _IDLE["requests"],
+                               "idle_s": round(time.monotonic() - _IDLE["last"], 1),
+                               "idle_ttl_s": IDLE_TTL_S})
 
 
 async def ollama_root(request: web.Request) -> web.Response:
@@ -2045,8 +2112,66 @@ async def _start_heap_watch(app) -> None:
     app["_heap_watch"] = asyncio.create_task(_watch())
 
 
+# ---- idle TTL (owner rule 2026-10-10) --------------------------------------
+# A model served on demand that nobody asks for within IDLE_TTL_S unloads itself
+# through gb_synapse.stop(): a detached child process runs the normal safe stop
+# path for THIS model only (engine, proxy, embed engine, feeders). Requests in
+# flight keep the model alive; their end resets the timer. 0 = never (pinned).
+IDLE_TTL_S = 0.0
+_IDLE = {"inflight": 0, "last": time.monotonic(), "requests": 0}
+_PASSIVE_PATHS = ("/", "/health", "/api/version", "/api/tags", "/api/ps")
+
+
+@web.middleware
+async def _activity_middleware(request: web.Request, handler):
+    if request.path in _PASSIVE_PATHS:
+        return await handler(request)
+    _IDLE["inflight"] += 1
+    _IDLE["requests"] += 1
+    _IDLE["last"] = time.monotonic()
+    try:
+        return await handler(request)
+    finally:
+        _IDLE["inflight"] -= 1
+        _IDLE["last"] = time.monotonic()
+
+
+def _idle_expired(now: float, ttl: float, inflight: int, last: float) -> bool:
+    return ttl > 0 and inflight <= 0 and (now - last) >= ttl
+
+
+def _idle_unload() -> None:
+    """Stop this model via the existing safe stop path, in a detached process
+    (stop() kills this proxy's own process group, so it cannot run in-process)."""
+    try:
+        import gb_dataflux
+        gb_dataflux.emit({"kind": "synapse_serve", "status": "idle_unload",
+                          "model": MODEL_NAME, "engine": ENGINE,
+                          "idle_ttl_s": IDLE_TTL_S})
+    except Exception:
+        pass
+    code = ("import sys; sys.path.insert(0, %r); import gb_synapse; "
+            "gb_synapse.stop(%r)" % (str(Path(__file__).resolve().parent), MODEL_NAME))
+    subprocess.Popen([sys.executable, "-c", code], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+async def _idle_watch(app) -> None:
+    while True:
+        await asyncio.sleep(max(0.5, min(5.0, IDLE_TTL_S / 4)))
+        if _idle_expired(time.monotonic(), IDLE_TTL_S, _IDLE["inflight"], _IDLE["last"]):
+            _idle_unload()
+            return
+
+
+async def _start_idle_watch(app) -> None:
+    if IDLE_TTL_S > 0:
+        app["idle_task"] = asyncio.ensure_future(_idle_watch(app))
+
+
 def build_app() -> web.Application:
-    app = web.Application(middlewares=[_auth_middleware])
+    app = web.Application(middlewares=[_body_limit_middleware, _auth_middleware, _activity_middleware],
+                          client_max_size=gb_vision.max_body_bytes())
     app.router.add_get("/", ollama_root)
     app.router.add_get("/health", health)
     app.router.add_get("/api/version", ollama_version)
@@ -2069,6 +2194,7 @@ def build_app() -> web.Application:
     app.router.add_route("*", "/slots/{path:.*}", slots_passthrough)
     app.on_startup.append(_on_startup)
     app.on_startup.append(_start_heap_watch)
+    app.on_startup.append(_start_idle_watch)
     app.on_cleanup.append(_on_cleanup)
     return app
 
@@ -2105,13 +2231,16 @@ def _start_flight_recorder() -> None:
 
 
 def main() -> None:
-    global UPSTREAM, MODEL_NAME, ENGINE, BIND
+    global UPSTREAM, MODEL_NAME, ENGINE, BIND, IDLE_TTL_S
     ap = argparse.ArgumentParser(description="gb-synapse API proxy")
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--upstream-port", type=int, required=True)
     ap.add_argument("--model-name", required=True)
     ap.add_argument("--engine", default="", help="backend name (llama.cpp/torch/"
                      "transformers/diffusers) — carried into synapse_stall events")
+    ap.add_argument("--idle-ttl-s", type=float, default=0.0,
+                     help="unload the model after this many idle seconds "
+                          "(0 = never; set by gb_synapse.serve)")
     ap.add_argument("--bind", default="127.0.0.1", help="listen address; a "
                      "non-loopback bind requires GB_SYNAPSE_TOKEN or "
                      "/etc/greenboost/synapse_token to be set (default: "
@@ -2122,6 +2251,7 @@ def main() -> None:
     MODEL_NAME = args.model_name
     ENGINE = args.engine
     BIND = args.bind
+    IDLE_TTL_S = max(0.0, args.idle_ttl_s)
 
     if not _is_loopback(BIND) and not _resolve_token():
         raise SystemExit(

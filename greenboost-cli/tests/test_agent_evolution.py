@@ -718,7 +718,122 @@ def test_a_late_change_keeps_the_earlier_chunks_reusable(pfx):
     assert v["stable_prefix_chars"] == len("SYS") + len("TOOLS") + len("H1")
 
 
+def test_an_appended_history_is_not_a_prefix_shift(pfx):
+    """The defect this module existed to avoid, found in its own output.
+
+    Measured 2026-08-22 over a real 11-turn conversation against the served
+    model: 14 consecutive `agent_prefix_shift` warns, every one
+    `first_changed=history`, on a conversation that was a pure append
+    throughout. `history` was joined into one string and hashed, so appending
+    turn N flipped the fingerprint and read as the prefix moving , one warn per
+    turn, which is exactly the noise observe()'s docstring says would bury the
+    real signal.
+    """
+    base = dict(_BASE, history=["m1", "m2"])
+    pfx.observe(base, emit=False)
+    v = pfx.observe({**base, "history": ["m1", "m2", "m3"], "user": "u2"}, emit=False)
+    assert v["first_changed"] == "user", "an append must not read as a shift"
+    assert v["history_appended"] is True
+    assert "history" not in v["changed"]
+    assert v["invalidated_chars"] == 0
+    assert pfx.explain(v) == ""
+    # Reusable means "was in the previous request and still is". The appended
+    # m3 was not, so it is newly prefilled, not reused , the same reasoning
+    # that keeps the trailing user turn out of invalidated_chars.
+    assert v["stable_prefix_chars"] == (
+        len("SYS") + len("TOOLS") + len("m1") + len("m2") + len("P"))
+
+
+def test_a_rewritten_history_is_still_a_prefix_shift(pfx):
+    """The append check must not blind the module to a real rewrite , which is
+    what a compaction does."""
+    base = dict(_BASE, history=["m1", "m2", "m3", "m4"])
+    pfx.observe(base, emit=False)
+    v = pfx.observe({**base, "history": ["m1", "SUMMARY"], "user": "u2"}, emit=False)
+    assert v["first_changed"] == "history"
+    assert v["history_appended"] is False
+    assert "history" in v["changed"]
+    assert v["stable_prefix_chars"] == len("SYS") + len("TOOLS") + len("m1")
+    assert "prefix shifted at 'history'" in pfx.explain(v)
+
+
+def test_a_dropped_leading_message_is_a_shift_even_though_nothing_was_edited(pfx):
+    """Trimming from the front rewrites the prefix as surely as editing does:
+    the previous messages are no longer a prefix of the current ones."""
+    base = dict(_BASE, history=["m1", "m2", "m3"])
+    pfx.observe(base, emit=False)
+    v = pfx.observe({**base, "history": ["m2", "m3"], "user": "u2"}, emit=False)
+    assert v["first_changed"] == "history"
+    assert v["history_appended"] is False
+
+
+def test_history_as_a_plain_string_still_works(pfx):
+    """Back-compat: a caller that has not switched to the list form keeps the
+    old, blunter behaviour rather than silently getting a different answer."""
+    pfx.observe(_BASE, emit=False)
+    v = pfx.observe({**_BASE, "history": "H2", "user": "u2"}, emit=False)
+    assert v["first_changed"] == "history"
+
+
 def test_an_unchanged_prompt_reports_no_shift(pfx):
     pfx.observe(_BASE, emit=False)
     v = pfx.observe(dict(_BASE), emit=False)
     assert v["first_changed"] is None and pfx.explain(v) == ""
+
+
+# ── head sizing by token budget (agent performance, 2026-08-22) ──────────────
+
+def test_head_span_floor_is_never_below_the_old_fixed_count():
+    """The change can only ever pin MORE than the previous behaviour."""
+    import os
+    from greenboost_cli.workflow.intelligence import _head_span, _HEAD_KEEP
+    msgs = [{"content": "x" * 100000} for _ in range(20)]   # every message blows the budget
+    os.environ.pop("GB_HEAD_TOKEN_FRACTION", None)
+    assert _head_span(msgs, 24576, 4.0) == _HEAD_KEEP
+
+
+def test_head_span_grows_with_the_budget():
+    import os
+    from greenboost_cli.workflow.intelligence import _head_span
+    msgs = [{"content": "x" * 400} for _ in range(30)]
+    os.environ["GB_HEAD_TOKEN_FRACTION"] = "0.0"
+    small = _head_span(msgs, 24576, 4.0)
+    os.environ["GB_HEAD_TOKEN_FRACTION"] = "0.10"
+    big = _head_span(msgs, 24576, 4.0)
+    os.environ.pop("GB_HEAD_TOKEN_FRACTION", None)
+    assert big > small
+
+
+def test_head_span_refuses_to_pin_a_huge_tool_result():
+    """A 40 KB Bash result at the front must not consume the whole budget --
+    messages vary by orders of magnitude, which is why the unit is tokens."""
+    import os
+    from greenboost_cli.workflow.intelligence import _head_span, _HEAD_KEEP
+    msgs = [{"content": "hi"}, {"content": "ok"}, {"content": "y" * 40000}] + \
+           [{"content": "z" * 200} for _ in range(20)]
+    os.environ["GB_HEAD_TOKEN_FRACTION"] = "0.10"
+    n = _head_span(msgs, 24576, 4.0)
+    os.environ.pop("GB_HEAD_TOKEN_FRACTION", None)
+    assert n == _HEAD_KEEP
+
+
+def test_head_span_always_leaves_a_middle_to_compact():
+    """A head that swallows the conversation makes compaction free nothing,
+    which is worse than the prefix it preserved."""
+    import os
+    from greenboost_cli.workflow.intelligence import _head_span, _MIN_MIDDLE_MESSAGES
+    msgs = [{"content": "x"} for _ in range(30)]
+    os.environ["GB_HEAD_TOKEN_FRACTION"] = "0.9"
+    n = _head_span(msgs, 1_000_000, 4.0)
+    os.environ.pop("GB_HEAD_TOKEN_FRACTION", None)
+    assert n <= len(msgs) - 8 - _MIN_MIDDLE_MESSAGES
+
+
+def test_head_span_survives_a_garbage_env_value():
+    import os
+    from greenboost_cli.workflow.intelligence import _head_span, _HEAD_KEEP
+    os.environ["GB_HEAD_TOKEN_FRACTION"] = "not-a-number"
+    msgs = [{"content": "x" * 400} for _ in range(20)]
+    n = _head_span(msgs, 24576, 4.0)
+    os.environ.pop("GB_HEAD_TOKEN_FRACTION", None)
+    assert n >= _HEAD_KEEP

@@ -415,7 +415,22 @@ def run_question_wizard(questions: list[dict],
 def run_picker(options: list[dict], multi: bool = False, title: str = "") -> list[int] | None:
     """Public entry point for a bare arrow-key picker (no box/header chrome).
     Returns 1-based selected indices, or None on cancel."""
-    return _picker(options, multi=multi, title=title)
+    # Slash commands run on the main thread while the input box is still live on
+    # the reader thread; both would read the keyboard and the picker would see
+    # half of every arrow key. Take the terminal first, give it back after.
+    # No-op when the REPL isn't running (scripts, tests, headless).
+    try:
+        from greenboost_cli.terminal import repl as _repl
+        live = _repl._pt_suspend_hook is not None
+    except Exception:
+        live = False
+    if live:
+        _repl._suspend_pt_for_wizard()
+    try:
+        return _picker(options, multi=multi, title=title)
+    finally:
+        if live:
+            _repl._resume_pt_after_wizard()
 
 
 # ── Approval picker (reused by renderer.prompt_approval) ─────────────────────
@@ -424,6 +439,12 @@ def _summarize_call(description: str) -> str:
     """Turn a raw `ToolName([[{'content': '...'}]])`-style call string into a
     clean `ToolName · <args summary>` line. Falls back to the raw string
     (truncated) if it doesn't look like a call."""
+    # Only a real "Name(args)" call is rewritten. A description like
+    # "Run: for i in $(seq 1 3); ..." has a "(" too; splitting it there ate
+    # the command (2026-10 owner report). Everything else is shown verbatim.
+    import re as _re0
+    if not _re0.match(r"[A-Za-z_][\w.\-]*\(", description):
+        return description
     name, _, rest = description.partition("(")
     if not rest:
         return description
@@ -437,6 +458,56 @@ def _summarize_call(description: str) -> str:
         m = re.search(r"""['"]([^'"]{3,})['"]""", rest)
     arg_s = m.group(1) if m else rest
     return f"{name.strip()} · {arg_s}"
+
+
+_CTRL_NAMES = {"\n": "⏎", "\r": "⏎", "\t": "⇥"}
+
+
+def neutralise_text(text: str) -> str:
+    """Make arbitrary command text safe and visible on one display line.
+
+    Escape bytes and other control characters are shown as their Unicode
+    control pictures (ESC -> U+241B) so a command can never move the cursor,
+    recolour the card or clear the screen. Newlines become a visible return
+    sign. Nothing else is touched: quotes, parentheses, $ and spaces stay.
+    """
+    out = []
+    for ch in text:
+        o = ord(ch)
+        if ch in _CTRL_NAMES:
+            out.append(_CTRL_NAMES[ch])
+        elif o < 0x20:
+            out.append(chr(0x2400 + o))
+        elif o == 0x7F:
+            out.append("\u2421")
+        elif 0x80 <= o <= 0x9F:
+            out.append("\ufffd")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def verbatim_lines(text: str, width: int, max_lines: int | None = 4) -> tuple[list[str], bool]:
+    """Hard-wrap neutralised `text` by display width, keeping every space.
+
+    Returns (lines, truncated). When max_lines is set and the text is longer,
+    the last shown line ends with an ellipsis within `width`.
+    """
+    text = neutralise_text(text)
+    lines: list[str] = []
+    cur, cur_w = [], 0
+    for ch in text:
+        cw = display_width(ch)
+        if cur_w + cw > width:
+            lines.append("".join(cur))
+            cur, cur_w = [], 0
+        cur.append(ch)
+        cur_w += cw
+    lines.append("".join(cur))
+    if max_lines is not None and len(lines) > max_lines:
+        last = truncate_to_width(lines[max_lines - 1], max(1, width - display_width("…"))) + "…"
+        return lines[:max_lines - 1] + [last], True
+    return lines, False
 
 
 def run_approval_picker(description: str) -> str:
@@ -478,20 +549,26 @@ def _draw_approval_card_and_pick(description: str, w: int) -> str:
     )
     from rich.markup import escape
     summary = _summarize_call(description)
-    desc_lines = _wrap_lines(summary, inner - 4)
-    shown, overflow = desc_lines[:3], len(desc_lines) > 3
-    if overflow:
-        shown[-1] = shown[-1].rstrip() + "…"
+    shown, overflow = verbatim_lines(summary, inner - 4, 4)
     for ln in shown:
         pad = " " * max(0, inner - 2 - display_width(ln))
         console.print(f"  [{DIM}]{BOX_V}[/]  [{GRAY}]{escape(ln)}[/]{pad}[{DIM}]{BOX_V}[/]")
+    if overflow:
+        opts.append({"label": "View full command", "description": "show it all, then ask again"})
     console.print(f"  [{DIM}]{BOX_BL}{BOX_H * inner}{BOX_BR}[/]")
     console.print()
 
-    chosen = _picker(opts, multi=False, title="Permission")
-    if chosen is None:
-        return "deny"
-    idx = chosen[0]   # 1-based
+    while True:
+        chosen = _picker(opts, multi=False, title="Permission")
+        if chosen is None:
+            return "deny"
+        idx = chosen[0]   # 1-based
+        if idx != 4:
+            break
+        full, _ = verbatim_lines(summary, inner - 4, None)
+        for ln in full:
+            console.print(f"  [{GRAY}]{escape(ln)}[/]")
+        console.print()
     if idx == 1:
         return "allow"
     if idx == 2:

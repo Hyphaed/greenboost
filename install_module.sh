@@ -7,13 +7,14 @@
 #
 # Usage:
 #   sudo ./install_module.sh           - install via DKMS
-#   sudo ./install_module.sh --uninstall - remove DKMS entry + unload module
+#   sudo ./install_module.sh --uninstall - remove everything this script installed
+#        ./install_module.sh --uninstall --dry-run - print what would be removed, change nothing
 #   sudo ./install_module.sh --status   - show DKMS registration state
 #   sudo ./install_module.sh --help
 
 set -euo pipefail
 
-GB_VERSION="3.4"
+GB_VERSION="3.5"
 DRIVER_NAME="greenboost"
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DKMS_SRC="/usr/src/${DRIVER_NAME}-${GB_VERSION}"
@@ -57,15 +58,17 @@ need_root() { [[ $EUID -eq 0 ]] || gb_die "Root required. Use: sudo $0 $*"; }
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 MODE="install"
+DRY_RUN=0
 for _arg in "$@"; do
     case "$_arg" in
+        --dry-run|-n)    DRY_RUN=1 ;;
         --uninstall|-u)  MODE="uninstall" ;;
         --status|-s)     MODE="status"    ;;
         --help|-h)
             gb_header
             printf '%b\n' "  ${C_GRAY}Usage:${C_RESET}"
             printf '%b\n' "    ${C_CYAN}sudo ./install_module.sh${C_RESET}            ${C_DIM}Install kernel module via DKMS${C_RESET}"
-            printf '%b\n' "    ${C_CYAN}sudo ./install_module.sh --uninstall${C_RESET} ${C_DIM}Remove DKMS entry + unload module${C_RESET}"
+            printf '%b\n' "    ${C_CYAN}sudo ./install_module.sh --uninstall${C_RESET} ${C_DIM}Remove everything this script installed (add --dry-run to preview)${C_RESET}"
             printf '%b\n' "    ${C_CYAN}sudo ./install_module.sh --status${C_RESET}    ${C_DIM}Show DKMS registration state${C_RESET}"
             printf '\n%b\n' "  ${C_DIM}This installer is hardware-agnostic: no GPU, CUDA, sysctl, or GRUB changes.${C_RESET}"
             echo ""
@@ -108,8 +111,8 @@ if [[ "$MODE" == "status" ]]; then
         gb_warn "dkms not installed"
     fi
     echo ""
-    if lsmod 2>/dev/null | grep -q "^${DRIVER_NAME}\b"; then
-        gb_ok "Module loaded: $(lsmod | grep "^${DRIVER_NAME}\b")"
+    if grep -q "^${DRIVER_NAME}\b" <<< "$(lsmod 2>/dev/null)"; then
+        gb_ok "Module loaded: $(grep "^${DRIVER_NAME}\b" <<< "$(lsmod 2>/dev/null)" || true)"
     else
         gb_info "Module not currently loaded"
     fi
@@ -118,40 +121,109 @@ if [[ "$MODE" == "status" ]]; then
 fi
 
 # ── UNINSTALL ─────────────────────────────────────────────────────────────────
+# Removes exactly what the INSTALL section below wrote (same list, same paths).
+# Idempotent. --dry-run prints the plan and changes nothing. Never prompts.
+GB_PY_DEST="/usr/local/lib/greenboost"
+GB_PY_FILES=(
+    gb_init.py
+    gb_quant.py gb_quant_tq.py gb_attn.py gb_synapse_fallback.py
+    gb_telemetry.py gb_stream_sched.py gb_model_tier.py
+    gb_mem_pool.py gb_diffusion_orch.py
+    gb_stability_monitor.py gb_feeder_diag.py
+    gb_quant_conv.py gb_cnn_tune.py gb_sdpa.py gb_compile.py gb_moe_cache.py
+)
+# Uninstall must remove every module ANY installer shipped, not only this library subset (the list drifted when v3.5 added
+# modules to greenboost_setup.sh's _py_files only). One source of truth: the _py_files array of the full installer, plus
+# every gb_*.py the checkout ships, plus the library subset above. checks/check_installer_parity.py guards all three.
+_gb_all_py_files() {
+    local _s
+    printf '%s\n' "${GB_PY_FILES[@]}"
+    for _s in "$SRC_DIR/greenboost_setup.sh" /usr/local/share/greenboost/greenboost_setup.sh; do
+        [[ -f "$_s" ]] || continue
+        awk '/_py_files=\(/{f=1;next} f&&/^[[:space:]]*\)/{exit} f{sub(/#.*/,""); print}' "$_s" | tr -s ' \t' '\n\n' | grep -E '^gb_[a-z0-9_]+\.py$' || true
+        break
+    done
+    local _g; for _g in "$SRC_DIR"/gb_*.py; do [[ -e "$_g" ]] && basename "$_g"; done
+    return 0
+}
+_gb_rm() {   # _gb_rm <path>...: remove files/symlinks that exist; preview under --dry-run
+    local _p
+    for _p in "$@"; do
+        [[ -e "$_p" || -L "$_p" ]] || continue
+        if (( DRY_RUN )); then gb_info "[dry-run] would remove $_p"; else rm -f "$_p" && gb_ok "Removed $_p"; fi
+    done
+}
+_gb_rmdir() {   # remove a directory only when empty (it may hold other things)
+    [[ -d "$1" ]] || return 0
+    if (( DRY_RUN )); then gb_info "[dry-run] would remove $1 if empty"; else rmdir "$1" 2>/dev/null && gb_ok "Removed empty $1" || true; fi
+}
 if [[ "$MODE" == "uninstall" ]]; then
-    need_root --uninstall
+    (( DRY_RUN )) || need_root --uninstall
+    (( DRY_RUN )) && gb_info "Dry run: nothing is changed, no service is touched"
 
     gb_step "Unloading kernel module (if loaded)..."
-    if lsmod 2>/dev/null | grep -q "^${DRIVER_NAME}\b"; then
-        rmmod "$DRIVER_NAME" 2>/dev/null && gb_ok "Module unloaded" || gb_warn "rmmod failed - reboot to complete removal"
+    if grep -q "^${DRIVER_NAME}\b" <<< "$(lsmod 2>/dev/null)"; then
+        if (( DRY_RUN )); then gb_info "[dry-run] would rmmod $DRIVER_NAME"
+        else rmmod "$DRIVER_NAME" 2>/dev/null && gb_ok "Module unloaded" || gb_warn "rmmod failed - reboot to complete removal"; fi
     else
         gb_info "Module not loaded"
     fi
 
-    gb_step "Removing DKMS entry..."
-    if command -v dkms &>/dev/null && dkms status 2>/dev/null | grep -q "^${DRIVER_NAME}"; then
-        rm -rf /var/lib/dkms/greenboost 2>/dev/null && gb_ok "DKMS entries removed"
-    else
-        gb_info "DKMS entry not found - skipping"
-    fi
+    gb_step "Removing boot guard..."
+    if (( ! DRY_RUN )); then systemctl disable greenboost-boot-guard.service &>/dev/null || true; fi
+    _gb_rm /etc/systemd/system/greenboost-boot-guard.service \
+           /etc/systemd/system/multi-user.target.wants/greenboost-boot-guard.service \
+           /usr/local/sbin/greenboost_boot_guard.sh
+    (( DRY_RUN )) || { systemctl daemon-reload 2>/dev/null || true; }
 
-    gb_step "Removing source trees from /usr/src..."
-    _any_src_removed=0
-    for _src_tree in /usr/src/greenboost-*; do
-        [[ -d "$_src_tree" ]] || continue
-        rm -rf "$_src_tree" && (( _any_src_removed++ )) || true
+    gb_step "Removing DKMS entry, installed modules and source trees..."
+    _dk=0
+    for _p in /var/lib/dkms/greenboost /usr/src/greenboost-*; do
+        [[ -d "$_p" ]] || continue
+        _dk=1
+        if (( DRY_RUN )); then gb_info "[dry-run] would remove $_p"; else rm -rf "$_p" && gb_ok "Removed $_p"; fi
     done
-    (( _any_src_removed > 0 )) && gb_ok "Removed $_any_src_removed source tree(s)" \
-                                || gb_info "No source trees found - skipping"
+    for _p in /lib/modules/*/updates/dkms/greenboost.ko* /lib/modules/*/extra/greenboost.ko*; do
+        [[ -e "$_p" ]] || continue
+        _dk=1
+        if (( DRY_RUN )); then gb_info "[dry-run] would remove $_p"; else rm -f "$_p" && gb_ok "Removed $_p"; fi
+    done
+    (( _dk )) && { (( DRY_RUN )) || { depmod -a 2>/dev/null || true; }; } || gb_info "No DKMS entry, module or source tree found"
 
-    gb_step "Removing modprobe configuration..."
-    if [[ -f /etc/modprobe.d/greenboost.conf ]]; then
-        rm -f /etc/modprobe.d/greenboost.conf
-        gb_ok "Removed /etc/modprobe.d/greenboost.conf"
-    fi
+    gb_step "Removing the expert-cache engine (installed copy, source/build tree, engine choice)..."
+    GB_ALL_PY=$(_gb_all_py_files | sort -u)   # read now: the setup script copy under /usr/local/share is removed below
+    for _p in /usr/local/lib/greenboost/synapse-moecache /var/lib/greenboost/synapse/src-moecache; do
+        [[ -d "$_p" ]] || continue
+        if (( DRY_RUN )); then gb_info "[dry-run] would remove $_p"; else rm -rf "$_p" && gb_ok "Removed $_p"; fi
+    done
+    _gb_rm /etc/greenboost/synapse/engine
+    _gb_rmdir /etc/greenboost/synapse
+    _gb_rmdir /var/lib/greenboost/synapse
+
+    gb_step "Removing configuration, udev rule, wrapper and libraries..."
+    _gb_rm /etc/modprobe.d/greenboost.conf /etc/modules-load.d/greenboost.conf \
+           /etc/udev/rules.d/99-greenboost.rules /etc/greenboost/build_info \
+           /usr/local/bin/greenboost /usr/local/share/greenboost/greenboost_setup.sh \
+           /usr/local/lib/libgreenboost_cuda.so /usr/local/lib/libgreenboost_audit.so \
+           /usr/local/lib/libgreenboost_vmm_override.so /usr/local/lib/i386-linux-gnu/libgreenboost_audit.so \
+           /usr/local/bin/greenboost-netd /etc/profile.d/greenboost_pythonpath.sh
+    _gb_rmdir /usr/local/lib/i386-linux-gnu
+    _gb_rmdir /usr/local/share/greenboost
+    _gb_rmdir /etc/greenboost
+    (( DRY_RUN )) || { udevadm control --reload-rules 2>/dev/null || true; ldconfig 2>/dev/null || true; }
+
+    gb_step "Removing the Python stack..."
+    for _f in $GB_ALL_PY; do _gb_rm "$GB_PY_DEST/$_f"; done
+    _gb_rm "$GB_PY_DEST/__init__.py"
+    _gb_rmdir "$GB_PY_DEST"
+    for _dp in /usr/local/lib/python3*/dist-packages "${CONDA_PREFIX:-/nonexistent}"/lib/python3*/site-packages; do
+        [[ -d "$_dp" ]] || continue
+        _gb_rm "$_dp/greenboost_sitecustomize.py" "$_dp/greenboost.pth"
+    done
 
     echo ""
-    gb_ok "Uninstall complete."
+    (( DRY_RUN )) && gb_ok "Dry run complete: nothing changed." || gb_ok "Uninstall complete."
+    gb_info "Kept on purpose: video group membership (it may predate this install) and the source tree."
     exit 0
 fi
 
@@ -162,7 +234,7 @@ need_root
 #        This prevents stale DKMS state, old source trees, and leftover kernel
 #        modules from causing failures on reinstall.
 gb_step "[0/4] Cleaning previous GreenBoost installation residues..."
-if lsmod 2>/dev/null | grep -q "^${DRIVER_NAME}\b"; then
+if grep -q "^${DRIVER_NAME}\b" <<< "$(lsmod 2>/dev/null)"; then
     rmmod "$DRIVER_NAME" 2>/dev/null && gb_ok "Module unloaded" \
         || gb_warn "rmmod failed - continuing (reboot if module stays stuck)"
 fi
@@ -455,7 +527,6 @@ gb_ok "CUDA shim + native libs installed"
 #   /etc/profile.d/greenboost_pythonpath.sh , PYTHONPATH for login shells
 #   greenboost.pth               , dist-packages + conda pth drop-in
 gb_step "Installing GreenBoost Python orchestration stack..."
-GB_PY_DEST="/usr/local/lib/greenboost"
 mkdir -p "$GB_PY_DEST"
 # Deliberately a LIBRARY-ONLY subset, not gb-synapse's HTTP-serving stack —
 # this is the standalone kernel-module installer, so it ships just enough for
@@ -467,13 +538,6 @@ mkdir -p "$GB_PY_DEST"
 # gb_diffusion_server.py by omission, those simply aren't this script's job).
 # `greenboost synapse serve` / the :11369 proxy / cluster RPC split need the
 # full stack — that's `greenboost_setup.sh`'s Full Install, not this script.
-GB_PY_FILES=(
-    gb_init.py
-    gb_quant.py gb_quant_tq.py gb_attn.py gb_synapse_fallback.py
-    gb_telemetry.py gb_stream_sched.py gb_model_tier.py
-    gb_mem_pool.py gb_diffusion_orch.py
-    gb_stability_monitor.py gb_feeder_diag.py
-)
 _installed=0
 for _f in "${GB_PY_FILES[@]}"; do
     if [[ -f "$SRC_DIR/$_f" ]]; then

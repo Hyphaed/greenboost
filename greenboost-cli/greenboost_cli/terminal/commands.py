@@ -641,10 +641,14 @@ def cmd_quiet(_args: str, _session, settings) -> bool:
 def cmd_permissions(args: str, _session, settings) -> bool:
     from greenboost_cli.environment.settings import save_settings
     modes = ["auto", "accept-all", "manual"]
+    from greenboost_cli.terminal.cc_features import cmd_permission_rules
+    if cmd_permission_rules(args, settings):
+        return True
     if not args.strip():
         current = settings.get("permission_mode", "auto")
         emit_info(f"Permission mode:   [{VIOLET}]{current}[/]")
         emit_info(f"Available modes:   [{GRAY}]{', '.join(modes)}[/]")
+        emit_info(f"Rules:             [{GRAY}]/permissions rules · allow · deny · remove[/]")
     else:
         m = args.strip()
         if m not in modes:
@@ -1079,7 +1083,10 @@ def dispatch_command(line: str, session, settings) -> bool:
         if handler:
             handler(args, session, settings)
         else:
-            emit_err(f"Unknown command: /{cmd}  (type /help for commands)")
+            import difflib
+            _near = difflib.get_close_matches(cmd, list(COMMAND_TABLE), n=1, cutoff=0.7)
+            _hint = f"did you mean /{_near[0]}?" if _near else "type /help for commands"
+            emit_err(f"Unknown command: /{cmd}  ({_hint})")
     return True
 
 
@@ -1090,3 +1097,5 @@ from greenboost_cli.slash_commands import mcp_session_cmds as _mcp_session  # no
 from greenboost_cli.slash_commands import autonomy_cmds as _autonomy  # noqa: E402,F401
 from greenboost_cli.slash_commands import memory_store_cmds as _memstore  # noqa: E402,F401
 from greenboost_cli.slash_commands import history_cmds as _histcmds  # noqa: E402,F401
+from greenboost_cli.terminal import cc_features as _cc  # noqa: E402
+_cc.register(COMMAND_TABLE)

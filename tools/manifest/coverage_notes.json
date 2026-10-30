@@ -1,0 +1,14 @@
+[
+ {
+  "match": "*/greenboost_sitecustomize.py",
+  "why": "removed through pth_manifest.txt, read into memory at the top of do_purge (greenboost_setup.sh:4842-4846, 5083-5088); the static reader cannot see a run-time path list"
+ },
+ {
+  "match": "tcp_bbr",
+  "why": "generic kernel module, intentionally left loaded"
+ },
+ {
+  "match": "cpuid",
+  "why": "generic kernel module, intentionally left loaded"
+ }
+]

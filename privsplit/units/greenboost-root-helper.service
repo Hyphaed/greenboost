@@ -1,0 +1,59 @@
+# PROPOSAL (SP41-12 / QC1). Socket-activated root helper, see privsplit/README.md.
+[Unit]
+Description=GreenBoost root helper (10 fixed verbs, SO_PEERCRED allow-list)
+Requires=greenboost-root-helper.socket
+After=greenboost-root-helper.socket
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/python3 -I /usr/local/lib/greenboost/privsplit/gb_root_helper.py --allow-user greenboost
+WatchdogSec=30
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gb-root-helper
+
+# Capabilities: bounding set only. CAP_SYS_ADMIN is left out on purpose; if
+# setpci or apparmor_parser need it, split a second unit (see README, open risks).
+# CAP_SYS_MODULE: modprobe/rmmod. CAP_SYS_RAWIO: setpci. CAP_MAC_ADMIN: apparmor_parser.
+CapabilityBoundingSet=CAP_SYS_MODULE CAP_SYS_RAWIO CAP_MAC_ADMIN
+AmbientCapabilities=
+NoNewPrivileges=yes
+UMask=0077
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# The helper writes sysctls and sysfs and loads modules: these two stay off.
+ProtectKernelTunables=no
+ProtectKernelModules=no
+ReadWritePaths=/proc/sys/vm /sys/devices
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=all
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @module
+SystemCallFilter=~@mount @reboot @swap @debug @cpu-emulation @obsolete
+PrivateNetwork=yes
+IPAddressDeny=any
+
+# NOT PrivateDevices: device nodes appear after a module load and DeviceAllow is
+# resolved at unit start. Test by starting with modules unloaded (README, test 8).
+DevicePolicy=closed
+DeviceAllow=char-nvidia-frontend rw
+DeviceAllow=char-nvidia-uvm rw
+DeviceAllow=char-nvidia-caps rw
+DeviceAllow=/dev/nvidiactl rw
+DeviceAllow=/dev/greenboost rw

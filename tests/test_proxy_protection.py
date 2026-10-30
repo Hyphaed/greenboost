@@ -62,7 +62,11 @@ def test_the_limit_is_actually_set_in_the_child(monkeypatch):
 
 def _sup():
     import gb_supervisor
-    return gb_supervisor.GreenBoostSupervisor.__new__(gb_supervisor.GreenBoostSupervisor)
+    s = gb_supervisor.GreenBoostSupervisor.__new__(gb_supervisor.GreenBoostSupervisor)
+    # __new__ skips __init__; _reap_orphaned_serves() needs the orphan-poll
+    # bookkeeping __init__ normally sets up (added with the orphan-poll feature).
+    s._orphan_polls = {}
+    return s
 
 
 def test_an_orphaned_engine_is_stopped(monkeypatch):
@@ -73,7 +77,12 @@ def test_an_orphaned_engine_is_stopped(monkeypatch):
         "stop": staticmethod(lambda m: stopped.append(m)),
     })
     monkeypatch.setitem(__import__("sys").modules, "gb_synapse", mod)
-    _sup()._reap_orphaned_serves()
+    import gb_supervisor
+    sup = _sup()
+    # SVC-06 debounce: an orphan is reaped only after REAP_CONFIRM_POLLS
+    # consecutive proxyless ticks, so drive that many ticks on one instance.
+    for _ in range(gb_supervisor.REAP_CONFIRM_POLLS):
+        sup._reap_orphaned_serves()
     assert stopped == ["M"]
 
 

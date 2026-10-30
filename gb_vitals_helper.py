@@ -129,6 +129,70 @@ def sample_shim_flow(stats_path: str = "/run/greenboost/shim_stats") -> dict[str
         return result
 
 
+# ── host memory admission signal ──────────────────────────────────────────────
+
+def host_memory(proc: str = "/proc") -> dict:
+    """Absolute host-memory headroom, read straight from /proc (no supervisor
+    needed). Admission decisions should use available RAM, free swap and
+    pressure-stall, not "swap used %": swap can be 80% used while tens of GB
+    of RAM are free. Missing files give zeros / empty fields, never raise."""
+    out: dict = {"mem_available_mb": 0, "swap_free_mb": 0,
+                 "psi_some_avg10": 0.0, "psi_full_avg10": 0.0}
+    try:
+        with open(f"{proc}/meminfo") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                if k == "MemAvailable":
+                    out["mem_available_mb"] = int(v.split()[0]) // 1024
+                elif k == "SwapFree":
+                    out["swap_free_mb"] = int(v.split()[0]) // 1024
+    except Exception:
+        pass
+    try:
+        with open(f"{proc}/pressure/memory") as f:
+            for line in f:
+                kind, _, rest = line.partition(" ")
+                for tok in rest.split():
+                    if tok.startswith("avg10=") and kind in ("some", "full"):
+                        out[f"psi_{kind}_avg10"] = float(tok[6:])
+    except Exception:
+        pass
+    return out
+
+
+def shim_pid_peaks(stats_dir: str = "/run/greenboost") -> dict:
+    """Per-process peak tier usage (MB) from each shim_stats.<pid> file:
+    {pid: {"alive": bool, "tier_t2_local_peak_mb": n, ...}}. A file outlives
+    its process until the shim's reaper removes it, so a finished job can
+    still be read shortly after exit."""
+    out: dict = {}
+    try:
+        names = os.listdir(stats_dir)
+    except OSError:
+        return out
+    for name in names:
+        suffix = name[len("shim_stats."):]
+        if not name.startswith("shim_stats.") or not suffix.isdigit():
+            continue
+        pid = int(suffix)
+        peaks: dict = {}
+        try:
+            with open(os.path.join(stats_dir, name)) as f:
+                for line in f:
+                    k, _, v = line.strip().partition("=")
+                    if k.startswith("tier_") and k.endswith("_peak_mb"):
+                        peaks[k] = int(float(v))
+        except Exception:
+            continue
+        try:
+            os.kill(pid, 0)
+            peaks["alive"] = True
+        except OSError:
+            peaks["alive"] = False
+        out[str(pid)] = peaks
+    return out
+
+
 # ── orchestrator state reader ─────────────────────────────────────────────────
 
 def _read_orch_state(path: str = "/run/greenboost/orch_state.json") -> dict:
@@ -248,6 +312,9 @@ def main() -> None:
             "ram_pressure_state": ram_pressure_state,
             "ram_available_pct":  float(ram_pressure.get("mem_available_pct", 0) or 0),
             "swap_used_pct":      float(ram_pressure.get("swap_used_pct", 0) or 0),
+            # Absolute host headroom (admission signal) and per-process peaks
+            "host_memory":     host_memory(),
+            "shim_pid_peaks":  shim_pid_peaks(),
             # Shim flow fields (empty dict when shim inactive , no KeyError)
             "shim_flow":       flow,
         }

@@ -28,3 +28,4 @@ third_party/turboquant/ vendored tree | 2>\$\{GB_LOGDIR\}/turboquant_sync\.log |
 synapse_engine/ vendored tree | 2>\$\{GB_LOGDIR\}/synapse_engine_sync\.log | rm -rf /usr/local/lib/greenboost
 semantics/ (GB-Semantics YAML defs) | 2>\$\{GB_LOGDIR\}/semantics_sync\.log | rm -rf /usr/local/lib/greenboost
 serving/ (serving recipes, NemoClaw audit Phase 5) | 2>\$\{GB_LOGDIR\}/serving_sync\.log | rm -rf /usr/local/lib/greenboost
+expert-cache engine (synapse-moecache + src-moecache) | cmd_synapse_build_moecache_engine\(\) | rm -rf /var/lib/greenboost/synapse/src-moecache

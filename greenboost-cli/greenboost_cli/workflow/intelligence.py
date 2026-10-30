@@ -348,6 +348,88 @@ def _summarize_turn_pair(user_msg: dict, asst_msg: dict | None) -> str:
 #: engine reusing its KV cache instead of re-prefilling.
 _HEAD_KEEP = 2
 
+#: Head sizing is a TOKEN budget, not a message count. `_HEAD_KEEP` is the
+#: floor, kept so this can only ever pin more than the old behaviour.
+#:
+#: Why the unit changed. A fixed count of 2 pinned whatever those two messages
+#: happened to weigh, and messages vary by orders of magnitude - a one-line
+#: user turn and a 40 KB tool result are both "one message". Measured on this
+#: box 2026-08-22 through gb_prefix_guard, two real compactions kept
+#: head_kept=2 both times and preserved 9.1% and 14.3% of the reusable prefix
+#: (1497 tokens lost between them). The count was constant; the share it
+#: bought was not, because a count cannot control a token budget. Same class
+#: of error as a hardcoded kv_step_mb, and the repo already has a rule against
+#: it (checks/check_hardware_literals.py).
+#:
+#: What a bigger head buys, and what it costs. Pinned head tokens stay
+#: byte-identical, so the engine reuses their KV for free; everything after
+#: the first changed byte is re-prefilled. Over 14 days of this box's own
+#: sessions a turn reusing >=99% of its prefix reached first token in ~5.5 s
+#: and one under 50% took ~165.9 s. The cost is window: bytes pinned in the
+#: head are bytes compaction cannot reclaim, so the budget is capped and the
+#: middle always keeps something to compact - otherwise compaction stops
+#: freeing anything and the session overflows instead.
+#:
+#: DERIVED, NOT CHOSEN. Measured 2026-08-22 on this box by A/B-ing the real
+#: _compress_context over real message content, scoring with the real
+#: gb_prefix_guard. The old fixed head reproduced exactly the 9.1% seen on the
+#: live compaction that day, which is why the reconstruction is trusted:
+#:
+#:     frac   prefix kept   window freed   msg tokens left after
+#:     0.00        9.1%          46.3%          6855   <- old behaviour
+#:     0.10       31.8%          34.1%          8413   <- default
+#:     0.25       45.5%          18.5%         10404
+#:     0.40       45.5%          18.5%         10404   <- cap binds, no gain
+#:
+#: 0.25 keeps the most prefix and is the WRONG default here. This box serves at
+#: ctx 24576 and spends ~13000 of it on the system prompt plus MCP tool schemas,
+#: leaving ~11576 for messages. At 0.25 a compaction leaves 10404 - 90% of that
+#: budget - so it would re-compact almost immediately or overflow, and a
+#: compaction that does not free anything is worse than the prefix it saved.
+#: 0.10 takes 3.5x the prefix of the old behaviour while still freeing a third
+#: of the window and landing at 73% of budget.
+#:
+#: A box with a wider window, or a smaller tool schema, can afford more. Re-derive
+#: rather than assume: sweep GB_HEAD_TOKEN_FRACTION and read prefix_kept_pct and
+#: the freed share back out of the agent_context_edit(op=compact) event.
+_HEAD_TOKEN_FRACTION = 0.10
+
+#: Never let the head grow so large that compaction cannot free anything.
+#: Below this many messages left in the middle, the head stops growing.
+_MIN_MIDDLE_MESSAGES = 4
+
+
+def _head_span(messages: list, ctx_window: int, chars_per_token: float) -> int:
+    """How many leading messages to pin, sized by tokens.
+
+    Returns at least `_HEAD_KEEP`, so this can only pin more than the previous
+    fixed-count behaviour, never less.
+    """
+    import os as _os
+    try:
+        frac = float(_os.environ.get("GB_HEAD_TOKEN_FRACTION", _HEAD_TOKEN_FRACTION))
+    except Exception:
+        frac = _HEAD_TOKEN_FRACTION
+    frac = max(0.0, min(0.9, frac))
+    if ctx_window <= 0 or frac <= 0:
+        return _HEAD_KEEP
+
+    budget = int(ctx_window * frac)
+    ratio = max(_CHARS_PER_TOKEN_MIN, min(_CHARS_PER_TOKEN_MAX, chars_per_token or 4.0))
+    # Leave the tail and enough middle that a compaction still reclaims space.
+    max_head = max(_HEAD_KEEP, len(messages) - 8 - _MIN_MIDDLE_MESSAGES)
+
+    spent, n = 0, 0
+    for m in messages[:max_head]:
+        c = m.get("content")
+        chars = len(c) if isinstance(c, str) else 0
+        cost = max(1, round(chars / ratio))
+        if n >= _HEAD_KEEP and spent + cost > budget:
+            break
+        spent += cost
+        n += 1
+    return max(_HEAD_KEEP, n)
+
 #: Marker opening a compaction block. Also how a later compaction RECOGNISES
 #: the previous one, so summaries extend instead of being rebuilt , an
 #: extended block keeps its existing bytes and therefore its cache reuse.
@@ -556,6 +638,33 @@ def _hard_trim_result(session, before: int, budget_tokens: int,
     return out
 
 
+#: WHY THIS COMPACTION IS EXTRACTIVE, AND SHOULD STAY THAT WAY.
+#:
+#: The recurring proposal is to replace summarisation-of-real-messages with a
+#: learned compressor , gisting, soft prompts, a small model that "compresses"
+#: the middle. The published evidence is against it, and it is worth writing
+#: down here rather than re-litigating it every few months.
+#:
+#: arXiv 2504.08934 (GistPool) evaluates exactly this. Gisting is the
+#: attractive option because it needs no architectural change to the decoder
+#: and drops into existing frameworks. It also **degrades badly as context
+#: grows** , significant loss at even minimal compression rates , and, the part
+#: that should settle the argument, **a plain average-pooling baseline
+#: consistently outperforms it**. The authors' own diagnosis is information-flow
+#: interruption, capacity limits, and an inability to restrict attention to
+#: subsets of the context.
+#:
+#: A learned compressor also forfeits the property this code is built around:
+#: extractive output is BYTE-STABLE. Keeping real message text means the head
+#: stays identical turn to turn, which is what the engine's prefix reuse
+#: requires (casebook C-17, C-20 , one percentage point of cache miss at an
+#: 18k agent prompt costs ~4.1 seconds). A generative summariser re-words its
+#: output on every run, so every compaction would move the prefix by
+#: construction.
+#:
+#: Crosswalk Q7-03. If this is revisited, the bar is: beat average pooling, at
+#: agent context lengths, without moving the prefix.
+
 def _compress_context(
     session: "ConversationSession", settings: dict, force: bool = False,
     extra_tokens: int = 0,
@@ -616,7 +725,14 @@ def _compress_context(
     # changed. Measured over 14 days of this box's own sessions, a turn whose
     # prefix was reused >=99% reached first token in ~5.5s; a turn in the
     # 50-90% band took ~140s. Where the summary goes is worth minutes.
-    head = session.messages[:_HEAD_KEEP]
+    # Sized by tokens, not by a fixed count. See _head_span.
+    try:
+        from greenboost_cli.environment.settings import gb_synapse_ctx
+        _ctx_win = int(settings.get("context_window", 0)) or gb_synapse_ctx(settings)
+    except Exception:
+        _ctx_win = 0
+    _head_n = _head_span(session.messages, _ctx_win, _chars_per_token)
+    head = session.messages[:_head_n]
     prior_memory = ""
     # A memory block sitting in the head is NOT a degenerate case, it is the
     # good case. It is byte-identical from turn to turn, which is the whole
@@ -775,6 +891,16 @@ def _compress_context(
         summary = (prior_memory.rstrip() + "\n\n" + body) if prior_memory else (
             _MEMORY_MARKER + "\n\n" + body)
 
+    # The reusable prefix as it stands BEFORE the rewrite. Chunked here rather
+    # than reconstructed afterwards because `session.messages` is replaced in
+    # place on the next statement and the previous shape is then gone.
+    prev_chunks = None
+    try:
+        import gb_prompt_index
+        prev_chunks = gb_prompt_index.chunk_messages(session.messages)
+    except Exception:
+        prev_chunks = None
+
     # Reassemble in place: pinned head, then the memory block, then the live
     # tail. The head's tokens are byte-identical to the previous request's, so
     # the engine reuses them instead of re-prefilling from zero.
@@ -782,6 +908,25 @@ def _compress_context(
         {"role": "user", "content": summary},
         {"role": "assistant", "content": "[Structured memory loaded. Continuing task.]"},
     ] + list(tail)
+
+    # What that rewrite just cost the prefix, as a number, on the event that
+    # caused it. Until this existed the governed metric
+    # `agent_compaction_prefix_kept_pct` could only infer the answer from
+    # `head_kept > 0` - a yes/no standing in for a percentage. `tokens_of`
+    # converts the chunk's character count at the live calibration, which is
+    # learned from the server's own `usage.prompt_tokens`, so `tokens_lost` is
+    # a token count rather than a chunk count wearing a token's name.
+    prefix_fields: dict = {}
+    if prev_chunks is not None:
+        try:
+            import gb_prefix_guard
+            ratio = max(_CHARS_PER_TOKEN_MIN, min(_CHARS_PER_TOKEN_MAX, _chars_per_token))
+            prefix_fields = gb_prefix_guard.verdict_from_chunks(
+                prev_chunks, gb_prompt_index.chunk_messages(session.messages),
+                tokens_of=lambda c: max(1, round(getattr(c, "chars", 0) / ratio)),
+            ).as_dict()
+        except Exception:
+            prefix_fields = {}
 
     try:
         import gb_dataflux
@@ -795,6 +940,7 @@ def _compress_context(
             "tail_kept": len(tail),
             "extended_prior": bool(prior_memory),
             "summary_chars": len(summary),
+            **prefix_fields,
         })
     except Exception:
         pass

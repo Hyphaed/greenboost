@@ -111,6 +111,13 @@ class AutonomyState:
     #: precisely because that one is reset by tool activity , the stall check
     #: needs a depth counter a busy-looking loop cannot rewind.
     chain_continues: int = 0
+    #: Fingerprints of every distinct (tool, result) seen in this chain, and how
+    #: many were new since the last stall check. A chain of cheap diagnostic
+    #: calls (nvidia-smi, ls, cat) writes few tokens but each result is new
+    #: information, so it is working, not circling. Only a chain whose results
+    #: repeat AND whose output is tiny is a stall.
+    seen_results: set = field(default_factory=set, repr=False)
+    new_results_in_window: int = 0
     started_ts: float = field(default_factory=time.time)
     journal: list = field(default_factory=list)
     journal_dropped: int = 0        # entries evicted by the cap, reported honestly
@@ -144,6 +151,15 @@ class AutonomyState:
         self.chain_output_tokens = 0
         self.last_delta_tokens = 0
         self.last_checked_tokens = 0
+        self.seen_results.clear()
+        self.new_results_in_window = 0
+
+    def note_tool_result(self, name: str, result: object) -> None:
+        """Record a finished tool call; a result never seen in this chain is progress."""
+        fp = hash((name, str(result)[:2000]))
+        if fp not in self.seen_results:
+            self.seen_results.add(fp)
+            self.new_results_in_window += 1
 
     def note_output_tokens(self, n: int) -> None:
         """Record a turn's generated tokens. Called once per model turn."""
@@ -167,7 +183,9 @@ class AutonomyState:
             self.chain_continues >= STALL_MIN_CONTINUES
             and delta < STALL_DELTA_TOKENS
             and self.last_delta_tokens < STALL_DELTA_TOKENS
+            and self.new_results_in_window == 0
         )
+        self.new_results_in_window = 0
         self.last_delta_tokens = delta
         self.last_checked_tokens = self.chain_output_tokens
         return stalled

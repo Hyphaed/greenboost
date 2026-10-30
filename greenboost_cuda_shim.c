@@ -143,7 +143,7 @@
  * change to the /run/greenboost/capabilities.json feature set; bump
  * GB_SHIM_CAP_ABI only on a breaking manifest schema change (consumers gate on
  * it via gb_monitor.capabilities()). */
-#define GB_SHIM_VERSION "3.4"
+#define GB_SHIM_VERSION "3.5"
 #define GB_SHIM_CAP_ABI 1
 
 /* ------------------------------------------------------------------ */
@@ -469,11 +469,17 @@ static FILE *gbdbg_fp(void)
 {
     static __thread FILE *fp;
     if (!fp) {
-        char path[256];
-        snprintf(path, sizeof(path), "/tmp/gbdbg_%d.log", getpid());
-        fp = fopen(path, "a");
+        /* Default OFF (2026-10-11): every preloaded process used to write a ~1.4 MB /tmp/gbdbg_<pid>.log; /tmp is tmpfs (RAM), 3,111 files = 4.2 GB
+         * after two days of Ollama runner launches. Enable with GREENBOOST_DBGFILE=1; otherwise the lines go to /dev/null. */
+        const char *on = getenv("GREENBOOST_DBGFILE");
+        if (on && on[0] == '1') {
+            char path[256];
+            snprintf(path, sizeof(path), "/tmp/gbdbg_%d.log", getpid());
+            fp = fopen(path, "a");
+            if (fp) setvbuf(fp, NULL, _IONBF, 0);
+        }
+        if (!fp) fp = fopen("/dev/null", "w");
         if (!fp) fp = stderr;
-        else setvbuf(fp, NULL, _IONBF, 0);
     }
     return fp;
 }
@@ -2425,6 +2431,111 @@ static _Atomic size_t   g_cached_free_vram  = 0;
 static _Atomic size_t   g_cached_total_vram = 0;
 static _Atomic uint64_t g_cached_meminfo_ms = 0;
 
+/* GB_TESTABLE_BEGIN gb_report_logic
+ * Pure logic for what the shim tells a process about memory (RT-02, RT-03, RT-05 of
+ * the maintainer notes).  tests/runtime/run.sh extracts this region
+ * verbatim and compiles it with gcc, so keep it free of CUDA/NVML types and of globals. */
+
+/* Saturating add: a reported total must never wrap around to a small number. */
+static inline unsigned long long gb_sat_add_u64(unsigned long long a, unsigned long long b)
+{
+    return (a > ~0ULL - b) ? ~0ULL : a + b;
+}
+
+/* NVML-style report.  physical != 0 means the process asked for ground truth
+ * (GREENBOOST_REPORT_PHYSICAL_VRAM=1 / GREENBOOST_REPORT_PROFILE=physical): leave it alone.
+ * Otherwise add the tier capacity the caller is meant to see. */
+static inline void gb_nvml_inflate(int physical, unsigned long long *total, unsigned long long *free_b,
+                                   unsigned long long virt_total, unsigned long long virt_free)
+{
+    if (physical || !total || !free_b)
+        return;
+    *total  = gb_sat_add_u64(*total,  virt_total);
+    *free_b = gb_sat_add_u64(*free_b, virt_free);
+}
+
+/* Capacity-report profile.  Explicit GREENBOOST_REPORT_PROFILE wins over the legacy
+ * GREENBOOST_REPORT_PHYSICAL_VRAM=1 flag.  "auto" reports the physical card unless the
+ * process name is on the tier-aware list (inference servers that need the pooled figure
+ * to schedule layers).  Unset profile and unset legacy flag: virtual (today's default). */
+#define GB_PROFILE_VIRTUAL   0
+#define GB_PROFILE_PHYSICAL  1
+#define GB_PROFILE_INVALID  (-1)
+#define GB_VIRTUAL_COMMS_DEFAULT "ollama,llama-server,llama-cli,llama-bench"
+
+static inline int gb_csv_has(const char *csv, const char *word)
+{
+    size_t wl;
+    if (!csv || !word || !word[0])
+        return 0;
+    wl = strlen(word);
+    while (*csv) {
+        const char *e = strchr(csv, ',');
+        size_t l = e ? (size_t)(e - csv) : strlen(csv);
+        if (l == wl && strncmp(csv, word, l) == 0)
+            return 1;
+        if (!e)
+            break;
+        csv = e + 1;
+    }
+    return 0;
+}
+
+static inline int gb_report_profile_resolve(const char *profile, int legacy_physical,
+                                            const char *comm, const char *virtual_comms)
+{
+    if (!profile || !profile[0])
+        return legacy_physical ? GB_PROFILE_PHYSICAL : GB_PROFILE_VIRTUAL;
+    if (strcmp(profile, "physical") == 0)
+        return GB_PROFILE_PHYSICAL;
+    if (strcmp(profile, "virtual") == 0)
+        return GB_PROFILE_VIRTUAL;
+    if (strcmp(profile, "auto") == 0) {
+        const char *list = (virtual_comms && virtual_comms[0]) ? virtual_comms
+                                                              : GB_VIRTUAL_COMMS_DEFAULT;
+        return gb_csv_has(list, comm) ? GB_PROFILE_VIRTUAL : GB_PROFILE_PHYSICAL;
+    }
+    return GB_PROFILE_INVALID;
+}
+
+/* Physical free/total for telemetry.  The cuMemGetInfo cache is only filled by the first
+ * overflow decision (first allocation), so a process that has not allocated yet used to
+ * publish physical_vram_free_mb=0.  Prefer a fresh CUDA cache, then NVML (needs no CUDA
+ * context), then a stale CUDA cache, else "unknown".  cuda_age_ms is ~0ULL when the cache
+ * was never filled. */
+#define GB_PHYS_SRC_NONE 0
+#define GB_PHYS_SRC_CUDA 1
+#define GB_PHYS_SRC_NVML 2
+#define GB_PHYS_CACHE_MAX_AGE_MS 2000ULL
+
+static inline int gb_phys_pick(unsigned long long cuda_free, unsigned long long cuda_total,
+                               unsigned long long cuda_age_ms,
+                               int nvml_ok, unsigned long long nvml_free, unsigned long long nvml_total,
+                               unsigned long long *out_free, unsigned long long *out_total)
+{
+    if (cuda_total > 0 && cuda_age_ms <= GB_PHYS_CACHE_MAX_AGE_MS) {
+        *out_free = cuda_free; *out_total = cuda_total;
+        return GB_PHYS_SRC_CUDA;
+    }
+    if (nvml_ok && nvml_total > 0) {
+        *out_free = nvml_free > nvml_total ? nvml_total : nvml_free;
+        *out_total = nvml_total;
+        return GB_PHYS_SRC_NVML;
+    }
+    if (cuda_total > 0) {
+        *out_free = cuda_free; *out_total = cuda_total;
+        return GB_PHYS_SRC_CUDA;
+    }
+    *out_free = 0; *out_total = 0;
+    return GB_PHYS_SRC_NONE;
+}
+/* GB_TESTABLE_END gb_report_logic */
+
+/* NVML handle of device 0, saved by the init probe so telemetry can ask the card for its
+ * free memory without a CUDA context. */
+static nvmlDevice_t gb_nvml_dev0    = NULL;
+static int          gb_nvml_dev0_ok = 0;
+
 /* ------------------------------------------------------------------ */
 /*  Allocation phase detector - distinguishes KV cache from weights    */
 /*                                                                      */
@@ -2672,6 +2783,28 @@ static size_t gb_t2_free_to_report(void)
             pool_free = avail_free;
     }
     return pool_free;
+}
+
+/* Honest OOM line (2026-10-09 incident): frameworks print the INFLATED capacity from cuMemGetInfo
+ * ("total capacity of 126.57 GiB of which 104 GiB is free") next to a failed 20 MiB allocation, which
+ * hides the real cause: physical VRAM full because another process holds it.  When every tier has
+ * refused an allocation, state the physical figures once per failure (first 8 only) so the cause is
+ * in the log.  Read-only: a cuMemGetInfo call and a stderr line. */
+static void gb_report_oom_truth(const char *where, size_t req)
+{
+    static _Atomic int n_reported = 0;
+    if (atomic_fetch_add_explicit(&n_reported, 1, memory_order_relaxed) >= 8)
+        return;
+    size_t f = 0, t = 0;
+    if (!real_cuMemGetInfo || real_cuMemGetInfo(&f, &t) != CUDA_SUCCESS)
+        return;
+    fprintf(stderr,
+            "[GreenBoost] OOM in %s: %zu MiB requested; PHYSICAL VRAM %zu of %zu MiB free "
+            "(the larger capacity a framework prints includes the T2/T3 tiers); T2 in use %zu MiB. "
+            "If physical free is small another process holds the card: "
+            "nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv\n",
+            where, req >> 20, f >> 20, t >> 20,
+            atomic_load_explicit(&gb_t2_overflow_bytes, memory_order_relaxed) >> 20);
 }
 
 /* Idle timeout: if no overflow alloc occurs for this many ms while in STEADY
@@ -3684,6 +3817,27 @@ static void gb_refault_check(uint64_t ptr)
     }
 }
 
+/* Physical free/total for telemetry: see gb_phys_pick().  Returns a GB_PHYS_SRC_* value. */
+static int gb_phys_mem_now(size_t *free_out, size_t *total_out)
+{
+    uint64_t last = atomic_load_explicit(&g_cached_meminfo_ms, memory_order_relaxed);
+    uint64_t now  = gb_now_ms();
+    unsigned long long age = last ? (now > last ? now - last : 0) : ~0ULL;
+    nvmlMemory_t m = {0};
+    int nvml_ok = 0;
+    unsigned long long f = 0, t = 0;
+    int src;
+
+    if (gb_nvml_dev0_ok && real_nvmlDeviceGetMemoryInfo && age > GB_PHYS_CACHE_MAX_AGE_MS)
+        nvml_ok = (real_nvmlDeviceGetMemoryInfo(gb_nvml_dev0, &m) == NVML_SUCCESS);
+    src = gb_phys_pick(atomic_load_explicit(&g_cached_free_vram,  memory_order_relaxed),
+                       atomic_load_explicit(&g_cached_total_vram, memory_order_relaxed),
+                       age, nvml_ok, m.free, m.total, &f, &t);
+    *free_out  = (size_t)f;
+    *total_out = (size_t)t;
+    return src;
+}
+
 static void gb_write_stats(void)
 {
     char tmp_path[128];
@@ -3807,8 +3961,9 @@ static void gb_write_stats(void)
             if (fread(_buf, 1, 7, _gmf) > 0) _gm = (_buf[0] == '1');
             fclose(_gmf);
         }
-        size_t _cached_free  = atomic_load_explicit(&g_cached_free_vram,  memory_order_relaxed);
-        size_t _cached_total = atomic_load_explicit(&g_cached_total_vram, memory_order_relaxed);
+        size_t _cached_free = 0, _cached_total = 0;
+        static const char *const _psrc_names[] = { "none", "cuda", "nvml" };
+        int _psrc = gb_phys_mem_now(&_cached_free, &_cached_total);
         size_t _ws_base = gb_effective_workstation_reserve_bytes(_cached_free, _cached_total);
         fprintf(f, "workstation_reserve_mb=%zu\n",     _ws_base >> 20);
         fprintf(f, "workstation_reserve_eff_mb=%zu\n", (_gm ? _ws_base * 2 : _ws_base) >> 20);
@@ -3816,6 +3971,8 @@ static void gb_write_stats(void)
          * real_cuMemGetInfo cache), so fill-% can be measured against physical
          * VRAM instead of the inflated virtual device total. */
         fprintf(f, "physical_vram_free_mb=%zu\n", _cached_free >> 20);
+        /* "none" = not measured yet, so the 0 above means unknown, not full. */
+        fprintf(f, "physical_vram_source=%s\n", _psrc_names[_psrc]);
     }
     fprintf(f, "local_t1_alloc_mb=%zu\n",     atomic_load_explicit(&g_local_t1_alloc_bytes, memory_order_relaxed) >> 20);
     fprintf(f, "remote_alloc_count=%zu\n",    atomic_load_explicit(&g_remote_alloc_count, memory_order_relaxed));
@@ -4604,7 +4761,10 @@ static int gb_cudart_major_from_handle(void *h)
     return v / 1000;
 }
 
-static void gb_cudart_resolve_syms(void *libcudart)
+/* Build marker: `greenboost doctor` greps the installed shim for this literal to prove the rebind-force patch is in the binary. */
+static const char gb_marker_cudart_rebind_force[] __attribute__((used)) = "GB-MARKER cudart-rebind-force=1";
+
+static void gb_cudart_resolve_syms(void *libcudart, int force)
 {
     /* FILL-IF-NULL, never overwrite (fix, 2026-07-31): this function's own
      * comment at its call site says "best-effort fallback only; the first
@@ -4624,98 +4784,98 @@ static void gb_cudart_resolve_syms(void *libcudart)
      * fallback — reproduced live as cudaFuncGetAttributes (unhooked, always
      * resolves straight to the app's real cudart) failing "invalid device
      * function" for a kernel whose registration got redirected into the
-     * clobbered runtime. Guarding every line with "if (!real_X)" restores
+     * clobbered runtime. Guarding every line with "if (force || !real_X)" restores
      * this function to what its own comment already claimed it was: a
      * fill-the-gaps fallback, never a reset. */
-    if (!real_cudaMalloc)           real_cudaMalloc           = (pfn_cudaMalloc)           gb_cudart_sym(libcudart, "cudaMalloc");
-    if (!real_cudaFree)             real_cudaFree             = (pfn_cudaFree)             gb_cudart_sym(libcudart, "cudaFree");
-    if (!real_cudaMallocManaged)    real_cudaMallocManaged    = (pfn_cudaMallocManaged)    gb_cudart_sym(libcudart, "cudaMallocManaged");
-    if (!real_cudaMallocAsync)      real_cudaMallocAsync      = (pfn_cudaMallocAsync)      gb_cudart_sym(libcudart, "cudaMallocAsync");
-    if (!real_cudaGetDeviceCount)   real_cudaGetDeviceCount   = (pfn_cudaGetDeviceCount)   gb_cudart_sym(libcudart, "cudaGetDeviceCount");
-    if (!real_cudaSetDevice)        real_cudaSetDevice        = (pfn_cudaSetDevice)        gb_cudart_sym(libcudart, "cudaSetDevice");
-    if (!real_cudaDeviceCanAccessPeer)
+    if (force || !real_cudaMalloc)           real_cudaMalloc           = (pfn_cudaMalloc)           gb_cudart_sym(libcudart, "cudaMalloc");
+    if (force || !real_cudaFree)             real_cudaFree             = (pfn_cudaFree)             gb_cudart_sym(libcudart, "cudaFree");
+    if (force || !real_cudaMallocManaged)    real_cudaMallocManaged    = (pfn_cudaMallocManaged)    gb_cudart_sym(libcudart, "cudaMallocManaged");
+    if (force || !real_cudaMallocAsync)      real_cudaMallocAsync      = (pfn_cudaMallocAsync)      gb_cudart_sym(libcudart, "cudaMallocAsync");
+    if (force || !real_cudaGetDeviceCount)   real_cudaGetDeviceCount   = (pfn_cudaGetDeviceCount)   gb_cudart_sym(libcudart, "cudaGetDeviceCount");
+    if (force || !real_cudaSetDevice)        real_cudaSetDevice        = (pfn_cudaSetDevice)        gb_cudart_sym(libcudart, "cudaSetDevice");
+    if (force || !real_cudaDeviceCanAccessPeer)
         real_cudaDeviceCanAccessPeer    = (pfn_cudaDeviceCanAccessPeer)
             gb_cudart_sym(libcudart, "cudaDeviceCanAccessPeer");
-    if (!real_cudaDeviceEnablePeerAccess)
+    if (force || !real_cudaDeviceEnablePeerAccess)
         real_cudaDeviceEnablePeerAccess = (pfn_cudaDeviceEnablePeerAccess)
             gb_cudart_sym(libcudart, "cudaDeviceEnablePeerAccess");
-    if (!real_cudaPointerGetAttributes)
+    if (force || !real_cudaPointerGetAttributes)
         real_cudaPointerGetAttributes   = (pfn_cudaPointerGetAttributes)
             gb_cudart_sym(libcudart, "cudaPointerGetAttributes");
-    if (!real_cudaMemcpy)
+    if (force || !real_cudaMemcpy)
         real_cudaMemcpy           = (cudaError_t (*)(void *, const void *, size_t, int))
             gb_cudart_sym(libcudart, "cudaMemcpy");
-    if (!real_cudaMemset)
+    if (force || !real_cudaMemset)
         real_cudaMemset           = (cudaError_t (*)(void *, int, size_t))
             gb_cudart_sym(libcudart, "cudaMemset");
-    if (!real_cudaMemsetAsync)
+    if (force || !real_cudaMemsetAsync)
         real_cudaMemsetAsync      = (cudaError_t (*)(void *, int, size_t, cudaStream_t))
             gb_cudart_sym(libcudart, "cudaMemsetAsync");
-    if (!real_cudaMemcpy2DAsync)
+    if (force || !real_cudaMemcpy2DAsync)
         real_cudaMemcpy2DAsync    = (cudaError_t (*)(void *, size_t, const void *, size_t,
                                                      size_t, size_t, int, cudaStream_t))
             gb_cudart_sym(libcudart, "cudaMemcpy2DAsync");
-    if (!real_cudaLaunchKernelExC)
+    if (force || !real_cudaLaunchKernelExC)
         real_cudaLaunchKernelExC  = (pfn_cudaLaunchKernelExC)
             gb_cudart_sym(libcudart, "cudaLaunchKernelExC");
-    if (!real_cudaGetKernel)
+    if (force || !real_cudaGetKernel)
         real_cudaGetKernel        = (cudaError_t (*)(void **, const void *))
             gb_cudart_sym(libcudart, "cudaGetKernel");
-    if (!real_cudaMemcpyAsync)
+    if (force || !real_cudaMemcpyAsync)
         real_cudaMemcpyAsync      = (cudaError_t (*)(void *, const void *, size_t, int, void *))
             gb_cudart_sym(libcudart, "cudaMemcpyAsync");
-    if (!real_cudaMemcpyPeer)
+    if (force || !real_cudaMemcpyPeer)
         real_cudaMemcpyPeer       = (cudaError_t (*)(void *, int, const void *, int, size_t))
             gb_cudart_sym(libcudart, "cudaMemcpyPeer");
-    if (!real_cudaMemcpyPeerAsync)
+    if (force || !real_cudaMemcpyPeerAsync)
         real_cudaMemcpyPeerAsync  = (cudaError_t (*)(void *, int, const void *, int, size_t, void *))
             gb_cudart_sym(libcudart, "cudaMemcpyPeerAsync");
-    if (!real_cudaImportExternalMemory)
+    if (force || !real_cudaImportExternalMemory)
         real_cudaImportExternalMemory        = (pfn_cudaImportExternalMemory)
             gb_cudart_sym(libcudart, "cudaImportExternalMemory");
-    if (!real_cudaExternalMemoryGetMappedBuffer)
+    if (force || !real_cudaExternalMemoryGetMappedBuffer)
         real_cudaExternalMemoryGetMappedBuffer = (pfn_cudaExternalMemoryGetMappedBuffer)
             gb_cudart_sym(libcudart, "cudaExternalMemoryGetMappedBuffer");
-    if (!real_cudaDestroyExternalMemory)
+    if (force || !real_cudaDestroyExternalMemory)
         real_cudaDestroyExternalMemory       = (pfn_cudaDestroyExternalMemory)
             gb_cudart_sym(libcudart, "cudaDestroyExternalMemory");
-    if (!real_cudaGetLastError)
+    if (force || !real_cudaGetLastError)
         real_cudaGetLastError                = (pfn_cudaGetLastError)
             gb_cudart_sym(libcudart, "cudaGetLastError");
-    if (!real_cudaDeviceSynchronize)
+    if (force || !real_cudaDeviceSynchronize)
         real_cudaDeviceSynchronize           = (pfn_cudaDeviceSynchronize)
             gb_cudart_sym(libcudart, "cudaDeviceSynchronize");
-    if (!real_cudaMemGetInfo)
+    if (force || !real_cudaMemGetInfo)
         real_cudaMemGetInfo                  = (pfn_cudaMemGetInfo)
             gb_cudart_sym(libcudart, "cudaMemGetInfo");
-    if (!real_cudaMemPrefetchAsync)
+    if (force || !real_cudaMemPrefetchAsync)
         real_cudaMemPrefetchAsync            = (pfn_cudaMemPrefetchAsync)
             gb_cudart_sym(libcudart, "cudaMemPrefetchAsync");
-    if (!real_cudaGetDeviceProperties)
+    if (force || !real_cudaGetDeviceProperties)
         real_cudaGetDeviceProperties         = (pfn_cudaGetDeviceProperties)
             gb_cudart_sym(libcudart, "cudaGetDeviceProperties_v2");
-    if (!real_cudaGetDeviceProperties)
+    if (force || !real_cudaGetDeviceProperties)
         real_cudaGetDeviceProperties     = (pfn_cudaGetDeviceProperties)
             gb_cudart_sym(libcudart, "cudaGetDeviceProperties");
-    if (!real_cudaGetDriverEntryPointByVersion)
+    if (force || !real_cudaGetDriverEntryPointByVersion)
         real_cudaGetDriverEntryPointByVersion = (pfn_cudaGetDriverEntryPointByVersion)
             gb_cudart_sym(libcudart, "cudaGetDriverEntryPointByVersion");
-    if (!real_cudaLaunchKernel)      real_cudaLaunchKernel      = (pfn_cudaLaunchKernel)      gb_cudart_sym(libcudart, "cudaLaunchKernel");
-    if (!real_cudaStreamSynchronize) real_cudaStreamSynchronize = (pfn_cudaStreamSynchronize) gb_cudart_sym(libcudart, "cudaStreamSynchronize");
-    if (!real_cudaStreamIsCapturing)  real_cudaStreamIsCapturing  = (pfn_cudaStreamIsCapturing)  gb_cudart_sym(libcudart, "cudaStreamIsCapturing");
-    if (!real_cudaStreamBeginCapture) real_cudaStreamBeginCapture = (pfn_cudaStreamBeginCapture) gb_cudart_sym(libcudart, "cudaStreamBeginCapture");
+    if (force || !real_cudaLaunchKernel)      real_cudaLaunchKernel      = (pfn_cudaLaunchKernel)      gb_cudart_sym(libcudart, "cudaLaunchKernel");
+    if (force || !real_cudaStreamSynchronize) real_cudaStreamSynchronize = (pfn_cudaStreamSynchronize) gb_cudart_sym(libcudart, "cudaStreamSynchronize");
+    if (force || !real_cudaStreamIsCapturing)  real_cudaStreamIsCapturing  = (pfn_cudaStreamIsCapturing)  gb_cudart_sym(libcudart, "cudaStreamIsCapturing");
+    if (force || !real_cudaStreamBeginCapture) real_cudaStreamBeginCapture = (pfn_cudaStreamBeginCapture) gb_cudart_sym(libcudart, "cudaStreamBeginCapture");
     /* CUDA doc: cudaStreamCreateWithPriority - resolve for stream priority
      * elevation hook; optional (silently skipped if unavailable). */
-    if (!real_cudaStreamCreateWithPriority)
+    if (force || !real_cudaStreamCreateWithPriority)
         real_cudaStreamCreateWithPriority = (pfn_cudaStreamCreateWithPriority)
             gb_cudart_sym(libcudart, "cudaStreamCreateWithPriority");
-    if (!real_cudaDeviceGetAttribute)
+    if (force || !real_cudaDeviceGetAttribute)
         real_cudaDeviceGetAttribute = (pfn_cudaDeviceGetAttribute)
             gb_cudart_sym(libcudart, "cudaDeviceGetAttribute");
-    if (!real_cudaDeviceGetStreamPriorityRange)
+    if (force || !real_cudaDeviceGetStreamPriorityRange)
         real_cudaDeviceGetStreamPriorityRange = (pfn_cudaDeviceGetStreamPriorityRange)
             gb_cudart_sym(libcudart, "cudaDeviceGetStreamPriorityRange");
-    if (!real___cudaRegisterFunction)
+    if (force || !real___cudaRegisterFunction)
         real___cudaRegisterFunction = (pfn___cudaRegisterFunction)
             gb_cudart_sym(libcudart, "__cudaRegisterFunction");
 }
@@ -4804,7 +4964,12 @@ static void gb_cudart_rebind(void)
                         "CUDA 13.0). Rebinding onto the app's own libcudart "
                         "instead of the mismatched override.\n",
                         g_cudart_override_major, app_major, found);
-                    gb_cudart_resolve_syms(h);
+                    /* force=1: the override's pointers are already filled, and
+                     * the fill-if-null resolve would keep every one of them,
+                     * so this "rebind" used to change nothing (cudaGet-
+                     * DeviceProperties kept returning the cu13 struct layout:
+                     * multiProcessorCount read as 0, fp16 convs gave NaN). */
+                    gb_cudart_resolve_syms(h, 1);
                     atomic_store_explicit(&g_cudart_is_app, 1, memory_order_release);
                     gb_log("cudart rebind (override mismatch cu%d vs cu%d) -> %s",
                            g_cudart_override_major, app_major, found);
@@ -4813,7 +4978,7 @@ static void gb_cudart_rebind(void)
                  * override's already-resolved pointers, unchanged from the
                  * pre-hardening behaviour. */
             } else {
-                gb_cudart_resolve_syms(h);
+                gb_cudart_resolve_syms(h, 1);
                 atomic_store_explicit(&g_cudart_is_app, 1, memory_order_release);
                 gb_log("cudart rebind -> %s (init fallback was %s)",
                        found, g_cudart_init_path[0] ? g_cudart_init_path : "none");
@@ -5004,8 +5169,27 @@ static void gb_shim_init(void)
     env = getenv("GREENBOOST_KV_OVERFLOW");
     if (env && env[0] == '1') g_kv_overflow_mode = 1;
 
-    env = getenv("GREENBOOST_REPORT_PHYSICAL_VRAM");
-    if (env && env[0] == '1') g_report_physical_vram = 1;
+    {
+        /* RT-03: capacity-report profile.  GREENBOOST_REPORT_PROFILE=physical|virtual|auto
+         * (explicit) beats the legacy GREENBOOST_REPORT_PHYSICAL_VRAM=1 flag; with neither set
+         * the pooled figure is reported, as before. */
+        const char *legacy = getenv("GREENBOOST_REPORT_PHYSICAL_VRAM");
+        const char *prof   = getenv("GREENBOOST_REPORT_PROFILE");
+        char comm[32] = {0};
+        FILE *cf = fopen("/proc/self/comm", "r");
+        if (cf) {
+            if (fgets(comm, sizeof(comm), cf)) comm[strcspn(comm, "\n")] = 0;
+            fclose(cf);
+        }
+        int pr = gb_report_profile_resolve(prof, legacy && legacy[0] == '1', comm,
+                                           getenv("GREENBOOST_VIRTUAL_COMMS"));
+        if (pr == GB_PROFILE_INVALID) {
+            fprintf(stderr, "[GreenBoost] GREENBOOST_REPORT_PROFILE='%s' is not physical, "
+                            "virtual or auto: using the legacy flag\n", prof);
+            pr = (legacy && legacy[0] == '1') ? GB_PROFILE_PHYSICAL : GB_PROFILE_VIRTUAL;
+        }
+        g_report_physical_vram = (pr == GB_PROFILE_PHYSICAL);
+    }
 
     env = getenv("GREENBOOST_DEBUG_ATTR");
     if (env && env[0] == '1') g_debug_attr = 1;
@@ -5394,6 +5578,8 @@ static void gb_shim_init(void)
                 if (nvml_init() == 0) { /* NVML_SUCCESS */
                     nvmlDevice_t dev = NULL;
                     if (nvml_get_handle(0, &dev) == 0 && dev) {
+                        gb_nvml_dev0 = dev;
+                        gb_nvml_dev0_ok = 1;
                         nvmlMemory_t mem = {0};
                         if (real_nvmlDeviceGetMemoryInfo(dev, &mem) == 0 && mem.total > 0)
                             gb_physical_vram_bytes = (size_t)mem.total;
@@ -5591,7 +5777,7 @@ static void gb_shim_init(void)
      * __cudaRegisterFunction call for this model's kernels preceded this
      * constructor's own completion, in the SAME process. */
     if (libcudart && !atomic_load_explicit(&g_cudart_is_app, memory_order_acquire))
-        gb_cudart_resolve_syms(libcudart);
+        gb_cudart_resolve_syms(libcudart, 0);
     /* Fallback: some CUDA versions export runtime wrappers from libcuda.so.1 */
     if (!real_cudaMalloc)        real_cudaMalloc        = (pfn_cudaMalloc)        dlsym(libcuda, "cudaMalloc");
     if (!real_cudaFree)          real_cudaFree          = (pfn_cudaFree)           dlsym(libcuda, "cudaFree");
@@ -7807,6 +7993,7 @@ static CUresult gb_smart_overflow_alloc(CUdeviceptr *dptr, size_t bytesize) {
     }
 
     gb_log("smart_alloc: FULL OOM - all tiers exhausted at %zu MB", bytesize >> 20);
+    gb_report_oom_truth("smart_alloc", bytesize);
     GB_NVTX_EVENT("OOM_FULL", "ALL", bytesize >> 20, 0, "all_tiers_exhausted");
     return CUDA_ERROR_OUT_OF_MEMORY;
 }
@@ -8004,6 +8191,7 @@ CUresult cuMemCreate(CUmemGenericAllocationHandle *handle, size_t size,
             if (!gb_cm_allow_vmm) {
                 GB_NVTX_EVENT("OOM_VMM_BLACKWELL_SKIP", "T2_DDR", size >> 20, 0,
                               "cuMemCreate_host_skip_blackwell");
+                gb_report_oom_truth("cuMemCreate (expandable_segments on Blackwell has no T2 fallback; set expandable_segments:False)", size);
                 return CUDA_ERROR_OUT_OF_MEMORY;
             }
         }
@@ -10085,8 +10273,9 @@ nvmlReturn_t nvmlDeviceGetMemoryInfo(nvmlDevice_t device, nvmlMemory_t *memory)
          * scheduling (models load fully onto "GPU"), but not here - inflating
          * the NVML total causes 262144-token contexts that exhaust host DDR. */
         size_t nvml_virt_total = (gb_t2_pool_bytes > 0) ? gb_t2_pool_bytes : gb_virtual_vram_bytes;
-        memory->total += nvml_virt_total + g_cluster_remote_t1t2_total_bytes;
-        memory->free  += gb_t2_free_to_report() + g_cluster_remote_t1t2_free_bytes;
+        gb_nvml_inflate(g_report_physical_vram, &memory->total, &memory->free,
+                        (unsigned long long)nvml_virt_total + g_cluster_remote_t1t2_total_bytes,
+                        (unsigned long long)gb_t2_free_to_report() + g_cluster_remote_t1t2_free_bytes);
         gb_log("nvmlDeviceGetMemoryInfo: total=%lluMB (T1+T2 only, excl T3 NVMe for ctx sizing)",
                (unsigned long long)memory->total >> 20);
     }
@@ -10106,8 +10295,9 @@ nvmlReturn_t nvmlDeviceGetMemoryInfo_v2(nvmlDevice_t device, nvmlMemory_v2_t *me
     nvmlReturn_t ret = real_nvmlDeviceGetMemoryInfo_v2(device, memory);
     if (ret == NVML_SUCCESS && memory) {
         size_t nvml_virt_total = (gb_t2_pool_bytes > 0) ? gb_t2_pool_bytes : gb_virtual_vram_bytes;
-        memory->total += nvml_virt_total + g_cluster_remote_t1t2_total_bytes;
-        memory->free  += gb_t2_free_to_report() + g_cluster_remote_t1t2_free_bytes;
+        gb_nvml_inflate(g_report_physical_vram, &memory->total, &memory->free,
+                        (unsigned long long)nvml_virt_total + g_cluster_remote_t1t2_total_bytes,
+                        (unsigned long long)gb_t2_free_to_report() + g_cluster_remote_t1t2_free_bytes);
     }
     return ret;
 }
@@ -10133,8 +10323,9 @@ nvmlReturn_t nvmlDeviceGetMemoryInfo_v3(nvmlDevice_t device, nvmlMemory_v3_t *me
     nvmlReturn_t ret = real_nvmlDeviceGetMemoryInfo_v3(device, memory);
     if (ret == NVML_SUCCESS && memory) {
         size_t nvml_virt_total = (gb_t2_pool_bytes > 0) ? gb_t2_pool_bytes : gb_virtual_vram_bytes;
-        memory->total += nvml_virt_total + g_cluster_remote_t1t2_total_bytes;
-        memory->free  += gb_t2_free_to_report() + g_cluster_remote_t1t2_free_bytes;
+        gb_nvml_inflate(g_report_physical_vram, &memory->total, &memory->free,
+                        (unsigned long long)nvml_virt_total + g_cluster_remote_t1t2_total_bytes,
+                        (unsigned long long)gb_t2_free_to_report() + g_cluster_remote_t1t2_free_bytes);
     }
     return ret;
 }

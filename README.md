@@ -4,7 +4,7 @@
 
 ### CUDA Memory & Compute Orchestrator for NVIDIA GPUs
 
-![Version](https://img.shields.io/badge/version-3.4-6C4FF6?style=flat-square)
+![Version](https://img.shields.io/badge/version-3.5-6C4FF6?style=flat-square)
 ![License](https://img.shields.io/badge/license-GPLv2%20%2B%20Commercial-blue?style=flat-square)
 ![CUDA](https://img.shields.io/badge/CUDA-12%20%7C%2013-76B900?style=flat-square&logo=nvidia&logoColor=white)
 ![Status](https://img.shields.io/badge/status-daily%20driver-success?style=flat-square)
@@ -149,21 +149,27 @@ Anyone running a local model on a card one size too small.
 ## 📈 What you get, measured
 
 Every figure below was measured on one box: RTX 5070, 12 GB VRAM, PCIe 4.0 x16,
-61 GB DDR5, Linux. They are not projections and they are not vendor numbers.
+64 GB DDR4, Linux. They are not projections and they are not vendor numbers.
 Where a result is bounded by physics rather than by tuning, it says so.
 
 | What changed | Before | After | What did it |
 |---|---|---|---|
 | A model larger than VRAM runs at all | won't load, or loads onto the CPU | runs, compute stays on the GPU | GB-Tiering T1→T2→T3 spill |
-| Decode on the reference 27B model | 4.6-4.7 tok/s | 8.7-9.4 tok/s (~1.9x) | MTP speculative-decode depth swept to 4 |
-| …then, on top of that | 5.175 tok/s mean | 5.620 mean (+8.6%) | `spec_draft_p_min=0.3`, drafts bail early |
 | Prompt cost on a repeat turn | full re-prefill | 100% cached (5233/5252 tokens) | prompt-prefix stability + slot reuse |
 | Usable conversation window | 2,048 tokens | ~46,000 tokens | three context-accounting bugs closed |
 | VRAM actually filled | 67-73% | 85.1% | measured KV cache replaces the formula |
 | Reference recipe at a 14.5k-token prompt | 4.74 tok/s | 7.18 tok/s (1.48x) | `kvCache: q4_0` pinned in the serving recipe |
 | That same recipe, 15-query needle test | 570 s | 135 s | same change, end to end |
+| MoE chat model (Qwen3.8-35B-A3B) on a 12 GB card, decode | 54 tok/s | 104-115 tok/s, with *less* VRAM | GPU expert cache (`--moe-cache-mib`) sized from free VRAM |
+| Real-ESRGAN tile | 108 ms, 685 MiB | 81.5 ms, 379 MiB | `channels_last` |
 | A 9B image model that didn't fit | ~7 min/image via DDR overflow | ~5 s/image | GB-Quant quantize-to-fit |
 | A diffusion pipeline with a second PC idle | ~5.5 min/generation | ~42 s (~7.8x) | GB-Cluster feeder GPU joins in |
+
+**Measured and left alone.** The GPU power limit: decode drew 116-126 W (max
+129 W) and ran 101-112 tok/s at every limit from 175 W to 300 W, so the limit
+never binds on this card. Attention already runs at ~96% of the board's
+66.5 TFLOP/s fp32-accumulate ceiling in every backend, so a further step needs a
+kernel that accumulates in lower precision, not another backend.
 
 **And the number that does not move.** A 15.85 GB model on an 11.9 GB card
 streams ~4 GB across PCIe every token. At this board's measured ~11-12 GB/s for
@@ -210,6 +216,12 @@ detail lives in each subsystem's own section below.
 | MoE expert residency | The *hot* experts occupy VRAM, not an arbitrary subset | `gb_moe.py`, routing-frequency driven |
 | Lossless cold-expert compression | Cold experts cost less RAM without losing a bit | `gb_moe.py`, decompress on prefetch |
 | Dense-LLM layer prefetch | Next layer's weights in flight while this one computes | `gb_prefetch.py` |
+| GPU expert cache for MoE models | All experts on the host, a cache of the hot ones on the GPU, sized from free VRAM: 54 -> 104-115 tok/s on the reference model | `gb_moe_cache.py`, `GB_MOE_CACHE`, `synapse build-moecache-engine` |
+| fp8 for convolutions | Conv weights (UNets, upscalers, video VAEs) stored as fp8 with per-channel scales, above 256 MiB of conv weights | `gb_quant_conv.py`, `GB_QUANT_CONV` |
+| GPU-aware fp8 advice | Which fp8 path suits which model kind on the detected GPU | `quant_advisor` MCP (`fp8_paths`) |
+| Attention backend | cuDNN first on consumer Blackwell (5-10% faster at head_dim 128) | `gb_sdpa.py`, `GB_ATTN_BACKEND` |
+| Regional `torch.compile` | 11-13% per image once compiled; automatic for batches of 8+ | `gb_compile.py`, `GB_COMPILE` |
+| CNN worker flags | `channels_last`: 1.33x and -45% VRAM on Real-ESRGAN | `gb_cnn_tune.py` |
 | Diffusion activation cache | Near-identical denoising timesteps stop recomputing | `gb_diffcache.py` |
 | Pluggable low-bit GEMM | Swap the kernel backend without touching the planner | `GB_KERNEL_BACKEND`, `gb_kernel_backends.py` |
 | Quality gates | Evidence that quality held, instead of a bit-width assumption | `quality_gate` MCP tool; `gb_aviary.smoke_gate`/`niah_certify` |
@@ -223,6 +235,8 @@ detail lives in each subsystem's own section below.
 | GGUF and HuggingFace serving | One server for both, with GreenBoost placement underneath | `greenboost pull <repo>`, `greenboost synapse run <model>` |
 | Cluster tensor-split | One model across host + feeder GPUs as a unified device | llama.cpp `--rpc`, or the `rpc-split` preset |
 | Serving recipes | A model's measured ctx/KV/MTP settings pinned, digest-checked | `serving/recipes/*.yaml`, `serving/check_recipes.py --check` |
+| Vision serving that fits the card | The projector's cost is priced from its own metadata and paid for before the engine starts; images of any size are resized to the model's token budget | `serve(vision=, mmproj=)`, `workflow/vision-serving.md` |
+| One heavy GPU phase at a time | A lease over the studio's lock file: Qwen, FLUX, browser raster and encode share one card | `gb_api.gpu_phase`, `gpu_phase_status` (MCP) |
 | Serving presets | Typed host-only vs rpc-split resolution against live facts | `serving/presets/*.yaml`, `synapse_resolve_preset` MCP |
 | Pre-serve probes | A closed-set failure reason instead of a crash log | `serving/probe.py`, `probe_serve_readiness_for()` |
 | MTP speculative decode | ~1.9x decode on the reference model, same output distribution | `synapse_serve(mtp_draft_n=…, spec_draft_p_min=…)` |
@@ -247,7 +261,7 @@ detail lives in each subsystem's own section below.
 | Self-provisioning feeders | A feeder that can't be made ready is dropped loudly, not silently | `ensure_feeder_ready()`, `feeder_provision` events |
 | Feeder diagnostics | T1/T2/T3 and compute tested against a live daemon | `greenboost feeders diag`, `gb_feeder_diag.py` |
 | PSK auth + per-message MAC | The fabric is not an open port on your LAN | `greenboost feeders genkey`/`export-key`/`import-key` |
-| A2A / AgentCard gateway | A delegating agent can discover and drive this cluster | `gb_a2a.py`, [docs/a2a-interop.md](docs/a2a-interop.md) |
+| A2A / AgentCard gateway | A delegating agent can discover and drive this cluster | `gb_a2a.py` |
 
 ### Observability and control
 
@@ -289,18 +303,18 @@ cd greenboost
 sudo ./greenboost_setup.sh
 ```
 
-That gives you `main`, which is currently **v3.5 in development**. There is no
-v3.5 release and no v3.5 tag: it builds, its gates pass, and it has had less
-running time on real hardware than a tagged release. That is the whole
-difference, and it is the reason `main` is not presented as stable.
+That gives you `main`, which is **v3.5** (tag `v3.5`). The installer builds the
+engine for your node, and a Full Install also builds the expert-cache engine
+(one shallow `git fetch` of upstream llama.cpp; opt out with
+`GB_INSTALL_MOECACHE_ENGINE=0`).
 
-For the last stable release instead:
+For the previous stable release instead:
 
 ```bash
-git checkout v3.4 && sudo ./greenboost_setup.sh
+git checkout v3.5 && sudo ./greenboost_setup.sh
 ```
 
-[CHANGELOG.md](CHANGELOG.md) tracks what is on `main` ahead of v3.4.
+[CHANGELOG.md](CHANGELOG.md) lists what changed in each release.
 
 The installer detects your hardware and asks which mode to use:
 
@@ -589,6 +603,8 @@ with turboquant_attention(k_bits=4, v_bits=3):
 - **Layer-adaptive:** the first two and last two layers automatically get
   +1 bit of K precision, where quality is most sensitive.
 
+`gpu_advice` (MCP) lists the serving recommendations learned on the 5070 class for the detected GPU (attention backend, expert-cache sizing, MTP depth, vision reserve, power limit, fp8 conv), each with its evidence doc; `synapse_status` shows which engine is active and the last expert-cache decision. `GB_SYNAPSE_CPU_PIN=1|auto` (off by default) pins one llama.cpp thread per physical P-core. See `workflow/round2-improvements.md`.
+
 ### Beyond the two branches
 
 - **MoE expert residency** (`gb_moe.py`): a mixture-of-experts model fires a
@@ -602,6 +618,23 @@ with turboquant_attention(k_bits=4, v_bits=3):
 - **Diffusion activation cache** (`gb_diffcache.py`): consecutive denoising
   timesteps are often near-identical, so the DiT block's output is reused
   instead of recomputed.
+
+### Convolutions and the 5070's other levers
+
+`gb_quant` compressed `nn.Linear` only. **`gb_quant_conv.py`** adds fp8 weight-only
+storage for `Conv1d/2d/3d` and `ConvTranspose` layers (e4m3, one scale per output
+channel, first and last conv kept in high precision, any layer over 6% error left
+alone), called by `quantize_module(bits="fp8")` once a model has 256 MiB of conv
+weights. It saves capacity, not time. Measured: the FLUX.2 VAE halves
+(160 -> 82 MiB, 46.9 dB between the fp8 and bf16 decodes); Real-ESRGAN loses
+13.6 dB for 16 MiB, which is why small CNNs stay below the gate.
+`quant_advisor` returns `fp8_paths`, the recommendation per model kind for the
+GPU it runs on. `workflow/gb-quant-conv.md` has the research and numbers.
+
+The same pass measured the cheap compute wins: **`gb_sdpa.py`** (cuDNN attention
+first on compute capability 12.x), **`gb_compile.py`** (regional `torch.compile`,
+persistent cache, automatic from 8 images) and **`gb_cnn_tune.py`**
+(`channels_last`). See `workflow/missing-5070-features.md`.
 
 ### Proving quality held, rather than assuming it
 
@@ -743,8 +776,7 @@ MCP server (`cluster_status`, `cluster_snapshot`, `cluster_feeders`,
 `cluster_topology`), and every dispatch leaves a GB-Dataflux event, so a
 feeder is never a black box. `gb_a2a.py` additionally exposes the cluster to a
 *delegating agent* over JSON-RPC with an AgentCard, sharing the same
-double-gated actuation path as MCP, see
-[docs/a2a-interop.md](docs/a2a-interop.md).
+double-gated actuation path as MCP.
 
 The cluster fabric is secured with:
 - Pre-shared key (PSK) auth + HKDF-derived session keys (`feeders genkey`,
@@ -780,6 +812,17 @@ HuggingFace's TGI API on the same port, so existing tools don't need to know
 anything changed. It measures tokens/sec proxy-side and emits it to
 GB-Dataflux, closing the loop between an orchestration decision and its real,
 client-observed throughput.
+
+**GPU expert cache.** For a MoE model whose experts do not fit, `serve()` keeps
+all experts on the host and gives the free VRAM to a cache of the hot ones
+(`--moe-cache-mib`, upstream llama.cpp PR 29887), sized by `gb_moe_cache.py`.
+On the reference model (Qwen3.8-35B-A3B, 12 GB card with the desktop resident)
+decode goes from 54 to 128 tok/s using less VRAM; the cache takes the free memory
+and MTP stacks with it at draft depth 2 (181 tok/s against 128 with the cache alone; `GB_MOE_CACHE_MTP=0` trades MTP for a bigger cache).
+It needs an engine with the flag: `sudo greenboost synapse build-moecache-engine`
+builds upstream llama.cpp at a pinned commit for your node, and
+`sudo greenboost synapse use-engine moecache|vendored` chooses the default (a Full
+Install does both). Details and the sweep: `workflow/gb-moe-cache.md`.
 
 **Engine backends**, selected per checkpoint: `llama-cpp.host-local` (default,
 GGUF, with `--rpc` cluster tensor-split), `torch.gllm-local` (GreenBoost's own
@@ -820,9 +863,7 @@ work on a cluster that can only hold one at a time.
 local consumer keeps working unchanged. LAN or container reach needs
 `GB_SYNAPSE_BIND` + `GB_SYNAPSE_TOKEN` (or `/etc/greenboost/synapse_token`,
 0600); a non-loopback bind with no token refuses to start rather than silently
-serving unauthenticated. Rejections emit a `synapse_auth` event. See
-[docs/nemoclaw-and-greenboost.md](docs/nemoclaw-and-greenboost.md) for a
-worked example.
+serving unauthenticated. Rejections emit a `synapse_auth` event.
 
 Full reference: [GREENBOOST_COMMANDS.md § gb-synapse](GREENBOOST_COMMANDS.md#-gb-synapse-huggingface-native-cluster-distributed-gguf-serving).
 

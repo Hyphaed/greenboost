@@ -160,6 +160,62 @@ def truncate_to_width(s: str, max_cols: int) -> str:
 TTY_LOCK = threading.RLock()
 
 
+class WrapLines:
+    """Stdout stand-in that word-wraps each printed line to the terminal width.
+
+    Third-party code (gb_synapse.serve) prints 300-column diagnostics with bare
+    print(); on a 200-column terminal the terminal hard-wraps them mid-word and
+    the second half lands at column 0 under the first. This wraps at word
+    boundaries instead and indents the continuation, so one message stays one
+    readable block. Lines that already fit pass through untouched."""
+
+    def __init__(self, out=None, indent: str = "      ") -> None:
+        self._out = out if out is not None else sys.stdout
+        self._indent = indent
+        self._buf = ""
+
+    def write(self, s: str) -> int:
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self._out.write(self._wrap(line) + "\n")
+        return len(s)
+
+    def _wrap(self, line: str) -> str:
+        import shutil
+        import textwrap
+        width = max(40, shutil.get_terminal_size((80, 24)).columns - 2)
+        if display_width(line) <= width:
+            return line
+        lead = line[:len(line) - len(line.lstrip())]
+        return textwrap.fill(line, width=width, subsequent_indent=lead + self._indent,
+                             break_long_words=False, break_on_hyphens=False)
+
+    def flush(self) -> None:
+        if self._buf:
+            self._out.write(self._wrap(self._buf))
+            self._buf = ""
+        self._out.flush()
+
+    def isatty(self) -> bool:
+        return getattr(self._out, "isatty", lambda: False)()
+
+    def __getattr__(self, name):
+        return getattr(self._out, name)
+
+
+def tty_overlay(s: str) -> None:
+    """Write bytes that live OUTSIDE the scrolling text (the pinned footer).
+
+    Takes the lock so it cannot interleave with a block being drawn, but does
+    not touch the line-start / row-ownership bookkeeping: the caller wraps the
+    paint in save/restore cursor, so as far as the text stream is concerned
+    nothing was written."""
+    with TTY_LOCK:
+        sys.stdout.write(s)
+        sys.stdout.flush()
+
+
 #: True when the last byte written to the terminal was a newline, i.e. the
 #: cursor sits at column 0 and a live painter may safely own the row.
 _at_line_start = True

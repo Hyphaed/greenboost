@@ -38,6 +38,28 @@ Usage:
 from __future__ import annotations
 
 
+def gpu_phase(name: str, need_pct: float = 0.0, *, wait_s: float = 0.0, owner: str = "gb_api", **kw):
+    """Context manager: hold the shared GPU phase lease (one heavy phase on the card at a time) for `name`.
+
+        with gb_api.gpu_phase("flux-batch", need_pct=75, owner="ai-forge", wait_s=120):
+            run_the_batch()
+
+    need_pct is % of the card's PHYSICAL VRAM that must be free (derive it from the phase's real footprint, never a GB literal).
+    Waits up to wait_s; pauses gb-synapse's own served models when VRAM is short (unless cls="llm"|"vlm"); raises gb_phase.PhaseBusy
+    with the reason in words otherwise. Same lock file as the studio's TypeScript hub, so both interoperate."""
+    import gb_phase
+    return gb_phase.gpu_phase(name, need_pct, wait_s=wait_s, owner=owner, **kw)
+
+
+def cpu_affinity(workload: str = "diffusion") -> dict:
+    """P-core pinning for a host process on a hybrid CPU, from the node's own topology: {"cpus": [...],
+    "cpulist": "0-15", "omp_num_threads": 16}, or {} when there is nothing to pin (non-hybrid CPU, llm engine that
+    sizes its own threads, GB_CPU_PIN=all). Apply with `taskset -c <cpulist>`; workload_env() already carries
+    GB_CPU_AFFINITY and OMP_NUM_THREADS for the same decision."""
+    import gb_cluster
+    return gb_cluster.cpu_affinity(workload)
+
+
 def workload_env(workload: str = "diffusion", *, enabled: bool = True,
                  python: "str | None" = None,
                  extra: "dict[str, str] | None" = None) -> dict:
@@ -149,7 +171,8 @@ def serve_gguf(model_path: str, port: int, mmproj: "str | None" = None, ctx: int
     its own docstring's admission, then hand-launches + health-polls
     llama-server itself for its OCR-VL model."""
     import gb_synapse
-    return gb_synapse.serve_gguf(model_path, port, mmproj=mmproj, ctx=ctx)
+    return gb_synapse.serve_gguf(model_path, port, mmproj=mmproj, ctx=ctx,
+                                 explicit=True, trigger="gb_api_serve_gguf")
 
 
 def endpoints() -> dict:

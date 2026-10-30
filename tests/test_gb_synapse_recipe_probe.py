@@ -18,6 +18,10 @@ import pytest
 import yaml
 
 import gb_synapse as gs
+
+
+def _gated_serve(*a, **k):
+    return gs.serve(*a, explicit=True, trigger="test", **k)
 import check_recipes as cr
 
 
@@ -204,7 +208,7 @@ def test_serve_ctx_sentinel_is_overridden_by_matching_recipe(
 ):
     _write_recipe(recipes_dir / "r.yaml", ctx=45824, mtpDraftN=4)
     with pytest.raises(_StopServe):
-        gs.serve("test-model", ctx=0, mtp_draft_n=None)
+        _gated_serve("test-model", ctx=0, mtp_draft_n=None)
     assert captured_backend_call[0]["ctx"] == 45824
     assert captured_backend_call[0]["mtp_draft_n"] == 4
 
@@ -214,7 +218,7 @@ def test_serve_explicit_caller_ctx_wins_over_recipe(
 ):
     _write_recipe(recipes_dir / "r.yaml", ctx=45824, mtpDraftN=4)
     with pytest.raises(_StopServe):
-        gs.serve("test-model", ctx=8192, mtp_draft_n=None)
+        _gated_serve("test-model", ctx=8192, mtp_draft_n=None)
     assert captured_backend_call[0]["ctx"] == 8192  # caller's explicit value, not the recipe's
     assert captured_backend_call[0]["mtp_draft_n"] == 4  # still overridden — this one WAS a sentinel
 
@@ -223,7 +227,7 @@ def test_serve_no_matching_recipe_leaves_sentinels_untouched(
     recipes_dir, captured_backend_call, fake_dataflux,
 ):
     with pytest.raises(_StopServe):
-        gs.serve("test-model", ctx=0, mtp_draft_n=None)
+        _gated_serve("test-model", ctx=0, mtp_draft_n=None)
     assert captured_backend_call[0]["ctx"] == 0
     assert captured_backend_call[0]["mtp_draft_n"] is None
 
@@ -236,7 +240,7 @@ def test_serve_threads_ngpulayers_and_kvcache_from_recipe(
     _write_recipe(recipes_dir / "r.yaml", nGpuLayers=42,
                   kvCache={"key": "q4_0", "value": "q4_0"})
     with pytest.raises(_StopServe):
-        gs.serve("test-model")
+        _gated_serve("test-model")
     call = captured_backend_call[0]
     assert call["n_gpu_layers_override"] == 42
     assert call["kv_type_override"] == "q4_0"
@@ -247,7 +251,7 @@ def test_serve_threads_ngpulayers_all_sentinel_from_recipe(
 ):
     _write_recipe(recipes_dir / "r.yaml", nGpuLayers="all")
     with pytest.raises(_StopServe):
-        gs.serve("test-model")
+        _gated_serve("test-model")
     assert captured_backend_call[0]["n_gpu_layers_override"] == "all"
 
 
@@ -256,7 +260,7 @@ def test_serve_threads_ncpumoe_when_recipe_has_it(
 ):
     _write_recipe(recipes_dir / "r.yaml", nCpuMoe=20)
     with pytest.raises(_StopServe):
-        gs.serve("test-model")
+        _gated_serve("test-model")
     assert captured_backend_call[0]["n_cpu_moe_override"] == 20
 
 
@@ -268,7 +272,7 @@ def test_serve_asymmetric_kvcache_does_not_set_kv_type_override(
     back to the heuristic) rather than silently picking one side."""
     _write_recipe(recipes_dir / "r.yaml", kvCache={"key": "f16", "value": "q8_0"})
     with pytest.raises(_StopServe):
-        gs.serve("test-model")
+        _gated_serve("test-model")
     assert captured_backend_call[0]["kv_type_override"] is None
 
 
@@ -276,7 +280,7 @@ def test_serve_no_matching_recipe_leaves_placement_overrides_none(
     recipes_dir, captured_backend_call, fake_dataflux,
 ):
     with pytest.raises(_StopServe):
-        gs.serve("test-model")
+        _gated_serve("test-model")
     call = captured_backend_call[0]
     assert call["n_gpu_layers_override"] is None
     assert call["kv_type_override"] is None

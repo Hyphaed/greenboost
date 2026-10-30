@@ -118,7 +118,11 @@ def _is_tty() -> bool:
     output and, worse, inflates the gate/retry text the factory feeds back into
     the next prompt, which is scarce context on a slow local model."""
     try:
-        return bool(sys.stdout.isatty())
+        # sys.__stdout__, not sys.stdout: while the input box is live,
+        # prompt_toolkit's patch_stdout replaces sys.stdout with a proxy whose
+        # isatty() is False, which made every status line behave as if output
+        # were piped to a file and skip the live activity line entirely.
+        return bool(sys.__stdout__.isatty())
     except Exception:
         return False
 
@@ -137,6 +141,11 @@ def renders_in_toolbar() -> bool:
     lands. At the decode rates this box reaches on a deep conversation, that
     silence lasts minutes and is indistinguishable from a hang."""
     return _use_pt()
+
+
+def _footer():
+    from greenboost_cli.terminal.footer import get_footer
+    return get_footer()
 
 
 def set_wizard_active(active: bool) -> None:
@@ -161,6 +170,35 @@ def is_prefilling() -> "bool | None":
     if sl is None:
         return None
     return getattr(sl, "_first_out_ts", None) is None
+
+
+def activity_fragments(tool_label: str = "") -> list[tuple[str, str]]:
+    """The live activity line shown above the input box while a turn runs:
+
+        ⠹ Running · Bash nvidia-smi -q…  (1m 58s · ↓ 6.9k tokens · 38 t/s)
+
+    Empty when no turn is live, so the header collapses at the idle prompt."""
+    sl = _live_sl
+    if sl is None:
+        return []
+    snap = sl.snapshot()
+    now = time.monotonic()
+    elapsed = now - sl._turn0
+    sp = SPINNER_THINK[int(now * 10) % len(SPINNER_THINK)]
+    tool = (tool_label or "").strip()
+    phase = "Running" if tool else (snap.get("phase") or "Working")
+    frags: list[tuple[str, str]] = [(f"fg:{TEAL}", f"{sp} {phase}…")]
+    if tool:
+        frags.append((f"fg:{DIM}", f"  {tool[:70]}"))
+    bits = [f"{int(elapsed // 60)}m {int(elapsed % 60):02d}s" if elapsed >= 60 else f"{elapsed:.0f}s"]
+    if snap.get("out_tok"):
+        o = snap["out_tok"]
+        bits.append(f"↓ {o / 1000:.1f}k tokens" if o >= 1000 else f"↓ {o} tokens")
+    tps = snap.get("tok_s", 0.0)
+    if tps > 0:
+        bits.append(f"{tps:.0f} t/s")
+    frags.append((f"fg:{DIM}", "  (" + " · ".join(bits) + ")"))
+    return frags
 
 
 def toolbar_status_fragments() -> list[tuple[str, str]]:
@@ -205,6 +243,9 @@ class StatusLine:
         self._stop_evt = threading.Event()
         self._thread: threading.Thread | None = None
         self._prev_vis_len: int = 0   # widest frame painted so far this run — see _render
+        # One StatusLine lives for a whole turn, so this is the TURN clock; _start
+        # is the per-step one that every restart after a tool call resets.
+        self._turn0: float = time.monotonic()
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -227,12 +268,18 @@ class StatusLine:
         global _live_sl
         _live_sl = self
         if _use_pt():
-            # pt app is live at the idle prompt — drive via toolbar repaint.
+            # The input box owns the bottom of the screen — drive the activity
+            # line above it by repainting through prompt_toolkit.
+            if self._thread is not None and self._thread.is_alive():
+                return      # already painting; a restart after a tool just re-labels it
             self._thread = threading.Thread(target=self._run_pt, daemon=True, name="gb-sl")
             self._thread.start()
             return
-        # pt app is not running (turn in progress) or not configured — use raw
-        # \r animation directly on stdout (patch_stdout is inactive during turns).
+        # A turn is running: the pinned footer owns the bottom rows, so there is
+        # no inline animation thread at all and nothing to strand in scrollback.
+        if _footer().activate(self):
+            return
+        # No footer (tiny terminal): fall back to the raw \r animation.
         self._thread = threading.Thread(target=self._run, daemon=True, name="gb-sl")
         self._thread.start()
 
@@ -266,12 +313,50 @@ class StatusLine:
         if _use_pt():
             self._pt_deactivate()
             return
+        if _footer().is_active():
+            # End of turn: drop the footer, leave ONE committed summary row.
+            _footer().deactivate()
+            if not at_line_start():
+                tty_write("\n")
+            tty_write(self._render(final=True) + "\n")
+            return
         self._clear_hint()
         # Erase before the final frame too: the static line inherits the row the
         # animation was using, so anything wider left over there must go.
         tty_write(
             _WRAP_OFF + "\r" + _ERASE_LINE + self._render(final=True) + _WRAP_ON + "\n"
         )
+
+    def end_turn(self, summary: bool = False) -> None:
+        """Tear down whatever painted this turn, whichever path it used. Idempotent;
+        repl calls it from the turn's `finally`, so every exit (done, interrupt,
+        loop guard, error) clears the activity line instead of leaving it up."""
+        if self._thread is not None or _live_sl is self:
+            self._stop_evt.set()
+            self._forget_live()
+            if self._thread:
+                self._thread.join(timeout=0.5)
+            self._thread = None
+            if _use_pt() and _is_tty():
+                self._pt_deactivate()
+                if summary:
+                    snap = self.snapshot()
+                    t = time.monotonic() - self._turn0
+                    bits = [f"{int(t // 60)}m {int(t % 60):02d}s" if t >= 60 else f"{t:.0f}s"]
+                    if snap["out_tok"]:
+                        o = snap["out_tok"]
+                        bits.append(f"↓ {o / 1000:.1f}k tokens" if o >= 1000 else f"↓ {o} tokens")
+                    if snap["tok_s"] > 0:
+                        bits.append(f"{snap['tok_s']:.0f} t/s")
+                    tty_write(f"\n  {ANSI_TEAL}✻{ANSI_RESET} {ANSI_DIM}Done in "
+                              f"{' · '.join(bits)}{ANSI_RESET}\n")
+
+    def snapshot(self) -> dict:
+        """Live fields for the pinned footer."""
+        with self._lock:
+            return {"phase": self._phase, "in_tok": self._in_tok, "out_tok": self._out_tok,
+                    "tok_s": self._tok_s, "first_out": self._first_out_ts,
+                    "ctx_pct": self._ctx_pct}
 
     def _forget_live(self) -> None:
         """Drop the module-level live reference if it still points at us.
@@ -285,6 +370,11 @@ class StatusLine:
 
     def cancel(self) -> None:
         """Stop the animation and erase the line without printing a final static line."""
+        if _use_pt() and _is_tty():
+            # Mid-turn with the input box live: keep painting the activity line
+            # through tool calls (that is when you most want to see it); the
+            # turn's end_turn() tears it down.
+            return
         self._stop_evt.set()
         self._forget_live()
         if self._thread:
@@ -292,8 +382,9 @@ class StatusLine:
         if not _is_tty():
             return  # nothing was painted, so there is nothing to erase
         if _use_pt():
-            self._pt_deactivate()
-            return
+            return      # mid-turn: the activity line stays up while a tool runs; end_turn() ends it
+        if _footer().is_active():
+            return      # mid-turn: the footer stays up, it is not this line's to erase
         self._clear_hint()
         tty_write("\r" + _ERASE_LINE)
 
@@ -356,7 +447,7 @@ class StatusLine:
         # ctrl+p is listed here too, not just on the idle toolbar: mid-turn is
         # exactly when an operator decides they want the GPU back for something
         # else, and a lever they cannot see is a lever they will not use.
-        hint = ("  esc to interrupt  ·  ctrl+p pause/resume  ·  ctrl+i compact  ·  "
+        hint = ("  esc to interrupt  ·  ctrl+p pause/resume  ·  ctrl+q compact  ·  "
                 "type to queue next prompt")
         tty_write(
             f"\n{_ERASE_LINE}{ANSI_DIM}{hint}{ANSI_RESET}"
@@ -396,7 +487,7 @@ class StatusLine:
 
         width   = shutil.get_terminal_size((80, 24)).columns
         safe_w  = width - 2
-        elapsed = time.monotonic() - self._start
+        elapsed = time.monotonic() - (self._turn0 if final else self._start)
 
         # ── Right side: ctx% · tokens · tps · elapsed ────────────────────────
         right_parts: list[str] = []
@@ -458,6 +549,7 @@ class StatusLine:
 
         # ── Spinner + phase label ──────────────────────────────────────────
         if final:
+            phase = "Done"
             sp_char  = "●"
             sp_color = ANSI_LIME
             lbl_color = ANSI_LIME

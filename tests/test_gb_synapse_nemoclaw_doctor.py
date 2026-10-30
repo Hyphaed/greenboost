@@ -3,7 +3,7 @@
 """
 Tests for gb_synapse.doctor()'s `nemoclaw` block — detects NVIDIA NemoClaw
 on PATH and whether something other than our own gb-synapse proxy is
-holding GB_SYNAPSE_PORT (see docs/nemoclaw-and-greenboost.md and the
+holding GB_SYNAPSE_PORT (see the maintainer notes and the
 Track 2 / rollout item 8 write-up in the NemoClaw audit plan). MCP Tool
 Gaps rule: this check belongs in the tool (`synapse_doctor`), not only in
 a doc a human has to remember to consult.

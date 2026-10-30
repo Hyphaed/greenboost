@@ -2,12 +2,11 @@
 # GreenBoost - Setup & installation script for Arch Linux
 # Supports: Arch, Manjaro, EndeavourOS, CachyOS, and any Arch-based distro.
 #
-# This script mirrors greenboost_setup.sh's Arch-specific parts: package-manager
-# bootstrap (pacman) and the menu UI. Feature logic shared with the main script
-# (cluster connect, vitals/pool-info parsing, turboquant, etc.) is NOT duplicated
-# here - it execs into greenboost_setup.sh, so patches to that logic land here
-# automatically and never need manual porting. Only Arch-specific bootstrap/UI
-# changes need to be made in this file directly.
+# This script carries the Arch-specific parts: package-manager bootstrap
+# (pacman), the menu UI and its own copy of the install flow. Only `uninstall`
+# is handed to greenboost_setup.sh (INS-11). The install flow here has NOT been
+# kept in step with the main script (no initramfs exclusion, boot guard or
+# atomic installs): treat an Arch full install as lagging until lib/ is shared.
 #
 # USAGE:
 #   sudo ./greenboost_setup_arch.sh full-install     - full install (prompts for mode)
@@ -30,7 +29,7 @@ VULKAN_IMPLICIT_LAYER_DIR="/etc/vulkan/implicit_layer.d"
 SHIM_DEST="/usr/local/lib"
 MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-GB_VERSION="3.4"
+GB_VERSION="3.5"
 GB_PROFILES_DIR="/etc/greenboost/profiles"
 GB_ACTIVE_PROFILE_LINK="/etc/greenboost/active_profile.md"
 GB_STOPPED_SERVICES=""
@@ -44,6 +43,11 @@ NC='\033[0m'
 info()  { echo -e "${GRN}[GreenBoost]${NC} $*"; }
 warn()  { echo -e "${YLW}[GreenBoost] WARN:${NC} $*"; }
 die()   { echo -e "${RED}[GreenBoost] ERROR:${NC} $*" >&2; exit 1; }
+
+# Module-presence check. Never `lsmod | grep -q` under `set -o pipefail`: grep -q
+# exits on the first match, lsmod can then die of SIGPIPE (141) and the whole
+# pipeline reads as "absent". Same bug, same fix as greenboost_setup.sh.
+gb_module_loaded() { grep -q "^${DRIVER_NAME} " <<< "$(lsmod)"; }
 
 # ---- Brand palette + UI primitives (mirrors greenboost_setup.sh) -----------
 _gb_truecolor() { [[ "${COLORTERM:-}" =~ ^(truecolor|24bit)$ ]]; }
@@ -554,7 +558,7 @@ do_purge() {
     rmdir /var/lib/greenboost 2>/dev/null || true
 
     # 9. Unload kernel module - done last so all consumers are gone.
-    if lsmod | grep -q "^${DRIVER_NAME} "; then
+    if gb_module_loaded; then
         if rmmod "$DRIVER_NAME" 2>/dev/null; then
             gb_ok "Kernel module unloaded"
         else
@@ -582,15 +586,11 @@ do_purge() {
     fi
 }
 
+# Removal is not distro-specific: hand over to the main script so this one
+# cannot drift from it (INS-11). It removes exactly what its install wrote,
+# supports --dry-run and never prompts.
 cmd_uninstall() {
-    need_root uninstall
-    gb_header
-    gb_info "Removing all GreenBoost artifacts from this system..."
-    echo ""
-    GB_STOPPED_SERVICES=""
-    do_purge 1
-    echo ""
-    gb_ok "GreenBoost uninstalled cleanly."
+    exec "$MODULE_DIR/greenboost_setup.sh" --skip-update-check uninstall "$@"
 }
 
 # ---- Build / Install -------------------------------------------------------
@@ -673,7 +673,7 @@ cmd_load() {
     local nvme_sw="${NVME_SWAP_GB:-${GB_NVME_SWAP}}"
     local nvme_pool="${NVME_POOL_GB:-${GB_NVME_POOL}}"
 
-    if lsmod | grep -q "^${DRIVER_NAME} "; then
+    if gb_module_loaded; then
         warn "Module already loaded - reloading..."
         for svc in ollama llama-server; do
             systemctl is-active --quiet "$svc" 2>/dev/null && \
@@ -708,7 +708,7 @@ cmd_load() {
 
 cmd_unload() {
     need_root unload
-    if lsmod | grep -q "^${DRIVER_NAME} "; then
+    if gb_module_loaded; then
         for svc in ollama llama-server; do
             systemctl is-active --quiet "$svc" 2>/dev/null && \
                 systemctl stop "$svc" 2>/dev/null || true
@@ -856,7 +856,7 @@ Environment="OLLAMA_FLASH_ATTENTION=1"
 Environment="OLLAMA_KV_CACHE_TYPE=q8_0"
 Environment="OLLAMA_NUM_CTX=${GB_OLLAMA_CTX}"
 Environment="OLLAMA_MAX_LOADED_MODELS=1"
-Environment="OLLAMA_KEEP_ALIVE=-1"
+Environment="OLLAMA_KEEP_ALIVE=${GB_OLLAMA_KEEP_ALIVE:-5m}"
 Environment="OLLAMA_NUM_GPU=999"
 Environment="GREENBOOST_VIRTUAL_VRAM_MB=$((GB_VIRT * 1024))"
 Environment="GREENBOOST_DEBUG=0"
@@ -1059,7 +1059,7 @@ cmd_status() {
     # Fallback: raw sysfs output when Ubuntu script is unavailable
     gb_header
     local pool_f="/sys/class/greenboost/greenboost/status"
-    if lsmod | grep -q "^${DRIVER_NAME} "; then
+    if gb_module_loaded; then
         gb_ok "Kernel module loaded"
     else
         gb_fail "Kernel module not loaded"
@@ -1400,7 +1400,7 @@ unset _ARGS _arg _expect_profile
 COMMAND="${1:-wizard}"
 case "$COMMAND" in
     install)             cmd_install            ;;
-    uninstall)           cmd_uninstall          ;;
+    uninstall)           cmd_uninstall "${@:2}" ;;
     build)               cmd_build              ;;
     load)                cmd_load               ;;
     unload)              cmd_unload             ;;

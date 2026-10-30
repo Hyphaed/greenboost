@@ -1,0 +1,131 @@
+# Which local model to use for which job, and when not to.
+#
+# Local-first: every entry is a model that runs on this workstation or a feeder on
+# the owner's LAN (GreenBoost's Local-First rule). Nothing here points at a hosted API.
+#
+# Placement (ctx, KV type, --n-cpu-moe, MTP depth) is NOT repeated here. It lives in
+# the digest-pinned serving recipe named by `recipe:`; this file says which model to
+# reach for and why. Evidence is kept next to each claim so a stale number is visible.
+#
+# Override one role without editing this file:  GB_MODEL_AGENT_FAST=<manifest name>
+# (role name upper-cased). A user's ~/.greenboost_cli/config.json "model" still wins
+# for the interactive session; this catalog drives defaults, escalation and `/roles`.
+#
+# Last measured: 2026-10-02, 12 GB card, no feeder. Numbers are decode tok/s, greedy,
+# one prompt, median of 3, and are NOT a quality result.
+version: 1
+
+# Order matters. Try the first; hand a task to the next only when a deterministic gate
+# (tests, build, type check) fails and the failure is not environmental. A cascade only
+# pays off when the verifier is deterministic, so never escalate on "the answer felt weak".
+escalation: [agent_fast, agent_deep]
+
+roles:
+  agent_fast:
+    summary: Default coding agent. Interactive work, edits, subagents, Factory first attempts.
+    model: qwen38-35b-a3b-apex-miniplus
+    source: https://huggingface.co/IsValorum/Qwen3.8-35B-A3B-Distill-MTP-APEX-I-MiniPlus-V2.1-GGUF
+    recipe: qwen38-35b-a3b-apex-miniplus
+    status: measured
+    use_when:
+      - Interactive coding and tool-driven agent loops, where waiting on tokens is the cost.
+      - Many short turns, subagent work, and the first attempt of a Factory task.
+      - Anything where 10x the dense model's speed matters more than the last bit of quality.
+    avoid_when:
+      - A gate already failed on this model for a logic reason; use agent_deep.
+      - Very long context work (the vendor admits degraded long context; unverified here).
+      - Quality-critical one-shot output you can't verify with a test.
+    measured:
+      decode_tok_s: 49.7
+      config: "--n-cpu-moe 28, MTP on, ctx 32768, f16 KV, 88.5% VRAM"
+      native_tool_calls: "5/5 valid on a one-tool smoke test"
+      warning: "--n-cpu-moe below 26 drops to ~14 tok/s (cause unknown, known-issues item 5); the recipe pins 28"
+    unmeasured:
+      - agentic and long-context quality, thinking-token cost per task vs agent_deep
+      - niah_certify(), smoke_gate()
+
+  agent_deep:
+    summary: Slow, careful tier. Re-attempts after a failed gate, and quality-critical work.
+    model: Qwen3.8-27B-Cold-Fusion-MTP-IQ4_XS
+    source: https://huggingface.co/DavidAU/Qwen3.8-27B-Cold-Fusion-GAIN-V1.1-NM-DAU-NEO-MAX-MTP-GGUF
+    recipe: qwen38-27b-cold-fusion-gain-v11
+    status: measured
+    use_when:
+      - agent_fast failed a test/build gate and the failure looks like a logic error.
+      - Work where one correct answer is worth waiting minutes for.
+      - Writing from exact specs (it follows exact paths, names and formulas well).
+    avoid_when:
+      - Interactive back-and-forth; at ~5 tok/s every turn is a wait.
+      - Bulk or parallel work; ~90-95% of decode is PCIe-bound, so extra slots don't help.
+    measured:
+      decode_tok_s: 4.9
+      config: "ctx 32768, f16 KV, -ngl 65, MTP depth 4, 2026-08-17 (the native benchmark of the same config read 5.2 to 6.5)"
+    unmeasured:
+      - thinking-token A/B against agent_fast on an identical prompt
+
+  embed:
+    summary: Code embeddings for the local RAG index.
+    model: jinaai/jina-embeddings-v2-base-code
+    config_key: rag_embed_model
+    status: in_use
+    use_when:
+      - Indexing and searching source code in the local RAG.
+    notes: >
+      qwen3-embedding:latest is in the gb-synapse manifest but has not been evaluated
+      against this model on retrieval recall, so it is not recommended here.
+
+  image:
+    summary: Local image generation for design assets.
+    model: klein-fp8
+    config_key: diffusion_model
+    status: in_use
+
+  vision:
+    summary: "Fast image understanding of screenshots, documents, charts and tables."
+    model: Qwen3VL-8B-Instruct-Q4_K_M
+    source: https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF
+    status: measured
+    use_when:
+      - Reading a screenshot, invoice, chart or table where a quick, mostly-right answer is what's needed.
+      - Anything interactive: a whole image turn takes about a second.
+    avoid_when:
+      - Questions that need reasoning across many rows of a dense, noisy table (it missed a "which row is highest" question the MoE got right).
+      - Alongside the MoE: both need the card, so serving this one means stopping the other.
+    measured:
+      decode_tok_s: 109.6
+      config: "Q4_K_M + mmproj Q8_0, ctx 16384, ~10.7 GB VRAM in the test run"
+      easy_test: "invoice + bar chart: every field correct, 1.9 s and 0.3 s"
+      hard_test: "dense 20-row table, rotated 2.2 deg, noise, JPEG q38: 2/3 correct in 0.3 s total"
+    unmeasured:
+      - more than one image per test; photographed documents; non-English text
+
+  vision_deep:
+    summary: Hard visual reasoning when the fast vision model gets it wrong.
+    model: qwen38-35b-a3b-apex-miniplus
+    source: https://huggingface.co/IsValorum/Qwen3.8-35B-A3B-Distill-MTP-APEX-I-MiniPlus-V2.1-GGUF
+    recipe: qwen38-35b-a3b-apex-miniplus
+    status: measured
+    use_when:
+      - The fast vision model answered a multi-step question over a table or chart incorrectly.
+      - The same session is already running the MoE and one more image question doesn't justify a swap.
+    avoid_when:
+      - "Anything latency-sensitive. It thinks first, so the hard test took 31.8 s for three questions against 0.3 s."
+      - With MTP on. It loads and works, but image turns got slower (invoice 22.9 s vs 15.0 s) and VRAM reached 11.6 GB.
+    how_to_serve: "add --mmproj <mmproj-Q8_0.gguf from the same repo> and set GB_SYNAPSE_MTP=0 for this serve"
+    measured:
+      decode_tok_s: 44.1
+      config: "--n-cpu-moe 28, mmproj-Q8_0 (0.57 GiB), MTP off, ctx 16384, 9.6 GB VRAM"
+      hard_test: "3/3 correct in 31.8 s"
+    unmeasured:
+      - quality on photographed documents; whether the distill keeps the base model's vision quality
+
+# Models that are in the manifest but are not recommended on this hardware, and why.
+not_for_this_hardware:
+  - model: Qwen3.8-Flash-Next-UD-Q2_K_XL
+    why: "73 GB of weights against 12 GB of VRAM; it would stream from host memory and disk on every token."
+  - model: qwen3:0.6b
+    why: "Superseded as the default helper. Fine for trivial tasks, but nothing here depends on it."
+
+# How to add a model: serve it, measure it with the sweep in workflow/spark-parity-roadmap.md,
+# write its serving recipe, then add a role here with the numbers. An entry with no
+# `measured` block must say `status: unverified` and `use_when` must say what is missing.

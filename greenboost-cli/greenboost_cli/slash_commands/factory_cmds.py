@@ -1,4 +1,4 @@
-"""AI Factory management: /factory [start|stop|status|submit|agents|history]."""
+"""AI Factory management: /factory [start|stop|status|submit|agents|history|interrupted|recover|discard]."""
 from __future__ import annotations
 
 import json
@@ -20,6 +20,9 @@ def _factory(args: str, session, settings: dict) -> None:
         "pause":   _pause,
         "resume":  _resume,
         "history": _history,
+        "interrupted": _interrupted,
+        "recover": _recover,
+        "discard": _discard,
         "help":    _help,
     }
     fn = dispatch.get(sub, _help)
@@ -51,6 +54,39 @@ def _start(args: str, settings: dict) -> None:
     factory.start(workers=workers)
     print(f"  AI Factory started — {workers} worker(s), {len(factory._agents)} agent(s)")
     print(f"  Dashboard: http://127.0.0.1:7821  (run: gb dashboard)")
+
+
+def _interrupted(_args: str, _settings: dict) -> None:
+    from greenboost_cli.workflow.factory import get_factory
+    rows = get_factory().interrupted_tasks()
+    if not rows:
+        print("  No interrupted tasks.")
+        return
+    print("  These tasks were running when their factory died. None was re-run.")
+    for r in rows:
+        print(f"  {r['task_id']}  attempt {r['attempt']}  {r['workspace'] or '(no workspace)'}")
+        print(f"    {(r['prompt'] or '')[:100]}")
+    print("  /factory recover <id> [--force]   re-queue it if the workspace is unchanged")
+    print("  /factory discard <id>             drop it")
+
+
+def _recover(args: str, _settings: dict) -> None:
+    parts = args.split()
+    if not parts:
+        print("  Usage: /factory recover <task-id> [--force]")
+        return
+    from greenboost_cli.workflow.factory import get_factory
+    res = get_factory().resume_task(parts[0], force="--force" in parts[1:])
+    if res.get("status") == "queued":
+        print(f"  Re-queued {parts[0]}.")
+    else:
+        print(f"  Not resumed: {res.get('reason') or res.get('error')}")
+
+
+def _discard(args: str, _settings: dict) -> None:
+    from greenboost_cli.workflow.factory import get_factory
+    tid = args.strip()
+    print("  Discarded." if tid and get_factory().discard_task(tid) else "  No such interrupted task.")
 
 
 def _stop(_args: str, _settings: dict) -> None:
@@ -180,6 +216,9 @@ def _help(_args: str, _settings: dict) -> None:
     print("  /factory pause <agent>      Pause an agent")
     print("  /factory resume <agent>     Resume a paused agent")
     print("  /factory history            Recent completed tasks")
+    print("  /factory interrupted        Tasks that were running when a factory died")
+    print("  /factory recover <id>       Re-queue one if its workspace is unchanged (--force to override)")
+    print("  /factory discard <id>       Drop an interrupted task")
 
 
 # ── Registration ──────────────────────────────────────────────────────────────

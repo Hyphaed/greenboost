@@ -2351,3 +2351,17 @@ def test_dump_includes_di6_health_state(monkeypatch):
     assert d["health_state"] in (GpuHealth.HEALTHY, GpuHealth.UNHEALTHY,
                                  GpuHealth.OVERLIMIT, GpuHealth.DISABLED)
     assert isinstance(d["admits_overcommit"], bool)
+
+
+def test_state_file_follows_pressure_clearing(tmp_path, monkeypatch):
+    """orch_state.json used to keep vram_pressure=true after it cleared."""
+    import json, gb_orchestrator
+    monkeypatch.setattr(gb_orchestrator, "_ORCH_STATE_FILE", tmp_path / "orch_state.json")
+    o = gb_orchestrator.ReactiveOrchestrator(mode="supervisor")
+    for _ in range(30):
+        o.on_metrics(_make_metrics(fb_used_pct=90.0))
+    o._state_written_ts = 0.0
+    for _ in range(5):
+        o.on_metrics(_make_metrics(fb_used_pct=0.0))
+    d = json.loads((tmp_path / "orch_state.json").read_text())
+    assert d["vram_pressure"] is False and "updated_ts" in d

@@ -56,6 +56,10 @@ void llama_model_saver::add_kv(const enum llm_kv key, const int32_t value) {
     gguf_set_val_i32(gguf_ctx, llm_kv(key).c_str(), value);
 }
 
+void llama_model_saver::add_kv(const enum llm_kv key, const uint64_t value) {
+    gguf_set_val_u64(gguf_ctx, llm_kv(key).c_str(), value);
+}
+
 void llama_model_saver::add_kv(const enum llm_kv key, const float value) {
     gguf_set_val_f32(gguf_ctx, llm_kv(key).c_str(), value);
 }
@@ -109,6 +113,8 @@ void llama_model_saver::add_kv(const enum llm_kv key, const Container & value, c
         gguf_set_arr_data(gguf_ctx, llm_kv(key).c_str(), GGUF_TYPE_BOOL, value.data(), n_values);
     } else if (std::is_same<typename Container::value_type, int32_t>::value) {
         gguf_set_arr_data(gguf_ctx, llm_kv(key).c_str(), GGUF_TYPE_INT32, value.data(), n_values);
+    } else if (std::is_same<typename Container::value_type, uint64_t>::value) {
+        gguf_set_arr_data(gguf_ctx, llm_kv(key).c_str(), GGUF_TYPE_UINT64, value.data(), n_values);
     } else if (std::is_same<typename Container::value_type, float>::value) {
         gguf_set_arr_data(gguf_ctx, llm_kv(key).c_str(), GGUF_TYPE_FLOAT32, value.data(), n_values);
     } else if (std::is_same<Container, std::string>::value) {

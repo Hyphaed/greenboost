@@ -892,6 +892,17 @@ def _delegate_patch(module, processor, skip_modules, group_size, device,
             pass
 
 
+def _maybe_conv_fp8(module, bits, device) -> None:
+    """fp8 weight-only for the convolutions of a module quantized at fp8 (gb_quant_conv; Linear is handled by the processors above). Gated by size and GB_QUANT_CONV."""
+    if bits not in ("fp8", "e4m3"):
+        return
+    try:
+        import gb_quant_conv
+        gb_quant_conv.maybe_quantize_convs(module, device=device)
+    except Exception as e:  # noqa: BLE001  - conv compression is an add-on: never fail the Linear path because of it
+        print(f"[gb_quant] conv fp8 skipped: {type(e).__name__}: {e}")
+
+
 def quantize_module(module, bits, device: str = "cuda",
                     dtype=None, group_size: int = 64,
                     skip_modules=_DEFAULT_SKIP_MODULES,
@@ -926,6 +937,7 @@ def quantize_module(module, bits, device: str = "cuda",
         with _gb_nvtx("gb:quantize:per_layer", color="cyan"):
             _delegate_patch(module, None, list(skip_modules), group_size, device,
                             per_layer_bits=per_layer_bits, scalar_bits=bits)
+        _maybe_conv_fp8(module, bits, device)
         gc.collect()
         _gb_cache_release()
         return module
@@ -940,6 +952,7 @@ def quantize_module(module, bits, device: str = "cuda",
         # unset => gemlite => one processor built and reused, as before.
         _delegate_patch(module, None, list(skip_modules), gs, device,
                         scalar_bits=bits)
+    _maybe_conv_fp8(module, bits, device)
     gc.collect()
     _gb_cache_release()
     return module

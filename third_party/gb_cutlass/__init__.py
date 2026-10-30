@@ -19,6 +19,15 @@ from __future__ import annotations
 import os
 
 try:
+    # torch MUST be imported first: the extension links libc10.so/libtorch.so
+    # from torch's lib dir, which is not on the loader's search path. Importing
+    # torch loads them into the process, so the extension then resolves. Without
+    # this the .so builds fine and silently fails to import with
+    # "libc10.so: cannot open shared object file" — swallowed by the except
+    # below, leaving _COMPILED False and available() False for a reason that
+    # looks exactly like "not built". Found 2026-08-22, first time the extension
+    # was ever compiled.
+    import torch  # noqa: F401
     from ._gb_cutlass_C import gemm_nvfp4  # noqa: F401  (compiled extension)
     _COMPILED = True
 except Exception:
@@ -51,20 +60,31 @@ def available() -> bool:
 # quantization half of the "weight-packing reconciliation" this module's own
 # docstring names as the remaining Stage-A2 step.
 #
-# SCOPE, stated plainly: this produces ROW-MAJOR packed e2m1 data + a FLAT
-# (one byte per 16-element block) ue4m3 scale array. It does NOT produce
-# CUTLASS's Sm1xxBlkScaledConfig-interleaved scale-factor layout that
-# gemm_nvfp4() actually requires for its SFA/SFB arguments (see
-# gb_cutlass_ext.cu's tile_atom_to_shape_SFA/SFB calls) — that interleaving
-# is a CuTe Layout coordinate-convention detail (block-vs-element K
-# granularity, nested-tuple atom tiling) that could not be verified against
-# a real compile+run cycle safely in this session; a wrong guess there
-# produces silently WRONG GEMM NUMERICS, not a compile error, so it was not
-# attempted rather than risk shipping that failure mode. gemm_nvfp4() (the
-# compiled extension) therefore still cannot be called end-to-end from this
-# packer's output — build_cutlass_nvfp4_processor() correctly stays a stub
-# returning None (gb_kernel_backends.py) until that interleaving is done and
-# verified.
+# SCOPE: this produces ROW-MAJOR packed e2m1 data + a FLAT (one byte per
+# 16-element block) ue4m3 scale array. That flat array is NOT what gemm_nvfp4()
+# indexes — it wants CUTLASS's Sm1xxBlkScaledConfig-interleaved scale-factor
+# layout.
+#
+# RESOLVED 2026-08-22. That interleaving is now done, and deliberately NOT by
+# re-deriving the CuTe coordinate convention here: the compiled extension
+# exposes pack_sfa()/pack_sfb(), which scatter this flat array using THE SAME
+# tile_atom_to_shape_SF{A,B} layout object the GEMM itself is configured with,
+# so the two cannot disagree by construction. Verified end to end on an RTX
+# 5070: cosine 0.999999 against a reference over the same dequantized operands,
+# at M in {1,16,512,2048}, N=K=4096. The earlier note here said a wrong guess
+# would produce silently WRONG NUMERICS rather than a compile error, so it was
+# not attempted. That reasoning was right; the fix was to stop guessing, not to
+# guess more carefully.
+#
+# build_cutlass_nvfp4_processor() nonetheless still returns None, for a
+# DIFFERENT and now-measured reason: end to end this path is 0.20x-0.40x of
+# bf16, because quantizing the ACTIVATION with pack_nvfp4 below (a PyTorch
+# argmin over the 8-entry E2M1 table, ~8x the memory traffic of a plain read)
+# costs 0.13-3.74 ms against a 0.017-0.164 ms GEMM. The GEMM is 1.6x-6.3x
+# faster and it does not matter. Weights are packed once offline and are not
+# the problem; activations are packed per forward and are. The remaining
+# blocker is a fused CUDA activation quantizer.
+# See tests/bench/bench_cutlass_nvfp4.py and docs/performance-casebook.md.
 #
 # What IS real and tested here: the quantization math itself (block absmax
 # scale, E2M1 4-bit rounding, UE4M3 8-bit scale encoding), which is a well-

@@ -1,0 +1,184 @@
+diff --git a/greenboost_cuda_shim.c b/greenboost_cuda_shim.c
+index b7c3c70..15fc6ad 100644
+--- a/greenboost_cuda_shim.c
++++ b/greenboost_cuda_shim.c
+@@ -4761,7 +4761,10 @@ static int gb_cudart_major_from_handle(void *h)
+     return v / 1000;
+ }
+ 
+-static void gb_cudart_resolve_syms(void *libcudart)
++/* Build marker: `greenboost doctor` greps the installed shim for this literal to prove the rebind-force patch is in the binary. */
++static const char gb_marker_cudart_rebind_force[] __attribute__((used)) = "GB-MARKER cudart-rebind-force=1";
++
++static void gb_cudart_resolve_syms(void *libcudart, int force)
+ {
+     /* FILL-IF-NULL, never overwrite (fix, 2026-07-31): this function's own
+      * comment at its call site says "best-effort fallback only; the first
+@@ -4781,98 +4784,98 @@ static void gb_cudart_resolve_syms(void *libcudart)
+      * fallback — reproduced live as cudaFuncGetAttributes (unhooked, always
+      * resolves straight to the app's real cudart) failing "invalid device
+      * function" for a kernel whose registration got redirected into the
+-     * clobbered runtime. Guarding every line with "if (!real_X)" restores
++     * clobbered runtime. Guarding every line with "if (force || !real_X)" restores
+      * this function to what its own comment already claimed it was: a
+      * fill-the-gaps fallback, never a reset. */
+-    if (!real_cudaMalloc)           real_cudaMalloc           = (pfn_cudaMalloc)           gb_cudart_sym(libcudart, "cudaMalloc");
+-    if (!real_cudaFree)             real_cudaFree             = (pfn_cudaFree)             gb_cudart_sym(libcudart, "cudaFree");
+-    if (!real_cudaMallocManaged)    real_cudaMallocManaged    = (pfn_cudaMallocManaged)    gb_cudart_sym(libcudart, "cudaMallocManaged");
+-    if (!real_cudaMallocAsync)      real_cudaMallocAsync      = (pfn_cudaMallocAsync)      gb_cudart_sym(libcudart, "cudaMallocAsync");
+-    if (!real_cudaGetDeviceCount)   real_cudaGetDeviceCount   = (pfn_cudaGetDeviceCount)   gb_cudart_sym(libcudart, "cudaGetDeviceCount");
+-    if (!real_cudaSetDevice)        real_cudaSetDevice        = (pfn_cudaSetDevice)        gb_cudart_sym(libcudart, "cudaSetDevice");
+-    if (!real_cudaDeviceCanAccessPeer)
++    if (force || !real_cudaMalloc)           real_cudaMalloc           = (pfn_cudaMalloc)           gb_cudart_sym(libcudart, "cudaMalloc");
++    if (force || !real_cudaFree)             real_cudaFree             = (pfn_cudaFree)             gb_cudart_sym(libcudart, "cudaFree");
++    if (force || !real_cudaMallocManaged)    real_cudaMallocManaged    = (pfn_cudaMallocManaged)    gb_cudart_sym(libcudart, "cudaMallocManaged");
++    if (force || !real_cudaMallocAsync)      real_cudaMallocAsync      = (pfn_cudaMallocAsync)      gb_cudart_sym(libcudart, "cudaMallocAsync");
++    if (force || !real_cudaGetDeviceCount)   real_cudaGetDeviceCount   = (pfn_cudaGetDeviceCount)   gb_cudart_sym(libcudart, "cudaGetDeviceCount");
++    if (force || !real_cudaSetDevice)        real_cudaSetDevice        = (pfn_cudaSetDevice)        gb_cudart_sym(libcudart, "cudaSetDevice");
++    if (force || !real_cudaDeviceCanAccessPeer)
+         real_cudaDeviceCanAccessPeer    = (pfn_cudaDeviceCanAccessPeer)
+             gb_cudart_sym(libcudart, "cudaDeviceCanAccessPeer");
+-    if (!real_cudaDeviceEnablePeerAccess)
++    if (force || !real_cudaDeviceEnablePeerAccess)
+         real_cudaDeviceEnablePeerAccess = (pfn_cudaDeviceEnablePeerAccess)
+             gb_cudart_sym(libcudart, "cudaDeviceEnablePeerAccess");
+-    if (!real_cudaPointerGetAttributes)
++    if (force || !real_cudaPointerGetAttributes)
+         real_cudaPointerGetAttributes   = (pfn_cudaPointerGetAttributes)
+             gb_cudart_sym(libcudart, "cudaPointerGetAttributes");
+-    if (!real_cudaMemcpy)
++    if (force || !real_cudaMemcpy)
+         real_cudaMemcpy           = (cudaError_t (*)(void *, const void *, size_t, int))
+             gb_cudart_sym(libcudart, "cudaMemcpy");
+-    if (!real_cudaMemset)
++    if (force || !real_cudaMemset)
+         real_cudaMemset           = (cudaError_t (*)(void *, int, size_t))
+             gb_cudart_sym(libcudart, "cudaMemset");
+-    if (!real_cudaMemsetAsync)
++    if (force || !real_cudaMemsetAsync)
+         real_cudaMemsetAsync      = (cudaError_t (*)(void *, int, size_t, cudaStream_t))
+             gb_cudart_sym(libcudart, "cudaMemsetAsync");
+-    if (!real_cudaMemcpy2DAsync)
++    if (force || !real_cudaMemcpy2DAsync)
+         real_cudaMemcpy2DAsync    = (cudaError_t (*)(void *, size_t, const void *, size_t,
+                                                      size_t, size_t, int, cudaStream_t))
+             gb_cudart_sym(libcudart, "cudaMemcpy2DAsync");
+-    if (!real_cudaLaunchKernelExC)
++    if (force || !real_cudaLaunchKernelExC)
+         real_cudaLaunchKernelExC  = (pfn_cudaLaunchKernelExC)
+             gb_cudart_sym(libcudart, "cudaLaunchKernelExC");
+-    if (!real_cudaGetKernel)
++    if (force || !real_cudaGetKernel)
+         real_cudaGetKernel        = (cudaError_t (*)(void **, const void *))
+             gb_cudart_sym(libcudart, "cudaGetKernel");
+-    if (!real_cudaMemcpyAsync)
++    if (force || !real_cudaMemcpyAsync)
+         real_cudaMemcpyAsync      = (cudaError_t (*)(void *, const void *, size_t, int, void *))
+             gb_cudart_sym(libcudart, "cudaMemcpyAsync");
+-    if (!real_cudaMemcpyPeer)
++    if (force || !real_cudaMemcpyPeer)
+         real_cudaMemcpyPeer       = (cudaError_t (*)(void *, int, const void *, int, size_t))
+             gb_cudart_sym(libcudart, "cudaMemcpyPeer");
+-    if (!real_cudaMemcpyPeerAsync)
++    if (force || !real_cudaMemcpyPeerAsync)
+         real_cudaMemcpyPeerAsync  = (cudaError_t (*)(void *, int, const void *, int, size_t, void *))
+             gb_cudart_sym(libcudart, "cudaMemcpyPeerAsync");
+-    if (!real_cudaImportExternalMemory)
++    if (force || !real_cudaImportExternalMemory)
+         real_cudaImportExternalMemory        = (pfn_cudaImportExternalMemory)
+             gb_cudart_sym(libcudart, "cudaImportExternalMemory");
+-    if (!real_cudaExternalMemoryGetMappedBuffer)
++    if (force || !real_cudaExternalMemoryGetMappedBuffer)
+         real_cudaExternalMemoryGetMappedBuffer = (pfn_cudaExternalMemoryGetMappedBuffer)
+             gb_cudart_sym(libcudart, "cudaExternalMemoryGetMappedBuffer");
+-    if (!real_cudaDestroyExternalMemory)
++    if (force || !real_cudaDestroyExternalMemory)
+         real_cudaDestroyExternalMemory       = (pfn_cudaDestroyExternalMemory)
+             gb_cudart_sym(libcudart, "cudaDestroyExternalMemory");
+-    if (!real_cudaGetLastError)
++    if (force || !real_cudaGetLastError)
+         real_cudaGetLastError                = (pfn_cudaGetLastError)
+             gb_cudart_sym(libcudart, "cudaGetLastError");
+-    if (!real_cudaDeviceSynchronize)
++    if (force || !real_cudaDeviceSynchronize)
+         real_cudaDeviceSynchronize           = (pfn_cudaDeviceSynchronize)
+             gb_cudart_sym(libcudart, "cudaDeviceSynchronize");
+-    if (!real_cudaMemGetInfo)
++    if (force || !real_cudaMemGetInfo)
+         real_cudaMemGetInfo                  = (pfn_cudaMemGetInfo)
+             gb_cudart_sym(libcudart, "cudaMemGetInfo");
+-    if (!real_cudaMemPrefetchAsync)
++    if (force || !real_cudaMemPrefetchAsync)
+         real_cudaMemPrefetchAsync            = (pfn_cudaMemPrefetchAsync)
+             gb_cudart_sym(libcudart, "cudaMemPrefetchAsync");
+-    if (!real_cudaGetDeviceProperties)
++    if (force || !real_cudaGetDeviceProperties)
+         real_cudaGetDeviceProperties         = (pfn_cudaGetDeviceProperties)
+             gb_cudart_sym(libcudart, "cudaGetDeviceProperties_v2");
+-    if (!real_cudaGetDeviceProperties)
++    if (force || !real_cudaGetDeviceProperties)
+         real_cudaGetDeviceProperties     = (pfn_cudaGetDeviceProperties)
+             gb_cudart_sym(libcudart, "cudaGetDeviceProperties");
+-    if (!real_cudaGetDriverEntryPointByVersion)
++    if (force || !real_cudaGetDriverEntryPointByVersion)
+         real_cudaGetDriverEntryPointByVersion = (pfn_cudaGetDriverEntryPointByVersion)
+             gb_cudart_sym(libcudart, "cudaGetDriverEntryPointByVersion");
+-    if (!real_cudaLaunchKernel)      real_cudaLaunchKernel      = (pfn_cudaLaunchKernel)      gb_cudart_sym(libcudart, "cudaLaunchKernel");
+-    if (!real_cudaStreamSynchronize) real_cudaStreamSynchronize = (pfn_cudaStreamSynchronize) gb_cudart_sym(libcudart, "cudaStreamSynchronize");
+-    if (!real_cudaStreamIsCapturing)  real_cudaStreamIsCapturing  = (pfn_cudaStreamIsCapturing)  gb_cudart_sym(libcudart, "cudaStreamIsCapturing");
+-    if (!real_cudaStreamBeginCapture) real_cudaStreamBeginCapture = (pfn_cudaStreamBeginCapture) gb_cudart_sym(libcudart, "cudaStreamBeginCapture");
++    if (force || !real_cudaLaunchKernel)      real_cudaLaunchKernel      = (pfn_cudaLaunchKernel)      gb_cudart_sym(libcudart, "cudaLaunchKernel");
++    if (force || !real_cudaStreamSynchronize) real_cudaStreamSynchronize = (pfn_cudaStreamSynchronize) gb_cudart_sym(libcudart, "cudaStreamSynchronize");
++    if (force || !real_cudaStreamIsCapturing)  real_cudaStreamIsCapturing  = (pfn_cudaStreamIsCapturing)  gb_cudart_sym(libcudart, "cudaStreamIsCapturing");
++    if (force || !real_cudaStreamBeginCapture) real_cudaStreamBeginCapture = (pfn_cudaStreamBeginCapture) gb_cudart_sym(libcudart, "cudaStreamBeginCapture");
+     /* CUDA doc: cudaStreamCreateWithPriority - resolve for stream priority
+      * elevation hook; optional (silently skipped if unavailable). */
+-    if (!real_cudaStreamCreateWithPriority)
++    if (force || !real_cudaStreamCreateWithPriority)
+         real_cudaStreamCreateWithPriority = (pfn_cudaStreamCreateWithPriority)
+             gb_cudart_sym(libcudart, "cudaStreamCreateWithPriority");
+-    if (!real_cudaDeviceGetAttribute)
++    if (force || !real_cudaDeviceGetAttribute)
+         real_cudaDeviceGetAttribute = (pfn_cudaDeviceGetAttribute)
+             gb_cudart_sym(libcudart, "cudaDeviceGetAttribute");
+-    if (!real_cudaDeviceGetStreamPriorityRange)
++    if (force || !real_cudaDeviceGetStreamPriorityRange)
+         real_cudaDeviceGetStreamPriorityRange = (pfn_cudaDeviceGetStreamPriorityRange)
+             gb_cudart_sym(libcudart, "cudaDeviceGetStreamPriorityRange");
+-    if (!real___cudaRegisterFunction)
++    if (force || !real___cudaRegisterFunction)
+         real___cudaRegisterFunction = (pfn___cudaRegisterFunction)
+             gb_cudart_sym(libcudart, "__cudaRegisterFunction");
+ }
+@@ -4961,7 +4964,12 @@ static void gb_cudart_rebind(void)
+                         "CUDA 13.0). Rebinding onto the app's own libcudart "
+                         "instead of the mismatched override.\n",
+                         g_cudart_override_major, app_major, found);
+-                    gb_cudart_resolve_syms(h);
++                    /* force=1: the override's pointers are already filled, and
++                     * the fill-if-null resolve would keep every one of them,
++                     * so this "rebind" used to change nothing (cudaGet-
++                     * DeviceProperties kept returning the cu13 struct layout:
++                     * multiProcessorCount read as 0, fp16 convs gave NaN). */
++                    gb_cudart_resolve_syms(h, 1);
+                     atomic_store_explicit(&g_cudart_is_app, 1, memory_order_release);
+                     gb_log("cudart rebind (override mismatch cu%d vs cu%d) -> %s",
+                            g_cudart_override_major, app_major, found);
+@@ -4970,7 +4978,7 @@ static void gb_cudart_rebind(void)
+                  * override's already-resolved pointers, unchanged from the
+                  * pre-hardening behaviour. */
+             } else {
+-                gb_cudart_resolve_syms(h);
++                gb_cudart_resolve_syms(h, 1);
+                 atomic_store_explicit(&g_cudart_is_app, 1, memory_order_release);
+                 gb_log("cudart rebind -> %s (init fallback was %s)",
+                        found, g_cudart_init_path[0] ? g_cudart_init_path : "none");
+@@ -5769,7 +5777,7 @@ static void gb_shim_init(void)
+      * __cudaRegisterFunction call for this model's kernels preceded this
+      * constructor's own completion, in the SAME process. */
+     if (libcudart && !atomic_load_explicit(&g_cudart_is_app, memory_order_acquire))
+-        gb_cudart_resolve_syms(libcudart);
++        gb_cudart_resolve_syms(libcudart, 0);
+     /* Fallback: some CUDA versions export runtime wrappers from libcuda.so.1 */
+     if (!real_cudaMalloc)        real_cudaMalloc        = (pfn_cudaMalloc)        dlsym(libcuda, "cudaMalloc");
+     if (!real_cudaFree)          real_cudaFree          = (pfn_cudaFree)           dlsym(libcuda, "cudaFree");

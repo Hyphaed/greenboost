@@ -29,7 +29,7 @@ AUDIT32 := libgreenboost_audit32.so
 VMM_OVERRIDE := libgreenboost_vmm_override.so
 MODULE  := greenboost.ko
 NETD    := greenboost-netd
-GB_VERSION := 3.4
+GB_VERSION := 3.5
 
 PHYS_GB    ?= 0
 VIRT_GB    ?= 0
@@ -318,12 +318,76 @@ netd-capture: greenboost_netd_capture.c
 	@echo "[GreenBoost] Built libgreenboost_netd_capture.so"
 
 # Stage-A2 opt-in: sm_120a NVFP4 GEMM CUTLASS torch extension. NOT part of `all`
-# or `install` (speculative, GPU-bench-gated). CUTLASS is header-only; point
-# GB_CUTLASS_PATH at the checkout (default: vendored under ~/Dev/greenboost_all).
+# or `install` (speculative, GPU-bench-gated). CUTLASS is header-only.
+#
+# GB_CUTLASS_PATH default: prefer the nvidia-sources checkout, which is where
+# CUTLASS actually is on this box; keep vendor/cutlass as the fallback the
+# original default assumed. A default that names a directory nobody has makes
+# the documented rebuild command fail on first use.
+#
+# nvcc: the `nvcc` on PATH here is 12.4, which cannot target sm_120 at all
+# ("Value 'sm_120a' is not defined"), so the build fails on the very box this
+# extension exists for. Same trap `pathbench` below already records, and it was
+# hit again 2026-08-22 on the first build this extension ever had. Prefer the
+# CUDA 13 toolkit when present; override with CUDA_HOME=... as before.
+GB_CUTLASS_CUDA_HOME ?= $(shell test -x /usr/local/cuda/bin/nvcc && echo /usr/local/cuda \
+                          || (ls -d /usr/local/cuda-1[3-9]* 2>/dev/null | sort -V | tail -1))
+# Resolved from THIS Makefile's location, never from $$HOME. The installer runs
+# the restore as `sudo -u <user>`, which keeps HOME=/root unless -H is passed,
+# so a $$HOME-relative default silently pointed at /root/Dev/... and the rebuild
+# failed on exactly the path it was added to fix. Found 2026-08-22, on the first
+# reinstall after the fix shipped.
+GB_REPO_ROOT := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+GB_CUTLASS_PATH_DEFAULT = $(shell \
+    for d in $(GB_REPO_ROOT)/../nvidia-sources/cutlass $(GB_REPO_ROOT)/../vendor/cutlass; do \
+        test -d "$$d/include" && echo "$$d" && exit 0; done; \
+    echo $(GB_REPO_ROOT)/../vendor/cutlass)
+#: The interpreter that HAS torch, which is not necessarily `python3`. The
+#: installer runs this restore as `sudo -H -u <user>`, whose PATH resolves
+#: python3 to /usr/bin/python3 , no torch , so the rebuild died with
+#: "ModuleNotFoundError: No module named 'torch'" while an interactive `make
+#: gb_cutlass` in a shell with miniforge on PATH succeeded. Second failure of
+#: this same restore for a second environment reason; both were invisible until
+#: the log was made readable. Probe rather than assume, and fall back to
+#: python3 so the error message is the honest one if nothing has torch.
+GB_PYTHON ?= $(shell for p in python3 \
+                        $$HOME/.miniforge3/bin/python3 \
+                        /usr/local/lib/greenboost/cli-venv/bin/python3; do \
+                       command -v "$$p" >/dev/null 2>&1 || continue; \
+                       "$$p" -c "import torch" >/dev/null 2>&1 && echo "$$p" && exit 0; \
+                     done; echo python3)
+
+#: Written by `clean` when it removes a built extension, read by
+#: `gb_cutlass-restore`. This is how a reinstall stops silently un-building it.
+GB_CUTLASS_STAMP = third_party/gb_cutlass/.was_built
+
 gb_cutlass:
-	GB_CUTLASS_PATH="$${GB_CUTLASS_PATH:-$$HOME/Dev/greenboost_all/vendor/cutlass}" \
-	    python3 third_party/gb_cutlass/setup.py build_ext --inplace
+	CUDA_HOME="$${CUDA_HOME:-$(GB_CUTLASS_CUDA_HOME)}" \
+	PATH="$${CUDA_HOME:-$(GB_CUTLASS_CUDA_HOME)}/bin:$$PATH" \
+	GB_CUTLASS_PATH="$${GB_CUTLASS_PATH:-$(GB_CUTLASS_PATH_DEFAULT)}" \
+	    $(GB_PYTHON) third_party/gb_cutlass/setup.py build_ext --inplace
+	@touch $(GB_CUTLASS_STAMP)
 	@echo "[GreenBoost] Built gb_cutlass extension (enable at runtime with GB_CUTLASS_ENABLE=1 after bench)"
+
+# Rebuild the extension ONLY on a box that had already built it. Called by
+# greenboost_setup.sh after `make clean all`, because `clean` removes the .so
+# and `all` deliberately does not put it back -- so every reinstall silently
+# un-built it, `gb_cutlass.available()` went False, and every NVFP4 layer fell
+# back to gemlite with no error, no warning and no log line. Confirmed twice on
+# 2026-08-22. Same failure shape as C-04 (a fresh install does not reload the
+# kernel module) and C-05 (a stale initrd silently disables T3): the system
+# keeps working, more slowly, and says nothing.
+#
+# A box that never built it stays untouched -- the opt-in policy is unchanged.
+# Never fails the install: a missing toolchain here must not block a working
+# GreenBoost, it must SAY so.
+gb_cutlass-restore:
+	@if [ -f $(GB_CUTLASS_STAMP) ]; then \
+	    echo "[GreenBoost] gb_cutlass was built before this reinstall , rebuilding"; \
+	    $(MAKE) gb_cutlass || echo "[GreenBoost] WARNING: gb_cutlass rebuild FAILED. NVFP4 layers will fall back to gemlite (slower, no error). Rebuild with: make gb_cutlass"; \
+	else \
+	    echo "[GreenBoost] gb_cutlass not previously built , skipping (opt-in: make gb_cutlass)"; \
+	fi
 
 # Speed Program Phase 0 opt-in: path-bandwidth microbenchmark (bulk H2D/D2H,
 # VRAM d2d, zero-copy SM read, staged-DMA-then-read). NOT part of `all` or
@@ -346,6 +410,7 @@ pathbench: tests/bench/gb_pathbench.cu
 clean: ebpf-clean
 	$(MAKE) -C $(KDIR) M=$(PWD) $(KERNEL_LLVM) clean
 	rm -f $(SHIM) $(AUDIT) $(AUDIT32) $(VMM_OVERRIDE) $(NETD) greenboost_cuda_v12.o
+	@if ls third_party/gb_cutlass/*.so >/dev/null 2>&1; then touch $(GB_CUTLASS_STAMP); fi
 	rm -f third_party/gb_cutlass/*.so third_party/gb_cutlass/_gb_cutlass_C*.so
 	rm -rf third_party/gb_cutlass/build
 	rm -f tests/bench/gb_pathbench

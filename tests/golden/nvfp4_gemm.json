@@ -1,0 +1,83 @@
+{
+ "_provenance": {
+  "case": "the maintainer notes C-16",
+  "measured": "2026-08-22",
+  "box": "RTX 5070 (sm_120), CUDA 13.3, torch 2.13, N=K=4096, desktop session active",
+  "producer": "GB_CUTLASS_ENABLE=1 python3 tests/bench/bench_cutlass_nvfp4.py --json <out>",
+  "method": "median of 3 consecutive runs, 30 timed iterations after 10 warmup each",
+  "tolerance_rationale": [
+   "0.10, derived not guessed. Across the 3 runs the worst observed spread",
+   "(max-min)/median was 3.3%, on fused_speedup_vs_bf16.M2048 - a ratio, so it",
+   "inherits the bf16 baseline's noise. Absolute timings held to <=0.3%.",
+   "10% is ~3x the worst spread: loose enough that a busy desktop does not cry",
+   "wolf, tight enough that the +21.7% outlier seen once on gemm_ms.M2048",
+   "(0.164 -> 0.1996, immediately after a GreenBoost reinstall and extension",
+   "rebuild) is still caught. An earlier draft of this file picked 10% at the",
+   "keyboard and called it loose because timings are noisy; the measurement",
+   "says they are not, and the number happens to be right for a reason that",
+   "was not the stated one."
+  ],
+  "why": [
+   "C-16 decided that build_cutlass_nvfp4_processor stays None on the strength",
+   "of these numbers. A decision resting on a measurement should fail loudly",
+   "when the measurement moves, and prose in a casebook cannot do that.",
+   "Cosine values are deterministic (0.0% spread across runs): a real drop in",
+   "cos_vs_dequant is a correctness claim about the CUTLASS scale-factor",
+   "layout, not a busy box."
+  ]
+ },
+ "direction": {
+  "cos_vs_bf16.M1": "higher_is_better",
+  "cos_vs_bf16.M16": "higher_is_better",
+  "cos_vs_bf16.M2048": "higher_is_better",
+  "cos_vs_bf16.M512": "higher_is_better",
+  "cos_vs_dequant.M1": "higher_is_better",
+  "cos_vs_dequant.M16": "higher_is_better",
+  "cos_vs_dequant.M2048": "higher_is_better",
+  "cos_vs_dequant.M512": "higher_is_better",
+  "fused_e2e_ms.M1": "lower_is_better",
+  "fused_e2e_ms.M16": "lower_is_better",
+  "fused_e2e_ms.M2048": "lower_is_better",
+  "fused_e2e_ms.M512": "lower_is_better",
+  "fused_speedup_vs_bf16.M1": "higher_is_better",
+  "fused_speedup_vs_bf16.M16": "higher_is_better",
+  "fused_speedup_vs_bf16.M2048": "higher_is_better",
+  "fused_speedup_vs_bf16.M512": "higher_is_better",
+  "gemm_ms.M1": "lower_is_better",
+  "gemm_ms.M16": "lower_is_better",
+  "gemm_ms.M2048": "lower_is_better",
+  "gemm_ms.M512": "lower_is_better"
+ },
+ "metrics": {
+  "cos_vs_bf16": {
+   "M1": 0.990507,
+   "M16": 0.990979,
+   "M2048": 0.990964,
+   "M512": 0.990959
+  },
+  "cos_vs_dequant": {
+   "M1": 0.999999,
+   "M16": 0.999999,
+   "M2048": 0.999999,
+   "M512": 0.999999
+  },
+  "fused_e2e_ms": {
+   "M1": 0.023,
+   "M16": 0.0227,
+   "M2048": 0.2394,
+   "M512": 0.0686
+  },
+  "fused_speedup_vs_bf16": {
+   "M1": 1.017,
+   "M16": 1.204,
+   "M2048": 4.344,
+   "M512": 3.893
+  },
+  "gemm_ms": {
+   "M1": 0.0171,
+   "M16": 0.0168,
+   "M2048": 0.164,
+   "M512": 0.0463
+  }
+ }
+}

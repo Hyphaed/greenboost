@@ -22,6 +22,7 @@ the model SEES, never what it can call).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 from greenboost_cli.instruments.schemas import INSTRUMENT_DEFINITIONS
@@ -51,11 +52,32 @@ class ToolPolicy:
     workspace_roots: "tuple[Path, ...]" = ()
 
     def permits_tool(self, name: str) -> bool:
-        if name in self.deny:
+        if _listed(name, self.deny):
             return False
         if self.allow is None:
             return True
-        return name in self.allow
+        return _listed(name, self.allow)
+
+    def narrowed(self, child: "ToolPolicy") -> "ToolPolicy":
+        """The policy a delegated subagent gets: never wider than this one.
+        `child` is what the delegation asked for (PERMISSIVE when it asked for
+        nothing). Allow-lists intersect, deny-lists and workspace roots union
+        into the stricter side, so a restricted worker can't launder a
+        permissive subagent through Delegate."""
+        if self.allow is None:
+            allow = child.allow
+        elif child.allow is None:
+            allow = self.allow
+        else:
+            allow = frozenset(
+                n for n in child.allow if _listed(n, self.allow)
+            ) | frozenset(n for n in self.allow if _listed(n, child.allow))
+        roots = self.workspace_roots or child.workspace_roots
+        if self.workspace_roots and child.workspace_roots:
+            roots = tuple(r for r in child.workspace_roots
+                          if any(r == p or p in r.parents for p in self.workspace_roots)) \
+                or self.workspace_roots
+        return ToolPolicy(allow=allow, deny=self.deny | child.deny, workspace_roots=roots)
 
     def permits_path(self, file_path: str) -> bool:
         """True if `file_path` resolves inside one of `workspace_roots`
@@ -71,6 +93,15 @@ class ToolPolicy:
             if resolved == root or root in resolved.parents:
                 return True
         return False
+
+
+def _listed(name: str, names) -> bool:
+    """Exact match, or an fnmatch pattern such as `mcp__github__*`. Patterns
+    exist so a restricted policy can name a whole MCP server without listing
+    every tool it exposes today and tomorrow."""
+    if name in names:
+        return True
+    return any("*" in n and fnmatchcase(name, n) for n in names)
 
 
 # What every ordinary REPL session and any un-opted-in caller gets: no
@@ -101,7 +132,8 @@ def build_policy(
 
     allow: "frozenset[str] | None" = None
     if tools is not None:
-        unknown = sorted(set(tools) - ALL_INSTRUMENT_NAMES)
+        unknown = sorted(n for n in set(tools) - ALL_INSTRUMENT_NAMES
+                         if not n.startswith("mcp__"))     # MCP tools aren't built-in instruments
         if unknown:
             raise ValueError(
                 f"unknown instrument name(s) in tool policy allow list: {unknown!r}; "
@@ -110,7 +142,8 @@ def build_policy(
         allow = frozenset(tools)
 
     deny_set = frozenset(deny or ())
-    unknown_deny = sorted(deny_set - ALL_INSTRUMENT_NAMES)
+    unknown_deny = sorted(n for n in deny_set - ALL_INSTRUMENT_NAMES
+                          if not n.startswith("mcp__"))
     if unknown_deny:
         raise ValueError(
             f"unknown instrument name(s) in tool policy deny list: {unknown_deny!r}; "

@@ -19,7 +19,7 @@
 set -uo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GB_VERSION="3.4"
+GB_VERSION="3.5"
 DRIVER_NAME="greenboost"
 
 C_LIME='\033[0;32m'; C_RED='\033[0;31m'; C_AMBER='\033[1;33m'; C_CYAN='\033[0;36m'; C_RESET='\033[0m'
@@ -59,7 +59,8 @@ done
 
 step "[3/5] Boot-time autoload (modules-load.d)"
 if [[ ! -f /etc/modules-load.d/greenboost.conf ]]; then
-    echo "$DRIVER_NAME" > /etc/modules-load.d/greenboost.conf
+    printf '%s\n' "$DRIVER_NAME" > /etc/modules-load.d/greenboost.conf.new \
+        && mv -f /etc/modules-load.d/greenboost.conf.new /etc/modules-load.d/greenboost.conf
     ok "Created /etc/modules-load.d/greenboost.conf"
 else
     ok "/etc/modules-load.d/greenboost.conf already present"
@@ -69,6 +70,9 @@ step "[4/5] Installing boot-time self-heal guard"
 if [[ -f "$SRC_DIR/greenboost_boot_guard.sh" && -f "$SRC_DIR/greenboost-boot-guard.service" ]]; then
     install -m 755 "$SRC_DIR/greenboost_boot_guard.sh" /usr/local/sbin/greenboost_boot_guard.sh
     install -m 644 "$SRC_DIR/greenboost-boot-guard.service" /etc/systemd/system/greenboost-boot-guard.service
+    # Same two adjustments greenboost_setup.sh makes after copying the unit; without
+    # them this script and a Full Install leave different units on disk (INS-12).
+    sed -i 's/^TimeoutStartSec=60$/TimeoutStartSec=300/' /etc/systemd/system/greenboost-boot-guard.service
     systemctl daemon-reload
     systemctl enable greenboost-boot-guard.service &>/dev/null \
         && ok "greenboost-boot-guard.service installed + enabled" \
@@ -79,7 +83,7 @@ fi
 
 step "[5/5] Loading the module now (this boot)"
 depmod -a "$(uname -r)" 2>/dev/null || true
-if lsmod | grep -q '^greenboost\b'; then
+if grep -q '^greenboost ' <<< "$(lsmod)"; then   # not `lsmod | grep -q`: SIGPIPE under pipefail
     ok "greenboost already loaded for $(uname -r)"
 elif modprobe "$DRIVER_NAME" 2>&1 | sed 's/^/    /'; then
     ok "greenboost loaded for $(uname -r)"

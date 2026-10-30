@@ -144,6 +144,13 @@ _GPU_POWER_STEP_W    = 15     # Loop P: power-limit step per thermal/throttle ev
 _GPU_POWER_FLOOR_FRAC = 0.5   # never step power limit below 50% of TDP
 
 _ORCH_STATE_FILE = Path("/run/greenboost/orch_state.json")
+# Loop O releases the performance envelope after this many seconds without GPU
+# load or a live perf phase (SVC-04); 0 disables the timer. Env-overridable.
+_ENVELOPE_IDLE_S     = float(os.environ.get("GB_ORCH_ENVELOPE_IDLE_S", "300") or "0")
+_ENVELOPE_BUSY_UTIL_PCT = 5.0
+# A supervisor-written state file younger than this is not overwritten by a
+# process-mode orchestrator (SVC-05).
+_STATE_FRESH_S       = 60.0
 
 
 class GpuHealth:
@@ -278,6 +285,8 @@ class ReactiveOrchestrator:
         self._ws_reserve_mb = 0       # current workstation_reserve target
         self._last_metrics: "Optional[GpuMetrics]" = None
         self._health_fsm = GpuHealth()  # DI-6: composite admission-gate state
+        self._envelope_engaged = False   # Loop O applied and not yet restored
+        self._envelope_busy_ts = 0.0     # monotonic time of the last sign of load
 
         # DI-6: opt-in continuous PID scaling of Loop I's mild-throttle KV
         # step (see _do_kv_grow). None (default) preserves the exact pre-DI-6
@@ -461,6 +470,7 @@ class ReactiveOrchestrator:
         Feeds all Signals from the GpuMetrics snapshot.
         """
         self._last_metrics = m
+        self._refresh_state_file()
 
         # Loop I: SM clock throttle , authoritative NVML bitmask gate first
         # (ground truth, immune to idle-clock noise), ratchet _sm_clock_max
@@ -485,6 +495,7 @@ class ReactiveOrchestrator:
         # Loop J: feed shim_phase into _phase_sig , pairwise() subscriber handles
         # INFERENCE→IDLE transition detection (rxRust pairwise operator pattern).
         self._phase_sig.set(m.shim_phase)
+        self._maybe_release_envelope(m)
 
         # Learn total VRAM once; derive workstation governor thresholds
         if m.fb_total_mb > 0 and self._total_vram_mb == 0:
@@ -871,6 +882,9 @@ class ReactiveOrchestrator:
             "[gb_orchestrator] Loop E: VRAM pressure cleared (%.1f%% < %.0f%%)",
             value, _VRAM_DEMOTE_EXIT,
         )
+        # The state file was only rewritten on a decision, so after the
+        # pressure cleared it kept saying vram_pressure=true (seen with 78% free).
+        self._write_state_file()
 
     # ── Loop F , DCGM health proactive eviction ───────────────────────────────
 
@@ -1239,6 +1253,8 @@ class ReactiveOrchestrator:
                 self._ctrl.set_gpu_power_limit(
                     int(self._last_metrics.power_limit_w), reason=f"phase={curr_phase}",
                 )
+            self._envelope_engaged = True
+            self._envelope_busy_ts = time.monotonic()
             decision["action"] = "performance_envelope_engaged"
             log.info(
                 "[gb_orchestrator] Loop O: phase=%s , performance envelope engaged "
@@ -1247,6 +1263,7 @@ class ReactiveOrchestrator:
             )
         elif curr_phase in ("IDLE", "DEEP_IDLE"):
             restored = self._ctrl.restore_baseline()
+            self._envelope_engaged = False
             decision["action"] = "performance_envelope_restored"
             decision["restored"] = restored
             log.info(
@@ -1256,6 +1273,21 @@ class ReactiveOrchestrator:
         else:
             return
         self._record_decision(decision)
+
+    def _maybe_release_envelope(self, m: "GpuMetrics") -> None:
+        """Loop O timer: restore the baseline once the envelope has seen no
+        load for _ENVELOPE_IDLE_S. The restore otherwise waits for an
+        IDLE/DEEP_IDLE phase write, which never comes when the writer exits or
+        sits in INIT; measured 2026-10-10: governor=performance, clocks locked
+        and power limit raised for hours with the card idle."""
+        if not self._envelope_engaged or _ENVELOPE_IDLE_S <= 0:
+            return
+        now = time.monotonic()
+        if m.gpu_util_pct >= _ENVELOPE_BUSY_UTIL_PCT or m.shim_phase in _PERF_PHASES:
+            self._envelope_busy_ts = now
+            return
+        if now - self._envelope_busy_ts >= _ENVELOPE_IDLE_S:
+            self._apply_performance_envelope("IDLE")
 
     # ── Loop P , thermal/throttle GPU power cap ───────────────────────────────
 
@@ -1494,14 +1526,50 @@ class ReactiveOrchestrator:
         except Exception:
             pass
 
+    def _refresh_state_file(self, min_interval_s: float = 5.0) -> None:
+        """Keep orch_state.json current between decisions (flags that cleared
+        used to stay stale until the next decision)."""
+        now = time.time()
+        if now - getattr(self, "_state_written_ts", 0.0) >= min_interval_s:
+            self._write_state_file()
+
     def _write_state_file(self) -> None:
+        self._state_written_ts = time.time()
+        if self._mode != "supervisor" and self._supervisor_state_fresh():
+            return
         state = self.dump()
+        state["updated_ts"] = self._state_written_ts
+        # mkstemp: random name, O_EXCL, never follows a planted symlink. The
+        # directory is writable by group ollama and this process is root, so a
+        # predictable temp name would let a group member make root overwrite
+        # any file (SVC-05). Then an atomic replace.
+        tmp = None
         try:
-            tmp = _ORCH_STATE_FILE.with_suffix(".tmp")
-            tmp.write_text(json.dumps(state, indent=2))
-            tmp.rename(_ORCH_STATE_FILE)
+            import tempfile
+            fd, tmp = tempfile.mkstemp(dir=str(_ORCH_STATE_FILE.parent),
+                                       prefix=_ORCH_STATE_FILE.name + ".", suffix=".tmp")
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(state, indent=2))
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, _ORCH_STATE_FILE)
         except Exception:
-            pass
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _supervisor_state_fresh() -> bool:
+        """True when orch_state.json was written by a live supervisor within
+        _STATE_FRESH_S. The directory is group-writable, so an inference
+        process can replace the file; its view of the card is not the daemon's."""
+        try:
+            d = json.loads(_ORCH_STATE_FILE.read_text())
+            return (d.get("mode") == "supervisor"
+                    and time.time() - float(d.get("updated_ts", 0)) < _STATE_FRESH_S)
+        except Exception:
+            return False
 
     # ── dump / observability ─────────────────────────────────────────────────
 

@@ -127,6 +127,26 @@ def _log_path() -> Path:
     return Path(os.environ.get("GREENBOOST_DATAFLUX_LOG", _DEFAULT_LOG_PATH))
 
 
+def _log_mode() -> int:
+    """Mode of newly created log and archive files: 0600 unless GB_DATAFLUX_LOG_MODE (octal, group/world write refused)."""
+    try:
+        m = int(os.environ.get("GB_DATAFLUX_LOG_MODE", "600"), 8) & 0o644
+    except ValueError:
+        m = 0o600
+    return m or 0o600
+
+
+def _open_private(path, flags: int) -> int:
+    """os.open(O_NOFOLLOW) with the log mode applied to a file this call created (a unit UMask must not narrow it)."""
+    fd = os.open(path, flags | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, _log_mode())
+    try:
+        if os.fstat(fd).st_size == 0:
+            os.fchmod(fd, _log_mode())
+    except OSError:
+        pass
+    return fd
+
+
 def _archive_path(log_path: Path) -> Path:
     # .gz: the archive is gzip-compressed (see _rotate_log()) — JSONL
     # telemetry (repeated keys, mostly-numeric snapshot fields) commonly
@@ -548,6 +568,87 @@ def start_snapshot_recorder(telemetry_manager=None, interval_s: float = 5.0):
     return recorders[0] if len(recorders) == 1 else recorders
 
 
+# ── spill outcome tracking ────────────────────────────────────────────────────
+# Ported from TensorRT-LLM's KV-cache stats schema (crosswalk P5-01), which
+# counts `iter_host_dropped_blocks/bytes` -- blocks offloaded to the host tier
+# and then dropped WITHOUT ever being onboarded back -- and counts them at the
+# drop site, where the outcome is actually known.
+#
+# GreenBoost had no equivalent, and the difference matters because the loss is
+# INVERTED here. Upstream, an offload that is never onboarded is wasted work.
+# In model tiering, a demotion that never returns is exactly what tiering is
+# FOR: the component finished (a VAE after decode, a text encoder after
+# encode), the VRAM was freed, and nothing had to be moved back. The loss is
+# the ROUND TRIP -- a demote and a promote paid for memory that was still live.
+#
+# Why this lives at the emit site rather than being inferred later: after the
+# fact, "demoted and still resident in T2" and "demoted and then evicted"
+# look identical -- both are simply "no promotion followed". Only the mover
+# knows which happened, and only at the moment it happens. Recording the
+# outcome here is what makes the difference recoverable at all.
+#
+# Best-effort and never raises: observation must not break a tier move.
+_SPILL_STATE: "dict[tuple, dict]" = {}
+_T1 = "T1_HBM"
+
+
+def spill_outcome(name: str, from_tier: str, to_tier: str, size_gb: float,
+                  now: "float | None" = None, pid: "int | None" = None) -> dict:
+    """Classify one tier move against this component's open spill, if any.
+
+    Returns the fields to attach to the `tier_move` event:
+
+      spill_outcome    "opened"   a T1 demotion; the spill is now outstanding
+                       "returned" promoted back to T1; the spill was undone
+                       "dropped"  pushed further down (T2 -> T3) without ever
+                                  returning to T1 -- upstream's host-dropped case
+                       "" (absent) a move with no bearing on any open spill
+      spill_resident_s how long it sat below T1 before returning or dropping
+      spill_returns    how many times this component has round-tripped
+
+    Keyed by (pid, name): two processes can hold same-named components, and a
+    promotion in one says nothing about a demotion in the other.
+    """
+    try:
+        import os as _os
+        import time as _time
+        ts = _time.time() if now is None else now
+        key = (_os.getpid() if pid is None else pid, name)
+        st = _SPILL_STATE.setdefault(key, {"open": None, "returns": 0})
+
+        if from_tier == _T1 and to_tier != _T1:
+            st["open"] = {"ts": ts, "size_gb": size_gb}
+            return {"spill_outcome": "opened"}
+
+        if to_tier == _T1:
+            op = st.get("open")
+            if not op:
+                return {}
+            st["open"] = None
+            st["returns"] = int(st.get("returns", 0)) + 1
+            return {"spill_outcome": "returned",
+                    "spill_resident_s": round(ts - op["ts"], 3),
+                    "spill_returns": st["returns"]}
+
+        # Below T1 and going further down: the spill will not be undone from
+        # here. This is the direct analogue of upstream counting a drop when
+        # the page leaves the last level it could have been onboarded from.
+        op = st.get("open")
+        if op:
+            st["open"] = None
+            return {"spill_outcome": "dropped",
+                    "spill_resident_s": round(ts - op["ts"], 3),
+                    "spill_returns": int(st.get("returns", 0))}
+    except Exception:  # noqa: BLE001  never let observation break a tier move
+        pass
+    return {}
+
+
+def reset_spill_state() -> None:
+    """Drop all open spill records. For tests; not part of the runtime path."""
+    _SPILL_STATE.clear()
+
+
 def emit(event: dict) -> None:
     """Append one structured event to the dataflux log.
 
@@ -564,7 +665,24 @@ def emit(event: dict) -> None:
     tradeoff gb_cluster.py's feeder-sync dedup already accepts explicitly).
     Rotations append a new gzip member rather than overwrite; older history
     is dropped by the supervisor's periodic compact_archive() call, not here.
+
+    SYNTHETIC EVENTS. When GB_DATAFLUX_SYNTHETIC=1 is set, every event written
+    is tagged `synthetic: true` and governed resolvers exclude it. Benchmarks
+    and A/B harnesses drive the REAL code paths on purpose , that is what makes
+    them worth running , and those paths emit. On 2026-08-22 an A/B script that
+    called the real _compress_context wrote ten compaction events, and
+    `agent_compaction_prefix_kept_pct` then reported "28.7% over 10 of 10
+    compactions" during a live session that had performed ZERO compactions. The
+    number described nothing that had happened, and it took filtering by
+    timestamp and pid to notice. A stream an operator reads must not contain
+    events a test invented. See the maintainer notes C-20.
     """
+    try:
+        import os as _os
+        if _os.environ.get("GB_DATAFLUX_SYNTHETIC") == "1":
+            event = {**event, "synthetic": True}
+    except Exception:
+        pass
     try:
         log_path = _log_path()
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -584,13 +702,13 @@ def emit(event: dict) -> None:
         # readable; tighten to 0600 the first time it's created (not every
         # append — a repeated chmod on the hot write path is unnecessary
         # syscall overhead and would also stomp an operator's own override).
-        _is_new = not log_path.exists()
-        with open(log_path, "a") as f:
-            if _is_new:
-                try:
-                    os.chmod(log_path, 0o600)
-                except OSError:
-                    pass
+        # SEC-11/SEC-02: open with O_NOFOLLOW (a symlink planted at the log name is
+        # refused, never followed, which matters when the writer is root) and give
+        # the file its mode AT CREATION (no window where it is wider). Default 0600;
+        # the root supervisor's log is made readable for the owner with
+        # GB_DATAFLUX_LOG_MODE=0644 (or 0640) in its unit environment.
+        fd = _open_private(log_path, os.O_WRONLY | os.O_APPEND)
+        with os.fdopen(fd, "a") as f:
             f.write(json.dumps(event) + "\n")
             size = f.tell()
         if size > _max_log_bytes(log_path):
@@ -612,7 +730,8 @@ def _rotate_log(log_path: Path) -> None:
     rewrites it as a single fresh member)."""
     archive = _archive_path(log_path)
     try:
-        with open(log_path, "rb") as src, gzip.open(archive, "ab") as dst:
+        afd = _open_private(archive, os.O_WRONLY | os.O_APPEND)
+        with open(log_path, "rb") as src, os.fdopen(afd, "ab") as raw, gzip.GzipFile(fileobj=raw, mode="ab") as dst:
             while True:
                 chunk = src.read(1024 * 1024)
                 if not chunk:
@@ -768,6 +887,53 @@ def _stat_key(p: Path) -> "tuple | None":
         return None
 
 
+_ROOT_LOG_DEFAULT = "/var/lib/greenboost/pub/dataflux-root.jsonl"
+
+
+def _trusted_extra(p: Path) -> bool:
+    """A merged log must be a regular file (not a symlink) owned by root or by this user and not group/world
+    writable, in a directory with the same properties. Anything else is ignored, silently."""
+    import stat as _st
+    ok_uid = (0, os.geteuid())
+    for q, want_dir in ((p, False), (p.parent, True)):
+        try:
+            st = os.lstat(q)
+        except OSError:
+            return False
+        if want_dir:
+            if not _st.S_ISDIR(st.st_mode):
+                return False
+        elif not _st.S_ISREG(st.st_mode):
+            return False
+        if st.st_uid not in ok_uid or st.st_mode & 0o022:
+            return False
+    return True
+
+
+def _merge_logs(own: Path) -> "list[Path]":
+    """Extra READ-ONLY logs merged into every read: GB_DATAFLUX_MERGE_LOGS (colon-separated; empty string
+    disables) else the root supervisor's /var/lib/greenboost/pub/dataflux-root.jsonl. The root process writes
+    it (its unit sets GREENBOOST_DATAFLUX_LOG to that path and GB_DATAFLUX_LOG_MODE=644) and rotates and
+    trims it itself; this reader never creates, writes or deletes anything there."""
+    raw = os.environ.get("GB_DATAFLUX_MERGE_LOGS")
+    if raw is None:      # the default applies only to the default owner log: a custom GREENBOOST_DATAFLUX_LOG (tests, a feeder) merges nothing
+        names = [] if "GREENBOOST_DATAFLUX_LOG" in os.environ else [_ROOT_LOG_DEFAULT]
+    else:
+        names = [x for x in raw.split(":") if x]
+    out = []
+    for n in names:
+        p = Path(n)
+        if p != own and p not in out:
+            out.append(p)
+    return out
+
+
+def _tag_root(evs: "list[dict]") -> "list[dict]":
+    for e in evs:
+        e.setdefault("src", "root")
+    return evs
+
+
 def read_events(since_hours: float | None = None) -> list[dict]:
     """All logged events, optionally filtered to the last `since_hours`.
 
@@ -783,7 +949,14 @@ def read_events(since_hours: float | None = None) -> list[dict]:
 
     archive_key = _stat_key(archive)
     main_key = _stat_key(log_path)
-    memo_key = (str(log_path), archive_key, main_key, since_hours)
+    extras = []                       # (log, archive, keys) of trusted merged logs
+    for xp in _merge_logs(log_path):
+        xa = _archive_path(xp)
+        xk = (_stat_key(xp) if _trusted_extra(xp) else None, _stat_key(xa) if _trusted_extra(xa) else None)
+        if xk != (None, None):
+            extras.append((xp, xa, xk))
+    memo_key = (str(log_path), archive_key, main_key, since_hours,
+                tuple((str(x[0]), x[2]) for x in extras))
     cached = _READ_EVENTS_MEMO.get(memo_key)
     if cached is not None:
         _READ_EVENTS_MEMO.move_to_end(memo_key)
@@ -804,6 +977,21 @@ def read_events(since_hours: float | None = None) -> list[dict]:
             out.extend(_read_jsonl_file(archive, cutoff))
     if main_key is not None:
         out.extend(_read_jsonl_file(log_path, cutoff))
+
+    # Merged root log: read-only, and never older than the retention window, so it can neither slow a query
+    # down nor resurrect history the owner's own trim already dropped (retention rule: GB_DATAFLUX_RETAIN_DAYS).
+    if extras:
+        try:
+            retain = float(os.environ.get("GB_DATAFLUX_RETAIN_DAYS", _DEFAULT_RETAIN_DAYS))
+        except ValueError:
+            retain = _DEFAULT_RETAIN_DAYS
+        xcut = time.time() - retain * 86400
+        xcut = xcut if cutoff is None else max(cutoff, xcut)
+        for xp, xa, (kmain, karch) in extras:
+            if karch is not None and (karch[0] / 1e9) >= xcut:
+                out.extend(_tag_root(_read_jsonl_file(xa, xcut)))
+            if kmain is not None:
+                out.extend(_tag_root(_read_jsonl_file(xp, xcut)))
 
     out.sort(key=lambda e: e.get("ts", 0))
     _READ_EVENTS_MEMO[memo_key] = out
@@ -881,9 +1069,14 @@ def compact_archive(retain_days: "float | None" = None) -> "int | None":
         if dropped == 0:
             return 0
         tmp = archive.with_suffix(archive.suffix + ".compact_tmp")
-        with gzip.open(tmp, "wt") as f:
+        try:
+            tmp.unlink()                      # a stale or planted temp is removed, never followed
+        except OSError:
+            pass
+        tfd = _open_private(tmp, os.O_WRONLY | os.O_EXCL)
+        with os.fdopen(tfd, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb") as gz:
             for _, line in kept:
-                f.write(line + "\n")
+                gz.write((line + "\n").encode())
         os.replace(tmp, archive)
         _READ_EVENTS_MEMO.clear()
         return dropped
@@ -1136,6 +1329,19 @@ def _diagnosis_hints(ev: dict, before: dict | None, after: dict | None,
     err_text = " ".join(str(ev.get(k, "")) for k in
                         ("error", "stage", "label", "kind")).lower()
 
+    # Round-2 tuning kinds (2026-10-30): their warnings carry the fix themselves.
+    if ev.get("kind") == "moe_cache_plan":
+        if ev.get("skip_reason") == "engine_without_flag":
+            hints.append("MoE experts are on the host and the active engine (%s) has no --moe-cache-mib: decode runs at the layer-split speed (about half of the cached speed measured on the "
+                         "5070); fix: sudo greenboost synapse build-moecache-engine && sudo greenboost synapse use-engine moecache" % (ev.get("engine_kind") or "unknown"))
+        elif ev.get("cache_mib") and ev["cache_mib"] < 1024:
+            hints.append("expert cache sized under 1 GB (%s MiB): almost no hot expert stays resident; free VRAM (close GPU apps), lower --ubatch/ctx, or set vision=false, then re-serve" % ev["cache_mib"])
+    elif ev.get("kind") == "engine_runtime_check":
+        hints.append("engine links CUDA runtime %s but nvcc is CUDA %s (cudaDeviceProp layout differs, kernels fail with 'invalid argument'): rebuild with GB_SYNAPSE_NVCC pointing at the "
+                     "matching toolkit, then sudo greenboost synapse build-moecache-engine" % (ev.get("runtime_major"), ev.get("nvcc_major")))
+    elif ev.get("kind") in ("sdpa_backend", "compile_decision") and ev.get("status") == "warn":
+        hints.append("%s was left at the default: %s" % (ev.get("kind"), ev.get("reason")))
+
     if snap:
         t3 = snap.get("t3_used_mb") or 0
         if t3 > 0:
@@ -1224,6 +1430,36 @@ def _diagnosis_hints(ev: dict, before: dict | None, after: dict | None,
         hints.append("no rule matched , compare snapshot_before/after deltas "
                      "(VRAM, t2/t3, phase) manually")
     return hints
+
+
+#: Order governed segments are reported in, worst first. A violation buried
+#: under six diagnoses is a violation the reader does not act on.
+_SEGMENT_SEVERITY_RANK = {"violation": 0, "warning": 1, "diagnosis": 2,
+                          "info": 3, "ok": 9}
+
+
+def compact_critic(rep: dict, max_incidents: int = 8, max_text: int = 400) -> dict:
+    """Readable form of critic_report(): counts by kind and by diagnosis hint, the most recent `max_incidents` incidents
+    without their snapshots, and the top recommendations. The full report of 32 incidents is ~57k characters (the snapshot
+    list alone is ~1,900 lines), which overflowed the MCP client's output limit and made the tool unusable for the one job
+    it exists for. critic_report(...) still returns everything; dataflux_critic(compact=False) hands that out."""
+    from collections import Counter
+    inc = list(rep.get("incidents") or [])
+    ev = lambda i: (i.get("event") or {})  # noqa: E731
+    by_kind = Counter(ev(i).get("kind", "?") for i in inc)
+    by_hint = Counter(str(h)[:160] for i in inc for h in (i.get("diagnosis_hints") or []))
+    recent = [{"ts": ev(i).get("ts"), "kind": ev(i).get("kind"), "node": ev(i).get("node"), "label": ev(i).get("label"),
+               "status": ev(i).get("status"), "hints": [str(h)[:max_text] for h in (i.get("diagnosis_hints") or [])][:3]}
+              for i in inc[-max_incidents:]]
+    return {"window_days": rep.get("window_days"), "events_scanned": rep.get("events_scanned"),
+            "incident_count": rep.get("incident_count"), "total_incidents": rep.get("total_incidents"),
+            "truncated": rep.get("truncated"), "by_kind": dict(by_kind.most_common()),
+            "by_hint": [{"hint": h, "count": n} for h, n in by_hint.most_common(8)],
+            "recent_incidents": recent,
+            "recommendations": [str(r)[:max_text] for r in (rep.get("recommendations") or [])][:8],
+            "segments_evaluated": rep.get("segments_evaluated"), "segments_matched": rep.get("segments_matched"),
+            "compact": f"summary: {len(inc)} incident(s) reduced to counts + the last {max_incidents}; "
+                       "dataflux_critic(compact=False) returns the full report with snapshots"}
 
 
 def critic_report(days: float = 1.0, limit: int = 50) -> dict:
@@ -1318,6 +1554,11 @@ def critic_report(days: float = 1.0, limit: int = 50) -> dict:
             if key not in seen and not h.startswith("no rule matched"):
                 seen.add(key)
                 recommendations.append(h)
+    # How many recommendations came from INCIDENT diagnosis specifically.
+    # Everything appended after this point (gb_pilot advisories, governed
+    # segments) describes state, not the incidents, so it must not be allowed
+    # to stand in for a diagnosis of them , see the fallback below.
+    incident_hint_count = len(recommendations)
     try:
         import gb_pilot
         analysis = gb_pilot.analyze(events)
@@ -1333,16 +1574,83 @@ def critic_report(days: float = 1.0, limit: int = 50) -> dict:
             recommendations.append(rec)
     except Exception:
         pass
-    if not recommendations:
-        if total_incidents:
+
+    # The governed layer, folded in.
+    #
+    # This critic diagnoses INCIDENTS , dataflux events with a bad status. It
+    # has never consulted gb_semantics, which diagnoses STATE. Measured on
+    # 2026-08-21 (casebook C-09): four governed segments were matching at that
+    # exact moment , one violation, three warnings , and this report named none
+    # of them, because none of them is an incident. The case recorded that as
+    # "a governed segment that fires with no corresponding critic hint is
+    # half-instrumented".
+    #
+    # Bridging the two here is deliberately not a new rule per segment: every
+    # segment added later is covered without touching this function.
+    #
+    # `matched is None` is NOT a match. Throughout gb_semantics None means
+    # "nobody measured", and reporting it as a finding is the exact confusion
+    # the null contract exists to prevent.
+    segments_evaluated = 0
+    segments_matched: list[str] = []
+    try:
+        # gb_semantics pulls gb_init/gb_telemetry, which announce themselves on
+        # STDOUT at import ("[gb_telemetry] GPU0 topology: ...", 309 bytes on
+        # this box). This function is reached over a stdio MCP channel where
+        # stdout IS the protocol, so that banner would not be noise, it would
+        # be a corrupt frame. Measured before/after: the pre-bridge
+        # critic_report wrote 0 bytes to stdout and this one wrote 309 until
+        # the redirect below. Everything the banner says still reaches stderr.
+        import contextlib
+        with contextlib.redirect_stdout(sys.stderr):
+            import gb_semantics
+        hits = []
+        with contextlib.redirect_stdout(sys.stderr):
+            seg_names = sorted(gb_semantics.load()["segments"])
+            evaluated = [(n, gb_semantics.evaluate_segment(n)) for n in seg_names]
+        for name, seg in evaluated:
+            if seg.get("error"):
+                continue
+            segments_evaluated += 1
+            if seg.get("matched") is not True:
+                continue
+            segments_matched.append(name)
+            # `ok` is the positive case (serve_healthy and friends). It is a
+            # real, governed answer , but a recommendation list is where a
+            # reader looks for what to DO, and "nothing is wrong" pushed in
+            # among things that are wrong buries them. Same rule the gb_pilot
+            # block above applies to its own ok-severity items. The name still
+            # appears in segments_matched, so the answer is not lost.
+            if seg.get("severity") == "ok":
+                continue
+            hits.append((_SEGMENT_SEVERITY_RANK.get(seg.get("severity"), 50), name, seg))
+        for _, name, seg in sorted(hits, key=lambda h: (h[0], h[1])):
+            doc = (seg.get("doc") or "").strip().split("\n")[0]
+            ev_bits = []
+            for e in (seg.get("evidence") or [])[:3]:
+                if isinstance(e, dict) and e.get("metric") is not None:
+                    ev_bits.append(f"{e['metric']}={e.get('value')}")
+            ev = f" (evidence: {', '.join(ev_bits)})" if ev_bits else ""
             recommendations.append(
-                f"{total_incidents} incident(s) in the window but no diagnosis "
-                f"rule matched any of them , inspect incidents[].diagnosis_hints "
-                f"and snapshot_before/after manually")
-        else:
-            recommendations.append(
-                "no incidents or pressure flags in the window , cluster inference "
-                "nominal; keep quantization at or above the fp8 quality floor")
+                f"[semantics:{seg.get('severity', 'info')}] {name}: {doc}{ev}")
+    except Exception:
+        pass
+
+    # An undiagnosed incident has to say so even when the list is otherwise
+    # full. This used to key off `not recommendations`, which meant ANY other
+    # recommendation , a pilot advisory, and after 2026-08-22 any matching
+    # governed segment , silently absorbed the fact that N incidents went
+    # unexplained. That is the same class of bug the message was added to fix:
+    # a report contradicting its own incident_count.
+    if total_incidents and incident_hint_count == 0:
+        recommendations.append(
+            f"{total_incidents} incident(s) in the window but no diagnosis "
+            f"rule matched any of them , inspect incidents[].diagnosis_hints "
+            f"and snapshot_before/after manually")
+    elif not recommendations:
+        recommendations.append(
+            "no incidents or pressure flags in the window , cluster inference "
+            "nominal; keep quantization at or above the fp8 quality floor")
 
     return {
         "window_days": days,
@@ -1353,6 +1661,12 @@ def critic_report(days: float = 1.0, limit: int = 50) -> dict:
         "truncated": truncated,
         "incidents": incidents,
         "recommendations": recommendations,
+        # How much of the governed layer this report actually saw. 0 evaluated
+        # means gb_semantics did not load , the recommendations then describe
+        # incidents only, and a reader must not take their silence as a clean
+        # bill of governed health.
+        "segments_evaluated": segments_evaluated,
+        "segments_matched": segments_matched,
     }
 
 

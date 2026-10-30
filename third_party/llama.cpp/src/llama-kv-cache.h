@@ -112,7 +112,9 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+        // a model can hold more than one cache, so the tensor names have to stay unique
+                 const char *   name_tag = "");
 
     ~llama_kv_cache() = default;
 
@@ -147,7 +149,28 @@ public:
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
+    // the cells of the stream that holds seq_id
+    const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+
+    // true when the cache stores per-cell extra data (2D position, token id)
+    bool has_cell_ext() const;
+
+    // for each token of the ubatch, the n tokens that precede it in its sequence
+    // res is n_tokens*n, LLAMA_TOKEN_NULL where there is no such token
+    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
+
+    // state_read, plus the cells the restored tokens were placed in
+    // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
+    //   sinfos_out: if set, filled with the layout used; a stream with no cells leaves an empty entry
+    //   sinfos_in : if set, the layout to use instead of searching. one entry per stream, cell count must match the blob
+    void state_read_sinfo(
+            llama_io_read_i & io,
+               llama_seq_id   seq_id,
+      llama_state_seq_flags   flags,
+          slot_info_vec_t *   sinfos_out,
+    const slot_info_vec_t *   sinfos_in);
 
     //
     // llama_kv_cache specific API
@@ -316,11 +339,16 @@ private:
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
 
-    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1);
+    // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
+    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {
+public:
+    // see llama_kv_cache::get_prev_tokens()
+    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+
 public:
     // some shorthands
     using slot_info_vec_t  = llama_kv_cache::slot_info_vec_t;

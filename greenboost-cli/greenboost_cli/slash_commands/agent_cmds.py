@@ -38,10 +38,22 @@ def _agent(args: str, session, settings: dict) -> None:
             i += 2
         else:
             rest.append(tok); i += 1
+    # `/agent reviewer <task>` runs a markdown-defined agent (.greenboost/agents)
+    from greenboost_cli.agents import custom as _custom
+    _defs = _custom.discover()
+    _named = None
+    if rest and rest[0].lower() in _defs and len(rest) > 1:
+        _named = _defs[rest.pop(0).lower()]
     prompt = _cap(" ".join(rest).strip(), _MAX_TEXT_LEN)
     if not prompt:
-        emit_warn("Usage: /agent [--model M] [--timeout S] <prompt>")
+        emit_warn("Usage: /agent [--model M] [--timeout S] [<agent-name>] <prompt>   (/agents lists the named ones)")
         return
+    _tools = None
+    if _named:
+        _tools, _unknown = _custom.usable_tools(_named.tools)
+        if _unknown:
+            emit_warn(f"{_named.name}: ignoring unknown tools {', '.join(_unknown)}")
+        prompt = _custom.build_prompt(_named, prompt)
 
     from greenboost_cli.agents.subagent import run_subagent
 
@@ -49,7 +61,8 @@ def _agent(args: str, session, settings: dict) -> None:
                   f"[{GRAY}](model={model or settings.get('model','?')}, "
                   f"timeout={int(timeout_s)}s)[/]")
     result = run_subagent(
-        prompt, model=model, timeout_s=timeout_s, settings=settings,
+        prompt, model=model, timeout_s=timeout_s, settings=settings, tools=_tools,
+        label=(_named.name if _named else "subagent"),
     )
 
     if result.error:
@@ -74,3 +87,18 @@ def _agent(args: str, session, settings: dict) -> None:
 
 
 register_command("agent", _agent, "Delegate a sub-task to an isolated subagent  (/agent <prompt>)")
+
+
+def _agents(args: str, session, settings: dict) -> None:
+    """List markdown-defined agents."""
+    from rich.markup import escape
+    from greenboost_cli.agents import custom
+    defs = custom.discover()
+    if not defs:
+        emit_info("No agents found. Put name.md (front matter: description, tools) in "
+                  ".greenboost/agents/")
+        return
+    for name, a in sorted(defs.items()):
+        tools = ", ".join(a.tools) if a.tools else "all tools"
+        console.print(f"  [{VIOLET}]{escape(name):<16}[/] [{GRAY}]{escape(a.description or '')}  ({escape(tools)})[/]")
+register_command("agents", _agents, "List user-defined agents  (.greenboost/agents)")

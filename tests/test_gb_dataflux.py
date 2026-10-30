@@ -384,6 +384,134 @@ def test_critic_report_bw_undetectable_has_diagnosis_rule():
     assert any("bandwidth undetectable" in h for h in hints)
 
 
+# ── the governed layer reaches the critic ────────────────────────────────────
+#
+# Measured 2026-08-21 (casebook C-09): four governed segments were matching at
+# that exact moment , one violation and three warnings , and critic_report()
+# named none of them, because none of them is a dataflux incident. The case
+# recorded it as "a governed segment that fires with no corresponding critic
+# hint is half-instrumented".
+
+def _fake_semantics(monkeypatch, segments: dict):
+    """Stand a fake gb_semantics in front of the bridge.
+
+    The bridge imports gb_semantics INSIDE critic_report, so the fake has to
+    be reachable by that import, not just by attribute patching.
+    """
+    import types
+    mod = types.ModuleType("gb_semantics")
+    mod.load = lambda: {"segments": {k: object() for k in segments}}
+    mod.evaluate_segment = lambda name: dict(segments[name], segment=name)
+    monkeypatch.setitem(sys.modules, "gb_semantics", mod)
+    return mod
+
+
+def test_critic_report_surfaces_matching_governed_segments(monkeypatch):
+    _fake_semantics(monkeypatch, {
+        "agent_compaction_broke_prefix": {
+            "matched": True, "severity": "violation", "doc": "prefix rewritten",
+            "evidence": [{"metric": "agent_compaction_prefix_kept_pct", "value": 0.0}]},
+        "prompt_cache_cold": {
+            "matched": True, "severity": "warning", "doc": "cache cold", "evidence": []},
+    })
+    report = gdf.critic_report(days=1)
+    assert report["segments_evaluated"] == 2
+    assert set(report["segments_matched"]) == {
+        "agent_compaction_broke_prefix", "prompt_cache_cold"}
+    recs = report["recommendations"]
+    assert any("[semantics:violation] agent_compaction_broke_prefix" in r for r in recs)
+    assert any("agent_compaction_prefix_kept_pct=0.0" in r for r in recs)
+    # Worst first: a violation buried under warnings is one the reader skips.
+    sem = [r for r in recs if r.startswith("[semantics:")]
+    assert sem[0].startswith("[semantics:violation]")
+
+
+def test_a_matching_segment_does_not_absorb_an_undiagnosed_incident(monkeypatch):
+    """The bridge must not silence the report's own incident bookkeeping.
+
+    The "N incident(s) ... no diagnosis rule matched" line used to key off an
+    EMPTY recommendation list, so once governed segments started appending to
+    it, an incident nothing could explain stopped being mentioned at all ,
+    while incident_count still said it happened. Same contradiction the
+    message was written to fix.
+    """
+    _fake_semantics(monkeypatch, {
+        "prompt_cache_cold": {"matched": True, "severity": "warning",
+                              "doc": "cache cold", "evidence": []},
+    })
+    t0 = time.time()
+    gdf.emit({"ts": t0, "node": "host", "label": "misc", "kind": "job_local",
+             "status": "error", "error": "disk full"})
+    report = gdf.critic_report(days=1)
+    assert report["incident_count"] == 1
+    recs = report["recommendations"]
+    assert any("[semantics:warning] prompt_cache_cold" in r for r in recs)
+    assert any("1 incident" in r and "no diagnosis rule matched" in r for r in recs)
+
+
+def test_critic_report_never_reports_a_null_segment_as_a_finding(monkeypatch):
+    """matched=None means "nobody measured", and throughout gb_semantics that
+    is deliberately not False. Reporting it as a finding is the exact confusion
+    the null contract exists to prevent."""
+    _fake_semantics(monkeypatch, {
+        "decode_tail_heavy": {"matched": None, "severity": "warning",
+                              "doc": "no percentiles sampled", "evidence": []},
+    })
+    report = gdf.critic_report(days=1)
+    assert report["segments_evaluated"] == 1
+    assert report["segments_matched"] == []
+    assert not any("decode_tail_heavy" in r for r in report["recommendations"])
+
+
+def test_critic_report_does_not_list_ok_segments_as_recommendations(monkeypatch):
+    """`ok` is a real governed answer, but a recommendation list is where the
+    reader looks for what to DO. serve_healthy pushed in among real findings
+    buries them. It still appears in segments_matched."""
+    _fake_semantics(monkeypatch, {
+        "serve_healthy": {"matched": True, "severity": "ok",
+                          "doc": "everything fine", "evidence": []},
+    })
+    report = gdf.critic_report(days=1)
+    assert report["segments_matched"] == ["serve_healthy"]
+    assert not any("serve_healthy" in r for r in report["recommendations"])
+
+
+def test_critic_report_survives_a_broken_semantics_layer(monkeypatch):
+    """The critic must still work on a box where the semantic layer cannot
+    load , it diagnosed incidents long before segments existed."""
+    import types
+    mod = types.ModuleType("gb_semantics")
+    def _boom():
+        raise RuntimeError("segments.yaml is unreadable")
+    mod.load = _boom
+    mod.evaluate_segment = lambda name: {}
+    monkeypatch.setitem(sys.modules, "gb_semantics", mod)
+    t0 = time.time()
+    gdf.emit({"ts": t0, "node": "host", "label": "misc", "kind": "job_local",
+             "status": "error", "error": "disk full"})
+    report = gdf.critic_report(days=1)
+    assert report["incident_count"] == 1
+    assert report["segments_evaluated"] == 0
+    assert report["segments_matched"] == []
+
+
+def test_critic_report_writes_nothing_to_stdout(monkeypatch, capsys):
+    """gb_semantics pulls gb_init/gb_telemetry, which announce themselves on
+    STDOUT at import. critic_report is reached over a stdio MCP channel where
+    stdout IS the protocol, so a banner there is a corrupt frame, not noise.
+    Measured on this box: 309 bytes leaked before the redirect was added."""
+    import types
+    mod = types.ModuleType("gb_semantics")
+    def _noisy():
+        print("[gb_telemetry] GPU0 topology: PCIe gen4x16")
+        return {"segments": {}}
+    mod.load = _noisy
+    mod.evaluate_segment = lambda name: {}
+    monkeypatch.setitem(sys.modules, "gb_semantics", mod)
+    gdf.critic_report(days=1)
+    assert capsys.readouterr().out == ""
+
+
 def test_dataflux_tier_moves_merges_tier_move_and_shim_decision():
     """dataflux_tier_moves used to query ONLY `kind == "tier_move"` (emitted
     by gb_model_tier.py's explicit Python-API moves, which nothing in

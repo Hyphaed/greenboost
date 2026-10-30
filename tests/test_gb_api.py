@@ -138,7 +138,7 @@ def test_stage_delegates_and_is_usable_as_context_manager(monkeypatch, tmp_path)
 def test_serve_gguf_delegates(monkeypatch):
     import gb_synapse
     monkeypatch.setattr(gb_synapse, "serve_gguf",
-                        lambda path, port, mmproj=None, ctx=0: {"pid": 1, "port": port})
+                        lambda path, port, mmproj=None, ctx=0, **kw: {"pid": 1, "port": port})
     assert gb_api.serve_gguf("/x.gguf", 8081) == {"pid": 1, "port": 8081}
 
 

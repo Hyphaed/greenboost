@@ -83,7 +83,8 @@ def synapse_status() -> dict:
     and whether the server and the :11434 Ollama/OpenAI proxy are running.
     Check before routing pipeline inference through gb-synapse (preferred
     over raw ollama per CLAUDE.md): if engine_built is false, the fallback is
-    raw ollama and the fix is `gb_synapse build` (host + each feeder)."""
+    raw ollama and the fix is `gb_synapse build` (host + each feeder). The `engine`
+    block: active engine kind/version, --moe-cache-mib support, last expert-cache decision."""
     try:
         import gb_synapse
         return gb_synapse.status()

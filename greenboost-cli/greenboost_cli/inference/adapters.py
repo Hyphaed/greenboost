@@ -46,6 +46,17 @@ class ContextOverflowError(RuntimeError):
         self.n_ctx = n_ctx
 
 
+def _paused_hint() -> str:
+    """A paused engine (Ctrl+P, /pause) has its port closed on purpose: say so instead of "start it"."""
+    try:
+        import gb_synapse
+        if gb_synapse.paused():
+            return "  • Paused (Ctrl+P or /pause): /resume brings it back with its context\n"
+    except Exception:
+        pass
+    return ""
+
+
 def _overflow_numbers(err_str: str) -> "tuple[int, int]":
     """(prompt_tokens, n_ctx) from llama-server's 400 body, or (0, 0).
 
@@ -485,6 +496,7 @@ def _stream_openai_api(
         if "Connection refused" in _e or "ConnectError" in _cls or "APIConnectionError" in _cls or "ConnectionError" in _cls:
             raise RuntimeError(
                 f"\nCannot connect to {base_url}\n\n"
+                + _paused_hint() +
                 f"  • /llamaserve          — start gb-synapse\n"
                 f"  • /llamaserve logs     — follow startup log\n"
                 f"  • /llamaserve status   — check if the model is loaded\n"
@@ -683,6 +695,7 @@ def _stream_injected(
             _url = base_url or "http://localhost:11369"  # gb-synapse's own default (registry.py)
             raise RuntimeError(
                 f"\nCannot connect to gb-synapse at {_url}\n\n"
+                + _paused_hint() +
                 f"  • /llamaserve          — start the server\n"
                 f"  • /llamaserve logs     — follow startup log\n"
                 f"  • /llamaserve status   — check if it's ready\n"

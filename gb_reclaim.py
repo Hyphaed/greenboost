@@ -122,6 +122,15 @@ def _ollama_unload(model: str, *, base_url: "str | None" = None,
     False on any network/server error."""
     if not model:
         return False
+    try:
+        import gb_lease_client
+        held = gb_lease_client.unload_blocked(model)
+    except Exception:
+        held = None
+    if held:
+        if not silent:
+            sys.stderr.write(f"gb_reclaim: not unloading {model}: GPU lease held by {held.get('client') or held.get('job')}\n")
+        return False
     url = (base_url or _ollama_base_url()) + "/api/generate"
     payload = json.dumps({"model": model, "keep_alive": 0}).encode()
     req = urllib.request.Request(url, data=payload,

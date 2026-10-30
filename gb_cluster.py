@@ -986,7 +986,52 @@ def shim_env(workload: str = "diffusion", enabled: bool = True,
             env["LD_PRELOAD"] = ":".join(preload)
         else:
             env.pop("LD_PRELOAD", None)
+    # CPU placement for the host process: P-cores only on a hybrid CPU (shimless or not). The launcher applies
+    # GB_CPU_AFFINITY with taskset; OMP_NUM_THREADS is set so torch/OpenMP size their pools to the cores they get.
+    aff = cpu_affinity(workload)
+    if aff:
+        env.setdefault("GB_CPU_AFFINITY", aff["cpulist"])
+        env.setdefault("OMP_NUM_THREADS", str(aff["omp_num_threads"]))
     return env
+
+
+def _cpulist(cpus: list) -> str:
+    """[0,1,2,3,8] -> "0-3,8" (the format taskset -c and /sys cpu lists use)."""
+    out, run = [], []
+    for c in sorted(set(int(x) for x in cpus)):
+        if run and c == run[-1] + 1:
+            run.append(c)
+            continue
+        if run:
+            out.append(f"{run[0]}-{run[-1]}" if len(run) > 1 else str(run[0]))
+        run = [c]
+    if run:
+        out.append(f"{run[0]}-{run[-1]}" if len(run) > 1 else str(run[0]))
+    return ",".join(out)
+
+
+def cpu_affinity(workload: str = "diffusion") -> dict:
+    """P-core pinning for a host process, from THIS node's topology (gb_topology: the profile or live sysfs detection),
+    never a literal. {"cpus": [...], "cpulist": "0-15", "omp_num_threads": 16}, or {} when there is nothing to pin:
+
+      * a non-hybrid CPU (no E-cores), or a topology that reports no P-cores;
+      * an llm/ggml workload (llama-server sizes its own --threads from the same topology, see gb_synapse._pcore_threads);
+      * GB_CPU_PIN=all (opt out).
+
+    Why: on a hybrid CPU the E-cores are slower and the model load / quantise phase is single-thread bound, so letting the
+    scheduler park the worker on an E-core costs minutes per batch. Consumers (ai-forge's _gen_gb.sh) read GB_CPU_AFFINITY
+    from shim_env() instead of deriving the list themselves."""
+    if workload in ("llm", "ggml") or os.environ.get("GB_CPU_PIN") == "all":
+        return {}
+    try:
+        import gb_topology
+        t = gb_topology.get_topology()
+        p, e = list(t.p_core_cpus), list(t.e_core_cpus)
+    except Exception:
+        return {}
+    if not p or not e:
+        return {}
+    return {"cpus": sorted(p), "cpulist": _cpulist(p), "omp_num_threads": len(p)}
 
 
 FEEDER_STAGE_PYTHON = "~/.local/share/mamba/envs/artpipeline_cu13/bin/python"
@@ -1728,6 +1773,45 @@ def _df_item_repr(item) -> str:
     return str(item)[:64]
 
 
+def _reconcile_chunk(run_id: str, node: str, label: str, kind: str,
+                     batch: list, out) -> int:
+    """Did this worker return one result per item it was given?
+
+    THE soft failure this cluster has always had, and the one the standing rule
+    tells operators to work around by hand: "feeder soft-failures may NOT appear
+    as dataflux errors , the process runs, produces nothing, reports success.
+    Cross-check item counts per node against expected outputs on disk."
+
+    That workaround exists because nothing reconciled the counts in code. Both
+    collection paths do:
+
+        for j, r in enumerate(out[offset:offset + len(b)]):
+            results[start + j] = r
+
+    A short `out` simply yields fewer iterations. The unfilled slots keep their
+    initial value, `_mark_done(len(batch))` then reports the whole batch
+    complete, and the caller receives a result list with holes in it and no
+    error anywhere. A worker that produced NOTHING is indistinguishable from
+    one that produced everything.
+
+    Returns the shortfall (0 when correct) and emits a loud error event when
+    non-zero. Never raises: a dispatch must not fail because accounting did.
+    """
+    try:
+        got = len(out) if out is not None else 0
+        want = len(batch)
+        if got == want:
+            return 0
+        _df_emit(run_id, node, label, kind, batch, 0.0, status="error",
+                 error=(f"item count mismatch: dispatched {want}, returned {got} "
+                        f"({want - got} missing)"),
+                 dispatched_items=want, returned_items=got,
+                 missing_items=want - got)
+        return want - got
+    except Exception:
+        return 0
+
+
 def _df_emit(run_id: str, node: str, label: str, kind: str, items: list,
             duration_s: float, status: str = "ok", error: str | None = None,
             **extra) -> None:
@@ -1814,6 +1898,7 @@ def cluster_map(items, run_local, run_remote=None, *, chunk="auto",
             out = run_local(batch)
             _df_emit(run_id, _HOST_KEY, label, "chunk_local", batch,
                      time.monotonic() - t0)
+            _reconcile_chunk(run_id, _HOST_KEY, label, "chunk_local", batch, out)
             results.extend(out)
             if on_progress:
                 on_progress(len(results), n)
@@ -1877,6 +1962,7 @@ def cluster_map(items, run_local, run_remote=None, *, chunk="auto",
                 _ewma_update(_throughput_ewma, key, len(batch) / elapsed)
                 _df_emit(run_id, node, label, "chunk_remote", batch, elapsed,
                          chunk_size=len(batch), pulled_chunks=len(pulled))
+                _reconcile_chunk(run_id, node, label, "chunk_remote", batch, out)
                 with res_lock:
                     offset = 0
                     for start, b in pulled:
@@ -1918,6 +2004,7 @@ def cluster_map(items, run_local, run_remote=None, *, chunk="auto",
         _ewma_update(_throughput_ewma, _HOST_KEY, len(batch) / elapsed)
         _df_emit(run_id, _HOST_KEY, label, "chunk_local", batch, elapsed,
                  chunk_size=len(batch), pulled_chunks=len(pulled))
+        _reconcile_chunk(run_id, _HOST_KEY, label, "chunk_local", batch, out)
         with res_lock:
             offset = 0
             for start, b in pulled:

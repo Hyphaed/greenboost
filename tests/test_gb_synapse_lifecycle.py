@@ -26,6 +26,10 @@ import pytest
 import gb_synapse as gs
 
 
+def _gated_serve(*a, **k):
+    return gs.serve(*a, explicit=True, trigger="test", **k)
+
+
 @pytest.fixture
 def run_dir(tmp_path, monkeypatch):
     d = tmp_path / "synapse_run"
@@ -152,7 +156,7 @@ def test_serve_restarts_only_proxy_when_engine_alive_proxy_dead(run_dir, fake_al
                               "existing engine is still alive")
     monkeypatch.setattr(gs.gb_synapse_backends, "select_backend", _boom_select_backend)
 
-    result = gs.serve("qwen3")
+    result = _gated_serve("qwen3")
 
     # Reused the EXISTING engine's ports, not a freshly-requested one.
     assert calls["args"] == ("qwen3", 11435, 12435, "llama.cpp")
@@ -173,7 +177,7 @@ def test_serve_reuses_state_when_both_alive(run_dir, fake_alive, monkeypatch):
         raise AssertionError("must not select a backend when already fully running")
     monkeypatch.setattr(gs.gb_synapse_backends, "select_backend", _boom)
 
-    result = gs.serve("qwen3")
+    result = _gated_serve("qwen3")
 
     assert result.llama_pid == 100
     assert result.proxy_pid == 200
@@ -195,7 +199,7 @@ def test_serve_spawns_fresh_backend_when_both_dead(run_dir, fake_alive, monkeypa
 
     monkeypatch.setattr(gs.gb_synapse_backends, "select_backend", lambda entry: _FakeBackend())
 
-    result = gs.serve("qwen3")
+    result = _gated_serve("qwen3")
 
     assert called.get("yes") is True
     assert result.llama_pid == 999

@@ -227,7 +227,7 @@ def sweep(base_url: str, model: str = "", depths=DEFAULT_DEPTHS,
     try:
       for d in depths:
         gb_synapse.stop(model)
-        gb_synapse.serve(model, mtp_draft_n=d)
+        gb_synapse.serve(model, mtp_draft_n=d, explicit=True, trigger="bench")
         # The serve call returns once /health is green, but the first request
         # still pays a cold prefill; the measurement below discards nothing, so
         # give the engine a beat rather than folding load noise into depth 0.
@@ -256,7 +256,7 @@ def sweep(base_url: str, model: str = "", depths=DEFAULT_DEPTHS,
         if target is not None and (failed or not results
                                    or target != results[-1]["draft_n"]):
             gb_synapse.stop(model)
-            gb_synapse.serve(model, mtp_draft_n=target)
+            gb_synapse.serve(model, mtp_draft_n=target, explicit=True, trigger="bench")
             restored = target
     except Exception as e:
         restored = f"FAILED: {type(e).__name__}: {e}"

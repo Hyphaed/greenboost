@@ -25,6 +25,18 @@ import gb_actuation as ga
 
 
 @pytest.fixture(autouse=True)
+def _authorized(monkeypatch, tmp_path):
+    """Applying a verb needs an out-of-band authorization (SEC-01), so these tests open a real token context."""
+    tf = tmp_path / "a2a.token"
+    tf.write_text("t" * 32 + "\n")
+    tf.chmod(0o600)
+    monkeypatch.setenv("GB_A2A_TOKEN_FILE", str(tf))
+    with ga.actuation_auth("t" * 32) as ok:
+        assert ok
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _gated(monkeypatch):
     monkeypatch.setenv("GB_ORCH_ACTUATE", "1")
 

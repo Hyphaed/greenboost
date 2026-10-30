@@ -1,0 +1,58 @@
+# PROPOSAL (SP41-12 / QC1). Replacement for greenboost-supervisor.service once the
+# supervisor routes root actions through the helper (privsplit/patches/).
+[Unit]
+Description=GreenBoost brain (unprivileged supervisor; root actions via helper)
+After=network.target nvidia-persistenced.service greenboost-root-helper.socket
+Wants=greenboost-root-helper.socket
+Before=ollama.service
+
+[Service]
+Type=notify
+User=greenboost
+Group=greenboost
+SupplementaryGroups=systemd-journal
+ExecStart=/usr/local/lib/greenboost/gb_supervisor.py
+Environment=GB_ROOT_HELPER=1
+Environment=GB_ROOT_HELPER_SOCKET=/run/greenboost-helper/root-helper.sock
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=90
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gb-supervisor
+StateDirectory=greenboost
+RuntimeDirectory=greenboost
+RuntimeDirectoryMode=0755
+
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+UMask=0027
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ReadWritePaths=/var/lib/greenboost /run/greenboost
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# Python extension modules and NVML may need W+X mappings: to be confirmed on the machine.
+MemoryDenyWriteExecute=no
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+DevicePolicy=closed
+DeviceAllow=char-nvidia-frontend r
+DeviceAllow=char-nvidia-uvm r
+DeviceAllow=char-nvidia-caps r
+DeviceAllow=/dev/nvidiactl r
+DeviceAllow=/dev/greenboost r
