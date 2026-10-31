@@ -58,6 +58,41 @@ UNATTENDED_ANSWER_AFTER_S = 300.0
 TIMEOUT = "TIMEOUT"
 
 
+#: Returned for an escape sequence that is not a key we act on (a terminal's cursor-position or
+#: other reply, Alt+key, function keys). The pickers ignore it.
+IGNORED = "IGNORED"
+
+
+def _read_escape(fd: int) -> str:
+    """Finish reading what follows an ESC byte. A lone ESC is the Escape key (cancel). Anything longer
+    is consumed whole: `ESC [ 24;1 R` is the terminal answering a cursor-position query, and treating
+    its first bytes as Escape cancelled a model load the user had just confirmed (2026-10-31)."""
+    def _next() -> "bytes | None":
+        if select.select([sys.stdin], [], [], 0.1)[0]:
+            return os.read(fd, 1)
+        return None
+
+    first = _next()
+    if first is None:
+        return "ESC"
+    if first == b"O":                                   # SS3 arrows (application cursor mode)
+        final = _next()
+        return {b"A": "UP", b"B": "DOWN", b"C": "RIGHT", b"D": "LEFT"}.get(final or b"", IGNORED)
+    if first != b"[":
+        return IGNORED                                  # Alt+key
+    params = b""
+    for _ in range(32):                                 # bounded: never wait on a runaway sequence
+        c = _next()
+        if c is None:
+            return IGNORED
+        if b"\x40" <= c <= b"\x7e":                      # final byte of a CSI sequence
+            if not params:
+                return {b"A": "UP", b"B": "DOWN", b"C": "RIGHT", b"D": "LEFT"}.get(c, IGNORED)
+            return IGNORED
+        params += c
+    return IGNORED
+
+
 def _getch(timeout: "float | None" = None) -> str:
     """Read one logical keypress (handles arrow-key escape sequences).
 
@@ -74,23 +109,7 @@ def _getch(timeout: "float | None" = None) -> str:
                 return TIMEOUT
         ch = os.read(fd, 1)
         if ch == b"\x1b":
-            # Peek for CSI sequence with a short timeout
-            rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
-            if rlist:
-                ch2 = os.read(fd, 1)
-                if ch2 == b"[":
-                    rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
-                    if rlist:
-                        ch3 = os.read(fd, 1)
-                        if ch3 == b"A":
-                            return "UP"
-                        if ch3 == b"B":
-                            return "DOWN"
-                        if ch3 == b"C":
-                            return "RIGHT"
-                        if ch3 == b"D":
-                            return "LEFT"
-            return "ESC"
+            return _read_escape(fd)
         decoded = ch.decode("utf-8", errors="replace")
         return decoded
     finally:

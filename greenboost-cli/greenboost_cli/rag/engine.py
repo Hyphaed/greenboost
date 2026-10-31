@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import re
 import threading
 import time
@@ -25,7 +26,6 @@ from greenboost_cli.environment.settings import GB_HOME
 # dashboard server.  RLock so a holder may call into other locked helpers.
 _store_lock = threading.RLock()
 # Guards lazy model construction (startup thread may race the first query).
-_model_lock = threading.Lock()
 
 RAG_DIR          = GB_HOME / "rag"
 # The live index is ONE directory per generation (rag/generations/<id>/ holding
@@ -66,95 +66,332 @@ def _read_hf_token() -> str | None:
 
 
 # ── Embedding model (lazy-loaded) ─────────────────────────────────────────────
+#
+# Placement policy (owner decision 2026-10-30, measured on this box):
+#   * Searching (a query, a skill match, a small batch) runs on the CPU. One
+#     query costs ~60-90 ms with 8-16 threads and touches no VRAM, so the served
+#     35B model keeps the whole card. Qwen3-Embedding-0.6B needs ~1.2 GB; with
+#     the 35B loaded there is less than that free.
+#   * Bulk indexing (a batch of GB_EMBED_BULK_MIN texts or more, and /rag
+#     reembed) runs on the GPU when the card has room, then RELEASES it: on the
+#     CPU the same work is ~2-4 s per 1,500-char chunk, which is days for the
+#     297k-chunk store, and it would take cores the 35B's CPU experts use.
+#   * GB_EMBED_DEVICE=cuda restores "everything on the GPU"; =cpu forces the CPU.
+# This is a measured placement against the GPU alternative, not a silent
+# fallback, and the CPU path is the exception the owner approved for embeddings.
 
-_model = None
+_models: dict = {}                    # device -> loaded SentenceTransformer
+_models_lock = threading.Lock()
+_model = None                         # most recently loaded model (introspection only)
 _embed_device = None
-EMBED_MODEL   = "jinaai/jina-embeddings-v2-base-code"
+EMBED_MODEL   = os.environ.get("GB_EMBED_MODEL", "Qwen/Qwen3-Embedding-0.6B")
 EMBED_FALLBACK = "all-MiniLM-L6-v2"
 
 
 def _resolve_device() -> str:
+    """The CUDA device check, kept for the GPU path: no CUDA is a real fault."""
     global _embed_device
     if _embed_device is not None:
         return _embed_device
     try:
         import torch
         if torch.cuda.is_available():
-            # GreenBoost: T2/T3 tiers are always available — CPU spillover is
-            # forbidden.  Trust torch.cuda.is_available() and skip the probe
-            # tensor, which can spuriously fail under T1 VRAM pressure when
-            # vLLM is loading and the CUDA context hasn't been created yet.
             _embed_device = "cuda"
         else:
-            # No CUDA driver / runtime — this is a genuine incompatibility.
             raise RuntimeError(
-                "torch.cuda.is_available() returned False — "
-                "check CUDA driver and torch+cuXXX version match. "
-                "CPU spillover is not permitted when GreenBoost is active."
-            )
+                "torch.cuda.is_available() returned False , check CUDA driver and "
+                "torch+cuXXX version match. Bulk embedding needs the GPU; searching "
+                "(GB_EMBED_DEVICE=auto) does not.")
     except ImportError:
         _embed_device = "cpu"
     return _embed_device
 
 
-def _get_model():
-    global _model, _active_embed_model
-    if _model is not None:
-        return _model
-    with _model_lock:
-        if _model is not None:        # another thread won the race
-            return _model
-        # Apply GreenBoost env before loading model onto GPU
+_fallback_warned = False
+
+
+def _warn_embed_fallback(err: Exception) -> None:
+    """Say, once, that search is running on the weaker fallback embedder.
+
+    This fallback was silent: under transformers 5 the old primary code embedder
+    can't load at all (its remote code imports a function transformers removed),
+    so every RAG/skill search ran on MiniLM with no word to anyone. Measured on
+    200 functions of this repo (docstring -> body): MiniLM top-1 0.52, against
+    0.81 for Qwen3-Embedding-0.6B.
+    """
+    global _fallback_warned
+    if _fallback_warned:
+        return
+    _fallback_warned = True
+    reason = " ".join(str(err).split())[:140]
+    msg = (f"Code search is using the small fallback embedder ({EMBED_FALLBACK}), "
+           f"because {EMBED_MODEL} would not load ({reason}). Search still works, "
+           f"but it finds the right function first far less often in our "
+           f"measurement. Nothing is lost: the index records which model built it. "
+           f"Check GB_EMBED_MODEL and that sentence-transformers imports, then restart.")
+    try:
+        from greenboost_cli.terminal.theme import emit_warn
+        emit_warn(msg)
+    except Exception:
+        print(f"[greenboost-cli] {msg}", file=sys.stderr)
+
+
+#: Qwen3-Embedding is trained to read "Instruct: <task>\nQuery: <query>" on the SEARCH side
+#: only. The prompt the model ships is about web search, and measured no better than no
+#: instruction at all (top-1 0.79 vs 0.79 on 200 functions of this repo); a code-oriented
+#: one gave 0.84 and MRR 0.892 vs 0.859. Documents are never prefixed, so an existing index
+#: stays valid. GB_EMBED_QUERY_PROMPT overrides the code task ("none" = the model's own).
+_QUERY_TASKS = {
+    "code": "Given a question about a codebase or its documentation, retrieve the code or "
+            "text that answers it",
+    "skill": "Given a user's request, retrieve the description of the skill that applies to it",
+}
+
+
+def _query_prompt(model, task: str) -> dict:
+    """encode() kwargs that put the right instruction in front of a query ({} = none)."""
+    if "query" not in (getattr(model, "prompts", None) or {}):
+        return {}                                    # models without a query prompt (MiniLM, ...)
+    override = os.environ.get("GB_EMBED_QUERY_PROMPT", "").strip()
+    if override.lower() == "none":
+        return {"prompt_name": "query"}
+    text = override if (override and task == "code") else _QUERY_TASKS.get(task, _QUERY_TASKS["code"])
+    return {"prompt": f"Instruct: {text}\nQuery: "}
+
+
+class EmbedDeferred(RuntimeError):
+    """A batch too big to embed on the CPU was refused; run it when the GPU is free."""
+
+
+def _cpu_bulk_cap() -> int:
+    """Most chunks one call may embed on the CPU (0 = no limit). Qwen3-Embedding-0.6B
+    costs ~2.3 s per 1,500-char chunk there (measured), so a few hundred is minutes and
+    thousands is hours."""
+    try:
+        return max(0, int(os.environ.get("GB_EMBED_CPU_MAX_CHUNKS", "300")))
+    except ValueError:
+        return 300
+
+
+def _policy() -> str:
+    p = os.environ.get("GB_EMBED_DEVICE", "auto").lower()
+    return p if p in ("auto", "cpu", "cuda") else "auto"
+
+
+def _bulk_min() -> int:
+    try:
+        return max(1, int(os.environ.get("GB_EMBED_BULK_MIN", "64")))
+    except ValueError:
+        return 64
+
+
+def _cpu_threads() -> int:
+    """About a third of the logical CPUs: enough for ~90 ms queries (measured at 8
+    of 24), few enough that the served model's CPU experts keep their cores."""
+    return max(2, (os.cpu_count() or 8) // 3)
+
+
+def _gpu_has_room_for(model) -> bool:
+    """Weights x1.25 for activations, plus the 10% VRAM headroom RULE #1 keeps."""
+    try:
+        import torch
+        free, total = torch.cuda.mem_get_info()
+        need = int(sum(p.numel() * p.element_size() for p in model.parameters()) * 1.25)
+        return free - need >= int(total * 0.10)
+    except Exception:
+        return False
+
+
+def _load(device: str, name: str | None = None):
+    """Load the primary embedder on `device`, else the fallback on the same device.
+
+    `name` loads exactly that model (the one an existing index was built with)
+    and changes no module state."""
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError as _e:
+        _cause = str(_e)
+        if "torch" in _cause.lower() or "torchao" in _cause.lower() or "int1" in _cause:
+            raise ImportError(
+                f"sentence-transformers import failed due to a torch/torchao version mismatch: {_cause}\n"
+                "Fix: upgrade torch in the active env:\n"
+                "  pip install --upgrade 'torch>=2.0' --index-url https://download.pytorch.org/whl/cu130"
+            ) from _e
+        raise ImportError(
+            f"sentence-transformers not installed or failed to import ({_cause}).\n"
+            "Run: pip install 'greenboost-cli[rag]'"
+        ) from _e
+
+    global _active_embed_model, _model
+    import warnings
+    warnings.filterwarnings("ignore", message=".*optimum.*", category=UserWarning)
+    hf_token = os.environ.get("HF_TOKEN") or _read_hf_token()
+    # On the CPU, float32: transformers 5 keeps the checkpoint's bfloat16, which the
+    # CPU runs ~3x slower (283 ms vs ~90 ms per query measured here).
+    mk = {}
+    if device == "cpu":
         try:
-            from greenboost_cli.greenboost.gb_torch import apply_gb_torch_env
-            apply_gb_torch_env()
-        except ImportError:
+            import torch
+            mk = {"model_kwargs": {"dtype": torch.float32}}
+        except Exception:
+            pass
+    if name:
+        return SentenceTransformer(name, device=device, token=hf_token, **mk)
+    try:
+        m = SentenceTransformer(EMBED_MODEL, trust_remote_code=True, device=device, token=hf_token, **mk)
+        _active_embed_model = EMBED_MODEL
+    except Exception as _primary_err:
+        m = SentenceTransformer(EMBED_FALLBACK, device=device, token=hf_token, **mk)
+        _active_embed_model = EMBED_FALLBACK       # recorded in the manifest, so it can't pass as the primary
+        _warn_embed_fallback(_primary_err)
+    try:        # Qwen3-Embedding ships max_seq_length 32768: bound it (4,000-char chunks are ~1,000 tokens)
+        m.max_seq_length = min(int(m.max_seq_length or 1024), 1024)
+    except Exception:
+        pass
+    _model = m
+    return m
+
+
+def _get_model(device: str | None = None, name: str | None = None):
+    """The embedder on `device` ("cpu" | "cuda"); None = the GPU path.
+    `name` = a specific model, cached under (device, name)."""
+    device = device or _resolve_device()
+    key = (device, name) if name else device
+    with _models_lock:
+        m = _models.get(key)
+        if m is not None:
+            return m
+        if device == "cuda":
+            # Apply GreenBoost env before loading model onto GPU
+            try:
+                from greenboost_cli.greenboost.gb_torch import apply_gb_torch_env
+                apply_gb_torch_env()
+            except ImportError:
+                pass
+        else:
+            try:
+                import torch
+                # never ABOVE what a caller already chose: the RAG auto-update thread
+                # sets 1 on purpose (a background reindex once froze input for a minute)
+                torch.set_num_threads(min(torch.get_num_threads(), _cpu_threads()))
+            except Exception:
+                pass
+        m = _load(device, name)
+        _models[key] = m
+        return m
+
+
+def release_gpu_embedder() -> None:
+    """Hand the GPU back (the served model needs it). Safe to call any time."""
+    global _model
+    with _models_lock:
+        m = _models.pop("cuda", None)
+        if m is not None and _model is m:
+            _model = None            # _load() also parks the newest model here; that reference alone kept ~1.2 GB alive
+    if m is not None:
+        del m
+        try:
+            import torch
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+        except Exception:
             pass
 
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError as _e:
-            _cause = str(_e)
-            if "torch" in _cause.lower() or "torchao" in _cause.lower() or "int1" in _cause:
-                raise ImportError(
-                    f"sentence-transformers import failed due to a torch/torchao version mismatch: {_cause}\n"
-                    "Fix: upgrade torch in the active env:\n"
-                    "  pip install --upgrade 'torch>=2.0' --index-url https://download.pytorch.org/whl/cu130"
-                ) from _e
-            raise ImportError(
-                f"sentence-transformers not installed or failed to import ({_cause}).\n"
-                "Run: pip install 'greenboost-cli[rag]'"
-            ) from _e
 
-        import warnings
-        warnings.filterwarnings("ignore", message=".*optimum.*", category=UserWarning)
-        device = _resolve_device()
-        hf_token = os.environ.get("HF_TOKEN") or _read_hf_token()
-        try:
-            _model = SentenceTransformer(EMBED_MODEL, trust_remote_code=True,
-                                         device=device, token=hf_token)
-            _active_embed_model = EMBED_MODEL
-        except Exception:
-            # Fallback model, still on CUDA — never drop to CPU silently.
-            _model = SentenceTransformer(EMBED_FALLBACK, device=device, token=hf_token)
-            _active_embed_model = EMBED_FALLBACK       # recorded in the manifest, so it can't pass as the primary
-    return _model
-
-
-def _embed(texts: list[str]) -> np.ndarray:
-    model = _get_model()
+def _pick_device(n_texts: int, bulk: bool | None) -> str:
+    p = _policy()
+    if p == "cpu":
+        return "cpu"
+    if p == "cuda":
+        return "cuda"
+    if bulk is None:
+        bulk = n_texts >= _bulk_min()
+    if not bulk:
+        return "cpu"
+    # Bulk: the GPU if there is room for it right now, else the CPU (slow, but a
+    # batch this size is bounded; /rag reembed refuses instead, see reembed_store).
     try:
-        # Never show tqdm's progress bar: it writes raw \r-based output to stderr,
-        # bypassing prompt_toolkit's patch_stdout, which corrupts the live REPL
-        # screen (cursor-position-report misreads show up as stray Escape input).
-        vecs = model.encode(texts, convert_to_tensor=True, show_progress_bar=False)
-        return vecs.cpu().numpy().astype(np.float32)
-    except RuntimeError as e:
-        if "no kernel image" in str(e) or "CUDA error" in str(e):
-            # Re-raise: CPU spillover is not permitted — GreenBoost T2/T3 should
-            # absorb any memory pressure.  Surface the error so it can be fixed.
-            raise
-        raise
+        import torch
+        if not torch.cuda.is_available():
+            return "cpu"
+        if _models.get("cuda") is not None:
+            return "cuda"
+        return "cuda" if _gpu_has_room_for(_get_model("cpu")) else "cpu"
+    except Exception:
+        return "cpu"
+
+
+#: Texts embedded per slice when a progress callback is given. Slices are taken from the
+#: length-sorted order (as encode() does internally), so padding stays low.
+_PROGRESS_SLICE = 256
+
+
+def _embed_with_progress(model, texts: list[str], kw: dict, device: str, progress) -> np.ndarray:
+    """Embed in slices, calling progress(done, total, eta_seconds | None, device) after each.
+
+    The ETA is weighted by characters, not by count: slices are length-sorted, so the long
+    ones come last and a plain count-based countdown would run optimistic then stall."""
+    order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
+    total_chars = sum(len(t) for t in texts) or 1
+    out = None
+    done = chars = 0
+    t0 = time.time()
+    progress(0, len(texts), None, device)
+    for s in range(0, len(order), _PROGRESS_SLICE):
+        idx = order[s:s + _PROGRESS_SLICE]
+        vecs = model.encode([texts[i] for i in idx], convert_to_tensor=True, show_progress_bar=False, **kw)
+        arr = vecs.float().cpu().numpy().astype(np.float32)
+        if out is None:
+            out = np.empty((len(texts), arr.shape[1]), dtype=np.float32)
+        out[idx] = arr
+        done += len(idx)
+        chars += sum(len(texts[i]) for i in idx)
+        elapsed = max(time.time() - t0, 1e-6)
+        eta = (total_chars - chars) / (chars / elapsed) if chars else None
+        progress(done, len(texts), eta, device)
+    return out
+
+
+def _embed(texts: list[str], *, query: bool = False, bulk: bool | None = None,
+           model_name: str | None = None, cpu_max: int | None = None,
+           task: str = "code", progress=None) -> np.ndarray:
+    """Embed `texts`. `query=True` applies the model's own query prompt when it
+    ships one (Qwen3-Embedding's "Instruct: ... Query:" form), which it was
+    trained to expect on the search side only. `bulk=None` decides by batch size."""
+    # An explicit model (search against an index built by an older embedder) is
+    # always a small CPU job: the vectors must come from the model that made the index.
+    device = "cpu" if model_name else _pick_device(len(texts), bulk)
+    if device == "cpu" and cpu_max and len(texts) > cpu_max:
+        raise EmbedDeferred(
+            f"{len(texts):,} chunks need embedding and the GPU has no room for the embedder "
+            f"right now (the CPU would take about {len(texts) * 2.3 / 3600:.1f} h and slow the "
+            f"model). Nothing was changed and search still works. Free the card (/exit "
+            f"unloads the model) and run /rag-update again, or set "
+            f"GB_EMBED_CPU_MAX_CHUNKS=0 to allow the CPU.")
+    model = _get_model(device, model_name)
+    kw = _query_prompt(model, task) if query else {}
+    vecs = None
+    try:
+        if progress is not None and len(texts) > _PROGRESS_SLICE:
+            out = _embed_with_progress(model, texts, kw, device, progress)
+        else:
+            # Never show tqdm's progress bar: it writes raw \r-based output to stderr,
+            # bypassing prompt_toolkit's patch_stdout, which corrupts the live REPL
+            # screen (cursor-position-report misreads show up as stray Escape input).
+            vecs = model.encode(texts, convert_to_tensor=True, show_progress_bar=False, **kw)
+            out = vecs.float().cpu().numpy().astype(np.float32)
+    finally:
+        # A GPU embedder is held only while there is bulk work: the served model
+        # gets its card back the moment this batch is done. This frame's own references
+        # go FIRST: release_gpu_embedder() empties the allocator cache, and weights that
+        # a local variable still holds are not freed yet, so ~1.2 GB stayed allocated to
+        # this process for the rest of the session (measured: "GPU: python3 1.5G" after a
+        # /rag-update), which cut the model server's expert-cache room and its decode speed.
+        model = vecs = None
+        if device == "cuda" and _policy() == "auto":
+            release_gpu_embedder()
+    return out
 
 
 # ── Code-aware chunker ────────────────────────────────────────────────────────
@@ -367,13 +604,14 @@ def _guard_append(existing_emb, new_emb) -> None:
     if existing_emb.shape[1] != new_emb.shape[1]:
         raise RagIndexMismatch(
             f"the index holds {existing_emb.shape[1]}-dim vectors but the embedding model "
-            f"'{_active_embed_model}' produces {new_emb.shape[1]}. Rebuild with /rag clear.")
+            f"'{_active_embed_model}' produces {new_emb.shape[1]}. Run /rag-reembed to rebuild it with the new model.")
     built_with = read_manifest().get("embed_model")
     if built_with and built_with != _active_embed_model:
         raise RagIndexMismatch(
             f"the index was built with '{built_with}' but this process is embedding with "
             f"'{_active_embed_model}'. Mixing them would return wrong neighbours. "
-            f"Rebuild with /rag clear, or switch back to '{built_with}'.")
+            f"Run /rag-reembed to rebuild it with the new model (searches keep working "
+            f"on the old index until then), or set GB_EMBED_MODEL='{built_with}'.")
 
 
 #: Tiny sidecar holding only what count-only callers need. Written beside the
@@ -497,6 +735,10 @@ def _save_store(embeddings: np.ndarray, metadata: list[dict]) -> None:
                 for piece in json.JSONEncoder(indent=2).iterencode(metadata):
                     f.write(piece)
                     sha.update(piece.encode())
+            try:        # the compact index search reads; best effort, search rebuilds it lazily if absent
+                _build_light(gdir, metadata)
+            except Exception:
+                pass
             rows = int(np.load(str(gdir / "embeddings.npy"), mmap_mode="r").shape[0]) if embeddings.size else 0
             if embeddings.size and rows != len(metadata):
                 raise RagIndexMismatch(
@@ -572,21 +814,148 @@ def resolve_folder_entry(cwd: Path | None = None) -> dict | None:
 
 # ── Index ──────────────────────────────────────────────────────────────────────
 
+#: Files that are data or output, not something a person searches for: lockfiles (6.9k
+#: chunks of the live index, 2.3%), minified bundles and source maps.
+_NOISE_NAMES = {"package-lock.json", "pnpm-lock.yaml", "yarn.lock", "poetry.lock", "uv.lock",
+                "Cargo.lock", "composer.lock", "Gemfile.lock", "go.sum"}
+_NOISE_SUFFIXES = (".lock", ".min.js", ".min.css", ".map")
+
+
+def _is_noise(f: Path) -> bool:
+    """True for a path the RAG index should not hold: an excluded or build-output
+    directory anywhere in it (build-synapse/, cmake-build-*, .mcp-cache: 7.8k chunks of
+    duplicated output), or a lockfile/minified/map file. Files already indexed that now
+    match are dropped by the next /rag-update, which needs no embedding."""
+    for part in f.parts[:-1]:                 # directories only: a FILE called build-x.md is source
+        if part in EXCLUDE_DIRS or part == ".mcp-cache" or part.startswith(("build-", "cmake-build")):
+            return True
+    return f.name in _NOISE_NAMES or f.name.endswith(_NOISE_SUFFIXES)
+
+
 def _scan_folder_files(folder: Path, exts: set[str] | None = None) -> list[Path]:
-    """Walk a folder, returning indexable files (honouring EXCLUDE_DIRS)."""
+    """Walk a folder, returning indexable files (see _is_noise)."""
     exts = exts or DEFAULT_EXTENSIONS
-    files: list[Path] = []
-    for f in folder.rglob("*"):
-        if f.is_file() and f.suffix.lower() in exts:
-            if not any(part in EXCLUDE_DIRS for part in f.parts):
-                files.append(f)
-    return files
+    return [f for f in folder.rglob("*")
+            if f.is_file() and f.suffix.lower() in exts and not _is_noise(f)]
+
+
+def _is_oom(e: BaseException) -> bool:
+    return "out of memory" in str(e).lower() or type(e).__name__ == "OutOfMemoryError"
+
+
+def _free_cuda_cache() -> None:
+    try:
+        import gc
+        import torch
+        gc.collect()
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+REEMBED_PART = 4096     # chunks per checkpoint part: a crash loses at most this much work
+
+
+def reembed_store(progress=None, batch_size: int = 32) -> dict:
+    """Re-embed every chunk of the live store with the CURRENT embedder, on the GPU.
+
+    The chunk text is kept in the store's metadata, so no source file is read.
+    Vectors are written to a new generation by the same atomic path every save
+    uses: the live index keeps answering searches until the swap, and a crash
+    or Ctrl+C leaves it untouched. Work is checkpointed in parts under
+    rag/reembed.tmp so a re-run resumes instead of starting over.
+
+    Refuses (rather than falling back to the CPU) when the card has no room:
+    at ~2-4 s per chunk the CPU needs days for a 297k-chunk store, and it would
+    take the cores the served model's experts use. progress(done, total, eta_s).
+    """
+    import shutil
+    emb, meta = _load_store()
+    if emb is None or not meta:
+        return {"status": "empty", "chunks": 0}
+    fp0 = _store_fingerprint()
+    built_with = read_manifest().get("embed_model")
+    if built_with == EMBED_MODEL:
+        return {"status": "current", "chunks": len(meta), "embed_model": built_with}
+
+    cpu_model = _get_model("cpu")
+    if not _gpu_has_room_for(cpu_model):
+        try:
+            import torch
+            free, total = torch.cuda.mem_get_info()
+            have = f"{free / 2**30:.1f} of {total / 2**30:.1f} GiB free"
+        except Exception:
+            have = "no CUDA device"
+        raise RuntimeError(
+            f"Not enough free VRAM to re-embed the index on the GPU ({have}). Nothing "
+            f"was changed and the current index still works. The CPU would take days "
+            f"for {len(meta):,} chunks. Stop the served model (or wait until it is "
+            f"unloaded), then run /rag-reembed again; it resumes where it stopped.")
+    release_gpu_embedder()
+    model = _get_model("cuda")
+    try:
+        texts = [m.get("text", "") or " " for m in meta]
+        order = sorted(range(len(texts)), key=lambda i: len(texts[i]))     # short first: little padding
+        tmp = RAG_DIR / "reembed.tmp"
+        plan = {"model": EMBED_MODEL, "n": len(texts), "part": REEMBED_PART,
+                "sig": hashlib.sha256(("".join(texts[i][:64] for i in order[::997])).encode()).hexdigest()[:16]}
+        plan_f = tmp / "plan.json"
+        if tmp.exists() and (not plan_f.exists() or json.loads(plan_f.read_text()) != plan):
+            shutil.rmtree(tmp, ignore_errors=True)         # a different job's leftovers
+        tmp.mkdir(parents=True, exist_ok=True)
+        plan_f.write_text(json.dumps(plan))
+        n_parts = (len(order) + REEMBED_PART - 1) // REEMBED_PART
+        t0, done_now = time.time(), 0
+        for p in range(n_parts):
+            part_f = tmp / f"p-{p:06d}.npy"
+            idx = order[p * REEMBED_PART:(p + 1) * REEMBED_PART]
+            if part_f.exists():
+                continue
+            # Longest chunks come last (sorted short-first), so activation memory climbs
+            # through the run: a real run was at 10.2 of 11.6 GiB at 60%. On an
+            # out-of-memory error, free the allocator's cache and halve the batch
+            # instead of dying; the smaller batch stays for the rest of the run.
+            while True:
+                try:
+                    vecs = model.encode([texts[i] for i in idx], batch_size=batch_size,
+                                        convert_to_tensor=True, show_progress_bar=False)
+                    break
+                except Exception as e:
+                    if not _is_oom(e) or batch_size <= 1:
+                        raise
+                    batch_size = max(1, batch_size // 2)
+                    _free_cuda_cache()
+            np.save(str(part_f) + ".tmp.npy", vecs.float().cpu().numpy().astype(np.float32))
+            os.replace(str(part_f) + ".tmp.npy", part_f)
+            _free_cuda_cache()                      # hand cached blocks back between parts
+            done_now += len(idx)
+            if progress:
+                rate = done_now / max(time.time() - t0, 1e-6)
+                progress(min((p + 1) * REEMBED_PART, len(order)), len(order),
+                         (len(order) - (p + 1) * REEMBED_PART) / max(rate, 1e-6))
+        parts = [np.load(str(tmp / f"p-{p:06d}.npy")) for p in range(n_parts)]
+        sorted_vecs = np.concatenate(parts, axis=0)
+        out = np.empty_like(sorted_vecs)
+        out[np.asarray(order)] = sorted_vecs               # back to the store's own order
+        if _store_fingerprint() != fp0:
+            raise RuntimeError(
+                "The index changed while it was being re-embedded (something was added or "
+                "removed), so the new vectors no longer line up. Nothing was swapped; run "
+                "/rag-reembed again.")
+        _save_store(out, meta)                             # new generation, atomic swap
+        shutil.rmtree(tmp, ignore_errors=True)
+        return {"status": "done", "chunks": len(meta), "dims": int(out.shape[1]),
+                "embed_model": _active_embed_model, "seconds": int(time.time() - t0)}
+    finally:
+        model = None                    # the local reference would keep the weights alive past the release
+        release_gpu_embedder()
 
 
 def index_folder(
     folder: Path,
     project: str | None = None,
     extensions: set[str] | None = None,
+    progress=None,
 ) -> dict:
     """Walk folder, chunk code files, embed, append to shared store."""
     from datetime import datetime
@@ -623,7 +992,7 @@ def index_folder(
     if not all_texts:
         return {"indexed": 0, "skipped": skipped, "project": project, "folder": str(folder)}
 
-    new_embeddings = _embed(all_texts)
+    new_embeddings = _embed(all_texts, cpu_max=_cpu_bulk_cap(), progress=progress)
 
     # Separator-safe prefix so /a/proj does not match /a/proj2.
     prefix = str(folder) + os.sep
@@ -698,7 +1067,7 @@ def index_text(
         for c in chunks
     ]
 
-    new_embeddings = _embed(all_texts)
+    new_embeddings = _embed(all_texts, cpu_max=_cpu_bulk_cap())
 
     with _store_lock:
         existing_emb, existing_meta = _load_store()
@@ -750,6 +1119,7 @@ def update_folder(
     project: str | None = None,
     force: bool = False,
     verbose: bool = False,
+    progress=None,
 ) -> dict:
     """Incrementally re-index a registered folder.
 
@@ -770,7 +1140,7 @@ def update_folder(
 
     # No prior incremental baseline → full index.
     if force or entry is None or not entry.get("last_indexed"):
-        res = index_folder(folder, project)
+        res = index_folder(folder, project, progress=progress)
         out = _empty_update_result(res.get("project", project or folder.name),
                                    str_folder, forced=True)
         out["scanned"] = res.get("indexed", 0)
@@ -833,7 +1203,7 @@ def update_folder(
                 "lines": [start, end], "text": text[:4000],
             })
 
-    new_embeddings = _embed(new_texts) if new_texts else None
+    new_embeddings = _embed(new_texts, cpu_max=_cpu_bulk_cap(), progress=progress) if new_texts else None
 
     with _store_lock:
         emb, meta = _load_store()           # re-load: a Q&A turn may have written
@@ -889,6 +1259,7 @@ def update_all(
     force: bool = False,
     verbose: bool = False,
     include_web: bool = True,
+    progress=None,
 ) -> dict:
     """Incrementally update every registered directory folder (and web sources).
 
@@ -903,7 +1274,7 @@ def update_all(
             continue
         try:
             results.append(update_folder(p, project=entry.get("project"),
-                                         force=force, verbose=verbose))
+                                         force=force, verbose=verbose, progress=progress))
         except Exception as e:
             if verbose:
                 print(f"  ✗  {raw}: {e}")
@@ -933,6 +1304,89 @@ def _bm25_score(query_terms: set[str], text: str) -> float:
     return hits / len(query_terms)
 
 
+# ── Compact index (what a search needs without parsing every chunk's text) ─────
+#
+# metadata.json holds every chunk's full text: 449 MiB for the live 297k-chunk index. A
+# search used to json.load all of it (0.85 s of a 1.1 s search, ~1.2 GB of transient RAM)
+# to score vectors that take 0.03 s. A generation is immutable, so the parts a search needs
+# are derived once and kept beside it, memory-mapped: per-chunk file/project/lines ids, and
+# the texts as one byte blob plus offsets, read only for the handful of hits.
+
+_LIGHT_FILES = ("light_rows.npz", "light_tables.json", "texts.bin", "text_offsets.npy")
+_light_cache: dict = {}
+
+
+class _Light:
+    def __init__(self, live: Path, n: int):
+        rows = np.load(str(live / "light_rows.npz"))
+        self.f_idx, self.p_idx, self.lines = rows["f_idx"], rows["p_idx"], rows["lines"]
+        tables = json.loads((live / "light_tables.json").read_text())
+        self.files, self.projects = tables["files"], tables["projects"]
+        self.offsets = np.load(str(live / "text_offsets.npy"), mmap_mode="r")
+        self.blob = np.memmap(str(live / "texts.bin"), dtype=np.uint8, mode="r") if self.offsets[-1] else b""
+        self.n = n
+
+    def text(self, i: int) -> str:
+        a, b = int(self.offsets[i]), int(self.offsets[i + 1])
+        return bytes(self.blob[a:b]).decode("utf-8", "replace") if b > a else ""
+
+
+def _build_light(live: Path, metadata: list) -> None:
+    """Write the compact index for the generation at `live`. Atomic: every file is
+    written under a temp name and renamed, and the marker goes last."""
+    n = len(metadata)
+    files: dict = {}
+    projects: dict = {}
+    f_idx = np.empty(n, dtype=np.int32)
+    p_idx = np.empty(n, dtype=np.int32)
+    lines = np.zeros((n, 2), dtype=np.int32)
+    offsets = np.zeros(n + 1, dtype=np.int64)
+    tmp = {name: live / (name + ".tmp") for name in _LIGHT_FILES}
+    with open(tmp["texts.bin"], "wb") as blob:
+        pos = 0
+        for i, m in enumerate(metadata):
+            f_idx[i] = files.setdefault(m["file"], len(files))
+            p_idx[i] = projects.setdefault(m.get("project", ""), len(projects))
+            ln = m.get("lines") or [0, 0]
+            lines[i] = (ln[0], ln[1])
+            raw = (m.get("text") or "").encode("utf-8")
+            blob.write(raw)
+            pos += len(raw)
+            offsets[i + 1] = pos
+    with open(tmp["light_rows.npz"], "wb") as f:
+        np.savez(f, f_idx=f_idx, p_idx=p_idx, lines=lines)
+    with open(tmp["text_offsets.npy"], "wb") as f:
+        np.save(f, offsets)
+    tmp["light_tables.json"].write_text(json.dumps({"files": list(files), "projects": list(projects)}))
+    for name in _LIGHT_FILES:
+        os.replace(tmp[name], live / name)
+    (live / "light.ok").write_text(str(n))             # last: its presence means all of the above is whole
+
+
+def _load_light(n_vectors: int) -> "_Light":
+    live = _live_dir()
+    key = (os.path.realpath(live), n_vectors)
+    hit = _light_cache.get("k")
+    if hit and hit[0] == key:
+        return hit[1]
+    marker = live / "light.ok"
+    try:
+        ready = marker.read_text().strip() == str(n_vectors) and all((live / f).exists() for f in _LIGHT_FILES)
+    except OSError:
+        ready = False
+    if not ready:
+        with open(_meta_path()) as f:
+            metadata = json.load(f)                    # one-time, per generation
+        if len(metadata) != n_vectors:
+            raise RagIndexMismatch(
+                f"the index is inconsistent: {n_vectors} vectors but {len(metadata)} chunks. "
+                f"Rebuild it with /rag clear, then re-index.")
+        _build_light(live, metadata)
+    light = _Light(live, n_vectors)
+    _light_cache["k"] = (key, light)
+    return light
+
+
 # ── Search ─────────────────────────────────────────────────────────────────────
 
 def search(
@@ -943,68 +1397,62 @@ def search(
     path_prefix: str | None = None,
 ) -> list[dict]:
     import os
-    import torch
 
     _migrate_legacy()
     if not (_emb_path().exists() and _meta_path().exists()):
         return []
-    # mmap: the matrix stays on disk and is paged in as the matmul reads it,
-    # instead of being parsed into RAM and then copied again by torch.tensor().
+    # mmap: the matrix stays on disk and is paged in as the matmul reads it.
     embeddings = np.load(str(_emb_path()), mmap_mode="r")
-    with open(_meta_path()) as f:
-        metadata = json.load(f)
-    if embeddings.ndim != 2 or len(metadata) == 0:
+    if embeddings.ndim != 2 or embeddings.shape[0] == 0:
         return []
-    if len(metadata) != embeddings.shape[0]:
-        raise RagIndexMismatch(
-            f"the index is inconsistent: {embeddings.shape[0]} vectors but {len(metadata)} chunks. "
-            f"Rebuild it with /rag clear, then re-index.")
+    light = _load_light(embeddings.shape[0])
 
-    query_vec = _embed([query])[0]
+    # Until /rag-reembed finishes, the live index may have been built by an older
+    # embedder; its queries must come from that same model or the neighbours are wrong.
+    _built = read_manifest().get("embed_model")
+    query_vec = _embed([query], query=True,
+                       model_name=_built if _built and _built != EMBED_MODEL else None)[0]
     if query_vec.shape[0] != embeddings.shape[1]:
         raise RagIndexMismatch(
             f"the index holds {embeddings.shape[1]}-dim vectors but '{_active_embed_model}' "
-            f"produces {query_vec.shape[0]}. Rebuild with /rag clear.")
-    scores = torch.from_numpy(np.ascontiguousarray(embeddings @ np.asarray(query_vec, dtype=np.float32)))
+            f"produces {query_vec.shape[0]}. Run /rag-reembed to rebuild it.")
+    scores = np.ascontiguousarray(embeddings @ np.asarray(query_vec, dtype=np.float32))
 
+    keep = None
     if project:
-        mask = torch.tensor(
-            [1.0 if m["project"] == project else 0.0 for m in metadata],
-            dtype=torch.float32,
-        )
-        scores = scores * mask
-
+        keep = np.array([p == project for p in light.projects])[light.p_idx]
     if path_prefix:
         # Keep only chunks whose file lives under path_prefix (separator-safe).
         prefix_with_sep = path_prefix.rstrip(os.sep) + os.sep
-        mask = torch.tensor(
-            [1.0 if m["file"].startswith(prefix_with_sep) else 0.0 for m in metadata],
-            dtype=torch.float32,
-        )
-        scores = scores * mask
+        under = np.array([f.startswith(prefix_with_sep) for f in light.files])[light.f_idx]
+        keep = under if keep is None else (keep & under)
+    if keep is not None:
+        scores = np.where(keep, scores, 0.0)
 
-    k = min(top_k * 2, len(metadata))
-    top_scores, top_indices = torch.topk(scores, k)
+    k = min(top_k * 2, len(scores))
+    top = np.argpartition(-scores, k - 1)[:k] if k < len(scores) else np.arange(len(scores))
+    top = top[np.argsort(-scores[top])]
 
     query_terms = set(query.lower().split())
     results = []
     seen_files: dict[str, int] = {}
-    for score, idx in zip(top_scores.tolist(), top_indices.tolist()):
+    for idx in top.tolist():
+        score = float(scores[idx])
         if score < min_score:
             break
-        meta      = metadata[idx]
-        file_path = meta["file"]
+        file_path = light.files[light.f_idx[idx]]
         if seen_files.get(file_path, 0) >= 2:
             continue
         seen_files[file_path] = seen_files.get(file_path, 0) + 1
-        bm25 = _bm25_score(query_terms, meta["text"])
+        text = light.text(idx)
+        bm25 = _bm25_score(query_terms, text)
         hybrid = round(0.75 * score + 0.25 * bm25, 3)
         results.append({
             "file":    file_path,
-            "project": meta["project"],
-            "lines":   meta["lines"],
+            "project": light.projects[light.p_idx[idx]],
+            "lines":   [int(light.lines[idx][0]), int(light.lines[idx][1])],
             "score":   hybrid,
-            "text":    meta["text"],
+            "text":    text,
         })
         if len(results) >= top_k * 2:
             break

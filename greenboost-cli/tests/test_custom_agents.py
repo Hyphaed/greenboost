@@ -44,7 +44,9 @@ def test_commands_registered():
     assert "agents" in COMMAND_TABLE and "agent" in COMMAND_TABLE
 
 
-def test_only_greenboost_folders_are_searched(tmp_path, monkeypatch):
+def test_greenboost_folders_win_and_claude_code_folders_are_also_searched(tmp_path, monkeypatch):
+    # Changed 2026-10-30: GB-CLI must run the agents already defined for Claude
+    # Code (.claude/agents), after its own folders, which keep precedence.
     monkeypatch.chdir(tmp_path)
     home = tmp_path / "home"
     for d in (".claude/agents", ".greenboost_cli/agents"):
@@ -53,4 +55,25 @@ def test_only_greenboost_folders_are_searched(tmp_path, monkeypatch):
     (home / ".greenboost_cli/agents/mine.md").write_text("x")
     _mk(tmp_path, "proj", "x", where=".claude/agents")
     monkeypatch.setattr(custom.Path, "home", classmethod(lambda cls: home))
-    assert set(custom.discover(tmp_path)) == {"mine"}
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    found = custom.discover(tmp_path)
+    assert set(found) == {"mine", "other", "proj"}
+    assert found["mine"].path.parent.name == "agents" and ".greenboost_cli" in str(found["mine"].path)
+
+
+def test_claude_code_agents_are_found_and_subagent_type_falls_back(tmp_path, monkeypatch):
+    from pathlib import Path
+    from greenboost_cli.agents import custom, subagent
+    home = tmp_path / "h"
+    (home / ".claude" / "agents").mkdir(parents=True)
+    (home / ".claude" / "agents" / "lookup.md").write_text(
+        "---\nname: lookup\ndescription: find things\ntools: Bash, Read, Grep, Glob\nmodel: haiku\n---\nBe brief.")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.chdir(tmp_path)
+    assert "lookup" in custom.discover()
+
+    calls = []
+    monkeypatch.setattr(subagent, "delegate", lambda prompt, **kw: calls.append(kw.get("tools")) or "ok")
+    assert subagent.delegate_named("x", agent="Explore", lenient=True) == "ok"
+    assert subagent.delegate_named("x").startswith("ok")
+    assert subagent.delegate_named("x", agent="nope").startswith("Error: no agent named")

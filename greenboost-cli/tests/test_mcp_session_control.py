@@ -84,3 +84,63 @@ def test_the_slash_commands_are_registered():
     from greenboost_cli.terminal.commands import COMMAND_TABLE
     for c in ("mcp-servers", "mcp-off", "mcp-on", "mcp-only", "mcp-all"):
         assert c in COMMAND_TABLE, f"/{c} not registered"
+
+
+def test_mcp_servers_reports_what_the_prompt_really_carries_not_the_sum_of_full_schemas():
+    from greenboost_cli.mcp.client import MCPRegistry
+    from greenboost_cli.slash_commands import mcp_session_cmds as M
+
+    class _C:
+        connected = True
+        def __init__(self, name):
+            self.name = name
+            self.tools = [{"name": f"tool_{i}", "description": "d" * 300,
+                           "inputSchema": {"type": "object", "properties": {f"p{j}": {"type": "string", "description": "x" * 80} for j in range(12)}}}
+                          for i in range(40)]
+        def connect(self): return True
+        def close(self): pass
+
+    reg = MCPRegistry()
+    reg._clients["big"] = _C("big")
+    reg.connect_all()
+    full = reg.schema_cost("big")
+    sent, listed, total = M._sent_to_model(reg, {})
+    assert total == 40 and full > 10_000
+    assert sent < full * 0.6            # the cap and light schemas cut it
+    assert listed <= total
+
+
+def test_mcp_servers_table_columns_line_up_whatever_the_name_length(monkeypatch):
+    import io
+    import types
+    from rich.console import Console
+    from greenboost_cli.mcp.client import MCPRegistry
+    from greenboost_cli.slash_commands import mcp_session_cmds as M
+
+    class _C:
+        connected = True
+        def __init__(self, name, n):
+            self.name = name
+            self.tools = [{"name": f"t{i}", "description": "d", "inputSchema": {"type": "object"}} for i in range(n)]
+        def connect(self): return True
+        def close(self): pass
+
+    reg = MCPRegistry()
+    for name, n in (("semble", 2), ("greenboost-orchestrator", 23), ("svg-animation-studio", 70)):
+        reg._clients[name] = _C(name, n)
+    reg.connect_all()
+    reg.set_dormant({"semble"})
+    buf = io.StringIO()
+    monkeypatch.setattr(M, "console", Console(file=buf, width=140, color_system=None))
+    M._show(types.SimpleNamespace(mcp_registry=reg), {})
+    lines = [l for l in buf.getvalue().splitlines() if l.strip()]
+    header = next(l for l in lines if l.strip().startswith("server"))
+    end_of_tools = header.index("tools") + len("tools")
+    rows = [l for l in lines if l.strip().split()[0] in ("semble", "greenboost-orchestrator", "svg-animation-studio")]
+    assert len(rows) == 3
+    for r in rows:                               # the tools count ends under the end of "tools"
+        assert r[:end_of_tools].rstrip().split()[-1].isdigit(), r
+    # and the token column is right-aligned under its heading, so the three numbers end together
+    ends = {r.rstrip().rfind(r.split()[-1]) + len(r.split()[-1]) for r in rows}
+    assert len(ends) == 1, ends
+    assert max(ends) == header.index("~prompt tokens") + len("~prompt tokens")

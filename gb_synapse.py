@@ -5835,6 +5835,40 @@ def _kill_process_group(pid: int) -> None:
             pass
 
 
+def _wait_for_release(pids, timeout_s: float = 45.0) -> float:
+    """Block until the stopped server's processes are gone AND the card's free VRAM has stopped rising.
+
+    stop() used to send SIGTERM and return, so a restart planned against a card the old server still
+    held. Measured 2026-10-30: the free-VRAM reading taken right after stop() was 3.1 and 6.9 GB on a
+    card that frees to 11.5 GB; the expert-cache plan then saw no room, kept no cache, and the model
+    ran at about 54 tok/s instead of 122-138 (`/llamaserve restart` waits one second: not enough
+    for a 13 GB model). Escalates to SIGKILL after 20 s. Returns the seconds waited. Never raises."""
+    t0 = time.time()
+    try:
+        pids = [p for p in pids if p]
+        while time.time() - t0 < timeout_s and any(_pid_alive(p) for p in pids):
+            if time.time() - t0 > 20.0:
+                for p in pids:
+                    if _pid_alive(p):
+                        try:
+                            os.killpg(os.getpgid(p), signal.SIGKILL)
+                        except OSError:
+                            pass
+            time.sleep(0.25)
+        from gb_nvml import get_nvml
+        last, stable = None, 0
+        while time.time() - t0 < timeout_s:
+            free_mb = get_nvml(0).mem()[1]
+            stable = stable + 1 if (last is not None and abs(free_mb - last) < 64) else 0
+            last = free_mb
+            if stable >= 2:                           # two readings 0.5 s apart, within 64 MiB
+                break
+            time.sleep(0.5)
+    except Exception:  # noqa: BLE001 - a wait is never worth failing a stop for
+        pass
+    return time.time() - t0
+
+
 def _teardown_feeders(model: str, st: "ServerState") -> None:
     """Best-effort cluster-side teardown for stop().
 
@@ -5921,9 +5955,11 @@ def stop(model: str) -> bool:
                                      "started_ts": getattr(st, "started_ts", None)})
         except Exception:
             pass  # telemetry must never block a stop
-        for pid in (st.llama_pid, st.proxy_pid, st.embed_pid):
-            if pid and _pid_alive(pid):
-                _kill_process_group(pid)
+        _killed = [pid for pid in (st.llama_pid, st.proxy_pid, st.embed_pid) if pid and _pid_alive(pid)]
+        for pid in _killed:
+            _kill_process_group(pid)
+        if _killed:
+            _wait_for_release(_killed)        # a restart must plan against the card the old server really freed
         _teardown_feeders(model, st)
         _run_state_path(model).unlink(missing_ok=True)
         return True

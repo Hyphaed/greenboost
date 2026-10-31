@@ -229,13 +229,17 @@ def delegate(prompt: str, *, label: str = "delegate",
 
 
 def delegate_named(prompt: str, *, label: str = "delegate", agent: str = "",
-                   parent_policy=None, **kw) -> str:
+                   parent_policy=None, lenient: bool = False, **kw) -> str:
     """delegate(), optionally as a user-defined markdown agent (agents/custom.py)."""
     if not agent:
         return delegate(prompt, label=label, parent_policy=parent_policy, **kw)
     from greenboost_cli.agents import custom
     defs = custom.discover()
     a = defs.get(agent.lower())
+    if a is None and lenient:
+        # A Claude-style subagent_type with no file behind it ("general-purpose",
+        # "Explore", "Plan"): run a general delegate rather than failing the call.
+        return delegate(prompt, label=label, parent_policy=parent_policy, **kw)
     if a is None:
         return (f"Error: no agent named {agent!r}. Available: "
                 f"{', '.join(sorted(defs)) or 'none'}. Omit `agent` to delegate to a general one.")

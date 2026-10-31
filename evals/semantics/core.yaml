@@ -877,3 +877,41 @@
   kind: segment
   name: tool_result_dominates_turn
   source: live
+
+# ── greenboost-cli and the expert cache (2026-10-30) ───────────────────────
+- id: moe_cache_mib_exact
+  kind: metric
+  name: moe_cache_mib
+  source: fixture
+  expect: {value: 0}
+  question: "How big is the GPU expert cache of the current MoE serve?"
+
+- id: moe_cache_skipped_no_room_fires
+  kind: segment
+  name: moe_cache_skipped_no_room
+  source: fixture
+  category: trap
+  expect: {matched: true}
+  question: "Why is decode a third of the speed it should be?"
+
+- id: cli_mcp_servers_connected_exact
+  kind: metric
+  name: cli_mcp_servers_connected
+  source: fixture
+  expect: {value: 1}
+  question: "How many MCP servers is greenboost-cli connected to?"
+
+- id: cli_mcp_none_connected_no_match
+  kind: segment
+  name: cli_mcp_none_connected
+  source: fixture
+  expect: {matched: false}
+  question: "Did greenboost-cli connect to no MCP servers at all?"
+
+- id: cli_web_tool_error_pct_exact
+  kind: metric
+  name: cli_web_tool_error_pct
+  source: fixture
+  expect: {value: 25.0}
+  question: "How often are the web tools failing?"
+

@@ -142,15 +142,12 @@ def _forge_quantize(args: str, session, settings: dict) -> None:
 
 def _forge_status(args: str, session, settings: dict) -> None:
     """Show MCP registry status: connected servers, tool counts."""
-    from greenboost_cli.mcp.client import discover_mcp_json
+    from greenboost_cli.mcp.config import discover_mcp_servers
 
     console.print(f"\n  [{VIOLET}]◈[/]  [{VIOLET}]forge status[/]\n")
 
-    mcp_path = discover_mcp_json()
-    if not mcp_path:
-        console.print(f"  [{GRAY}]No .mcp.json found in current directory tree.[/]")
-    else:
-        console.print(f"  [{GRAY}].mcp.json: {mcp_path}[/]")
+    _n = len(discover_mcp_servers())
+    console.print(f"  [{GRAY}]{_n} MCP server(s) configured (Claude Code config + .mcp.json)[/]")
 
     registry = getattr(session, "mcp_registry", None)
     if registry is None:
@@ -184,13 +181,14 @@ def _forge_status(args: str, session, settings: dict) -> None:
 
 
 def _forge_connect(args: str, session, settings: dict) -> None:
-    """Connect / reconnect MCP servers from .mcp.json."""
+    """Connect / reconnect MCP servers (Claude Code config + .mcp.json)."""
     import threading
-    from greenboost_cli.mcp.client import discover_mcp_json, MCPRegistry
+    from greenboost_cli.mcp.client import MCPRegistry
+    from greenboost_cli.mcp.config import discover_mcp_servers
 
-    mcp_path = discover_mcp_json()
-    if not mcp_path:
-        emit_err("No .mcp.json found in the current directory tree.")
+    specs = discover_mcp_servers()
+    if not specs:
+        emit_err("No MCP servers found in ~/.claude.json, $CLAUDE_CONFIG_DIR/.claude.json or .mcp.json.")
         return
 
     # Disconnect existing registry
@@ -198,12 +196,12 @@ def _forge_connect(args: str, session, settings: dict) -> None:
     if old:
         old.close_all()
 
-    registry = MCPRegistry.from_mcp_json(mcp_path)
+    registry = MCPRegistry.from_config(specs)
     session.mcp_registry = registry
 
     servers = registry.server_names()
     if not servers:
-        emit_warn("No servers defined in .mcp.json")
+        emit_warn("No MCP servers defined")
         return
 
     console.print(f"\n  [{VIOLET}]◈[/]  Connecting {len(servers)} MCP server(s)…\n")

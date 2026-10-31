@@ -2230,6 +2230,18 @@ def _start_flight_recorder() -> None:
         print(f"[gb-synapse-api] flight recorder unavailable: {exc}", flush=True)
 
 
+def run_server(app: "web.Application", host: str, port: int) -> None:
+    """Serve `app`, cancelling a request's handler when its client disconnects.
+
+    handler_cancellation=True is what lets a Ctrl-C/Esc in greenboost-cli stop the
+    engine: without it the handler keeps awaiting llama-server while the client is
+    gone, and a request still reading its prompt isn't noticed as dead until the
+    first token is written (minutes on a deep context). Cancelling the handler
+    closes the upstream connection, which llama-server treats as an abort.
+    """
+    web.run_app(app, host=host, port=port, print=None, handler_cancellation=True)
+
+
 def main() -> None:
     global UPSTREAM, MODEL_NAME, ENGINE, BIND, IDLE_TTL_S
     ap = argparse.ArgumentParser(description="gb-synapse API proxy")
@@ -2263,7 +2275,7 @@ def main() -> None:
           f"(auth={'token' if _resolve_token() else 'loopback-only'})",
           flush=True)
     _start_flight_recorder()
-    web.run_app(build_app(), host=BIND, port=args.port, print=None)
+    run_server(build_app(), BIND, args.port)
 
 
 if __name__ == "__main__":

@@ -132,6 +132,31 @@ def _html_to_text(body: str) -> str:
     return re.sub(r"[ \t]+", " ", re.sub(r"(?s)<[^>]+>", " ", body)).strip()
 
 
+def _user_agent() -> str:
+    """Descriptive UA with a contact URL. "greenboost-cli/1 (+local)" was refused
+    by Wikipedia (HTTP 403) while the same request with a contact URL gets 200;
+    sites that follow the Wikimedia UA policy want to know who is asking."""
+    return os.environ.get(
+        "GB_WEBFETCH_UA",
+        "greenboost-cli/1 (local AI agent; +https://github.com/Hyphaed/greenboost)")
+
+
+_BOT_WALL_MARKS = ("just a moment", "cf_chl", "cf-chl", "attention required",
+                   "verify you are human", "captcha", "access denied", "px-captcha")
+
+
+def _block_hint(body: str) -> str:
+    """Name the wall in the error. The body used to be thrown away, so a
+    Cloudflare challenge looked identical to a missing page."""
+    head = body[:6000].lower()
+    m = re.search(r"<title[^>]*>(.*?)</title>", body[:6000], re.I | re.S)
+    title = re.sub(r"\s+", " ", m.group(1)).strip()[:80] if m else ""
+    wall = any(k in head for k in _BOT_WALL_MARKS)
+    if not (title or wall):
+        return ""
+    return (f' ("{title}"' if title else " (") + (", looks like a bot check" if wall else "") + ")"
+
+
 def fetch(url: str, *, resolver=None, client_factory=None) -> str:
     """Fetch `url` as readable text under every rule above. Returns the text, or
     an "Error: ..." string (never raises)."""
@@ -157,7 +182,8 @@ def fetch(url: str, *, resolver=None, client_factory=None) -> str:
                 with client.stream("GET", target,
                                    headers={"Host": host if port in (80, 443) else f"{host}:{port}",
                                             "Accept": "text/html,text/plain,application/json;q=0.9,*/*;q=0.1",
-                                            "User-Agent": "greenboost-cli/1 (+local)"},
+                                            "Accept-Language": "en-US,en;q=0.8",
+                                            "User-Agent": _user_agent()},
                                    extensions={"sni_hostname": host}) as r:
                     if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("location"):
                         current = urljoin(current, r.headers["location"])
@@ -187,7 +213,7 @@ def fetch(url: str, *, resolver=None, client_factory=None) -> str:
         text = body if "json" in ctype or ctype.startswith("text/plain") else _html_to_text(body)
         _emit("ok", current, status_code=status, bytes=min(size, MAX_BYTES), truncated=truncated, hops=hop)
         if status >= 400:
-            return f"Error: {current} returned HTTP {status}"
+            return f"Error: {current} returned HTTP {status}{_block_hint(body)}"
         note = f"\n\n[download stopped at {MAX_BYTES:,} bytes]" if truncated else ""
         return text[:MAX_CHARS] + note
     _emit("blocked", current, "too many redirects")

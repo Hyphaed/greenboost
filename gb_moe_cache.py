@@ -123,6 +123,31 @@ def plan(*, n_layers: int, n_cpu_moe: int, dense_gb: float, expert_gb_total: flo
     return MoeCachePlan(mib, n_layers, f"free {budget_gb:.1f} GB - dense {dense_gb:.1f} - kv {kv_gb:.1f} - vision {vision_gb:.1f} - compute {compute:.1f} - mtp {draft:.1f} - safety {safety:.1f} = {room:.1f} GB of cache")
 
 
+#: llama.cpp's own default --ubatch-size: the floor of the step-down below.
+ENGINE_DEFAULT_UBATCH = 512
+
+
+def plan_with_ubatch(*, ubatch: Optional[int], **kw) -> "tuple[Optional[MoeCachePlan], Optional[int]]":
+    """plan() at the requested ubatch, else at each smaller one down to the engine default.
+    Returns (plan, ubatch_used); (None, None) when even the smallest leaves no room.
+
+    Why: a recipe's ubatch (2048 for qwen38-35b-a3b-apex-miniplus, a 1.81x cold-prefill win) is
+    charged linearly against the cache's room. At the free VRAM a real desktop leaves (9.5 and
+    8.9 GB, not 9.97) 2048 left no room, the cache was skipped and decode fell to ~54 tok/s
+    against 181 with it (cache + MTP depth 2). ubatch 1024 keeps 83% of the 2048 prefill
+    (2045 vs 2470 tok/s, the recipe's own table) and still fits the cache at those budgets, so
+    the largest ubatch that fits wins: decode is what a person waits on token by token."""
+    requested = ubatch or ENGINE_DEFAULT_UBATCH
+    rungs = [requested]
+    while rungs[-1] > ENGINE_DEFAULT_UBATCH:
+        rungs.append(max(ENGINE_DEFAULT_UBATCH, rungs[-1] // 2))
+    for ub in rungs:
+        p = plan(ubatch=ub, **kw)
+        if p is not None:
+            return p, ub
+    return None, None
+
+
 def engine_info(server_path, moecache_dir, vendored_dir=None) -> dict:
     """Which engine this llama-server is: kind ("moecache" | "vendored" | "other"), directory, version file content, and whether it accepts --moe-cache-mib. `engine_supports` runs the binary (cached)."""
     d = os.path.dirname(str(server_path))
@@ -153,6 +178,9 @@ def decision_event(*, model: str, plan_: Optional[MoeCachePlan], inputs: dict, e
     status, warn = "ok", ""
     if plan_ is not None and plan_.cache_mib < UNDER_GB_WARN * 1024:
         status, warn = "warn", f"expert cache only {plan_.cache_mib} MiB (< {UNDER_GB_WARN:g} GB): few hot experts stay resident"
+    elif skip == "not_enough_room":
+        status, warn = "warn", (f"no room for the GPU expert cache even at the smallest ubatch ({inputs.get('budget_gb', '?')} GB free): decode runs at the "
+                                f"non-cache speed, about a third of what the cache gives. Free VRAM (close other GPU jobs) and serve again")
     elif skip == "engine_without_flag":
         status, warn = "warn", "MoE experts are on the host and this engine has no --moe-cache-mib: sudo greenboost synapse build-moecache-engine && sudo greenboost synapse use-engine moecache"
     ev = {"node": "host", "label": "gb_moe_cache", "n_items": 1, "items": [model], "duration_s": 0.0, "status": status,
@@ -175,7 +203,7 @@ def emit_decision(**kw) -> None:
         pass
 
 
-LAST_FIELDS = ("ts", "model", "cache_mib", "n_cpu_moe", "mtp", "mtp_draft_n", "mtp_reason", "engine_kind", "engine_version", "skip_reason", "status", "budget_gb")
+LAST_FIELDS = ("ts", "model", "cache_mib", "n_cpu_moe", "mtp", "mtp_draft_n", "mtp_reason", "engine_kind", "engine_version", "skip_reason", "status", "budget_gb", "ubatch", "ubatch_requested")
 
 
 def last_decision(since_hours: float = 72.0) -> Optional[dict]:

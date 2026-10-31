@@ -59,6 +59,29 @@ _TEMPLATE: list[dict] = [
         # one at the wrong depth is not.
         "draft_n": 40, "draft_n_accepted": 26,
     },
+    # The serve that silently ran at a third of the speed: a MoE model with experts on the host and NO
+    # room for the GPU expert cache at the recipe's ubatch 2048 (the real case, 2026-10-30: budget 9.469 GB).
+    {
+        "node": NODE, "label": "gb_moe_cache", "kind": "moe_cache_plan", "status": "warn",
+        "n_items": 1, "items": ["fable-fusion-27b"], "duration_s": 0.0,
+        "model": "fable-fusion-27b", "cache_mib": 0, "n_cpu_moe": 28, "mtp": True, "mtp_draft_n": 4,
+        "mtp_reason": "on", "engine_kind": "moecache", "engine_version": "0893ec98f", "skip_reason": "not_enough_room",
+        "budget_gb": 9.469, "ubatch": 2048, "ubatch_requested": 2048,
+    },
+    # greenboost-cli MCP connects: one server up, one failed. Connected = the LATEST event per server that is ok.
+    {"node": NODE, "label": "greenboost-cli", "kind": "cli_mcp_connect", "status": "ok", "n_items": 1, "items": ["semble"],
+     "duration_s": 0.0, "server": "semble", "n_tools": 2, "ms": 800, "error": ""},
+    {"node": NODE, "label": "greenboost-cli", "kind": "cli_mcp_connect", "status": "error", "n_items": 1, "items": ["firefox-devtools"],
+     "duration_s": 0.0, "server": "firefox-devtools", "n_tools": 0, "ms": 30000, "error": "no initialize reply within 30s"},
+    # Web tool calls: 1 of 4 failed (a bot-walled WebFetch) = 25%.
+    {"node": NODE, "label": "greenboost-cli", "kind": "cli_tool_call", "status": "ok", "n_items": 1, "items": ["WebSearch"],
+     "duration_s": 0.0, "name": "WebSearch", "decision": "allowed", "outcome": "ok"},
+    {"node": NODE, "label": "greenboost-cli", "kind": "cli_tool_call", "status": "ok", "n_items": 1, "items": ["WebSearch"],
+     "duration_s": 0.0, "name": "WebSearch", "decision": "allowed", "outcome": "ok"},
+    {"node": NODE, "label": "greenboost-cli", "kind": "cli_tool_call", "status": "ok", "n_items": 1, "items": ["WebFetch"],
+     "duration_s": 0.0, "name": "WebFetch", "decision": "allowed", "outcome": "ok"},
+    {"node": NODE, "label": "greenboost-cli", "kind": "cli_tool_call", "status": "ok", "n_items": 1, "items": ["WebFetch"],
+     "duration_s": 0.0, "name": "WebFetch", "decision": "allowed", "outcome": "http_error"},
     # A game session that was stopped cleanly, followed by a NEWER
     # gaming_session event that carries no `orphans` field at all. That
     # ordering is the point: `orphans` is emitted only on

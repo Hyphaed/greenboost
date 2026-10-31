@@ -302,16 +302,33 @@
 - name: tok_s_decode
   entity: serve_session
   unit: tokens_per_second
-  doc: Client-OBSERVED decode throughput (gb_synapse.record_measured_tok_s(), fed from real GB-CLI turns) , never a synapse_recommend() estimate, which is a pre-serve fit projection, not a measurement.
+  doc: Sustained client-OBSERVED decode throughput (gb_synapse.record_measured_tok_s(), fed from real GB-CLI turns) , token-weighted over the last 10 completions of 100+ tokens , never a synapse_recommend() estimate and never one short reply.
   resolver: tok_s_decode
   source_fields: ["gb_dataflux.tok_s_measured.tok_s"]
   source_tier: measured
   direction: higher_is_better
   owner: GB-Synapse
   never_use:
+    - field: a single short completion's tok_s
+      why: "A 32-token reply measured 318.6 tok/s on the same server where a 399-token reply measured 58 and the status line showed 31-63: speculative decoding accepts several tokens at once on easy text. The resolver now weights by tokens over 100+ token completions."
     - field: synapse_recommend()'s fit-report estimate
       why: "A pre-serve projection based on VRAM fit math, not an observed rate. CLAUDE.md is explicit that measured tok/s beats estimated whenever they disagree."
   aliases: [tok_s, decode_speed, tokens_per_second]
+
+- name: moe_cache_mib
+  entity: serve_session
+  unit: MiB
+  doc: >
+    Size of the GPU expert cache (--moe-cache-mib) the latest MoE serve planned; 0 means none, with
+    the reason in raw_source (not_enough_room, disabled, engine_without_flag, no_experts_on_host).
+    For a MoE model with experts on the host this is the biggest decode lever on a 12 GB card:
+    54 tok/s without it, 93-181 with it (workflow/gb-moe-cache.md).
+  resolver: moe_cache_mib
+  source_fields: ["moe_cache_plan.cache_mib", "moe_cache_plan.skip_reason", "moe_cache_plan.ubatch"]
+  source_tier: measured
+  direction: higher_is_better
+  owner: GB-Synapse
+  aliases: [expert_cache_mib, moe_cache]
 
 - name: ttft_ms
   entity: serve_session
@@ -946,6 +963,42 @@
   source_tier: measured
   direction: lower_is_better
   owner: GB-CLI
+
+- name: cli_mcp_servers_connected
+  entity: node
+  unit: count
+  doc: >
+    How many MCP servers greenboost-cli is connected to, from the latest
+    cli_mcp_connect event per server. Servers come from Claude Code's config
+    (~/.claude.json, $CLAUDE_CONFIG_DIR/.claude.json, project entries) merged
+    with .mcp.json. Zero with servers configured means every connect failed;
+    the event carries the reason (/mcp-servers shows it too).
+  resolver: cli_mcp_servers_connected
+  source_fields: ["cli_mcp_connect.status", "cli_mcp_connect.server"]
+  source_tier: measured
+  direction: higher_is_better
+  owner: GB-CLI
+
+- name: cli_web_tool_error_pct
+  entity: node
+  unit: percent
+  doc: >
+    Share of WebSearch/WebFetch calls that failed: search backend bot
+    challenge, HTTP 403/429/503, bot wall. A rate above a few percent means
+    the web tools are being blocked, not that the model asked badly.
+  resolver: cli_web_tool_error_pct
+  source_fields: ["cli_tool_call.outcome", "cli_tool_call.name"]
+  source_tier: measured
+  direction: lower_is_better
+  owner: GB-CLI
+  never_use:
+    - field: result_chars
+      class: wrong_scope
+      why: >
+        A WebSearch result_chars of 16 is the literal "No results found".
+        Before 2026-10-30 a bot-challenged DuckDuckGo page produced exactly
+        that string and was logged outcome=ok, so a short result looked like
+        an empty web when the backend had actually refused the request.
 
 - name: agent_compaction_prefix_kept_pct
   entity: node

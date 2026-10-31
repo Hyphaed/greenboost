@@ -86,9 +86,10 @@
   segments: [below_quality_floor]
 
 - intent: serve_throughput
-  triggers: ["tok/s", "tokens per second", "decode speed", "how fast"]
-  metrics: [tok_s_decode]
-  segments: []
+  triggers: ["tok/s", "tokens per second", "decode speed", "how fast", "why is decode", "decode low",
+             "slow decode", "decode is slow", "expert cache", "moe cache", "why is it slow"]
+  metrics: [tok_s_decode, moe_cache_mib]
+  segments: [moe_cache_skipped_no_room]
   raw_tool_fallback: "greenboost-synapse.synapse_recommend"
 
 - intent: context_and_ctx
@@ -157,6 +158,21 @@
   segments: ["agent_eval_below_reference", "agent_hallucinating_tool_names"]
   raw_tool_fallback: >
     dataflux_events(kind="agent_eval_run") and kind="agent_tool_schema_miss".
+
+- intent: cli_mcp_connected
+  triggers:
+    - "are mcp servers connected"
+    - "mcp servers connected"
+    - "no mcp servers"
+    - "mcp tools missing"
+    - "cli cannot use mcp"
+    - "web search not working"
+    - "websearch returns nothing"
+    - "webfetch 403"
+  metrics: ["cli_mcp_servers_connected", "cli_web_tool_error_pct"]
+  segments: ["cli_mcp_none_connected"]
+  raw_tool_fallback: >
+    dataflux_events(kind="cli_mcp_connect") and kind="cli_tool_call" with name WebSearch/WebFetch.
 
 - intent: kv_in_t2
   triggers:

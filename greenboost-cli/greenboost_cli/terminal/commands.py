@@ -339,6 +339,44 @@ def _cmd_model_remove(name: str, settings: dict) -> bool:
     return True
 
 
+def _unregistered_hf_models(entries) -> list[tuple[str, str]]:
+    """Text LLMs sitting in the HuggingFace cache (`hf download`) that gb-synapse has not registered,
+    as (repo, verdict). `hf download` never touches the gb-synapse manifest, so /model list used to
+    hide them. MLX builds are Apple Silicon only; GGUF repos can be registered with `gb synapse pull`."""
+    import json
+    import os
+    from pathlib import Path
+    hub = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
+    known = {getattr(e, "repo", "") for e in entries}
+    out = []
+    for d in sorted(hub.glob("models--*")):
+        repo = d.name[len("models--"):].replace("--", "/", 1)
+        if repo in known:
+            continue
+        snaps = sorted((d / "snapshots").glob("*"), key=lambda s: s.stat().st_mtime, reverse=True)
+        if not snaps:
+            continue
+        files = [f.name for f in snaps[0].iterdir()]
+        try:
+            cfg = json.loads((snaps[0] / "config.json").read_text())
+        except Exception:
+            cfg = {}
+        arch = " ".join(cfg.get("architectures") or [])
+        is_gguf = any(f.endswith(".gguf") for f in files)
+        chat = "chat_template.jinja" in files or "chat_template" in (snaps[0] / "tokenizer_config.json").read_text() if (snaps[0] / "tokenizer_config.json").exists() else "chat_template.jinja" in files
+        if any(w in repo.lower() for w in ("embedding", "tts", "rerank", "musicgen", "toto", "tirex")):
+            continue
+        if not is_gguf and not (chat and ("CausalLM" in arch or "ConditionalGeneration" in arch)):
+            continue                                   # not a chat LLM (TTS, time series, embedders ...)
+        if "mlx" in repo.lower() or "mlx" in str(cfg.get("quantization", "")).lower():
+            out.append((repo, "MLX build: runs on Apple Silicon only, llama.cpp cannot load it on this CUDA card"))
+        elif any(f.endswith(".gguf") for f in files):
+            out.append((repo, f"not registered yet: run  gb synapse pull {repo}"))
+        else:
+            out.append((repo, "safetensors: register with  gb synapse pull " + repo + "  (served by the torch engine)"))
+    return out
+
+
 def _cmd_model_list(_session, settings: dict) -> bool:
     """Arrow-key picker over every model gb-synapse knows about (HuggingFace-
     pulled or Ollama-indexed) — all served the same way, through gb-synapse's
@@ -349,6 +387,8 @@ def _cmd_model_list(_session, settings: dict) -> bool:
     except Exception as e:
         emit_err(f"Could not load gb-synapse manifest: {e}")
         return True
+    for repo, verdict in _unregistered_hf_models(entries):
+        emit_warn(f"Downloaded but not selectable: [{VIOLET}]{repo}[/]  ({verdict})")
     if not entries:
         emit_info("No models yet — run /fetch-model huggingface  or  /fetch-model ollama")
         return True
@@ -414,9 +454,19 @@ def _warn_if_model_exceeds_vram(model: str) -> None:
         if model_mb <= vram_mb * 0.85:
             return
 
+        if getattr(match, "is_moe", False) and getattr(match, "dense_bytes", 0):
+            # A mixture-of-experts model is not "too big": the always-active weights go on the card, the
+            # experts stay in host RAM and a GPU cache holds the hot ones (sized from free VRAM at load).
+            dense_gb = match.dense_bytes / 1024 ** 3
+            if dense_gb * 1024 <= vram_mb * 0.85:
+                emit_info(f"{bare_name} is a mixture-of-experts model: {dense_gb:.1f} GB of always-active "
+                          f"weights go on the GPU, the experts stay in host RAM with a GPU cache of the hot "
+                          f"ones. That is the intended fast setup, nothing to change.")
+                return
+
         smaller = sorted(
             (e for e in entries if e.n_bytes and e.n_bytes / (1024 * 1024) <= vram_mb * 0.85
-             and e.name != bare_name),
+             and e.name != bare_name and "embed" not in e.name.lower() and "embed" not in (e.arch or "").lower()),
             key=lambda e: -e.n_bytes,
         )
         emit_warn(
@@ -985,26 +1035,11 @@ def cmd_todo(_args: str, _session, _settings) -> bool:
     return True
 
 
-def cmd_exit(_args: str, _session, _settings) -> bool:
-    from greenboost_cli.terminal.repl import request_shutdown, release_memory_pool
-    emit_ok("Goodbye.")
-    # MCP autoconnect (repl.py's _mcp_autoconnect) starts a stdio subprocess
-    # per configured server and never closed it on exit before this — each
-    # /exit left every connected server (gb_synapse_mcp.py, gb_mcp.py, ...)
-    # running as an orphan, accumulating one set per session. close_all()
-    # already exists for the config-reload path (forge_cmds.py); this is
-    # the same call on the normal shutdown path.
-    registry = getattr(_session, "mcp_registry", None)
-    if registry is not None:
-        try:
-            registry.close_all()
-        except Exception:
-            pass
-    request_shutdown()
-    # After request_shutdown(), so restore_terminal() has already cleared the
-    # screen and this one confirmation line lands on a clean terminal.
-    release_memory_pool("/exit")
-    sys.exit(0)
+def cmd_exit(args: str, _session, _settings) -> bool:
+    """/exit, /quit: close cleanly and unload the model. `/exit keep` leaves it loaded."""
+    from greenboost_cli.terminal.repl import graceful_exit
+    graceful_exit(_session, _settings, "/exit", keep_model=args.strip().lower() == "keep")
+    return True
 
 
 def cmd_setup(_args: str, _session, settings) -> bool:

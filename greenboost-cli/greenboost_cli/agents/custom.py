@@ -7,8 +7,12 @@
     ---
     The system instructions for this agent...
 
-Search order, first hit wins: project `.greenboost/agents`, then `~/.greenboost_cli/agents`.
-Every agent runs on the one local model; there is no per-agent model."""
+Search order, first hit wins: project `.greenboost/agents`, `~/.greenboost_cli/agents`,
+then Claude Code's own agents: project `.claude/agents`, `$CLAUDE_CONFIG_DIR/agents`,
+`~/.claude/agents`, so the lookup/summarizer/hyperresearch-* agents already defined
+there work here unchanged.
+Every agent runs on the one local model; a Claude `model:` line (haiku, sonnet...) is
+ignored, there is no per-agent model."""
 from __future__ import annotations
 
 import re
@@ -26,7 +30,15 @@ class AgentDef:
 
 
 def _dirs(cwd: "Path | None" = None) -> "list[Path]":
-    return [(cwd or Path.cwd()) / ".greenboost" / "agents", Path.home() / ".greenboost_cli" / "agents"]
+    import os
+    cwd = cwd or Path.cwd()
+    dirs = [cwd / ".greenboost" / "agents", Path.home() / ".greenboost_cli" / "agents",
+            cwd / ".claude" / "agents"]
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if cfg:
+        dirs.append(Path(cfg).expanduser() / "agents")
+    dirs.append(Path.home() / ".claude" / "agents")
+    return dirs
 
 
 def _parse(path: Path) -> "AgentDef | None":

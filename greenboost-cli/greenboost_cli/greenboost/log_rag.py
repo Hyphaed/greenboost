@@ -113,7 +113,7 @@ def search_logs(query: str, top_k: int = 20) -> list[dict]:
         return []
     try:
         from greenboost_cli.rag.engine import _embed
-        q_emb = _embed([query])
+        q_emb = _embed([query], query=True)
         scores = (emb @ q_emb.T).flatten()
         top_idx = np.argsort(scores)[::-1][:top_k]
         results = []

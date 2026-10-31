@@ -171,17 +171,58 @@ def test_search_ranks_by_similarity_using_the_mmapped_matrix(rag, monkeypatch):
     emb = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0.9, 0.1, 0, 0]], dtype=np.float32)
     meta = [{"file": f"/p/f{i}.py", "project": "p", "lines": [1, 1], "text": f"chunk {i}"} for i in range(3)]
     E._save_store(emb, meta)
-    monkeypatch.setattr(E, "_embed", lambda texts: np.array([[1, 0, 0, 0]], dtype=np.float32))
+    monkeypatch.setattr(E, "_embed", lambda texts, **kw: np.array([[1, 0, 0, 0]], dtype=np.float32))
     hits = E.search("anything", top_k=2, min_score=0.1)
     assert [h["file"] for h in hits] == ["/p/f0.py", "/p/f2.py"]
 
 
 def test_search_refuses_a_query_from_a_different_dimension(rag, monkeypatch):
     E._save_store(_vecs(2), _meta(2))
-    monkeypatch.setattr(E, "_embed", lambda texts: np.ones((1, DIM + 3), dtype=np.float32))
+    monkeypatch.setattr(E, "_embed", lambda texts, **kw: np.ones((1, DIM + 3), dtype=np.float32))
     with pytest.raises(E.RagIndexMismatch):
         E.search("q")
 
 
 def test_search_on_an_empty_store_returns_nothing(rag):
     assert E.search("q") == []
+
+
+def test_scan_skips_lockfiles_minified_files_and_build_output_but_keeps_real_source(tmp_path):
+    from pathlib import Path as P
+    root = tmp_path / "proj"
+    keep = ["src/app.py", "src/build_tools.py", "docs/notes.md", "build-scripts-not-output.md"]
+    skip = ["package-lock.json", "pnpm-lock.yaml", "web/app.min.js", "web/app.js.map",
+            "build-synapse/tools/ui.ts", "cmake-build-debug/x.cpp", ".mcp-cache/r.json",
+            "node_modules/x/index.js", "dist/bundle.js", "poetry.lock"]
+    for rel in keep + skip:
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x = 1\n")
+    got = {str(f.relative_to(root)) for f in E._scan_folder_files(root)}
+    assert set(keep) <= got, set(keep) - got
+    assert not (got & set(skip)), got & set(skip)
+
+
+def test_a_search_reads_the_compact_index_not_the_full_metadata(rag, monkeypatch):
+    """metadata.json is 449 MiB on the live index; a search must not parse it (0.85 s of 1.1 s)."""
+    E._save_store(_vecs(4, 1.0), _meta(4, "s"))
+    live = E._live_dir()
+    assert (live / "light.ok").exists()                              # written by _save_store
+    (live / "metadata.json").write_text("this is not json")          # if search touched it, it would raise
+    E._light_cache.clear()
+    monkeypatch.setattr(E, "_embed", lambda texts, **kw: np.array([[1, 0, 0, 0]], dtype=np.float32))
+    res = E.search("anything", top_k=2, min_score=0.0)
+    assert res and all("text" in r and r["file"] for r in res)
+
+
+def test_a_generation_without_the_compact_index_gets_one_on_first_search(rag, monkeypatch):
+    E._save_store(_vecs(4, 1.0), _meta(4, "s"))
+    live = E._live_dir()
+    for name in E._LIGHT_FILES + ("light.ok",):
+        (live / name).unlink()
+    E._light_cache.clear()
+    monkeypatch.setattr(E, "_embed", lambda texts, **kw: np.array([[1, 0, 0, 0]], dtype=np.float32))
+    before = E.search("q", top_k=3, min_score=0.0)
+    assert (live / "light.ok").exists()
+    E._light_cache.clear()
+    assert [r["file"] for r in E.search("q", top_k=3, min_score=0.0)] == [r["file"] for r in before]

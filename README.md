@@ -160,7 +160,7 @@ Where a result is bounded by physics rather than by tuning, it says so.
 | VRAM actually filled | 67-73% | 85.1% | measured KV cache replaces the formula |
 | Reference recipe at a 14.5k-token prompt | 4.74 tok/s | 7.18 tok/s (1.48x) | `kvCache: q4_0` pinned in the serving recipe |
 | That same recipe, 15-query needle test | 570 s | 135 s | same change, end to end |
-| MoE chat model (Qwen3.8-35B-A3B) on a 12 GB card, decode | 54 tok/s | 104-115 tok/s, with *less* VRAM | GPU expert cache (`--moe-cache-mib`) sized from free VRAM |
+| MoE chat model (Qwen3.8-35B-A3B) on a 12 GB card, decode | 54 tok/s | 104-115 tok/s with the cache alone, 118-138 tok/s with MTP stacked at depth 2 (measured 2026-10-30, 9 to 11 GB free), with *less* VRAM | GPU expert cache (`--moe-cache-mib`) sized from free VRAM; the recipe's ubatch steps down when the cache would not fit |
 | Real-ESRGAN tile | 108 ms, 685 MiB | 81.5 ms, 379 MiB | `channels_last` |
 | A 9B image model that didn't fit | ~7 min/image via DDR overflow | ~5 s/image | GB-Quant quantize-to-fit |
 | A diffusion pipeline with a second PC idle | ~5.5 min/generation | ~42 s (~7.8x) | GB-Cluster feeder GPU joins in |
@@ -216,7 +216,7 @@ detail lives in each subsystem's own section below.
 | MoE expert residency | The *hot* experts occupy VRAM, not an arbitrary subset | `gb_moe.py`, routing-frequency driven |
 | Lossless cold-expert compression | Cold experts cost less RAM without losing a bit | `gb_moe.py`, decompress on prefetch |
 | Dense-LLM layer prefetch | Next layer's weights in flight while this one computes | `gb_prefetch.py` |
-| GPU expert cache for MoE models | All experts on the host, a cache of the hot ones on the GPU, sized from free VRAM: 54 -> 104-115 tok/s on the reference model | `gb_moe_cache.py`, `GB_MOE_CACHE`, `synapse build-moecache-engine` |
+| GPU expert cache for MoE models | All experts on the host, a cache of the hot ones on the GPU, sized from free VRAM: 54 -> 104-115 tok/s on the reference model (118-138 with MTP depth 2) | `gb_moe_cache.py`, `GB_MOE_CACHE`, `synapse build-moecache-engine` |
 | fp8 for convolutions | Conv weights (UNets, upscalers, video VAEs) stored as fp8 with per-channel scales, above 256 MiB of conv weights | `gb_quant_conv.py`, `GB_QUANT_CONV` |
 | GPU-aware fp8 advice | Which fp8 path suits which model kind on the detected GPU | `quant_advisor` MCP (`fp8_paths`) |
 | Attention backend | cuDNN first on consumer Blackwell (5-10% faster at head_dim 128) | `gb_sdpa.py`, `GB_ATTN_BACKEND` |

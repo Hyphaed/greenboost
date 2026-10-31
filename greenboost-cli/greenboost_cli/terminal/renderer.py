@@ -742,7 +742,7 @@ def show_instrument_result(name: str, result: str, verbose: bool) -> None:
 
     if _quiet_mode:
         if is_error:
-            err_text = result[:80].replace("\n", " ")
+            err_text = " ".join(result.split())[:max(20, safe_w - len(name) - 12)]
             if _pt_live():
                 from rich.markup import escape as _esc_q
                 console.print(f"  [{AMBER}]✗  {name}  {_esc_q(err_text)}  [{t}][/]")
@@ -769,8 +769,8 @@ def show_instrument_result(name: str, result: str, verbose: bool) -> None:
         return
 
     if is_error:
-        err_text = result[:80].replace("\n", " ")
-        console.print(f"  [{AMBER}]  {_CC_TREE} ✗  {escape(err_text[:safe_w])}[/]")
+        err_text = " ".join(result.split())
+        console.print(f"  [{AMBER}]  {_CC_TREE} ✗  {escape(err_text[:max(20, safe_w - 8)])}[/]")
         return
 
     # ── TodoWrite: render live task board ──────────────────────────────────────

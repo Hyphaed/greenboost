@@ -124,3 +124,46 @@ def test_emit_decision_writes_the_event(tmp_path, monkeypatch):
     mc.emit_decision(model="m", plan_=_plan(4000), inputs={"budget_gb": 9.0}, engine={"kind": "moecache", "supports_cache": True}, n_cpu_moe=30, is_moe=True, mtp=False, mtp_draft_n=0)
     ev = [e for e in gb_dataflux.read_events(since_hours=1) if e.get("kind") == "moe_cache_plan"]
     assert ev and ev[-1]["cache_mib"] == 4000
+
+
+# ---- ubatch step-down (2026-10-30): a recipe's ubatch must not cost the cache ---------------------------------------------------------------
+# The real inputs of qwen38-35b-a3b-apex-miniplus at ctx 32768 f16 (measured KV 409 MiB), MTP on, n_cpu_moe 28 from the recipe.
+REAL = dict(n_layers=40, n_cpu_moe=28, dense_gb=1.54, expert_gb_total=12.19, kv_gb=0.40, vision_gb=0.0, mtp=True)
+
+
+def test_the_logged_serves_are_reproduced_exactly_by_the_arithmetic(monkeypatch):
+    monkeypatch.delenv("GB_MOE_CACHE", raising=False)
+    assert mc.plan(**REAL, budget_gb=9.97, ubatch=2048).cache_mib == 3414            # the moe_cache_plan event that DID get a cache
+    assert mc.plan(**REAL, budget_gb=9.469, ubatch=2048) is None                      # the two events that did not: not_enough_room,
+    assert mc.plan(**REAL, budget_gb=8.928, ubatch=2048) is None                      # ~54 tok/s without the cache
+
+
+def test_the_ubatch_steps_down_until_the_cache_fits_and_keeps_the_largest_that_does(monkeypatch):
+    monkeypatch.delenv("GB_MOE_CACHE", raising=False)
+    p, ub = mc.plan_with_ubatch(ubatch=2048, **REAL, budget_gb=9.97)
+    assert ub == 2048 and p.cache_mib == 3414                                         # room for the recipe's own ubatch: untouched
+    p, ub = mc.plan_with_ubatch(ubatch=2048, **REAL, budget_gb=9.469)
+    assert ub == 1024 and p.cache_mib >= 3500                                         # 1024 keeps 83% of the 2048 prefill (2045 vs 2470 tok/s)
+    p, ub = mc.plan_with_ubatch(ubatch=2048, **REAL, budget_gb=8.928)
+    assert ub == 1024 and p.cache_mib >= 3000
+
+
+def test_the_step_down_stops_at_the_engine_default_and_gives_up_cleanly(monkeypatch):
+    monkeypatch.delenv("GB_MOE_CACHE", raising=False)
+    assert mc.plan_with_ubatch(ubatch=2048, **REAL, budget_gb=5.0) == (None, None)    # not even 512 leaves 3 GB of cache
+    p, ub = mc.plan_with_ubatch(ubatch=None, **REAL, budget_gb=9.469)                 # no override = the engine's 512: no ladder, same as plan()
+    assert ub == 512 and p.cache_mib == mc.plan(**REAL, budget_gb=9.469, ubatch=512).cache_mib
+
+
+def test_serve_applies_the_ubatch_it_planned_with_and_says_so():
+    import inspect
+    import gb_synapse_backends as be
+    src = inspect.getsource(be)
+    assert "gb_moe_cache.plan_with_ubatch(" in src and "nonlocal ubatch_override" in src
+    assert "so the GPU expert cache fits" in src                                      # never a silent change of a pinned recipe value
+
+
+def test_a_skipped_cache_is_a_warning_with_the_cost_and_the_fix_not_a_quiet_ok():
+    ev = mc.decision_event(model="m", plan_=None, inputs={"budget_gb": 9.469}, engine={"kind": "moecache", "supports_cache": True}, n_cpu_moe=28, is_moe=True, mtp=True, mtp_draft_n=4)
+    assert ev["skip_reason"] == "not_enough_room" and ev["status"] == "warn"
+    assert "a third" in ev["warning"] and "Free VRAM" in ev["warning"]

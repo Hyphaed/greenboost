@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Generator
 
 from greenboost_cli.inference.router import StreamFragment, ReasoningFragment, CompletedResponse
@@ -75,6 +76,85 @@ def _overflow_numbers(err_str: str) -> "tuple[int, int]":
 
 def _is_context_overflow(err_str: str) -> bool:
     return "exceeds the available context size" in err_str
+
+
+# In-flight HTTP clients, keyed by the thread running the turn. Cancelling a turn
+# used to be cooperative: the loop looked at the cancel flag when the next token
+# arrived, and during prompt processing no token exists (5 to 35 s measured, more
+# on deep contexts), so Esc/Ctrl-C did nothing visible. abort_active_requests()
+# closes the connection from the cancelling thread; the worker's blocked read then
+# raises at once.
+class TurnCancelled(Exception):
+    """The turn was cancelled before (or while) its request was sent."""
+
+
+def _raise_if_cancelled(settings: dict) -> None:
+    """A cancel pressed during the work BEFORE the request (loading the embedder for
+    auto-RAG took ~5 s on the first turn, measured) used to be ignored: the request was
+    sent after it and then waited with nothing left to abort."""
+    ev = (settings or {}).get("_cancel_event")
+    if ev is not None and ev.is_set():
+        raise TurnCancelled("cancelled before the request was sent")
+
+
+_ACTIVE_CLIENTS: dict = {}
+_ACTIVE_LOCK = threading.Lock()
+
+
+def _track_client(client):
+    with _ACTIVE_LOCK:
+        _ACTIVE_CLIENTS[threading.get_ident()] = client
+    return client
+
+
+def untrack_client() -> None:
+    with _ACTIVE_LOCK:
+        _ACTIVE_CLIENTS.pop(threading.get_ident(), None)
+
+
+def _live_sockets(client) -> list:
+    """The sockets of a client's open connections (httpx -> httpcore internals).
+
+    Closing a client does not wake a thread blocked in recv() on one of its
+    connections; shutting the socket down does. These are private attributes, so
+    the walk is guarded and tests/test_cancel_abort.py fails loudly if a library
+    upgrade moves them."""
+    socks = []
+    try:
+        pool = client._client._transport._pool
+        for conn in list(pool._connections):
+            ns = getattr(getattr(conn, "_connection", None), "_network_stream", None)
+            s = ns.get_extra_info("socket") if ns is not None else None
+            if s is not None:
+                socks.append(s)
+    except Exception:
+        pass
+    return socks
+
+
+def abort_active_requests() -> int:
+    """Close every in-flight model request. Returns how many clients were aborted. Never raises.
+
+    Order matters: shut the sockets down first (wakes the blocked read; the engine
+    sees the disconnect), then close the client (so the SDK's automatic retry
+    can't quietly start the request again)."""
+    import socket as _socket
+    with _ACTIVE_LOCK:
+        clients = list(_ACTIVE_CLIENTS.values())
+        _ACTIVE_CLIENTS.clear()
+    n = 0
+    for c in clients:
+        for s in _live_sockets(c):
+            try:
+                s.shutdown(_socket.SHUT_RDWR)
+            except Exception:
+                pass
+        try:
+            c.close()
+            n += 1
+        except Exception:
+            pass
+    return n
 
 
 def guarded_stream(stream_obj, model: str, base_url: str):
@@ -407,6 +487,54 @@ def _looks_truncated(raw: str) -> bool:
     return in_str or depth > 0
 
 
+#: Sampling for the Qwen3.8 Distill MoE, from its model card (empero-ai guidance plus the quant author's
+#: coding advisory): a repeat penalty above 1.0 punishes the brackets and indentation code is made of and
+#: swaps `{` for `=`, so repetition is held back with the DRY sampler instead. temperature 0.6 because
+#: greedy decoding makes this model loop on long generations. llama-server reads these from the request
+#: body; dry_penalty_last_n is left at the server default (the whole context) on purpose.
+DEFAULT_SAMPLING: dict = {
+    "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.05,
+    "repeat_penalty": 1.0, "presence_penalty": 0.0, "frequency_penalty": 0.0,
+    "dry_multiplier": 0.8, "dry_base": 1.75, "dry_allowed_length": 2,
+}
+_OPENAI_SAMPLING = ("temperature", "top_p", "presence_penalty", "frequency_penalty")
+_EFFORTS = ("low", "medium", "high")
+
+
+def sampling_for(settings: dict) -> dict:
+    """The sampling profile for this request: DEFAULT_SAMPLING overridden key by key by
+    settings["sampling"]; settings["sampling"] = False sends nothing (the server's own defaults)."""
+    user = settings.get("sampling", {})
+    if user is False:
+        return {}
+    return {**DEFAULT_SAMPLING, **(user if isinstance(user, dict) else {})}
+
+
+def apply_request_tuning(kwargs: dict, settings: dict) -> None:
+    """Sampling, thinking switch, reasoning effort and thinking-history policy for one chat request.
+    Shared by both request paths so they cannot drift apart."""
+    sampling = sampling_for(settings)
+    extra = dict(settings.get("extra_body", {}))
+    for k, v in sampling.items():
+        if k in _OPENAI_SAMPLING:
+            kwargs[k] = v
+        else:
+            extra[k] = v
+    tmpl = dict(extra.get("chat_template_kwargs", {}))
+    thinking = bool(settings.get("enable_thinking", False))
+    if not thinking:
+        tmpl["enable_thinking"] = False
+    effort = str(settings.get("reasoning_effort", "") or "").lower()
+    if thinking and effort in _EFFORTS:
+        tmpl["reasoning_effort"] = effort            # the model's template: low / medium / high
+    if settings.get("preserve_thinking") is not None:
+        tmpl["preserve_thinking"] = bool(settings["preserve_thinking"])
+    if tmpl:
+        extra["chat_template_kwargs"] = tmpl
+    if extra:
+        kwargs["extra_body"] = extra
+
+
 def _stream_openai_api(
     api_key: str,
     base_url: str,
@@ -419,7 +547,8 @@ def _stream_openai_api(
     """Stream from gb-synapse's OpenAI-compatible endpoint. Yields
     StreamFragment, then CompletedResponse."""
     from openai import OpenAI
-    client = OpenAI(api_key=api_key or "dummy", base_url=base_url)
+    _raise_if_cancelled(settings)
+    client = _track_client(OpenAI(api_key=api_key or "dummy", base_url=base_url))
 
     oai_messages = [{"role": "system", "content": system}] + convert_to_openai(messages)
 
@@ -454,11 +583,7 @@ def _stream_openai_api(
     # visible chain-of-thought; `settings["enable_thinking"]=True` re-enables
     # it for anyone who wants deeper reasoning and can afford the latency.
     # Harmless no-op for templates that don't recognize the kwarg.
-    if not settings.get("enable_thinking", False):
-        kwargs["extra_body"] = {
-            **settings.get("extra_body", {}),
-            "chat_template_kwargs": {"enable_thinking": False},
-        }
+    apply_request_tuning(kwargs, settings)
 
     text = ""
     tool_buf: dict = {}
@@ -481,6 +606,7 @@ def _stream_openai_api(
     _tool_filter = _ToolTagFilter() if _is_local else None
 
     try:
+        _raise_if_cancelled(settings)
         stream = client.chat.completions.create(**kwargs)
     except Exception as _conn_err:
         _e = str(_conn_err)
@@ -628,7 +754,8 @@ def _stream_injected(
     )
     from openai import OpenAI
     injected_system = inject_tools_into_system(system, tool_schemas, model)
-    client = OpenAI(api_key=api_key or "dummy", base_url=base_url)
+    _raise_if_cancelled(settings)
+    client = _track_client(OpenAI(api_key=api_key or "dummy", base_url=base_url))
 
     oai_messages = (
         [{"role": "system", "content": injected_system}]
@@ -650,11 +777,7 @@ def _stream_injected(
     # model from generating it, which is the expensive part. This is the
     # tool-call-injection path (used for the Qwen3.5/3.6 family specifically,
     # see _is_qwen35_family/should_inject_tools) — same fix, same reasoning.
-    if not settings.get("enable_thinking", False):
-        kwargs["extra_body"] = {
-            **settings.get("extra_body", {}),
-            "chat_template_kwargs": {"enable_thinking": False},
-        }
+    apply_request_tuning(kwargs, settings)
 
     full_text  = ""   # raw text (includes think tags + tool calls, used for parsing)
     prose_text = ""   # displayable prose (think-stripped + tool-stripped)
@@ -663,6 +786,7 @@ def _stream_injected(
     tool_filter  = _ToolTagFilter()
 
     try:
+        _raise_if_cancelled(settings)
         stream_obj = client.chat.completions.create(**kwargs)
     except Exception as _conn_err:
         err_str = str(_conn_err)

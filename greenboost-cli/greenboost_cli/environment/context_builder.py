@@ -370,17 +370,14 @@ def _greenboost_context() -> str:
 def _gather_mcp_context() -> str:
     """Describe MCP servers and tools from .mcp.json in the current project tree."""
     try:
-        from greenboost_cli.mcp.client import discover_mcp_json, MCPRegistry
-        mcp_path = discover_mcp_json()
-        if not mcp_path:
-            return ""
-        servers = MCPRegistry.load_servers_config(mcp_path)
+        from greenboost_cli.mcp.config import discover_mcp_servers
+        servers = {n: s for n, s in discover_mcp_servers().items() if not s.get("error")}
         if not servers:
             return ""
-        lines = [f"\n# MCP Servers (from {mcp_path.name})"]
-        for name, cfg in servers.items():
+        lines = ["\n# MCP Servers (Claude Code config + .mcp.json)"]
+        for name, cfg in sorted(servers.items()):
             transport = cfg.get("type", "stdio")
-            desc = cfg.get("url", " ".join(cfg.get("args", [])[:1]))
+            desc = cfg.get("url") or " ".join(cfg.get("command", [])[1:2])
             lines.append(f"- **{name}** ({transport}): {desc}")
         lines.append(
             "\nThese MCP tools are available alongside the built-in tools (Read, Write, Bash, etc.)."
@@ -467,6 +464,11 @@ def assemble_system_context(model: str = "") -> str:
         gb_context=_greenboost_context(),
         plan_session=_gather_plan_session(),
     )
+    try:
+        from greenboost_cli.skill.router import skill_index
+        base += skill_index()
+    except Exception:
+        pass
     ollama_system = _gather_ollama_system_prompt(model)
     if ollama_system:
         base += (

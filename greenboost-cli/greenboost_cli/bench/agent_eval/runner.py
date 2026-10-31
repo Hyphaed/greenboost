@@ -23,8 +23,8 @@ def _requirements_met(task, settings) -> str:
     """Empty string when the task can run; otherwise the skip reason."""
     if "mcp" in task.requires:
         try:
-            from greenboost_cli.mcp.client import discover_mcp_json
-            if discover_mcp_json() is None:
+            from greenboost_cli.mcp.config import discover_mcp_servers
+            if not discover_mcp_servers():
                 return "no .mcp.json discovered"
         except Exception as e:
             return f"MCP unavailable: {type(e).__name__}"

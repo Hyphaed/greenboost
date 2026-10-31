@@ -226,6 +226,38 @@ def _capped_mcp_schemas(mcp_schemas: list, settings: dict) -> list:
     return kept
 
 
+def _rank_tools(schemas: list, q: str) -> list:
+    """(rank, schema) pairs, best first. The whole phrase in a name or description
+    still ranks highest (the old behaviour); beyond that every query WORD counts, so
+    "search code semantically" finds a tool described as "instant code search". Words
+    in the tool's name or its server's name weigh more than words in its description.
+    A tool matching nothing is dropped; ties keep registry order."""
+    words = {w for w in re.findall(r"[a-z0-9]+", q) if len(w) >= 3}
+    out = []
+    for i, schema in enumerate(schemas):
+        name = schema.get("name", "")
+        name_l = name.lower()
+        desc_l = (schema.get("description", "") or "").lower()
+        score = 0
+        if q in name_l:
+            score += 100
+        elif q in desc_l:
+            score += 50
+        parts = name_l.split("__")                      # mcp__<server>__<tool>
+        server_l = parts[1] if len(parts) >= 3 and parts[0] == "mcp" else ""
+        for w in words:
+            if w in name_l:
+                score += 6
+            if w in server_l:
+                score += 4
+            if w in desc_l:
+                score += 2
+        if score:
+            out.append((-score, i, schema))
+    out.sort(key=lambda x: (x[0], x[1]))
+    return [(rank, s) for rank, _, s in out]
+
+
 def _tool_search(mcp_registry, query: str, max_results: int = 6) -> str:
     """Handler for the ToolSearch builtin: look up full MCP tool schemas
     (from the registry's uncapped list, unaffected by _capped_mcp_schemas)
@@ -244,15 +276,19 @@ def _tool_search(mcp_registry, query: str, max_results: int = 6) -> str:
     q = (query or "").lower().strip()[:MAX_SEARCH_QUERY_LENGTH]
     if not q:
         return "ToolSearch needs a non-empty query (a tool name or keyword)."
-    scored = []
-    for schema in mcp_registry.tool_schemas:
-        name = schema.get("name", "")
-        desc = schema.get("description", "") or ""
-        if q in name.lower():
-            scored.append((0, schema))
-        elif q in desc.lower():
-            scored.append((1, schema))
-    scored.sort(key=lambda pair: pair[0])
+    # Claude Code's own form: "select:name1,name2" fetches exactly those tools.
+    if q.startswith("select:"):
+        picked, seen = [], set()
+        by_name = {s.get("name", ""): s for s in mcp_registry.tool_schemas}
+        for raw in query.split(":", 1)[1].split(","):
+            key = mcp_registry._normalize_tool_name(raw.strip()) if hasattr(
+                mcp_registry, "_normalize_tool_name") else raw.strip()
+            if key and key in by_name and key not in seen:
+                seen.add(key)
+                picked.append(by_name[key])
+        scored = [(0, s) for s in picked]
+    else:
+        scored = _rank_tools(mcp_registry.tool_schemas, q)
     total_matched = len(scored)
     matches = [s for _, s in scored[:max_results]]
     if not matches:
@@ -265,15 +301,13 @@ def _tool_search(mcp_registry, query: str, max_results: int = 6) -> str:
     # all the matches", which can lead the model to conclude a tool doesn't
     # exist when it was simply outside the shown slice.
     withheld = total_matched - len(matches)
-    encoded = json.dumps(matches, indent=2)
+    # Compact, not indent=2: the whitespace was 26 to 32% of the result (about 770 to 940
+    # tokens per call, measured on real MCP tools), and the model reads JSON either way.
+    encoded = json.dumps(matches, separators=(",", ":"))
     if len(encoded) > MAX_SEARCH_OUTPUT_BYTES:
-        # Re-encode compactly first; only fall back to a hard truncation
-        # (rare — one match's schema would have to be enormous) if even
-        # that doesn't fit.
-        encoded = json.dumps(matches)
-        if len(encoded) > MAX_SEARCH_OUTPUT_BYTES:
-            encoded = encoded[:MAX_SEARCH_OUTPUT_BYTES] + \
-                "...[truncated — narrow your query for a smaller result set]"
+        # Only a hard truncation is left (rare: one match's schema would have to be enormous).
+        encoded = encoded[:MAX_SEARCH_OUTPUT_BYTES] + \
+            "...[truncated — narrow your query for a smaller result set]"
     if withheld > 0:
         encoded += (
             f"\n\n({withheld} more match(es) not shown — refine your query "
@@ -368,7 +402,7 @@ def _prefetch_safe_batches(tool_calls, session, settings):
     def _eligible(tc):
         if tc["name"] in _INTERCEPTS:
             return False
-        if _plan_mode_block(tc, session) is not None:
+        if _plan_mode_block(tc, session, settings) is not None:
             return False
         try:
             _is_mcp = bool(session.mcp_registry
@@ -998,7 +1032,7 @@ def execute_turn(
                 repeat_count  = 0
                 continue
 
-            _plan_violation = _plan_mode_block(tc, session)
+            _plan_violation = _plan_mode_block(tc, session, settings)
             if _plan_violation is not None:
                 result, permitted = _plan_violation, False
             else:
@@ -1158,7 +1192,41 @@ _PLAN_MODE_READONLY = {
 }
 
 
-def _plan_mode_block(tc: dict, session: ConversationSession) -> str | None:
+#: MCP tools that are safe in plan mode although their servers declare no `readOnlyHint`
+#: (fnmatch patterns on the prefixed name). Servers that DO annotate are trusted through the
+#: hint instead. The owner extends this with the `plan_mode_allow_mcp` setting.
+_PLAN_MODE_MCP_DEFAULT = (
+    "mcp__semble__*",                       # code search
+    "mcp__reranker__*",                     # pure scoring function
+    "mcp__knowledge-rag__search_*", "mcp__knowledge-rag__get_*", "mcp__knowledge-rag__list_*",
+    "mcp__knowledge-rag__evaluate_retrieval",
+    "mcp__contextual-rag__search_docs", "mcp__contextual-rag__rag_status",
+)
+
+
+def _mcp_readonly_in_plan_mode(session, name: str, settings: dict | None) -> bool:
+    """True when a plan-mode session may call this MCP tool: the server declared
+    `annotations.readOnlyHint: true` for it (the same signal Claude Code uses), or the
+    prefixed name matches an allowlist pattern. A tool that declares nothing stays blocked:
+    plan mode is a safety boundary, so it is never guessed from a name like get_ or list_."""
+    registry = getattr(session, "mcp_registry", None)
+    if registry is None or not name.startswith("mcp__"):
+        return False
+    from fnmatch import fnmatchcase
+    patterns = list(_PLAN_MODE_MCP_DEFAULT) + [str(p) for p in ((settings or {}).get("plan_mode_allow_mcp") or [])]
+    if any(fnmatchcase(name, p) for p in patterns):
+        return True
+    try:
+        key = registry._normalize_tool_name(name) or name
+        for s in registry.tool_schemas:
+            if s.get("name") == key:
+                return (s.get("annotations") or {}).get("readOnlyHint") is True
+    except Exception:
+        pass
+    return False
+
+
+def _plan_mode_block(tc: dict, session: ConversationSession, settings: dict | None = None) -> str | None:
     """Return a denial message if *tc* violates active plan-mode
     restrictions, else None (call allowed to proceed to normal permission
     checks). Read-only Bash is still permitted (parity with "auto" mode)."""
@@ -1167,6 +1235,8 @@ def _plan_mode_block(tc: dict, session: ConversationSession) -> str | None:
 
     name = tc["name"]
     if name in _PLAN_MODE_READONLY:
+        return None
+    if _mcp_readonly_in_plan_mode(session, name, settings):
         return None
     if name == "Bash":
         if is_readonly_command(tc["input"].get("command", "")):
@@ -1189,6 +1259,8 @@ def _plan_mode_block(tc: dict, session: ConversationSession) -> str | None:
     return (
         f"Blocked by plan mode: '{name}' is not a read-only operation. "
         "Finish writing the plan instead of executing changes."
+        + (" (This MCP tool doesn't declare itself read-only; the owner can allow it with the "
+           "`plan_mode_allow_mcp` setting.)" if name.startswith("mcp__") else "")
     )
 
 

@@ -650,6 +650,14 @@ class EngineBackend:
         return {}
 
 
+def gb_moe_cache_min_gb() -> float:
+    try:
+        import gb_moe_cache
+        return float(os.environ.get("GB_MOE_CACHE_MIN_GB", str(gb_moe_cache.DEFAULT_MIN_GB)))
+    except Exception:  # noqa: BLE001
+        return 3.0
+
+
 @register("llama-cpp.host-local/v1")
 class LlamaCppBackend(EngineBackend):
     """The default, cluster-aware engine — llama.cpp with an explicit
@@ -1203,7 +1211,9 @@ class LlamaCppBackend(EngineBackend):
         _moe_inputs: dict = {}      # the last sizing inputs, for the moe_cache_plan dataflux event
 
         def _plan_moe_cache(_mtp: bool):
-            """gb_moe_cache plan for this serve (None: keep the placement), or None when the engine has no --moe-cache-mib / the model is not a MoE with experts on the host."""
+            """gb_moe_cache plan for this serve (None: keep the placement), or None when the engine has no --moe-cache-mib / the model is not a MoE with experts on the host.
+            Steps the ubatch down (recipe's 2048 -> 1024 -> 512) to the largest one that leaves room for the cache, and applies it (see gb_moe_cache.plan_with_ubatch)."""
+            nonlocal ubatch_override
             if not (entry.is_moe and n_cpu_moe and not cpu_quirk and "--n-cpu-moe" in cmd):
                 return None
             try:
@@ -1211,12 +1221,19 @@ class LlamaCppBackend(EngineBackend):
                 if not gb_moe_cache.engine_supports(gs.ENGINE_DIR / "llama-server"):
                     return None
                 _exp_gb = (getattr(entry, "expert_bytes", 0) or 0) / 2**30
+                _requested = _moe_inputs.get("ubatch_requested") or ubatch_override or 512
                 _moe_inputs.update(budget_gb=budget_gb, dense_gb=(getattr(entry, "dense_bytes", 0) or 0) / 2**30, expert_gb=_exp_gb, kv_gb=kv_total_gb,
-                                   vision_gb=(gb_vision.VISION_FIT.extra_gb if mmproj else 0.0), ubatch=ubatch_override or 512)
-                return gb_moe_cache.plan(
-                    n_layers=entry.n_layers or 0, n_cpu_moe=n_cpu_moe, dense_gb=(getattr(entry, "dense_bytes", 0) or 0) / 2**30,
+                                   vision_gb=(gb_vision.VISION_FIT.extra_gb if mmproj else 0.0), ubatch=ubatch_override or 512, ubatch_requested=_requested)
+                _p, _ub = gb_moe_cache.plan_with_ubatch(
+                    ubatch=_requested, n_layers=entry.n_layers or 0, n_cpu_moe=n_cpu_moe, dense_gb=(getattr(entry, "dense_bytes", 0) or 0) / 2**30,
                     expert_gb_total=_exp_gb or (gs._moe_expert_gb_per_layer(entry) * (entry.n_layers or 0)), kv_gb=kv_total_gb,
-                    vision_gb=(gb_vision.VISION_FIT.extra_gb if mmproj else 0.0), budget_gb=budget_gb, ubatch=ubatch_override, mtp=_mtp)
+                    vision_gb=(gb_vision.VISION_FIT.extra_gb if mmproj else 0.0), budget_gb=budget_gb, mtp=_mtp)
+                if _p is not None and _ub != (ubatch_override or 512):
+                    print(f"  [gb-synapse] {entry.name}: ubatch {ubatch_override or 512} -> {_ub} so the GPU expert cache fits ({budget_gb:.1f} GB free): decode is ~3x faster with it, "
+                          f"cold prefill a little slower.", flush=True)
+                    ubatch_override = _ub
+                    _moe_inputs["ubatch"] = _ub
+                return _p
             except Exception as _e:  # noqa: BLE001  - an optimisation: never stops a serve
                 print(f"  [gb-synapse] moe cache skipped: {type(_e).__name__}: {_e}", flush=True)
                 return None
@@ -1276,6 +1293,13 @@ class LlamaCppBackend(EngineBackend):
             cmd += ["--moe-cache-mib", str(_moe_cache.cache_mib)]
             n_cpu_moe = _moe_cache.n_cpu_moe
             print(f"  [gb-synapse] {entry.name}: all experts on the host + {_moe_cache.cache_mib} MiB GPU expert cache ({_moe_cache.detail})", flush=True)
+        elif (entry.is_moe and n_cpu_moe and not cpu_quirk and "--n-cpu-moe" in cmd and _moe_inputs.get("budget_gb") is not None
+              and os.environ.get("GB_MOE_CACHE", "auto").strip().lower() not in ("0", "off", "false", "no")):
+            # Planned and refused: say so where the owner is looking, not only in dataflux. Without the cache this
+            # model decodes at about a third of the speed (54 vs 93-181 tok/s measured, workflow/gb-moe-cache.md).
+            print(f"  [gb-synapse] {entry.name}: NO GPU expert cache: only {_moe_inputs['budget_gb']:.1f} GB of VRAM is free and it needs about "
+                  f"{gb_moe_cache_min_gb():.0f} GB beyond the dense weights, KV and compute buffers. Decode will be about 3x slower "
+                  f"(~54 vs 93-181 tok/s). Close other GPU users (a CLI session that ran /rag-update, Chrome, VMs) and serve again.", flush=True)
         try:                                                                  # telemetry: why this cache size / no cache (read by dataflux_critic and synapse_status)
             import gb_moe_cache
             gb_moe_cache.emit_decision(

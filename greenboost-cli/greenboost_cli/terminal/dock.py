@@ -5,7 +5,7 @@
     ──────────────────────────────────────────── session name ─   (rule)
     ❯ <input box, grows upward, stays live during a turn>
     ────────────────────────────────────────────────────────────  (rule)
-    <status 1: permission mode · nonstop · model state · GPU owner · queue    ctx %>
+    <status 1: permission mode · nonstop · model state · GPU · model · queue    ctx %>
     <status 2: hints (dim)                                  T1 · T2 · T3 tiers>
 
 Ownership rule (see docs/terminal-dock.md): while the dock is live,
@@ -28,7 +28,7 @@ import threading
 from dataclasses import dataclass, field
 
 from greenboost_cli.terminal.theme import (
-    TEAL, VIOLET, LIME, AMBER, DIM, GRAY, CORAL, BOX_H,
+    TEAL, VIOLET, LIME, AMBER, DIM, GRAY, CORAL, BOX_H, CYAN,
 )
 from greenboost_cli.terminal.width import (
     TTY_LOCK, display_width, truncate_to_width, tty_overlay,
@@ -140,6 +140,8 @@ class DockState:
     auto_answer: bool | None = None
     server: tuple | None = None                      # (style, text)
     gpu_owner: str = ""
+    gpu_name: str = ""                # "NVIDIA RTX 5070 12G"
+    model: str = ""                   # active model, shown right of the GPU
     statusline: str = ""
     queued: int = 0
     ctx_pct: float | None = None
@@ -179,8 +181,15 @@ def status1_frags(st: DockState, cols: int):
         parts.append([(f"fg:{TEAL}", "nonstop")])
     if st.auto_answer:
         parts.append([(f"fg:{AMBER}", "autoanswer")])
-    if st.gpu_owner:
-        parts.append([(f"fg:{AMBER}", f"GPU: {st.gpu_owner}")])
+    if st.gpu_name or st.gpu_owner:
+        gpu = []
+        if st.gpu_name:
+            gpu.append((f"fg:{DIM}", f"GPU: {st.gpu_name}"))
+        if st.gpu_owner:                  # another heavy job holds the card: say who, in amber
+            gpu.append((f"fg:{AMBER}", (" · " if st.gpu_name else "GPU: ") + st.gpu_owner))
+        parts.append(gpu)
+    if st.model:                          # its own part: dropped whole when the row is narrow
+        parts.append([(f"fg:{CYAN}", st.model)])
     if st.queued:
         parts.append([(f"fg:{AMBER}", f"{st.queued} queued")])
     if st.statusline:

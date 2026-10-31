@@ -478,6 +478,15 @@ KINDS: dict[str, KindSpec] = {
         group="quant", doc="A quantization choice made by a consumer pipeline (which precision, why), "
                            "seen in the live log without a GreenBoost emit site.",
         planned=True),
+    "cli_mcp_connect": KindSpec(
+        group="agent", doc="greenboost-cli mcp/client.py: one MCP server connect attempt at session start "
+                           "or /mcp-servers reconnect. status is ok|error; `error` carries the reason "
+                           "(command not found, no initialize reply within the timeout, exited with a "
+                           "code plus the last stderr line). Servers come from Claude Code's own config "
+                           "(~/.claude.json, $CLAUDE_CONFIG_DIR/.claude.json) merged with .mcp.json, so "
+                           "an absent event means the session never tried, not that all is well.",
+        fields=("server", "status", "error"), numeric_fields=("n_tools", "ms"),
+        incident_when=("error",), sync_scope="host"),
     "web_fetch": KindSpec(
         group="agent", doc="greenboost-cli instruments/safe_fetch.py: one WebFetch outcome. status is "
                            "ok|blocked|error; a blocked fetch carries the refusal `reason` (private or "

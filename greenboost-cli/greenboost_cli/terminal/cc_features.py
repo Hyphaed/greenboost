@@ -208,6 +208,7 @@ def register(table: dict) -> None:
     table.setdefault("hooks", cmd_hooks)
     table.setdefault("vim", cmd_vim)
     table.setdefault("think", cmd_think)
+    table.setdefault("effort", cmd_effort)
     table.setdefault("commands", cmd_commands)
     table.setdefault("copy", cmd_copy)
     for alias, target in (("memory", "memories"),
@@ -233,12 +234,13 @@ def sanitize(text: str) -> str:
 # ── /gpu and the load preflight ──────────────────────────────────────────────
 
 def gpu_snapshot() -> "dict | None":
-    """{total, used, free (MiB), apps: [(pid, label, MiB)]} from nvidia-smi, or None."""
+    """{name, total, used, free (MiB), apps: [(pid, label, MiB)]} from nvidia-smi, or None."""
     def smi(*a):
         return subprocess.run(["nvidia-smi", *a], capture_output=True, text=True, timeout=5).stdout
     try:
-        mem = smi("--query-gpu=memory.total,memory.used,memory.free", "--format=csv,noheader,nounits")
-        total, used, free = (int(float(x)) for x in mem.strip().splitlines()[0].split(","))
+        mem = smi("--query-gpu=name,memory.total,memory.used,memory.free", "--format=csv,noheader,nounits")
+        name, *nums = [x.strip() for x in mem.strip().splitlines()[0].split(",")]
+        total, used, free = (int(float(x)) for x in nums)
         apps = []
         for ln in smi("--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits").splitlines():
             if "," not in ln:
@@ -247,7 +249,50 @@ def gpu_snapshot() -> "dict | None":
             apps.append((int(pid), _app_label(int(pid)), int(float(mib))))
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         return None
-    return {"total": total, "used": used, "free": free, "apps": apps}
+    return {"name": name, "total": total, "used": used, "free": free, "apps": apps}
+
+
+def gpu_title(snap: "dict | None") -> str:
+    """"NVIDIA RTX 5070 12G": the card and its size as the driver reports them (nothing
+    hardcoded, so it's right on any machine). "" when there is no snapshot."""
+    if not snap or not snap.get("name"):
+        return ""
+    short = snap["name"].replace("NVIDIA ", "").replace("GeForce ", "").strip()
+    return f"NVIDIA {short} {round(snap['total'] / 1024)}G"
+
+
+_INTERPRETERS = ("python", "node", "java", "ruby", "bash", "sh")
+
+
+def _is_own_process(pid: int, me: "int | None" = None) -> bool:
+    """True when `pid` is this process or one of its descendants (the embedder, an MCP server)."""
+    me = me or os.getpid()
+    for _ in range(8):
+        if pid == me:
+            return True
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            pid = int(stat.rsplit(")", 1)[1].split()[1])          # field 4: ppid
+        except (OSError, ValueError, IndexError):
+            return False
+        if pid <= 1:
+            return False
+    return False
+
+
+def gpu_holders_to_show(apps: list, is_own=_is_own_process, min_mib: int = 1024) -> list:
+    """The other jobs worth naming in the bar: not gb-synapse (it has its own indicator), not
+    this CLI or its children (its embedder and MCP servers were shown as "GPU: python3 3.9G"),
+    and not a bare interpreter name, which says nothing about what the job is."""
+    out = []
+    for pid, label, mib in apps:
+        low = label.lower()
+        if "gb-synapse" in low or mib < min_mib or is_own(pid):
+            continue
+        if low.split(".")[0].rstrip("0123456789") in _INTERPRETERS or low.startswith("pid "):
+            continue
+        out.append((pid, label, mib))
+    return sorted(out, key=lambda a: -a[2])
 
 
 def _app_label(pid: int) -> str:
@@ -350,6 +395,23 @@ def cmd_think(args: str, _session, settings) -> bool:
         return True
     emit_ok("Thinking: " + ("on" if settings.get("enable_thinking") else "off")
             + "  (server-side; off is faster and the default for Qwen3.8)")
+    return True
+
+
+def cmd_effort(args: str, _session, settings) -> bool:
+    """/effort [low|medium|high|auto]: how hard the model thinks when /think is on (its chat template's
+    reasoning_effort). low keeps tool loops quick; high plans before it writes code."""
+    from greenboost_cli.terminal.theme import emit_ok, emit_info
+    a = args.strip().lower()
+    if a in ("low", "medium", "high"):
+        settings["reasoning_effort"] = a
+    elif a in ("auto", "off", "default"):
+        settings.pop("reasoning_effort", None)
+    elif a:
+        emit_info("Usage: /effort [low|medium|high|auto]")
+        return True
+    emit_ok(f"Reasoning effort: {settings.get('reasoning_effort', 'auto (model default: medium)')}"
+            + ("" if settings.get("enable_thinking") else "  (only applies while /think is on)"))
     return True
 
 

@@ -8,7 +8,7 @@ Implements the Anthropic Contextual Retrieval recipe:
   4. Embed   — qwen3-embedding:4b via Ollama REST API, 1024-dim Matryoshka truncation
   5. BM25    — rank_bm25.BM25Okapi, enriched text
   6. RRF     — Reciprocal Rank Fusion k=60 (same as knowledge-rag/semble)
-  7. Rerank  — CrossEncoder ms-marco-MiniLM-L-6-v2 (CPU-only)
+  7. Rerank  — CrossEncoder ettin-reranker-17m-v1 (CPU-only)
 
 VRAM management (RTX 5070 12 GB):
   Phase 1 contextualize: Haiku cloud (no VRAM) or local → unloaded after
@@ -53,7 +53,14 @@ _EMBED_MODEL = "qwen3-embedding:4b"
 _EMBED_DIM   = 1024          # Matryoshka truncation
 _EMBED_BATCH = 32
 
-_RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+# Override with GB_RERANK_MODEL. Measured 2026-10-30, two-stage code search (20 candidates
+# from a bi-encoder, 150 queries from this repo, CPU), MRR / ms per pair:
+#   ms-marco-MiniLM-L-6   0.65 / 29      (the previous default, a 2020-era model)
+#   ettin-reranker-17m    0.69 / 15      (Apache-2.0, 2026-05)  <- default: better and 2x faster
+#   ettin-reranker-68m    0.75 / 105
+#   ettin-reranker-150m   0.77 / 243     (best quality; set GB_RERANK_MODEL to trade latency for it)
+# Prose (CHANGELOG title -> body) showed no difference between the first two.
+_RERANK_MODEL = os.environ.get("GB_RERANK_MODEL", "cross-encoder/ettin-reranker-17m-v1")
 
 _RRF_K             = 60
 _CHUNK_TARGET_WORDS = 600

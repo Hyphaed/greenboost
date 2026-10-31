@@ -83,7 +83,7 @@ def test_the_loop_uses_the_helper_rather_than_a_bare_get():
 def test_first_cancel_during_decode_promises_a_quick_stop():
     from greenboost_cli.terminal.repl import cancel_message
     msg = cancel_message(None, still_prefilling=False)
-    assert "next token" in msg
+    assert "closing the request" in msg
     assert "prompt" not in msg
 
 
@@ -95,8 +95,8 @@ def test_first_cancel_during_prefill_says_why_it_will_take_a_while():
     a minute reads as a second bug."""
     from greenboost_cli.terminal.repl import cancel_message
     msg = cancel_message(None, still_prefilling=True)
-    assert "reading the prompt" in msg
-    assert "first token" in msg
+    assert "reading" in msg and "prompt" in msg
+    assert "first token" not in msg          # no longer waits for one: the request is closed
 
 
 def test_repeat_cancel_reports_how_long_it_has_been_pending():

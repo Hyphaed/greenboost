@@ -368,6 +368,37 @@
     instructing it harder , PATool's finding is to fit the schema to the
     model, not the model to the schema.
 
+- name: cli_mcp_none_connected
+  entity: node
+  severity: warning
+  doc: >
+    greenboost-cli started a session and connected to zero MCP servers, so the
+    model has none of the Claude Code tools it is expected to share (semble,
+    knowledge-rag, charlotte, the greenboost-* servers...). Returns null when
+    no session has been observed.
+  evaluator: cli_mcp_none_connected
+  metrics: ["cli_mcp_servers_connected"]
+  remediation: >
+    Run /mcp-servers inside the CLI: each failed server lists its reason
+    (command not found, no initialize reply, exit code). /mcp-servers
+    reconnect retries them. Config is read from ~/.claude.json,
+    $CLAUDE_CONFIG_DIR/.claude.json and the nearest .mcp.json.
+
+- name: moe_cache_skipped_no_room
+  entity: node
+  severity: warning
+  doc: >
+    The latest MoE serve kept experts on the host but had no room for the GPU expert cache, so decode
+    runs at about a third of the cached speed (~54 vs 93-181 tok/s). Returns null when no serve has
+    logged a cache decision.
+  evaluator: moe_cache_skipped_no_room
+  metrics: ["moe_cache_mib"]
+  remediation: >
+    Free VRAM and serve again: the budget is the card's FREE memory at serve time, so close other GPU
+    users first (a greenboost-cli session that ran /rag-update, Chrome, VMs; check
+    nvidia-smi --query-compute-apps). serve() already steps a recipe's ubatch down (2048 -> 1024 -> 512)
+    to fit the cache; if it still doesn't fit, the card is genuinely too full.
+
 - name: agent_eval_below_reference
   entity: node
   severity: diagnosis

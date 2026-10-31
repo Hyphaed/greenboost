@@ -71,7 +71,11 @@ def generate(
     base_url     = backend["base_url"]
     settings["_backend"] = backend_name
 
-    if tool_schemas and should_inject_tools(settings, model_name):
-        yield from _stream_injected(api_key, base_url, model_name, system, messages, tool_schemas, settings)
-    else:
-        yield from _stream_openai_api(api_key, base_url, model_name, system, messages, tool_schemas, settings)
+    from greenboost_cli.inference.adapters import untrack_client
+    try:
+        if tool_schemas and should_inject_tools(settings, model_name):
+            yield from _stream_injected(api_key, base_url, model_name, system, messages, tool_schemas, settings)
+        else:
+            yield from _stream_openai_api(api_key, base_url, model_name, system, messages, tool_schemas, settings)
+    finally:
+        untrack_client()

@@ -56,6 +56,9 @@ except Exception as _e:
 
 
 def main() -> None:
+    # The hub's own "unauthenticated requests" warning is replaced by one that says how to fix it.
+    from greenboost_cli.hf_token import install_warning_filter
+    install_warning_filter()
     # Headless subcommand fast-path: `gb rag-search`, `gb compress`, etc.
     # These bypass the REPL so they can be called from scripts (e.g.
     # optimal-claude's gb_bridge). They run before the main argparse because

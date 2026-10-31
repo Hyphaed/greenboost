@@ -54,6 +54,16 @@ _gb_t3_total_mb_cache: float = 0.0
 _GB_STATS_STALE_S = 30.0   # matches gb_monitor's own shim-stats staleness gate
 
 
+
+# prompt_toolkit asks the terminal where the cursor is (ESC[6n) and, on exit, waits
+# for the reply; on a terminal that answers late the reply can land while the input
+# box is closing.
+# NOT enabled by default: without it the dock stops pinning to the last rows of the
+# screen (tests/test_dock_pty.py). Set PROMPT_TOOLKIT_NO_CPR=1 yourself to trade the
+# pinned dock for an exit that can't be delayed by a slow terminal.
+
+_terminal_restored = False
+
 def _read_gb_snapshot() -> "tuple[dict | None, bool]":
     """(snapshot_dict, is_stale). snapshot_dict is None if nothing usable was
     found anywhere.
@@ -186,6 +196,7 @@ def _gb_stats_updater() -> None:
 #: the bar flips from "not loaded" to "loading" to "running" without a keypress.
 _server_state = "unknown"
 _gpu_owner = ""          # "FLUX generation 8.1G" when another heavy job holds the card
+_gpu_name = ""           # "NVIDIA RTX 5070 12G", from the driver
 _statusline = ""         # first line of the user's statusline_command
 
 
@@ -231,7 +242,7 @@ def _server_state_poller(settings: dict) -> None:
     global _server_state
     import time as _t
     from greenboost_cli.slash_commands.backend_cmds import llamacpp_server_status
-    global _gpu_owner, _statusline
+    global _gpu_owner, _gpu_name, _statusline
     from greenboost_cli.terminal import cc_features as _ccf
     _last = None
     _n = 0
@@ -239,10 +250,9 @@ def _server_state_poller(settings: dict) -> None:
         try:
             if _n % 4 == 0:
                 _snap = _ccf.gpu_snapshot()
-                _heavy = [a for a in (_snap or {}).get("apps", [])
-                          if "gb-synapse" not in a[1] and a[2] >= 1024]
-                _gpu_owner = ", ".join(f"{l} {m / 1024:.1f}G" for _, l, m in
-                                       sorted(_heavy, key=lambda a: -a[2])[:2])
+                _gpu_name = _ccf.gpu_title(_snap)
+                _heavy = _ccf.gpu_holders_to_show((_snap or {}).get("apps", []))
+                _gpu_owner = ", ".join(f"{l} {m / 1024:.1f}G" for _, l, m in _heavy[:2])
                 _statusline = _ccf.statusline_text(settings)
             _n += 1
             _server_state = llamacpp_server_status(settings)
@@ -591,9 +601,9 @@ def cancel_message(pending_s: "float | None", still_prefilling: bool) -> str:
     """
     if pending_s is None:
         if still_prefilling:
-            return ("Cancelling…  the model is still reading the prompt, so this "
-                    "lands when the first token arrives")
-        return "Cancelling…  (stops at next token — Ctrl-C again for status)"
+            return ("Cancelling…  closing the request, so the model stops reading "
+                    "the prompt")
+        return "Cancelling…  closing the request (Ctrl-C again for status)"
     waited = f"{pending_s:.0f}s"
     if still_prefilling:
         return (f"Cancel pending {waited} — still in prompt processing, no token "
@@ -628,6 +638,72 @@ def next_stdin_event(q: "queue.Queue", timeout: float = 0.5
         return None, None
     except KeyboardInterrupt:
         return "interrupt", None
+
+
+def unload_model_on_exit(settings: dict) -> str:
+    """Stop the gb-synapse server this CLI is configured for, so exiting frees the card.
+
+    Owner requirement 2026-10-30: /exit must unload the model. It used to
+    deliberately spare a running server (release_memory_pool's scope="residue").
+    Opt out with GB_CLI_KEEP_MODEL=1, settings "unload_model_on_exit": false, or
+    `/exit keep`. Only the CLI's configured model is stopped, never another
+    model's server. Bounded: a feeder that doesn't answer can't hang the exit.
+    Returns a one-line outcome for the caller to print ("" = nothing to do).
+    """
+    if os.environ.get("GB_CLI_KEEP_MODEL", "") in ("1", "true", "yes"):
+        return ""
+    if settings.get("unload_model_on_exit", True) is False:
+        return ""
+    try:
+        from greenboost_cli.slash_commands.backend_cmds import (
+            _import_gb_synapse, _llamaserve_model_name)
+        gb = _import_gb_synapse()
+        name = _llamaserve_model_name(settings)
+        if not name or not any(s.get("model") == name for s in gb.ps()):
+            return ""
+    except Exception:
+        return ""
+    result: dict = {}
+
+    def _stop() -> None:
+        try:
+            result["ok"] = bool(gb.stop(name))
+        except Exception as e:
+            result["err"] = f"{type(e).__name__}: {e}"
+
+    th = threading.Thread(target=_stop, daemon=True, name="gb-exit-unload")
+    th.start()
+    th.join(timeout=20.0)
+    if th.is_alive():
+        return (f"The model server for {name} didn't stop within 20 s; it may still hold the "
+                f"card. Check with: greenboost synapse ps")
+    if result.get("err"):
+        return f"Could not unload {name} ({result['err']}). Check with: greenboost synapse ps"
+    return f"Unloaded {name}; its VRAM is free." if result.get("ok") else ""
+
+
+def graceful_exit(session, settings: dict, reason: str, *, keep_model: bool = False) -> None:
+    """The one exit path (/exit, /quit, Ctrl-D): clean terminal first, then tidy up.
+
+    Order matters. The screen is restored BEFORE the slow parts (MCP servers,
+    unloading the model, the memory-pool release), so nothing of the session is
+    left drawn while they run; each prints its own line on the clean terminal.
+    """
+    from greenboost_cli.terminal.theme import emit_ok, emit_muted
+    request_shutdown()
+    emit_ok("Goodbye.")
+    registry = getattr(session, "mcp_registry", None)
+    if registry is not None:
+        try:
+            registry.close_all()
+        except Exception:
+            pass
+    if not keep_model:
+        msg = unload_model_on_exit(settings)
+        if msg:
+            (emit_ok if msg.startswith("Unloaded") else emit_muted)(msg)
+    release_memory_pool(reason)
+    sys.exit(0)
 
 
 def request_shutdown() -> None:
@@ -665,12 +741,17 @@ def request_shutdown() -> None:
     restore_terminal()
 
 
-def _drain_terminal_replies(fd: int, timeout: float = 1.2) -> None:
+def _drain_terminal_replies(fd: int, timeout: float = 3.0) -> None:
     """Swallow terminal replies still in flight (prompt_toolkit's cursor-position
     query, answered after the prompt closed) so the shell never echoes them as
-    "^[[1;1R". The terminal answers in order, so a fence query of our own works
-    as a barrier: once its reply arrives, every earlier reply has been read.
-    Bounded; a terminal that never answers costs `timeout` once."""
+    "^[[1;1R". The terminal answers queries in order, so a query of our own with a
+    DISTINCT reply is a barrier: ESC[5n is answered ESC[0n, and once that arrives
+    every earlier ESC[row;colR has been read too. (The old barrier was another
+    cursor query, whose reply looks like the ones it was waiting for, so the loop
+    stopped at the first reply and left its own behind: "^[[2;1R" in the shell.)
+    Bounded; a terminal that never answers costs `timeout` once, one that answers
+    promptly (nearly all) costs nothing. 3 s: a reply 1.6 s late was enough to
+    leak, and the screen is already clean while this waits."""
     import select
     import termios
     import time
@@ -680,7 +761,7 @@ def _drain_terminal_replies(fd: int, timeout: float = 1.2) -> None:
     raw[6][termios.VMIN], raw[6][termios.VTIME] = 0, 0
     termios.tcsetattr(fd, termios.TCSANOW, raw)
     try:
-        sys.stdout.write("\033[6n")
+        sys.stdout.write("\033[5n")
         sys.stdout.flush()
         buf = b""
         end = time.monotonic() + timeout
@@ -689,10 +770,8 @@ def _drain_terminal_replies(fd: int, timeout: float = 1.2) -> None:
             if not r:
                 break
             buf += os.read(fd, 256)
-            if buf.count(b"R") and buf.rstrip().endswith(b"R") and buf.count(b"\x1b[") <= buf.count(b"R"):
-                # one reply per query sent: pt's pending ones plus ours; stop once a short quiet gap follows
-                if not select.select([fd], [], [], 0.05)[0]:
-                    break
+            if b"\x1b[0n" in buf or b"\x1b[3n" in buf:
+                break
     finally:
         termios.tcsetattr(fd, termios.TCSANOW, old)
 
@@ -734,12 +813,43 @@ def restore_terminal(clear: bool = True) -> None:
     Set GB_CLI_NO_CLEAR_ON_EXIT=1 to keep the session transcript on screen —
     the terminal is still restored, only the clear is skipped.
     """
+    global _terminal_restored
     try:
         if not sys.stdout.isatty():
             return
     except Exception:
         return
+    already = _terminal_restored and not clear     # the atexit safety net after /exit
 
+    seq = (
+        "\033[?1049l"
+        "\033[r"
+        "\033[?25h"
+        "\033[?2004l"
+        "\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?1015l"
+        "\033[0m"
+    )
+    clear_seq = ""
+    if clear and os.environ.get("GB_CLI_NO_CLEAR_ON_EXIT", "") not in ("1", "true", "yes"):
+        clear_seq = "\033[H\033[2J\033[3J"
+
+    def _write(s: str) -> None:
+        try:
+            sys.stdout.write(s)
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+    # 1. Leave a clean screen NOW. This used to come last, after up to ~3 s of
+    #    waiting on the terminal's reply to a cursor query, so "Goodbye." and a
+    #    copy of the dock stayed on screen for that whole time.
+    _write(seq + clear_seq)
+    if already:
+        return      # already restored and drained once: don't wait on the terminal a second time
+
+    # 2. Then make the tty safe for the shell: no echo while terminal replies that
+    #    are still in flight are swallowed (a late "ESC[1;1R" otherwise lands in the
+    #    shell's prompt as "^[[1;1R"), then echo back on.
     try:
         import termios
         fd = sys.stdin.fileno()
@@ -752,23 +862,11 @@ def restore_terminal(clear: bool = True) -> None:
         attrs[3] |= termios.ECHO
         termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
     except Exception:
-        pass   # not a real tty, or stdin already closed — the escapes below still apply
+        pass   # not a real tty, or stdin already closed , the escapes still apply
 
-    seq = (
-        "\033[?1049l"
-        "\033[r"
-        "\033[?25h"
-        "\033[?2004l"
-        "\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?1015l"
-        "\033[0m"
-    )
-    if clear and os.environ.get("GB_CLI_NO_CLEAR_ON_EXIT", "") not in ("1", "true", "yes"):
-        seq += "\033[H\033[2J\033[3J"
-    try:
-        sys.stdout.write(seq)
-        sys.stdout.flush()
-    except Exception:
-        pass
+    # 3. Anything that repainted while we waited is erased again (idempotent).
+    _write(seq + clear_seq)
+    _terminal_restored = True
 
 
 def _suspend_pt_for_wizard() -> None:
@@ -791,7 +889,11 @@ def _suspend_pt_for_wizard() -> None:
     set_wizard_active(True)
     if _pt_suspend_hook is not None:
         _pt_suspend_hook()
-        if _dock_state_provider is not None and _wizard_depth == 1:
+        if (_dock_state_provider is not None and _wizard_depth == 1
+                and not _shutdown_evt.is_set()):
+            # (Not while shutting down: this paints a static copy of the dock that then
+            # sat on screen through the whole exit , measured 2-3 s with a terminal that
+            # answers the cursor query late , right under "Goodbye.")
             # The input app is stopped; fence the last rows and paint a static dock
             # there so the wizard renders ABOVE it. _resume_pt_after_wizard restores.
             from greenboost_cli.terminal.dock import get_hold
@@ -1407,6 +1509,14 @@ def process_query(user_input: str, session: ConversationSession,
                         f"\n  [{AMBER}]⚠  Loop guard ({event.reason}):[/]"
                         f"  [{GRAY}]{event.message}[/]\n"
                     )
+    except Exception:
+        # The request was closed on purpose by abort_active_requests() (Esc/Ctrl-C):
+        # the blocked read raises, and that is the cancel arriving, not a failure.
+        if _cancel and _cancel.is_set():
+            _interrupted = True
+            _stop_sl(cancel=True)
+        else:
+            raise
     finally:
         _stop_sl()
         sl.end_turn(summary=not _interrupted and sys.exc_info()[0] is None)
@@ -1660,7 +1770,7 @@ def run_interactive(settings: dict, initial_prompt: str = None,
         "guidelines_cmds", "convert_cmds", "mcp_cmds",
         "plan_cmds", "agent_cmds", "task_cmds", "skill_cmds",
         "git_cmds", "quant_cmds", "doctor_cmds", "autonomous_cmds",
-        "forge_cmds", "init_cmds", "model_cmds",
+        "forge_cmds", "init_cmds", "model_cmds", "hf_token_cmds", "mcp_add_cmds",
     ):
         try:
             __import__(f"greenboost_cli.slash_commands.{_mod}")
@@ -1798,27 +1908,33 @@ def run_interactive(settings: dict, initial_prompt: str = None,
             except Exception:
                 pass
 
-    # ── Non-interactive fast path ──────────────────────────────────────────
-    if initial_prompt:
-        _run_once_safe(initial_prompt, session, settings)
-        return
-
-    # ── MCP auto-connect from .mcp.json (background, non-blocking) ───────────
+    # ── MCP auto-connect from Claude Code's config + .mcp.json ───────────────
     def _mcp_autoconnect() -> None:
+        # GB_MCP_AUTOCONNECT=0: scripted `gb -p` callers that don't need MCP
+        # skip spawning every configured server (about 3.5 s and 16 processes here).
+        if os.environ.get("GB_MCP_AUTOCONNECT") == "0":
+            return
         try:
-            from greenboost_cli.mcp.client import discover_mcp_json, MCPRegistry
-            mcp_path = discover_mcp_json()
-            if not mcp_path:
+            from greenboost_cli.mcp.client import MCPRegistry
+            from greenboost_cli.mcp.config import discover_mcp_servers
+            specs = discover_mcp_servers()
+            if not specs:
                 return
-            registry = MCPRegistry.from_mcp_json(mcp_path)
+            registry = MCPRegistry.from_config(specs)
             if not registry.server_names():
                 return
-            # connect_all() BEFORE publishing the registry to the session — a
-            # turn starting in the old window between these two lines could
-            # see an empty/half-populated tool_schemas and _tool_to_server.
-            results = registry.connect_all()
+            # Publish BEFORE connecting: connect_all() registers each server's
+            # tools as it finishes (under a lock), and /mcp-servers must show
+            # "connecting" rather than "none" while a slow server starts.
             session.mcp_registry = registry
+            atexit.register(registry.close_all)     # idempotent; covers exits that skip graceful_exit
+            results = registry.connect_all()
             ok = sum(1 for v in results.values() if v)
+            _failed = [n for n, v in results.items() if not v]
+            if _failed:
+                from greenboost_cli.terminal.theme import emit_muted as _em
+                _em(f"MCP: {len(_failed)} server(s) failed to connect "
+                    f"({', '.join(sorted(_failed))}) , /mcp-servers shows why")
             if ok:
                 n_tools = len(registry.tool_schemas)
                 servers_ok = [n for n, v in results.items() if v]
@@ -1856,8 +1972,42 @@ def run_interactive(settings: dict, initial_prompt: str = None,
                 if _dups:
                     emit_muted(f"MCP: {len(_dups)} tool names exist on more than one server; "
                                f"all stay callable as mcp__<server>__<tool> (/mcp-servers lists them)")
+        except Exception as _e:
+            # Never abort the session over MCP, but never hide it either: a
+            # bare pass here is why "No MCP servers connected" had no cause.
+            try:
+                from greenboost_cli.terminal.theme import emit_warn
+                emit_warn(f"MCP auto-connect failed: {type(_e).__name__}: {_e}")
+            except Exception:
+                pass
+
+    # ── Non-interactive fast path ──────────────────────────────────────────
+    if initial_prompt:
+        # -p mode used to skip MCP entirely. Connect synchronously (bounded by
+        # the per-server init timeout, servers connect in parallel) so the
+        # first turn already has the same tools an interactive session has.
+        _mcp_autoconnect()
+        _run_once_safe(initial_prompt, session, settings)
+        return
+
+    def _warm_embedder() -> None:
+        """Load the embedders the first turn will use, off the critical path. Measured:
+        skill matching alone took 5.6 s on the first turn (the default embedder loading),
+        and a cancel pressed in that window found nothing to cancel. Two models may be
+        needed: the default (skill matching) and, until /rag-reembed has run, the one
+        that built the index (RAG search)."""
+        try:
+            from greenboost_cli.rag import engine as _E
+            _E._embed(["warm up"], query=True)                       # default: skill matching
+            if not settings.get("auto_rag", True) or not _E.store_stats().get("chunks"):
+                return
+            built = _E.read_manifest().get("embed_model")
+            if built and built != _E.EMBED_MODEL:
+                _E._embed(["warm up"], query=True, model_name=built)  # the index's own model
         except Exception:
             pass
+
+    threading.Thread(target=_warm_embedder, daemon=True, name="gb-embed-warm").start()
 
     threading.Thread(target=_mcp_autoconnect, daemon=True,
                      name="gb-mcp-autoconnect").start()
@@ -2300,7 +2450,8 @@ def run_interactive(settings: dict, initial_prompt: str = None,
             plan_mode=bool(getattr(session, "plan_mode", False)),
             autonomous=settings.get("permission_mode") == "autonomous",
             nonstop=nonstop, auto_answer=autoans,
-            server=_server_state_frag(), gpu_owner=_gpu_owner or "",
+            server=_server_state_frag(), gpu_owner=_gpu_owner or "", gpu_name=_gpu_name or "",
+            model=str(settings.get("model", "") or ""),
             statusline=_statusline or "", queued=len(prompt_queue),
             ctx_pct=_ctx_pct_now(), tiers=tiers, hints=hints,
         )
@@ -2562,18 +2713,9 @@ def run_interactive(settings: dict, initial_prompt: str = None,
                 run_stop_hooks(f"Session ended after {turns} turn(s).")
             except Exception:
                 pass
-            # Same cleanup as cmd_exit() (/exit, /quit) — Ctrl-D must leave
-            # the terminal and MCP subprocesses in the same clean state, not
-            # a second, thinner exit path that skips both.
-            registry = getattr(session, "mcp_registry", None)
-            if registry is not None:
-                try:
-                    registry.close_all()
-                except Exception:
-                    pass
-            request_shutdown()
-            release_memory_pool("Ctrl-D")
-            sys.exit(0)
+            # Same exit path as /exit, /quit: clean terminal, MCP servers closed,
+            # model unloaded, pool released.
+            graceful_exit(session, settings, "Ctrl-D")
 
         elif ev == "interrupt":
             if _is_processing.is_set():
@@ -2598,6 +2740,13 @@ def run_interactive(settings: dict, initial_prompt: str = None,
                     _cancel_event.set()
                     _cancel_requested_at[0] = _t.monotonic()
                     msg = cancel_message(None, still_prefilling)
+                    # Close the request now: the worker is blocked waiting for a
+                    # token that, during prompt processing, may be minutes away.
+                    try:
+                        from greenboost_cli.inference.adapters import abort_active_requests
+                        abort_active_requests()
+                    except Exception:
+                        pass
                 console.print(f"\n  [{AMBER}]◈[/]  [{GRAY}]{msg}[/]")
             continue
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import glob as _glob_mod
 import shlex
 import subprocess
@@ -551,19 +552,47 @@ def _handle_shell_foreground(command: str, timeout: int = 120) -> str:
         out = out.strip() or "(no output)"
         # Truncate to prevent context explosion (30K matches Claude Code's
         # default; _ctx_char_budget shrinks it against a small served window)
+        out = _collapse_passing_run(out, r.returncode)
         _limit = _ctx_char_budget(30_000)
         if len(out) > _limit:
-            half = _limit // 2
+            # A failing command prints its reason LAST (the traceback, the
+            # failed-test summary), so a failure keeps 25% head / 75% tail.
+            head = _limit // 2 if r.returncode == 0 else _limit // 4
             out = (
-                out[:half]
+                out[:head]
                 + f"\n\n[... {len(out) - _limit:,} chars truncated ...]\n\n"
-                + out[-half:]
+                + out[-(_limit - head):]
             )
         return out
     except subprocess.TimeoutExpired:
         return f"Error: timed out after {timeout}s"
     except Exception as e:
         return f"Error: {e}"
+
+
+_PASS_SUMMARY = re.compile(
+    r"(\b\d+ passed\b|\btest result: ok\b|\bTests?:\s+\d+ passed|\bAll tests passed\b|^ok\s+\S+\s+[\d.]+s)",
+    re.I | re.M)
+
+
+def _collapse_passing_run(out: str, returncode: int) -> str:
+    """A long, fully passing test run is one line of information.
+
+    Only when the command exited 0, the output is long, and a recognised
+    runner summary (pytest "N passed", cargo "test result: ok", jest/vitest
+    "Tests: N passed", go "ok pkg 0.4s") sits in the last lines: keep that
+    tail and say how much was dropped. Anything else, and every non-zero exit,
+    is returned whole, because hiding a failure is far worse than a long log.
+    """
+    lines = out.splitlines()
+    if returncode != 0 or len(lines) < 60:
+        return out
+    tail = lines[-6:]
+    if not _PASS_SUMMARY.search("\n".join(tail)) or re.search(
+            r"\b(\d+ (failed|errors?)|FAILED|panicked|Traceback)\b", out):
+        return out
+    return (f"[{len(lines) - len(tail):,} lines of passing test output collapsed; "
+            f"exit code 0]\n" + "\n".join(tail))
 
 
 def handle_glob(pattern: str, path: str = None) -> str:
@@ -657,6 +686,44 @@ def handle_semble(query: str, repo: str = None, top_k: int = 5,
     return "\n".join(out)[:_ctx_char_budget(20_000)]
 
 
+_STOP = frozenset("the and for with that this from what which how are was were you your can does "
+                  "has have into about page return give tell list any all not but its their there".split())
+#: A page longer than this is focused on the prompt instead of being truncated blind.
+FOCUS_ABOVE_CHARS = 6_000
+
+
+def _focus_on_prompt(text: str, prompt: str, budget: int = FOCUS_ABOVE_CHARS) -> str:
+    """Keep the blocks of `text` that mention what `prompt` asks about.
+
+    Extractive and local on purpose: Claude Code runs the page through a small
+    model, but here that would queue behind the one served model that is already
+    busy with the turn. Blocks are scored by how many distinct prompt words they
+    contain, the best are kept in document order, and the page's opening is
+    always kept for context. Says plainly that it did this.
+    """
+    words = {w for w in re.findall(r"[a-z0-9_]{3,}", prompt.lower()) if w not in _STOP}
+    if not words or len(text) <= budget:
+        return text
+    blocks = [b.strip() for b in re.split(r"\n\s*\n|\n(?=[#*-] )", text) if b.strip()]
+    head = text[:500]
+    scored = []
+    for i, b in enumerate(blocks):
+        hit = len(words & set(re.findall(r"[a-z0-9_]{3,}", b.lower())))
+        if hit:
+            scored.append((hit, -i, i, b))
+    if not scored:
+        return text[:budget] + f"\n\n[page is {len(text):,} chars; nothing matched the prompt, showing the start]"
+    keep, used = [], len(head)
+    for hit, _, i, b in sorted(scored, reverse=True):
+        if used + len(b) > budget:
+            continue
+        keep.append((i, b))
+        used += len(b) + 2
+    body = "\n\n".join(b for _, b in sorted(keep))
+    return (f"{head}\n\n[... focused on your prompt: {len(keep)} of {len(blocks)} blocks, "
+            f"{used:,} of {len(text):,} chars ...]\n\n{body}")
+
+
 def handle_fetch_url(url: str, prompt: str = None) -> str:
     # WebFetch is in _ALWAYS_APPROVED, so it never asks. Over a multi-day
     # unattended run that is a lot of unreviewed outbound requests, and the URL
@@ -666,13 +733,24 @@ def handle_fetch_url(url: str, prompt: str = None) -> str:
     # allowlist). A guard that errors blocks the fetch; it does not skip it.
     from greenboost_cli.instruments import safe_fetch
     result = safe_fetch.fetch(url)
-    # A real browser can be pointed at anything by a page's own JavaScript, and a
-    # redirect it follows can't be checked hop by hop. So the bot-wall fallback
-    # is opt-in, and only after the plain client was refused with an anti-bot status.
-    if (os.environ.get("GB_WEBFETCH_BROWSER") == "1"
+    # Bot-wall fallback: a headless browser (scrapling StealthyFetcher). On by
+    # default since 2026-10-30 because opt-in meant every 403 was a dead end.
+    # The trade-off the original opt-in guarded against stands: a browser runs
+    # the page's own JavaScript and follows redirects that can't be checked hop
+    # by hop. It is only tried after the plain client was refused with an
+    # anti-bot status for a URL that already passed safe_fetch.validate().
+    # GB_WEBFETCH_BROWSER=0 turns it off.
+    if (os.environ.get("GB_WEBFETCH_BROWSER", "1") != "0"
             and any(f"returned HTTP {c}" in result for c in (403, 429, 503))):
         from greenboost_cli.instruments.scrapling_utils import fetch_url as _scrapling_fetch
-        return _scrapling_fetch(url, use_stealth=True)
+        browsed = _scrapling_fetch(url, use_stealth=True)
+        if not browsed.startswith("Error:"):
+            return _focus_on_prompt(browsed, prompt) if prompt else browsed
+        return (result + " The headless-browser retry was refused too. Do not retry "
+                "WebFetch on this host; if an mcp__charlotte__* browser tool is "
+                "available, navigate there with it.")
+    if prompt and not result.startswith("Error:"):
+        return _focus_on_prompt(result, prompt)
     return result
 
 
@@ -693,7 +771,15 @@ def handle_screenshot(url: str, output_path: str, width: int = 1280,
 def handle_web_query(query: str) -> str:
     from greenboost_cli.instruments.scrapling_utils import search_ddg
 
-    hits = search_ddg(query, max_results=8)
+    from greenboost_cli.instruments.scrapling_utils import search_ddg_ex
+    hits, reason = search_ddg_ex(query, max_results=8)
+    if not hits and reason:
+        # Not "no results": the backend refused us. Say so, and say what to try,
+        # so the model neither loops on it nor reports an empty web.
+        return (f"Error: web search backend unavailable ({reason}). Do not retry "
+                f"WebSearch for this query. If an mcp__charlotte__* or "
+                f"mcp__playwright__* browser tool is available, navigate to "
+                f"https://lite.duckduckgo.com/lite/?q=<query> with it instead.")
     if not hits:
         return "No results found"
 

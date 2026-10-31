@@ -970,6 +970,10 @@ def _auto_load_skills(user_input: str, settings: dict) -> str:
             top_k=_MAX_SKILLS_PER_TURN,
             min_score=0.20,
         )
+        # A body already in this session's history is not injected again: each
+        # injection is permanent history now, so repeating it would only grow it.
+        done = settings.setdefault("_skills_in_history", []) if settings is not None else []
+        matches = [m for m in matches if m.name not in done]
         if not matches:
             return ""
         budget = _MAX_SKILL_INJECT_CHARS
@@ -987,6 +991,8 @@ def _auto_load_skills(user_input: str, settings: dict) -> str:
                 block = block[:budget].rstrip() + "\n[...truncated...]"
             chunks.append(block)
             loaded_names.append(entry.name)
+            if settings is not None and len(done) < 200:      # bounded: runs for days
+                done.append(entry.name)
             budget -= len(block)
         if not chunks:
             return ""
@@ -1096,10 +1102,14 @@ def pre_process_query(
     #    re-inject here if goals were added mid-session)
     # Goals are already in system_context from assemble_system_context() — skip.
 
-    # 4. Skill auto-load (trigger-gated) — append SKILL.md bodies to system_context
+    # 4. Skill auto-load (trigger-gated). The bodies go in front of the USER
+    #    turn, the last chunk of the prompt (core/prefix.py CHUNK_ORDER), not
+    #    onto the system prompt: a skill matching on turn N but not N+1 used to
+    #    change the first chunk and throw away the cached prefix after it,
+    #    tool schemas included.
     skill_block = _auto_load_skills(user_input, settings)
     if skill_block:
-        system_context = system_context + skill_block
+        user_input = skill_block.lstrip("\n") + "\n" + user_input
 
     # 5. Plan-mode directive — restricts the model to plan-file edits only
     plan_block = plan_mode_directive(settings, session)

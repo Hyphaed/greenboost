@@ -160,8 +160,23 @@ def _parse_plain_md(md_file: Path) -> SkillEntry | None:
     return SkillEntry(name=name, description=desc, path=str(md_file), triggers=[])
 
 
+#: skills dir (str) -> plugin name, filled by discover_all_skill_dirs() so a
+#: plugin's skills surface as "plugin:skill", the way Claude Code names them.
+_PLUGIN_PREFIX: dict[str, str] = {}
+
+
 def discover_skills_in_dir(skills_dir: Path) -> list[SkillEntry]:
     """Discover SKILL.md entries AND plain .md files (claude_workflow/commands style)."""
+    entries = _discover_skills_in_dir(skills_dir)
+    prefix = _PLUGIN_PREFIX.get(str(skills_dir))
+    if prefix:
+        for e in entries:
+            if ":" not in e.name:
+                e.name = f"{prefix}:{e.name}"
+    return entries
+
+
+def _discover_skills_in_dir(skills_dir: Path) -> list[SkillEntry]:
     if not skills_dir.is_dir():
         return []
     entries = discover_skills(skills_dir)
@@ -176,15 +191,52 @@ def discover_skills_in_dir(skills_dir: Path) -> list[SkillEntry]:
     return entries
 
 
+def _plugin_skill_dirs(cwd: Path) -> list[tuple[Path, str]]:
+    """(skills dir, plugin name) for every installed Claude Code plugin."""
+    import json
+    import os
+    roots = [Path.home() / ".claude"]
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if cfg:
+        roots.insert(0, Path(cfg).expanduser())
+    out: list[tuple[Path, str]] = []
+    seen: set[str] = set()
+    for root in roots:
+        try:
+            data = json.loads((root / "plugins" / "installed_plugins.json").read_text())
+        except Exception:
+            continue
+        for key, installs in (data.get("plugins") or {}).items():
+            plugin = key.split("@", 1)[0]
+            for inst in installs if isinstance(installs, list) else []:
+                if inst.get("scope") == "project":
+                    pp = inst.get("projectPath")
+                    if not pp or (Path(pp) != cwd and Path(pp) not in cwd.parents):
+                        continue
+                path = inst.get("installPath")
+                if not path:
+                    continue
+                d = Path(path) / "skills"
+                if d.is_dir() and str(d) not in seen:
+                    seen.add(str(d))
+                    out.append((d, plugin))
+    return out
+
+
 def discover_all_skill_dirs(settings: dict) -> list[Path]:
     """Return all directories that should be scanned for skills.
 
-    Order (all combined, deduped):
+    Order = precedence (first skill with a given name wins), the order Claude
+    Code uses: project > account > global > plugin.
     1. User-configured skills_dir
-    2. ~/.claude-accounts/*/skills/  (Claude Code per-account installed skills)
-    3. ~/.claude/skills/             (global Claude Code skills)
-    4. ~/Dev/claude_workflow/commands/ (plain .md files, if auto_discover enabled)
+    2. <project>/.claude/skills (cwd and its ancestors up to $HOME)
+    3. $CLAUDE_CONFIG_DIR/skills (the active Claude Code account)
+    4. ~/.claude-accounts/*/skills/  (other per-account installed skills)
+    5. ~/.claude/skills/             (global Claude Code skills)
+    6. ~/Dev/claude_workflow/commands/ (plain .md files, if auto_discover enabled)
+    7. installed plugins' skills/, named "plugin:skill"
     """
+    import os
     dirs: list[Path] = []
     seen: set[str] = set()
 
@@ -198,20 +250,119 @@ def discover_all_skill_dirs(settings: dict) -> list[Path]:
     if raw:
         _add(Path(raw).expanduser())
 
-    # 2. Claude Code per-account skills
+    # 2. Project skills: nearest first
+    cwd = Path.cwd().resolve()
+    home = Path.home()
+    p = cwd
+    for _ in range(10):
+        _add(p / ".claude" / "skills")
+        if p == home or p.parent == p:
+            break
+        p = p.parent
+
+    # 3. Active Claude Code account
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if cfg:
+        _add(Path(cfg).expanduser() / "skills")
+
+    # 4. Claude Code per-account skills
     accounts_dir = Path.home() / ".claude-accounts"
     if accounts_dir.is_dir():
         for account_dir in sorted(accounts_dir.iterdir()):
             _add(account_dir / "skills")
 
-    # 3. Global Claude Code skills
+    # 5. Global Claude Code skills
     _add(Path.home() / ".claude" / "skills")
 
-    # 4. claude_workflow/commands — plain .md files
+    # 6. claude_workflow/commands — plain .md files
     if (settings or {}).get("skills_auto_discover", True):
         _add(Path.home() / "Dev" / "claude_workflow" / "commands")
 
+    # 7. Plugins
+    for d, plugin in _plugin_skill_dirs(cwd):
+        _PLUGIN_PREFIX[str(d)] = plugin
+        _add(d)
+
     return dirs
+
+
+#: project file -> words that make a skill relevant to it. Ranking only: no skill
+#: is ever hidden by this, it just decides who gets the limited index budget.
+_PROJECT_MARKERS = {
+    "pyproject.toml": ("python", "pytest", "django", "fastapi"),
+    "requirements.txt": ("python", "pytest"),
+    "package.json": ("javascript", "typescript", "node", "react", "vue", "angular", "frontend"),
+    "Cargo.toml": ("rust", "cargo"),
+    "go.mod": ("golang", " go "),
+    "CMakeLists.txt": ("c++", "cmake", "cuda"),
+    "Makefile": ("c/c++", "kernel", "cuda"),
+    "build.gradle": ("kotlin", "java", "android"),
+    "Package.swift": ("swift", "ios"),
+    "capacitor.config.ts": ("capacitor", "ionic", "mobile"),
+}
+
+
+def _project_words(cwd: Path) -> tuple[str, ...]:
+    words: list[str] = []
+    for marker, ws in _PROJECT_MARKERS.items():
+        if (cwd / marker).exists():
+            words.extend(ws)
+    if any(cwd.glob("*.cu")) or any(cwd.glob("*/*.cu")):
+        words.append("cuda")
+    return tuple(words)
+
+
+def _rank_for_project(entries: list, cwd: Path) -> list:
+    """Stable re-order: skills that mention the project's stack first.
+
+    Stable, so precedence (project > account > global > plugin) still breaks
+    ties, and deterministic for a given cwd, so the prompt prefix doesn't move.
+    """
+    words = _project_words(cwd)
+    if not words:
+        return entries
+    def score(e) -> int:
+        text = f" {e.name} {e.description} ".lower()
+        return sum(1 for w in words if w in text)
+    return sorted(entries, key=lambda e: -score(e))
+
+
+def skill_index(settings: dict | None = None, max_chars: int = 3000) -> str:
+    """Compact "name: description" list for the STATIC part of the system prompt.
+
+    Claude Code shows the model its available skills up front; greenboost-cli
+    made it call Skill() blind. Bounded by max_chars (a small context pays for
+    every character on every request) and built in precedence order, so the
+    text is identical from turn to turn and the prompt cache survives.
+    """
+    try:
+        entries = discover_skills_multi(discover_all_skill_dirs(settings or {}))
+    except Exception:
+        return ""
+    if not entries:
+        return ""
+    entries = _rank_for_project(entries, Path.cwd())
+    lines: list[str] = []
+    used = 0
+    entries_skipped = 0
+    for e in entries:
+        # hyperresearch-<N>-<step> skills are internal stages the router skill
+        # chains to itself; listing sixteen of them spent the whole budget.
+        if re.match(r"^hyperresearch-\d", e.name):
+            entries_skipped += 1
+            continue
+        # YAML folded/literal markers ("description: >") leak into the parsed text.
+        desc = " ".join(e.description.split()).lstrip(">|").strip()
+        line = f"- {e.name}: {desc[:100]}"
+        if used + len(line) > max_chars:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    rest = len(entries) - entries_skipped - len(lines)
+    head = ("\n# Available skills\nInvoke with the Skill tool by name before doing "
+            "work a skill covers.\n")
+    tail = f"\n(+{rest} more: call Skill with no name to list them)" if rest > 0 else ""
+    return head + "\n".join(lines) + tail + "\n"
 
 
 def discover_skills_multi(dirs: list[Path]) -> list[SkillEntry]:
@@ -243,7 +394,8 @@ def match_skills_multi(
         return []
 
     from greenboost_cli.rag.engine import _embed
-    q_vec = _embed([turn])[0]
+    q_vec = _embed([turn], query=True, task="skill")[0]
+    embeddings = _aligned(embeddings, q_vec, entries)
     q_norm = q_vec / (np.linalg.norm(q_vec) + 1e-8)
     e_norm = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8)
     sims = e_norm @ q_norm
@@ -279,6 +431,14 @@ def match_skills_multi(
 
 def _manifest_signature(entries: list[SkillEntry]) -> str:
     h = hashlib.sha256()
+    # The embedder is part of the key: vectors from another model are not
+    # comparable (and usually not even the same width).
+    try:
+        from greenboost_cli.rag.engine import EMBED_MODEL
+        h.update(EMBED_MODEL.encode("utf-8"))
+    except Exception:
+        pass
+    h.update(b"\x01")
     for e in sorted(entries, key=lambda x: x.name):
         h.update(e.name.encode("utf-8"))
         h.update(b"\x00")
@@ -318,6 +478,24 @@ def _load_or_build_embeddings(entries: list[SkillEntry]) -> np.ndarray:
     return embeddings
 
 
+def _aligned(embeddings: np.ndarray, q_vec: np.ndarray, entries: list[SkillEntry]) -> np.ndarray:
+    """Cached skill vectors must be the same width as the live query vector.
+
+    They differ after the embedder changes, or when the primary embedder fails
+    and the fallback answers. The mismatch raised a shape error that
+    _auto_load_skills swallowed, so skills silently stopped loading. Rebuild
+    with the model that is actually live instead.
+    """
+    if embeddings.ndim == 2 and embeddings.shape[1] == q_vec.shape[0]:
+        return embeddings
+    for old in SKILLS_CACHE_DIR.glob("*.npz"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    return _load_or_build_embeddings(entries)
+
+
 # ── Routing ────────────────────────────────────────────────────────────────────
 
 def route(
@@ -341,7 +519,8 @@ def route(
         return []
 
     from greenboost_cli.rag.engine import _embed
-    q_vec = _embed([query])[0]
+    q_vec = _embed([query], query=True, task="skill")[0]
+    embeddings = _aligned(embeddings, q_vec, entries)
 
     # Normalise for cosine
     q_norm = q_vec / (np.linalg.norm(q_vec) + 1e-8)

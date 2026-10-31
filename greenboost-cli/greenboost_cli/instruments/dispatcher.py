@@ -69,7 +69,9 @@ _DISPATCH: dict[str, Callable] = {
     "Delegate": lambda p: __import__(
         "greenboost_cli.agents.subagent", fromlist=["delegate"]
     ).delegate_named(str(p["prompt"]), label=str(p.get("label") or "delegate")[:40],
-                     agent=str(p.get("agent") or ""), parent_policy=_CALL.policy),
+                     agent=str(p.get("agent") or p.get("subagent_type") or ""),
+                     lenient=not p.get("agent") and bool(p.get("subagent_type")),
+                     parent_policy=_CALL.policy),
     "MemoryWrite": lambda p: handle_memory_write(p["key"], p["content"], p.get("scope", "project")),
 }
 

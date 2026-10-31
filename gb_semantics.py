@@ -671,23 +671,59 @@ def _res_recurrent_layer_fraction(entity_id, window_s):
     return {"value": None, "unit": "fraction", "raw_source": "no matching model in manifest"}
 
 
+#: A completion shorter than this reports a burst, not a rate: a 32-token reply measured 318 tok/s while
+#: a 399-token reply on the same server measured 58 (MTP accepts several tokens at once on easy text).
+_SUSTAINED_MIN_TOKENS = 100
+
+
 def _res_tok_s_decode(entity_id, window_s):
+    """Sustained decode rate: token-weighted over the last 10 completions of >= 100 tokens.
+
+    The old value was the single latest sample, which on a short reply is a speculative-decoding
+    burst (318.6 tok/s was returned while real turns ran at 31-63). Falls back to the median of
+    the last 10 samples when none is long enough, then to the latest."""
     try:
+        events = [e for e in _read_events(since_hours=(window_s / 3600.0) if window_s else 48)
+                  if e.get("kind") == "tok_s_measured" and e.get("tok_s")]
+        if events:
+            model = entity_id or max(events, key=lambda e: e.get("ts", 0)).get("model")
+            mine = [e for e in events if e.get("model") == model] or events
+            long_ = [e for e in mine if (e.get("completion_tokens") or 0) >= _SUSTAINED_MIN_TOKENS][-10:]
+            if long_:
+                tokens = sum(e["completion_tokens"] for e in long_)
+                secs = sum(e["completion_tokens"] / e["tok_s"] for e in long_)
+                return {"value": round(tokens / secs, 1), "unit": "tokens_per_second", "model": model, "samples": len(long_),
+                        "raw_source": f"dataflux.tok_s_measured, token-weighted over the last {len(long_)} completions of >= {_SUSTAINED_MIN_TOKENS} tokens"}
+            vals = sorted(e["tok_s"] for e in mine[-10:])
+            return {"value": round(vals[len(vals) // 2], 1), "unit": "tokens_per_second", "model": model, "samples": len(vals),
+                    "raw_source": f"dataflux.tok_s_measured, median of the last {len(vals)} samples (none was >= {_SUSTAINED_MIN_TOKENS} tokens, so short-reply bursts are possible)"}
         import gb_dataflux
-        events = _read_events(since_hours=(window_s / 3600.0) if window_s else 48)
-        summary = gb_dataflux.summarize(events)
+        summary = gb_dataflux.summarize(_read_events(since_hours=(window_s / 3600.0) if window_s else 48))
         tok_s = summary.get("tok_s", {})
-        if entity_id and entity_id in tok_s:
-            t = tok_s[entity_id]
-            return {"value": t["latest"], "unit": "tokens_per_second",
-                     "raw_source": "dataflux.tok_s_measured", "samples": t.get("samples")}
         if tok_s:
             best = max(tok_s.items(), key=lambda kv: kv[1].get("last_ts", 0))
-            return {"value": best[1]["latest"], "unit": "tokens_per_second",
-                    "raw_source": "dataflux.tok_s_measured", "model": best[0]}
+            return {"value": best[1]["latest"], "unit": "tokens_per_second", "raw_source": "dataflux.tok_s_measured (latest)", "model": best[0]}
     except Exception as e:
         return {"value": None, "unit": "tokens_per_second", "raw_source": "unavailable", "error": str(e)}
     return {"value": None, "unit": "tokens_per_second", "raw_source": "no tok_s_measured events"}
+
+
+def _res_moe_cache_mib(entity_id, window_s):
+    """Size of the GPU expert cache the latest serve planned (0 = none), and why.
+
+    A MoE model with experts on the host decodes at ~54 tok/s without it and 93-181 with it
+    (workflow/gb-moe-cache.md); 0 with skip_reason not_enough_room is the silent third-speed case."""
+    try:
+        import gb_moe_cache
+        d = gb_moe_cache.last_decision(since_hours=(window_s / 3600.0) if window_s else 96)
+    except Exception:
+        d = None
+    if not d:
+        return {"value": None, "unit": "MiB", "raw_source": "no moe_cache_plan event yet (no MoE serve logged one)"}
+    why = d.get("skip_reason") or "planned"
+    return {"value": int(d.get("cache_mib") or 0), "unit": "MiB", "model": d.get("model"),
+            "raw_source": f"dataflux.moe_cache_plan: {why}, ubatch {d.get('ubatch', '?')} (asked {d.get('ubatch_requested', '?')}), "
+                          f"budget {d.get('budget_gb', '?')} GB, mtp depth {d.get('mtp_draft_n', '?')}"}
 
 
 def _res_ttft_ms(entity_id, window_s):
@@ -945,6 +981,45 @@ def _res_agent_hallucinated_tool_pct(entity_id, window_s):
     missed = sum(1 for e in ev if e.get("outcome") not in ("resolved", "ok"))
     return {"value": round(100.0 * missed / len(ev), 1), "unit": "percent",
             "raw_source": f"agent_tool_schema_miss over {len(ev)} call(s)"}
+
+
+def _res_cli_mcp_servers_connected(entity_id, window_s):
+    """MCP servers greenboost-cli is connected to right now (latest attempt per server).
+
+    A server counts as connected when its MOST RECENT cli_mcp_connect event is
+    ok. Counting events instead would double-count a reconnect and keep a
+    server "connected" after it later failed.
+    """
+    ev = _agent_events("cli_mcp_connect", window_s, days=1.0)
+    if not ev:
+        return {"value": None, "unit": "count",
+                "raw_source": "no cli_mcp_connect events in the window , the CLI "
+                              "has not started a session (or predates this event)"}
+    latest = {}
+    for e in ev:
+        latest[e.get("server", "?")] = e
+    n_ok = sum(1 for e in latest.values() if e.get("status") == "ok")
+    failed = sorted(s for s, e in latest.items() if e.get("status") != "ok")
+    src = f"cli_mcp_connect, latest per server, {len(latest)} server(s)"
+    if failed:
+        src += f"; failed: {', '.join(failed[:6])}"
+    return {"value": n_ok, "unit": "count", "raw_source": src}
+
+
+def _res_cli_web_tool_error_pct(entity_id, window_s):
+    """Share of WebSearch/WebFetch calls that failed (blocked, 4xx/5xx, bot wall).
+
+    Before 2026-10-30 a bot-challenged WebSearch returned "No results found"
+    and was logged outcome=ok, so this could only ever read ~0.
+    """
+    ev = [e for e in _agent_events("cli_tool_call", window_s)
+          if e.get("name") in ("WebSearch", "WebFetch")]
+    if not ev:
+        return {"value": None, "unit": "percent",
+                "raw_source": "no WebSearch/WebFetch cli_tool_call events yet"}
+    bad = sum(1 for e in ev if e.get("outcome") not in ("", "ok", None))
+    return {"value": round(100.0 * bad / len(ev), 1), "unit": "percent",
+            "raw_source": f"cli_tool_call.outcome over {len(ev)} web call(s)"}
 
 
 #: Minimum missed tokens before a prompt_cache event may set the per-token
@@ -3302,6 +3377,35 @@ def _seg_agent_hallucinating_tool_names(entity_id=None, window_s=None):
     if v is None:
         return None, [pct]
     return v >= 5.0, [pct]
+
+
+def _seg_cli_mcp_none_connected(entity_id=None, window_s=None):
+    """greenboost-cli started but connected to zero MCP servers.
+
+    Null when no session has been observed: a clean bill of health inferred
+    from missing data is exactly what this layer exists to prevent.
+    """
+    m = resolve("cli_mcp_servers_connected")
+    v = m.get("value")
+    if v is None:
+        return None, [m]
+    return v == 0, [m]
+
+
+def _seg_moe_cache_skipped_no_room(entity_id=None, window_s=None):
+    """The latest MoE serve had experts on the host and NO room for the GPU expert cache.
+
+    That is the third-speed case: ~54 tok/s instead of 93-181. Null when no serve has logged a
+    cache decision (nothing to judge), never False from missing data."""
+    m = resolve("moe_cache_mib")
+    if m.get("value") is None:
+        return None, [m]
+    try:
+        import gb_moe_cache
+        d = gb_moe_cache.last_decision(since_hours=96) or {}
+    except Exception:
+        d = {}
+    return d.get("skip_reason") == "not_enough_room", [m]
 
 
 def _seg_agent_eval_below_reference(entity_id=None, window_s=None):

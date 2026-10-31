@@ -290,9 +290,14 @@ INSTRUMENT_DEFINITIONS = [
                 "agent": {
                     "type": "string",
                     "description": (
-                        "Optional: name of a user-defined agent (a .md file in .greenboost/agents). "
-                        "It brings its own instructions and tool limits."
+                        "Optional: name of a user-defined agent (a .md file in .greenboost/agents "
+                        "or Claude Code's .claude/agents). It brings its own instructions and "
+                        "tool limits."
                     ),
+                },
+                "subagent_type": {
+                    "type": "string",
+                    "description": "Alias of `agent` (Claude Code naming). An unknown name runs a general delegate.",
                 },
             },
             "required": ["prompt"],
@@ -466,8 +471,9 @@ INSTRUMENT_DEFINITIONS = [
                 "query": {
                     "type": "string",
                     "description": (
-                        "Tool name (exact or partial) or a keyword from its "
-                        "description, e.g. 'generate_image' or 'mcp__forge3d'."
+                        "Tool name (exact or partial), or several keywords from what you "
+                        "need ('search code semantically', 'take screenshot browser'), or "
+                        "'select:mcp__server__tool,mcp__server__other' for exact tools."
                     ),
                 },
             },
